@@ -253,7 +253,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_C_COMPILER=clang-cl `
             -DCMAKE_CXX_COMPILER=clang-cl `
-            -DCMAKE_CXX_FLAGS="/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
+            -DCMAKE_CXX_FLAGS="/DWIN32 /D_WINDOWS /EHsc /D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
 
       - name: Build (Clang-CL)
         shell: pwsh
