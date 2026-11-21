@@ -29,6 +29,7 @@ typedef int32_t XGameResult;
 constexpr XGameResult XGR_S_OK = 0x00000000;
 constexpr XGameResult XGR_S_FALSE = 0x00000001;
 constexpr XGameResult XGR_E_NOTIMPL = static_cast<XGameResult>(0x80004001u);
+constexpr XGameResult XGR_E_NOINTERFACE = static_cast<XGameResult>(0x80004002u);
 constexpr XGameResult XGR_E_POINTER = static_cast<XGameResult>(0x80004003u);
 constexpr XGameResult XGR_E_ABORT = static_cast<XGameResult>(0x80004004u);
 constexpr XGameResult XGR_E_FAIL = static_cast<XGameResult>(0x80004005u);
@@ -529,6 +530,298 @@ OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XDisplayTryAcquireTimeout
     XDisplayTimeoutDeferralHandle* handle);
 OPENSCARLETT_GDK_API void OPENSCARLETT_GDK_CALL XDisplayCloseTimeoutDeferralHandle(
     XDisplayTimeoutDeferralHandle handle);
+
+// ---------------------------------------------------------------------------
+// GDK Static Import Runtime Dispatch (InitializeApiImpl / QueryApiImpl)
+// ---------------------------------------------------------------------------
+struct XgrGuid {
+    uint32_t data1;
+    uint16_t data2;
+    uint16_t data3;
+    uint8_t data4[8];
+};
+static_assert(sizeof(XgrGuid) == 16, "XgrGuid must be 16 bytes");
+
+constexpr XgrGuid XGR_IID_IUNKNOWN = {
+    0x00000000u, 0x0000u, 0x0000u, {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
+
+constexpr XgrGuid XGR_API_GUID_TASK_QUEUE = {
+    0x4F534752u, 0x0001u, 0x4000u, {0x80, 0x01, 0x00, 0x58, 0x54, 0x51, 0x00, 0x01}};
+constexpr XgrGuid XGR_API_GUID_ASYNC = {
+    0x4F534752u, 0x0002u, 0x4000u, {0x80, 0x02, 0x00, 0x58, 0x41, 0x53, 0x00, 0x02}};
+constexpr XgrGuid XGR_API_GUID_USER = {
+    0x4F534752u, 0x0003u, 0x4000u, {0x80, 0x03, 0x00, 0x58, 0x55, 0x53, 0x00, 0x03}};
+constexpr XgrGuid XGR_API_GUID_GAME_SAVE = {
+    0x4F534752u, 0x0004u, 0x4000u, {0x80, 0x04, 0x00, 0x58, 0x47, 0x53, 0x00, 0x04}};
+constexpr XgrGuid XGR_API_GUID_SYSTEM = {
+    0x4F534752u, 0x0005u, 0x4000u, {0x80, 0x05, 0x00, 0x58, 0x53, 0x59, 0x00, 0x05}};
+constexpr XgrGuid XGR_API_GUID_MEM = {
+    0x4F534752u, 0x0006u, 0x4000u, {0x80, 0x06, 0x00, 0x58, 0x4D, 0x45, 0x00, 0x06}};
+constexpr XgrGuid XGR_API_GUID_PACKAGE = {
+    0x4F534752u, 0x0007u, 0x4000u, {0x80, 0x07, 0x00, 0x58, 0x50, 0x4B, 0x00, 0x07}};
+constexpr XgrGuid XGR_API_GUID_DISPLAY = {
+    0x4F534752u, 0x0008u, 0x4000u, {0x80, 0x08, 0x00, 0x58, 0x44, 0x50, 0x00, 0x08}};
+
+typedef XGameResult(OPENSCARLETT_GDK_CALL* XgrQueryInterfaceFn)(
+    const void* self,
+    const XgrGuid* riid,
+    void** ppvObject);
+typedef uint32_t(OPENSCARLETT_GDK_CALL* XgrAddRefFn)(const void* self);
+typedef uint32_t(OPENSCARLETT_GDK_CALL* XgrReleaseFn)(const void* self);
+
+struct IXgrTaskQueueApiVtable {
+    XgrQueryInterfaceFn QueryInterface;
+    XgrAddRefFn AddRef;
+    XgrReleaseFn Release;
+
+    XGameResult(OPENSCARLETT_GDK_CALL* XTaskQueueCreate)(
+        XTaskQueueDispatchMode workDispatchMode,
+        XTaskQueueDispatchMode completionDispatchMode,
+        XTaskQueueHandle* queue);
+    XGameResult(OPENSCARLETT_GDK_CALL* XTaskQueueDuplicateHandle)(
+        XTaskQueueHandle queueHandle,
+        XTaskQueueHandle* duplicatedHandle);
+    void(OPENSCARLETT_GDK_CALL* XTaskQueueCloseHandle)(XTaskQueueHandle queue);
+    bool(OPENSCARLETT_GDK_CALL* XTaskQueueGetCurrentProcessTaskQueue)(XTaskQueueHandle* queue);
+    void(OPENSCARLETT_GDK_CALL* XTaskQueueSetCurrentProcessTaskQueue)(XTaskQueueHandle queue);
+    XGameResult(OPENSCARLETT_GDK_CALL* XTaskQueueSubmitCallback)(
+        XTaskQueueHandle queue,
+        XTaskQueuePort port,
+        void* callbackContext,
+        XTaskQueueCallback callback);
+    XGameResult(OPENSCARLETT_GDK_CALL* XTaskQueueSubmitDelayedCallback)(
+        XTaskQueueHandle queue,
+        XTaskQueuePort port,
+        uint32_t delayMs,
+        void* callbackContext,
+        XTaskQueueCallback callback);
+    bool(OPENSCARLETT_GDK_CALL* XTaskQueueDispatch)(
+        XTaskQueueHandle queue,
+        XTaskQueuePort port,
+        uint32_t timeoutInMs);
+    XGameResult(OPENSCARLETT_GDK_CALL* XTaskQueueTerminate)(
+        XTaskQueueHandle queue,
+        bool wait,
+        void* callbackContext,
+        XTaskQueueTerminatedCallback callback);
+    XGameResult(OPENSCARLETT_GDK_CALL* XTaskQueueRegisterMonitor)(
+        XTaskQueueHandle queue,
+        void* callbackContext,
+        XTaskQueueMonitorCallback callback,
+        XTaskQueueRegistrationToken* token);
+    void(OPENSCARLETT_GDK_CALL* XTaskQueueUnregisterMonitor)(
+        XTaskQueueHandle queue,
+        XTaskQueueRegistrationToken token);
+};
+
+struct IXgrAsyncApiVtable {
+    XgrQueryInterfaceFn QueryInterface;
+    XgrAddRefFn AddRef;
+    XgrReleaseFn Release;
+
+    XGameResult(OPENSCARLETT_GDK_CALL* XAsyncBegin)(
+        XAsyncBlock* asyncBlock,
+        void* context,
+        const void* identity,
+        const char* identityName,
+        XAsyncProvider provider);
+    XGameResult(OPENSCARLETT_GDK_CALL* XAsyncSchedule)(
+        XAsyncBlock* asyncBlock,
+        uint32_t delayInMs);
+    void(OPENSCARLETT_GDK_CALL* XAsyncComplete)(
+        XAsyncBlock* asyncBlock,
+        XGameResult result,
+        size_t requiredBufferSize);
+    XGameResult(OPENSCARLETT_GDK_CALL* XAsyncGetStatus)(
+        XAsyncBlock* asyncBlock,
+        bool wait);
+    XGameResult(OPENSCARLETT_GDK_CALL* XAsyncGetResultSize)(
+        XAsyncBlock* asyncBlock,
+        size_t* bufferSize);
+    XGameResult(OPENSCARLETT_GDK_CALL* XAsyncGetResult)(
+        XAsyncBlock* asyncBlock,
+        const void* identity,
+        size_t bufferSize,
+        void* buffer,
+        size_t* bufferUsed);
+    void(OPENSCARLETT_GDK_CALL* XAsyncCancel)(XAsyncBlock* asyncBlock);
+};
+
+struct IXgrUserApiVtable {
+    XgrQueryInterfaceFn QueryInterface;
+    XgrAddRefFn AddRef;
+    XgrReleaseFn Release;
+
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserAddAsync)(
+        XUserAddOptions options,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserAddResult)(
+        XAsyncBlock* async,
+        XUserHandle* newUser);
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserDuplicateHandle)(
+        XUserHandle handle,
+        XUserHandle* duplicatedHandle);
+    void(OPENSCARLETT_GDK_CALL* XUserCloseHandle)(XUserHandle user);
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserGetId)(XUserHandle user, uint64_t* userId);
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserGetLocalId)(
+        XUserHandle user,
+        XUserLocalId* userLocalId);
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserGetGamertag)(
+        XUserHandle user,
+        XUserGamertagComponent gamertagComponent,
+        size_t gamertagSize,
+        char* gamertag,
+        size_t* gamertagUsed);
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserGetState)(XUserHandle user, XUserState* state);
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserGetAgeGroup)(
+        XUserHandle user,
+        XUserAgeGroup* ageGroup);
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserCheckPrivilege)(
+        XUserHandle user,
+        XUserPrivilegeOptions options,
+        XUserPrivilege privilege,
+        bool* hasPrivilege,
+        XUserPrivilegeDenyReason* reason);
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserGetMaxUsers)(uint32_t* maxUsers);
+    int32_t(OPENSCARLETT_GDK_CALL* XUserCompare)(XUserHandle user1, XUserHandle user2);
+};
+
+struct IXgrGameSaveApiVtable {
+    XgrQueryInterfaceFn QueryInterface;
+    XgrAddRefFn AddRef;
+    XgrReleaseFn Release;
+
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameSaveInitializeProvider)(
+        XUserHandle requestingUser,
+        const char* configurationId,
+        bool syncOnDemand,
+        XGameSaveProviderHandle* provider);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameSaveInitializeProviderAsync)(
+        XUserHandle requestingUser,
+        const char* configurationId,
+        bool syncOnDemand,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameSaveInitializeProviderResult)(
+        XAsyncBlock* async,
+        XGameSaveProviderHandle* provider);
+    void(OPENSCARLETT_GDK_CALL* XGameSaveCloseProvider)(XGameSaveProviderHandle provider);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameSaveCreateContainer)(
+        XGameSaveProviderHandle provider,
+        const char* name,
+        XGameSaveContainerHandle* result);
+    void(OPENSCARLETT_GDK_CALL* XGameSaveCloseContainer)(XGameSaveContainerHandle context);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameSaveCreateUpdate)(
+        XGameSaveContainerHandle container,
+        const char* containerDisplayName,
+        XGameSaveUpdateHandle* result);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameSaveSubmitBlobWrite)(
+        XGameSaveUpdateHandle updateContext,
+        const char* blobName,
+        const uint8_t* data,
+        size_t byteCount);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameSaveSubmitBlobDelete)(
+        XGameSaveUpdateHandle updateContext,
+        const char* blobName);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameSaveSubmitUpdate)(XGameSaveUpdateHandle updateContext);
+    void(OPENSCARLETT_GDK_CALL* XGameSaveCloseUpdate)(XGameSaveUpdateHandle updateContext);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameSaveReadBlobData)(
+        XGameSaveContainerHandle container,
+        const char** blobNames,
+        uint32_t* countOfBlobs,
+        size_t blobsSize,
+        XGameSaveBlob* blobData);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameSaveEnumerateContainerInfo)(
+        XGameSaveProviderHandle provider,
+        void* context,
+        XGameSaveContainerInfoCallback callback);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameSaveEnumerateBlobInfo)(
+        XGameSaveContainerHandle container,
+        void* context,
+        XGameSaveBlobInfoCallback callback);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameSaveDeleteContainer)(
+        XGameSaveProviderHandle provider,
+        const char* name);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameSaveGetRemainingQuota)(
+        XGameSaveProviderHandle provider,
+        int64_t* remainingQuota);
+};
+
+struct IXgrSystemApiVtable {
+    XgrQueryInterfaceFn QueryInterface;
+    XgrAddRefFn AddRef;
+    XgrReleaseFn Release;
+
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameRuntimeInitialize)(void);
+    void(OPENSCARLETT_GDK_CALL* XGameRuntimeUninitialize)(void);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameGetXboxTitleId)(uint32_t* titleId);
+    XSystemDeviceType(OPENSCARLETT_GDK_CALL* XSystemGetDeviceType)(void);
+    XGameResult(OPENSCARLETT_GDK_CALL* XSystemGetConsoleId)(
+        size_t consoleIdSize,
+        char* consoleId,
+        size_t* consoleIdUsed);
+    XGameResult(OPENSCARLETT_GDK_CALL* XSystemGetXboxLiveSandboxId)(
+        size_t sandboxIdSize,
+        char* sandboxId,
+        size_t* sandboxIdUsed);
+    XSystemAnalyticsInfo(OPENSCARLETT_GDK_CALL* XSystemGetAnalyticsInfo)(void);
+    XSystemRuntimeInfo(OPENSCARLETT_GDK_CALL* XSystemGetRuntimeInfo)(void);
+    bool(OPENSCARLETT_GDK_CALL* XSystemIsHandleValid)(void* handle);
+};
+
+struct IXgrMemApiVtable {
+    XgrQueryInterfaceFn QueryInterface;
+    XgrAddRefFn AddRef;
+    XgrReleaseFn Release;
+
+    void*(OPENSCARLETT_GDK_CALL* XMemAllocDefault)(size_t size, uint64_t attributes);
+    void(OPENSCARLETT_GDK_CALL* XMemFreeDefault)(void* pointer, uint64_t attributes);
+    void*(OPENSCARLETT_GDK_CALL* XMemAlloc)(size_t size, uint64_t attributes);
+    void(OPENSCARLETT_GDK_CALL* XMemFree)(void* pointer, uint64_t attributes);
+    XGameResult(OPENSCARLETT_GDK_CALL* XMemSetAllocationHooks)(
+        XMemAllocFunction allocHook,
+        XMemFreeFunction freeHook);
+};
+
+struct IXgrPackageApiVtable {
+    XgrQueryInterfaceFn QueryInterface;
+    XgrAddRefFn AddRef;
+    XgrReleaseFn Release;
+
+    XGameResult(OPENSCARLETT_GDK_CALL* XPackageGetCurrentProcessPackageIdentifier)(
+        size_t bufferSize,
+        char* buffer);
+    bool(OPENSCARLETT_GDK_CALL* XPackageIsPackagedProcess)(void);
+    XGameResult(OPENSCARLETT_GDK_CALL* XPackageEnumerateChunkAvailability)(
+        const char* packageIdentifier,
+        uint32_t selectorCount,
+        const XPackageChunkSelector* selectors,
+        void* context,
+        XPackageChunkAvailabilityCallback callback);
+};
+
+struct IXgrDisplayApiVtable {
+    XgrQueryInterfaceFn QueryInterface;
+    XgrAddRefFn AddRef;
+    XgrReleaseFn Release;
+
+    XDisplayHdrModeResult(OPENSCARLETT_GDK_CALL* XDisplayTryEnableHdrMode)(
+        uint32_t preferredHdrMode,
+        XDisplayHdrModeInfo* displayHdrModeInfo);
+    XGameResult(OPENSCARLETT_GDK_CALL* XDisplayTryAcquireTimeoutDeferral)(
+        XDisplayTimeoutDeferralHandle* handle);
+    void(OPENSCARLETT_GDK_CALL* XDisplayCloseTimeoutDeferralHandle)(
+        XDisplayTimeoutDeferralHandle handle);
+};
+
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL InitializeApiImpl(void);
+OPENSCARLETT_GDK_API void OPENSCARLETT_GDK_CALL UninitializeApiImpl(void);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL QueryApiImpl(
+    const XgrGuid* apiId,
+    void** ppApiVtable);
+OPENSCARLETT_GDK_API int32_t OPENSCARLETT_GDK_CALL XgrGetTelemetryCallCountForTest(
+    const char* symbolName,
+    uint64_t* outTotalCalls,
+    uint64_t* outNotImplCalls);
 
 #ifdef __cplusplus
 }
