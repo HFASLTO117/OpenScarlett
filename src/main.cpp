@@ -1,11 +1,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <vector>
 
 #include "openscarlett/gpu/vulkan_backend.h"
+#include "openscarlett/loader/apc_injector.h"
 #include "openscarlett/loader/pe_inspector.h"
 
 #if defined(_WIN32)
@@ -127,12 +130,223 @@ int RunInspect(const std::string& path) {
     return 0;
 }
 
+std::string QuoteWin32Arg(const std::string& arg) {
+    if (!arg.empty() && arg.find_first_of(" \t\n\v\"") == std::string::npos) {
+        return arg;
+    }
+    std::string out = "\"";
+    size_t backslashes = 0;
+    for (char c : arg) {
+        if (c == '\\') {
+            ++backslashes;
+        } else if (c == '"') {
+            out.append(backslashes * 2 + 1, '\\');
+            out.push_back('"');
+            backslashes = 0;
+        } else {
+            out.append(backslashes, '\\');
+            out.push_back(c);
+            backslashes = 0;
+        }
+    }
+    out.append(backslashes * 2, '\\');
+    out.push_back('"');
+    return out;
+}
+
+bool ExtractJsonStringField(const std::string& line, const std::string& key, std::string& out_val) {
+    std::string pat = "\"" + key + "\": \"";
+    size_t pos = line.find(pat);
+    if (pos == std::string::npos) {
+        return false;
+    }
+    pos += pat.size();
+    std::string val;
+    while (pos < line.size()) {
+        char c = line[pos++];
+        if (c == '\\' && pos < line.size()) {
+            val.push_back(line[pos++]);
+        } else if (c == '"') {
+            out_val = std::move(val);
+            return true;
+        } else {
+            val.push_back(c);
+        }
+    }
+    return false;
+}
+
+bool ExtractJsonUintField(const std::string& line, const std::string& key, uint64_t& out_val) {
+    std::string pat = "\"" + key + "\": ";
+    size_t pos = line.find(pat);
+    if (pos == std::string::npos) {
+        return false;
+    }
+    pos += pat.size();
+    char* end_ptr = nullptr;
+    unsigned long long parsed = std::strtoull(line.c_str() + pos, &end_ptr, 10);
+    if (end_ptr == line.c_str() + pos) {
+        return false;
+    }
+    out_val = static_cast<uint64_t>(parsed);
+    return true;
+}
+
+void PrintTelemetrySummary(const std::string& json_path) {
+    if (json_path.empty() || !std::filesystem::exists(json_path)) {
+        std::printf("Telemetry    : (no report written)\n");
+        return;
+    }
+    std::ifstream ifs(json_path);
+    if (!ifs) {
+        std::printf("Telemetry    : %s (unreadable)\n", json_path.c_str());
+        return;
+    }
+
+    struct BlockerRow {
+        std::string module;
+        std::string symbol;
+        uint64_t not_impl = 0;
+        uint64_t total = 0;
+    };
+    size_t total_entries = 0;
+    std::vector<BlockerRow> blockers;
+
+    std::string line;
+    while (std::getline(ifs, line)) {
+        std::string mod;
+        std::string sym;
+        uint64_t not_impl = 0;
+        uint64_t total = 0;
+        if (!ExtractJsonStringField(line, "module", mod) ||
+            !ExtractJsonStringField(line, "symbol", sym)) {
+            continue;
+        }
+        ++total_entries;
+        ExtractJsonUintField(line, "not_impl", not_impl);
+        ExtractJsonUintField(line, "total", total);
+        if (not_impl > 0) {
+            blockers.push_back(BlockerRow{std::move(mod), std::move(sym), not_impl, total});
+        }
+    }
+
+    std::printf("Telemetry    : %s (%zu symbols tracked, %zu missing blockers)\n",
+                json_path.c_str(),
+                total_entries,
+                blockers.size());
+    const size_t show = std::min<size_t>(blockers.size(), 10);
+    for (size_t i = 0; i < show; ++i) {
+        std::printf("  [BLOCKER]  %s!%s (not_impl=%llu, total=%llu)\n",
+                    blockers[i].module.c_str(),
+                    blockers[i].symbol.c_str(),
+                    static_cast<unsigned long long>(blockers[i].not_impl),
+                    static_cast<unsigned long long>(blockers[i].total));
+    }
+}
+
+int RunGuestExecutable(int argc, char** argv) {
+    openscarlett::LaunchOptions opts{};
+    std::vector<std::string> guest_args;
+    bool in_guest_args = false;
+
+    for (int i = 2; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (in_guest_args) {
+            guest_args.push_back(arg);
+            continue;
+        }
+        if (arg == "--") {
+            in_guest_args = true;
+            continue;
+        }
+        auto take_value = [&](const char* flag, std::string& dst) -> bool {
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "run: missing value for %s\n", flag);
+                return false;
+            }
+            dst = argv[++i];
+            return true;
+        };
+
+        if (arg == "--shim-dir") {
+            if (!take_value("--shim-dir", opts.shim_dir)) return 1;
+        } else if (arg == "--vfs-g") {
+            if (!take_value("--vfs-g", opts.vfs_g)) return 1;
+        } else if (arg == "--vfs-t") {
+            if (!take_value("--vfs-t", opts.vfs_t)) return 1;
+        } else if (arg == "--vfs-s") {
+            if (!take_value("--vfs-s", opts.vfs_s)) return 1;
+        } else if (arg == "--telemetry") {
+            if (!take_value("--telemetry", opts.telemetry_output_path)) return 1;
+        } else if (arg == "--timeout-ms") {
+            std::string raw;
+            if (!take_value("--timeout-ms", raw)) return 1;
+            char* end_ptr = nullptr;
+            unsigned long val = std::strtoul(raw.c_str(), &end_ptr, 10);
+            if (!end_ptr || *end_ptr != '\0') {
+                std::fprintf(stderr, "run: invalid --timeout-ms value: %s\n", raw.c_str());
+                return 1;
+            }
+            opts.timeout_ms = static_cast<uint32_t>(val);
+        } else if (opts.exe_path.empty() && (!arg.empty() && arg[0] != '-')) {
+            opts.exe_path = arg;
+        } else if (!opts.exe_path.empty()) {
+            guest_args.push_back(arg);
+        } else {
+            std::fprintf(stderr, "run: unknown option: %s\n", arg.c_str());
+            return 1;
+        }
+    }
+
+    if (opts.exe_path.empty()) {
+        std::fprintf(stderr, "run: missing target executable path\n");
+        return 1;
+    }
+
+    for (size_t i = 0; i < guest_args.size(); ++i) {
+        if (i > 0) opts.arguments.push_back(' ');
+        opts.arguments += QuoteWin32Arg(guest_args[i]);
+    }
+
+    if (opts.telemetry_output_path.empty()) {
+        std::string stem = std::filesystem::path(opts.exe_path).stem().string();
+        if (stem.empty()) stem = "guest";
+        opts.telemetry_output_path = "E:\\OpenScarlett\\.tmp\\telemetry\\" + stem + "_telemetry.json";
+    }
+
+    openscarlett::LaunchResult res{};
+    auto st = openscarlett::LaunchWithApcHook(opts, res);
+
+    std::printf("=== OpenScarlett Suspended-Process APC Launch ===\n");
+    std::printf("Target EXE   : %s\n", opts.exe_path.c_str());
+    std::printf("Shim Dir     : %s\n", res.resolved_shim_dir.c_str());
+    std::printf("VFS G:\\      : %s\n", res.resolved_vfs_g.c_str());
+    std::printf("VFS T:\\      : %s\n", res.resolved_vfs_t.c_str());
+    std::printf("VFS S:\\      : %s\n", res.resolved_vfs_s.c_str());
+    std::printf("Guest PID    : %u\n", res.process_id);
+    std::printf("Exit Code    : %u%s\n", res.exit_code, res.timed_out ? " (TIMED OUT)" : "");
+    PrintTelemetrySummary(res.resolved_telemetry_path);
+
+    if (!st.ok()) {
+        std::fprintf(stderr, "run failed: %s\n", st.message.c_str());
+        return res.timed_out ? 124 : 1;
+    }
+    return static_cast<int>(res.exit_code);
+}
+
 void PrintUsage() {
     std::printf(
         "OpenScarlett — Clean-room Xbox Series X|S (Scarlett) translation layer for Windows x64\n"
         "Usage:\n"
         "  openscarlett probe-gpu               Probe host D3D12, Vulkan, and DXC capabilities\n"
-        "  openscarlett inspect <exe_or_dll>    Inspect PE32+ x64 imports & console DLL dependencies\n");
+        "  openscarlett inspect <exe_or_dll>    Inspect PE32+ x64 imports & console DLL dependencies\n"
+        "  openscarlett run <exe> [options] [-- <guest-args...>]\n"
+        "      --shim-dir <dir>                 Directory containing OpenScarlett shim DLLs\n"
+        "      --vfs-g <dir>                    Backing directory for virtual G:\\ (game package)\n"
+        "      --vfs-t <dir>                    Backing directory for virtual T:\\ (title scratch)\n"
+        "      --vfs-s <dir>                    Backing directory for virtual S:\\ (persistent saves)\n"
+        "      --telemetry <json>               Output path for unified CallTelemetry JSON report\n"
+        "      --timeout-ms <ms>                Maximum runtime in milliseconds (0 = infinite)\n");
 }
 
 }  // namespace
@@ -145,6 +359,7 @@ int main(int argc, char** argv) {
     std::string cmd = argv[1];
     if (cmd == "probe-gpu") return RunProbeGpu();
     if (cmd == "inspect" && argc >= 3) return RunInspect(argv[2]);
+    if (cmd == "run") return RunGuestExecutable(argc, argv);
     PrintUsage();
     return 1;
 }
