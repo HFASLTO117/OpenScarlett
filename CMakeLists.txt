@@ -90,6 +90,13 @@ foreach(_os_module_cmake
     cmake/presentx_targets.cmake
     cmake/gdk_live_targets.cmake
     cmake/wave2_gdk_targets.cmake
+    cmake/wave3_vulkan_graphics.cmake
+    cmake/wave3_hdr10_d3d12.cmake
+    cmake/wave3_gdk_extended_loader.cmake
+    cmake/wave3_portability.cmake
+    cmake/wave4_simple_lighting.cmake
+    cmake/wave4_hdr_cubemap.cmake
+    cmake/wave4_vulkan_mesh_showcase.cmake
 )
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_os_module_cmake}")
         include("${CMAKE_CURRENT_SOURCE_DIR}/${_os_module_cmake}")
