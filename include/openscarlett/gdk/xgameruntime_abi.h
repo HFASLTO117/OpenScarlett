@@ -59,6 +59,7 @@ OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameGetXboxTitleId(uint3
 // XTaskQueue
 // ---------------------------------------------------------------------------
 typedef struct XTaskQueueObject* XTaskQueueHandle;
+typedef struct XTaskQueuePortObject* XTaskQueuePortHandle;
 
 enum XTaskQueueDispatchMode : uint32_t {
     XTaskQueueDispatchMode_ThreadPool = 0,
@@ -123,6 +124,24 @@ OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XTaskQueueRegisterMonitor
 OPENSCARLETT_GDK_API void OPENSCARLETT_GDK_CALL XTaskQueueUnregisterMonitor(
     XTaskQueueHandle queue,
     XTaskQueueRegistrationToken token);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XTaskQueueGetPort(
+    XTaskQueueHandle queue,
+    XTaskQueuePort port,
+    XTaskQueuePortHandle* portHandle);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XTaskQueueCreateComposite(
+    XTaskQueuePortHandle workPort,
+    XTaskQueuePortHandle completionPort,
+    XTaskQueueHandle* queue);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XTaskQueueRegisterWaiter(
+    XTaskQueueHandle queue,
+    XTaskQueuePort port,
+    void* waitHandle,
+    void* callbackContext,
+    XTaskQueueCallback callback,
+    XTaskQueueRegistrationToken* token);
+OPENSCARLETT_GDK_API void OPENSCARLETT_GDK_CALL XTaskQueueUnregisterWaiter(
+    XTaskQueueHandle queue,
+    XTaskQueueRegistrationToken token);
 
 // ---------------------------------------------------------------------------
 // XAsync
@@ -182,6 +201,12 @@ OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XAsyncGetResult(
     void* buffer,
     size_t* bufferUsed);
 OPENSCARLETT_GDK_API void OPENSCARLETT_GDK_CALL XAsyncCancel(XAsyncBlock* asyncBlock);
+
+typedef XGameResult(OPENSCARLETT_GDK_CALL* XAsyncWork)(XAsyncBlock* asyncBlock);
+
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XAsyncRun(
+    XAsyncBlock* asyncBlock,
+    XAsyncWork work);
 
 // ---------------------------------------------------------------------------
 // XUser
@@ -285,9 +310,33 @@ OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XUserCheckPrivilege(
     bool* hasPrivilege,
     XUserPrivilegeDenyReason* reason);
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XUserGetMaxUsers(uint32_t* maxUsers);
+enum XUserGamerPictureSize : uint32_t {
+    XUserGamerPictureSize_Small = 0,
+    XUserGamerPictureSize_Medium = 1,
+    XUserGamerPictureSize_Large = 2,
+    XUserGamerPictureSize_ExtraLarge = 3,
+};
+
+constexpr size_t XUserGamertagComponentClassicMaxBytes = 16;
+constexpr size_t XUserGamertagComponentModernMaxBytes = 97;
+constexpr size_t XUserGamertagComponentModernSuffixMaxBytes = 15;
+constexpr size_t XUserGamertagComponentUniqueModernMaxBytes = 101;
+
 OPENSCARLETT_GDK_API int32_t OPENSCARLETT_GDK_CALL XUserCompare(
     XUserHandle user1,
     XUserHandle user2);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XUserGetGamerPictureAsync(
+    XUserHandle user,
+    XUserGamerPictureSize pictureSize,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XUserGetGamerPictureResultSize(
+    XAsyncBlock* async,
+    size_t* bufferSize);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XUserGetGamerPictureResult(
+    XAsyncBlock* async,
+    size_t bufferSize,
+    uint8_t* buffer,
+    size_t* bufferUsed);
 
 // ---------------------------------------------------------------------------
 // XGameSave
@@ -378,6 +427,38 @@ OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameSaveDeleteContainer(
     const char* name);
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameSaveGetRemainingQuota(
     XGameSaveProviderHandle provider,
+    int64_t* remainingQuota);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameSaveEnumerateContainerInfoByName(
+    XGameSaveProviderHandle provider,
+    const char* containerNamePrefix,
+    void* context,
+    XGameSaveContainerInfoCallback callback);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameSaveReadBlobDataAsync(
+    XGameSaveContainerHandle container,
+    const char** blobNames,
+    uint32_t countOfBlobs,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameSaveReadBlobDataResult(
+    XAsyncBlock* async,
+    size_t blobsSize,
+    XGameSaveBlob* blobData,
+    uint32_t* countOfBlobs);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameSaveSubmitUpdateAsync(
+    XGameSaveUpdateHandle updateContext,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameSaveSubmitUpdateResult(
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameSaveDeleteContainerAsync(
+    XGameSaveProviderHandle provider,
+    const char* name,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameSaveDeleteContainerResult(
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameSaveGetRemainingQuotaAsync(
+    XGameSaveProviderHandle provider,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameSaveGetRemainingQuotaResult(
+    XAsyncBlock* async,
     int64_t* remainingQuota);
 
 // ---------------------------------------------------------------------------
