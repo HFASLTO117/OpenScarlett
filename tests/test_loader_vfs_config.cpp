@@ -21,6 +21,34 @@ namespace fs = std::filesystem;
 
 namespace {
 
+fs::path ResolveRuntimeBinDir() {
+    std::error_code ec;
+    wchar_t self_buf[MAX_PATH]{};
+    const DWORD self_len = ::GetModuleFileNameW(nullptr, self_buf, static_cast<DWORD>(MAX_PATH));
+    if (self_len > 0 && self_len < MAX_PATH) {
+        const fs::path exe_dir = fs::path(self_buf).parent_path();
+        if (fs::exists(exe_dir / L"openscarlett.exe", ec) &&
+            fs::exists(exe_dir / L"openscarlett_hook.dll", ec)) {
+            return exe_dir;
+        }
+    }
+    return fs::path(OPENSCARLETT_BINARY_DIR);
+}
+
+fs::path ResolveScratchRoot() {
+    std::error_code ec;
+    wchar_t temp_buf[1024]{};
+    const DWORD tlen = ::GetEnvironmentVariableW(L"TEMP", temp_buf, static_cast<DWORD>(1024));
+    if (tlen > 0 && tlen < 1024) {
+        return (fs::path(temp_buf) / L"openscarlett_loader_vfs_config").make_preferred();
+    }
+    const fs::path sys_tmp = fs::temp_directory_path(ec);
+    if (!ec && !sys_tmp.empty()) {
+        return (sys_tmp / L"openscarlett_loader_vfs_config").make_preferred();
+    }
+    return (ResolveRuntimeBinDir() / L".tmp_loader_vfs_config").make_preferred();
+}
+
 // ---------------------------------------------------------------------------
 // File & Deterministic Directory Hash Helpers (proves 100% byte-identical G:\)
 // ---------------------------------------------------------------------------
@@ -309,8 +337,7 @@ void TestGameConfigParserAndResolution() {
     OS_REQUIRE(!ParseGameConfigXml("<Game><TitleId>1234</Wrong></Game>", "bad4", bad).ok());
 
     // 1D. ResolvePackageLaunchTarget (dir, config file, direct exe with sibling config)
-    const fs::path sandbox =
-        (fs::path(OPENSCARLETT_BINARY_DIR) / ".tmp_loader_vfs_config" / "resolve_pkg").make_preferred();
+    const fs::path sandbox = (ResolveScratchRoot() / "resolve_pkg").make_preferred();
     std::error_code ec;
     fs::remove_all(sandbox, ec);
     fs::create_directories(sandbox, ec);
@@ -368,8 +395,7 @@ void TestGameConfigParserAndResolution() {
 void TestCowVfsUnit() {
     using namespace openscarlett;
 
-    const fs::path root =
-        (fs::path(OPENSCARLETT_BINARY_DIR) / ".tmp_loader_vfs_config" / "cow_unit").make_preferred();
+    const fs::path root = (ResolveScratchRoot() / "cow_unit").make_preferred();
     std::error_code ec;
     fs::remove_all(root, ec);
 
@@ -799,8 +825,7 @@ void TestDllRoutingTable() {
     }
 
     // Create temp shim_dir and guest_dir to verify filesystem-backed resolution
-    const fs::path root =
-        (fs::path(OPENSCARLETT_BINARY_DIR) / ".tmp_loader_vfs_config" / "routing_unit").make_preferred();
+    const fs::path root = (ResolveScratchRoot() / "routing_unit").make_preferred();
     std::error_code ec;
     fs::remove_all(root, ec);
     const fs::path shim_dir = root / "shims";
@@ -1028,15 +1053,14 @@ int RunCowGuestChild() {
 }
 
 void TestLivePackageLaunchAndCowOverlay(const fs::path& self_exe) {
-    const fs::path build_dir = fs::path(OPENSCARLETT_BINARY_DIR);
+    const fs::path build_dir = ResolveRuntimeBinDir();
     const fs::path cli_exe = build_dir / "openscarlett.exe";
     const fs::path dummy_exe = build_dir / "test_guest_dummy.exe";
     OS_REQUIRE(fs::exists(cli_exe));
     OS_REQUIRE(fs::exists(dummy_exe));
     OS_REQUIRE(fs::exists(self_exe));
 
-    const fs::path sandbox =
-        (build_dir / ".tmp_loader_vfs_config" / "live_pkg_cow").make_preferred();
+    const fs::path sandbox = (ResolveScratchRoot() / "live_pkg_cow").make_preferred();
     std::error_code ec;
     fs::remove_all(sandbox, ec);
 

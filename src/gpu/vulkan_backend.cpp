@@ -144,10 +144,12 @@ struct alignas(8) VkPhysicalDevicePropertiesRaw {
     uint32_t deviceType;
     char deviceName[256];
     uint8_t pipelineCacheUUID[16];
-    alignas(8) uint8_t limits_and_sparse_storage[1024];
+    uint32_t pad_to_8;
+    uint8_t limits_and_sparse_storage[1024];
 };
 static_assert(offsetof(VkPhysicalDevicePropertiesRaw, deviceName) == 20, "VkPhysicalDeviceProperties layout");
 static_assert(offsetof(VkPhysicalDevicePropertiesRaw, pipelineCacheUUID) == 276, "UUID offset");
+static_assert(offsetof(VkPhysicalDevicePropertiesRaw, limits_and_sparse_storage) == 296, "limits offset");
 
 struct VkExtent3D {
     uint32_t width;
