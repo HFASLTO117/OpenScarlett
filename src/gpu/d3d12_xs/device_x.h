@@ -22,6 +22,12 @@ public:
     ID3D12Device* HostDevice() const noexcept { return host_dev_; }
     const D3D12AdapterInfo& AdapterInfo() const noexcept { return adapter_info_; }
     HWND DefaultWindow() const noexcept { return default_hwnd_; }
+    uint32_t FrameIntervalMicroseconds() const noexcept {
+        return frame_interval_us_.load(std::memory_order_relaxed);
+    }
+    uint32_t MaxFrameLatency() const noexcept {
+        return max_frame_latency_.load(std::memory_order_relaxed);
+    }
 
     // IUnknown (slots 0..2)
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override;
