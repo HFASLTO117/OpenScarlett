@@ -301,4 +301,63 @@ OPENSCARLETT_D3D12_API int WINAPI OpenScarlettD3D12GetTelemetryEntry(
     return 0;
 }
 
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12GetPresentWindowState(
+    ID3D12CommandQueue* queue,
+    D3D12XBOX_PRESENT_WINDOW_STATE* out_state) {
+    if (!queue) return E_INVALIDARG;
+    if (!out_state) return E_POINTER;
+    IOpenScarlettPresentWindow* win = nullptr;
+    HRESULT hr = queue->QueryInterface(IID_IOpenScarlettPresentWindow,
+                                       reinterpret_cast<void**>(&win));
+    if (FAILED(hr) || !win) {
+        return FAILED(hr) ? hr : E_NOINTERFACE;
+    }
+    hr = win->GetPresentWindowState(out_state);
+    win->Release();
+    return hr;
+}
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12ToggleBorderlessFullscreen(
+    ID3D12CommandQueue* queue) {
+    if (!queue) return E_INVALIDARG;
+    IOpenScarlettPresentWindow* win = nullptr;
+    HRESULT hr = queue->QueryInterface(IID_IOpenScarlettPresentWindow,
+                                       reinterpret_cast<void**>(&win));
+    if (FAILED(hr) || !win) {
+        return FAILED(hr) ? hr : E_NOINTERFACE;
+    }
+    hr = win->ToggleBorderlessFullscreen();
+    win->Release();
+    return hr;
+}
+
+OPENSCARLETT_D3D12_API HANDLE WINAPI OpenScarlettD3D12GetFrameLatencyWaitableObject(
+    ID3D12CommandQueue* queue) {
+    if (!queue) return nullptr;
+    IOpenScarlettPresentWindow* win = nullptr;
+    HRESULT hr = queue->QueryInterface(IID_IOpenScarlettPresentWindow,
+                                       reinterpret_cast<void**>(&win));
+    if (FAILED(hr) || !win) {
+        return nullptr;
+    }
+    HANDLE h = win->GetFrameLatencyWaitableObject();
+    win->Release();
+    return h;
+}
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12SetWindowCloseBehavior(
+    ID3D12CommandQueue* queue,
+    int post_quit_on_close) {
+    if (!queue) return E_INVALIDARG;
+    IOpenScarlettPresentWindow* win = nullptr;
+    HRESULT hr = queue->QueryInterface(IID_IOpenScarlettPresentWindow,
+                                       reinterpret_cast<void**>(&win));
+    if (FAILED(hr) || !win) {
+        return FAILED(hr) ? hr : E_NOINTERFACE;
+    }
+    hr = win->SetWindowCloseBehavior(post_quit_on_close ? TRUE : FALSE);
+    win->Release();
+    return hr;
+}
+
 }  // extern "C"

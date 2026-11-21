@@ -106,6 +106,13 @@ enum GameInputRumbleMotors : uint32_t {
     GameInputRumbleRightTrigger = 0x00000008u,
 };
 
+enum GameInputFocusPolicy : uint32_t {
+    GameInputDefaultFocusPolicy = 0x00000000u,
+    GameInputDisableBackgroundInput = 0x00000001u,
+    GameInputExclusiveForegroundInput = 0x00000002u,
+    GameInputEnableBackgroundInput = 0x00000004u,
+};
+
 struct GameInputGamepadState {
     uint32_t buttons;
     float leftTrigger;
@@ -204,6 +211,19 @@ extern "C" {
 
 OPENSCARLETT_GAMEINPUT_API int32_t OPENSCARLETT_GAMEINPUT_CALL GameInputCreate(
     IGameInput** gameInput);
+
+// OpenScarlett optional window-focus & deterministic test injection helpers.
+// `hwnd` accepts a Win32 HWND (implicitly convertible to void*) or nullptr.
+OPENSCARLETT_GAMEINPUT_API int32_t OPENSCARLETT_GAMEINPUT_CALL
+OpenScarlettGameInputSetTargetWindow(IGameInput* input, void* hwnd);
+
+OPENSCARLETT_GAMEINPUT_API int32_t OPENSCARLETT_GAMEINPUT_CALL
+OpenScarlettGameInputInjectTestState(
+    IGameInput* input,
+    const GameInputGamepadState* gp,
+    const GameInputKeyState* keys,
+    uint32_t key_count,
+    int enable);
 
 #ifdef __cplusplus
 }
