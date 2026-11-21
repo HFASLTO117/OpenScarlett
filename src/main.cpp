@@ -10,6 +10,7 @@
 
 #include "openscarlett/gpu/vulkan_backend.h"
 #include "openscarlett/loader/apc_injector.h"
+#include "openscarlett/loader/game_config.h"
 #include "openscarlett/loader/pe_inspector.h"
 
 #if defined(_WIN32)
@@ -158,9 +159,18 @@ int RunInspect(const std::string& path) {
                 static_cast<unsigned long long>(rep.image_base),
                 rep.image_size,
                 rep.section_count);
-    std::printf("Flags        : Relocs=%s | TLS=%s\n",
+    size_t forwarded_exports = 0;
+    for (const auto& exp : rep.exports) {
+        if (exp.is_forwarded) ++forwarded_exports;
+    }
+    std::printf("Flags        : Relocs=%s | TLS=%s (%zu callbacks) | .pdata=%u SEH entries\n",
                 rep.has_relocations ? "yes" : "stripped",
-                rep.has_tls ? "yes" : "no");
+                rep.has_tls ? "yes" : "no",
+                rep.tls_callback_rvas.size(),
+                rep.exception_entry_count);
+    std::printf("Exports      : %zu total (%zu forwarded)\n",
+                rep.exports.size(),
+                forwarded_exports);
     std::printf("Imports      : %u total (%u console-only, %u GDK, %u delay-loaded) across %zu DLLs\n",
                 rep.total_imports,
                 rep.console_imports,
@@ -318,6 +328,8 @@ int RunGuestExecutable(int argc, char** argv) {
             if (!take_value("--shim-dir", opts.shim_dir)) return 1;
         } else if (arg == "--vfs-g") {
             if (!take_value("--vfs-g", opts.vfs_g)) return 1;
+        } else if (arg == "--vfs-g-overlay") {
+            if (!take_value("--vfs-g-overlay", opts.vfs_g_overlay)) return 1;
         } else if (arg == "--vfs-t") {
             if (!take_value("--vfs-t", opts.vfs_t)) return 1;
         } else if (arg == "--vfs-s") {
@@ -345,7 +357,7 @@ int RunGuestExecutable(int argc, char** argv) {
     }
 
     if (opts.exe_path.empty()) {
-        std::fprintf(stderr, "run: missing target executable path\n");
+        std::fprintf(stderr, "run: missing target package directory, MicrosoftGame.Config, or executable path\n");
         return 1;
     }
 
@@ -355,7 +367,14 @@ int RunGuestExecutable(int argc, char** argv) {
     }
 
     if (opts.telemetry_output_path.empty()) {
-        std::string stem = std::filesystem::path(opts.exe_path).stem().string();
+        std::string stem;
+        openscarlett::ResolvedPackageTarget pre_target{};
+        if (openscarlett::ResolvePackageLaunchTarget(opts.exe_path, pre_target).ok() &&
+            !pre_target.exe_path.empty()) {
+            stem = std::filesystem::path(pre_target.exe_path).stem().string();
+        } else {
+            stem = std::filesystem::path(opts.exe_path).stem().string();
+        }
         if (stem.empty()) stem = "guest";
         std::filesystem::path tel_base;
 #if defined(_WIN32)
@@ -376,9 +395,20 @@ int RunGuestExecutable(int argc, char** argv) {
     auto st = openscarlett::LaunchWithApcHook(opts, res);
 
     std::printf("=== OpenScarlett Suspended-Process APC Launch ===\n");
-    std::printf("Target EXE   : %s\n", opts.exe_path.c_str());
+    if (!res.resolved_config_path.empty()) {
+        std::printf("Game Config  : %s\n", res.resolved_config_path.c_str());
+    }
+    if (!res.resolved_title_id.empty()) {
+        std::printf("TitleId      : %s\n", res.resolved_title_id.c_str());
+    }
+    if (!res.resolved_package_id.empty()) {
+        std::printf("PackageId    : %s\n", res.resolved_package_id.c_str());
+    }
+    std::printf("Target EXE   : %s\n",
+                res.resolved_exe_path.empty() ? opts.exe_path.c_str() : res.resolved_exe_path.c_str());
     std::printf("Shim Dir     : %s\n", res.resolved_shim_dir.c_str());
-    std::printf("VFS G:\\      : %s\n", res.resolved_vfs_g.c_str());
+    std::printf("VFS G:\\      : %s (read-only base)\n", res.resolved_vfs_g.c_str());
+    std::printf("VFS G: CoW   : %s\n", res.resolved_vfs_g_overlay.c_str());
     std::printf("VFS T:\\      : %s\n", res.resolved_vfs_t.c_str());
     std::printf("VFS S:\\      : %s\n", res.resolved_vfs_s.c_str());
     std::printf("Guest PID    : %u\n", res.process_id);
@@ -397,10 +427,11 @@ void PrintUsage() {
         "OpenScarlett — Clean-room Xbox Series X|S (Scarlett) translation layer for Windows x64\n"
         "Usage:\n"
         "  openscarlett probe-gpu               Probe host D3D12, Vulkan, and DXC capabilities\n"
-        "  openscarlett inspect <exe_or_dll>    Inspect PE32+ x64 imports & console DLL dependencies\n"
-        "  openscarlett run <exe> [options] [-- <guest-args...>]\n"
+        "  openscarlett inspect <exe_or_dll>    Inspect PE32+ x64 imports, exports, TLS & .pdata\n"
+        "  openscarlett run <package_dir_or_config_or_exe> [options] [-- <guest-args...>]\n"
         "      --shim-dir <dir>                 Directory containing OpenScarlett shim DLLs\n"
-        "      --vfs-g <dir>                    Backing directory for virtual G:\\ (game package)\n"
+        "      --vfs-g <dir>                    Backing directory for virtual G:\\ / GAME:\\ (read-only)\n"
+        "      --vfs-g-overlay <dir>            Copy-on-Write overlay directory for G:\\ / GAME:\\ writes\n"
         "      --vfs-t <dir>                    Backing directory for virtual T:\\ (title scratch)\n"
         "      --vfs-s <dir>                    Backing directory for virtual S:\\ (persistent saves)\n"
         "      --telemetry <json>               Output path for unified CallTelemetry JSON report\n"

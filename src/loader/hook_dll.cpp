@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "openscarlett/core/telemetry.h"
+#include "openscarlett/loader/pe_inspector.h"
 #include "openscarlett/loader/vfs_mounts.h"
 
 namespace {
@@ -35,6 +36,10 @@ using PfnGetFileAttributesA = DWORD(WINAPI*)(LPCSTR);
 using PfnGetFileAttributesW = DWORD(WINAPI*)(LPCWSTR);
 using PfnGetFileAttributesExW = BOOL(WINAPI*)(LPCWSTR, GET_FILEEX_INFO_LEVELS, LPVOID);
 using PfnCreateDirectoryW = BOOL(WINAPI*)(LPCWSTR, LPSECURITY_ATTRIBUTES);
+using PfnDeleteFileA = BOOL(WINAPI*)(LPCSTR);
+using PfnDeleteFileW = BOOL(WINAPI*)(LPCWSTR);
+using PfnMoveFileExW = BOOL(WINAPI*)(LPCWSTR, LPCWSTR, DWORD);
+using PfnRemoveDirectoryW = BOOL(WINAPI*)(LPCWSTR);
 using PfnFindFirstFileW = HANDLE(WINAPI*)(LPCWSTR, LPWIN32_FIND_DATAW);
 using PfnExitProcess = VOID(WINAPI*)(UINT);
 
@@ -53,6 +58,10 @@ PfnGetFileAttributesA g_real_GetFileAttributesA = nullptr;
 PfnGetFileAttributesW g_real_GetFileAttributesW = nullptr;
 PfnGetFileAttributesExW g_real_GetFileAttributesExW = nullptr;
 PfnCreateDirectoryW g_real_CreateDirectoryW = nullptr;
+PfnDeleteFileA g_real_DeleteFileA = nullptr;
+PfnDeleteFileW g_real_DeleteFileW = nullptr;
+PfnMoveFileExW g_real_MoveFileExW = nullptr;
+PfnRemoveDirectoryW g_real_RemoveDirectoryW = nullptr;
 PfnFindFirstFileW g_real_FindFirstFileW = nullptr;
 PfnExitProcess g_real_ExitProcess = nullptr;
 
@@ -61,9 +70,11 @@ PfnExitProcess g_real_ExitProcess = nullptr;
 // ---------------------------------------------------------------------------
 HMODULE g_self_module = nullptr;
 std::wstring g_shim_dir_w;
+std::wstring g_guest_dir_w;
 std::wstring g_windows_dir_lower_w;
 std::string g_telemetry_path_utf8;
 openscarlett::VfsMounts g_vfs;
+openscarlett::DllRoutingTable g_routing_table;
 
 std::atomic<bool> g_initialized{false};
 std::atomic<bool> g_shutting_down{false};
@@ -80,6 +91,8 @@ struct PatchedModuleKey {
     uint32_t timestamp = 0;
 };
 std::unordered_map<HMODULE, PatchedModuleKey> g_patched_modules;
+
+thread_local uint32_t tl_forwarder_depth = 0;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -146,50 +159,43 @@ std::wstring GetModulePathW(HMODULE mod) {
     }
 }
 
-struct ShimmedDllSpec {
-    const wchar_t* lower_name;
-    const wchar_t* canonical_w;
-    const char* canonical_a;
-};
-
-constexpr ShimmedDllSpec kShimmedXboxDlls[] = {
-    {L"d3d12_xs.dll", L"d3d12_xs.dll", "d3d12_xs.dll"},
-    {L"xg_xs.dll", L"xg_xs.dll", "xg_xs.dll"},
-    {L"kernelx.dll", L"kernelx.dll", "kernelx.dll"},
-    {L"xgameruntime.dll", L"xgameruntime.dll", "xgameruntime.dll"},
-    {L"gameinput.dll", L"GameInput.dll", "GameInput.dll"},
-    {L"xaudio2_9.dll", L"XAudio2_9.dll", "XAudio2_9.dll"},
-    {L"acphal.dll", L"AcpHal.dll", "AcpHal.dll"},
-    {L"dstorage_xs.dll", L"dstorage_xs.dll", "dstorage_xs.dll"},
-    {L"winrt_xs.dll", L"winrt_xs.dll", "winrt_xs.dll"},
-    {L"microsoft.xbox.services.gdk.c.dll", L"Microsoft.Xbox.Services.GDK.C.dll",
-     "Microsoft.Xbox.Services.GDK.C.dll"},
-    {L"xcrypt.dll", L"xcrypt.dll", "xcrypt.dll"},
-    {L"xcurl.dll", L"xcurl.dll", "xcurl.dll"},
-    {L"libhttpclient.gdk.dll", L"libHttpClient.GDK.dll", "libHttpClient.GDK.dll"},
-};
-
-bool MatchXboxShimmedDllW(std::wstring_view raw_name,
-                          std::wstring& out_canonical_w,
-                          std::string& out_canonical_a) {
+bool MatchRoutedShimOrGuestDllW(std::wstring_view raw_name,
+                                openscarlett::DllRouteDecision& out_decision,
+                                std::wstring& out_target_path) {
+    out_decision = {};
+    out_target_path.clear();
     if (raw_name.empty()) {
         return false;
     }
-    size_t slash = raw_name.find_last_of(L"\\/");
-    std::wstring_view base = (slash == std::wstring_view::npos) ? raw_name : raw_name.substr(slash + 1);
-    if (base.empty()) {
-        return false;
-    }
-    std::wstring lower = ToLowerAsciiW(base);
-    if (lower.size() < 4 || lower.compare(lower.size() - 4, 4, L".dll") != 0) {
-        lower.append(L".dll");
-    }
-    for (const auto& spec : kShimmedXboxDlls) {
-        if (lower == spec.lower_name) {
-            out_canonical_w = spec.canonical_w;
-            out_canonical_a = spec.canonical_a;
-            return true;
+
+    const bool has_path_sep = (raw_name.find_first_of(L"\\/") != std::wstring_view::npos);
+    out_decision = g_routing_table.ResolveRouteW(raw_name, g_shim_dir_w, g_guest_dir_w);
+
+    if (out_decision.policy == openscarlett::DllRoutePolicy::Shim) {
+        if (!out_decision.resolved_path.empty()) {
+            out_target_path = out_decision.resolved_path;
+        } else {
+            const std::wstring canon_w = openscarlett::Utf8ToWide(out_decision.canonical_name);
+            out_target_path = g_shim_dir_w.empty() ? canon_w : (g_shim_dir_w + L"\\" + canon_w);
         }
+        return true;
+    }
+
+    if (out_decision.policy == openscarlett::DllRoutePolicy::NativeGuestDll &&
+        !out_decision.resolved_path.empty() &&
+        (!has_path_sep || out_decision.from_override)) {
+        out_target_path = out_decision.resolved_path;
+        return true;
+    }
+
+    return false;
+}
+
+bool MatchTrackedShimNameW(std::wstring_view path_or_name, std::string& out_canonical_a) {
+    const auto* rule = g_routing_table.FindRule(openscarlett::WideToUtf8(path_or_name));
+    if (rule && rule->policy == openscarlett::DllRoutePolicy::Shim) {
+        out_canonical_a = rule->canonical_name;
+        return true;
     }
     return false;
 }
@@ -260,9 +266,8 @@ bool LookupXboxModuleName(HMODULE mod, std::string& out_name) {
     }
 
     std::wstring path = GetModulePathW(mod);
-    std::wstring canon_w;
     std::string canon_a;
-    if (MatchXboxShimmedDllW(path, canon_w, canon_a)) {
+    if (MatchTrackedShimNameW(path, canon_a)) {
         RegisterXboxModule(mod, canon_a);
         out_name = std::move(canon_a);
         return true;
@@ -292,23 +297,20 @@ int FlushTelemetryInternal(bool only_once) {
     return st.ok() ? 1 : 0;
 }
 
-// Forward declarations for recursive IAT/delay-load patching
+// Forward declarations for recursive IAT/delay-load patching and forwarded GetProcAddress
 void PatchModuleImports(HMODULE mod);
 void PatchAllLoadedNonSystemModules();
+FARPROC WINAPI Hook_GetProcAddress(HMODULE hModule, LPCSTR lpProcName);
 
 // ---------------------------------------------------------------------------
-// Hook Implementations: Library Loading & Symbol Resolution
+// Hook Implementations: Library Loading & Symbol Resolution (Data-Driven)
 // ---------------------------------------------------------------------------
-HMODULE RedirectAndLoadXboxDll(const std::wstring& canonical_w,
-                               const std::string& canonical_a,
-                               const char* api_name,
-                               HANDLE hFile,
-                               DWORD dwFlags,
-                               bool use_ex) {
-    std::wstring target_path = g_shim_dir_w.empty()
-                                   ? canonical_w
-                                   : (g_shim_dir_w + L"\\" + canonical_w);
-
+HMODULE LoadRoutedDll(const openscarlett::DllRouteDecision& decision,
+                      const std::wstring& target_path,
+                      const char* api_name,
+                      HANDLE hFile,
+                      DWORD dwFlags,
+                      bool use_ex) {
     HMODULE loaded = nullptr;
     if (use_ex) {
         DWORD sanitized_flags = dwFlags;
@@ -325,7 +327,7 @@ HMODULE RedirectAndLoadXboxDll(const std::wstring& canonical_w,
             LOAD_LIBRARY_AS_DATAFILE |
             LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE |
             LOAD_LIBRARY_AS_IMAGE_RESOURCE;
-        if ((sanitized_flags & kDatafileFlags) == 0 && !g_shim_dir_w.empty()) {
+        if ((sanitized_flags & kDatafileFlags) == 0 && !target_path.empty()) {
             sanitized_flags |= LOAD_WITH_ALTERED_SEARCH_PATH;
         }
         loaded = g_real_LoadLibraryExW(target_path.c_str(), hFile, sanitized_flags);
@@ -336,10 +338,13 @@ HMODULE RedirectAndLoadXboxDll(const std::wstring& canonical_w,
     DWORD last_err = ::GetLastError();
 
     if (!g_shutting_down.load(std::memory_order_acquire)) {
+        const bool is_shim = (decision.policy == openscarlett::DllRoutePolicy::Shim);
         if (loaded != nullptr) {
-            RegisterXboxModule(loaded, canonical_a);
+            if (is_shim) {
+                RegisterXboxModule(loaded, decision.canonical_name);
+            }
             openscarlett::CallTelemetry::Global().Record(
-                canonical_a, api_name, openscarlett::CallOutcome::Ok, 0, -1);
+                decision.canonical_name, api_name, openscarlett::CallOutcome::Ok, 0, -1);
             constexpr DWORD kDatafileFlags =
                 LOAD_LIBRARY_AS_DATAFILE |
                 LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE |
@@ -348,9 +353,9 @@ HMODULE RedirectAndLoadXboxDll(const std::wstring& canonical_w,
                 PatchModuleImports(loaded);
                 PatchAllLoadedNonSystemModules();
             }
-        } else {
+        } else if (is_shim) {
             openscarlett::CallTelemetry::Global().Record(
-                canonical_a, api_name, openscarlett::CallOutcome::NotImplemented,
+                decision.canonical_name, api_name, openscarlett::CallOutcome::NotImplemented,
                 static_cast<int32_t>(last_err), -1);
         }
     }
@@ -359,13 +364,32 @@ HMODULE RedirectAndLoadXboxDll(const std::wstring& canonical_w,
     return loaded;
 }
 
+bool TryTranslateVirtualDllPath(std::wstring_view raw_path, std::wstring& out_host_path) {
+    if (openscarlett::VfsMounts::DetectVirtualDriveW(raw_path) == openscarlett::VfsDrive::None) {
+        return false;
+    }
+    auto st = g_vfs.TranslateForAccessW(raw_path, openscarlett::VfsAccessMode::ReadOnly, out_host_path, nullptr, true);
+    return st == openscarlett::VfsTranslateStatus::Translated;
+}
+
 HMODULE WINAPI Hook_LoadLibraryA(LPCSTR lpLibFileName) {
     if (!g_shutting_down.load(std::memory_order_acquire) && lpLibFileName != nullptr) {
         std::wstring wide_name = AnsiToWide(lpLibFileName);
-        std::wstring canon_w;
-        std::string canon_a;
-        if (MatchXboxShimmedDllW(wide_name, canon_w, canon_a)) {
-            return RedirectAndLoadXboxDll(canon_w, canon_a, "LoadLibraryA", nullptr, 0, false);
+        openscarlett::DllRouteDecision decision;
+        std::wstring target_path;
+        if (MatchRoutedShimOrGuestDllW(wide_name, decision, target_path)) {
+            return LoadRoutedDll(decision, target_path, "LoadLibraryA", nullptr, 0, false);
+        }
+        std::wstring vfs_host;
+        if (TryTranslateVirtualDllPath(wide_name, vfs_host)) {
+            HMODULE mod = g_real_LoadLibraryW(vfs_host.c_str());
+            DWORD err = ::GetLastError();
+            if (mod != nullptr) {
+                PatchModuleImports(mod);
+                PatchAllLoadedNonSystemModules();
+            }
+            ::SetLastError(err);
+            return mod;
         }
     }
     HMODULE mod = g_real_LoadLibraryA(lpLibFileName);
@@ -380,10 +404,21 @@ HMODULE WINAPI Hook_LoadLibraryA(LPCSTR lpLibFileName) {
 
 HMODULE WINAPI Hook_LoadLibraryW(LPCWSTR lpLibFileName) {
     if (!g_shutting_down.load(std::memory_order_acquire) && lpLibFileName != nullptr) {
-        std::wstring canon_w;
-        std::string canon_a;
-        if (MatchXboxShimmedDllW(lpLibFileName, canon_w, canon_a)) {
-            return RedirectAndLoadXboxDll(canon_w, canon_a, "LoadLibraryW", nullptr, 0, false);
+        openscarlett::DllRouteDecision decision;
+        std::wstring target_path;
+        if (MatchRoutedShimOrGuestDllW(lpLibFileName, decision, target_path)) {
+            return LoadRoutedDll(decision, target_path, "LoadLibraryW", nullptr, 0, false);
+        }
+        std::wstring vfs_host;
+        if (TryTranslateVirtualDllPath(lpLibFileName, vfs_host)) {
+            HMODULE mod = g_real_LoadLibraryW(vfs_host.c_str());
+            DWORD err = ::GetLastError();
+            if (mod != nullptr) {
+                PatchModuleImports(mod);
+                PatchAllLoadedNonSystemModules();
+            }
+            ::SetLastError(err);
+            return mod;
         }
     }
     HMODULE mod = g_real_LoadLibraryW(lpLibFileName);
@@ -399,10 +434,23 @@ HMODULE WINAPI Hook_LoadLibraryW(LPCWSTR lpLibFileName) {
 HMODULE WINAPI Hook_LoadLibraryExA(LPCSTR lpLibFileName, HANDLE hFile, DWORD dwFlags) {
     if (!g_shutting_down.load(std::memory_order_acquire) && lpLibFileName != nullptr) {
         std::wstring wide_name = AnsiToWide(lpLibFileName);
-        std::wstring canon_w;
-        std::string canon_a;
-        if (MatchXboxShimmedDllW(wide_name, canon_w, canon_a)) {
-            return RedirectAndLoadXboxDll(canon_w, canon_a, "LoadLibraryExA", hFile, dwFlags, true);
+        openscarlett::DllRouteDecision decision;
+        std::wstring target_path;
+        if (MatchRoutedShimOrGuestDllW(wide_name, decision, target_path)) {
+            return LoadRoutedDll(decision, target_path, "LoadLibraryExA", hFile, dwFlags, true);
+        }
+        std::wstring vfs_host;
+        if (TryTranslateVirtualDllPath(wide_name, vfs_host)) {
+            HMODULE mod = g_real_LoadLibraryExW(vfs_host.c_str(), hFile, dwFlags);
+            DWORD err = ::GetLastError();
+            constexpr DWORD kDatafileFlags =
+                LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE | LOAD_LIBRARY_AS_IMAGE_RESOURCE;
+            if (mod != nullptr && (dwFlags & kDatafileFlags) == 0) {
+                PatchModuleImports(mod);
+                PatchAllLoadedNonSystemModules();
+            }
+            ::SetLastError(err);
+            return mod;
         }
     }
     HMODULE mod = g_real_LoadLibraryExA(lpLibFileName, hFile, dwFlags);
@@ -422,10 +470,23 @@ HMODULE WINAPI Hook_LoadLibraryExA(LPCSTR lpLibFileName, HANDLE hFile, DWORD dwF
 
 HMODULE WINAPI Hook_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, DWORD dwFlags) {
     if (!g_shutting_down.load(std::memory_order_acquire) && lpLibFileName != nullptr) {
-        std::wstring canon_w;
-        std::string canon_a;
-        if (MatchXboxShimmedDllW(lpLibFileName, canon_w, canon_a)) {
-            return RedirectAndLoadXboxDll(canon_w, canon_a, "LoadLibraryExW", hFile, dwFlags, true);
+        openscarlett::DllRouteDecision decision;
+        std::wstring target_path;
+        if (MatchRoutedShimOrGuestDllW(lpLibFileName, decision, target_path)) {
+            return LoadRoutedDll(decision, target_path, "LoadLibraryExW", hFile, dwFlags, true);
+        }
+        std::wstring vfs_host;
+        if (TryTranslateVirtualDllPath(lpLibFileName, vfs_host)) {
+            HMODULE mod = g_real_LoadLibraryExW(vfs_host.c_str(), hFile, dwFlags);
+            DWORD err = ::GetLastError();
+            constexpr DWORD kDatafileFlags =
+                LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE | LOAD_LIBRARY_AS_IMAGE_RESOURCE;
+            if (mod != nullptr && (dwFlags & kDatafileFlags) == 0) {
+                PatchModuleImports(mod);
+                PatchAllLoadedNonSystemModules();
+            }
+            ::SetLastError(err);
+            return mod;
         }
     }
     HMODULE mod = g_real_LoadLibraryExW(lpLibFileName, hFile, dwFlags);
@@ -444,13 +505,12 @@ HMODULE WINAPI Hook_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, DWORD dw
 }
 
 HMODULE WINAPI Hook_GetModuleHandleA(LPCSTR lpModuleName) {
-    if (!g_shutting_down.load(std::memory_order_acquire) && lpModuleName != nullptr && !g_shim_dir_w.empty()) {
+    if (!g_shutting_down.load(std::memory_order_acquire) && lpModuleName != nullptr) {
         std::wstring wide_name = AnsiToWide(lpModuleName);
-        std::wstring canon_w;
-        std::string canon_a;
-        if (MatchXboxShimmedDllW(wide_name, canon_w, canon_a)) {
-            std::wstring redirected = g_shim_dir_w + L"\\" + canon_w;
-            HMODULE mod = g_real_GetModuleHandleW(redirected.c_str());
+        openscarlett::DllRouteDecision decision;
+        std::wstring target_path;
+        if (MatchRoutedShimOrGuestDllW(wide_name, decision, target_path) && !target_path.empty()) {
+            HMODULE mod = g_real_GetModuleHandleW(target_path.c_str());
             if (mod != nullptr) {
                 return mod;
             }
@@ -460,12 +520,11 @@ HMODULE WINAPI Hook_GetModuleHandleA(LPCSTR lpModuleName) {
 }
 
 HMODULE WINAPI Hook_GetModuleHandleW(LPCWSTR lpModuleName) {
-    if (!g_shutting_down.load(std::memory_order_acquire) && lpModuleName != nullptr && !g_shim_dir_w.empty()) {
-        std::wstring canon_w;
-        std::string canon_a;
-        if (MatchXboxShimmedDllW(lpModuleName, canon_w, canon_a)) {
-            std::wstring redirected = g_shim_dir_w + L"\\" + canon_w;
-            HMODULE mod = g_real_GetModuleHandleW(redirected.c_str());
+    if (!g_shutting_down.load(std::memory_order_acquire) && lpModuleName != nullptr) {
+        openscarlett::DllRouteDecision decision;
+        std::wstring target_path;
+        if (MatchRoutedShimOrGuestDllW(lpModuleName, decision, target_path) && !target_path.empty()) {
+            HMODULE mod = g_real_GetModuleHandleW(target_path.c_str());
             if (mod != nullptr) {
                 return mod;
             }
@@ -477,13 +536,12 @@ HMODULE WINAPI Hook_GetModuleHandleW(LPCWSTR lpModuleName) {
 BOOL WINAPI Hook_GetModuleHandleExA(DWORD dwFlags, LPCSTR lpModuleName, HMODULE* phModule) {
     if (!g_shutting_down.load(std::memory_order_acquire) &&
         (dwFlags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS) == 0 &&
-        lpModuleName != nullptr && !g_shim_dir_w.empty()) {
+        lpModuleName != nullptr) {
         std::wstring wide_name = AnsiToWide(lpModuleName);
-        std::wstring canon_w;
-        std::string canon_a;
-        if (MatchXboxShimmedDllW(wide_name, canon_w, canon_a)) {
-            std::wstring redirected = g_shim_dir_w + L"\\" + canon_w;
-            if (g_real_GetModuleHandleExW(dwFlags, redirected.c_str(), phModule)) {
+        openscarlett::DllRouteDecision decision;
+        std::wstring target_path;
+        if (MatchRoutedShimOrGuestDllW(wide_name, decision, target_path) && !target_path.empty()) {
+            if (g_real_GetModuleHandleExW(dwFlags, target_path.c_str(), phModule)) {
                 return TRUE;
             }
         }
@@ -494,12 +552,11 @@ BOOL WINAPI Hook_GetModuleHandleExA(DWORD dwFlags, LPCSTR lpModuleName, HMODULE*
 BOOL WINAPI Hook_GetModuleHandleExW(DWORD dwFlags, LPCWSTR lpModuleName, HMODULE* phModule) {
     if (!g_shutting_down.load(std::memory_order_acquire) &&
         (dwFlags & GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS) == 0 &&
-        lpModuleName != nullptr && !g_shim_dir_w.empty()) {
-        std::wstring canon_w;
-        std::string canon_a;
-        if (MatchXboxShimmedDllW(lpModuleName, canon_w, canon_a)) {
-            std::wstring redirected = g_shim_dir_w + L"\\" + canon_w;
-            if (g_real_GetModuleHandleExW(dwFlags, redirected.c_str(), phModule)) {
+        lpModuleName != nullptr) {
+        openscarlett::DllRouteDecision decision;
+        std::wstring target_path;
+        if (MatchRoutedShimOrGuestDllW(lpModuleName, decision, target_path) && !target_path.empty()) {
+            if (g_real_GetModuleHandleExW(dwFlags, target_path.c_str(), phModule)) {
                 return TRUE;
             }
         }
@@ -508,6 +565,62 @@ BOOL WINAPI Hook_GetModuleHandleExW(DWORD dwFlags, LPCWSTR lpModuleName, HMODULE
 }
 
 FARPROC WINAPI Hook_GetProcAddress(HMODULE hModule, LPCSTR lpProcName) {
+    // Intercept forwarded exports targeting shimmed Xbox DLLs BEFORE Windows resolves them
+    // against C:\Windows\System32\.
+    if (!g_shutting_down.load(std::memory_order_acquire) &&
+        hModule != nullptr && lpProcName != nullptr && tl_forwarder_depth < 8u) {
+        openscarlett::PeForwarderTarget fwd{};
+        std::string raw_fwd;
+        if (openscarlett::LookupMappedPeExportForwarder(hModule, lpProcName, fwd, &raw_fwd)) {
+            const openscarlett::DllRouteDecision decision =
+                g_routing_table.ResolveRoute(fwd.dll_name, g_shim_dir_w, g_guest_dir_w);
+            if (decision.policy == openscarlett::DllRoutePolicy::Shim ||
+                (decision.policy == openscarlett::DllRoutePolicy::NativeGuestDll &&
+                 !decision.resolved_path.empty())) {
+                std::wstring target_path = !decision.resolved_path.empty()
+                                               ? decision.resolved_path
+                                               : (g_shim_dir_w.empty()
+                                                      ? openscarlett::Utf8ToWide(decision.canonical_name)
+                                                      : (g_shim_dir_w + L"\\" +
+                                                         openscarlett::Utf8ToWide(decision.canonical_name)));
+                HMODULE target_mod = g_real_GetModuleHandleW(target_path.c_str());
+                if (!target_mod) {
+                    target_mod = LoadRoutedDll(decision, target_path, "GetProcAddress:forwarder",
+                                               nullptr, 0, false);
+                }
+                FARPROC resolved = nullptr;
+                DWORD fwd_err = ERROR_PROC_NOT_FOUND;
+                if (target_mod) {
+                    ++tl_forwarder_depth;
+                    LPCSTR next_proc = fwd.by_ordinal
+                                           ? reinterpret_cast<LPCSTR>(static_cast<uintptr_t>(fwd.ordinal))
+                                           : fwd.symbol_name.c_str();
+                    resolved = Hook_GetProcAddress(target_mod, next_proc);
+                    fwd_err = ::GetLastError();
+                    --tl_forwarder_depth;
+                } else {
+                    fwd_err = ::GetLastError();
+                }
+
+                std::string sym_label;
+                if (reinterpret_cast<uintptr_t>(lpProcName) <= 0xFFFFu) {
+                    sym_label = "ordinal#" + std::to_string(reinterpret_cast<uintptr_t>(lpProcName));
+                } else {
+                    sym_label = lpProcName;
+                }
+                openscarlett::CallTelemetry::Global().Record(
+                    decision.canonical_name,
+                    sym_label + "->" + raw_fwd,
+                    resolved != nullptr ? openscarlett::CallOutcome::Ok
+                                        : openscarlett::CallOutcome::NotImplemented,
+                    resolved != nullptr ? 0 : static_cast<int32_t>(0x80004001u),
+                    -1);
+                ::SetLastError(resolved != nullptr ? ERROR_SUCCESS : fwd_err);
+                return resolved;
+            }
+        }
+    }
+
     FARPROC proc = g_real_GetProcAddress(hModule, lpProcName);
     DWORD last_err = ::GetLastError();
 
@@ -539,8 +652,127 @@ FARPROC WINAPI Hook_GetProcAddress(HMODULE hModule, LPCSTR lpProcName) {
 }
 
 // ---------------------------------------------------------------------------
-// Hook Implementations: Virtual Drive VFS (G:\, T:\, S:\)
+// Hook Implementations: Read-Only CoW Overlay Virtual Drive VFS
+//   Supports G:\, GAME:\, T:\, S:\ (never mutates target game package dir!)
 // ---------------------------------------------------------------------------
+HANDLE CreateVirtualFileW(std::wstring_view virtual_path,
+                          const char* api_tag,
+                          DWORD dwDesiredAccess,
+                          DWORD dwShareMode,
+                          LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+                          DWORD dwCreationDisposition,
+                          DWORD dwFlagsAndAttributes,
+                          HANDLE hTemplateFile) {
+    const openscarlett::VfsDrive drive = openscarlett::VfsMounts::DetectVirtualDriveW(virtual_path);
+    constexpr DWORD kWriteAccessMask =
+        GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA | FILE_APPEND_DATA |
+        FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA | DELETE | WRITE_DAC | WRITE_OWNER;
+    const bool wants_write =
+        (dwDesiredAccess & kWriteAccessMask) != 0 ||
+        dwCreationDisposition == CREATE_NEW ||
+        dwCreationDisposition == CREATE_ALWAYS ||
+        dwCreationDisposition == TRUNCATE_EXISTING;
+
+    std::wstring host_path;
+    bool was_whiteout = false;
+    openscarlett::VfsTranslateStatus st = openscarlett::VfsTranslateStatus::NotVirtual;
+
+    if (drive == openscarlett::VfsDrive::Game) {
+        if (!wants_write && dwCreationDisposition == OPEN_EXISTING) {
+            st = g_vfs.TranslateForAccessW(
+                virtual_path, openscarlett::VfsAccessMode::ReadOnly, host_path, &was_whiteout, true);
+        } else if (!wants_write && dwCreationDisposition == OPEN_ALWAYS) {
+            // Check traversal & visibility first.
+            st = g_vfs.TranslateForAccessW(
+                virtual_path, openscarlett::VfsAccessMode::ReadOnly, host_path, &was_whiteout, true);
+            if (st != openscarlett::VfsTranslateStatus::RejectedTraversal) {
+                if (!g_vfs.IsVisibleGamePathW(virtual_path)) {
+                    st = g_vfs.TranslateForAccessW(
+                        virtual_path, openscarlett::VfsAccessMode::WriteCreate, host_path, &was_whiteout, true);
+                }
+            }
+        } else if (dwCreationDisposition == CREATE_NEW) {
+            st = g_vfs.TranslateForAccessW(
+                virtual_path, openscarlett::VfsAccessMode::ReadOnly, host_path, &was_whiteout, true);
+            if (st != openscarlett::VfsTranslateStatus::RejectedTraversal) {
+                if (g_vfs.IsVisibleGamePathW(virtual_path)) {
+                    openscarlett::CallTelemetry::Global().Record(
+                        "vfs", api_tag, openscarlett::CallOutcome::Error,
+                        static_cast<int32_t>(ERROR_FILE_EXISTS), -1);
+                    ::SetLastError(ERROR_FILE_EXISTS);
+                    return INVALID_HANDLE_VALUE;
+                }
+                st = g_vfs.TranslateForAccessW(
+                    virtual_path, openscarlett::VfsAccessMode::WriteCreate, host_path, &was_whiteout, true);
+            }
+        } else if (dwCreationDisposition == CREATE_ALWAYS) {
+            st = g_vfs.TranslateForAccessW(
+                virtual_path, openscarlett::VfsAccessMode::WriteCreate, host_path, &was_whiteout, true);
+        } else if (dwCreationDisposition == TRUNCATE_EXISTING ||
+                   dwCreationDisposition == OPEN_EXISTING) {
+            st = g_vfs.TranslateForAccessW(
+                virtual_path, openscarlett::VfsAccessMode::WriteModify, host_path, &was_whiteout, true);
+        } else {
+            // OPEN_ALWAYS with write access: CoW-copy if visible, else create fresh in overlay.
+            st = g_vfs.TranslateForAccessW(
+                virtual_path, openscarlett::VfsAccessMode::ReadOnly, host_path, &was_whiteout, true);
+            if (st != openscarlett::VfsTranslateStatus::RejectedTraversal) {
+                const auto mode = g_vfs.IsVisibleGamePathW(virtual_path)
+                                      ? openscarlett::VfsAccessMode::WriteModify
+                                      : openscarlett::VfsAccessMode::WriteCreate;
+                st = g_vfs.TranslateForAccessW(virtual_path, mode, host_path, &was_whiteout, true);
+            }
+        }
+    } else {
+        const auto mode = wants_write ? openscarlett::VfsAccessMode::WriteCreate
+                                      : openscarlett::VfsAccessMode::ReadOnly;
+        st = g_vfs.TranslateForAccessW(virtual_path, mode, host_path, &was_whiteout, true);
+    }
+
+    if (st == openscarlett::VfsTranslateStatus::RejectedTraversal) {
+        openscarlett::CallTelemetry::Global().Record(
+            "vfs", std::string(api_tag) + ":traversal_blocked", openscarlett::CallOutcome::Error,
+            static_cast<int32_t>(ERROR_ACCESS_DENIED), -1);
+        ::SetLastError(ERROR_ACCESS_DENIED);
+        return INVALID_HANDLE_VALUE;
+    }
+    if (st == openscarlett::VfsTranslateStatus::ReadOnlyViolation) {
+        openscarlett::CallTelemetry::Global().Record(
+            "vfs", std::string(api_tag) + ":readonly_blocked", openscarlett::CallOutcome::Error,
+            static_cast<int32_t>(ERROR_ACCESS_DENIED), -1);
+        ::SetLastError(ERROR_ACCESS_DENIED);
+        return INVALID_HANDLE_VALUE;
+    }
+    if (st == openscarlett::VfsTranslateStatus::DeletedWhiteout) {
+        openscarlett::CallTelemetry::Global().Record(
+            "vfs", std::string(api_tag) + ":whiteout", openscarlett::CallOutcome::Error,
+            static_cast<int32_t>(ERROR_FILE_NOT_FOUND), -1);
+        ::SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
+    if (st != openscarlett::VfsTranslateStatus::Translated) {
+        ::SetLastError(ERROR_PATH_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
+
+    HANDLE h = g_real_CreateFileW(host_path.c_str(),
+                                  dwDesiredAccess,
+                                  dwShareMode,
+                                  lpSecurityAttributes,
+                                  dwCreationDisposition,
+                                  dwFlagsAndAttributes,
+                                  hTemplateFile);
+    DWORD err = ::GetLastError();
+    openscarlett::CallTelemetry::Global().Record(
+        "vfs",
+        api_tag,
+        h != INVALID_HANDLE_VALUE ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error,
+        h != INVALID_HANDLE_VALUE ? 0 : static_cast<int32_t>(err),
+        -1);
+    ::SetLastError(err);
+    return h;
+}
+
 HANDLE WINAPI Hook_CreateFileW(LPCWSTR lpFileName,
                                DWORD dwDesiredAccess,
                                DWORD dwShareMode,
@@ -551,33 +783,14 @@ HANDLE WINAPI Hook_CreateFileW(LPCWSTR lpFileName,
     if (!g_shutting_down.load(std::memory_order_acquire) &&
         lpFileName != nullptr &&
         openscarlett::VfsMounts::DetectVirtualDriveW(lpFileName) != openscarlett::VfsDrive::None) {
-        std::wstring host_path;
-        auto st = g_vfs.TranslateW(lpFileName, host_path, true);
-        if (st == openscarlett::VfsTranslateStatus::RejectedTraversal) {
-            openscarlett::CallTelemetry::Global().Record(
-                "vfs", "CreateFileW:traversal_blocked", openscarlett::CallOutcome::Error,
-                static_cast<int32_t>(ERROR_ACCESS_DENIED), -1);
-            ::SetLastError(ERROR_ACCESS_DENIED);
-            return INVALID_HANDLE_VALUE;
-        }
-        if (st == openscarlett::VfsTranslateStatus::Translated) {
-            HANDLE h = g_real_CreateFileW(host_path.c_str(),
-                                          dwDesiredAccess,
-                                          dwShareMode,
-                                          lpSecurityAttributes,
-                                          dwCreationDisposition,
-                                          dwFlagsAndAttributes,
-                                          hTemplateFile);
-            DWORD err = ::GetLastError();
-            openscarlett::CallTelemetry::Global().Record(
-                "vfs",
-                "CreateFileW",
-                h != INVALID_HANDLE_VALUE ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error,
-                h != INVALID_HANDLE_VALUE ? 0 : static_cast<int32_t>(err),
-                -1);
-            ::SetLastError(err);
-            return h;
-        }
+        return CreateVirtualFileW(lpFileName,
+                                  "CreateFileW",
+                                  dwDesiredAccess,
+                                  dwShareMode,
+                                  lpSecurityAttributes,
+                                  dwCreationDisposition,
+                                  dwFlagsAndAttributes,
+                                  hTemplateFile);
     }
     return g_real_CreateFileW(lpFileName,
                               dwDesiredAccess,
@@ -599,33 +812,14 @@ HANDLE WINAPI Hook_CreateFileA(LPCSTR lpFileName,
         lpFileName != nullptr &&
         openscarlett::VfsMounts::DetectVirtualDriveA(lpFileName) != openscarlett::VfsDrive::None) {
         std::wstring wide_in = AnsiToWide(lpFileName);
-        std::wstring host_path;
-        auto st = g_vfs.TranslateW(wide_in, host_path, true);
-        if (st == openscarlett::VfsTranslateStatus::RejectedTraversal) {
-            openscarlett::CallTelemetry::Global().Record(
-                "vfs", "CreateFileA:traversal_blocked", openscarlett::CallOutcome::Error,
-                static_cast<int32_t>(ERROR_ACCESS_DENIED), -1);
-            ::SetLastError(ERROR_ACCESS_DENIED);
-            return INVALID_HANDLE_VALUE;
-        }
-        if (st == openscarlett::VfsTranslateStatus::Translated) {
-            HANDLE h = g_real_CreateFileW(host_path.c_str(),
-                                          dwDesiredAccess,
-                                          dwShareMode,
-                                          lpSecurityAttributes,
-                                          dwCreationDisposition,
-                                          dwFlagsAndAttributes,
-                                          hTemplateFile);
-            DWORD err = ::GetLastError();
-            openscarlett::CallTelemetry::Global().Record(
-                "vfs",
-                "CreateFileA",
-                h != INVALID_HANDLE_VALUE ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error,
-                h != INVALID_HANDLE_VALUE ? 0 : static_cast<int32_t>(err),
-                -1);
-            ::SetLastError(err);
-            return h;
-        }
+        return CreateVirtualFileW(wide_in,
+                                  "CreateFileA",
+                                  dwDesiredAccess,
+                                  dwShareMode,
+                                  lpSecurityAttributes,
+                                  dwCreationDisposition,
+                                  dwFlagsAndAttributes,
+                                  hTemplateFile);
     }
     return g_real_CreateFileA(lpFileName,
                               dwDesiredAccess,
@@ -641,12 +835,21 @@ DWORD WINAPI Hook_GetFileAttributesW(LPCWSTR lpFileName) {
         lpFileName != nullptr &&
         openscarlett::VfsMounts::DetectVirtualDriveW(lpFileName) != openscarlett::VfsDrive::None) {
         std::wstring host_path;
-        auto st = g_vfs.TranslateW(lpFileName, host_path, true);
+        bool was_wo = false;
+        auto st = g_vfs.TranslateForAccessW(
+            lpFileName, openscarlett::VfsAccessMode::ReadOnly, host_path, &was_wo, true);
         if (st == openscarlett::VfsTranslateStatus::RejectedTraversal) {
             openscarlett::CallTelemetry::Global().Record(
                 "vfs", "GetFileAttributesW:traversal_blocked", openscarlett::CallOutcome::Error,
                 static_cast<int32_t>(ERROR_ACCESS_DENIED), -1);
             ::SetLastError(ERROR_ACCESS_DENIED);
+            return INVALID_FILE_ATTRIBUTES;
+        }
+        if (st == openscarlett::VfsTranslateStatus::DeletedWhiteout) {
+            openscarlett::CallTelemetry::Global().Record(
+                "vfs", "GetFileAttributesW:whiteout", openscarlett::CallOutcome::Error,
+                static_cast<int32_t>(ERROR_FILE_NOT_FOUND), -1);
+            ::SetLastError(ERROR_FILE_NOT_FOUND);
             return INVALID_FILE_ATTRIBUTES;
         }
         if (st == openscarlett::VfsTranslateStatus::Translated) {
@@ -671,12 +874,21 @@ DWORD WINAPI Hook_GetFileAttributesA(LPCSTR lpFileName) {
         openscarlett::VfsMounts::DetectVirtualDriveA(lpFileName) != openscarlett::VfsDrive::None) {
         std::wstring wide_in = AnsiToWide(lpFileName);
         std::wstring host_path;
-        auto st = g_vfs.TranslateW(wide_in, host_path, true);
+        bool was_wo = false;
+        auto st = g_vfs.TranslateForAccessW(
+            wide_in, openscarlett::VfsAccessMode::ReadOnly, host_path, &was_wo, true);
         if (st == openscarlett::VfsTranslateStatus::RejectedTraversal) {
             openscarlett::CallTelemetry::Global().Record(
                 "vfs", "GetFileAttributesA:traversal_blocked", openscarlett::CallOutcome::Error,
                 static_cast<int32_t>(ERROR_ACCESS_DENIED), -1);
             ::SetLastError(ERROR_ACCESS_DENIED);
+            return INVALID_FILE_ATTRIBUTES;
+        }
+        if (st == openscarlett::VfsTranslateStatus::DeletedWhiteout) {
+            openscarlett::CallTelemetry::Global().Record(
+                "vfs", "GetFileAttributesA:whiteout", openscarlett::CallOutcome::Error,
+                static_cast<int32_t>(ERROR_FILE_NOT_FOUND), -1);
+            ::SetLastError(ERROR_FILE_NOT_FOUND);
             return INVALID_FILE_ATTRIBUTES;
         }
         if (st == openscarlett::VfsTranslateStatus::Translated) {
@@ -702,12 +914,21 @@ BOOL WINAPI Hook_GetFileAttributesExW(LPCWSTR lpFileName,
         lpFileName != nullptr &&
         openscarlett::VfsMounts::DetectVirtualDriveW(lpFileName) != openscarlett::VfsDrive::None) {
         std::wstring host_path;
-        auto st = g_vfs.TranslateW(lpFileName, host_path, true);
+        bool was_wo = false;
+        auto st = g_vfs.TranslateForAccessW(
+            lpFileName, openscarlett::VfsAccessMode::ReadOnly, host_path, &was_wo, true);
         if (st == openscarlett::VfsTranslateStatus::RejectedTraversal) {
             openscarlett::CallTelemetry::Global().Record(
                 "vfs", "GetFileAttributesExW:traversal_blocked", openscarlett::CallOutcome::Error,
                 static_cast<int32_t>(ERROR_ACCESS_DENIED), -1);
             ::SetLastError(ERROR_ACCESS_DENIED);
+            return FALSE;
+        }
+        if (st == openscarlett::VfsTranslateStatus::DeletedWhiteout) {
+            openscarlett::CallTelemetry::Global().Record(
+                "vfs", "GetFileAttributesExW:whiteout", openscarlett::CallOutcome::Error,
+                static_cast<int32_t>(ERROR_FILE_NOT_FOUND), -1);
+            ::SetLastError(ERROR_FILE_NOT_FOUND);
             return FALSE;
         }
         if (st == openscarlett::VfsTranslateStatus::Translated) {
@@ -730,9 +951,31 @@ BOOL WINAPI Hook_CreateDirectoryW(LPCWSTR lpPathName, LPSECURITY_ATTRIBUTES lpSe
     if (!g_shutting_down.load(std::memory_order_acquire) &&
         lpPathName != nullptr &&
         openscarlett::VfsMounts::DetectVirtualDriveW(lpPathName) != openscarlett::VfsDrive::None) {
+        const auto drive = openscarlett::VfsMounts::DetectVirtualDriveW(lpPathName);
         std::wstring host_path;
-        auto st = g_vfs.TranslateW(lpPathName, host_path, true);
-        if (st == openscarlett::VfsTranslateStatus::RejectedTraversal) {
+        if (drive == openscarlett::VfsDrive::Game) {
+            auto chk = g_vfs.TranslateForAccessW(
+                lpPathName, openscarlett::VfsAccessMode::ReadOnly, host_path, nullptr, false);
+            if (chk == openscarlett::VfsTranslateStatus::RejectedTraversal) {
+                openscarlett::CallTelemetry::Global().Record(
+                    "vfs", "CreateDirectoryW:traversal_blocked", openscarlett::CallOutcome::Error,
+                    static_cast<int32_t>(ERROR_ACCESS_DENIED), -1);
+                ::SetLastError(ERROR_ACCESS_DENIED);
+                return FALSE;
+            }
+            if (g_vfs.IsVisibleGamePathW(lpPathName)) {
+                openscarlett::CallTelemetry::Global().Record(
+                    "vfs", "CreateDirectoryW", openscarlett::CallOutcome::Error,
+                    static_cast<int32_t>(ERROR_ALREADY_EXISTS), -1);
+                ::SetLastError(ERROR_ALREADY_EXISTS);
+                return FALSE;
+            }
+        }
+
+        auto st = g_vfs.TranslateForAccessW(
+            lpPathName, openscarlett::VfsAccessMode::WriteCreate, host_path, nullptr, true);
+        if (st == openscarlett::VfsTranslateStatus::RejectedTraversal ||
+            st == openscarlett::VfsTranslateStatus::ReadOnlyViolation) {
             openscarlett::CallTelemetry::Global().Record(
                 "vfs", "CreateDirectoryW:traversal_blocked", openscarlett::CallOutcome::Error,
                 static_cast<int32_t>(ERROR_ACCESS_DENIED), -1);
@@ -755,17 +998,177 @@ BOOL WINAPI Hook_CreateDirectoryW(LPCWSTR lpPathName, LPSECURITY_ATTRIBUTES lpSe
     return g_real_CreateDirectoryW(lpPathName, lpSecurityAttributes);
 }
 
+BOOL WINAPI Hook_DeleteFileW(LPCWSTR lpFileName) {
+    if (!g_shutting_down.load(std::memory_order_acquire) &&
+        lpFileName != nullptr &&
+        openscarlett::VfsMounts::DetectVirtualDriveW(lpFileName) != openscarlett::VfsDrive::None) {
+        uint32_t err = 0;
+        bool ok = g_vfs.DeleteVirtualFileW(lpFileName, err);
+        openscarlett::CallTelemetry::Global().Record(
+            "vfs",
+            "DeleteFileW",
+            ok ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error,
+            ok ? 0 : static_cast<int32_t>(err),
+            -1);
+        ::SetLastError(ok ? ERROR_SUCCESS : static_cast<DWORD>(err));
+        return ok ? TRUE : FALSE;
+    }
+    return g_real_DeleteFileW(lpFileName);
+}
+
+BOOL WINAPI Hook_DeleteFileA(LPCSTR lpFileName) {
+    if (!g_shutting_down.load(std::memory_order_acquire) &&
+        lpFileName != nullptr &&
+        openscarlett::VfsMounts::DetectVirtualDriveA(lpFileName) != openscarlett::VfsDrive::None) {
+        std::wstring wide_in = AnsiToWide(lpFileName);
+        uint32_t err = 0;
+        bool ok = g_vfs.DeleteVirtualFileW(wide_in, err);
+        openscarlett::CallTelemetry::Global().Record(
+            "vfs",
+            "DeleteFileA",
+            ok ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error,
+            ok ? 0 : static_cast<int32_t>(err),
+            -1);
+        ::SetLastError(ok ? ERROR_SUCCESS : static_cast<DWORD>(err));
+        return ok ? TRUE : FALSE;
+    }
+    return g_real_DeleteFileA(lpFileName);
+}
+
+BOOL WINAPI Hook_RemoveDirectoryW(LPCWSTR lpPathName) {
+    if (!g_shutting_down.load(std::memory_order_acquire) &&
+        lpPathName != nullptr &&
+        openscarlett::VfsMounts::DetectVirtualDriveW(lpPathName) != openscarlett::VfsDrive::None) {
+        uint32_t err = 0;
+        bool ok = g_vfs.RemoveVirtualDirectoryW(lpPathName, err);
+        openscarlett::CallTelemetry::Global().Record(
+            "vfs",
+            "RemoveDirectoryW",
+            ok ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error,
+            ok ? 0 : static_cast<int32_t>(err),
+            -1);
+        ::SetLastError(ok ? ERROR_SUCCESS : static_cast<DWORD>(err));
+        return ok ? TRUE : FALSE;
+    }
+    return g_real_RemoveDirectoryW(lpPathName);
+}
+
+BOOL WINAPI Hook_MoveFileExW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName, DWORD dwFlags) {
+    if (!g_shutting_down.load(std::memory_order_acquire) &&
+        lpExistingFileName != nullptr && lpNewFileName != nullptr &&
+        (openscarlett::VfsMounts::DetectVirtualDriveW(lpExistingFileName) != openscarlett::VfsDrive::None ||
+         openscarlett::VfsMounts::DetectVirtualDriveW(lpNewFileName) != openscarlett::VfsDrive::None)) {
+        uint32_t err = 0;
+        bool ok = g_vfs.MoveVirtualPathW(lpExistingFileName, lpNewFileName, dwFlags, err);
+        openscarlett::CallTelemetry::Global().Record(
+            "vfs",
+            "MoveFileExW",
+            ok ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error,
+            ok ? 0 : static_cast<int32_t>(err),
+            -1);
+        ::SetLastError(ok ? ERROR_SUCCESS : static_cast<DWORD>(err));
+        return ok ? TRUE : FALSE;
+    }
+    return g_real_MoveFileExW(lpExistingFileName, lpNewFileName, dwFlags);
+}
+
 HANDLE WINAPI Hook_FindFirstFileW(LPCWSTR lpFileName, LPWIN32_FIND_DATAW lpFindFileData) {
     if (!g_shutting_down.load(std::memory_order_acquire) &&
         lpFileName != nullptr &&
         openscarlett::VfsMounts::DetectVirtualDriveW(lpFileName) != openscarlett::VfsDrive::None) {
+        const std::wstring_view in_view(lpFileName);
+        const auto drive = openscarlett::VfsMounts::DetectVirtualDriveW(in_view);
+        const bool has_wildcards = (in_view.find_first_of(L"*?") != std::wstring_view::npos);
+
+        if (drive == openscarlett::VfsDrive::Game && has_wildcards) {
+            std::wstring base_pat;
+            std::wstring overlay_pat;
+            std::wstring rel_pat;
+            bool was_wo = false;
+            auto st = g_vfs.ResolveGamePairW(in_view, base_pat, overlay_pat, rel_pat, &was_wo);
+            if (st == openscarlett::VfsTranslateStatus::RejectedTraversal) {
+                openscarlett::CallTelemetry::Global().Record(
+                    "vfs", "FindFirstFileW:traversal_blocked", openscarlett::CallOutcome::Error,
+                    static_cast<int32_t>(ERROR_ACCESS_DENIED), -1);
+                ::SetLastError(ERROR_ACCESS_DENIED);
+                return INVALID_HANDLE_VALUE;
+            }
+            if (st == openscarlett::VfsTranslateStatus::DeletedWhiteout) {
+                ::SetLastError(ERROR_FILE_NOT_FOUND);
+                return INVALID_HANDLE_VALUE;
+            }
+            if (st == openscarlett::VfsTranslateStatus::Translated) {
+                std::wstring rel_dir;
+                const size_t slash = rel_pat.find_last_of(L'\\');
+                if (slash != std::wstring::npos) {
+                    rel_dir = rel_pat.substr(0, slash);
+                }
+
+                auto is_hidden_entry = [&](const wchar_t* filename, bool from_overlay) -> bool {
+                    std::wstring_view fn(filename);
+                    if (from_overlay && rel_dir.empty() && fn == L".whiteout") {
+                        return true;
+                    }
+                    if (fn == L"." || fn == L"..") {
+                        return false;
+                    }
+                    std::wstring vpath = L"G:\\";
+                    if (!rel_dir.empty()) {
+                        vpath += rel_dir + L"\\";
+                    }
+                    vpath.append(fn);
+                    return g_vfs.IsWhiteoutedW(vpath);
+                };
+
+                auto find_visible = [&](const std::wstring& pat, bool from_overlay) -> HANDLE {
+                    if (pat.empty()) {
+                        return INVALID_HANDLE_VALUE;
+                    }
+                    HANDLE h = g_real_FindFirstFileW(pat.c_str(), lpFindFileData);
+                    if (h == INVALID_HANDLE_VALUE) {
+                        return INVALID_HANDLE_VALUE;
+                    }
+                    while (is_hidden_entry(lpFindFileData->cFileName, from_overlay)) {
+                        if (!::FindNextFileW(h, lpFindFileData)) {
+                            ::FindClose(h);
+                            return INVALID_HANDLE_VALUE;
+                        }
+                    }
+                    return h;
+                };
+
+                HANDLE h = find_visible(overlay_pat, true);
+                if (h == INVALID_HANDLE_VALUE) {
+                    h = find_visible(base_pat, false);
+                }
+                DWORD err = (h != INVALID_HANDLE_VALUE) ? ERROR_SUCCESS : ERROR_FILE_NOT_FOUND;
+                openscarlett::CallTelemetry::Global().Record(
+                    "vfs",
+                    "FindFirstFileW",
+                    h != INVALID_HANDLE_VALUE ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error,
+                    h != INVALID_HANDLE_VALUE ? 0 : static_cast<int32_t>(err),
+                    -1);
+                ::SetLastError(err);
+                return h;
+            }
+        }
+
         std::wstring host_path;
-        auto st = g_vfs.TranslateW(lpFileName, host_path, true);
+        bool was_wo = false;
+        auto st = g_vfs.TranslateForAccessW(
+            lpFileName, openscarlett::VfsAccessMode::ReadOnly, host_path, &was_wo, true);
         if (st == openscarlett::VfsTranslateStatus::RejectedTraversal) {
             openscarlett::CallTelemetry::Global().Record(
                 "vfs", "FindFirstFileW:traversal_blocked", openscarlett::CallOutcome::Error,
                 static_cast<int32_t>(ERROR_ACCESS_DENIED), -1);
             ::SetLastError(ERROR_ACCESS_DENIED);
+            return INVALID_HANDLE_VALUE;
+        }
+        if (st == openscarlett::VfsTranslateStatus::DeletedWhiteout) {
+            openscarlett::CallTelemetry::Global().Record(
+                "vfs", "FindFirstFileW:whiteout", openscarlett::CallOutcome::Error,
+                static_cast<int32_t>(ERROR_FILE_NOT_FOUND), -1);
+            ::SetLastError(ERROR_FILE_NOT_FOUND);
             return INVALID_HANDLE_VALUE;
         }
         if (st == openscarlett::VfsTranslateStatus::Translated) {
@@ -791,7 +1194,7 @@ VOID WINAPI Hook_ExitProcess(UINT uExitCode) {
 }
 
 // ---------------------------------------------------------------------------
-// IAT & Delay-Load Import Table Patcher (PE32+ x64)
+// IAT & Delay-Load Import Table Patcher (PE32+ x64) + TLS / .pdata Verification
 // ---------------------------------------------------------------------------
 struct HookBinding {
     const char* symbol_name;
@@ -834,6 +1237,14 @@ void* ResolveHookForSymbol(const char* name) {
          reinterpret_cast<void**>(&g_real_GetFileAttributesExW)},
         {"CreateDirectoryW", reinterpret_cast<void*>(&Hook_CreateDirectoryW),
          reinterpret_cast<void**>(&g_real_CreateDirectoryW)},
+        {"DeleteFileA", reinterpret_cast<void*>(&Hook_DeleteFileA),
+         reinterpret_cast<void**>(&g_real_DeleteFileA)},
+        {"DeleteFileW", reinterpret_cast<void*>(&Hook_DeleteFileW),
+         reinterpret_cast<void**>(&g_real_DeleteFileW)},
+        {"MoveFileExW", reinterpret_cast<void*>(&Hook_MoveFileExW),
+         reinterpret_cast<void**>(&g_real_MoveFileExW)},
+        {"RemoveDirectoryW", reinterpret_cast<void*>(&Hook_RemoveDirectoryW),
+         reinterpret_cast<void**>(&g_real_RemoveDirectoryW)},
         {"FindFirstFileW", reinterpret_cast<void*>(&Hook_FindFirstFileW),
          reinterpret_cast<void**>(&g_real_FindFirstFileW)},
         {"ExitProcess", reinterpret_cast<void*>(&Hook_ExitProcess),
@@ -872,6 +1283,10 @@ void* ResolveHookForRealAddress(ULONGLONG addr) {
     if (void* p = match(g_real_GetFileAttributesW, &Hook_GetFileAttributesW)) return p;
     if (void* p = match(g_real_GetFileAttributesExW, &Hook_GetFileAttributesExW)) return p;
     if (void* p = match(g_real_CreateDirectoryW, &Hook_CreateDirectoryW)) return p;
+    if (void* p = match(g_real_DeleteFileA, &Hook_DeleteFileA)) return p;
+    if (void* p = match(g_real_DeleteFileW, &Hook_DeleteFileW)) return p;
+    if (void* p = match(g_real_MoveFileExW, &Hook_MoveFileExW)) return p;
+    if (void* p = match(g_real_RemoveDirectoryW, &Hook_RemoveDirectoryW)) return p;
     if (void* p = match(g_real_FindFirstFileW, &Hook_FindFirstFileW)) return p;
     if (void* p = match(g_real_ExitProcess, &Hook_ExitProcess)) return p;
     return nullptr;
@@ -936,6 +1351,47 @@ void PatchThunkTable(uint8_t* base,
             WriteIatSlot(&iat[i].u1.Function, replacement);
         }
     }
+}
+
+void InspectModuleTlsAndPdata(HMODULE mod,
+                              const uint8_t* base,
+                              const IMAGE_NT_HEADERS64* nt,
+                              uint32_t image_size) {
+    // 1. Inspect TLS callbacks for telemetry visibility.
+    std::vector<uint32_t> tls_rvas;
+    if (openscarlett::ReadMappedPeTlsCallbackRvas(mod, tls_rvas) && !tls_rvas.empty()) {
+        openscarlett::CallTelemetry::Global().Record(
+            "loader", "tls_callbacks_inspected", openscarlett::CallOutcome::Ok,
+            static_cast<int32_t>(tls_rvas.size()), -1);
+    }
+
+    // 2. Verify x64 .pdata SEH registration; register via RtlAddFunctionTable if missing
+    //    (e.g. for custom-mapped PE modules).
+#if defined(_M_X64) || defined(__x86_64__)
+    const auto& exc_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    if (exc_dir.VirtualAddress != 0 && exc_dir.Size >= sizeof(RUNTIME_FUNCTION) &&
+        exc_dir.VirtualAddress < image_size &&
+        exc_dir.Size <= image_size - exc_dir.VirtualAddress) {
+        const auto* first_rf = reinterpret_cast<const RUNTIME_FUNCTION*>(base + exc_dir.VirtualAddress);
+        if (first_rf->BeginAddress != 0 && first_rf->BeginAddress < image_size) {
+            DWORD64 img_base_out = 0;
+            const DWORD64 probe_pc = reinterpret_cast<DWORD64>(base + first_rf->BeginAddress);
+            if (::RtlLookupFunctionEntry(probe_pc, &img_base_out, nullptr) == nullptr) {
+                if (openscarlett::RegisterPeExceptionTable(
+                        mod, exc_dir.VirtualAddress, exc_dir.Size)) {
+                    const uint32_t entries = exc_dir.Size / static_cast<uint32_t>(sizeof(RUNTIME_FUNCTION));
+                    openscarlett::CallTelemetry::Global().Record(
+                        "loader", "pdata_registered", openscarlett::CallOutcome::Ok,
+                        static_cast<int32_t>(entries), -1);
+                }
+            }
+        }
+    }
+#else
+    (void)base;
+    (void)nt;
+    (void)image_size;
+#endif
 }
 
 void PatchModuleImports(HMODULE mod) {
@@ -1018,6 +1474,8 @@ void PatchModuleImports(HMODULE mod) {
 
     g_patched_modules[mod] = PatchedModuleKey{mod, image_size, timestamp};
     ::ReleaseSRWLockExclusive(&g_patch_lock);
+
+    InspectModuleTlsAndPdata(mod, base, nt, image_size);
 }
 
 void PatchAllLoadedNonSystemModules() {
@@ -1054,9 +1512,8 @@ void PatchAllLoadedNonSystemModules() {
             continue;
         }
         std::wstring path = GetModulePathW(mod);
-        std::wstring canon_w;
         std::string canon_a;
-        if (MatchXboxShimmedDllW(path, canon_w, canon_a)) {
+        if (MatchTrackedShimNameW(path, canon_a)) {
             RegisterXboxModule(mod, canon_a);
         }
         PatchModuleImports(mod);
@@ -1086,6 +1543,10 @@ bool InitializeHookRuntime(HMODULE self_mod) {
     g_real_GetFileAttributesW = reinterpret_cast<PfnGetFileAttributesW>(::GetProcAddress(k32, "GetFileAttributesW"));
     g_real_GetFileAttributesExW = reinterpret_cast<PfnGetFileAttributesExW>(::GetProcAddress(k32, "GetFileAttributesExW"));
     g_real_CreateDirectoryW = reinterpret_cast<PfnCreateDirectoryW>(::GetProcAddress(k32, "CreateDirectoryW"));
+    g_real_DeleteFileA = reinterpret_cast<PfnDeleteFileA>(::GetProcAddress(k32, "DeleteFileA"));
+    g_real_DeleteFileW = reinterpret_cast<PfnDeleteFileW>(::GetProcAddress(k32, "DeleteFileW"));
+    g_real_MoveFileExW = reinterpret_cast<PfnMoveFileExW>(::GetProcAddress(k32, "MoveFileExW"));
+    g_real_RemoveDirectoryW = reinterpret_cast<PfnRemoveDirectoryW>(::GetProcAddress(k32, "RemoveDirectoryW"));
     g_real_FindFirstFileW = reinterpret_cast<PfnFindFirstFileW>(::GetProcAddress(k32, "FindFirstFileW"));
     g_real_ExitProcess = reinterpret_cast<PfnExitProcess>(::GetProcAddress(k32, "ExitProcess"));
 
@@ -1114,9 +1575,13 @@ bool InitializeHookRuntime(HMODULE self_mod) {
         g_telemetry_path_utf8 = openscarlett::WideToUtf8(tel_w);
     }
 
+    // Build unified data-driven DLL routing table honoring OPENSCARLETT_DLL_ROUTING overrides.
+    g_routing_table = openscarlett::DllRoutingTable::CreateWithEnvOverrides();
+
     std::wstring main_exe_path = GetModulePathW(nullptr);
     std::wstring main_exe_dir = std::filesystem::path(main_exe_path).parent_path().wstring();
     g_vfs.Configure(openscarlett::VfsMounts::BuildDefaultConfig(main_exe_dir));
+    g_guest_dir_w = g_vfs.GetGameRoot().empty() ? main_exe_dir : g_vfs.GetGameRoot();
 
     PatchAllLoadedNonSystemModules();
     g_initialized.store(true, std::memory_order_release);
@@ -1146,6 +1611,29 @@ __declspec(dllexport) void __cdecl OpenScarlettHook_RecordCall(const char* modul
 
 __declspec(dllexport) int __cdecl OpenScarlettHook_FlushTelemetry() {
     return FlushTelemetryInternal(false);
+}
+
+__declspec(dllexport) uint32_t __cdecl OpenScarlettHook_InvokeModuleTlsCallbacks(HMODULE mod,
+                                                                                 DWORD reason) {
+    const uint32_t count = openscarlett::InvokePeTlsCallbacks(mod, reason, nullptr);
+    if (!g_shutting_down.load(std::memory_order_acquire)) {
+        openscarlett::CallTelemetry::Global().Record(
+            "loader", "tls_callbacks_invoked", openscarlett::CallOutcome::Ok,
+            static_cast<int32_t>(count), -1);
+    }
+    return count;
+}
+
+__declspec(dllexport) int __cdecl OpenScarlettHook_RegisterModuleExceptionTable(HMODULE mod) {
+    uint32_t count = 0;
+    const bool ok = openscarlett::RegisterPeExceptionTableFromImage(mod, &count);
+    if (!g_shutting_down.load(std::memory_order_acquire)) {
+        openscarlett::CallTelemetry::Global().Record(
+            "loader", "pdata_register_helper",
+            ok ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error,
+            static_cast<int32_t>(count), -1);
+    }
+    return ok ? 1 : 0;
 }
 
 }  // extern "C"

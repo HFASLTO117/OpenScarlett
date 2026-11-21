@@ -1,6 +1,7 @@
 # OpenScarlett Loader Subsystem (VFS, Suspended-Process APC Injector, In-Process Hook DLL)
 
 target_sources(openscarlett_core PRIVATE
+    src/loader/game_config.cpp
     src/loader/vfs_mounts.cpp
     src/loader/apc_injector.cpp
 )
@@ -42,3 +43,6 @@ endif()
 
 openscarlett_add_test(test_apc_loader tests/test_apc_loader.cpp)
 add_dependencies(test_apc_loader openscarlett openscarlett_hook winrt_xs test_guest_dummy)
+
+openscarlett_add_test(test_loader_vfs_config tests/test_loader_vfs_config.cpp)
+add_dependencies(test_loader_vfs_config openscarlett openscarlett_hook winrt_xs test_guest_dummy)

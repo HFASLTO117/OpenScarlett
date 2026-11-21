@@ -1,12 +1,15 @@
 #include "openscarlett/loader/apc_injector.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cwchar>
 #include <filesystem>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "openscarlett/loader/game_config.h"
+#include "openscarlett/loader/pe_inspector.h"
 #include "openscarlett/loader/vfs_mounts.h"
 
 #if defined(_WIN32)
@@ -58,6 +61,27 @@ bool FileExistsW(const std::wstring& path) {
     return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0;
 }
 
+bool HasEnvVarW(const wchar_t* name) {
+    return ::GetEnvironmentVariableW(name, nullptr, 0) > 0;
+}
+
+std::string SanitizeFolderSegment(std::string_view raw) {
+    std::string out;
+    out.reserve(raw.size());
+    for (char c : raw) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (std::isalnum(uc) != 0 || c == '.' || c == '-' || c == '_') {
+            out.push_back(c);
+        } else {
+            out.push_back('_');
+        }
+    }
+    while (!out.empty() && (out.back() == '.' || out.back() == ' ')) {
+        out.pop_back();
+    }
+    return out;
+}
+
 void UpsertEnvEntry(std::vector<std::pair<std::wstring, std::wstring>>& entries,
                     const std::wstring& key,
                     const std::wstring& value) {
@@ -82,8 +106,11 @@ void RemoveEnvEntry(std::vector<std::pair<std::wstring, std::wstring>>& entries,
 
 std::vector<wchar_t> BuildChildEnvironmentBlock(const std::wstring& shim_dir,
                                                 const std::wstring& vfs_g,
+                                                const std::wstring& vfs_g_overlay,
                                                 const std::wstring& vfs_t,
                                                 const std::wstring& vfs_s,
+                                                const std::wstring& title_id,
+                                                const std::wstring& package_id,
                                                 const std::wstring& telemetry_path) {
     std::vector<std::pair<std::wstring, std::wstring>> entries;
 
@@ -93,7 +120,6 @@ std::vector<wchar_t> BuildChildEnvironmentBlock(const std::wstring& shim_dir,
         while (*cur != L'\0') {
             std::wstring entry(cur);
             cur += entry.size() + 1;
-            // Drive-current-directory entries begin with '=' (e.g. "=E:=E:\dir").
             size_t eq = entry.find(L'=', entry.front() == L'=' ? 1 : 0);
             if (eq == std::wstring::npos) {
                 continue;
@@ -123,9 +149,22 @@ std::vector<wchar_t> BuildChildEnvironmentBlock(const std::wstring& shim_dir,
 
     UpsertEnvEntry(entries, L"OPENSCARLETT_SHIM_DIR", shim_dir);
     UpsertEnvEntry(entries, L"OPENSCARLETT_VFS_G", vfs_g);
+    UpsertEnvEntry(entries, L"OPENSCARLETT_VFS_G_OVERLAY", vfs_g_overlay);
     UpsertEnvEntry(entries, L"OPENSCARLETT_VFS_T", vfs_t);
     UpsertEnvEntry(entries, L"OPENSCARLETT_VFS_S", vfs_s);
     UpsertEnvEntry(entries, L"OPENSCARLETT_SAVE_ROOT", vfs_s);
+
+    if (!title_id.empty()) {
+        UpsertEnvEntry(entries, L"OPENSCARLETT_TITLE_ID", title_id);
+    } else {
+        RemoveEnvEntry(entries, L"OPENSCARLETT_TITLE_ID");
+    }
+
+    if (!package_id.empty()) {
+        UpsertEnvEntry(entries, L"OPENSCARLETT_PACKAGE_ID", package_id);
+    } else {
+        RemoveEnvEntry(entries, L"OPENSCARLETT_PACKAGE_ID");
+    }
 
     if (!telemetry_path.empty()) {
         UpsertEnvEntry(entries, L"OPENSCARLETT_TELEMETRY_PATH", telemetry_path);
@@ -151,14 +190,11 @@ std::vector<wchar_t> BuildChildEnvironmentBlock(const std::wstring& shim_dir,
     return block;
 }
 
-// Redirect static PE imports of shimmed Xbox DLLs in the suspended child process BEFORE
-// LdrInitializeThunk runs. On Windows 10/11, C:\Windows\System32\ ships desktop stubs
-// named xgameruntime.dll, GameInput.dll, and XAudio2_9.dll which shadow PATH during
-// static import resolution. Rewriting matching IMAGE_IMPORT_DESCRIPTOR::Name RVAs in
-// the suspended child's memory to point to full absolute paths inside shim_dir guarantees
-// OpenScarlett's shims load BEFORE System32 with ZERO files copied to the guest folder!
+// Redirect static PE imports of routed DLLs in the suspended child process BEFORE
+// LdrInitializeThunk runs using OpenScarlett's unified data-driven DllRoutingTable.
 bool RedirectChildStaticXboxImports(HANDLE h_process,
-                                    const std::wstring& shim_dir_w) {
+                                    const std::wstring& shim_dir_w,
+                                    const std::wstring& guest_dir_w) {
 #if defined(_M_X64) || defined(__x86_64__)
     using PfnNtQueryInformationProcess = NTSTATUS(NTAPI*)(
         HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
@@ -212,41 +248,7 @@ bool RedirectChildStaticXboxImports(HANDLE h_process,
         return true;
     }
 
-    struct ShimEntry {
-        const char* lower_name;
-        const wchar_t* canonical_w;
-        int priority;  // Lower loads first so base shims precede dependent shims (e.g. XSAPI -> xgameruntime)
-    };
-    static constexpr ShimEntry kShims[] = {
-        {"xgameruntime.dll", L"xgameruntime.dll", 0},
-        {"gameinput.dll", L"GameInput.dll", 0},
-        {"xaudio2_9.dll", L"XAudio2_9.dll", 0},
-        {"kernelx.dll", L"kernelx.dll", 1},
-        {"d3d12_xs.dll", L"d3d12_xs.dll", 1},
-        {"xg_xs.dll", L"xg_xs.dll", 1},
-        {"acphal.dll", L"AcpHal.dll", 1},
-        {"dstorage_xs.dll", L"dstorage_xs.dll", 1},
-        {"winrt_xs.dll", L"winrt_xs.dll", 1},
-        {"microsoft.xbox.services.gdk.c.dll", L"Microsoft.Xbox.Services.GDK.C.dll", 2},
-    };
-
-    auto match_shim = [&](const std::string& raw, std::wstring& out_full_w, int& out_prio) -> bool {
-        std::string lo = raw;
-        for (char& c : lo) {
-            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-        }
-        for (const auto& s : kShims) {
-            if (lo == s.lower_name) {
-                std::wstring full = shim_dir_w + L"\\" + s.canonical_w;
-                if (FileExistsW(full)) {
-                    out_full_w = std::move(full);
-                    out_prio = s.priority;
-                    return true;
-                }
-            }
-        }
-        return false;
-    };
+    const DllRoutingTable routing = DllRoutingTable::CreateWithEnvOverrides();
 
     std::vector<IMAGE_IMPORT_DESCRIPTOR> descs;
     std::vector<std::string> full_paths;
@@ -278,12 +280,20 @@ bool RedirectChildStaticXboxImports(HANDLE h_process,
             }
         }
 
-        std::wstring full_w;
-        int prio = 10;
-        if (!dll_name.empty() && match_shim(dll_name, full_w, prio)) {
-            full_paths.push_back(WideToUtf8(full_w));
-            priorities.push_back(prio);
-            any_redirected = true;
+        if (!dll_name.empty()) {
+            const DllRouteDecision decision = routing.ResolveRoute(dll_name, shim_dir_w, guest_dir_w);
+            const bool should_rewrite =
+                !decision.resolved_path.empty() &&
+                (decision.policy == DllRoutePolicy::Shim ||
+                 (decision.policy == DllRoutePolicy::NativeGuestDll && decision.from_override));
+            if (should_rewrite) {
+                full_paths.push_back(WideToUtf8(decision.resolved_path));
+                priorities.push_back(decision.load_priority);
+                any_redirected = true;
+            } else {
+                full_paths.emplace_back();
+                priorities.push_back(10);
+            }
         } else {
             full_paths.emplace_back();
             priorities.push_back(10);
@@ -340,8 +350,7 @@ bool RedirectChildStaticXboxImports(HANDLE h_process,
         }
     }
 
-    // Stable-sort descriptors so base shims (xgameruntime, GameInput, XAudio2_9) load before
-    // dependent shims (e.g. Microsoft.Xbox.Services.GDK.C.dll -> xgameruntime.dll).
+    // Stable-sort descriptors so base shims (priority 0) load before core (1) and dependent shims (2).
     std::vector<size_t> order(descs.size());
     for (size_t i = 0; i < order.size(); ++i) order[i] = i;
     std::stable_sort(order.begin(), order.end(),
@@ -369,6 +378,7 @@ bool RedirectChildStaticXboxImports(HANDLE h_process,
 #else
     (void)h_process;
     (void)shim_dir_w;
+    (void)guest_dir_w;
     return false;
 #endif
 }
@@ -385,15 +395,23 @@ Status LaunchWithApcHook(const LaunchOptions& options, LaunchResult& out_result)
     return Status::Error(StatusCode::NotImplemented, "APC hook loader is Windows-only");
 #else
     if (options.exe_path.empty()) {
-        return Status::Error(StatusCode::InvalidArgument, "Target executable path is empty");
+        return Status::Error(StatusCode::InvalidArgument, "Target executable or package path is empty");
     }
 
-    const std::wstring exe_w = ResolveAbsolutePathW(Utf8ToWide(options.exe_path));
+    // Resolve package directory, MicrosoftGame.Config/.mgc, or direct .exe (with sibling config auto-detect).
+    ResolvedPackageTarget pkg_target{};
+    auto resolve_st = ResolvePackageLaunchTarget(options.exe_path, pkg_target);
+    if (!resolve_st.ok()) {
+        return resolve_st;
+    }
+
+    const std::wstring exe_w = ResolveAbsolutePathW(Utf8ToWide(pkg_target.exe_path));
     if (!FileExistsW(exe_w)) {
         return Status::Error(StatusCode::NotFound, "Target executable not found: " + WideToUtf8(exe_w));
     }
 
     const std::wstring exe_dir_w = std::filesystem::path(exe_w).parent_path().wstring();
+    const std::wstring pkg_root_w = ResolveAbsolutePathW(Utf8ToWide(pkg_target.package_root));
 
     std::wstring shim_dir_w = options.shim_dir.empty()
                                   ? GetCurrentExecutableDirW()
@@ -410,11 +428,56 @@ Status LaunchWithApcHook(const LaunchOptions& options, LaunchResult& out_result)
                              "openscarlett_hook.dll not found: " + WideToUtf8(hook_dll_w));
     }
 
-    // Build default VFS mounts without touching C:\ or modifying the guest directory.
-    VfsMountConfig defaults = VfsMounts::BuildDefaultConfig(exe_dir_w);
-    std::wstring vfs_g_w = options.vfs_g.empty() ? defaults.g_root : ResolveAbsolutePathW(Utf8ToWide(options.vfs_g));
+    std::string resolved_title_id = options.title_id;
+    std::string resolved_package_id = options.package_id;
+    std::string title_folder;
+    if (pkg_target.has_config) {
+        if (resolved_title_id.empty()) {
+            resolved_title_id = pkg_target.config.title_id;
+        }
+        if (resolved_package_id.empty()) {
+            resolved_package_id = pkg_target.config.identity.name;
+        }
+        if (options.title_id.empty()) {
+            title_folder = FormatTitleIdFolderName(pkg_target.config);
+        }
+    }
+    if (title_folder.empty() && !resolved_title_id.empty()) {
+        title_folder = SanitizeFolderSegment(resolved_title_id);
+    }
+
+    // Build default VFS mounts strictly on E:\ / %TEMP% without modifying the guest directory.
+    VfsMountConfig defaults = VfsMounts::BuildDefaultConfig(pkg_root_w);
+    std::wstring vfs_g_w;
+    if (!options.vfs_g.empty()) {
+        vfs_g_w = ResolveAbsolutePathW(Utf8ToWide(options.vfs_g));
+    } else if (pkg_target.has_config && !HasEnvVarW(L"OPENSCARLETT_VFS_G")) {
+        vfs_g_w = pkg_root_w;
+    } else {
+        vfs_g_w = defaults.g_root;
+    }
+
     std::wstring vfs_t_w = options.vfs_t.empty() ? defaults.t_root : ResolveAbsolutePathW(Utf8ToWide(options.vfs_t));
-    std::wstring vfs_s_w = options.vfs_s.empty() ? defaults.s_root : ResolveAbsolutePathW(Utf8ToWide(options.vfs_s));
+
+    std::wstring vfs_s_w;
+    if (!options.vfs_s.empty()) {
+        vfs_s_w = ResolveAbsolutePathW(Utf8ToWide(options.vfs_s));
+    } else {
+        vfs_s_w = defaults.s_root;
+        if (!HasEnvVarW(L"OPENSCARLETT_VFS_S") && !title_folder.empty() && !vfs_s_w.empty()) {
+            vfs_s_w = (std::filesystem::path(vfs_s_w) / Utf8ToWide(title_folder)).wstring();
+        }
+    }
+
+    std::wstring vfs_g_overlay_w;
+    if (!options.vfs_g_overlay.empty()) {
+        vfs_g_overlay_w = ResolveAbsolutePathW(Utf8ToWide(options.vfs_g_overlay));
+    } else {
+        vfs_g_overlay_w = defaults.g_overlay_root;
+        if (!HasEnvVarW(L"OPENSCARLETT_VFS_G_OVERLAY") && !title_folder.empty() && !vfs_g_overlay_w.empty()) {
+            vfs_g_overlay_w = (std::filesystem::path(vfs_g_overlay_w) / Utf8ToWide(title_folder)).wstring();
+        }
+    }
 
     std::wstring work_dir_w = options.working_dir.empty()
                                   ? exe_dir_w
@@ -424,12 +487,15 @@ Status LaunchWithApcHook(const LaunchOptions& options, LaunchResult& out_result)
                                    ? std::wstring{}
                                    : ResolveAbsolutePathW(Utf8ToWide(options.telemetry_output_path));
 
-    // Pre-create writable backing directories on E:\ (never touches vfs_g / target exe directory).
+    // Pre-create writable backing directories on E:\ (NEVER touches vfs_g / target package directory).
     if (!vfs_t_w.empty()) {
         EnsureDirectoryTreeW(vfs_t_w);
     }
     if (!vfs_s_w.empty()) {
         EnsureDirectoryTreeW(vfs_s_w);
+    }
+    if (!vfs_g_overlay_w.empty()) {
+        EnsureDirectoryTreeW(vfs_g_overlay_w);
     }
     if (!telemetry_w.empty()) {
         std::wstring tel_parent = std::filesystem::path(telemetry_w).parent_path().wstring();
@@ -438,11 +504,16 @@ Status LaunchWithApcHook(const LaunchOptions& options, LaunchResult& out_result)
         }
     }
 
+    out_result.resolved_exe_path = WideToUtf8(exe_w);
+    out_result.resolved_config_path = pkg_target.config_path;
     out_result.resolved_shim_dir = WideToUtf8(shim_dir_w);
     out_result.resolved_hook_dll = WideToUtf8(hook_dll_w);
     out_result.resolved_vfs_g = WideToUtf8(vfs_g_w);
+    out_result.resolved_vfs_g_overlay = WideToUtf8(vfs_g_overlay_w);
     out_result.resolved_vfs_t = WideToUtf8(vfs_t_w);
     out_result.resolved_vfs_s = WideToUtf8(vfs_s_w);
+    out_result.resolved_title_id = resolved_title_id;
+    out_result.resolved_package_id = resolved_package_id;
     out_result.resolved_telemetry_path = WideToUtf8(telemetry_w);
 
     // Build mutable command line: "<exe>" [arguments]
@@ -452,8 +523,15 @@ Status LaunchWithApcHook(const LaunchOptions& options, LaunchResult& out_result)
         cmd_line.append(Utf8ToWide(options.arguments));
     }
 
-    std::vector<wchar_t> env_block =
-        BuildChildEnvironmentBlock(shim_dir_w, vfs_g_w, vfs_t_w, vfs_s_w, telemetry_w);
+    std::vector<wchar_t> env_block = BuildChildEnvironmentBlock(
+        shim_dir_w,
+        vfs_g_w,
+        vfs_g_overlay_w,
+        vfs_t_w,
+        vfs_s_w,
+        Utf8ToWide(resolved_title_id),
+        Utf8ToWide(resolved_package_id),
+        telemetry_w);
 
     STARTUPINFOW si{};
     si.cb = sizeof(si);
@@ -479,9 +557,8 @@ Status LaunchWithApcHook(const LaunchOptions& options, LaunchResult& out_result)
 
     out_result.process_id = static_cast<uint32_t>(pi.dwProcessId);
 
-    // Ensure static PE imports resolve OpenScarlett shims BEFORE C:\Windows\System32\
-    // (critical for xgameruntime.dll, GameInput.dll, XAudio2_9.dll on Windows 10/11).
-    (void)RedirectChildStaticXboxImports(pi.hProcess, shim_dir_w);
+    // Apply unified data-driven static import routing BEFORE LdrInitializeThunk runs.
+    (void)RedirectChildStaticXboxImports(pi.hProcess, shim_dir_w, vfs_g_w);
 
     auto abort_child = [&](StatusCode code, const char* step, DWORD err) -> Status {
         ::TerminateProcess(pi.hProcess, 1);

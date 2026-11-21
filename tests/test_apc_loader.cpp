@@ -92,6 +92,12 @@ void TestVfsMountsUnit() {
     OS_REQUIRE(vfs.TranslateW(L"g:/assets//./textures/hero.dds", out) == VfsTranslateStatus::Translated);
     OS_REQUIRE(out == (g_dir / L"assets\\textures\\hero.dds").wstring());
 
+    // 1b. GAME:\ / game:/ virtual drive prefix support
+    OS_REQUIRE(vfs.TranslateW(L"GAME:\\assets\\hero.dds", out) == VfsTranslateStatus::Translated);
+    OS_REQUIRE(out == (g_dir / L"assets\\hero.dds").wstring());
+    OS_REQUIRE(vfs.TranslateW(L"game:/assets/hero.dds", out) == VfsTranslateStatus::Translated);
+    OS_REQUIRE(out == (g_dir / L"assets\\hero.dds").wstring());
+
     // 2. Extended-length \\?\ prefix support
     OS_REQUIRE(vfs.TranslateW(L"\\\\?\\G:\\dir\\sub\\..\\file.bin", out) == VfsTranslateStatus::Translated);
     OS_REQUIRE(out == L"\\\\?\\" + (g_dir / L"dir\\file.bin").wstring());
