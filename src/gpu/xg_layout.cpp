@@ -24,9 +24,19 @@ constexpr uint32_t Log2Pow2(uint32_t v) noexcept {
     return r;
 }
 
+constexpr uint32_t NextPow2(uint32_t v) noexcept {
+    if (v <= 1u) return 1u;
+    --v;
+    v |= v >> 1u;
+    v |= v >> 2u;
+    v |= v >> 4u;
+    v |= v >> 8u;
+    v |= v >> 16u;
+    return v + 1u;
+}
+
 // Rectangular 2D Morton (Z-order) encoder:
 // Strictly bijective over [0, 2^bits_x) x [0, 2^bits_y) -> [0, 2^(bits_x + bits_y)).
-// Interleaves (x, y) bit pairs up to min(bits_x, bits_y), then places remaining upper bits.
 constexpr uint32_t MortonEncode2D(
     uint32_t x,
     uint32_t y,
@@ -56,32 +66,121 @@ constexpr uint32_t MortonEncode2D(
     return result;
 }
 
+// Rectangular 3D Morton (Z-order) encoder:
+// Strictly bijective over [0, 2^bx) x [0, 2^by) x [0, 2^bz) -> [0, 2^(bx + by + bz)).
+// axis_order: 0 => (x, y, z), 1 => (y, x, z), 2 => (z, x, y).
+constexpr uint32_t MortonEncode3D(
+    uint32_t x,
+    uint32_t y,
+    uint32_t z,
+    uint32_t bx,
+    uint32_t by,
+    uint32_t bz,
+    uint32_t axis_order = 0u) noexcept {
+    uint32_t result = 0u;
+    uint32_t out_bit = 0u;
+    const uint32_t max_bits = std::max(bx, std::max(by, bz));
+    for (uint32_t i = 0u; i < max_bits; ++i) {
+        if (axis_order == 0u) {
+            if (i < bx) result |= (((x >> i) & 1u) << out_bit++);
+            if (i < by) result |= (((y >> i) & 1u) << out_bit++);
+            if (i < bz) result |= (((z >> i) & 1u) << out_bit++);
+        } else if (axis_order == 1u) {
+            if (i < by) result |= (((y >> i) & 1u) << out_bit++);
+            if (i < bx) result |= (((x >> i) & 1u) << out_bit++);
+            if (i < bz) result |= (((z >> i) & 1u) << out_bit++);
+        } else {
+            if (i < bz) result |= (((z >> i) & 1u) << out_bit++);
+            if (i < bx) result |= (((x >> i) & 1u) << out_bit++);
+            if (i < by) result |= (((y >> i) & 1u) << out_bit++);
+        }
+    }
+    return result;
+}
+
+enum class SwizzleFamily : uint8_t {
+    Linear = 0,
+    Standard = 1,     // _S / _S_X
+    Displayable = 2,  // _D / _D_X
+    DepthZ = 3,       // _Z / _Z_X
+    Rotated = 4,      // _R / _R_X
+};
+
 struct TileGeometry {
     uint32_t tile_size_bytes = 256u;
     uint32_t tile_w_elems = 1u;
     uint32_t tile_h_elems = 1u;
+    uint32_t tile_d_elems = 1u;
     uint32_t micro_w_elems = 1u;
     uint32_t micro_h_elems = 1u;
     uint32_t micro_size_bytes = 64u;
+    uint32_t mip_tail_sub_align = 256u;
+    SwizzleFamily family = SwizzleFamily::Linear;
+    bool is_3d = false;
+    bool has_xor = false;
+    bool supports_mip_tail = false;
 };
 
-// Standard RDNA2 / D3D12 Standard Swizzle tile dimensions per bytes-per-element.
-// Invariant: tile_w_elems * tile_h_elems * bpe == tile_size_bytes,
-//            micro_w_elems * micro_h_elems * bpe == micro_size_bytes.
+// Complete AMD GFX10 / RDNA2 2D thin (15 tiled modes) + 3D thick (6 tiled modes) + Linear
+// tile geometries per bytes-per-element (1, 2, 4, 8, 16).
+// Invariant: tile_w_elems * tile_h_elems * tile_d_elems * bpe == tile_size_bytes.
 bool GetTileGeometry(XG_TILE_MODE mode, uint32_t bpe, TileGeometry& out) noexcept {
+    out = TileGeometry{};
+    if (bpe != 1u && bpe != 2u && bpe != 4u && bpe != 8u && bpe != 16u) {
+        return false;
+    }
+
     if (mode == XG_TILE_MODE_LINEAR) {
         out.tile_size_bytes = 256u;
         out.tile_w_elems = 1u;
         out.tile_h_elems = 1u;
+        out.tile_d_elems = 1u;
         out.micro_w_elems = 1u;
         out.micro_h_elems = 1u;
         out.micro_size_bytes = bpe;
+        out.family = SwizzleFamily::Linear;
         return true;
     }
 
-    if (mode == XG_TILE_MODE_2D_THIN_4KB_S) {
+    // 2D Thin 256B modes (S, D, R)
+    if (mode == XG_TILE_MODE_2D_THIN_256B_S ||
+        mode == XG_TILE_MODE_2D_THIN_256B_D ||
+        mode == XG_TILE_MODE_2D_THIN_256B_R) {
+        out.tile_size_bytes = 256u;
+        out.micro_size_bytes = 64u;
+        out.tile_d_elems = 1u;
+        out.supports_mip_tail = false;
+        out.family = (mode == XG_TILE_MODE_2D_THIN_256B_S)
+                         ? SwizzleFamily::Standard
+                         : ((mode == XG_TILE_MODE_2D_THIN_256B_D) ? SwizzleFamily::Displayable
+                                                                  : SwizzleFamily::Rotated);
+        switch (bpe) {
+            case 1u:  out.tile_w_elems = 16u; out.tile_h_elems = 16u; out.micro_w_elems = 8u; out.micro_h_elems = 8u; return true;
+            case 2u:  out.tile_w_elems = 16u; out.tile_h_elems = 8u;  out.micro_w_elems = 8u; out.micro_h_elems = 4u; return true;
+            case 4u:  out.tile_w_elems = 8u;  out.tile_h_elems = 8u;  out.micro_w_elems = 4u; out.micro_h_elems = 4u; return true;
+            case 8u:  out.tile_w_elems = 8u;  out.tile_h_elems = 4u;  out.micro_w_elems = 4u; out.micro_h_elems = 2u; return true;
+            case 16u: out.tile_w_elems = 4u;  out.tile_h_elems = 4u;  out.micro_w_elems = 2u; out.micro_h_elems = 2u; return true;
+            default: return false;
+        }
+    }
+
+    // 2D Thin 4KB modes (Z, S, D, R)
+    if (mode == XG_TILE_MODE_2D_THIN_4KB_Z ||
+        mode == XG_TILE_MODE_2D_THIN_4KB_S ||
+        mode == XG_TILE_MODE_2D_THIN_4KB_D ||
+        mode == XG_TILE_MODE_2D_THIN_4KB_R) {
         out.tile_size_bytes = 4096u;
         out.micro_size_bytes = 64u;
+        out.tile_d_elems = 1u;
+        out.mip_tail_sub_align = 64u;
+        out.supports_mip_tail = true;
+        switch (mode) {
+            case XG_TILE_MODE_2D_THIN_4KB_Z: out.family = SwizzleFamily::DepthZ; break;
+            case XG_TILE_MODE_2D_THIN_4KB_S: out.family = SwizzleFamily::Standard; break;
+            case XG_TILE_MODE_2D_THIN_4KB_D: out.family = SwizzleFamily::Displayable; break;
+            case XG_TILE_MODE_2D_THIN_4KB_R: out.family = SwizzleFamily::Rotated; break;
+            default: return false;
+        }
         switch (bpe) {
             case 1u:  out.tile_w_elems = 64u; out.tile_h_elems = 64u; out.micro_w_elems = 8u; out.micro_h_elems = 8u; return true;
             case 2u:  out.tile_w_elems = 64u; out.tile_h_elems = 32u; out.micro_w_elems = 8u; out.micro_h_elems = 4u; return true;
@@ -92,11 +191,31 @@ bool GetTileGeometry(XG_TILE_MODE mode, uint32_t bpe, TileGeometry& out) noexcep
         }
     }
 
-    if (mode == XG_TILE_MODE_2D_THIN_64KB_S ||
+    // 2D Thin 64KB modes (Z, S, D, R, Z_X, S_X, D_X, R_X)
+    if (mode == XG_TILE_MODE_2D_THIN_64KB_Z ||
+        mode == XG_TILE_MODE_2D_THIN_64KB_S ||
         mode == XG_TILE_MODE_2D_THIN_64KB_D ||
+        mode == XG_TILE_MODE_2D_THIN_64KB_R ||
+        mode == XG_TILE_MODE_2D_THIN_64KB_Z_X ||
+        mode == XG_TILE_MODE_2D_THIN_64KB_S_X ||
+        mode == XG_TILE_MODE_2D_THIN_64KB_D_X ||
         mode == XG_TILE_MODE_2D_THIN_64KB_R_X) {
         out.tile_size_bytes = 65536u;
         out.micro_size_bytes = 256u;
+        out.tile_d_elems = 1u;
+        out.mip_tail_sub_align = 256u;
+        out.supports_mip_tail = true;
+        switch (mode) {
+            case XG_TILE_MODE_2D_THIN_64KB_Z:   out.family = SwizzleFamily::DepthZ; out.has_xor = false; break;
+            case XG_TILE_MODE_2D_THIN_64KB_S:   out.family = SwizzleFamily::Standard; out.has_xor = false; break;
+            case XG_TILE_MODE_2D_THIN_64KB_D:   out.family = SwizzleFamily::Displayable; out.has_xor = false; break;
+            case XG_TILE_MODE_2D_THIN_64KB_R:   out.family = SwizzleFamily::Rotated; out.has_xor = false; break;
+            case XG_TILE_MODE_2D_THIN_64KB_Z_X: out.family = SwizzleFamily::DepthZ; out.has_xor = true; break;
+            case XG_TILE_MODE_2D_THIN_64KB_S_X: out.family = SwizzleFamily::Standard; out.has_xor = true; break;
+            case XG_TILE_MODE_2D_THIN_64KB_D_X: out.family = SwizzleFamily::Displayable; out.has_xor = true; break;
+            case XG_TILE_MODE_2D_THIN_64KB_R_X: out.family = SwizzleFamily::Rotated; out.has_xor = true; break;
+            default: return false;
+        }
         switch (bpe) {
             case 1u:  out.tile_w_elems = 256u; out.tile_h_elems = 256u; out.micro_w_elems = 16u; out.micro_h_elems = 16u; return true;
             case 2u:  out.tile_w_elems = 256u; out.tile_h_elems = 128u; out.micro_w_elems = 16u; out.micro_h_elems = 8u;  return true;
@@ -107,10 +226,56 @@ bool GetTileGeometry(XG_TILE_MODE mode, uint32_t bpe, TileGeometry& out) noexcep
         }
     }
 
+    // 3D Thick 4KB mode (S)
+    if (mode == XG_TILE_MODE_3D_THICK_4KB_S) {
+        out.tile_size_bytes = 4096u;
+        out.mip_tail_sub_align = 64u;
+        out.family = SwizzleFamily::Standard;
+        out.is_3d = true;
+        out.has_xor = false;
+        out.supports_mip_tail = true;
+        switch (bpe) {
+            case 1u:  out.tile_w_elems = 16u; out.tile_h_elems = 16u; out.tile_d_elems = 16u; return true;
+            case 2u:  out.tile_w_elems = 16u; out.tile_h_elems = 16u; out.tile_d_elems = 8u;  return true;
+            case 4u:  out.tile_w_elems = 16u; out.tile_h_elems = 8u;  out.tile_d_elems = 8u;  return true;
+            case 8u:  out.tile_w_elems = 8u;  out.tile_h_elems = 8u;  out.tile_d_elems = 8u;  return true;
+            case 16u: out.tile_w_elems = 8u;  out.tile_h_elems = 8u;  out.tile_d_elems = 4u;  return true;
+            default: return false;
+        }
+    }
+
+    // 3D Thick 64KB modes (Z, S, Z_X, S_X, R_X)
+    if (mode == XG_TILE_MODE_3D_THICK_64KB_Z ||
+        mode == XG_TILE_MODE_3D_THICK_64KB_S ||
+        mode == XG_TILE_MODE_3D_THICK_64KB_Z_X ||
+        mode == XG_TILE_MODE_3D_THICK_64KB_S_X ||
+        mode == XG_TILE_MODE_3D_THICK_64KB_R_X) {
+        out.tile_size_bytes = 65536u;
+        out.mip_tail_sub_align = 256u;
+        out.is_3d = true;
+        out.supports_mip_tail = true;
+        switch (mode) {
+            case XG_TILE_MODE_3D_THICK_64KB_Z:   out.family = SwizzleFamily::DepthZ; out.has_xor = false; break;
+            case XG_TILE_MODE_3D_THICK_64KB_S:   out.family = SwizzleFamily::Standard; out.has_xor = false; break;
+            case XG_TILE_MODE_3D_THICK_64KB_Z_X: out.family = SwizzleFamily::DepthZ; out.has_xor = true; break;
+            case XG_TILE_MODE_3D_THICK_64KB_S_X: out.family = SwizzleFamily::Standard; out.has_xor = true; break;
+            case XG_TILE_MODE_3D_THICK_64KB_R_X: out.family = SwizzleFamily::Rotated; out.has_xor = true; break;
+            default: return false;
+        }
+        switch (bpe) {
+            case 1u:  out.tile_w_elems = 64u; out.tile_h_elems = 32u; out.tile_d_elems = 32u; return true;
+            case 2u:  out.tile_w_elems = 32u; out.tile_h_elems = 32u; out.tile_d_elems = 32u; return true;
+            case 4u:  out.tile_w_elems = 32u; out.tile_h_elems = 32u; out.tile_d_elems = 16u; return true;
+            case 8u:  out.tile_w_elems = 32u; out.tile_h_elems = 16u; out.tile_d_elems = 16u; return true;
+            case 16u: out.tile_w_elems = 16u; out.tile_h_elems = 16u; out.tile_d_elems = 16u; return true;
+            default: return false;
+        }
+    }
+
     return false;
 }
 
-uint32_t ComputeMaxMips(uint32_t width, uint32_t height) noexcept {
+uint32_t ComputeMaxMips2D(uint32_t width, uint32_t height) noexcept {
     uint32_t dim = (width > height) ? width : height;
     uint32_t mips = 1u;
     while (dim > 1u && mips < XG_MAX_MIP_LEVELS) {
@@ -120,20 +285,327 @@ uint32_t ComputeMaxMips(uint32_t width, uint32_t height) noexcept {
     return mips;
 }
 
+uint32_t ComputeMaxMips3D(uint32_t width, uint32_t height, uint32_t depth) noexcept {
+    uint32_t dim = std::max(width, std::max(height, depth));
+    uint32_t mips = 1u;
+    while (dim > 1u && mips < XG_MAX_MIP_LEVELS) {
+        dim >>= 1u;
+        ++mips;
+    }
+    return mips;
+}
+
+// Lays out a single 2D plane (mip chain + optional GFX10 mip tail) starting at `start_offset`.
+bool LayoutPlane2D(
+    uint32_t width,
+    uint32_t height,
+    uint32_t mip_levels,
+    uint32_t array_size,
+    XG_TILE_MODE tile_mode,
+    const XG_FORMAT_BLOCK_INFO& fmt,
+    uint64_t start_offset,
+    XG_MIPLEVEL_LAYOUT out_mips[XG_MAX_MIP_LEVELS],
+    uint32_t& out_mip_tail_start,
+    uint64_t& out_mip_tail_offset,
+    uint64_t& out_mip_tail_slice_pitch,
+    uint64_t& out_plane_size) noexcept {
+    TileGeometry geom{};
+    if (!GetTileGeometry(tile_mode, fmt.bytes_per_block, geom) || geom.is_3d) {
+        return false;
+    }
+
+    out_mip_tail_start = mip_levels;
+    out_mip_tail_offset = 0ull;
+    out_mip_tail_slice_pitch = 0ull;
+
+    uint64_t cursor = start_offset;
+    bool in_mip_tail = false;
+    uint32_t mip_tail_sub_cursor = 0u;
+
+    for (uint32_t m = 0u; m < mip_levels; ++m) {
+        const uint32_t mip_w = std::max(1u, width >> m);
+        const uint32_t mip_h = std::max(1u, height >> m);
+        const uint32_t elems_x = (mip_w + fmt.block_width - 1u) / fmt.block_width;
+        const uint32_t elems_y = (mip_h + fmt.block_height - 1u) / fmt.block_height;
+
+        XG_MIPLEVEL_LAYOUT& ml = out_mips[m];
+        std::memset(&ml, 0, sizeof(ml));
+        ml.WidthElements = elems_x;
+        ml.HeightElements = elems_y;
+        ml.DepthElements = 1u;
+        ml.PaddedDepthElements = 1u;
+        ml.TileWidthElements = geom.tile_w_elems;
+        ml.TileHeightElements = geom.tile_h_elems;
+        ml.TileDepthElements = 1u;
+        ml.TilesZ = 1u;
+        ml.TileSizeBytes = geom.tile_size_bytes;
+
+        if (tile_mode == XG_TILE_MODE_LINEAR) {
+            cursor = AlignUpU64(cursor, 256ull);
+            const uint32_t row_pitch = AlignUpU32(elems_x * fmt.bytes_per_block, 256u);
+            const uint64_t slice_bytes = static_cast<uint64_t>(row_pitch) * elems_y;
+            ml.PaddedWidthElements = row_pitch / fmt.bytes_per_block;
+            ml.PaddedHeightElements = elems_y;
+            ml.TilesX = 1u;
+            ml.TilesY = 1u;
+            ml.RowPitchBytes = row_pitch;
+            ml.OffsetBytes = cursor;
+            ml.SlicePitchBytes = AlignUpU64(slice_bytes, 256ull);
+            ml.SizeBytes = ml.SlicePitchBytes * array_size;
+            cursor += ml.SizeBytes;
+            continue;
+        }
+
+        // Check GFX10 mip-tail entry (active on multi-mip 4KB/64KB tiled textures).
+        const uint32_t sub_w = NextPow2(elems_x);
+        const uint32_t sub_h = NextPow2(elems_y);
+        const uint32_t raw_sub_bytes = sub_w * sub_h * fmt.bytes_per_block;
+        const uint32_t aligned_sub_bytes = AlignUpU32(raw_sub_bytes, geom.mip_tail_sub_align);
+
+        if (!in_mip_tail &&
+            geom.supports_mip_tail &&
+            mip_levels > 1u &&
+            elems_x <= (geom.tile_w_elems / 2u) &&
+            elems_y <= (geom.tile_h_elems / 2u) &&
+            aligned_sub_bytes <= geom.tile_size_bytes) {
+            in_mip_tail = true;
+            cursor = AlignUpU64(cursor, geom.tile_size_bytes);
+            out_mip_tail_start = m;
+            out_mip_tail_offset = cursor;
+            out_mip_tail_slice_pitch = geom.tile_size_bytes;
+            mip_tail_sub_cursor = 0u;
+        }
+
+        if (in_mip_tail && (mip_tail_sub_cursor + aligned_sub_bytes) <= geom.tile_size_bytes) {
+            ml.InMipTail = 1u;
+            ml.MipTailSubTileOffsetBytes = mip_tail_sub_cursor;
+            ml.MipTailSubBlockBytes = aligned_sub_bytes;
+            ml.MipTailPaddedWidthElements = sub_w;
+            ml.MipTailPaddedHeightElements = sub_h;
+            ml.MipTailPaddedDepthElements = 1u;
+            ml.PaddedWidthElements = sub_w;
+            ml.PaddedHeightElements = sub_h;
+            ml.TilesX = 1u;
+            ml.TilesY = 1u;
+            ml.OffsetBytes = out_mip_tail_offset + mip_tail_sub_cursor;
+            ml.SlicePitchBytes = out_mip_tail_slice_pitch;
+            ml.SizeBytes = aligned_sub_bytes;
+            mip_tail_sub_cursor += aligned_sub_bytes;
+            continue;
+        }
+
+        // Standard full-tile layout (or spill if extreme aspect ratio exceeded tail block).
+        if (in_mip_tail) {
+            // Advance past the mip-tail block before placing any spilled level.
+            cursor = out_mip_tail_offset + out_mip_tail_slice_pitch * array_size;
+            in_mip_tail = false;
+        }
+        cursor = AlignUpU64(cursor, geom.tile_size_bytes);
+        const uint32_t padded_x = AlignUpU32(elems_x, geom.tile_w_elems);
+        const uint32_t padded_y = AlignUpU32(elems_y, geom.tile_h_elems);
+        const uint32_t tiles_x = padded_x / geom.tile_w_elems;
+        const uint32_t tiles_y = padded_y / geom.tile_h_elems;
+        const uint64_t slice_bytes =
+            static_cast<uint64_t>(tiles_x) * tiles_y * geom.tile_size_bytes;
+        ml.PaddedWidthElements = padded_x;
+        ml.PaddedHeightElements = padded_y;
+        ml.TilesX = tiles_x;
+        ml.TilesY = tiles_y;
+        ml.RowPitchBytes = 0u;
+        ml.OffsetBytes = cursor;
+        ml.SlicePitchBytes = slice_bytes;
+        ml.SizeBytes = slice_bytes * array_size;
+        cursor += ml.SizeBytes;
+    }
+
+    if (in_mip_tail) {
+        cursor = out_mip_tail_offset + out_mip_tail_slice_pitch * array_size;
+    }
+
+    out_plane_size = AlignUpU64(cursor - start_offset, geom.tile_size_bytes);
+    return true;
+}
+
+uint32_t ComputeIntraTileOffset2D(
+    XG_TILE_MODE mode,
+    const TileGeometry& geom,
+    uint32_t bpe,
+    uint32_t tile_x,
+    uint32_t tile_y,
+    uint32_t slice_index,
+    uint32_t in_tile_x,
+    uint32_t in_tile_y) noexcept {
+    uint32_t offset_in_tile = 0u;
+
+    if (geom.family == SwizzleFamily::Displayable) {
+        // Displayable (_D / _D_X): full-tile Y-first Morton interleaving.
+        const uint32_t bits_x = Log2Pow2(geom.tile_w_elems);
+        const uint32_t bits_y = Log2Pow2(geom.tile_h_elems);
+        const uint32_t elem_index = MortonEncode2D(in_tile_x, in_tile_y, bits_x, bits_y, true);
+        offset_in_tile = elem_index * bpe;
+    } else if (geom.family == SwizzleFamily::DepthZ) {
+        // GFX10 Depth Z-swizzle (_Z / _Z_X): 2x2 quad-first + sheared Y-first outer quad Morton.
+        const uint32_t bits_x = Log2Pow2(geom.tile_w_elems);
+        const uint32_t bits_y = Log2Pow2(geom.tile_h_elems);
+        if (bits_x >= 1u && bits_y >= 1u) {
+            const uint32_t quad_elem = (in_tile_x & 1u) | ((in_tile_y & 1u) << 1u);
+            const uint32_t ux = in_tile_x >> 1u;
+            const uint32_t uy = in_tile_y >> 1u;
+            const uint32_t bits_ux = bits_x - 1u;
+            const uint32_t bits_uy = bits_y - 1u;
+            const uint32_t mask_ux = (bits_ux > 0u) ? ((1u << bits_ux) - 1u) : 0u;
+            const uint32_t ux_sheared = ux ^ (uy & mask_ux);
+            const uint32_t quad_idx = MortonEncode2D(ux_sheared, uy, bits_ux, bits_uy, true);
+            offset_in_tile = ((quad_idx << 2u) | quad_elem) * bpe;
+        } else {
+            offset_in_tile = MortonEncode2D(in_tile_x, in_tile_y, bits_x, bits_y, false) * bpe;
+        }
+    } else if (geom.family == SwizzleFamily::Rotated && mode != XG_TILE_MODE_2D_THIN_64KB_R_X) {
+        // Non-XOR Rotated (_R): Y-first micro-tile index + X-first element-in-micro Morton.
+        const uint32_t micro_x = in_tile_x / geom.micro_w_elems;
+        const uint32_t micro_y = in_tile_y / geom.micro_h_elems;
+        const uint32_t local_x = in_tile_x % geom.micro_w_elems;
+        const uint32_t local_y = in_tile_y % geom.micro_h_elems;
+        const uint32_t micro_grid_w = geom.tile_w_elems / geom.micro_w_elems;
+        const uint32_t micro_grid_h = geom.tile_h_elems / geom.micro_h_elems;
+        const uint32_t micro_idx = MortonEncode2D(
+            micro_x, micro_y, Log2Pow2(micro_grid_w), Log2Pow2(micro_grid_h), true);
+        const uint32_t elem_in_micro = MortonEncode2D(
+            local_x, local_y, Log2Pow2(geom.micro_w_elems), Log2Pow2(geom.micro_h_elems), false);
+        offset_in_tile = micro_idx * geom.micro_size_bytes + elem_in_micro * bpe;
+    } else {
+        // Standard Swizzle (_S / _S_X) and preserved 64KB_R_X:
+        // Two-level X-first Morton addressing (micro-tile within macro-tile + element within micro).
+        const uint32_t micro_x = in_tile_x / geom.micro_w_elems;
+        const uint32_t micro_y = in_tile_y / geom.micro_h_elems;
+        const uint32_t local_x = in_tile_x % geom.micro_w_elems;
+        const uint32_t local_y = in_tile_y % geom.micro_h_elems;
+        const uint32_t micro_grid_w = geom.tile_w_elems / geom.micro_w_elems;
+        const uint32_t micro_grid_h = geom.tile_h_elems / geom.micro_h_elems;
+        const uint32_t micro_idx = MortonEncode2D(
+            micro_x, micro_y, Log2Pow2(micro_grid_w), Log2Pow2(micro_grid_h), false);
+        const uint32_t elem_in_micro = MortonEncode2D(
+            local_x, local_y, Log2Pow2(geom.micro_w_elems), Log2Pow2(geom.micro_h_elems), false);
+        offset_in_tile = micro_idx * geom.micro_size_bytes + elem_in_micro * bpe;
+    }
+
+    if (geom.has_xor) {
+        // Invertible GFX10 pipe/bank XOR swizzle on bits [12..15] of the 64 KiB tile.
+        uint32_t xor_nibble = 0u;
+        switch (mode) {
+            case XG_TILE_MODE_2D_THIN_64KB_R_X:
+                xor_nibble = (tile_x ^ (tile_y << 1u) ^ (slice_index << 2u)) & 0xFu;
+                break;
+            case XG_TILE_MODE_2D_THIN_64KB_S_X:
+                xor_nibble = ((tile_x << 1u) ^ tile_y ^ slice_index) & 0xFu;
+                break;
+            case XG_TILE_MODE_2D_THIN_64KB_D_X:
+                xor_nibble = (tile_x ^ tile_y ^ (slice_index << 1u)) & 0xFu;
+                break;
+            case XG_TILE_MODE_2D_THIN_64KB_Z_X:
+                xor_nibble = (tile_x ^ (tile_y * 3u) ^ (slice_index << 2u)) & 0xFu;
+                break;
+            default:
+                break;
+        }
+        offset_in_tile ^= (xor_nibble << 12u);
+    }
+
+    return offset_in_tile;
+}
+
+uint32_t ComputeIntraTileOffset3D(
+    XG_TILE_MODE mode,
+    const TileGeometry& geom,
+    uint32_t bpe,
+    uint32_t tile_x,
+    uint32_t tile_y,
+    uint32_t tile_z,
+    uint32_t in_x,
+    uint32_t in_y,
+    uint32_t in_z) noexcept {
+    const uint32_t bx = Log2Pow2(geom.tile_w_elems);
+    const uint32_t by = Log2Pow2(geom.tile_h_elems);
+    const uint32_t bz = Log2Pow2(geom.tile_d_elems);
+
+    uint32_t elem_index = 0u;
+    if (geom.family == SwizzleFamily::DepthZ && bx >= 1u && by >= 1u && bz >= 1u) {
+        // 2x2x2 voxel-block first + outer (y, x, z) 3D Morton.
+        const uint32_t voxel = (in_x & 1u) | ((in_y & 1u) << 1u) | ((in_z & 1u) << 2u);
+        const uint32_t outer = MortonEncode3D(
+            in_x >> 1u, in_y >> 1u, in_z >> 1u, bx - 1u, by - 1u, bz - 1u, 1u);
+        elem_index = (outer << 3u) | voxel;
+    } else if (geom.family == SwizzleFamily::Rotated) {
+        elem_index = MortonEncode3D(in_x, in_y, in_z, bx, by, bz, 2u);
+    } else {
+        elem_index = MortonEncode3D(in_x, in_y, in_z, bx, by, bz, 0u);
+    }
+
+    uint32_t offset_in_tile = elem_index * bpe;
+
+    if (geom.has_xor) {
+        uint32_t xor_nibble = 0u;
+        switch (mode) {
+            case XG_TILE_MODE_3D_THICK_64KB_S_X:
+                xor_nibble = (tile_x ^ (tile_y << 1u) ^ (tile_z << 2u)) & 0xFu;
+                break;
+            case XG_TILE_MODE_3D_THICK_64KB_Z_X:
+                xor_nibble = ((tile_x << 1u) ^ tile_y ^ (tile_z * 3u)) & 0xFu;
+                break;
+            case XG_TILE_MODE_3D_THICK_64KB_R_X:
+                xor_nibble = (tile_z ^ (tile_x << 1u) ^ (tile_y << 2u)) & 0xFu;
+                break;
+            default:
+                break;
+        }
+        offset_in_tile ^= (xor_nibble << 12u);
+    }
+
+    return offset_in_tile;
+}
+
 }  // namespace
+
+bool IsTileMode3D(XG_TILE_MODE mode) noexcept {
+    switch (mode) {
+        case XG_TILE_MODE_3D_THICK_4KB_S:
+        case XG_TILE_MODE_3D_THICK_64KB_Z:
+        case XG_TILE_MODE_3D_THICK_64KB_S:
+        case XG_TILE_MODE_3D_THICK_64KB_Z_X:
+        case XG_TILE_MODE_3D_THICK_64KB_S_X:
+        case XG_TILE_MODE_3D_THICK_64KB_R_X:
+            return true;
+        default:
+            return false;
+    }
+}
+
+uint32_t GetFormatPlaneCount(uint32_t dxgi_format) noexcept {
+    switch (static_cast<DXGI_FORMAT>(dxgi_format)) {
+        case DXGI_FORMAT_R24G8_TYPELESS:
+        case DXGI_FORMAT_D24_UNORM_S8_UINT:
+        case DXGI_FORMAT_R32G8X24_TYPELESS:
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+            return 2u;
+        default:
+            return 1u;
+    }
+}
 
 bool GetFormatBlockInfo(uint32_t dxgi_format, XG_FORMAT_BLOCK_INFO& out_info) noexcept {
     out_info = XG_FORMAT_BLOCK_INFO{};
     out_info.dxgi_format = dxgi_format;
 
     switch (static_cast<DXGI_FORMAT>(dxgi_format)) {
-        // 8 bpp (1 byte)
+        // 8 bpp (1 byte) + stencil-view formats
         case DXGI_FORMAT_R8_TYPELESS:
         case DXGI_FORMAT_R8_UNORM:
         case DXGI_FORMAT_R8_UINT:
         case DXGI_FORMAT_R8_SNORM:
         case DXGI_FORMAT_R8_SINT:
         case DXGI_FORMAT_A8_UNORM:
+        case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
+        case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
             out_info.block_width = 1u;
             out_info.block_height = 1u;
             out_info.bytes_per_block = 1u;
@@ -161,7 +633,7 @@ bool GetFormatBlockInfo(uint32_t dxgi_format, XG_FORMAT_BLOCK_INFO& out_info) no
             out_info.is_compressed = 0u;
             return true;
 
-        // 32 bpp (4 bytes)
+        // 32 bpp (4 bytes): RGBA8, BGRA8, RGB10A2, RG11B10, RGB9E5, D32F, D24S8/D32FS8X24 Plane 0
         case DXGI_FORMAT_R8G8B8A8_TYPELESS:
         case DXGI_FORMAT_R8G8B8A8_UNORM:
         case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
@@ -176,6 +648,7 @@ bool GetFormatBlockInfo(uint32_t dxgi_format, XG_FORMAT_BLOCK_INFO& out_info) no
         case DXGI_FORMAT_R10G10B10A2_UNORM:
         case DXGI_FORMAT_R10G10B10A2_UINT:
         case DXGI_FORMAT_R11G11B10_FLOAT:
+        case DXGI_FORMAT_R9G9B9E5_SHAREDEXP:
         case DXGI_FORMAT_R16G16_TYPELESS:
         case DXGI_FORMAT_R16G16_FLOAT:
         case DXGI_FORMAT_R16G16_UNORM:
@@ -189,6 +662,10 @@ bool GetFormatBlockInfo(uint32_t dxgi_format, XG_FORMAT_BLOCK_INFO& out_info) no
         case DXGI_FORMAT_R32_SINT:
         case DXGI_FORMAT_R24G8_TYPELESS:
         case DXGI_FORMAT_D24_UNORM_S8_UINT:
+        case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+        case DXGI_FORMAT_R32G8X24_TYPELESS:
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+        case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
             out_info.block_width = 1u;
             out_info.block_height = 1u;
             out_info.bytes_per_block = 4u;
@@ -263,6 +740,27 @@ bool GetFormatBlockInfo(uint32_t dxgi_format, XG_FORMAT_BLOCK_INFO& out_info) no
     }
 }
 
+bool GetFormatPlaneBlockInfo(
+    uint32_t dxgi_format,
+    uint32_t plane,
+    XG_FORMAT_BLOCK_INFO& out_info) noexcept {
+    const uint32_t planes = GetFormatPlaneCount(dxgi_format);
+    if (plane >= planes) {
+        return false;
+    }
+    if (plane == 0u) {
+        return GetFormatBlockInfo(dxgi_format, out_info);
+    }
+    // Plane 1 for planar depth/stencil formats (D24S8 / R24G8 / D32FS8X24 / R32G8X24): 8-bit stencil.
+    out_info = XG_FORMAT_BLOCK_INFO{};
+    out_info.dxgi_format = static_cast<uint32_t>(DXGI_FORMAT_R8_UINT);
+    out_info.block_width = 1u;
+    out_info.block_height = 1u;
+    out_info.bytes_per_block = 1u;
+    out_info.is_compressed = 0u;
+    return true;
+}
+
 XG_TILE_MODE ComputeOptimalTileMode(
     uint32_t dxgi_format,
     uint32_t width,
@@ -287,9 +785,108 @@ XG_TILE_MODE ComputeOptimalTileMode(
     return XG_TILE_MODE_2D_THIN_64KB_S;
 }
 
+XG_TEXTURE2D_DESC MakeCubeMapDesc(
+    uint32_t face_size,
+    uint32_t mip_levels,
+    uint32_t num_cubes,
+    uint32_t dxgi_format,
+    XG_TILE_MODE tile_mode,
+    uint32_t bind_flags) noexcept {
+    XG_TEXTURE2D_DESC desc{};
+    desc.Width = face_size;
+    desc.Height = face_size;
+    desc.MipLevels = mip_levels;
+    desc.ArraySize = std::max(1u, num_cubes) * 6u;
+    desc.Format = dxgi_format;
+    desc.SampleCount = 1u;
+    desc.BindFlags = bind_flags | XG_BIND_CUBE_MAP;
+    desc.TileMode = tile_mode;
+    return desc;
+}
+
 bool ComputeTexture2DLayout(const XG_TEXTURE2D_DESC& desc, XG_RESOURCE_LAYOUT& out_layout) noexcept {
     std::memset(&out_layout, 0, sizeof(out_layout));
-    if (desc.Width == 0u || desc.Height == 0u) {
+    if (desc.Width == 0u || desc.Height == 0u || IsTileMode3D(desc.TileMode)) {
+        return false;
+    }
+
+    const uint32_t array_size = (desc.ArraySize == 0u) ? 1u : desc.ArraySize;
+    const bool is_cube = (desc.BindFlags & XG_BIND_CUBE_MAP) != 0u;
+    if (is_cube && (desc.Width != desc.Height || (array_size % 6u) != 0u)) {
+        return false;
+    }
+
+    XG_FORMAT_BLOCK_INFO fmt0{};
+    if (!GetFormatPlaneBlockInfo(desc.Format, 0u, fmt0)) {
+        return false;
+    }
+
+    TileGeometry geom0{};
+    if (!GetTileGeometry(desc.TileMode, fmt0.bytes_per_block, geom0) || geom0.is_3d) {
+        return false;
+    }
+
+    const uint32_t max_mips = ComputeMaxMips2D(desc.Width, desc.Height);
+    const uint32_t mip_levels = (desc.MipLevels == 0u) ? max_mips : std::min(desc.MipLevels, max_mips);
+    const uint32_t plane_count = GetFormatPlaneCount(desc.Format);
+
+    out_layout.Dimension = XG_RESOURCE_DIMENSION_TEXTURE2D;
+    out_layout.Depth = 1u;
+    out_layout.IsCubeMap = is_cube ? 1u : 0u;
+    out_layout.PlaneCount = plane_count;
+    out_layout.FormatInfo = fmt0;
+    out_layout.PlaneFormatInfo[0] = fmt0;
+    out_layout.TileMode = desc.TileMode;
+    out_layout.MipLevels = mip_levels;
+    out_layout.ArraySize = array_size;
+    out_layout.BaseAlignmentBytes = geom0.tile_size_bytes;
+    out_layout.PlaneOffsets[0] = 0ull;
+
+    if (!LayoutPlane2D(
+            desc.Width, desc.Height, mip_levels, array_size, desc.TileMode, fmt0,
+            0ull,
+            out_layout.Mips,
+            out_layout.MipTailStartLevel,
+            out_layout.MipTailOffsetBytes,
+            out_layout.MipTailSlicePitchBytes,
+            out_layout.PlaneSizes[0])) {
+        return false;
+    }
+
+    uint64_t total_size = out_layout.PlaneSizes[0];
+
+    if (plane_count == 2u) {
+        XG_FORMAT_BLOCK_INFO fmt1{};
+        if (!GetFormatPlaneBlockInfo(desc.Format, 1u, fmt1)) {
+            return false;
+        }
+        out_layout.PlaneFormatInfo[1] = fmt1;
+        out_layout.PlaneOffsets[1] = AlignUpU64(total_size, out_layout.BaseAlignmentBytes);
+        if (!LayoutPlane2D(
+                desc.Width, desc.Height, mip_levels, array_size, desc.TileMode, fmt1,
+                out_layout.PlaneOffsets[1],
+                out_layout.Plane1Mips,
+                out_layout.Plane1MipTailStartLevel,
+                out_layout.Plane1MipTailOffsetBytes,
+                out_layout.Plane1MipTailSlicePitchBytes,
+                out_layout.PlaneSizes[1])) {
+            return false;
+        }
+        total_size = out_layout.PlaneOffsets[1] + out_layout.PlaneSizes[1];
+    } else {
+        out_layout.Plane1MipTailStartLevel = mip_levels;
+    }
+
+    out_layout.SizeBytes = AlignUpU64(total_size, out_layout.BaseAlignmentBytes);
+    return true;
+}
+
+bool ComputeTexture3DLayout(const XG_TEXTURE3D_DESC& desc, XG_RESOURCE_LAYOUT& out_layout) noexcept {
+    std::memset(&out_layout, 0, sizeof(out_layout));
+    if (desc.Width == 0u || desc.Height == 0u || desc.Depth == 0u) {
+        return false;
+    }
+    if (desc.TileMode != XG_TILE_MODE_LINEAR && !IsTileMode3D(desc.TileMode)) {
         return false;
     }
 
@@ -303,65 +900,205 @@ bool ComputeTexture2DLayout(const XG_TEXTURE2D_DESC& desc, XG_RESOURCE_LAYOUT& o
         return false;
     }
 
-    const uint32_t max_mips = ComputeMaxMips(desc.Width, desc.Height);
+    const uint32_t max_mips = ComputeMaxMips3D(desc.Width, desc.Height, desc.Depth);
     const uint32_t mip_levels = (desc.MipLevels == 0u) ? max_mips : std::min(desc.MipLevels, max_mips);
-    const uint32_t array_size = (desc.ArraySize == 0u) ? 1u : desc.ArraySize;
 
+    out_layout.Dimension = XG_RESOURCE_DIMENSION_TEXTURE3D;
+    out_layout.Depth = desc.Depth;
+    out_layout.IsCubeMap = 0u;
+    out_layout.PlaneCount = 1u;
     out_layout.FormatInfo = fmt;
+    out_layout.PlaneFormatInfo[0] = fmt;
     out_layout.TileMode = desc.TileMode;
     out_layout.MipLevels = mip_levels;
-    out_layout.ArraySize = array_size;
+    out_layout.ArraySize = 1u;
     out_layout.BaseAlignmentBytes = geom.tile_size_bytes;
+    out_layout.MipTailStartLevel = mip_levels;
+    out_layout.Plane1MipTailStartLevel = mip_levels;
+    out_layout.PlaneOffsets[0] = 0ull;
 
     uint64_t cursor = 0ull;
+    bool in_mip_tail = false;
+    uint32_t mip_tail_sub_cursor = 0u;
+
     for (uint32_t m = 0u; m < mip_levels; ++m) {
         const uint32_t mip_w = std::max(1u, desc.Width >> m);
         const uint32_t mip_h = std::max(1u, desc.Height >> m);
+        const uint32_t mip_d = std::max(1u, desc.Depth >> m);
         const uint32_t elems_x = (mip_w + fmt.block_width - 1u) / fmt.block_width;
         const uint32_t elems_y = (mip_h + fmt.block_height - 1u) / fmt.block_height;
+        const uint32_t elems_z = mip_d;
 
         XG_MIPLEVEL_LAYOUT& ml = out_layout.Mips[m];
         ml.WidthElements = elems_x;
         ml.HeightElements = elems_y;
+        ml.DepthElements = elems_z;
         ml.TileWidthElements = geom.tile_w_elems;
         ml.TileHeightElements = geom.tile_h_elems;
+        ml.TileDepthElements = geom.tile_d_elems;
         ml.TileSizeBytes = geom.tile_size_bytes;
 
         if (desc.TileMode == XG_TILE_MODE_LINEAR) {
             cursor = AlignUpU64(cursor, 256ull);
             const uint32_t row_pitch = AlignUpU32(elems_x * fmt.bytes_per_block, 256u);
-            const uint64_t slice_bytes = static_cast<uint64_t>(row_pitch) * elems_y;
+            const uint64_t depth_pitch = AlignUpU64(static_cast<uint64_t>(row_pitch) * elems_y, 256ull);
+            const uint64_t vol_bytes = depth_pitch * elems_z;
             ml.PaddedWidthElements = row_pitch / fmt.bytes_per_block;
             ml.PaddedHeightElements = elems_y;
+            ml.PaddedDepthElements = elems_z;
             ml.TilesX = 1u;
             ml.TilesY = 1u;
+            ml.TilesZ = 1u;
             ml.RowPitchBytes = row_pitch;
+            ml.DepthPitchBytes = depth_pitch;
             ml.OffsetBytes = cursor;
-            ml.SlicePitchBytes = AlignUpU64(slice_bytes, 256ull);
-            ml.SizeBytes = ml.SlicePitchBytes * array_size;
-            cursor += ml.SizeBytes;
-        } else {
-            cursor = AlignUpU64(cursor, geom.tile_size_bytes);
-            const uint32_t padded_x = AlignUpU32(elems_x, geom.tile_w_elems);
-            const uint32_t padded_y = AlignUpU32(elems_y, geom.tile_h_elems);
-            const uint32_t tiles_x = padded_x / geom.tile_w_elems;
-            const uint32_t tiles_y = padded_y / geom.tile_h_elems;
-            const uint64_t slice_bytes =
-                static_cast<uint64_t>(tiles_x) * tiles_y * geom.tile_size_bytes;
-            ml.PaddedWidthElements = padded_x;
-            ml.PaddedHeightElements = padded_y;
-            ml.TilesX = tiles_x;
-            ml.TilesY = tiles_y;
-            ml.RowPitchBytes = 0u;
-            ml.OffsetBytes = cursor;
-            ml.SlicePitchBytes = slice_bytes;
-            ml.SizeBytes = slice_bytes * array_size;
-            cursor += ml.SizeBytes;
+            ml.SlicePitchBytes = vol_bytes;
+            ml.SizeBytes = vol_bytes;
+            cursor += vol_bytes;
+            continue;
         }
+
+        const uint32_t sub_w = NextPow2(elems_x);
+        const uint32_t sub_h = NextPow2(elems_y);
+        const uint32_t sub_d = NextPow2(elems_z);
+        const uint32_t raw_sub_bytes = sub_w * sub_h * sub_d * fmt.bytes_per_block;
+        const uint32_t aligned_sub_bytes = AlignUpU32(raw_sub_bytes, geom.mip_tail_sub_align);
+
+        if (!in_mip_tail &&
+            geom.supports_mip_tail &&
+            mip_levels > 1u &&
+            elems_x <= (geom.tile_w_elems / 2u) &&
+            elems_y <= (geom.tile_h_elems / 2u) &&
+            elems_z <= (geom.tile_d_elems / 2u) &&
+            aligned_sub_bytes <= geom.tile_size_bytes) {
+            in_mip_tail = true;
+            cursor = AlignUpU64(cursor, geom.tile_size_bytes);
+            out_layout.MipTailStartLevel = m;
+            out_layout.MipTailOffsetBytes = cursor;
+            out_layout.MipTailSlicePitchBytes = geom.tile_size_bytes;
+            mip_tail_sub_cursor = 0u;
+        }
+
+        if (in_mip_tail && (mip_tail_sub_cursor + aligned_sub_bytes) <= geom.tile_size_bytes) {
+            ml.InMipTail = 1u;
+            ml.MipTailSubTileOffsetBytes = mip_tail_sub_cursor;
+            ml.MipTailSubBlockBytes = aligned_sub_bytes;
+            ml.MipTailPaddedWidthElements = sub_w;
+            ml.MipTailPaddedHeightElements = sub_h;
+            ml.MipTailPaddedDepthElements = sub_d;
+            ml.PaddedWidthElements = sub_w;
+            ml.PaddedHeightElements = sub_h;
+            ml.PaddedDepthElements = sub_d;
+            ml.TilesX = 1u;
+            ml.TilesY = 1u;
+            ml.TilesZ = 1u;
+            ml.OffsetBytes = out_layout.MipTailOffsetBytes + mip_tail_sub_cursor;
+            ml.SlicePitchBytes = out_layout.MipTailSlicePitchBytes;
+            ml.SizeBytes = aligned_sub_bytes;
+            mip_tail_sub_cursor += aligned_sub_bytes;
+            continue;
+        }
+
+        if (in_mip_tail) {
+            cursor = out_layout.MipTailOffsetBytes + out_layout.MipTailSlicePitchBytes;
+            in_mip_tail = false;
+        }
+
+        cursor = AlignUpU64(cursor, geom.tile_size_bytes);
+        const uint32_t padded_x = AlignUpU32(elems_x, geom.tile_w_elems);
+        const uint32_t padded_y = AlignUpU32(elems_y, geom.tile_h_elems);
+        const uint32_t padded_z = AlignUpU32(elems_z, geom.tile_d_elems);
+        const uint32_t tiles_x = padded_x / geom.tile_w_elems;
+        const uint32_t tiles_y = padded_y / geom.tile_h_elems;
+        const uint32_t tiles_z = padded_z / geom.tile_d_elems;
+        const uint64_t vol_bytes =
+            static_cast<uint64_t>(tiles_x) * tiles_y * tiles_z * geom.tile_size_bytes;
+
+        ml.PaddedWidthElements = padded_x;
+        ml.PaddedHeightElements = padded_y;
+        ml.PaddedDepthElements = padded_z;
+        ml.TilesX = tiles_x;
+        ml.TilesY = tiles_y;
+        ml.TilesZ = tiles_z;
+        ml.OffsetBytes = cursor;
+        ml.SlicePitchBytes = vol_bytes;
+        ml.SizeBytes = vol_bytes;
+        cursor += vol_bytes;
     }
 
-    out_layout.SizeBytes = AlignUpU64(cursor, out_layout.BaseAlignmentBytes);
+    if (in_mip_tail) {
+        cursor = out_layout.MipTailOffsetBytes + out_layout.MipTailSlicePitchBytes;
+    }
+
+    out_layout.PlaneSizes[0] = AlignUpU64(cursor, out_layout.BaseAlignmentBytes);
+    out_layout.SizeBytes = out_layout.PlaneSizes[0];
     return true;
+}
+
+uint64_t ComputeElementByteOffsetPlane(
+    const XG_RESOURCE_LAYOUT& layout,
+    uint32_t plane,
+    uint32_t mip_level,
+    uint32_t slice_index,
+    uint32_t element_x,
+    uint32_t element_y) noexcept {
+    if (layout.Dimension == XG_RESOURCE_DIMENSION_TEXTURE3D) {
+        return UINT64_MAX;
+    }
+    const uint32_t plane_count = (layout.PlaneCount == 0u) ? 1u : layout.PlaneCount;
+    if (plane >= plane_count || mip_level >= layout.MipLevels || slice_index >= layout.ArraySize) {
+        return UINT64_MAX;
+    }
+
+    const XG_MIPLEVEL_LAYOUT& ml = (plane == 0u) ? layout.Mips[mip_level] : layout.Plane1Mips[mip_level];
+    const uint32_t bpe = (plane == 0u) ? layout.FormatInfo.bytes_per_block
+                                       : layout.PlaneFormatInfo[1].bytes_per_block;
+    if (element_x >= ml.PaddedWidthElements || element_y >= ml.PaddedHeightElements) {
+        return UINT64_MAX;
+    }
+
+    if (layout.TileMode == XG_TILE_MODE_LINEAR) {
+        const uint64_t slice_base =
+            ml.OffsetBytes + static_cast<uint64_t>(slice_index) * ml.SlicePitchBytes;
+        return slice_base +
+               static_cast<uint64_t>(element_y) * ml.RowPitchBytes +
+               static_cast<uint64_t>(element_x) * bpe;
+    }
+
+    TileGeometry geom{};
+    if (!GetTileGeometry(layout.TileMode, bpe, geom) || geom.is_3d) {
+        return UINT64_MAX;
+    }
+
+    if (ml.InMipTail != 0u) {
+        const uint64_t tail_base = (plane == 0u) ? layout.MipTailOffsetBytes : layout.Plane1MipTailOffsetBytes;
+        const uint64_t tail_pitch =
+            (plane == 0u) ? layout.MipTailSlicePitchBytes : layout.Plane1MipTailSlicePitchBytes;
+        const uint64_t slice_tail_base = tail_base + static_cast<uint64_t>(slice_index) * tail_pitch;
+        const uint32_t bits_w = Log2Pow2(ml.MipTailPaddedWidthElements);
+        const uint32_t bits_h = Log2Pow2(ml.MipTailPaddedHeightElements);
+        const bool y_first =
+            (geom.family == SwizzleFamily::Displayable || geom.family == SwizzleFamily::Rotated);
+        uint32_t sub_off = MortonEncode2D(element_x, element_y, bits_w, bits_h, y_first) * bpe;
+        if (geom.has_xor && ml.MipTailSubBlockBytes >= 256u) {
+            const uint32_t sub_xor = ((mip_level ^ (slice_index << 1u)) & 0xFu) << 4u;
+            sub_off ^= sub_xor;
+        }
+        return slice_tail_base + ml.MipTailSubTileOffsetBytes + sub_off;
+    }
+
+    const uint64_t slice_base =
+        ml.OffsetBytes + static_cast<uint64_t>(slice_index) * ml.SlicePitchBytes;
+    const uint32_t tile_x = element_x / geom.tile_w_elems;
+    const uint32_t tile_y = element_y / geom.tile_h_elems;
+    const uint32_t in_tile_x = element_x % geom.tile_w_elems;
+    const uint32_t in_tile_y = element_y % geom.tile_h_elems;
+    const uint64_t tile_index = static_cast<uint64_t>(tile_y) * ml.TilesX + tile_x;
+
+    const uint32_t offset_in_tile = ComputeIntraTileOffset2D(
+        layout.TileMode, geom, bpe, tile_x, tile_y, slice_index, in_tile_x, in_tile_y);
+
+    return slice_base + tile_index * geom.tile_size_bytes + offset_in_tile;
 }
 
 uint64_t ComputeElementByteOffset(
@@ -370,72 +1107,73 @@ uint64_t ComputeElementByteOffset(
     uint32_t slice_index,
     uint32_t element_x,
     uint32_t element_y) noexcept {
-    if (mip_level >= layout.MipLevels || slice_index >= layout.ArraySize) {
-        return UINT64_MAX;
-    }
-    const XG_MIPLEVEL_LAYOUT& ml = layout.Mips[mip_level];
-    if (element_x >= ml.PaddedWidthElements || element_y >= ml.PaddedHeightElements) {
+    return ComputeElementByteOffsetPlane(layout, 0u, mip_level, slice_index, element_x, element_y);
+}
+
+uint64_t ComputeElementByteOffset3D(
+    const XG_RESOURCE_LAYOUT& layout,
+    uint32_t mip_level,
+    uint32_t element_x,
+    uint32_t element_y,
+    uint32_t element_z) noexcept {
+    if (layout.Dimension != XG_RESOURCE_DIMENSION_TEXTURE3D || mip_level >= layout.MipLevels) {
         return UINT64_MAX;
     }
 
+    const XG_MIPLEVEL_LAYOUT& ml = layout.Mips[mip_level];
     const uint32_t bpe = layout.FormatInfo.bytes_per_block;
-    const uint64_t slice_base = ml.OffsetBytes + static_cast<uint64_t>(slice_index) * ml.SlicePitchBytes;
+    if (element_x >= ml.PaddedWidthElements ||
+        element_y >= ml.PaddedHeightElements ||
+        element_z >= ml.PaddedDepthElements) {
+        return UINT64_MAX;
+    }
 
     if (layout.TileMode == XG_TILE_MODE_LINEAR) {
-        return slice_base +
+        return ml.OffsetBytes +
+               static_cast<uint64_t>(element_z) * ml.DepthPitchBytes +
                static_cast<uint64_t>(element_y) * ml.RowPitchBytes +
                static_cast<uint64_t>(element_x) * bpe;
     }
 
     TileGeometry geom{};
-    if (!GetTileGeometry(layout.TileMode, bpe, geom)) {
+    if (!GetTileGeometry(layout.TileMode, bpe, geom) || !geom.is_3d) {
         return UINT64_MAX;
+    }
+
+    if (ml.InMipTail != 0u) {
+        const uint32_t bx = Log2Pow2(ml.MipTailPaddedWidthElements);
+        const uint32_t by = Log2Pow2(ml.MipTailPaddedHeightElements);
+        const uint32_t bz = Log2Pow2(ml.MipTailPaddedDepthElements);
+        const uint32_t order = (geom.family == SwizzleFamily::Rotated)
+                                   ? 2u
+                                   : ((geom.family == SwizzleFamily::DepthZ) ? 1u : 0u);
+        uint32_t sub_off = MortonEncode3D(element_x, element_y, element_z, bx, by, bz, order) * bpe;
+        if (geom.has_xor && ml.MipTailSubBlockBytes >= 256u) {
+            const uint32_t sub_xor = (mip_level & 0xFu) << 4u;
+            sub_off ^= sub_xor;
+        }
+        return layout.MipTailOffsetBytes + ml.MipTailSubTileOffsetBytes + sub_off;
     }
 
     const uint32_t tile_x = element_x / geom.tile_w_elems;
     const uint32_t tile_y = element_y / geom.tile_h_elems;
-    const uint32_t in_tile_x = element_x % geom.tile_w_elems;
-    const uint32_t in_tile_y = element_y % geom.tile_h_elems;
-    const uint64_t tile_index = static_cast<uint64_t>(tile_y) * ml.TilesX + tile_x;
+    const uint32_t tile_z = element_z / geom.tile_d_elems;
+    const uint32_t in_x = element_x % geom.tile_w_elems;
+    const uint32_t in_y = element_y % geom.tile_h_elems;
+    const uint32_t in_z = element_z % geom.tile_d_elems;
 
-    uint32_t offset_in_tile = 0u;
+    const uint64_t tile_index =
+        (static_cast<uint64_t>(tile_z) * ml.TilesY + tile_y) * ml.TilesX + tile_x;
 
-    if (layout.TileMode == XG_TILE_MODE_2D_THIN_64KB_D) {
-        // Displayable 64 KiB layout: full-tile Y-first Morton interleaving.
-        const uint32_t bits_x = Log2Pow2(geom.tile_w_elems);
-        const uint32_t bits_y = Log2Pow2(geom.tile_h_elems);
-        const uint32_t elem_index = MortonEncode2D(in_tile_x, in_tile_y, bits_x, bits_y, true);
-        offset_in_tile = elem_index * bpe;
-    } else {
-        // Standard Swizzle (4KB_S / 64KB_S) & Rotated/XOR Render-Target (64KB_R_X):
-        // Two-level Morton addressing: micro-tile within macro-tile + element within micro-tile.
-        const uint32_t micro_x = in_tile_x / geom.micro_w_elems;
-        const uint32_t micro_y = in_tile_y / geom.micro_h_elems;
-        const uint32_t local_x = in_tile_x % geom.micro_w_elems;
-        const uint32_t local_y = in_tile_y % geom.micro_h_elems;
+    const uint32_t offset_in_tile = ComputeIntraTileOffset3D(
+        layout.TileMode, geom, bpe, tile_x, tile_y, tile_z, in_x, in_y, in_z);
 
-        const uint32_t micro_grid_w = geom.tile_w_elems / geom.micro_w_elems;
-        const uint32_t micro_grid_h = geom.tile_h_elems / geom.micro_h_elems;
-
-        const uint32_t micro_idx = MortonEncode2D(
-            micro_x, micro_y, Log2Pow2(micro_grid_w), Log2Pow2(micro_grid_h), false);
-        const uint32_t elem_in_micro = MortonEncode2D(
-            local_x, local_y, Log2Pow2(geom.micro_w_elems), Log2Pow2(geom.micro_h_elems), false);
-
-        offset_in_tile = micro_idx * geom.micro_size_bytes + elem_in_micro * bpe;
-
-        if (layout.TileMode == XG_TILE_MODE_2D_THIN_64KB_R_X) {
-            // Invertible RDNA2-style pipe/bank XOR swizzle on bits [12..15] of the 64 KiB tile.
-            const uint32_t bank_xor = ((tile_x ^ (tile_y << 1u)) & 0xFu) << 12u;
-            offset_in_tile ^= bank_xor;
-        }
-    }
-
-    return slice_base + tile_index * geom.tile_size_bytes + offset_in_tile;
+    return ml.OffsetBytes + tile_index * geom.tile_size_bytes + offset_in_tile;
 }
 
-bool TileSurface2D(
+bool TileSurface2DPlane(
     const XG_TEXTURE2D_DESC& desc,
+    uint32_t plane,
     uint32_t mip_level,
     uint32_t slice_index,
     const void* src_linear,
@@ -446,40 +1184,55 @@ bool TileSurface2D(
 
     XG_RESOURCE_LAYOUT layout{};
     if (!ComputeTexture2DLayout(desc, layout)) return false;
-    if (mip_level >= layout.MipLevels || slice_index >= layout.ArraySize) return false;
+    if (plane >= layout.PlaneCount || mip_level >= layout.MipLevels || slice_index >= layout.ArraySize) {
+        return false;
+    }
 
-    const XG_MIPLEVEL_LAYOUT& ml = layout.Mips[mip_level];
-    const uint32_t bpe = layout.FormatInfo.bytes_per_block;
+    const XG_MIPLEVEL_LAYOUT& ml = (plane == 0u) ? layout.Mips[mip_level] : layout.Plane1Mips[mip_level];
+    const uint32_t bpe = (plane == 0u) ? layout.FormatInfo.bytes_per_block
+                                       : layout.PlaneFormatInfo[1].bytes_per_block;
     const uint32_t min_row_bytes = ml.WidthElements * bpe;
     if (src_row_pitch_bytes == 0u) src_row_pitch_bytes = min_row_bytes;
     if (src_row_pitch_bytes < min_row_bytes) return false;
 
-    const uint64_t required_end =
-        ml.OffsetBytes + static_cast<uint64_t>(slice_index + 1u) * ml.SlicePitchBytes;
-    if (dst_tiled_size_bytes < required_end) return false;
-
     auto* dst_bytes = static_cast<uint8_t*>(dst_tiled);
     const auto* src_bytes = static_cast<const uint8_t*>(src_linear);
 
-    // Zero-initialize the target subresource slice so padded tile slack is deterministic.
-    const uint64_t slice_base =
-        ml.OffsetBytes + static_cast<uint64_t>(slice_index) * ml.SlicePitchBytes;
-    std::memset(dst_bytes + slice_base, 0, static_cast<size_t>(ml.SlicePitchBytes));
-
-    if (layout.TileMode == XG_TILE_MODE_LINEAR) {
-        for (uint32_t y = 0u; y < ml.HeightElements; ++y) {
-            std::memcpy(
-                dst_bytes + slice_base + static_cast<uint64_t>(y) * ml.RowPitchBytes,
-                src_bytes + static_cast<uint64_t>(y) * src_row_pitch_bytes,
-                min_row_bytes);
+    if (ml.InMipTail != 0u) {
+        const uint64_t tail_base = (plane == 0u) ? layout.MipTailOffsetBytes : layout.Plane1MipTailOffsetBytes;
+        const uint64_t tail_pitch =
+            (plane == 0u) ? layout.MipTailSlicePitchBytes : layout.Plane1MipTailSlicePitchBytes;
+        const uint64_t sub_base =
+            tail_base + static_cast<uint64_t>(slice_index) * tail_pitch + ml.MipTailSubTileOffsetBytes;
+        if (sub_base + ml.MipTailSubBlockBytes > dst_tiled_size_bytes) {
+            return false;
         }
-        return true;
+        // Zero ONLY this mip's sub-block inside the shared mip-tail tile!
+        std::memset(dst_bytes + sub_base, 0, static_cast<size_t>(ml.MipTailSubBlockBytes));
+    } else {
+        const uint64_t slice_base =
+            ml.OffsetBytes + static_cast<uint64_t>(slice_index) * ml.SlicePitchBytes;
+        if (slice_base + ml.SlicePitchBytes > dst_tiled_size_bytes) {
+            return false;
+        }
+        std::memset(dst_bytes + slice_base, 0, static_cast<size_t>(ml.SlicePitchBytes));
+
+        if (layout.TileMode == XG_TILE_MODE_LINEAR) {
+            for (uint32_t y = 0u; y < ml.HeightElements; ++y) {
+                std::memcpy(
+                    dst_bytes + slice_base + static_cast<uint64_t>(y) * ml.RowPitchBytes,
+                    src_bytes + static_cast<uint64_t>(y) * src_row_pitch_bytes,
+                    min_row_bytes);
+            }
+            return true;
+        }
     }
 
     for (uint32_t y = 0u; y < ml.HeightElements; ++y) {
         const uint8_t* src_row = src_bytes + static_cast<uint64_t>(y) * src_row_pitch_bytes;
         for (uint32_t x = 0u; x < ml.WidthElements; ++x) {
-            const uint64_t dst_off = ComputeElementByteOffset(layout, mip_level, slice_index, x, y);
+            const uint64_t dst_off =
+                ComputeElementByteOffsetPlane(layout, plane, mip_level, slice_index, x, y);
             if (dst_off == UINT64_MAX || dst_off + bpe > dst_tiled_size_bytes) {
                 return false;
             }
@@ -489,8 +1242,9 @@ bool TileSurface2D(
     return true;
 }
 
-bool UntileSurface2D(
+bool UntileSurface2DPlane(
     const XG_TEXTURE2D_DESC& desc,
+    uint32_t plane,
     uint32_t mip_level,
     uint32_t slice_index,
     const void* src_tiled,
@@ -501,7 +1255,156 @@ bool UntileSurface2D(
 
     XG_RESOURCE_LAYOUT layout{};
     if (!ComputeTexture2DLayout(desc, layout)) return false;
-    if (mip_level >= layout.MipLevels || slice_index >= layout.ArraySize) return false;
+    if (plane >= layout.PlaneCount || mip_level >= layout.MipLevels || slice_index >= layout.ArraySize) {
+        return false;
+    }
+
+    const XG_MIPLEVEL_LAYOUT& ml = (plane == 0u) ? layout.Mips[mip_level] : layout.Plane1Mips[mip_level];
+    const uint32_t bpe = (plane == 0u) ? layout.FormatInfo.bytes_per_block
+                                       : layout.PlaneFormatInfo[1].bytes_per_block;
+    const uint32_t min_row_bytes = ml.WidthElements * bpe;
+    if (dst_row_pitch_bytes == 0u) dst_row_pitch_bytes = min_row_bytes;
+    if (dst_row_pitch_bytes < min_row_bytes) return false;
+
+    const auto* src_bytes = static_cast<const uint8_t*>(src_tiled);
+    auto* dst_bytes = static_cast<uint8_t*>(dst_linear);
+
+    if (ml.InMipTail != 0u) {
+        const uint64_t tail_base = (plane == 0u) ? layout.MipTailOffsetBytes : layout.Plane1MipTailOffsetBytes;
+        const uint64_t tail_pitch =
+            (plane == 0u) ? layout.MipTailSlicePitchBytes : layout.Plane1MipTailSlicePitchBytes;
+        const uint64_t sub_end =
+            tail_base + static_cast<uint64_t>(slice_index) * tail_pitch +
+            ml.MipTailSubTileOffsetBytes + ml.MipTailSubBlockBytes;
+        if (src_tiled_size_bytes < sub_end) {
+            return false;
+        }
+    } else {
+        const uint64_t slice_base =
+            ml.OffsetBytes + static_cast<uint64_t>(slice_index) * ml.SlicePitchBytes;
+        if (src_tiled_size_bytes < slice_base + ml.SlicePitchBytes) {
+            return false;
+        }
+        if (layout.TileMode == XG_TILE_MODE_LINEAR) {
+            for (uint32_t y = 0u; y < ml.HeightElements; ++y) {
+                std::memcpy(
+                    dst_bytes + static_cast<uint64_t>(y) * dst_row_pitch_bytes,
+                    src_bytes + slice_base + static_cast<uint64_t>(y) * ml.RowPitchBytes,
+                    min_row_bytes);
+            }
+            return true;
+        }
+    }
+
+    for (uint32_t y = 0u; y < ml.HeightElements; ++y) {
+        uint8_t* dst_row = dst_bytes + static_cast<uint64_t>(y) * dst_row_pitch_bytes;
+        for (uint32_t x = 0u; x < ml.WidthElements; ++x) {
+            const uint64_t src_off =
+                ComputeElementByteOffsetPlane(layout, plane, mip_level, slice_index, x, y);
+            if (src_off == UINT64_MAX || src_off + bpe > src_tiled_size_bytes) {
+                return false;
+            }
+            std::memcpy(dst_row + static_cast<uint64_t>(x) * bpe, src_bytes + src_off, bpe);
+        }
+    }
+    return true;
+}
+
+bool TileSurface2D(
+    const XG_TEXTURE2D_DESC& desc,
+    uint32_t mip_level,
+    uint32_t slice_index,
+    const void* src_linear,
+    uint32_t src_row_pitch_bytes,
+    void* dst_tiled,
+    uint64_t dst_tiled_size_bytes) noexcept {
+    return TileSurface2DPlane(
+        desc, 0u, mip_level, slice_index, src_linear, src_row_pitch_bytes,
+        dst_tiled, dst_tiled_size_bytes);
+}
+
+bool UntileSurface2D(
+    const XG_TEXTURE2D_DESC& desc,
+    uint32_t mip_level,
+    uint32_t slice_index,
+    const void* src_tiled,
+    uint64_t src_tiled_size_bytes,
+    void* dst_linear,
+    uint32_t dst_row_pitch_bytes) noexcept {
+    return UntileSurface2DPlane(
+        desc, 0u, mip_level, slice_index, src_tiled, src_tiled_size_bytes,
+        dst_linear, dst_row_pitch_bytes);
+}
+
+bool TileSurface3D(
+    const XG_TEXTURE3D_DESC& desc,
+    uint32_t mip_level,
+    const void* src_linear,
+    uint32_t src_row_pitch_bytes,
+    uint32_t src_slice_pitch_bytes,
+    void* dst_tiled,
+    uint64_t dst_tiled_size_bytes) noexcept {
+    if (!src_linear || !dst_tiled) return false;
+
+    XG_RESOURCE_LAYOUT layout{};
+    if (!ComputeTexture3DLayout(desc, layout)) return false;
+    if (mip_level >= layout.MipLevels) return false;
+
+    const XG_MIPLEVEL_LAYOUT& ml = layout.Mips[mip_level];
+    const uint32_t bpe = layout.FormatInfo.bytes_per_block;
+    const uint32_t min_row_bytes = ml.WidthElements * bpe;
+    if (src_row_pitch_bytes == 0u) src_row_pitch_bytes = min_row_bytes;
+    if (src_row_pitch_bytes < min_row_bytes) return false;
+
+    const uint32_t min_slice_bytes = src_row_pitch_bytes * ml.HeightElements;
+    if (src_slice_pitch_bytes == 0u) src_slice_pitch_bytes = min_slice_bytes;
+    if (src_slice_pitch_bytes < min_slice_bytes) return false;
+
+    auto* dst_bytes = static_cast<uint8_t*>(dst_tiled);
+    const auto* src_bytes = static_cast<const uint8_t*>(src_linear);
+
+    if (ml.InMipTail != 0u) {
+        const uint64_t sub_base = layout.MipTailOffsetBytes + ml.MipTailSubTileOffsetBytes;
+        if (sub_base + ml.MipTailSubBlockBytes > dst_tiled_size_bytes) {
+            return false;
+        }
+        std::memset(dst_bytes + sub_base, 0, static_cast<size_t>(ml.MipTailSubBlockBytes));
+    } else {
+        if (ml.OffsetBytes + ml.SizeBytes > dst_tiled_size_bytes) {
+            return false;
+        }
+        std::memset(dst_bytes + ml.OffsetBytes, 0, static_cast<size_t>(ml.SizeBytes));
+    }
+
+    for (uint32_t z = 0u; z < ml.DepthElements; ++z) {
+        const uint8_t* src_slice = src_bytes + static_cast<uint64_t>(z) * src_slice_pitch_bytes;
+        for (uint32_t y = 0u; y < ml.HeightElements; ++y) {
+            const uint8_t* src_row = src_slice + static_cast<uint64_t>(y) * src_row_pitch_bytes;
+            for (uint32_t x = 0u; x < ml.WidthElements; ++x) {
+                const uint64_t dst_off = ComputeElementByteOffset3D(layout, mip_level, x, y, z);
+                if (dst_off == UINT64_MAX || dst_off + bpe > dst_tiled_size_bytes) {
+                    return false;
+                }
+                std::memcpy(dst_bytes + dst_off, src_row + static_cast<uint64_t>(x) * bpe, bpe);
+            }
+        }
+    }
+    return true;
+}
+
+bool UntileSurface3D(
+    const XG_TEXTURE3D_DESC& desc,
+    uint32_t mip_level,
+    const void* src_tiled,
+    uint64_t src_tiled_size_bytes,
+    void* dst_linear,
+    uint32_t dst_row_pitch_bytes,
+    uint32_t dst_slice_pitch_bytes) noexcept {
+    if (!src_tiled || !dst_linear) return false;
+
+    XG_RESOURCE_LAYOUT layout{};
+    if (!ComputeTexture3DLayout(desc, layout)) return false;
+    if (mip_level >= layout.MipLevels) return false;
 
     const XG_MIPLEVEL_LAYOUT& ml = layout.Mips[mip_level];
     const uint32_t bpe = layout.FormatInfo.bytes_per_block;
@@ -509,34 +1412,32 @@ bool UntileSurface2D(
     if (dst_row_pitch_bytes == 0u) dst_row_pitch_bytes = min_row_bytes;
     if (dst_row_pitch_bytes < min_row_bytes) return false;
 
-    const uint64_t required_end =
-        ml.OffsetBytes + static_cast<uint64_t>(slice_index + 1u) * ml.SlicePitchBytes;
-    if (src_tiled_size_bytes < required_end) return false;
+    const uint32_t min_slice_bytes = dst_row_pitch_bytes * ml.HeightElements;
+    if (dst_slice_pitch_bytes == 0u) dst_slice_pitch_bytes = min_slice_bytes;
+    if (dst_slice_pitch_bytes < min_slice_bytes) return false;
+
+    if (ml.InMipTail != 0u) {
+        const uint64_t sub_end =
+            layout.MipTailOffsetBytes + ml.MipTailSubTileOffsetBytes + ml.MipTailSubBlockBytes;
+        if (src_tiled_size_bytes < sub_end) return false;
+    } else {
+        if (src_tiled_size_bytes < ml.OffsetBytes + ml.SizeBytes) return false;
+    }
 
     const auto* src_bytes = static_cast<const uint8_t*>(src_tiled);
     auto* dst_bytes = static_cast<uint8_t*>(dst_linear);
 
-    const uint64_t slice_base =
-        ml.OffsetBytes + static_cast<uint64_t>(slice_index) * ml.SlicePitchBytes;
-
-    if (layout.TileMode == XG_TILE_MODE_LINEAR) {
+    for (uint32_t z = 0u; z < ml.DepthElements; ++z) {
+        uint8_t* dst_slice = dst_bytes + static_cast<uint64_t>(z) * dst_slice_pitch_bytes;
         for (uint32_t y = 0u; y < ml.HeightElements; ++y) {
-            std::memcpy(
-                dst_bytes + static_cast<uint64_t>(y) * dst_row_pitch_bytes,
-                src_bytes + slice_base + static_cast<uint64_t>(y) * ml.RowPitchBytes,
-                min_row_bytes);
-        }
-        return true;
-    }
-
-    for (uint32_t y = 0u; y < ml.HeightElements; ++y) {
-        uint8_t* dst_row = dst_bytes + static_cast<uint64_t>(y) * dst_row_pitch_bytes;
-        for (uint32_t x = 0u; x < ml.WidthElements; ++x) {
-            const uint64_t src_off = ComputeElementByteOffset(layout, mip_level, slice_index, x, y);
-            if (src_off == UINT64_MAX || src_off + bpe > src_tiled_size_bytes) {
-                return false;
+            uint8_t* dst_row = dst_slice + static_cast<uint64_t>(y) * dst_row_pitch_bytes;
+            for (uint32_t x = 0u; x < ml.WidthElements; ++x) {
+                const uint64_t src_off = ComputeElementByteOffset3D(layout, mip_level, x, y, z);
+                if (src_off == UINT64_MAX || src_off + bpe > src_tiled_size_bytes) {
+                    return false;
+                }
+                std::memcpy(dst_row + static_cast<uint64_t>(x) * bpe, src_bytes + src_off, bpe);
             }
-            std::memcpy(dst_row + static_cast<uint64_t>(x) * bpe, src_bytes + src_off, bpe);
         }
     }
     return true;

@@ -253,7 +253,11 @@ public:
     explicit DStorageQueueImpl(const DSTORAGE_QUEUE_DESC& desc) : desc_(desc) {
         if (desc_.Capacity < DSTORAGE_MIN_QUEUE_CAPACITY) {
             desc_.Capacity = DSTORAGE_MIN_QUEUE_CAPACITY;
+        } else if (desc_.Capacity > DSTORAGE_MAX_QUEUE_CAPACITY) {
+            desc_.Capacity = DSTORAGE_MAX_QUEUE_CAPACITY;
         }
+        auto_submit_threshold_ =
+            std::max<uint16_t>(1u, static_cast<uint16_t>(desc_.Capacity / 2u));
         if (desc_.Name) {
             name_storage_ = desc_.Name;
             desc_.Name = name_storage_.c_str();
@@ -311,11 +315,22 @@ public:
             item.request.Source.File.Source) {
             item.request.Source.File.Source->AddRef();
         }
-        std::lock_guard<std::mutex> lk(mutex_);
-        if (!closed_) {
-            staged_.push_back(item);
-        } else if (item.request.Options.SourceType == DSTORAGE_REQUEST_SOURCE_FILE &&
-                   item.request.Source.File.Source) {
+        bool release_file = false;
+        {
+            std::unique_lock<std::mutex> lk(mutex_);
+            WaitForSlotLocked(lk);
+            if (!closed_) {
+                staged_.push_back(item);
+                ++staged_request_count_;
+                if (staged_request_count_ >= auto_submit_threshold_) {
+                    FlushStagedLocked();
+                }
+            } else if (item.request.Options.SourceType == DSTORAGE_REQUEST_SOURCE_FILE &&
+                       item.request.Source.File.Source) {
+                release_file = true;
+            }
+        }
+        if (release_file) {
             item.request.Source.File.Source->Release();
         }
     }
@@ -332,10 +347,17 @@ public:
         item.kind = QueueItem::Kind::Status;
         item.status_array = impl;
         item.status_index = index;
-        std::lock_guard<std::mutex> lk(mutex_);
-        if (!closed_) {
-            staged_.push_back(item);
-        } else {
+        bool fail_closed = false;
+        {
+            std::unique_lock<std::mutex> lk(mutex_);
+            WaitForSlotLocked(lk);
+            if (!closed_) {
+                staged_.push_back(item);
+            } else {
+                fail_closed = true;
+            }
+        }
+        if (fail_closed) {
             impl->MarkComplete(index, OS_DSTORAGE_E_FAIL);
             impl->Release();
         }
@@ -347,7 +369,8 @@ public:
         QueueItem item{};
         item.kind = QueueItem::Kind::Event;
         item.event_handle = handle;
-        std::lock_guard<std::mutex> lk(mutex_);
+        std::unique_lock<std::mutex> lk(mutex_);
+        WaitForSlotLocked(lk);
         if (!closed_) {
             staged_.push_back(item);
         }
@@ -357,11 +380,7 @@ public:
         RecordOk("IDStorageQueueX::Submit", 6);
         std::lock_guard<std::mutex> lk(mutex_);
         if (closed_ || staged_.empty()) return;
-        for (auto& it : staged_) {
-            active_.push_back(it);
-        }
-        staged_.clear();
-        cv_.notify_one();
+        FlushStagedLocked();
     }
 
     void OPENSCARLETT_DSTORAGE_CALL CancelRequestsWithTag(
@@ -371,13 +390,16 @@ public:
         auto cancel_in = [&](std::deque<QueueItem>& q) {
             for (auto& item : q) {
                 if (item.kind == QueueItem::Kind::Request &&
-                    (item.request.CancellationTag & mask) == (value & mask)) {
+                    (item.request.CancellationTag & mask) == value) {
                     item.canceled = true;
                 }
             }
         };
         cancel_in(staged_);
         cancel_in(active_);
+        if (executing_request_ && (executing_tag_ & mask) == value) {
+            executing_canceled_ = true;
+        }
     }
 
     void OPENSCARLETT_DSTORAGE_CALL Close() override {
@@ -416,10 +438,36 @@ public:
         info->EmptySlotCount = (used < desc_.Capacity)
                                    ? static_cast<uint16_t>(desc_.Capacity - used)
                                    : 0u;
-        info->RequestCountUntilAutoSubmit = desc_.Capacity;
+        info->RequestCountUntilAutoSubmit =
+            (staged_request_count_ < auto_submit_threshold_)
+                ? static_cast<uint16_t>(auto_submit_threshold_ - staged_request_count_)
+                : 0u;
     }
 
 private:
+    void FlushStagedLocked() {
+        if (staged_.empty()) {
+            staged_request_count_ = 0u;
+            return;
+        }
+        for (auto& it : staged_) {
+            active_.push_back(it);
+        }
+        staged_.clear();
+        staged_request_count_ = 0u;
+        cv_.notify_one();
+    }
+
+    void WaitForSlotLocked(std::unique_lock<std::mutex>& lk) {
+        while (!closed_ && (staged_.size() + active_.size()) >= desc_.Capacity) {
+            if (!staged_.empty()) {
+                FlushStagedLocked();
+            }
+            space_cv_.wait(lk, [&]() {
+                return closed_ || (staged_.size() + active_.size()) < desc_.Capacity;
+            });
+        }
+    }
     struct QueueItem {
         enum class Kind { Request, Status, Event };
         Kind kind = Kind::Request;
@@ -541,16 +589,31 @@ private:
                 }
                 item = active_.front();
                 active_.pop_front();
+                if (item.kind == QueueItem::Kind::Request) {
+                    executing_request_ = true;
+                    executing_tag_ = item.request.CancellationTag;
+                    executing_canceled_ = item.canceled;
+                }
             }
+            space_cv_.notify_all();
 
             switch (item.kind) {
                 case QueueItem::Kind::Request: {
+                    int32_t hr = OS_DSTORAGE_S_OK;
                     if (!item.canceled) {
-                        const int32_t hr = ExecuteRequest(item.request);
-                        if (hr < 0) {
-                            if (batch_hr >= 0) batch_hr = hr;
-                            RecordFailure(hr, item.request);
-                        }
+                        hr = ExecuteRequest(item.request);
+                    }
+                    bool was_canceled = item.canceled;
+                    {
+                        std::lock_guard<std::mutex> lk(mutex_);
+                        was_canceled = was_canceled || executing_canceled_;
+                        executing_request_ = false;
+                        executing_tag_ = 0u;
+                        executing_canceled_ = false;
+                    }
+                    if (!was_canceled && hr < 0) {
+                        if (batch_hr >= 0) batch_hr = hr;
+                        RecordFailure(hr, item.request);
                     }
                     if (item.request.Options.SourceType == DSTORAGE_REQUEST_SOURCE_FILE &&
                         item.request.Source.File.Source) {
@@ -587,7 +650,9 @@ private:
             if (closed_) return;
             closed_ = true;
             leftover_staged.swap(staged_);
+            staged_request_count_ = 0u;
             cv_.notify_all();
+            space_cv_.notify_all();
         }
         for (auto& item : leftover_staged) {
             if (item.kind == QueueItem::Kind::Request &&
@@ -610,11 +675,17 @@ private:
 
     std::atomic<uint32_t> ref_count_{1};
     DSTORAGE_QUEUE_DESC desc_{};
+    uint16_t auto_submit_threshold_ = DSTORAGE_MIN_QUEUE_CAPACITY / 2u;
     std::string name_storage_;
 
     std::mutex mutex_;
     std::condition_variable cv_;
+    std::condition_variable space_cv_;
     bool closed_ = false;
+    uint32_t staged_request_count_ = 0u;
+    bool executing_request_ = false;
+    uint64_t executing_tag_ = 0u;
+    bool executing_canceled_ = false;
     std::deque<QueueItem> staged_;
     std::deque<QueueItem> active_;
     std::thread worker_;

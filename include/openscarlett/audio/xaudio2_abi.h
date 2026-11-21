@@ -31,7 +31,10 @@ constexpr int32_t OS_XAUDIO2_E_DEVICE_INVALIDATED = static_cast<int32_t>(0x88960
 
 constexpr uint16_t OS_WAVE_FORMAT_PCM = 0x0001u;
 constexpr uint16_t OS_WAVE_FORMAT_IEEE_FLOAT = 0x0003u;
+constexpr uint16_t OS_WAVE_FORMAT_IMA_ADPCM = 0x0011u;
+constexpr uint16_t OS_WAVE_FORMAT_XBOX_ADPCM = 0x0069u;
 constexpr uint16_t OS_WAVE_FORMAT_XMA2 = 0x0166u;
+constexpr uint16_t OS_WAVE_FORMAT_OPUS = 0x704Fu;
 constexpr uint16_t OS_WAVE_FORMAT_EXTENSIBLE = 0xFFFEu;
 
 constexpr uint32_t OS_XAUDIO2_DEFAULT_CHANNELS = 0u;
@@ -91,6 +94,21 @@ struct OS_XMA2WAVEFORMATEX {
 };
 static_assert(sizeof(OS_XMA2WAVEFORMATEX) == 52,
               "OS_XMA2WAVEFORMATEX must match 52-byte Xbox XMA2WAVEFORMATEX ABI");
+
+struct OS_IMAADPCMWAVEFORMAT {
+    OS_WAVEFORMATEX wfx;
+    uint16_t wSamplesPerBlock;
+};
+static_assert(sizeof(OS_IMAADPCMWAVEFORMAT) == 20,
+              "OS_IMAADPCMWAVEFORMAT must match 20-byte Windows IMA-ADPCM ABI");
+
+struct OS_OPUSWAVEFORMAT {
+    OS_WAVEFORMATEX wfx;
+    uint16_t PreSkip;
+    uint16_t Version;
+};
+static_assert(sizeof(OS_OPUSWAVEFORMAT) == 22,
+              "OS_OPUSWAVEFORMAT must match 22-byte Xbox Opus ABI");
 #pragma pack(pop)
 
 struct OS_XAUDIO2_BUFFER {
@@ -284,6 +302,24 @@ OPENSCARLETT_XAUDIO2_API int32_t OPENSCARLETT_XAUDIO2_CALL OpenScarlettXAudio2Re
     IXAudio2* pXAudio2,
     float* out_frames,
     uint32_t frame_count);
+
+// Diagnostic backend status snapshot (WASAPI active vs null audio, sample rate, rendered frames, Opus MFT).
+struct OS_XAUDIO2_BACKEND_INFO {
+    uint32_t null_audio_forced;
+    uint32_t wasapi_active;
+    uint32_t wasapi_event_driven;
+    uint32_t wasapi_sample_rate;
+    uint32_t wasapi_channels;
+    uint32_t wasapi_bits_per_sample;
+    uint32_t wasapi_buffer_frames;
+    uint64_t wasapi_frames_rendered;
+    int32_t wasapi_last_hresult;
+    uint32_t opus_mft_active_voices;
+};
+
+OPENSCARLETT_XAUDIO2_API int32_t OPENSCARLETT_XAUDIO2_CALL OpenScarlettXAudio2GetBackendInfo(
+    IXAudio2* pXAudio2,
+    OS_XAUDIO2_BACKEND_INFO* out_info);
 
 #ifdef __cplusplus
 }
