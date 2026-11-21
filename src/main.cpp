@@ -73,13 +73,21 @@ int RunProbeGpu() {
     auto vk_status = vk.Initialize(true);
     if (vk_status.ok()) {
         const auto& info = vk.GetDeviceInfo();
-        std::printf("Vulkan       : %s | API %u.%u.%u | %s | compute_q=%u\n",
+        const char* mesh_str = "no";
+        if (info.supports_mesh_shader) {
+            mesh_str = info.supports_task_shader ? "task+mesh" : "mesh";
+        }
+        std::printf("Vulkan       : %s | API %u.%u.%u | %s | compute_q=%u | gfx_q=%s | VK_EXT_mesh_shader=%s | Win32Swapchain=%s | HDR10_CS=%s\n",
                     info.device_name.c_str(),
                     (info.api_version >> 22) & 0x3FFu,
                     (info.api_version >> 12) & 0x3FFu,
                     info.api_version & 0xFFFu,
                     info.is_hardware ? "Hardware ICD" : "Software Fallback",
-                    info.compute_queue_family);
+                    info.compute_queue_family,
+                    info.supports_graphics ? std::to_string(info.graphics_queue_family).c_str() : "none",
+                    mesh_str,
+                    (info.supports_win32_surface && info.supports_swapchain) ? "yes" : "no",
+                    info.supports_hdr10_colorspace ? "yes" : "no");
         vk.Shutdown();
     } else {
         std::printf("Vulkan       : unavailable (%s)\n", vk_status.message.c_str());
@@ -303,7 +311,15 @@ void PrintTelemetrySummary(const std::string& json_path) {
 int RunGuestExecutable(int argc, char** argv) {
     openscarlett::LaunchOptions opts{};
     std::vector<std::string> guest_args;
+    std::string gpu_backend_override;
     bool in_guest_args = false;
+
+    auto normalize_backend = [](std::string raw) -> std::string {
+        std::transform(raw.begin(), raw.end(), raw.begin(), [](unsigned char c) {
+            return static_cast<char>(c >= 'A' && c <= 'Z' ? (c - 'A' + 'a') : c);
+        });
+        return raw;
+    };
 
     for (int i = 2; i < argc; ++i) {
         std::string arg = argv[i];
@@ -336,6 +352,23 @@ int RunGuestExecutable(int argc, char** argv) {
             if (!take_value("--vfs-s", opts.vfs_s)) return 1;
         } else if (arg == "--telemetry") {
             if (!take_value("--telemetry", opts.telemetry_output_path)) return 1;
+        } else if (arg == "--backend") {
+            std::string raw;
+            if (!take_value("--backend", raw)) return 1;
+            const std::string norm = normalize_backend(raw);
+            if (norm != "vulkan" && norm != "d3d12") {
+                std::fprintf(stderr, "run: invalid --backend value '%s' (expected 'd3d12' or 'vulkan')\n", raw.c_str());
+                return 1;
+            }
+            gpu_backend_override = norm;
+        } else if (arg.rfind("--backend=", 0) == 0) {
+            const std::string raw = arg.substr(std::string("--backend=").size());
+            const std::string norm = normalize_backend(raw);
+            if (norm != "vulkan" && norm != "d3d12") {
+                std::fprintf(stderr, "run: invalid --backend value '%s' (expected 'd3d12' or 'vulkan')\n", raw.c_str());
+                return 1;
+            }
+            gpu_backend_override = norm;
         } else if (arg == "--timeout-ms") {
             std::string raw;
             if (!take_value("--timeout-ms", raw)) return 1;
@@ -391,10 +424,62 @@ int RunGuestExecutable(int argc, char** argv) {
         opts.telemetry_output_path = (tel_base / (stem + "_telemetry.json")).string();
     }
 
+    // Save/set/restore OPENSCARLETT_GPU_BACKEND around LaunchWithApcHook
+    bool had_prev_backend_env = false;
+    std::string prev_backend_env;
+#if defined(_WIN32)
+    {
+        char prev_buf[256]{};
+        const DWORD prev_len = GetEnvironmentVariableA(
+            "OPENSCARLETT_GPU_BACKEND", prev_buf, static_cast<DWORD>(sizeof(prev_buf)));
+        if (prev_len > 0 && prev_len < sizeof(prev_buf)) {
+            had_prev_backend_env = true;
+            prev_backend_env = prev_buf;
+        } else if (prev_len == 0 && GetLastError() != ERROR_ENVVAR_NOT_FOUND) {
+            had_prev_backend_env = true;
+            prev_backend_env.clear();
+        }
+        if (!gpu_backend_override.empty()) {
+            SetEnvironmentVariableA("OPENSCARLETT_GPU_BACKEND", gpu_backend_override.c_str());
+        }
+    }
+#else
+    if (const char* prev = std::getenv("OPENSCARLETT_GPU_BACKEND")) {
+        had_prev_backend_env = true;
+        prev_backend_env = prev;
+    }
+    if (!gpu_backend_override.empty()) {
+        setenv("OPENSCARLETT_GPU_BACKEND", gpu_backend_override.c_str(), 1);
+    }
+#endif
+
+    const std::string active_backend = !gpu_backend_override.empty()
+                                           ? gpu_backend_override
+                                           : (had_prev_backend_env && !prev_backend_env.empty()
+                                                  ? prev_backend_env
+                                                  : "d3d12 (default)");
+
     openscarlett::LaunchResult res{};
     auto st = openscarlett::LaunchWithApcHook(opts, res);
 
+    if (!gpu_backend_override.empty()) {
+#if defined(_WIN32)
+        if (had_prev_backend_env) {
+            SetEnvironmentVariableA("OPENSCARLETT_GPU_BACKEND", prev_backend_env.c_str());
+        } else {
+            SetEnvironmentVariableA("OPENSCARLETT_GPU_BACKEND", nullptr);
+        }
+#else
+        if (had_prev_backend_env) {
+            setenv("OPENSCARLETT_GPU_BACKEND", prev_backend_env.c_str(), 1);
+        } else {
+            unsetenv("OPENSCARLETT_GPU_BACKEND");
+        }
+#endif
+    }
+
     std::printf("=== OpenScarlett Suspended-Process APC Launch ===\n");
+    std::printf("GPU Backend  : %s\n", active_backend.c_str());
     if (!res.resolved_config_path.empty()) {
         std::printf("Game Config  : %s\n", res.resolved_config_path.c_str());
     }
@@ -435,6 +520,7 @@ void PrintUsage() {
         "      --vfs-t <dir>                    Backing directory for virtual T:\\ (title scratch)\n"
         "      --vfs-s <dir>                    Backing directory for virtual S:\\ (persistent saves)\n"
         "      --telemetry <json>               Output path for unified CallTelemetry JSON report\n"
+        "      --backend <d3d12|vulkan>         Select GPU backend via OPENSCARLETT_GPU_BACKEND\n"
         "      --timeout-ms <ms>                Maximum runtime in milliseconds (0 = infinite)\n");
 }
 
