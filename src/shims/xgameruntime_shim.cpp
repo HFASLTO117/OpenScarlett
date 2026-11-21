@@ -8027,9 +8027,51 @@ void OPENSCARLETT_GDK_CALL UninitializeApiImpl(void) {
     RecordOk("UninitializeApiImpl");
 }
 
+static bool IsWritableMemoryPtr(const void* ptr) noexcept {
+#if defined(_WIN32)
+    if (!ptr) {
+        return false;
+    }
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (::VirtualQuery(ptr, &mbi, sizeof(mbi)) == 0) {
+        return false;
+    }
+    if (mbi.State != MEM_COMMIT) {
+        return false;
+    }
+    const DWORD prot = mbi.Protect & 0xFFu;
+    return prot == PAGE_READWRITE ||
+           prot == PAGE_WRITECOPY ||
+           prot == PAGE_EXECUTE_READWRITE ||
+           prot == PAGE_EXECUTE_WRITECOPY;
+#else
+    return ptr != nullptr;
+#endif
+}
+
 XGameResult OPENSCARLETT_GDK_CALL QueryApiImpl(
     const XgrGuid* apiId,
-    void** ppApiVtable) {
+    void** ppApiVtable,
+    void** ppApiVtable3) {
+    // Support BOTH:
+    //   - 2-arg OpenScarlett internal ABI: QueryApiImpl(const XgrGuid* apiId, void** ppApiVtable)
+    //   - 3-arg real Microsoft XGamingRuntimeThunks.dll ABI:
+    //       QueryApiImpl(const GUID* clsid, const GUID* iid, void** ppv)
+    //     where arg2 points to a read-only .rdata IID and arg3 is the writable output pointer.
+    if (apiId && ppApiVtable && !IsWritableMemoryPtr(ppApiVtable)) {
+        const auto* clsid = apiId;
+        const auto* iid = reinterpret_cast<const XgrGuid*>(ppApiVtable);
+        if (!ppApiVtable3 || !IsWritableMemoryPtr(ppApiVtable3)) {
+            return RecordHr("QueryApiImpl", XGR_E_POINTER);
+        }
+        *ppApiVtable3 = nullptr;
+        const std::string sym =
+            "QueryApiImpl(clsid=" + FormatXgrGuid(*clsid) + ",iid=" + FormatXgrGuid(*iid) + ")";
+        openscarlett::CallTelemetry::Global().Record(
+            kModName, sym, openscarlett::CallOutcome::NotImplemented, XGR_E_NOINTERFACE, -1);
+        return XGR_E_NOINTERFACE;
+    }
+
     if (!ppApiVtable) {
         return RecordHr("QueryApiImpl", XGR_E_POINTER);
     }

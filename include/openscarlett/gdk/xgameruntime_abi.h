@@ -3095,7 +3095,12 @@ OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL InitializeApiImpl(void);
 OPENSCARLETT_GDK_API void OPENSCARLETT_GDK_CALL UninitializeApiImpl(void);
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL QueryApiImpl(
     const XgrGuid* apiId,
-    void** ppApiVtable);
+    void** ppApiVtable
+#ifdef __cplusplus
+    ,
+    void** ppApiVtable3 = nullptr
+#endif
+);
 OPENSCARLETT_GDK_API int32_t OPENSCARLETT_GDK_CALL XgrGetTelemetryCallCountForTest(
     const char* symbolName,
     uint64_t* outTotalCalls,

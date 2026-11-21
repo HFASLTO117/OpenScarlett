@@ -1545,9 +1545,24 @@ void TestXGameRuntimeThunksParity() {
         OS_REQUIRE(core_vt->XClosedCaptionSetEnabled(false) == XGR_S_OK);
     }
 
+    // --- 7. 3-arg real XGamingRuntimeThunks QueryApiImpl(clsid, iid, ppv) safety ---
+    {
+        static const XgrGuid kRealClsid = {
+            0x073B7DCBu, 0x1FCFu, 0x4030u, {0x94, 0xBE, 0xE3, 0xC9, 0xEB, 0x62, 0x34, 0x28}};
+        static const XgrGuid kRealIid = {
+            0x073B7DCBu, 0x1FCFu, 0x4030u, {0x94, 0xBE, 0xE3, 0xC9, 0xEB, 0x62, 0x34, 0x28}};
+        void* out_iface = reinterpret_cast<void*>(static_cast<uintptr_t>(0x1234u));
+        const XGameResult hr3 = QueryApiImpl(
+            &kRealClsid,
+            reinterpret_cast<void**>(const_cast<XgrGuid*>(&kRealIid)),
+            &out_iface);
+        OS_REQUIRE(hr3 == XGR_E_NOINTERFACE);
+        OS_REQUIRE(out_iface == nullptr);
+    }
+
     XUserCloseHandle(user);
     UninitializeApiImpl();
-    std::printf("[PASS] xgameruntime.dll thunks parity (XUser, XStore, XGameUi, XNetworking, XPackage, Core + 12-GUID QueryApiImpl)\n");
+    std::printf("[PASS] xgameruntime.dll thunks parity (XUser, XStore, XGameUi, XNetworking, XPackage, Core + 15-GUID & 3-arg QueryApiImpl)\n");
 }
 
 }  // namespace

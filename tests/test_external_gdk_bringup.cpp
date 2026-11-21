@@ -34,6 +34,7 @@
 #include "openscarlett/io/gdeflate.h"
 #include "openscarlett/loader/game_config.h"
 #include "openscarlett/loader/pe_inspector.h"
+#include "openscarlett/loader/vfs_mounts.h"
 #include "openscarlett/middleware/bink2_decoder.h"
 #include "os_check.h"
 
@@ -326,6 +327,11 @@ void WipePerTitleOverlayAndSave(const wchar_t* title_folder) {
     const std::wstring env_temp = ReadEnvW(L"TEMP");
     if (!env_temp.empty()) {
         fs::remove_all(fs::path(env_temp) / L"vfs" / L"G_overlay" / title_folder, ec);
+    }
+    const fs::path default_vfs = openscarlett::ResolveDefaultVfsRootW(ResolveRuntimeBinDir().wstring());
+    if (!default_vfs.empty()) {
+        fs::remove_all(default_vfs / L"G_overlay" / title_folder, ec);
+        fs::remove_all(default_vfs / L"S" / title_folder, ec);
     }
     const std::wstring env_save = ReadEnvW(L"OPENSCARLETT_SAVE_ROOT");
     if (!env_save.empty()) {
