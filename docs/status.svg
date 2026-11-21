@@ -9,11 +9,11 @@
   </style>
   <rect width="900" height="522" rx="10" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
   <text class="h1" x="28" y="42">OpenScarlett — Live Subsystem Readiness: 100.0%</text>
-  <text class="sub" x="28" y="64">Windows 10/11 x64 · MIT Clean-Room · CTest: 12/12 passing · Target: Xbox Series X|S (Scarlett)</text>
+  <text class="sub" x="28" y="64">Windows 10/11 x64 · MIT Clean-Room · CTest: 13/13 passing · Target: Xbox Series X|S (Scarlett)</text>
   <line x1="28" y1="80" x2="872" y2="80" stroke="#21262d" stroke-width="1"/>
   <text class="sub" x="28" y="102">Legend:  ■ Green = Live GPU / Real Binary Verified   ■ Purple = Unit-Tested   ■ Amber = In Progress   ■ Grey = Planned</text>
   <line x1="28" y1="116" x2="872" y2="116" stroke="#21262d" stroke-width="1"/>
-  <text class="name" x="28" y="142">PE32+ Inspector &amp; Live Call Telemetry</text>
+  <text class="name" x="28" y="142">PE32+ Inspector, APC Hook Loader &amp; Call Telemetry</text>
   <rect x="440" y="128" width="146" height="20" rx="10" fill="#2ea043"/>
   <text class="stage" x="513" y="142" text-anchor="middle">Live-Binary Verified</text>
   <rect x="610" y="132" width="180" height="10" rx="5" fill="#21262d"/>
@@ -27,7 +27,7 @@
   <rect x="610" y="166" width="180" height="10" rx="5" fill="#2ea043"/>
   <text class="pct" x="872" y="176" text-anchor="end">100%</text>
   <line x1="28" y1="188" x2="872" y2="188" stroke="#161b22" stroke-width="1"/>
-  <text class="name" x="28" y="210">Production Codecs (GDeflate / BCPack / XMA2 / Bink2)</text>
+  <text class="name" x="28" y="210">Production Codecs &amp; GPU Upscaler (GDeflate / BCPack / XMA2 / Bink2 / FSR 1.0)</text>
   <rect x="440" y="196" width="146" height="20" rx="10" fill="#2ea043"/>
   <text class="stage" x="513" y="210" text-anchor="middle">Live-GPU Verified</text>
   <rect x="610" y="200" width="180" height="10" rx="5" fill="#21262d"/>
@@ -42,31 +42,31 @@
   <text class="pct" x="872" y="244" text-anchor="end">100%</text>
   <line x1="28" y1="256" x2="872" y2="256" stroke="#161b22" stroke-width="1"/>
   <text class="name" x="28" y="278">WinRT Activation &amp; HSTRING (`winrt_xs.dll`)</text>
-  <rect x="440" y="264" width="146" height="20" rx="10" fill="#8957e5"/>
-  <text class="stage" x="513" y="278" text-anchor="middle">Unit-Tested</text>
+  <rect x="440" y="264" width="146" height="20" rx="10" fill="#2ea043"/>
+  <text class="stage" x="513" y="278" text-anchor="middle">Live-Binary Verified</text>
   <rect x="610" y="268" width="180" height="10" rx="5" fill="#21262d"/>
-  <rect x="610" y="268" width="180" height="10" rx="5" fill="#8957e5"/>
+  <rect x="610" y="268" width="180" height="10" rx="5" fill="#2ea043"/>
   <text class="pct" x="872" y="278" text-anchor="end">100%</text>
   <line x1="28" y1="290" x2="872" y2="290" stroke="#161b22" stroke-width="1"/>
   <text class="name" x="28" y="312">Xbox Unified Memory, `GpuTilePool` &amp; `kernelx.dll`</text>
-  <rect x="440" y="298" width="146" height="20" rx="10" fill="#8957e5"/>
-  <text class="stage" x="513" y="312" text-anchor="middle">Unit-Tested</text>
+  <rect x="440" y="298" width="146" height="20" rx="10" fill="#2ea043"/>
+  <text class="stage" x="513" y="312" text-anchor="middle">Live-Binary Verified</text>
   <rect x="610" y="302" width="180" height="10" rx="5" fill="#21262d"/>
-  <rect x="610" y="302" width="180" height="10" rx="5" fill="#8957e5"/>
+  <rect x="610" y="302" width="180" height="10" rx="5" fill="#2ea043"/>
   <text class="pct" x="872" y="312" text-anchor="end">100%</text>
   <line x1="28" y1="324" x2="872" y2="324" stroke="#161b22" stroke-width="1"/>
-  <text class="name" x="28" y="346">`d3d12_xs` Guest COM Proxy &amp; `xg_xs` Swizzle</text>
+  <text class="name" x="28" y="346">`d3d12_xs.dll` COM Proxy &amp; `xg_xs.dll` Swizzle</text>
   <rect x="440" y="332" width="146" height="20" rx="10" fill="#2ea043"/>
   <text class="stage" x="513" y="346" text-anchor="middle">Live-GPU Verified</text>
   <rect x="610" y="336" width="180" height="10" rx="5" fill="#21262d"/>
   <rect x="610" y="336" width="180" height="10" rx="5" fill="#2ea043"/>
   <text class="pct" x="872" y="346" text-anchor="end">100%</text>
   <line x1="28" y1="358" x2="872" y2="358" stroke="#161b22" stroke-width="1"/>
-  <text class="name" x="28" y="380">GDK Runtime (`xgameruntime`, `GameInput`, `XAudio2`, `dstorage_xs`, `XSAPI`)</text>
-  <rect x="440" y="366" width="146" height="20" rx="10" fill="#8957e5"/>
-  <text class="stage" x="513" y="380" text-anchor="middle">Unit-Tested</text>
+  <text class="name" x="28" y="380">GDK Runtime (`xgameruntime`, `GameInput`, `XAudio2_9`, `AcpHal`, `dstorage_xs`, `XSAPI`)</text>
+  <rect x="440" y="366" width="146" height="20" rx="10" fill="#2ea043"/>
+  <text class="stage" x="513" y="380" text-anchor="middle">Live-Binary Verified</text>
   <rect x="610" y="370" width="180" height="10" rx="5" fill="#21262d"/>
-  <rect x="610" y="370" width="180" height="10" rx="5" fill="#8957e5"/>
+  <rect x="610" y="370" width="180" height="10" rx="5" fill="#2ea043"/>
   <text class="pct" x="872" y="380" text-anchor="end">100%</text>
   <line x1="28" y1="392" x2="872" y2="392" stroke="#161b22" stroke-width="1"/>
   <text class="name" x="28" y="414">Hardware DXR Tier 1.1 Pipeline</text>

@@ -58,31 +58,32 @@ def collect_components() -> list[Component]:
 
     return [
         Component(
-            name="PE32+ Inspector & Live Call Telemetry",
+            name="PE32+ Inspector, APC Hook Loader & Call Telemetry",
             area="Loader",
             stage="Unit-Tested" if not has_hook else "Live-Binary Verified",
             pct=100 if has_hook else 50,
             what_works=(
-                "PE32+ import & delay-load classification, JSON vtable/call blocker telemetry"
-                + ("; suspended-process APC hook loader + G:/T:/S: VFS" if has_hook else "; APC hook loader next")
+                "PE32+ import/delay-load inspector, suspended-process APC hook loader (`openscarlett_hook.dll` + `openscarlett run`), pre-loader PE IAT redirection, `G:/T:/S:` VFS, unified cross-DLL JSON telemetry"
+                if has_hook
+                else "PE32+ import & delay-load classification, JSON vtable/call blocker telemetry; APC hook loader next"
             ),
-            verified_on="Windows 10 x64 (`test_pe_inspect`)",
+            verified_on="Windows 10 x64 (`test_pe_inspect`, `test_apc_loader`, `test_gdk_live`)" if has_hook else "Windows 10 x64 (`test_pe_inspect`)",
         ),
         Component(
             name="Vulkan 1.2/1.4 Dynamic Compute Backend",
             area="Graphics",
             stage="Live-GPU Verified",
             pct=100,
-            what_works="Zero-SDK dynamic `vulkan-1.dll` loader, SPIR-V 1.3 validator, live GPU compute pipelines + bit-exact software fallback",
-            verified_on="NVIDIA GeForce GTX 1650 Ti (Vulkan 1.4.329, `test_vulkan_live`)",
+            what_works="Zero-SDK dynamic `vulkan-1.dll` loader, SPIR-V 1.3 validator, live GPU compute/LDS/wave64 pipelines + software fallback",
+            verified_on="NVIDIA GeForce GTX 1650 Ti (Vulkan 1.4.329, `test_vulkan_live`, `test_rdna2_lifter_live`)",
         ),
         Component(
-            name="Production Codecs (GDeflate / BCPack / XMA2 / Bink2)",
+            name="Production Codecs & GPU Upscaler (GDeflate / BCPack / XMA2 / Bink2 / FSR 1.0)",
             area="Media & IO",
             stage="Unit-Tested" if not has_fsr else "Live-GPU Verified",
             pct=100 if has_fsr else 80,
-            what_works="Microsoft GDeflate v1 (`0x04/0xFB`), Xbox BCPack (BC1–BC7), XMA2 2048B IMDCT audio, Bink2 `KB2i` DCT video" + (", GPU FSR 1.0 EASU+RCAS" if has_fsr else ""),
-            verified_on="Windows 10 x64 (`test_codecs`)",
+            what_works="Microsoft GDeflate v1 (`0x04/0xFB`), Xbox BCPack (BC1–BC7), XMA2 2048B IMDCT audio, Bink2 `KB2i` DCT video" + (", live D3D12 GPU FSR 1.0 EASU+RCAS" if has_fsr else ""),
+            verified_on="NVIDIA GTX 1650 Ti + WARP (`test_codecs`, `test_d3d12_xs_live`)" if has_fsr else "Windows 10 x64 (`test_codecs`)",
         ),
         Component(
             name="RDNA2 / GFX10.3 Shader Decoder & Lifter",
@@ -90,51 +91,51 @@ def collect_components() -> list[Component]:
             stage="Live-GPU Verified" if has_lifter else "In Progress",
             pct=100 if has_lifter else 45,
             what_works=(
-                "RDNA2 binary decoder, SSA IR (constant folding + DCE), SPIR-V 1.3 & DXIL/SM6.5 lifter (VS/PS/CS/MS/AS, MIMG, LDS, wave64)"
+                "RDNA2 disassembler + SSA IR (const-fold/DCE) + SPIR-V 1.3 & DXIL SM 6.5 lifter (`MIMG`, `DS`/LDS + `S_BARRIER`, `wave64`→`wave32`, `VS`/`PS`/`CS`/`MS`/`AS`)"
                 if has_lifter
                 else "RDNA2/GFX10.3 binary decoder + CFG/SSA IR (constant folding + DCE); SPIR-V + DXC SM6.5/Mesh/Wave64 lifter next"
             ),
-            verified_on="Windows 10 x64 (`test_rdna2_core`)",
+            verified_on="`spirv-val` + `dxc` SM 6.5 + GTX 1650 Ti (Vulkan 1.4 & D3D12 `MeshTier=10`) + WARP (`test_rdna2_lifter_live`)" if has_lifter else "Windows 10 x64 (`test_rdna2_core`)",
         ),
         Component(
             name="WinRT Activation & HSTRING (`winrt_xs.dll`)",
             area="Runtime",
-            stage="Unit-Tested",
+            stage="Live-Binary Verified" if has_gdk_runner else "Unit-Tested",
             pct=100,
-            what_works=f"{count_exports('include/openscarlett/winrt/winrt_abi.h', 'OPENSCARLETT_WINRT_API')} exports: `RoInitialize`, activation factories, zero-alloc `HSTRING`, Xbox `AnalyticsInfo`/`ApplicationData`",
-            verified_on="Windows 10 x64 (`test_winrt_xs`)",
+            what_works=f"{count_exports('include/openscarlett/winrt/winrt_abi.h', 'OPENSCARLETT_WINRT_API')} exports: `RoInitialize`, activation factories, zero-alloc `HSTRING`, Xbox `AnalyticsInfo`/`ApplicationData` + `CallTelemetry`",
+            verified_on="Windows 10 x64 (`test_winrt_xs`, `test_apc_loader`, `test_gdk_live`)" if has_gdk_runner else "Windows 10 x64 (`test_winrt_xs`)",
         ),
         Component(
             name="Xbox Unified Memory, `GpuTilePool` & `kernelx.dll`",
             area="Memory",
-            stage="Unit-Tested" if has_kernelx else "Planned",
+            stage="Live-Binary Verified" if (has_kernelx and has_gdk_runner) else ("Unit-Tested" if has_kernelx else "Planned"),
             pct=100 if has_kernelx else 0,
-            what_works="OS section-backed 64 KiB / 4 MiB physical-virtual placeholder aliasing + `kernelx.dll`" if has_kernelx else "Next sprint: Win10 `VirtualAlloc2`/`MapViewOfFile3` aliasing, 64 KiB `GpuTilePool`, `kernelx.dll`",
-            verified_on="Windows 10 x64" if has_kernelx else "Queued (Sprint 1)",
+            what_works="Win10 `VirtualAlloc2`/`MapViewOfFile3` 64 KiB & 4 MiB physical-virtual aliasing, `GpuTilePool`, 41 `kernelx.dll` exports" if has_kernelx else "Next sprint: Win10 `VirtualAlloc2`/`MapViewOfFile3` aliasing, 64 KiB `GpuTilePool`, `kernelx.dll`",
+            verified_on="Windows 10 x64 (`test_kernelx`, `test_gdk_live`)" if (has_kernelx and has_gdk_runner) else ("Windows 10 x64 (`test_kernelx`)" if has_kernelx else "Queued (Sprint 1)"),
         ),
         Component(
-            name="`d3d12_xs` Guest COM Proxy & `xg_xs` Swizzle",
+            name="`d3d12_xs.dll` COM Proxy & `xg_xs.dll` Swizzle",
             area="Graphics",
             stage="Live-GPU Verified" if has_d3d_proxy else "Planned",
             pct=100 if has_d3d_proxy else 0,
-            what_works="Modular `d3d12_xs` Device/Queue/CmdList COM proxies, `PresentX`, DXR 1.1" if has_d3d_proxy else "Next sprint: modular `device_x`/`queue_x`/`cmdlist_x` COM proxies with live slot telemetry + `xg_xs`",
-            verified_on="GTX 1650 Ti + WARP" if has_d3d_proxy else "Queued (Sprint 1)",
+            what_works="Modular `DeviceX`/`CommandQueueX`/`CommandListX` COM proxies with per-slot telemetry, `PresentX` (DXGI flip-model + readback), `DispatchMesh`, `xg_xs` `4KB_S`/`64KB_S`" if has_d3d_proxy else "Next sprint: modular `device_x`/`queue_x`/`cmdlist_x` COM proxies with live slot telemetry + `xg_xs`",
+            verified_on="NVIDIA GTX 1650 Ti (`MeshTier=10`) + WARP (`test_d3d12_xs_live`, `test_gdk_live`)" if has_d3d_proxy else "Queued (Sprint 1)",
         ),
         Component(
-            name="GDK Runtime (`xgameruntime`, `GameInput`, `XAudio2`, `dstorage_xs`, `XSAPI`)",
+            name="GDK Runtime (`xgameruntime`, `GameInput`, `XAudio2_9`, `AcpHal`, `dstorage_xs`, `XSAPI`)",
             area="GDK Shims",
             stage="Live-Binary Verified" if has_gdk_runner else ("Unit-Tested" if has_xgr else "Planned"),
             pct=100 if has_xgr else 0,
-            what_works="GDK runtime, XUser, XGameSave, GameInput, XAudio2/AcpHal, DirectStorage, XSAPI" if has_xgr else "Next sprint: clean-room GDK DLL shims verified against live Microsoft `Xbox-GDK-Samples`",
-            verified_on="Live GDK Samples" if has_gdk_runner else "Queued (Sprint 1)",
+            what_works="113 exports across 6 DLLs: `XTaskQueue`/`XAsync`, `XUser`, disk `XGameSave`, live XInput+KB `GameInput`, `XAudio2`/`AcpHal` XMA2, `dstorage_xs` GDeflate+BCPack, `XSAPI`" if has_xgr else "Next sprint: clean-room GDK DLL shims verified against live Microsoft `Xbox-GDK-Samples`",
+            verified_on="Official MIT `Xbox-GDK-Samples` via `openscarlett run` (`test_gdk_shims`, `test_gdk_live`)" if has_gdk_runner else "Queued (Sprint 1)",
         ),
         Component(
             name="Hardware DXR Tier 1.1 Pipeline",
             area="Graphics",
             stage="Unit-Tested" if has_dxr else "Planned",
             pct=100 if has_dxr else 0,
-            what_works="ID3D12Device5 BLAS/TLAS/SBT + software BVH fallback for non-RT GPUs" if has_dxr else "Queued (Sprint 2): ID3D12Device5 DXR 1.1 + software BVH fallback for GTX 1650 Ti / WARP",
-            verified_on="GTX 1650 Ti / WARP" if has_dxr else "Queued (Sprint 2)",
+            what_works="`ID3D12Device5` BLAS/TLAS/SBT ABI + live GPU SBT upload + 12-bin SAH software BVH fallback (HW RT-core path ready for RTX/RDNA2 GPUs)" if has_dxr else "Queued (Sprint 2): ID3D12Device5 DXR 1.1 + software BVH fallback for GTX 1650 Ti / WARP",
+            verified_on="GTX 1650 Ti (`DXR=0` SW BVH fallback) + WARP (`test_dxr_live`)" if has_dxr else "Queued (Sprint 2)",
         ),
         Component(
             name="Retail DRM / Encrypted `.xvc`/`.xvd` Decryption",
