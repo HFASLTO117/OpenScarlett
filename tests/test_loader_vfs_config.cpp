@@ -36,15 +36,9 @@ fs::path ResolveRuntimeBinDir() {
 }
 
 fs::path ResolveScratchRoot() {
-    std::error_code ec;
-    wchar_t temp_buf[1024]{};
-    const DWORD tlen = ::GetEnvironmentVariableW(L"TEMP", temp_buf, static_cast<DWORD>(1024));
-    if (tlen > 0 && tlen < 1024) {
-        return (fs::path(temp_buf) / L"openscarlett_loader_vfs_config").make_preferred();
-    }
-    const fs::path sys_tmp = fs::temp_directory_path(ec);
-    if (!ec && !sys_tmp.empty()) {
-        return (sys_tmp / L"openscarlett_loader_vfs_config").make_preferred();
+    const std::wstring work_dir = openscarlett::ResolveDefaultWorkDirW(ResolveRuntimeBinDir().wstring());
+    if (!work_dir.empty()) {
+        return (fs::path(work_dir) / L"test_loader_vfs_config").make_preferred();
     }
     return (ResolveRuntimeBinDir() / L".tmp_loader_vfs_config").make_preferred();
 }
@@ -1047,7 +1041,14 @@ int RunCowGuestChild() {
     }
     ::FreeLibrary(h_fwd);
 
-    std::printf("[cow-guest-child] PASS: CoW G:/GAME: writes/deletes/moves/whiteouts + forwarder routing OK\n");
+    // 9. Live versioned/thunk GDK DLL alias routing via Hook_LoadLibraryW!
+    HMODULE h_xsapi_thunk = ::LoadLibraryW(L"Microsoft.Xbox.Services.141.GDK.C.Thunks.dll");
+    if (!h_xsapi_thunk) {
+        return fail("LoadLibraryW(Microsoft.Xbox.Services.141.GDK.C.Thunks.dll) failed", ::GetLastError());
+    }
+    ::FreeLibrary(h_xsapi_thunk);
+
+    std::printf("[cow-guest-child] PASS: CoW G:/GAME: writes/deletes/moves/whiteouts + forwarder & alias routing OK\n");
     std::fflush(stdout);
     return 0;
 }
@@ -1142,6 +1143,11 @@ void TestLivePackageLaunchAndCowOverlay(const fs::path& self_exe) {
         ::SetEnvironmentVariableW(L"OPENSCARLETT_VFS_G_OVERLAY", nullptr);
         ::SetEnvironmentVariableW(L"OPENSCARLETT_VFS_S", nullptr);
         ::SetEnvironmentVariableW(L"OPENSCARLETT_VFS_G", nullptr);
+        const std::wstring default_vfs_root = openscarlett::ResolveDefaultVfsRootW(build_dir.wstring());
+        if (!default_vfs_root.empty()) {
+            fs::remove_all(fs::path(default_vfs_root) / L"G_overlay" / L"41525331", ec);
+            fs::remove_all(fs::path(default_vfs_root) / L"S" / L"41525331", ec);
+        }
         const std::wstring env_temp = ReadEnvStrW(L"TEMP");
         if (!env_temp.empty()) {
             fs::remove_all(fs::path(env_temp) / L"vfs" / L"G_overlay" / L"41525331", ec);
@@ -1179,18 +1185,343 @@ void TestLivePackageLaunchAndCowOverlay(const fs::path& self_exe) {
         OS_REQUIRE(snap_after.fnv1a_hash == snap_before.fnv1a_hash);
         OS_REQUIRE(snap_after.entries == snap_before.entries);
 
-        // Verify telemetry recorded forwarded export resolution + CoW VFS calls
+        // Verify telemetry recorded forwarded export resolution, versioned DLL alias routing & CoW VFS calls
         OS_REQUIRE(fs::exists(tel_path));
         const std::string tel_json = ReadFileBytes(tel_path);
         OS_REQUIRE(tel_json.find("ForwardRoInit->winrt_xs.RoInitialize") != std::string::npos);
+        OS_REQUIRE(tel_json.find("dll_alias:Microsoft.Xbox.Services.141.GDK.C.Thunks.dll->Microsoft.Xbox.Services.GDK.C.dll") != std::string::npos);
         OS_REQUIRE(tel_json.find("DeleteFileW") != std::string::npos);
         OS_REQUIRE(tel_json.find("MoveFileExW") != std::string::npos);
         OS_REQUIRE(tel_json.find("RemoveDirectoryW") != std::string::npos);
 
-        std::printf("[PASS] Live CoW overlay VFS + forwarder GetProcAddress verified "
+        std::printf("[PASS] Live CoW overlay VFS + forwarder GetProcAddress + versioned alias routing verified "
                     "(G:\\ pkg hash=0x%016llX byte-identical)\n",
                     static_cast<unsigned long long>(snap_after.fnv1a_hash));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Test 8: Default Work / VFS / Telemetry Path Resolution (Zero C:\ Leak)
+// ---------------------------------------------------------------------------
+struct ScopedEnvVarW {
+    std::wstring name;
+    bool had_prev = false;
+    std::wstring prev_val;
+
+    explicit ScopedEnvVarW(std::wstring var_name) : name(std::move(var_name)) {
+        DWORD needed = ::GetEnvironmentVariableW(name.c_str(), nullptr, 0);
+        if (needed > 0) {
+            had_prev = true;
+            prev_val.resize(needed, L'\0');
+            DWORD written = ::GetEnvironmentVariableW(name.c_str(), prev_val.data(), needed);
+            prev_val.resize(written);
+        }
+    }
+    ~ScopedEnvVarW() {
+        if (had_prev) {
+            ::SetEnvironmentVariableW(name.c_str(), prev_val.c_str());
+        } else {
+            ::SetEnvironmentVariableW(name.c_str(), nullptr);
+        }
+    }
+};
+
+bool StartsWithDriveCW(std::wstring_view path) noexcept {
+    return path.size() >= 2 && (path[0] == L'C' || path[0] == L'c') && path[1] == L':';
+}
+
+void TestDefaultWorkDirResolution() {
+    using namespace openscarlett;
+
+    const fs::path sandbox = (ResolveScratchRoot() / "workdir_resolution").make_preferred();
+    std::error_code ec;
+    fs::remove_all(sandbox, ec);
+    fs::create_directories(sandbox, ec);
+
+    ScopedEnvVarW guard_work(L"OPENSCARLETT_WORK_DIR");
+    ScopedEnvVarW guard_temp(L"TEMP");
+    ScopedEnvVarW guard_tmp(L"TMP");
+    ScopedEnvVarW guard_vfs_t(L"OPENSCARLETT_VFS_T");
+    ScopedEnvVarW guard_vfs_s(L"OPENSCARLETT_VFS_S");
+    ScopedEnvVarW guard_vfs_ovl(L"OPENSCARLETT_VFS_G_OVERLAY");
+    ScopedEnvVarW guard_save(L"OPENSCARLETT_SAVE_ROOT");
+
+    ::SetEnvironmentVariableW(L"OPENSCARLETT_WORK_DIR", nullptr);
+    ::SetEnvironmentVariableW(L"OPENSCARLETT_VFS_T", nullptr);
+    ::SetEnvironmentVariableW(L"OPENSCARLETT_VFS_S", nullptr);
+    ::SetEnvironmentVariableW(L"OPENSCARLETT_VFS_G_OVERLAY", nullptr);
+    ::SetEnvironmentVariableW(L"OPENSCARLETT_SAVE_ROOT", nullptr);
+    // Simulate default Windows %TEMP% pointing at C:\!
+    ::SetEnvironmentVariableW(L"TEMP", L"C:\\Users\\SimulatedUser\\AppData\\Local\\Temp");
+    ::SetEnvironmentVariableW(L"TMP", L"C:\\Users\\SimulatedUser\\AppData\\Local\\Temp");
+
+    // 8A. Executable inside a build\ directory on E:\ -> lands under <parent>\.tmp\openscarlett_run (NEVER C:\!)
+    const fs::path repo_root = sandbox / "fake_repo";
+    const fs::path fake_build = repo_root / "build";
+    fs::create_directories(fake_build, ec);
+
+    const std::wstring work_build = ResolveDefaultWorkDirW(fake_build.wstring());
+    OS_REQUIRE(!StartsWithDriveCW(work_build));
+    OS_REQUIRE(work_build == (repo_root / L".tmp" / L"openscarlett_run").wstring());
+
+    const std::wstring vfs_build = ResolveDefaultVfsRootW(fake_build.wstring());
+    OS_REQUIRE(!StartsWithDriveCW(vfs_build));
+    OS_REQUIRE(vfs_build == (repo_root / L".tmp" / L"openscarlett_run" / L"vfs").wstring());
+
+    const std::wstring tel_build = ResolveDefaultTelemetryDirW(fake_build.wstring());
+    OS_REQUIRE(!StartsWithDriveCW(tel_build));
+    OS_REQUIRE(tel_build == (repo_root / L".tmp" / L"openscarlett_run" / L"telemetry").wstring());
+
+    // Multi-config build\Release walks up to <repo_root>\.tmp\openscarlett_run
+    const fs::path fake_build_rel = fake_build / "Release";
+    fs::create_directories(fake_build_rel, ec);
+    OS_REQUIRE(ResolveDefaultWorkDirW(fake_build_rel.wstring()) ==
+               (repo_root / L".tmp" / L"openscarlett_run").wstring());
+
+    // 8B. Standalone release directory on E:\ -> lands under <dir>\.openscarlett_tmp (NEVER C:\!)
+    const fs::path standalone_dir = sandbox / "standalone_release";
+    fs::create_directories(standalone_dir, ec);
+    const std::wstring work_standalone = ResolveDefaultWorkDirW(standalone_dir.wstring());
+    OS_REQUIRE(!StartsWithDriveCW(work_standalone));
+    OS_REQUIRE(work_standalone == (standalone_dir / L".openscarlett_tmp").wstring());
+
+    // 8C. Default BuildDefaultConfig() from this E:\ binary NEVER leaks to C:\ even with TEMP=C:\...!
+    const fs::path bin_dir = ResolveRuntimeBinDir();
+    if (!StartsWithDriveCW(bin_dir.wstring())) {
+        const VfsMountConfig def_cfg = VfsMounts::BuildDefaultConfig(L"E:\\DummyGame");
+        OS_REQUIRE(!StartsWithDriveCW(def_cfg.t_root));
+        OS_REQUIRE(!StartsWithDriveCW(def_cfg.s_root));
+        OS_REQUIRE(!StartsWithDriveCW(def_cfg.g_overlay_root));
+    }
+
+    // 8D. OPENSCARLETT_WORK_DIR override takes highest precedence
+    const fs::path explicit_work = sandbox / "custom_work_dir";
+    ::SetEnvironmentVariableW(L"OPENSCARLETT_WORK_DIR", explicit_work.c_str());
+    OS_REQUIRE(ResolveDefaultWorkDirW(fake_build.wstring()) == explicit_work.wstring());
+    OS_REQUIRE(ResolveDefaultVfsRootW(fake_build.wstring()) == (explicit_work / L"vfs").wstring());
+    OS_REQUIRE(ResolveDefaultTelemetryDirW(fake_build.wstring()) == (explicit_work / L"telemetry").wstring());
+    const VfsMountConfig env_cfg = VfsMounts::BuildDefaultConfig(L"E:\\DummyGame");
+    OS_REQUIRE(env_cfg.t_root == (explicit_work / L"vfs" / L"T").wstring());
+    OS_REQUIRE(env_cfg.s_root == (explicit_work / L"vfs" / L"S").wstring());
+    OS_REQUIRE(env_cfg.g_overlay_root == (explicit_work / L"vfs" / L"G_overlay").wstring());
+
+    // 8E. Explicitly redirected non-C:\ %TEMP% (e.g. build.cmd / build_wt.cmd) is honored without C:\ leakage
+    ::SetEnvironmentVariableW(L"OPENSCARLETT_WORK_DIR", nullptr);
+    const fs::path custom_non_c_temp = sandbox / "non_c_temp";
+    fs::create_directories(custom_non_c_temp, ec);
+    ::SetEnvironmentVariableW(L"TEMP", custom_non_c_temp.c_str());
+    ::SetEnvironmentVariableW(L"TMP", custom_non_c_temp.c_str());
+    if (!StartsWithDriveCW(custom_non_c_temp.wstring())) {
+        OS_REQUIRE(ResolveDefaultWorkDirW(fake_build.wstring()) == custom_non_c_temp.wstring());
+    }
+
+    // 8F. Fallback to %TEMP%\openscarlett ONLY when the anchor directory is unwritable
+    ::SetEnvironmentVariableW(L"TEMP", L"C:\\Users\\SimulatedUser\\AppData\\Local\\Temp");
+    ::SetEnvironmentVariableW(L"TMP", L"C:\\Users\\SimulatedUser\\AppData\\Local\\Temp");
+
+    // Place a regular file where ".openscarlett_tmp" directory would be created to simulate read-only failure.
+    // Note: ResolveDefaultWorkDirW only returns the fallback path string and does NOT touch C:\ on disk.
+    const fs::path unwritable_anchor = sandbox / "unwritable_dir";
+    fs::create_directories(unwritable_anchor, ec);
+    WriteFileBytes(unwritable_anchor / ".openscarlett_tmp", "BLOCK_DIR_CREATION");
+    OS_REQUIRE(ResolveDefaultWorkDirW(unwritable_anchor.wstring()) ==
+               L"C:\\Users\\SimulatedUser\\AppData\\Local\\Temp\\openscarlett");
+
+    std::printf("[PASS] Default work/VFS/telemetry path resolution verified (OPENSCARLETT_WORK_DIR + zero C:\\ leak)\n");
+}
+
+// ---------------------------------------------------------------------------
+// Test 9: Versioned & Thunk GDK DLL Routing Aliases + Passthrough Overrides
+// ---------------------------------------------------------------------------
+void TestVersionedAndThunkDllAliases() {
+    using namespace openscarlett;
+
+    // 9A. ClassifyImportDll recognizes versioned/thunk GDK DLLs and XGamingRuntimeThunks.dll
+    OS_REQUIRE(ClassifyImportDll("Microsoft.Xbox.Services.141.GDK.C.Thunks.dll") == DllCategory::GdkRuntime);
+    OS_REQUIRE(ClassifyImportDll("Microsoft.Xbox.Services.142.GDK.C.Thunks.dll") == DllCategory::GdkRuntime);
+    OS_REQUIRE(ClassifyImportDll("Microsoft.Xbox.Services.141.GDK.C.dll") == DllCategory::GdkRuntime);
+    OS_REQUIRE(ClassifyImportDll("libHttpClient.141.GDK.C.dll") == DllCategory::GdkRuntime);
+    OS_REQUIRE(ClassifyImportDll("libHttpClient.GDK.C.dll") == DllCategory::GdkRuntime);
+    OS_REQUIRE(ClassifyImportDll("XGamingRuntimeThunks.dll") == DllCategory::GdkRuntime);
+
+    // 9B. ResolveShimAlias exact & pattern matching
+    std::string canon;
+    OS_REQUIRE(ResolveShimAlias("Microsoft.Xbox.Services.140.GDK.C.Thunks.dll", canon));
+    OS_REQUIRE(canon == "Microsoft.Xbox.Services.GDK.C.dll");
+    OS_REQUIRE(ResolveShimAlias("Microsoft.Xbox.Services.141.GDK.C.Thunks.dll", canon));
+    OS_REQUIRE(canon == "Microsoft.Xbox.Services.GDK.C.dll");
+    OS_REQUIRE(ResolveShimAlias("Microsoft.Xbox.Services.142.GDK.C.Thunks.dll", canon));
+    OS_REQUIRE(canon == "Microsoft.Xbox.Services.GDK.C.dll");
+    OS_REQUIRE(ResolveShimAlias("Microsoft.Xbox.Services.143.GDK.C.Thunks.dll", canon));
+    OS_REQUIRE(canon == "Microsoft.Xbox.Services.GDK.C.dll");
+    OS_REQUIRE(ResolveShimAlias("Microsoft.Xbox.Services.141.GDK.C.dll", canon));
+    OS_REQUIRE(canon == "Microsoft.Xbox.Services.GDK.C.dll");
+    OS_REQUIRE(ResolveShimAlias("Microsoft.Xbox.Services.GDK.C.Thunks.dll", canon));
+    OS_REQUIRE(canon == "Microsoft.Xbox.Services.GDK.C.dll");
+    OS_REQUIRE(ResolveShimAlias(R"(D:\Game\Plugins\x86_64\Microsoft.Xbox.Services.141.GDK.C.Thunks.dll)", canon));
+    OS_REQUIRE(canon == "Microsoft.Xbox.Services.GDK.C.dll");
+    OS_REQUIRE(ResolveShimAlias("xsapi.dll", canon));
+    OS_REQUIRE(canon == "Microsoft.Xbox.Services.GDK.C.dll");
+
+    OS_REQUIRE(ResolveShimAlias("libHttpClient.141.GDK.C.dll", canon));
+    OS_REQUIRE(canon == "libHttpClient.GDK.dll");
+    OS_REQUIRE(ResolveShimAlias("libHttpClient.142.GDK.dll", canon));
+    OS_REQUIRE(canon == "libHttpClient.GDK.dll");
+    OS_REQUIRE(ResolveShimAlias("libHttpClient.GDK.C.dll", canon));
+    OS_REQUIRE(canon == "libHttpClient.GDK.dll");
+    OS_REQUIRE(ResolveShimAlias("libHttpClient.141.GDK.C.Thunks.dll", canon));
+    OS_REQUIRE(canon == "libHttpClient.GDK.dll");
+
+    // Canonical names & XGamingRuntimeThunks.dll are NOT aliased by default
+    OS_REQUIRE(!ResolveShimAlias("Microsoft.Xbox.Services.GDK.C.dll", canon));
+    OS_REQUIRE(!ResolveShimAlias("libHttpClient.GDK.dll", canon));
+    OS_REQUIRE(!ResolveShimAlias("XGamingRuntimeThunks.dll", canon));
+
+    // 9C. DllRoutingTable resolution with filesystem backing
+    const fs::path root = (ResolveScratchRoot() / "alias_routing_unit").make_preferred();
+    std::error_code ec;
+    fs::remove_all(root, ec);
+    const fs::path shim_dir = root / "shims";
+    const fs::path guest_dir = root / "guest";
+    WriteFileBytes(shim_dir / "Microsoft.Xbox.Services.GDK.C.dll", "SHIM_XSAPI");
+    WriteFileBytes(shim_dir / "libHttpClient.GDK.dll", "SHIM_LHC");
+    WriteFileBytes(shim_dir / "xgameruntime.dll", "SHIM_XGR");
+    WriteFileBytes(guest_dir / "XGamingRuntimeThunks.dll", "GUEST_THUNKS");
+    WriteFileBytes(guest_dir / "Microsoft.Xbox.Services.141.GDK.C.Thunks.dll", "GUEST_XSAPI_THUNKS");
+
+    DllRoutingTable table;
+    auto r1 = table.ResolveRoute("Microsoft.Xbox.Services.141.GDK.C.Thunks.dll",
+                                 shim_dir.wstring(), guest_dir.wstring());
+    OS_REQUIRE(r1.policy == DllRoutePolicy::Shim);
+    OS_REQUIRE(r1.aliased);
+    OS_REQUIRE(r1.requested_name == "Microsoft.Xbox.Services.141.GDK.C.Thunks.dll");
+    OS_REQUIRE(r1.canonical_name == "Microsoft.Xbox.Services.GDK.C.dll");
+    OS_REQUIRE(r1.resolved_path == (shim_dir / L"Microsoft.Xbox.Services.GDK.C.dll").wstring());
+
+    auto r2 = table.ResolveRoute("Microsoft.Xbox.Services.142.GDK.C.Thunks.dll",
+                                 shim_dir.wstring(), guest_dir.wstring());
+    OS_REQUIRE(r2.policy == DllRoutePolicy::Shim);
+    OS_REQUIRE(r2.aliased);
+    OS_REQUIRE(r2.canonical_name == "Microsoft.Xbox.Services.GDK.C.dll");
+
+    auto r3 = table.ResolveRoute("libHttpClient.141.GDK.C.dll",
+                                 shim_dir.wstring(), guest_dir.wstring());
+    OS_REQUIRE(r3.policy == DllRoutePolicy::Shim);
+    OS_REQUIRE(r3.aliased);
+    OS_REQUIRE(r3.canonical_name == "libHttpClient.GDK.dll");
+    OS_REQUIRE(r3.resolved_path == (shim_dir / L"libHttpClient.GDK.dll").wstring());
+
+    // XGamingRuntimeThunks.dll defaults to NativeGuestDll when present in guest_dir (lets it call LoadLibrary("xgameruntime.dll"))
+    auto r4 = table.ResolveRoute("XGamingRuntimeThunks.dll",
+                                 shim_dir.wstring(), guest_dir.wstring());
+    OS_REQUIRE(r4.policy == DllRoutePolicy::NativeGuestDll);
+    OS_REQUIRE(!r4.aliased);
+    OS_REQUIRE(r4.resolved_path == (guest_dir / L"XGamingRuntimeThunks.dll").wstring());
+
+    // 9D. OPENSCARLETT_DLL_ROUTING custom source=target and source=passthrough overrides
+    {
+        ScopedEnvVarW guard_route(L"OPENSCARLETT_DLL_ROUTING");
+        OS_REQUIRE(::SetEnvironmentVariableA(
+                       "OPENSCARLETT_DLL_ROUTING",
+                       "XGamingRuntimeThunks.dll=xgameruntime.dll;"
+                       "Microsoft.Xbox.Services.141.GDK.C.Thunks.dll=passthrough;"
+                       "CustomHttp.dll=libHttpClient.GDK.dll") != 0);
+        DllRoutingTable custom = DllRoutingTable::CreateWithEnvOverrides();
+
+        auto c1 = custom.ResolveRoute("XGamingRuntimeThunks.dll",
+                                      shim_dir.wstring(), guest_dir.wstring());
+        OS_REQUIRE(c1.policy == DllRoutePolicy::Shim);
+        OS_REQUIRE(c1.aliased);
+        OS_REQUIRE(c1.from_override);
+        OS_REQUIRE(c1.canonical_name == "xgameruntime.dll");
+        OS_REQUIRE(c1.resolved_path == (shim_dir / L"xgameruntime.dll").wstring());
+
+        auto c2 = custom.ResolveRoute("Microsoft.Xbox.Services.141.GDK.C.Thunks.dll",
+                                      shim_dir.wstring(), guest_dir.wstring());
+        OS_REQUIRE(c2.policy == DllRoutePolicy::Windows);
+        OS_REQUIRE(!c2.aliased);
+        OS_REQUIRE(c2.from_override);
+        OS_REQUIRE(c2.resolved_path.empty());
+
+        // Unrelated versioned variant STILL aliases normally!
+        auto c3 = custom.ResolveRoute("Microsoft.Xbox.Services.142.GDK.C.Thunks.dll",
+                                      shim_dir.wstring(), guest_dir.wstring());
+        OS_REQUIRE(c3.policy == DllRoutePolicy::Shim);
+        OS_REQUIRE(c3.aliased);
+        OS_REQUIRE(c3.canonical_name == "Microsoft.Xbox.Services.GDK.C.dll");
+
+        auto c4 = custom.ResolveRoute("CustomHttp.dll",
+                                      shim_dir.wstring(), guest_dir.wstring());
+        OS_REQUIRE(c4.policy == DllRoutePolicy::Shim);
+        OS_REQUIRE(c4.aliased);
+        OS_REQUIRE(c4.from_override);
+        OS_REQUIRE(c4.canonical_name == "libHttpClient.GDK.dll");
+        OS_REQUIRE(c4.resolved_path == (shim_dir / L"libHttpClient.GDK.dll").wstring());
+    }
+
+    std::printf("[PASS] Versioned/thunk GDK DLL aliases & OPENSCARLETT_DLL_ROUTING target/passthrough overrides verified\n");
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: Microsoft Store / Xbox Play Anywhere Bootstrapper Diagnostics
+// ---------------------------------------------------------------------------
+void TestStoreBootstrapDiagnostics() {
+    using namespace openscarlett;
+
+    // 10A. WindowsApps gamelaunchhelper.exe exiting with 0 and 0 tracked symbols -> detected!
+    {
+        LaunchResult lr{};
+        lr.exit_code = 0;
+        lr.timed_out = false;
+        lr.resolved_exe_path = R"(C:\Program Files\WindowsApps\Publisher.Title_1.0.0.0_x64__abc\gamelaunchhelper.exe)";
+        const StoreBootstrapDiagnostic d = DiagnoseStoreBootstrapper(lr, 0, false);
+        OS_REQUIRE(d.suspected_store_bootstrapper);
+        OS_REQUIRE(d.in_windows_apps);
+        OS_REQUIRE(d.is_gamelaunchhelper);
+        OS_REQUIRE(d.message.find("GamingServices") != std::string::npos);
+        OS_REQUIRE(d.message.find("AppModel") != std::string::npos);
+        OS_REQUIRE(d.message.find("ACLs") != std::string::npos);
+    }
+
+    // 10B. XboxGames package with MicrosoftGame.config exiting 0 with 0 symbols -> detected!
+    {
+        LaunchResult lr{};
+        lr.exit_code = 0;
+        lr.timed_out = false;
+        lr.resolved_exe_path = R"(E:\XboxGames\SampleTitle\Content\Game.exe)";
+        lr.resolved_config_path = R"(E:\XboxGames\SampleTitle\Content\MicrosoftGame.config)";
+        const StoreBootstrapDiagnostic d = DiagnoseStoreBootstrapper(lr, 0, true);
+        OS_REQUIRE(d.suspected_store_bootstrapper);
+        OS_REQUIRE(d.in_xbox_games);
+        OS_REQUIRE(d.has_game_config);
+        OS_REQUIRE(d.reason.find("XboxGames") != std::string::npos);
+    }
+
+    // 10C. Normal GDK title with tracked symbols -> NOT flagged!
+    {
+        LaunchResult lr{};
+        lr.exit_code = 0;
+        lr.timed_out = false;
+        lr.resolved_exe_path = R"(E:\XboxGames\SampleTitle\Content\Game.exe)";
+        lr.resolved_config_path = R"(E:\XboxGames\SampleTitle\Content\MicrosoftGame.config)";
+        const StoreBootstrapDiagnostic d = DiagnoseStoreBootstrapper(lr, 12, true);
+        OS_REQUIRE(!d.suspected_store_bootstrapper);
+    }
+
+    // 10D. Non-zero exit or timeout -> NOT flagged!
+    {
+        LaunchResult lr{};
+        lr.exit_code = 1;
+        lr.timed_out = false;
+        lr.resolved_exe_path = R"(C:\Program Files\WindowsApps\Publisher.Title\gamelaunchhelper.exe)";
+        OS_REQUIRE(!DiagnoseStoreBootstrapper(lr, 0, false).suspected_store_bootstrapper);
+
+        lr.exit_code = 0;
+        lr.timed_out = true;
+        OS_REQUIRE(!DiagnoseStoreBootstrapper(lr, 0, false).suspected_store_bootstrapper);
+    }
+
+    std::printf("[PASS] Store-bootstrapper diagnostic helper verified\n");
 }
 
 }  // namespace
@@ -1208,6 +1539,9 @@ int main(int argc, char** argv) {
     TestPeTlsCallbacks();
     TestPeExceptionTableRegistration();
     TestDllRoutingTable();
+    TestDefaultWorkDirResolution();
+    TestVersionedAndThunkDllAliases();
+    TestStoreBootstrapDiagnostics();
 
     fs::path self_exe;
     wchar_t mod_buf[MAX_PATH]{};
@@ -1217,6 +1551,6 @@ int main(int argc, char** argv) {
 
     TestLivePackageLaunchAndCowOverlay(self_exe);
 
-    std::printf("[PASS] test_loader_vfs_config (all MicrosoftGame.Config, CoW VFS, PE forwarder/TLS/.pdata, routing checks passed)\n");
+    std::printf("[PASS] test_loader_vfs_config (all MicrosoftGame.Config, CoW VFS, PE forwarder/TLS/.pdata, routing, workdir, alias & diagnostic checks passed)\n");
     return 0;
 }

@@ -12,7 +12,7 @@ namespace openscarlett {
 
 namespace {
 
-constexpr wchar_t kDefaultVfsRootW[] = L"E:\\OpenScarlett\\.tmp\\vfs";
+constexpr wchar_t kDefaultWorkDirFallbackW[] = L"E:\\OpenScarlett\\.tmp\\openscarlett_run";
 constexpr wchar_t kWhiteoutDirNameW[] = L".whiteout";
 
 wchar_t AsciiLowerW(wchar_t c) noexcept {
@@ -20,6 +20,14 @@ wchar_t AsciiLowerW(wchar_t c) noexcept {
         return static_cast<wchar_t>(c - L'A' + L'a');
     }
     return c;
+}
+
+std::wstring ToLowerAsciiW(std::wstring_view s) {
+    std::wstring out(s);
+    for (wchar_t& c : out) {
+        c = AsciiLowerW(c);
+    }
+    return out;
 }
 
 char AsciiLowerA(char c) noexcept {
@@ -337,7 +345,73 @@ bool IsOverlayDirVisiblyEmpty(const std::wstring& base_dir,
     return true;
 }
 
+std::wstring GetRunningExeDirW() {
+    std::wstring buf(MAX_PATH, L'\0');
+    for (;;) {
+        DWORD len = ::GetModuleFileNameW(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
+        if (len == 0) {
+            return {};
+        }
+        if (len < buf.size() - 1) {
+            buf.resize(len);
+            break;
+        }
+        buf.resize(buf.size() * 2);
+    }
+    return std::filesystem::path(buf).parent_path().wstring();
+}
+
+bool IsDirectoryWritableW(const std::wstring& candidate_dir) {
+    if (candidate_dir.empty()) {
+        return false;
+    }
+    if (!EnsureDirectoryTreeW(candidate_dir)) {
+        return false;
+    }
+    const DWORD pid = ::GetCurrentProcessId();
+    const DWORD tid = ::GetCurrentThreadId();
+    std::wstring probe = candidate_dir;
+    if (probe.back() != L'\\') {
+        probe.push_back(L'\\');
+    }
+    probe.append(L".os_write_probe_");
+    probe.append(std::to_wstring(pid));
+    probe.push_back(L'_');
+    probe.append(std::to_wstring(tid));
+    probe.append(L".tmp");
+
+    HANDLE h = ::CreateFileW(probe.c_str(),
+                             GENERIC_WRITE,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                             nullptr,
+                             CREATE_ALWAYS,
+                             FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+                             nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    ::CloseHandle(h);
+    return true;
+}
+
 #endif  // _WIN32
+
+std::wstring NormalizePathRootW(std::wstring_view root) {
+    if (root.empty()) {
+        return {};
+    }
+    std::wstring out(root);
+    for (wchar_t& c : out) {
+        if (c == L'/') {
+            c = L'\\';
+        }
+    }
+    const size_t min_len = IsExtendedPrefixW(out) ? 7u : 3u;
+    while (out.size() > min_len && out.back() == L'\\') {
+        out.pop_back();
+    }
+    return out;
+}
 
 }  // namespace
 
@@ -431,6 +505,97 @@ bool EnsureDirectoryTreeW(std::wstring_view path) {
 #endif
 }
 
+static bool IsOnSystemDriveW(std::wstring_view path) {
+    if (IsExtendedPrefixW(path)) {
+        path.remove_prefix(4);
+    }
+    if (path.size() < 2 || path[1] != L':') {
+        return false;
+    }
+    wchar_t sys_drive = L'c';
+    std::wstring env_sys = ReadEnvVarW(L"SystemDrive");
+    if (!env_sys.empty()) {
+        sys_drive = AsciiLowerW(env_sys[0]);
+    }
+    const wchar_t drv = AsciiLowerW(path[0]);
+    return drv == L'c' || drv == sys_drive;
+}
+
+std::wstring ResolveDefaultWorkDirW(std::wstring_view anchor_dir) {
+    // 1. Explicit OPENSCARLETT_WORK_DIR override takes highest precedence.
+    std::wstring env_work = ReadEnvVarW(L"OPENSCARLETT_WORK_DIR");
+    if (!env_work.empty()) {
+        return NormalizePathRootW(env_work);
+    }
+
+#if defined(_WIN32)
+    // 2. If %TEMP% was explicitly redirected off the C:\ system drive (e.g. build.cmd /
+    //    build_wt.cmd setting TEMP=E:\OpenScarlett\.tmp\...), honor that isolated scratch root
+    //    while still strictly preventing any C:\ leakage.
+    std::wstring env_temp = ReadEnvVarW(L"TEMP");
+    if (env_temp.empty()) {
+        env_temp = ReadEnvVarW(L"TMP");
+    }
+    if (!env_temp.empty() && !IsOnSystemDriveW(env_temp)) {
+        std::wstring custom_temp = NormalizePathRootW(env_temp);
+        if (!custom_temp.empty() && IsDirectoryWritableW(custom_temp)) {
+            return custom_temp;
+        }
+    }
+
+    // 3. Derive from anchor_dir (or running executable's directory) if writable.
+    std::wstring base_dir = anchor_dir.empty() ? GetRunningExeDirW() : NormalizePathRootW(anchor_dir);
+    if (!base_dir.empty()) {
+        std::filesystem::path p(base_dir);
+        std::wstring leaf_lo = ToLowerAsciiW(p.filename().wstring());
+
+        // Handle multi-config build outputs such as "...\build\Release" or "...\bin\Debug".
+        if (leaf_lo == L"debug" || leaf_lo == L"release" ||
+            leaf_lo == L"relwithdebinfo" || leaf_lo == L"minsizerel") {
+            const std::filesystem::path parent = p.parent_path();
+            const std::wstring parent_lo = ToLowerAsciiW(parent.filename().wstring());
+            if (parent_lo == L"build" || parent_lo == L"bin") {
+                p = parent;
+                leaf_lo = parent_lo;
+            }
+        }
+
+        std::wstring candidate;
+        if ((leaf_lo == L"build" || leaf_lo == L"bin") &&
+            p.has_parent_path() && p.parent_path() != p.root_path()) {
+            candidate = NormalizePathRootW((p.parent_path() / L".tmp" / L"openscarlett_run").wstring());
+        } else {
+            candidate = NormalizePathRootW((p / L".openscarlett_tmp").wstring());
+        }
+
+        if (!candidate.empty() && IsDirectoryWritableW(candidate)) {
+            return candidate;
+        }
+    }
+
+    // 4. Only fall back to %TEMP%\openscarlett when the executable/anchor directory is read-only.
+    if (!env_temp.empty()) {
+        return NormalizePathRootW(env_temp + L"\\openscarlett");
+    }
+    return std::wstring(kDefaultWorkDirFallbackW);
+#else
+    (void)anchor_dir;
+    return std::wstring(kDefaultWorkDirFallbackW);
+#endif
+}
+
+std::string ResolveDefaultWorkDirUtf8(std::string_view anchor_dir) {
+    return WideToUtf8(ResolveDefaultWorkDirW(Utf8ToWide(anchor_dir)));
+}
+
+std::wstring ResolveDefaultVfsRootW(std::wstring_view anchor_dir) {
+    return NormalizePathRootW(ResolveDefaultWorkDirW(anchor_dir) + L"\\vfs");
+}
+
+std::wstring ResolveDefaultTelemetryDirW(std::wstring_view anchor_dir) {
+    return NormalizePathRootW(ResolveDefaultWorkDirW(anchor_dir) + L"\\telemetry");
+}
+
 VfsMounts::VfsMounts(const VfsMountConfig& config) {
     Configure(config);
 }
@@ -443,12 +608,7 @@ VfsMountConfig VfsMounts::BuildDefaultConfig(std::wstring_view default_g_root,
     if (!default_vfs_root.empty()) {
         base_vfs = NormalizeRoot(default_vfs_root);
     } else {
-        std::wstring env_temp = ReadEnvVarW(L"TEMP");
-        if (!env_temp.empty()) {
-            base_vfs = NormalizeRoot(env_temp + L"\\vfs");
-        } else {
-            base_vfs = std::wstring(kDefaultVfsRootW);
-        }
+        base_vfs = ResolveDefaultVfsRootW();
     }
 
     std::wstring env_g = ReadEnvVarW(L"OPENSCARLETT_VFS_G");
@@ -488,20 +648,7 @@ VfsMountConfig VfsMounts::BuildDefaultConfig(std::wstring_view default_g_root,
 }
 
 std::wstring VfsMounts::NormalizeRoot(std::wstring_view root) {
-    if (root.empty()) {
-        return {};
-    }
-    std::wstring out(root);
-    for (wchar_t& c : out) {
-        if (c == L'/') {
-            c = L'\\';
-        }
-    }
-    const size_t min_len = IsExtendedPrefixW(out) ? 7u : 3u;
-    while (out.size() > min_len && out.back() == L'\\') {
-        out.pop_back();
-    }
-    return out;
+    return NormalizePathRootW(root);
 }
 
 void VfsMounts::Configure(const VfsMountConfig& config) {

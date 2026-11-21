@@ -12,6 +12,7 @@
 #include "openscarlett/loader/apc_injector.h"
 #include "openscarlett/loader/game_config.h"
 #include "openscarlett/loader/pe_inspector.h"
+#include "openscarlett/loader/vfs_mounts.h"
 
 #if defined(_WIN32)
 #include <d3d12.h>
@@ -256,16 +257,24 @@ bool ExtractJsonUintField(const std::string& line, const std::string& key, uint6
     return true;
 }
 
-void PrintTelemetrySummary(const std::string& json_path) {
+struct TelemetrySummaryInfo {
+    bool file_written = false;
+    size_t tracked_symbols = 0;
+    size_t blocker_count = 0;
+};
+
+TelemetrySummaryInfo PrintTelemetrySummary(const std::string& json_path) {
+    TelemetrySummaryInfo info{};
     if (json_path.empty() || !std::filesystem::exists(json_path)) {
         std::printf("Telemetry    : (no report written)\n");
-        return;
+        return info;
     }
     std::ifstream ifs(json_path);
     if (!ifs) {
         std::printf("Telemetry    : %s (unreadable)\n", json_path.c_str());
-        return;
+        return info;
     }
+    info.file_written = true;
 
     struct BlockerRow {
         std::string module;
@@ -294,6 +303,9 @@ void PrintTelemetrySummary(const std::string& json_path) {
         }
     }
 
+    info.tracked_symbols = total_entries;
+    info.blocker_count = blockers.size();
+
     std::printf("Telemetry    : %s (%zu symbols tracked, %zu missing blockers)\n",
                 json_path.c_str(),
                 total_entries,
@@ -306,6 +318,7 @@ void PrintTelemetrySummary(const std::string& json_path) {
                     static_cast<unsigned long long>(blockers[i].not_impl),
                     static_cast<unsigned long long>(blockers[i].total));
     }
+    return info;
 }
 
 int RunGuestExecutable(int argc, char** argv) {
@@ -409,18 +422,10 @@ int RunGuestExecutable(int argc, char** argv) {
             stem = std::filesystem::path(opts.exe_path).stem().string();
         }
         if (stem.empty()) stem = "guest";
-        std::filesystem::path tel_base;
-#if defined(_WIN32)
-        char temp_buf[1024]{};
-        DWORD tlen = GetEnvironmentVariableA("TEMP", temp_buf, static_cast<DWORD>(sizeof(temp_buf)));
-        if (tlen > 0 && tlen < sizeof(temp_buf)) {
-            tel_base = std::filesystem::path(temp_buf) / "telemetry";
-        } else {
-            tel_base = std::filesystem::path("E:\\OpenScarlett\\.tmp\\telemetry");
-        }
-#else
-        tel_base = std::filesystem::temp_directory_path() / "openscarlett_telemetry";
-#endif
+        const std::wstring anchor_w = opts.shim_dir.empty()
+                                          ? std::wstring{}
+                                          : openscarlett::Utf8ToWide(opts.shim_dir);
+        const std::filesystem::path tel_base(openscarlett::ResolveDefaultTelemetryDirW(anchor_w));
         opts.telemetry_output_path = (tel_base / (stem + "_telemetry.json")).string();
     }
 
@@ -498,7 +503,15 @@ int RunGuestExecutable(int argc, char** argv) {
     std::printf("VFS S:\\      : %s\n", res.resolved_vfs_s.c_str());
     std::printf("Guest PID    : %u\n", res.process_id);
     std::printf("Exit Code    : %u%s\n", res.exit_code, res.timed_out ? " (TIMED OUT)" : "");
-    PrintTelemetrySummary(res.resolved_telemetry_path);
+    const TelemetrySummaryInfo tel_info = PrintTelemetrySummary(res.resolved_telemetry_path);
+
+    if (st.ok()) {
+        const auto diag = openscarlett::DiagnoseStoreBootstrapper(
+            res, tel_info.tracked_symbols, tel_info.file_written);
+        if (diag.suspected_store_bootstrapper) {
+            std::printf("Diagnostic   : %s\n", diag.message.c_str());
+        }
+    }
 
     if (!st.ok()) {
         std::fprintf(stderr, "run failed: %s\n", st.message.c_str());

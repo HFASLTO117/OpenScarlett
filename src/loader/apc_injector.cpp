@@ -756,8 +756,10 @@ Status LaunchWithApcHook(const LaunchOptions& options, LaunchResult& out_result)
         title_folder = SanitizeFolderSegment(resolved_title_id);
     }
 
-    // Build default VFS mounts strictly on E:\ / %TEMP% without modifying the guest directory.
-    VfsMountConfig defaults = VfsMounts::BuildDefaultConfig(pkg_root_w);
+    // Build default VFS mounts anchored to OPENSCARLETT_WORK_DIR / shim_dir (never C:\ when writable)
+    // without modifying the guest directory.
+    VfsMountConfig defaults =
+        VfsMounts::BuildDefaultConfig(pkg_root_w, ResolveDefaultVfsRootW(shim_dir_w));
     std::wstring vfs_g_w;
     if (!options.vfs_g.empty()) {
         vfs_g_w = ResolveAbsolutePathW(Utf8ToWide(options.vfs_g));
@@ -946,6 +948,85 @@ Status LaunchWithApcHook(const LaunchOptions& options, LaunchResult& out_result)
     ::CloseHandle(pi.hProcess);
     return Status::Ok();
 #endif
+}
+
+StoreBootstrapDiagnostic DiagnoseStoreBootstrapper(const LaunchResult& result,
+                                                   size_t tracked_telemetry_symbols,
+                                                   bool telemetry_file_written) {
+    StoreBootstrapDiagnostic diag{};
+
+    std::string exe_lower = result.resolved_exe_path;
+    for (char& c : exe_lower) {
+        if (c == '/') {
+            c = '\\';
+        } else if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
+    }
+
+    diag.in_windows_apps = (exe_lower.find("\\windowsapps\\") != std::string::npos);
+    diag.in_xbox_games = (exe_lower.find("\\xboxgames\\") != std::string::npos);
+
+    std::string filename_lo;
+    {
+        const size_t slash = exe_lower.find_last_of('\\');
+        filename_lo = (slash == std::string::npos) ? exe_lower : exe_lower.substr(slash + 1);
+    }
+    diag.is_gamelaunchhelper = (filename_lo == "gamelaunchhelper.exe");
+
+    diag.has_game_config = !result.resolved_config_path.empty();
+    if (!diag.has_game_config && !result.resolved_exe_path.empty()) {
+        std::error_code ec;
+        const std::filesystem::path exe_dir = std::filesystem::path(result.resolved_exe_path).parent_path();
+        if (!exe_dir.empty() && std::filesystem::exists(exe_dir, ec)) {
+            if (std::filesystem::exists(exe_dir / "MicrosoftGame.config", ec) ||
+                std::filesystem::exists(exe_dir / "MicrosoftGame.Config", ec) ||
+                std::filesystem::exists(exe_dir / "MicrosoftGameConfig.mgc", ec)) {
+                diag.has_game_config = true;
+            }
+        }
+    }
+
+    // Only flag when the process exited cleanly (code 0, not timed out) with 0 tracked symbols.
+    if (result.exit_code != 0 || result.timed_out || tracked_telemetry_symbols > 0) {
+        return diag;
+    }
+
+    diag.suspected_store_bootstrapper = true;
+
+    std::vector<std::string> signals;
+    if (diag.is_gamelaunchhelper) {
+        signals.emplace_back("gamelaunchhelper.exe bootstrapper");
+    }
+    if (diag.in_windows_apps) {
+        signals.emplace_back("WindowsApps package path");
+    }
+    if (diag.in_xbox_games) {
+        signals.emplace_back("XboxGames package path");
+    }
+    if (diag.has_game_config) {
+        signals.emplace_back("MicrosoftGame.config present");
+    }
+    if (!telemetry_file_written) {
+        signals.emplace_back("no hook telemetry report written");
+    } else {
+        signals.emplace_back("0 tracked hook/shim symbols");
+    }
+
+    for (size_t i = 0; i < signals.size(); ++i) {
+        if (i > 0) diag.reason += ", ";
+        diag.reason += signals[i];
+    }
+
+    diag.message =
+        "Target exited with code 0 and 0 tracked OpenScarlett hook/shim symbols (" + diag.reason + ").\n"
+        "               Microsoft Store / Xbox Play Anywhere bootstrapper executables (such as\n"
+        "               gamelaunchhelper.exe or AppModel launchers under WindowsApps / XboxGames)\n"
+        "               delegate launch to Windows GamingServices and exit immediately with code 0\n"
+        "               after spawning a detached AppModel child process.\n"
+        "               OpenScarlett strictly respects Windows Store / AppModel boundaries and\n"
+        "               does not bypass Windows Store ACLs or DRM.";
+    return diag;
 }
 
 }  // namespace openscarlett

@@ -490,6 +490,11 @@ HMODULE LoadRoutedDll(const openscarlett::DllRouteDecision& decision,
             sanitized_flags |= LOAD_WITH_ALTERED_SEARCH_PATH;
         }
         loaded = g_real_LoadLibraryExW(target_path.c_str(), hFile, sanitized_flags);
+    } else if (g_real_LoadLibraryExW != nullptr &&
+               target_path.find_first_of(L"\\/") != std::wstring::npos) {
+        // Use LOAD_WITH_ALTERED_SEARCH_PATH so dependent shims (e.g. XSAPI -> xgameruntime.dll /
+        // libHttpClient.GDK.dll) resolve from shim_dir BEFORE C:\Windows\System32\.
+        loaded = g_real_LoadLibraryExW(target_path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
     } else {
         loaded = g_real_LoadLibraryW(target_path.c_str());
     }
@@ -498,6 +503,15 @@ HMODULE LoadRoutedDll(const openscarlett::DllRouteDecision& decision,
 
     if (!g_shutting_down.load(std::memory_order_acquire)) {
         const bool is_shim = (decision.policy == openscarlett::DllRoutePolicy::Shim);
+        if (decision.aliased && !decision.requested_name.empty()) {
+            openscarlett::CallTelemetry::Global().Record(
+                "loader",
+                std::string("dll_alias:") + decision.requested_name + "->" + decision.canonical_name,
+                loaded != nullptr ? openscarlett::CallOutcome::Ok
+                                  : openscarlett::CallOutcome::NotImplemented,
+                loaded != nullptr ? 0 : static_cast<int32_t>(last_err),
+                -1);
+        }
         if (loaded != nullptr) {
             if (is_shim) {
                 RegisterXboxModule(loaded, decision.canonical_name);
@@ -1553,6 +1567,73 @@ void InspectModuleTlsAndPdata(HMODULE mod,
 #endif
 }
 
+bool IsModuleInShimDir(HMODULE mod) {
+    if (!mod || g_shim_dir_w.empty()) {
+        return false;
+    }
+    std::wstring path = GetModulePathW(mod);
+    if (path.empty()) {
+        return false;
+    }
+    std::wstring path_lo = ToLowerAsciiW(path);
+    std::wstring shim_lo = ToLowerAsciiW(g_shim_dir_w);
+    for (wchar_t& c : path_lo) {
+        if (c == L'/') c = L'\\';
+    }
+    for (wchar_t& c : shim_lo) {
+        if (c == L'/') c = L'\\';
+    }
+    if (!shim_lo.empty() && shim_lo.back() != L'\\') {
+        shim_lo.push_back(L'\\');
+    }
+    return path_lo.rfind(shim_lo, 0) == 0;
+}
+
+uint32_t RebindShimIatTable(uint8_t* base,
+                            uint32_t image_size,
+                            uint32_t int_rva,
+                            uint32_t iat_rva,
+                            HMODULE shim_mod) {
+    if (!shim_mod || !g_real_GetProcAddress || iat_rva == 0 || iat_rva >= image_size) {
+        return 0;
+    }
+    if (int_rva == 0 || int_rva >= image_size) {
+        return 0;
+    }
+    auto* iat = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + iat_rva);
+    auto* orig = reinterpret_cast<IMAGE_THUNK_DATA64*>(base + int_rva);
+    uint32_t patched = 0;
+
+    for (size_t i = 0; i < 16384; ++i) {
+        if (iat_rva + (i + 1) * sizeof(IMAGE_THUNK_DATA64) > image_size ||
+            int_rva + (i + 1) * sizeof(IMAGE_THUNK_DATA64) > image_size) {
+            break;
+        }
+        const ULONGLONG ord_val = orig[i].u1.Ordinal;
+        if (ord_val == 0 || iat[i].u1.Function == 0) {
+            break;
+        }
+        LPCSTR proc_key = nullptr;
+        if ((ord_val & IMAGE_ORDINAL_FLAG64) != 0) {
+            proc_key = reinterpret_cast<LPCSTR>(static_cast<uintptr_t>(ord_val & 0xFFFFu));
+        } else {
+            const uint32_t name_rva = static_cast<uint32_t>(orig[i].u1.AddressOfData);
+            if (name_rva + sizeof(WORD) + 1 >= image_size) {
+                continue;
+            }
+            const auto* ibn = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(base + name_rva);
+            proc_key = ibn->Name;
+        }
+        FARPROC shim_proc = g_real_GetProcAddress(shim_mod, proc_key);
+        if (shim_proc != nullptr) {
+            if (WriteIatSlot(&iat[i].u1.Function, reinterpret_cast<void*>(shim_proc))) {
+                ++patched;
+            }
+        }
+    }
+    return patched;
+}
+
 void PatchModuleImports(HMODULE mod) {
     if (!mod || IsWindowsSystemModule(mod)) {
         return;
@@ -1572,6 +1653,14 @@ void PatchModuleImports(HMODULE mod) {
 
     const uint32_t image_size = nt->OptionalHeader.SizeOfImage;
     const uint32_t timestamp = nt->FileHeader.TimeDateStamp;
+    const bool is_shim_module = IsModuleInShimDir(mod);
+
+    struct DeferredShimIat {
+        openscarlett::DllRouteDecision decision;
+        uint32_t int_rva = 0;
+        uint32_t iat_rva = 0;
+    };
+    std::vector<DeferredShimIat> deferred_shim_iats;
 
     ::AcquireSRWLockExclusive(&g_patch_lock);
     auto it = g_patched_modules.find(mod);
@@ -1598,10 +1687,16 @@ void PatchModuleImports(HMODULE mod) {
                 continue;
             }
             const char* dll_name = reinterpret_cast<const char*>(base + d.Name);
-            if (!IsHookableImportDll(dll_name)) {
-                continue;
+            if (IsHookableImportDll(dll_name)) {
+                PatchThunkTable(base, image_size, d.OriginalFirstThunk, d.FirstThunk);
+            } else if (!is_shim_module) {
+                const auto decision = g_routing_table.ResolveRoute(dll_name, g_shim_dir_w, g_guest_dir_w);
+                if (decision.policy == openscarlett::DllRoutePolicy::Shim &&
+                    !decision.resolved_path.empty()) {
+                    deferred_shim_iats.push_back(
+                        DeferredShimIat{decision, d.OriginalFirstThunk, d.FirstThunk});
+                }
             }
-            PatchThunkTable(base, image_size, d.OriginalFirstThunk, d.FirstThunk);
         }
     }
 
@@ -1633,6 +1728,31 @@ void PatchModuleImports(HMODULE mod) {
 
     g_patched_modules[mod] = PatchedModuleKey{mod, image_size, timestamp};
     ::ReleaseSRWLockExclusive(&g_patch_lock);
+
+    // 3. Rebind static IAT slots for routed/aliased Xbox shims (outside g_patch_lock).
+    for (const auto& entry : deferred_shim_iats) {
+        HMODULE shim_mod = g_real_GetModuleHandleW
+                               ? g_real_GetModuleHandleW(entry.decision.resolved_path.c_str())
+                               : nullptr;
+        if (!shim_mod && g_initialized.load(std::memory_order_acquire)) {
+            shim_mod = LoadRoutedDll(entry.decision, entry.decision.resolved_path,
+                                     "IAT:route", nullptr, 0, false);
+        }
+        if (shim_mod != nullptr) {
+            const uint32_t patched = RebindShimIatTable(
+                base, image_size, entry.int_rva, entry.iat_rva, shim_mod);
+            if (patched > 0 && entry.decision.aliased && !entry.decision.requested_name.empty() &&
+                !g_shutting_down.load(std::memory_order_acquire)) {
+                openscarlett::CallTelemetry::Global().Record(
+                    "loader",
+                    std::string("iat_alias:") + entry.decision.requested_name + "->" +
+                        entry.decision.canonical_name,
+                    openscarlett::CallOutcome::Ok,
+                    static_cast<int32_t>(patched),
+                    -1);
+            }
+        }
+    }
 
     InspectModuleTlsAndPdata(mod, base, nt, image_size);
 }
@@ -1739,7 +1859,8 @@ bool InitializeHookRuntime(HMODULE self_mod) {
 
     std::wstring main_exe_path = GetModulePathW(nullptr);
     std::wstring main_exe_dir = std::filesystem::path(main_exe_path).parent_path().wstring();
-    g_vfs.Configure(openscarlett::VfsMounts::BuildDefaultConfig(main_exe_dir));
+    const std::wstring default_vfs_root = openscarlett::ResolveDefaultVfsRootW(g_shim_dir_w);
+    g_vfs.Configure(openscarlett::VfsMounts::BuildDefaultConfig(main_exe_dir, default_vfs_root));
     g_guest_dir_w = g_vfs.GetGameRoot().empty() ? main_exe_dir : g_vfs.GetGameRoot();
 
     PatchAllLoadedNonSystemModules();
