@@ -10,6 +10,7 @@
 
 #include "openscarlett/core/telemetry.h"
 #include "openscarlett/gpu/rdna2_disasm.h"
+#include "openscarlett/gpu/rdna2_interpreter.h"
 #include "openscarlett/gpu/rdna2_ir.h"
 #include "openscarlett/gpu/rdna2_lifter.h"
 #include "openscarlett/gpu/vulkan_backend.h"
@@ -622,6 +623,294 @@ struct D3D12TestContext {
         std::memcpy(out_rgba8.data(), mapped, kTotalBytes);
         readback->Unmap(0, nullptr);
     }
+
+    // Runs 3D IMAGE_LOAD_MIP (t0), Cube/2DArray IMAGE_LOAD_MIP (t1), and 2D R32_UINT IMAGE_ATOMIC_CMPSWAP (u2)
+    // alongside output buffer (u1) on live D3D12 HW and WARP!
+    void RunComputeMimg3dCubeAtomic(const std::vector<uint8_t>& dxil,
+                                    const openscarlett::Rdna2CpuTexture& tex3d,
+                                    const openscarlett::Rdna2CpuTexture& texcube,
+                                    uint32_t initial_atomic_val,
+                                    std::vector<uint32_t>& out_buf,
+                                    uint32_t& out_final_atomic_val) {
+        out_buf.assign(64, 0u);
+        out_final_atomic_val = 0u;
+
+        // Root signature:
+        // Param 0: root UAV u1 (_out0)
+        // Param 1: descriptor table [t0 (3D SRV), t1 (Cube 2DArray SRV), u2 (RWTexture2D<uint>)]
+        D3D12_DESCRIPTOR_RANGE ranges[2]{};
+        ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        ranges[0].NumDescriptors = 2;
+        ranges[0].BaseShaderRegister = 0;
+        ranges[0].OffsetInDescriptorsFromTableStart = 0;
+
+        ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+        ranges[1].NumDescriptors = 1;
+        ranges[1].BaseShaderRegister = 2;
+        ranges[1].OffsetInDescriptorsFromTableStart = 2;
+
+        D3D12_ROOT_PARAMETER params[2]{};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+        params[0].Descriptor.ShaderRegister = 1;
+        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[1].DescriptorTable.NumDescriptorRanges = 2;
+        params[1].DescriptorTable.pDescriptorRanges = ranges;
+        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+        D3D12_ROOT_SIGNATURE_DESC rsd{};
+        rsd.NumParameters = 2;
+        rsd.pParameters = params;
+        ComPtr<ID3DBlob> sig_blob;
+        ComPtr<ID3DBlob> err_blob;
+        OS_REQUIRE(SUCCEEDED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig_blob, &err_blob)));
+        ComPtr<ID3D12RootSignature> root_sig;
+        OS_REQUIRE(SUCCEEDED(device->CreateRootSignature(0, sig_blob->GetBufferPointer(), sig_blob->GetBufferSize(),
+                                                         IID_PPV_ARGS(&root_sig))));
+
+        D3D12_COMPUTE_PIPELINE_STATE_DESC cpd{};
+        cpd.pRootSignature = root_sig.Get();
+        cpd.CS = {dxil.data(), dxil.size()};
+        ComPtr<ID3D12PipelineState> pso;
+        HRESULT hr = device->CreateComputePipelineState(&cpd, IID_PPV_ARGS(&pso));
+        if (FAILED(hr)) {
+            std::fprintf(stderr, "[FAIL] RunComputeMimg3dCubeAtomic PSO failed on %s: hr=0x%08lX\n",
+                         adapter_name.c_str(), static_cast<unsigned long>(hr));
+        }
+        OS_REQUIRE(SUCCEEDED(hr));
+
+        D3D12_HEAP_PROPERTIES hp_def{};
+        hp_def.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+        // 1. 3D texture 4x4x4 with 2 mips (mip0: 4x4x4, mip1: 2x2x2)
+        D3D12_RESOURCE_DESC td3d{};
+        td3d.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+        td3d.Width = 4;
+        td3d.Height = 4;
+        td3d.DepthOrArraySize = 4;
+        td3d.MipLevels = 2;
+        td3d.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        td3d.SampleDesc.Count = 1;
+        ComPtr<ID3D12Resource> res_3d;
+        OS_REQUIRE(SUCCEEDED(device->CreateCommittedResource(&hp_def, D3D12_HEAP_FLAG_NONE, &td3d,
+                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                             IID_PPV_ARGS(&res_3d))));
+
+        // 2. Cube texture as 2DArray (4x4, 6 faces, 2 mips)
+        D3D12_RESOURCE_DESC tdcube{};
+        tdcube.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        tdcube.Width = 4;
+        tdcube.Height = 4;
+        tdcube.DepthOrArraySize = 6;
+        tdcube.MipLevels = 2;
+        tdcube.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        tdcube.SampleDesc.Count = 1;
+        ComPtr<ID3D12Resource> res_cube;
+        OS_REQUIRE(SUCCEEDED(device->CreateCommittedResource(&hp_def, D3D12_HEAP_FLAG_NONE, &tdcube,
+                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                             IID_PPV_ARGS(&res_cube))));
+
+        // 3. Atomic 2D R32_UINT texture (4x4)
+        D3D12_RESOURCE_DESC tdatom{};
+        tdatom.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        tdatom.Width = 4;
+        tdatom.Height = 4;
+        tdatom.DepthOrArraySize = 1;
+        tdatom.MipLevels = 1;
+        tdatom.Format = DXGI_FORMAT_R32_UINT;
+        tdatom.SampleDesc.Count = 1;
+        tdatom.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        ComPtr<ID3D12Resource> res_atom;
+        OS_REQUIRE(SUCCEEDED(device->CreateCommittedResource(&hp_def, D3D12_HEAP_FLAG_NONE, &tdatom,
+                                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                             IID_PPV_ARGS(&res_atom))));
+
+        // Upload staging buffers (row pitch = 256 bytes minimum D3D12 alignment)
+        auto up_3d_m1 = CreateBuffer(256u * 2u * 2u, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
+                                     D3D12_RESOURCE_STATE_GENERIC_READ);
+        {
+            void* p = nullptr;
+            OS_REQUIRE(SUCCEEDED(up_3d_m1->Map(0, nullptr, &p)));
+            auto* dst = static_cast<uint8_t*>(p);
+            std::memset(dst, 0, 256u * 4u);
+            for (uint32_t z = 0; z < 2u; ++z) {
+                for (uint32_t y = 0; y < 2u; ++y) {
+                    auto* row = reinterpret_cast<float*>(dst + (z * 2u + y) * 256u);
+                    for (uint32_t x = 0; x < 2u; ++x) {
+                        auto c = tex3d.LoadRgba32f(x, y, z, 1u);
+                        row[x * 4 + 0] = c[0]; row[x * 4 + 1] = c[1];
+                        row[x * 4 + 2] = c[2]; row[x * 4 + 3] = c[3];
+                    }
+                }
+            }
+            up_3d_m1->Unmap(0, nullptr);
+        }
+
+        // Cube mip1 upload for all 6 faces (each 2x2 slice needs 512 bytes)
+        auto up_cube_m1 = CreateBuffer(512u * 6u, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
+                                       D3D12_RESOURCE_STATE_GENERIC_READ);
+        {
+            void* p = nullptr;
+            OS_REQUIRE(SUCCEEDED(up_cube_m1->Map(0, nullptr, &p)));
+            auto* dst = static_cast<uint8_t*>(p);
+            std::memset(dst, 0, 512u * 6u);
+            for (uint32_t f = 0; f < 6u; ++f) {
+                for (uint32_t y = 0; y < 2u; ++y) {
+                    auto* row = reinterpret_cast<float*>(dst + f * 512u + y * 256u);
+                    for (uint32_t x = 0; x < 2u; ++x) {
+                        auto c = texcube.LoadRgba32f(x, y, f, 1u);
+                        row[x * 4 + 0] = c[0]; row[x * 4 + 1] = c[1];
+                        row[x * 4 + 2] = c[2]; row[x * 4 + 3] = c[3];
+                    }
+                }
+            }
+            up_cube_m1->Unmap(0, nullptr);
+        }
+
+        auto up_atom = CreateBuffer(256u * 4u, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
+                                    D3D12_RESOURCE_STATE_GENERIC_READ);
+        {
+            void* p = nullptr;
+            OS_REQUIRE(SUCCEEDED(up_atom->Map(0, nullptr, &p)));
+            auto* dst = static_cast<uint8_t*>(p);
+            std::memset(dst, 0, 256u * 4u);
+            for (uint32_t y = 0; y < 4u; ++y) {
+                auto* row = reinterpret_cast<uint32_t*>(dst + y * 256u);
+                for (uint32_t x = 0; x < 4u; ++x) row[x] = initial_atomic_val;
+            }
+            up_atom->Unmap(0, nullptr);
+        }
+
+        auto out_gpu = CreateBuffer(64u * 4u, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        auto rb_buf = CreateBuffer(64u * 4u, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+                                   D3D12_RESOURCE_STATE_COPY_DEST);
+        auto rb_atom = CreateBuffer(256u * 4u, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+                                    D3D12_RESOURCE_STATE_COPY_DEST);
+
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hd.NumDescriptors = 3;
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        ComPtr<ID3D12DescriptorHeap> heap;
+        OS_REQUIRE(SUCCEEDED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap))));
+        const UINT inc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        D3D12_CPU_DESCRIPTOR_HANDLE h0 = heap->GetCPUDescriptorHandleForHeapStart();
+        D3D12_CPU_DESCRIPTOR_HANDLE h1 = {h0.ptr + inc};
+        D3D12_CPU_DESCRIPTOR_HANDLE h2 = {h0.ptr + inc * 2u};
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv3d{};
+        srv3d.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        srv3d.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
+        srv3d.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv3d.Texture3D.MipLevels = 2;
+        device->CreateShaderResourceView(res_3d.Get(), &srv3d, h0);
+
+        D3D12_SHADER_RESOURCE_VIEW_DESC srvcube{};
+        srvcube.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        srvcube.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        srvcube.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srvcube.Texture2DArray.MipLevels = 2;
+        srvcube.Texture2DArray.ArraySize = 6;
+        device->CreateShaderResourceView(res_cube.Get(), &srvcube, h1);
+
+        D3D12_UNORDERED_ACCESS_VIEW_DESC uav_atom{};
+        uav_atom.Format = DXGI_FORMAT_R32_UINT;
+        uav_atom.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+        device->CreateUnorderedAccessView(res_atom.Get(), nullptr, &uav_atom, h2);
+
+        OS_REQUIRE(SUCCEEDED(allocator->Reset()));
+        OS_REQUIRE(SUCCEEDED(cmd_list->Reset(allocator.Get(), pso.Get())));
+
+        // Copy 3D mip 1 (subresource 1)
+        {
+            D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+            src.pResource = up_3d_m1.Get();
+            src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            src.PlacedFootprint.Footprint = {DXGI_FORMAT_R32G32B32A32_FLOAT, 2, 2, 2, 256};
+            dst.pResource = res_3d.Get();
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            dst.SubresourceIndex = 1;
+            cmd_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        }
+        // Copy Cube mip 1 for each face f (subresource = f * 2 + 1)
+        for (UINT f = 0; f < 6u; ++f) {
+            D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+            src.pResource = up_cube_m1.Get();
+            src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            src.PlacedFootprint.Offset = f * 512u;
+            src.PlacedFootprint.Footprint = {DXGI_FORMAT_R32G32B32A32_FLOAT, 2, 2, 1, 256};
+            dst.pResource = res_cube.Get();
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            dst.SubresourceIndex = f * 2u + 1u;
+            cmd_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        }
+        // Copy atomic texture
+        {
+            D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+            src.pResource = up_atom.Get();
+            src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            src.PlacedFootprint.Footprint = {DXGI_FORMAT_R32_UINT, 4, 4, 1, 256};
+            dst.pResource = res_atom.Get();
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            dst.SubresourceIndex = 0;
+            cmd_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        }
+
+        D3D12_RESOURCE_BARRIER bars[3]{};
+        bars[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        bars[0].Transition = {res_3d.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                              D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+        bars[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        bars[1].Transition = {res_cube.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                              D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+        bars[2].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        bars[2].Transition = {res_atom.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                              D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+        cmd_list->ResourceBarrier(3, bars);
+
+        ID3D12DescriptorHeap* heaps[] = {heap.Get()};
+        cmd_list->SetDescriptorHeaps(1, heaps);
+        cmd_list->SetComputeRootSignature(root_sig.Get());
+        cmd_list->SetComputeRootUnorderedAccessView(0, out_gpu->GetGPUVirtualAddress());
+        cmd_list->SetComputeRootDescriptorTable(1, heap->GetGPUDescriptorHandleForHeapStart());
+        cmd_list->Dispatch(1, 1, 1);
+
+        D3D12_RESOURCE_BARRIER post[2]{};
+        post[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        post[0].Transition = {out_gpu.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                              D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE};
+        post[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        post[1].Transition = {res_atom.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                              D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE};
+        cmd_list->ResourceBarrier(2, post);
+
+        cmd_list->CopyResource(rb_buf.Get(), out_gpu.Get());
+        {
+            D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
+            src.pResource = res_atom.Get();
+            src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            src.SubresourceIndex = 0;
+            dst.pResource = rb_atom.Get();
+            dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            dst.PlacedFootprint.Footprint = {DXGI_FORMAT_R32_UINT, 4, 4, 1, 256};
+            cmd_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+        }
+
+        OS_REQUIRE(SUCCEEDED(cmd_list->Close()));
+        ID3D12CommandList* lists[] = {cmd_list.Get()};
+        queue->ExecuteCommandLists(1, lists);
+        WaitGpu();
+
+        void* mp = nullptr;
+        OS_REQUIRE(SUCCEEDED(rb_buf->Map(0, nullptr, &mp)));
+        std::memcpy(out_buf.data(), mp, 64u * 4u);
+        rb_buf->Unmap(0, nullptr);
+
+        OS_REQUIRE(SUCCEEDED(rb_atom->Map(0, nullptr, &mp)));
+        out_final_atomic_val = *static_cast<const uint32_t*>(mp);
+        rb_atom->Unmap(0, nullptr);
+    }
 };
 #endif
 
@@ -724,6 +1013,14 @@ void Test1_ComputeAluBranchConstFold(openscarlett::VulkanBackend& vk,
     std::vector<uint32_t> d3d_warp_out;
     d3d_warp.RunComputeBuffers(CompileForDevice(d3d_warp, res.hlsl_source, res.pc_dxil), input, d3d_warp_out, 1);
     verify_golden(d3d_warp_out, "D3D12-WARP");
+
+    // Verify exact parity with Clean-Room CPU RDNA2 Reference Interpreter
+    Rdna2CpuExecState cpu{};
+    cpu.uav0 = input;
+    cpu.uav1.assign(kCount, 0u);
+    OS_REQUIRE(ExecuteRdna2Cpu(res.container, res.instructions, cpu).ok());
+    verify_golden(cpu.uav1, "CPU-Interpreter");
+    OS_REQUIRE(cpu.uav1 == d3d_hw_out);
 
     // Also verify SM 5.0 fallback target emission
     std::string sm50_hlsl, sm50_target;
@@ -838,7 +1135,15 @@ void Test2_DsLdsBarrierAtomics(openscarlett::VulkanBackend& vk,
     d3d_warp.RunComputeBuffers(CompileForDevice(d3d_warp, res.hlsl_source, res.pc_dxil), input, d3d_warp_out, 1);
     verify_golden(d3d_warp_out, "D3D12-WARP");
 
-    std::printf("[PASS] Test 2: DS LDS + S_BARRIER + DS_ADD_RTN_U32 (64/64 unique atomic tickets) -> spirv-val + Vulkan + DXC cs_6_5 + D3D12 HW + WARP\n");
+    // CPU RDNA2 Reference Interpreter parity (verifies LDS + S_BARRIER lockstep + DS_ADD_RTN_U32)
+    Rdna2CpuExecState cpu{};
+    cpu.uav0 = input;
+    cpu.uav1.assign(kCount, 0u);
+    OS_REQUIRE(ExecuteRdna2Cpu(res.container, res.instructions, cpu).ok());
+    OS_REQUIRE(cpu.barriers_synchronized == 2u);
+    verify_golden(cpu.uav1, "CPU-Interpreter");
+
+    std::printf("[PASS] Test 2: DS LDS + S_BARRIER + DS_ADD_RTN_U32 (64/64 unique atomic tickets) -> spirv-val + Vulkan + DXC cs_6_5 + D3D12 HW + WARP + CPU parity\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -958,7 +1263,15 @@ void Test3_Wave64OnWave32(openscarlett::VulkanBackend& vk,
     d3d_warp.RunComputeBuffers(CompileForDevice(d3d_warp, res.hlsl_source, res.pc_dxil), input, d3d_warp_out, 1);
     verify_golden(d3d_warp_out, "D3D12-WARP");
 
-    std::printf("[PASS] Test 3: wave64->wave32 emulation (HW Wave=%u, Ballot64/Count=32/Prefix/ReadLane(42)/Swizzle) -> spirv-val + Vulkan + DXC cs_6_5 + D3D12 HW + WARP\n",
+    // Wave64 CPU RDNA2 Reference Interpreter exact parity vs live GPU!
+    Rdna2CpuExecState cpu{};
+    cpu.uav0 = input;
+    cpu.uav1.assign(320, 0u);
+    OS_REQUIRE(ExecuteRdna2Cpu(res.container, res.instructions, cpu).ok());
+    verify_golden(cpu.uav1, "CPU-Interpreter-Wave64");
+    OS_REQUIRE(cpu.uav1 == d3d_hw_out);
+
+    std::printf("[PASS] Test 3: wave64->wave32 emulation (HW Wave=%u, Ballot64/Count=32/Prefix/ReadLane(42)/Swizzle) -> spirv-val + Vulkan + DXC cs_6_5 + D3D12 HW + WARP + CPU Wave64 parity\n",
                 d3d_hw.wave_min);
 }
 
@@ -1068,7 +1381,16 @@ void Test4_MimgTexturePipeline(D3D12TestContext& d3d_hw, D3D12TestContext& d3d_w
     d3d_warp.RunComputeMimgTexture16x16(CompileForDevice(d3d_warp, res.hlsl_source, res.pc_dxil), in_rgba, warp_out);
     verify_pixels(warp_out, "D3D12-WARP");
 
-    std::printf("[PASS] Test 4: MIMG (IMAGE_LOAD + IMAGE_SAMPLE_LZ + IMAGE_STORE, 16x16 RGBA32F) -> spirv-val + DXC cs_6_5 + D3D12 HW + WARP\n");
+    // CPU RDNA2 Reference Interpreter 16x16 texture parity!
+    Rdna2CpuExecState cpu{};
+    cpu.dispatch_x = 4;
+    cpu.tex2d_srv.AllocateRgba32f(1, 16, 16, 1, 1);
+    cpu.tex2d_srv.mips[0].rgba32f = in_rgba;
+    cpu.tex2d_uav.AllocateRgba32f(1, 16, 16, 1, 1);
+    OS_REQUIRE(ExecuteRdna2Cpu(res.container, res.instructions, cpu).ok());
+    verify_pixels(cpu.tex2d_uav.mips[0].rgba32f, "CPU-Interpreter");
+
+    std::printf("[PASS] Test 4: MIMG (IMAGE_LOAD + IMAGE_SAMPLE_LZ + IMAGE_STORE, 16x16 RGBA32F) -> spirv-val + DXC cs_6_5 + D3D12 HW + WARP + CPU parity\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -1311,6 +1633,368 @@ void Test6_DisasmRoundTripAndEdgeCases() {
     std::printf("[PASS] Test 6: XS2 v2 round-trip, IMAGE_SAMPLE(LOD), DS_ADD_U32 DCE retention, packed EXP Prim, & error diagnostics\n");
 }
 
+// ---------------------------------------------------------------------------
+// Test 7: AAA Opcodes Live Dual-GPU + spirv-val + CPU Interpreter Bit-Exact Parity
+//   7A: V_PERMLANE16_B32, V_PERMLANEX16_B32, V_BFE_U32, V_BFE_I32, V_BFI_B32, SCRATCH_LOAD/STORE
+//   7B: VOP3P (0x33) V_PK_ADD_F16, V_PK_MUL_F16, V_PK_FMA_F16, V_PK_ADD_U16, V_PK_LSHLREV_B16, V_PK_LSHRREV_B16
+//   7C: MIMG 3D IMAGE_LOAD_MIP, Cube IMAGE_LOAD_MIP, & IMAGE_ATOMIC_CMPSWAP
+//   7D: MIMG IMAGE_BVH_INTERSECT_RAY (Möller-Trumbore triangle + AABB slab)
+// ---------------------------------------------------------------------------
+void Test7_AaaOpcodesLiveDualGpuAndCpuParity(openscarlett::VulkanBackend& vk,
+                                             D3D12TestContext& d3d_hw,
+                                             D3D12TestContext& d3d_warp) {
+    using namespace openscarlett;
+
+    auto float_to_bits = [](float f) -> uint32_t {
+        uint32_t b = 0;
+        std::memcpy(&b, &f, sizeof(b));
+        return b;
+    };
+    auto bits_to_float = [](uint32_t b) -> float {
+        float f = 0.0f;
+        std::memcpy(&f, &b, sizeof(f));
+        return f;
+    };
+
+    Rdna2LiftOptions opts{};
+    opts.use_sm65 = true;
+    opts.validate_spirv_external = HasExternalSpirvVal();
+    opts.compile_dxil_with_dxc = true;
+
+    // ----- 7A: Permlane16/X16 + BFE_U32/I32 + BFI_B32 + SCRATCH_LOAD/STORE -----
+    {
+        Rdna2Assembler a;
+        // v1 = tid * 4
+        a.EmitVop2(Rdna2Opcode::V_LSHLREV_B32, 1, Rdna2Operand::InlineInt(2), 0);
+        // v2 = in[tid]
+        a.EmitMubuf(Rdna2Opcode::BUFFER_LOAD_DWORD, 2, 1, 0);
+        // Reverse-lane permute table for 16 lanes: row 0..7 -> 15..8 (0x89ABCDEF), row 8..15 -> 7..0 (0x01234567)
+        a.EmitSop1(Rdna2Opcode::S_MOV_B32, 8, Rdna2Operand::LiteralU32(0x89ABCDEFu));
+        a.EmitSop1(Rdna2Opcode::S_MOV_B32, 9, Rdna2Operand::LiteralU32(0x01234567u));
+        a.EmitVop3(Rdna2Opcode::V_PERMLANE16_B32, 3, Rdna2Operand::Vgpr(2), Rdna2Operand::Sgpr(8), Rdna2Operand::Sgpr(9));
+        a.EmitVop3(Rdna2Opcode::V_PERMLANEX16_B32, 4, Rdna2Operand::Vgpr(2), Rdna2Operand::Sgpr(8), Rdna2Operand::Sgpr(9));
+        // Bitfield ops on v2
+        a.EmitVop3(Rdna2Opcode::V_BFE_U32, 5, Rdna2Operand::Vgpr(2), Rdna2Operand::InlineInt(8), Rdna2Operand::InlineInt(8));
+        a.EmitVop3(Rdna2Opcode::V_BFE_I32, 6, Rdna2Operand::Vgpr(2), Rdna2Operand::InlineInt(8), Rdna2Operand::InlineInt(8));
+        a.EmitVop3(Rdna2Opcode::V_BFI_B32, 7, Rdna2Operand::LiteralU32(0x00FF00FFu), Rdna2Operand::Vgpr(3), Rdna2Operand::Vgpr(4));
+        // Thread-private scratch round-trip: store v7 at scratch[(tid & 3) * 4 + 8], load back into v10
+        a.EmitVop2(Rdna2Opcode::V_AND_B32, 8, Rdna2Operand::InlineInt(3), 0);
+        a.EmitVop2(Rdna2Opcode::V_LSHLREV_B32, 8, Rdna2Operand::InlineInt(2), 8);
+        a.EmitScratch(Rdna2Opcode::SCRATCH_STORE_DWORD, 7, 8, 8);
+        a.EmitScratch(Rdna2Opcode::SCRATCH_LOAD_DWORD, 10, 8, 8);
+
+        // Store 5 outputs per lane across 64 threads -> 320 dwords
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 3, 1, 4, 0);     // out[0..63]   = permlane16
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 4, 1, 4, 256);   // out[64..127] = permlanex16
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 5, 1, 4, 512);   // out[128..191]= bfe_u32
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 6, 1, 4, 768);   // out[192..255]= bfe_i32
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 10, 1, 4, 1024); // out[256..319]= scratch(bfi_b32)
+        a.EmitSopp(Rdna2Opcode::S_ENDPGM);
+
+        const auto xs2 = a.BuildXs2(ShaderStage::Compute, 64, 1, 1, 16, 16, 32);
+        Rdna2LiftResult res{};
+        auto st = LiftRdna2Xs2Shader(xs2, res, opts);
+        if (!st.ok()) {
+            std::fprintf(stderr, "[FAIL] Test7A Lift failed: %s\nHLSL:\n%s\n", st.message.c_str(), res.hlsl_source.c_str());
+        }
+        OS_REQUIRE(st.ok());
+        OS_REQUIRE(res.ir.uses_scratch);
+        VerifySpirvExternalStrict(res.spirv_words, "Test7A_PermlaneBfeBfiScratch");
+
+        std::vector<uint32_t> input(320, 0u);
+        for (uint32_t i = 0; i < 64u; ++i) {
+            input[i] = 0xA0000000u | ((0x80u + i) << 8) | (i * 3u + 1u);
+        }
+
+        // Execute on CPU RDNA2 Reference Interpreter first
+        Rdna2CpuExecState cpu{};
+        cpu.uav0 = input;
+        cpu.uav1.assign(320, 0u);
+        OS_REQUIRE(ExecuteRdna2Cpu(res.container, res.instructions, cpu).ok());
+
+        // Compare bit-for-bit against Vulkan HW, D3D12 HW, and D3D12 WARP!
+        if (vk.GetDeviceInfo().is_hardware) {
+            std::vector<uint32_t> vk_out;
+            OS_REQUIRE(vk.ExecuteComputeShader(res.spirv_words, input, vk_out, 1).ok());
+            OS_REQUIRE(vk_out == cpu.uav1);
+        }
+
+        std::vector<uint32_t> hw_out;
+        d3d_hw.RunComputeBuffers(CompileForDevice(d3d_hw, res.hlsl_source, res.pc_dxil), input, hw_out, 1);
+        OS_REQUIRE(hw_out == cpu.uav1);
+
+        std::vector<uint32_t> warp_out;
+        d3d_warp.RunComputeBuffers(CompileForDevice(d3d_warp, res.hlsl_source, res.pc_dxil), input, warp_out, 1);
+        OS_REQUIRE(warp_out == cpu.uav1);
+    }
+
+    // ----- 7B: VOP3P (0x33) Packed 16-bit f16 & u16/b16 Live Dual-GPU + CPU Parity -----
+    {
+        Rdna2Assembler a;
+        a.EmitVop2(Rdna2Opcode::V_LSHLREV_B32, 1, Rdna2Operand::InlineInt(2), 0);
+        // v2 = in[tid] (packed 2xf16), v3 = in[tid + 64] (packed 2xf16)
+        a.EmitMubuf(Rdna2Opcode::BUFFER_LOAD_DWORD, 2, 1, 0, 0);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_LOAD_DWORD, 3, 1, 0, 256);
+        a.EmitVop3p(Rdna2Opcode::V_PK_ADD_F16, 4, Rdna2Operand::Vgpr(2), Rdna2Operand::Vgpr(3));
+        a.EmitVop3p(Rdna2Opcode::V_PK_MUL_F16, 5, Rdna2Operand::Vgpr(2), Rdna2Operand::Vgpr(3));
+        a.EmitVop3p(Rdna2Opcode::V_PK_FMA_F16, 6, Rdna2Operand::Vgpr(2), Rdna2Operand::Vgpr(3), Rdna2Operand::Vgpr(4));
+        // v7 = in[tid + 128] (packed 2xu16), v8 = packed shift/add (lo=2, hi=3)
+        a.EmitMubuf(Rdna2Opcode::BUFFER_LOAD_DWORD, 7, 1, 0, 512);
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 8, Rdna2Operand::LiteralU32(0x00030002u));
+        a.EmitVop3p(Rdna2Opcode::V_PK_ADD_U16, 9, Rdna2Operand::Vgpr(7), Rdna2Operand::Vgpr(8));
+        a.EmitVop3p(Rdna2Opcode::V_PK_LSHLREV_B16, 10, Rdna2Operand::Vgpr(8), Rdna2Operand::Vgpr(7));
+        a.EmitVop3p(Rdna2Opcode::V_PK_LSHRREV_B16, 11, Rdna2Operand::Vgpr(8), Rdna2Operand::Vgpr(7));
+
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 4, 1, 4, 0);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 5, 1, 4, 256);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 6, 1, 4, 512);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 9, 1, 4, 768);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 10, 1, 4, 1024);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 11, 1, 4, 1280);
+        a.EmitSopp(Rdna2Opcode::S_ENDPGM);
+
+        const auto xs2 = a.BuildXs2(ShaderStage::Compute, 64, 1, 1, 16, 16, 32);
+        Rdna2LiftResult res{};
+        auto st = LiftRdna2Xs2Shader(xs2, res, opts);
+        if (!st.ok()) {
+            std::fprintf(stderr, "[FAIL] Test7B Lift failed: %s\nHLSL:\n%s\n", st.message.c_str(), res.hlsl_source.c_str());
+        }
+        OS_REQUIRE(st.ok());
+        VerifySpirvExternalStrict(res.spirv_words, "Test7B_Vop3pPacked16");
+
+        // Use exact binary16 powers/halves so CPU, Vulkan, D3D12 HW, and WARP match bit-for-bit
+        constexpr uint16_t kHalves[4] = {0x3800u /*0.5*/, 0x3C00u /*1.0*/, 0x3E00u /*1.5*/, 0x4000u /*2.0*/};
+        std::vector<uint32_t> input(384, 0u);
+        for (uint32_t i = 0; i < 64u; ++i) {
+            input[i] = static_cast<uint32_t>(kHalves[i & 3u]) |
+                       (static_cast<uint32_t>(kHalves[(i + 1u) & 3u]) << 16);
+            input[64 + i] = static_cast<uint32_t>(kHalves[(i + 2u) & 3u]) |
+                            (static_cast<uint32_t>(kHalves[(i + 3u) & 3u]) << 16);
+            input[128 + i] = ((i * 11u + 16u) & 0xFFFFu) | (((i * 23u + 64u) & 0xFFFFu) << 16);
+        }
+
+        Rdna2CpuExecState cpu{};
+        cpu.uav0 = input;
+        cpu.uav1.assign(384, 0u);
+        OS_REQUIRE(ExecuteRdna2Cpu(res.container, res.instructions, cpu).ok());
+
+        if (vk.GetDeviceInfo().is_hardware) {
+            std::vector<uint32_t> vk_out;
+            OS_REQUIRE(vk.ExecuteComputeShader(res.spirv_words, input, vk_out, 1).ok());
+            OS_REQUIRE(vk_out == cpu.uav1);
+        }
+
+        std::vector<uint32_t> hw_out;
+        d3d_hw.RunComputeBuffers(CompileForDevice(d3d_hw, res.hlsl_source, res.pc_dxil), input, hw_out, 1);
+        OS_REQUIRE(hw_out == cpu.uav1);
+
+        std::vector<uint32_t> warp_out;
+        d3d_warp.RunComputeBuffers(CompileForDevice(d3d_warp, res.hlsl_source, res.pc_dxil), input, warp_out, 1);
+        OS_REQUIRE(warp_out == cpu.uav1);
+    }
+
+    // ----- 7C: MIMG 3D IMAGE_LOAD_MIP + Cube IMAGE_LOAD_MIP + IMAGE_ATOMIC_CMPSWAP -----
+    {
+        Rdna2Assembler a;
+        // 8 threads: load 3D mip1 texel at (tid&1, (tid>>1)&1, (tid>>2)&1, mip=1)
+        a.EmitVop2(Rdna2Opcode::V_AND_B32, 1, Rdna2Operand::InlineInt(1), 0);
+        a.EmitVop2(Rdna2Opcode::V_LSHRREV_B32, 2, Rdna2Operand::InlineInt(1), 0);
+        a.EmitVop2(Rdna2Opcode::V_AND_B32, 2, Rdna2Operand::InlineInt(1), 2);
+        a.EmitVop2(Rdna2Opcode::V_LSHRREV_B32, 3, Rdna2Operand::InlineInt(2), 0);
+        a.EmitVop2(Rdna2Opcode::V_AND_B32, 3, Rdna2Operand::InlineInt(1), 3);
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 4, Rdna2Operand::InlineInt(1));  // mip = 1
+        // 3D IMAGE_LOAD_MIP v[8:11], v[1:4], dim=2 (3D)
+        a.EmitMimg(Rdna2Opcode::IMAGE_LOAD_MIP, 8, 1, 0, 0, 0xFu, 2u, true);
+
+        // Cube face = (tid & 3) (faces 0..3), coords (1, 0, face, mip=1)
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 12, Rdna2Operand::InlineInt(1));
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 13, Rdna2Operand::InlineInt(0));
+        a.EmitVop2(Rdna2Opcode::V_AND_B32, 14, Rdna2Operand::InlineInt(3), 0);
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 15, Rdna2Operand::InlineInt(1));
+        // Cube IMAGE_LOAD_MIP v[16:19], v[12:15], dim=3 (Cube)
+        a.EmitMimg(Rdna2Opcode::IMAGE_LOAD_MIP, 16, 12, 0, 0, 0xFu, 3u, true);
+
+        // Lane 0 performs IMAGE_ATOMIC_CMPSWAP at (0, 0): if tex == 100 -> swap to 777, returns old (100)
+        a.EmitVopc(Rdna2Opcode::V_CMP_EQ_U32, Rdna2Operand::InlineInt(0), 0);
+        const uint32_t br_skip = a.EmitSopp(Rdna2Opcode::S_CBRANCH_VCCZ);
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 20, Rdna2Operand::LiteralU32(777u));  // vdata[0] = src (new)
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 21, Rdna2Operand::LiteralU32(100u));  // vdata[1] = cmp (expected)
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 22, Rdna2Operand::InlineInt(0));      // x = 0
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 23, Rdna2Operand::InlineInt(0));      // y = 0
+        a.EmitMimg(Rdna2Opcode::IMAGE_ATOMIC_CMPSWAP, 20, 22, 0, 0, 0x1u, 1u, true, true);
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 24, Rdna2Operand::LiteralU32(64u));   // out[16] = prev atomic val
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 20, 24, 4, 0);
+        a.PatchBranch(br_skip, a.CurrentWordOffset());
+
+        // Store 3D.r and Cube.g to u1 (out[tid] = v8, out[8 + tid] = v17)
+        a.EmitVop2(Rdna2Opcode::V_LSHLREV_B32, 25, Rdna2Operand::InlineInt(2), 0);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 8, 25, 4, 0);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 17, 25, 4, 32);
+        a.EmitSopp(Rdna2Opcode::S_ENDPGM);
+
+        const auto xs2 = a.BuildXs2(ShaderStage::Compute, 8, 1, 1, 16, 32, 32);
+        Rdna2LiftResult res{};
+        auto st = LiftRdna2Xs2Shader(xs2, res, opts);
+        if (!st.ok()) {
+            std::fprintf(stderr, "[FAIL] Test7C Lift failed: %s\nHLSL:\n%s\n", st.message.c_str(), res.hlsl_source.c_str());
+        }
+        OS_REQUIRE(st.ok());
+        OS_REQUIRE(res.ir.uses_texture3d_srv && res.ir.uses_texture_cube_srv && res.ir.uses_texture_u32_uav);
+        OS_REQUIRE(SpirvContainsOpcode(res.spirv_words, 95u));   // OpImageFetch
+        OS_REQUIRE(SpirvContainsOpcode(res.spirv_words, 60u));   // OpImageTexelPointer
+        OS_REQUIRE(SpirvContainsOpcode(res.spirv_words, 230u));  // OpAtomicCompareExchange
+        VerifySpirvExternalStrict(res.spirv_words, "Test7C_Mimg3dCubeAtomic");
+
+        Rdna2CpuTexture tex3d{};
+        tex3d.AllocateRgba32f(2, 4, 4, 4, 2);
+        for (uint32_t z = 0; z < 2u; ++z) {
+            for (uint32_t y = 0; y < 2u; ++y) {
+                for (uint32_t x = 0; x < 2u; ++x) {
+                    const size_t idx = ((z * 2u + y) * 2u + x) * 4u;
+                    tex3d.mips[1].rgba32f[idx + 0] = static_cast<float>(x + y * 2u + z * 4u + 1u) * 0.25f;
+                    tex3d.mips[1].rgba32f[idx + 3] = 1.0f;
+                }
+            }
+        }
+        Rdna2CpuTexture texcube{};
+        texcube.AllocateRgba32f(3, 4, 4, 6, 2);
+        for (uint32_t f = 0; f < 6u; ++f) {
+            const size_t idx = ((f * 2u + 0u) * 2u + 1u) * 4u;  // (x=1, y=0, face=f) in mip 1
+            texcube.mips[1].rgba32f[idx + 1] = static_cast<float>(f + 1u) * 0.5f;
+            texcube.mips[1].rgba32f[idx + 3] = 1.0f;
+        }
+
+        Rdna2CpuExecState cpu{};
+        cpu.tex3d_srv = tex3d;
+        cpu.texcube_srv = texcube;
+        cpu.tex_u32_uav.AllocateR32u(1, 4, 4, 1);
+        cpu.tex_u32_uav.mips[0].r32u[0] = 100u;
+        cpu.uav1.assign(64, 0u);
+        OS_REQUIRE(ExecuteRdna2Cpu(res.container, res.instructions, cpu).ok());
+        OS_REQUIRE(cpu.uav1[16] == 100u);
+        OS_REQUIRE(cpu.tex_u32_uav.mips[0].r32u[0] == 777u);
+
+        std::vector<uint32_t> hw_out;
+        uint32_t hw_atom_final = 0u;
+        d3d_hw.RunComputeMimg3dCubeAtomic(
+            CompileForDevice(d3d_hw, res.hlsl_source, res.pc_dxil),
+            tex3d, texcube, 100u, hw_out, hw_atom_final);
+        OS_REQUIRE(hw_atom_final == 777u);
+        OS_REQUIRE(hw_out[16] == 100u);
+        for (uint32_t i = 0; i < 16u; ++i) {
+            OS_REQUIRE(std::fabs(bits_to_float(hw_out[i]) - bits_to_float(cpu.uav1[i])) < 1e-5f);
+        }
+
+        std::vector<uint32_t> warp_out;
+        uint32_t warp_atom_final = 0u;
+        d3d_warp.RunComputeMimg3dCubeAtomic(
+            CompileForDevice(d3d_warp, res.hlsl_source, res.pc_dxil),
+            tex3d, texcube, 100u, warp_out, warp_atom_final);
+        OS_REQUIRE(warp_atom_final == 777u);
+        OS_REQUIRE(warp_out[16] == 100u);
+        for (uint32_t i = 0; i < 16u; ++i) {
+            OS_REQUIRE(std::fabs(bits_to_float(warp_out[i]) - bits_to_float(cpu.uav1[i])) < 1e-5f);
+        }
+    }
+
+    // ----- 7D: IMAGE_BVH_INTERSECT_RAY (Triangle Möller-Trumbore + AABB Slab) Live Dual-GPU + CPU Parity -----
+    {
+        Rdna2Assembler a;
+        // 4 rays in threads 0..3:
+        // tid 0: triangle node (ptr=0), ray hits at (0.25, 0.25, 0) -> (0,0,1), t=5, u=0.25, v=0.25, id=42
+        // tid 1: triangle node (ptr=0), ray misses at (2.25, 0.25, 0) -> (0,0,1), id=0xFFFFFFFF
+        // tid 2: AABB box node (ptr=64), ray hits at (0.25, 0.25, 0) -> (0,0,1), t_enter=2, t_exit=4, id=77
+        // tid 3: AABB box node (ptr=64), ray misses at (2.25, 0.25, 0) -> (0,0,1), id=0xFFFFFFFF
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 10, Rdna2Operand::InlineInt(0));
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 11, Rdna2Operand::InlineInt(64));
+        a.EmitVop2(Rdna2Opcode::V_AND_B32, 12, Rdna2Operand::InlineInt(2), 0);
+        a.EmitVopc(Rdna2Opcode::V_CMP_EQ_U32, Rdna2Operand::InlineInt(2), 12);
+        a.EmitVop2(Rdna2Opcode::V_CNDMASK_B32, 20, Rdna2Operand::Vgpr(10), 11);  // node_ptr = (tid & 2) ? 64 : 0
+
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 21, Rdna2Operand::LiteralF32(100.0f));  // tmax
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 13, Rdna2Operand::LiteralF32(0.25f));
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 14, Rdna2Operand::LiteralF32(2.25f));
+        a.EmitVop2(Rdna2Opcode::V_AND_B32, 15, Rdna2Operand::InlineInt(1), 0);
+        a.EmitVopc(Rdna2Opcode::V_CMP_EQ_U32, Rdna2Operand::InlineInt(1), 15);
+        a.EmitVop2(Rdna2Opcode::V_CNDMASK_B32, 22, Rdna2Operand::Vgpr(13), 14);  // ox = (tid & 1) ? 2.25 : 0.25
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 23, Rdna2Operand::LiteralF32(0.25f));  // oy
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 24, Rdna2Operand::InlineFloat(0.0f));  // oz
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 25, Rdna2Operand::InlineFloat(0.0f));  // dx
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 26, Rdna2Operand::InlineFloat(0.0f));  // dy
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 27, Rdna2Operand::InlineFloat(1.0f));  // dz
+
+        a.EmitMimg(Rdna2Opcode::IMAGE_BVH_INTERSECT_RAY, 30, 20, 0, 0, 0xFu, 0u, false);
+
+        a.EmitVop2(Rdna2Opcode::V_LSHLREV_B32, 1, Rdna2Operand::InlineInt(4), 0);  // tid * 16
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 30, 1, 4, 0);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 31, 1, 4, 4);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 32, 1, 4, 8);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 33, 1, 4, 12);
+        a.EmitSopp(Rdna2Opcode::S_ENDPGM);
+
+        const auto xs2 = a.BuildXs2(ShaderStage::Compute, 4, 1, 1, 16, 40, 32);
+        Rdna2LiftResult res{};
+        auto st = LiftRdna2Xs2Shader(xs2, res, opts);
+        if (!st.ok()) {
+            std::fprintf(stderr, "[FAIL] Test7D Lift failed: %s\nHLSL:\n%s\n", st.message.c_str(), res.hlsl_source.c_str());
+        }
+        OS_REQUIRE(st.ok());
+        OS_REQUIRE(res.ir.uses_bvh_ray);
+        VerifySpirvExternalStrict(res.spirv_words, "Test7D_BvhIntersectRay");
+
+        std::vector<uint32_t> bvh_buf(64, 0u);
+        // Triangle at offset 0: (0,0,5), (1,0,5), (0,1,5), id=42
+        bvh_buf[0] = 42u;
+        bvh_buf[1] = float_to_bits(0.0f); bvh_buf[2] = float_to_bits(0.0f); bvh_buf[3] = float_to_bits(5.0f);
+        bvh_buf[4] = float_to_bits(1.0f); bvh_buf[5] = float_to_bits(0.0f); bvh_buf[6] = float_to_bits(5.0f);
+        bvh_buf[7] = float_to_bits(0.0f); bvh_buf[8] = float_to_bits(1.0f); bvh_buf[9] = float_to_bits(5.0f);
+        // AABB Box at offset 64 (dword 16): bmin=(0,0,2), bmax=(1,1,4), id=77 | 0x80000000
+        bvh_buf[16] = 0x80000000u | 77u;
+        bvh_buf[17] = float_to_bits(0.0f); bvh_buf[18] = float_to_bits(0.0f); bvh_buf[19] = float_to_bits(2.0f);
+        bvh_buf[20] = float_to_bits(1.0f); bvh_buf[21] = float_to_bits(1.0f); bvh_buf[22] = float_to_bits(4.0f);
+
+        Rdna2CpuExecState cpu{};
+        cpu.uav0 = bvh_buf;
+        cpu.uav1.assign(64, 0u);
+        OS_REQUIRE(ExecuteRdna2Cpu(res.container, res.instructions, cpu).ok());
+        OS_REQUIRE(cpu.uav1[3] == 42u);
+        OS_REQUIRE(cpu.uav1[7] == 0xFFFFFFFFu);
+        OS_REQUIRE(cpu.uav1[11] == 77u);
+        OS_REQUIRE(cpu.uav1[15] == 0xFFFFFFFFu);
+
+        auto verify_bvh_parity = [&](const std::vector<uint32_t>& gpu_out, const char* backend) {
+            for (uint32_t r = 0; r < 4u; ++r) {
+                for (uint32_t c = 0; c < 3u; ++c) {
+                    const float gf = bits_to_float(gpu_out[r * 4 + c]);
+                    const float cf = bits_to_float(cpu.uav1[r * 4 + c]);
+                    if (std::fabs(gf - cf) > 1e-4f) {
+                        std::fprintf(stderr, "[FAIL] Test7D %s ray %u comp %u: got %.5f exp %.5f\n",
+                                     backend, r, c, gf, cf);
+                    }
+                    OS_REQUIRE(std::fabs(gf - cf) <= 1e-4f);
+                }
+                OS_REQUIRE(gpu_out[r * 4 + 3] == cpu.uav1[r * 4 + 3]);
+            }
+        };
+
+        if (vk.GetDeviceInfo().is_hardware) {
+            std::vector<uint32_t> vk_out;
+            OS_REQUIRE(vk.ExecuteComputeShader(res.spirv_words, bvh_buf, vk_out, 1).ok());
+            verify_bvh_parity(vk_out, "Vulkan-HW");
+        }
+
+        std::vector<uint32_t> hw_out;
+        d3d_hw.RunComputeBuffers(CompileForDevice(d3d_hw, res.hlsl_source, res.pc_dxil), bvh_buf, hw_out, 1);
+        verify_bvh_parity(hw_out, "D3D12-HW");
+
+        std::vector<uint32_t> warp_out;
+        d3d_warp.RunComputeBuffers(CompileForDevice(d3d_warp, res.hlsl_source, res.pc_dxil), bvh_buf, warp_out, 1);
+        verify_bvh_parity(warp_out, "D3D12-WARP");
+    }
+
+    std::printf("[PASS] Test 7: AAA Opcodes (Permlane16/X16, BFE/BFI, Scratch, VOP3P f16/u16, 3D/Cube Mip + AtomicCmpSwap, BVH Ray) -> spirv-val + Vulkan + D3D12 HW + WARP + CPU exact parity!\n");
+}
+
 }  // namespace
 
 int main() {
@@ -1341,6 +2025,7 @@ int main() {
     Test4_MimgTexturePipeline(d3d_hw, d3d_warp);
     Test5_GraphicsVsPsAndLiveMeshAs(d3d_hw);
     Test6_DisasmRoundTripAndEdgeCases();
+    Test7_AaaOpcodesLiveDualGpuAndCpuParity(vk, d3d_hw, d3d_warp);
 
     // Verify CallTelemetry recorded our lifter calls cleanly
     const auto snap = CallTelemetry::Global().Snapshot();
@@ -1354,6 +2039,6 @@ int main() {
     OS_REQUIRE(saw_lifter_telemetry);
 
     vk.Shutdown();
-    std::printf("[PASS] test_rdna2_lifter_live: ALL 5 LIVE DUAL-GPU SUITES PASSED!\n");
+    std::printf("[PASS] test_rdna2_lifter_live: ALL 7 LIVE DUAL-GPU & CPU-PARITY SUITES PASSED!\n");
     return 0;
 }

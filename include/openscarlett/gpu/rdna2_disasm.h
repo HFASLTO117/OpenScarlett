@@ -39,6 +39,83 @@ Status ParseXs2Container(const std::vector<uint8_t>& bytes, Xs2ShaderContainer& 
 std::vector<uint8_t> BuildXs2Container(const Xs2ShaderContainer& container);
 
 // ---------------------------------------------------------------------------
+// Xbox-Wrapped DXBC / DXIL Shader Container Parser & Builder
+// ---------------------------------------------------------------------------
+enum class XboxShaderBlobFormat : uint8_t {
+    Unknown = 0,
+    RawXs2,            // Raw "XS2\0" RDNA2 shader blob
+    XboxDxbc,          // "DXBC" container carrying Xbox RDNA2 chunks ("XBOX" / "XS2M")
+    StandardHostDxbc,  // Standard host PC DXBC / DXIL container (no Xbox RDNA2 chunks)
+};
+
+struct XboxDxbcChunk {
+    char fourcc[5] = {};  // Null-terminated 4-char chunk ID (e.g. "XBOX", "XS2M", "ISG1")
+    std::vector<uint8_t> data;
+};
+
+struct XboxSignatureElement {
+    std::string semantic_name;
+    uint32_t semantic_index = 0;
+    uint32_t system_value_type = 0;
+    uint32_t component_type = 0;  // 1=uint, 2=sint, 3=float
+    uint32_t register_index = 0;
+    uint8_t mask = 0xFu;
+    uint8_t rw_mask = 0xFu;
+    uint32_t stream = 0;
+};
+
+struct XboxStaticSamplerInfo {
+    uint32_t filter = 0;
+    uint32_t address_u = 0;
+    uint32_t address_v = 0;
+    uint32_t address_w = 0;
+    float mip_lod_bias = 0.0f;
+    uint32_t max_anisotropy = 1;
+    uint32_t comparison_func = 0;
+    uint32_t border_color = 0;
+    float min_lod = 0.0f;
+    float max_lod = 3.402823466e+38f;
+    uint32_t shader_register = 0;
+    uint32_t register_space = 0;
+    uint32_t shader_visibility = 0;
+};
+
+struct XboxDxbcContainer {
+    XboxShaderBlobFormat format = XboxShaderBlobFormat::Unknown;
+    bool has_xs2 = false;
+    Xs2ShaderContainer xs2{};
+    bool has_dxil_or_shdr = false;
+    std::string host_shader_chunk_fourcc;  // "DXIL", "SHEX", or "SHDR" if present
+    std::vector<XboxDxbcChunk> chunks;
+    std::vector<XboxSignatureElement> input_signature;   // Parsed from ISG1 / ISGN
+    std::vector<XboxSignatureElement> output_signature;  // Parsed from OSG1 / OSGN
+    std::vector<XboxStaticSamplerInfo> static_samplers;  // Parsed from RTS0 / STSM
+    std::vector<uint8_t> raw_root_signature_chunk;       // Raw RTS0 chunk payload if present
+};
+
+struct XboxDxbcBuildDesc {
+    std::vector<uint8_t> xs2_blob;          // Embedded into "XBOX" or "XS2M" chunk
+    std::string xbox_chunk_fourcc = "XBOX"; // "XBOX" or "XS2M"
+    std::vector<XboxSignatureElement> input_signature;
+    std::vector<XboxSignatureElement> output_signature;
+    std::vector<XboxStaticSamplerInfo> static_samplers;
+    bool emit_rts0_for_samplers = false;    // Emit RTS0 root signature chunk vs STSM chunk
+    std::vector<uint8_t> aux_dxil_or_shdr;  // Optional "DXIL"/"SHEX"/"SHDR" chunk payload
+    std::string aux_shader_fourcc = "DXIL";
+};
+
+// Fast, zero-allocation check: returns true iff blob is raw "XS2\0" or "DXBC" with "XBOX"/"XS2M" chunk.
+bool IsXboxShaderBytecode(const void* data, size_t size) noexcept;
+
+// Parses raw "XS2\0" OR "DXBC" container carrying Xbox chunks ("XBOX", "XS2M", "SHDR"/"SHEX"/"DXIL",
+// "ISG1"/"ISGN", "OSG1"/"OSGN", "RTS0"/"STSM").
+Status ParseXboxShaderContainer(const void* data, size_t size, XboxDxbcContainer& out_container);
+Status ParseXboxShaderContainer(const std::vector<uint8_t>& bytes, XboxDxbcContainer& out_container);
+
+// Clean-room builder for Xbox-wrapped DXBC containers (for testing and tooling).
+std::vector<uint8_t> BuildXboxDxbcContainer(const XboxDxbcBuildDesc& desc);
+
+// ---------------------------------------------------------------------------
 // AMD RDNA2 / GFX10.3 Binary Instruction Model (Public ISA Reference Guide)
 // ---------------------------------------------------------------------------
 enum class Rdna2Encoding : uint8_t {
@@ -52,6 +129,7 @@ enum class Rdna2Encoding : uint8_t {
     VOP1,
     VOPC,
     VOP3,
+    VOP3P,
     SMEM,
     MUBUF,
     MIMG,
@@ -172,15 +250,28 @@ enum class Rdna2Opcode : uint16_t {
     V_CMP_GT_U32,
     V_CMP_GE_U32,
 
-    // VOP3 (native 3-operand / wave ops)
+    // VOP3 (native 3-operand / wave / bitfield ops)
     V_FMA_F32,
     V_MAD_F32,
+    V_BFE_U32,
+    V_BFE_I32,
+    V_BFI_B32,
     V_MUL_LO_U32,
     V_MBCNT_LO_U32_B32,
     V_MBCNT_HI_U32_B32,
     V_READLANE_B32,
     V_ADD3_U32,
     V_DOT2_F32_F16,
+    V_PERMLANE16_B32,
+    V_PERMLANEX16_B32,
+
+    // VOP3P (packed 16-bit f16 / u16 / b16 ops, encoding 0x33)
+    V_PK_LSHLREV_B16,
+    V_PK_LSHRREV_B16,
+    V_PK_ADD_U16,
+    V_PK_FMA_F16,
+    V_PK_ADD_F16,
+    V_PK_MUL_F16,
 
     // SMEM
     S_LOAD_DWORD,
@@ -192,9 +283,12 @@ enum class Rdna2Opcode : uint16_t {
 
     // MIMG
     IMAGE_LOAD,
+    IMAGE_LOAD_MIP,
     IMAGE_STORE,
+    IMAGE_ATOMIC_CMPSWAP,
     IMAGE_SAMPLE,
     IMAGE_SAMPLE_LZ,
+    IMAGE_BVH_INTERSECT_RAY,
 
     // DS (LDS / Shared Memory & Swizzle)
     DS_ADD_U32,
@@ -203,11 +297,13 @@ enum class Rdna2Opcode : uint16_t {
     DS_SWIZZLE_B32,
     DS_READ_B32,
 
-    // FLAT / GLOBAL
+    // FLAT / GLOBAL / SCRATCH
     GLOBAL_LOAD_DWORD,
     GLOBAL_STORE_DWORD,
     FLAT_LOAD_DWORD,
     FLAT_STORE_DWORD,
+    SCRATCH_LOAD_DWORD,
+    SCRATCH_STORE_DWORD,
 
     // EXP
     EXP,
@@ -305,6 +401,12 @@ struct Rdna2Instruction {
     bool clamp = false;
     uint8_t omod = 0;
 
+    // VOP3P metadata (packed 2x16 ops, encoding 0x33)
+    uint8_t vop3p_op_sel = 0;     // bits [2:0]: lo-half src0/1/2 select (0=lo16, 1=hi16)
+    uint8_t vop3p_op_sel_hi = 7;  // bits [2:0]: hi-half src0/1/2 select (default 0b111 = hi16)
+    uint8_t vop3p_neg_lo = 0;     // bits [2:0]: lo-half negate
+    uint8_t vop3p_neg_hi = 0;     // bits [2:0]: hi-half negate
+
     // MIMG metadata
     uint8_t mimg_dmask = 0;
     uint8_t mimg_dim = 0;
@@ -382,6 +484,19 @@ public:
         const Rdna2Operand& src2 = Rdna2Operand::InlineInt(0),
         bool clamp = false);
 
+    // VOP3P (64-bit, or 96-bit with literal; encoding 0x33 packed 16-bit ops)
+    void EmitVop3p(
+        Rdna2Opcode op,
+        uint8_t vdst,
+        const Rdna2Operand& src0,
+        const Rdna2Operand& src1,
+        const Rdna2Operand& src2 = Rdna2Operand::InlineInt(0),
+        uint8_t op_sel = 0u,
+        uint8_t op_sel_hi = 7u,
+        uint8_t neg_lo = 0u,
+        uint8_t neg_hi = 0u,
+        bool clamp = false);
+
     // SMEM (64-bit)
     void EmitSmem(Rdna2Opcode op, uint8_t sdata, uint8_t sbase_sgpr, int32_t offset, uint8_t soffset = 0x7Du);
 
@@ -396,7 +511,8 @@ public:
         bool idxen = false,
         uint8_t soffset = 128);
 
-    // MIMG (64-bit: IMAGE_LOAD, IMAGE_STORE, IMAGE_SAMPLE, IMAGE_SAMPLE_LZ)
+    // MIMG (64-bit: IMAGE_LOAD, IMAGE_LOAD_MIP, IMAGE_STORE, IMAGE_ATOMIC_CMPSWAP,
+    // IMAGE_SAMPLE, IMAGE_SAMPLE_LZ, IMAGE_BVH_INTERSECT_RAY)
     void EmitMimg(
         Rdna2Opcode op,
         uint8_t vdata,
@@ -405,7 +521,8 @@ public:
         uint8_t ssamp_sgpr = 0,
         uint8_t dmask = 0xFu,
         uint8_t dim = 1u,
-        bool unrm = false);
+        bool unrm = false,
+        bool glc = false);
 
     // DS (64-bit: DS_WRITE_B32, DS_READ_B32, DS_ADD_U32, DS_ADD_RTN_U32, DS_SWIZZLE_B32)
     void EmitDs(
@@ -417,8 +534,16 @@ public:
         uint16_t offset = 0,
         bool gds = false);
 
-    // GLOBAL / FLAT (64-bit)
+    // GLOBAL / FLAT / SCRATCH (64-bit)
     void EmitGlobal(
+        Rdna2Opcode op,
+        uint8_t vdst_or_data,
+        uint8_t vaddr,
+        int16_t offset = 0,
+        uint8_t saddr = 0x7Fu);
+
+    // SCRATCH (64-bit FLAT encoding with flat_seg == 1)
+    void EmitScratch(
         Rdna2Opcode op,
         uint8_t vdst_or_data,
         uint8_t vaddr,

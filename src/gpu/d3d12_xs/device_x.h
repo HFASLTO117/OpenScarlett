@@ -6,6 +6,7 @@
 
 #include "openscarlett/gpu/d3d12_adapter.h"
 #include "openscarlett/gpu/d3d12_xs_abi.h"
+#include "openscarlett/gpu/shader_cache.h"
 
 namespace openscarlett::d3d12_xs {
 
@@ -258,6 +259,7 @@ private:
     std::atomic<uint32_t> max_frame_latency_{2u};
     std::atomic<uint64_t> next_frame_token_{1ull};
     std::atomic<bool> suspended_{false};
+    openscarlett::ShaderCache shader_cache_;
 };
 
 }  // namespace openscarlett::d3d12_xs
