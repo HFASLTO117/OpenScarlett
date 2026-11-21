@@ -354,12 +354,36 @@ D3D12_HEAP_PROPERTIES STDMETHODCALLTYPE DeviceX::GetCustomHeapProperties(
     return props;
 }
 
+D3D12_HEAP_FLAGS SanitizeXboxHeapFlags(D3D12_HEAP_FLAGS flags) noexcept {
+    // Xbox GDK titles (e.g. Microsoft Xbox-GDK-Samples DeviceResources) pass
+    // D3D12_HEAP_FLAG_ALLOW_DISPLAY on swapchain/scanout committed textures,
+    // which desktop D3D12 rejects with E_INVALIDARG.
+    constexpr uint32_t kMaskOut = static_cast<uint32_t>(D3D12_HEAP_FLAG_ALLOW_DISPLAY);
+    return static_cast<D3D12_HEAP_FLAGS>(static_cast<uint32_t>(flags) & ~kMaskOut);
+}
+
+D3D12_RESOURCE_DESC SanitizeXboxResourceDesc(const D3D12_RESOURCE_DESC& desc) noexcept {
+    // Strip Xbox-exclusive upper D3D12XBOX_RESOURCE_FLAG_* bits (e.g. ALLOW_DCC = 0x80000000)
+    // while keeping all standard desktop D3D12_RESOURCE_FLAGS intact.
+    D3D12_RESOURCE_DESC out = desc;
+    constexpr uint32_t kDesktopResourceFlagsMask = 0x000000FFu;
+    out.Flags = static_cast<D3D12_RESOURCE_FLAGS>(
+        static_cast<uint32_t>(desc.Flags) & kDesktopResourceFlagsMask);
+    return out;
+}
+
 HRESULT STDMETHODCALLTYPE DeviceX::CreateCommittedResource(
     const D3D12_HEAP_PROPERTIES* pHeapProperties, D3D12_HEAP_FLAGS HeapFlags,
     const D3D12_RESOURCE_DESC* pDesc, D3D12_RESOURCE_STATES InitialResourceState,
     const D3D12_CLEAR_VALUE* pOptimizedClearValue, REFIID riidResource, void** ppvResource) {
+    D3D12_RESOURCE_DESC clean_desc{};
+    const D3D12_RESOURCE_DESC* desc_ptr = pDesc;
+    if (pDesc) {
+        clean_desc = SanitizeXboxResourceDesc(*pDesc);
+        desc_ptr = &clean_desc;
+    }
     const HRESULT hr = host_dev_->CreateCommittedResource(
-        pHeapProperties, HeapFlags, pDesc, InitialResourceState,
+        pHeapProperties, SanitizeXboxHeapFlags(HeapFlags), desc_ptr, InitialResourceState,
         pOptimizedClearValue, riidResource, ppvResource);
     RecordDev("ID3D12DeviceX::CreateCommittedResource", 27, hr);
     return hr;
@@ -367,7 +391,14 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommittedResource(
 
 HRESULT STDMETHODCALLTYPE DeviceX::CreateHeap(
     const D3D12_HEAP_DESC* pDesc, REFIID riid, void** ppvHeap) {
-    const HRESULT hr = host_dev_->CreateHeap(pDesc, riid, ppvHeap);
+    D3D12_HEAP_DESC clean_heap{};
+    const D3D12_HEAP_DESC* heap_ptr = pDesc;
+    if (pDesc) {
+        clean_heap = *pDesc;
+        clean_heap.Flags = SanitizeXboxHeapFlags(pDesc->Flags);
+        heap_ptr = &clean_heap;
+    }
+    const HRESULT hr = host_dev_->CreateHeap(heap_ptr, riid, ppvHeap);
     RecordDev("ID3D12DeviceX::CreateHeap", 28, hr);
     return hr;
 }
@@ -376,8 +407,14 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResource(
     ID3D12Heap* pHeap, UINT64 HeapOffset, const D3D12_RESOURCE_DESC* pDesc,
     D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE* pOptimizedClearValue,
     REFIID riid, void** ppvResource) {
+    D3D12_RESOURCE_DESC clean_desc{};
+    const D3D12_RESOURCE_DESC* desc_ptr = pDesc;
+    if (pDesc) {
+        clean_desc = SanitizeXboxResourceDesc(*pDesc);
+        desc_ptr = &clean_desc;
+    }
     const HRESULT hr = host_dev_->CreatePlacedResource(
-        pHeap, HeapOffset, pDesc, InitialState, pOptimizedClearValue, riid, ppvResource);
+        pHeap, HeapOffset, desc_ptr, InitialState, pOptimizedClearValue, riid, ppvResource);
     RecordDev("ID3D12DeviceX::CreatePlacedResource", 29, hr);
     return hr;
 }
@@ -385,8 +422,14 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResource(
 HRESULT STDMETHODCALLTYPE DeviceX::CreateReservedResource(
     const D3D12_RESOURCE_DESC* pDesc, D3D12_RESOURCE_STATES InitialState,
     const D3D12_CLEAR_VALUE* pOptimizedClearValue, REFIID riid, void** ppvResource) {
+    D3D12_RESOURCE_DESC clean_desc{};
+    const D3D12_RESOURCE_DESC* desc_ptr = pDesc;
+    if (pDesc) {
+        clean_desc = SanitizeXboxResourceDesc(*pDesc);
+        desc_ptr = &clean_desc;
+    }
     const HRESULT hr = host_dev_->CreateReservedResource(
-        pDesc, InitialState, pOptimizedClearValue, riid, ppvResource);
+        desc_ptr, InitialState, pOptimizedClearValue, riid, ppvResource);
     RecordDev("ID3D12DeviceX::CreateReservedResource", 30, hr);
     return hr;
 }

@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 
+#include "openscarlett/core/framebuffer.h"
 #include "openscarlett/core/status.h"
 
 namespace openscarlett {
@@ -12,15 +13,6 @@ struct Vec3 {
     float x = 0.0f;
     float y = 0.0f;
     float z = 0.0f;
-};
-
-struct FrameBufferRgba8 {
-    uint32_t width = 0;
-    uint32_t height = 0;
-    std::vector<uint8_t> pixels;  // RGBA8, row-major, 4 bytes per pixel
-
-    uint64_t ComputeFnv1aHash() const noexcept;
-    Status WritePpm(const std::string& file_path) const;
 };
 
 struct RtTriangle {

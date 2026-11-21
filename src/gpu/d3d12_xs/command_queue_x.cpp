@@ -431,7 +431,16 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
     const D3D12XBOX_PRESENT_PARAMETERS* pPresentParameters,
     void* pPresentToken) {
     (void)pPresentToken;
-    if (PlaneCount == 0 || !pPlaneParameters ||
+    // Xbox GDK titles (e.g. Xbox-GDK-Samples DeviceResources::~DeviceResources & resize)
+    // legitimately call PresentX(0, nullptr, nullptr) to present a blank screen before teardown.
+    if (PlaneCount == 0) {
+        std::lock_guard<std::mutex> lock(present_mutex_);
+        WaitForInternalFenceLocked();
+        ++present_count_;
+        RecordQueue("ID3D12CommandQueueX::PresentX", 19, S_OK);
+        return S_OK;
+    }
+    if (!pPlaneParameters ||
         pPlaneParameters[0].ResourceCount == 0 ||
         !pPlaneParameters[0].ppResources ||
         !pPlaneParameters[0].ppResources[0]) {
