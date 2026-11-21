@@ -51,8 +51,33 @@ constexpr XGameResult XGR_E_GS_CONTAINER_NOT_IN_SYNC = static_cast<XGameResult>(
 // ---------------------------------------------------------------------------
 // Game Runtime Lifecycle
 // ---------------------------------------------------------------------------
+enum XGameRuntimeFeature : uint32_t {
+    XGameRuntimeFeature_XAccessibility = 0,
+    XGameRuntimeFeature_XAppCapture = 1,
+    XGameRuntimeFeature_XAsync = 2,
+    XGameRuntimeFeature_XAsyncProvider = 3,
+    XGameRuntimeFeature_XDisplay = 4,
+    XGameRuntimeFeature_XGame = 5,
+    XGameRuntimeFeature_XGameInvite = 6,
+    XGameRuntimeFeature_XGameSave = 7,
+    XGameRuntimeFeature_XGameUI = 8,
+    XGameRuntimeFeature_XLauncher = 9,
+    XGameRuntimeFeature_XNetworking = 10,
+    XGameRuntimeFeature_XPackage = 11,
+    XGameRuntimeFeature_XPersistentLocalStorage = 12,
+    XGameRuntimeFeature_XSpeechSynthesizer = 13,
+    XGameRuntimeFeature_XStore = 14,
+    XGameRuntimeFeature_XSystem = 15,
+    XGameRuntimeFeature_XTaskQueue = 16,
+    XGameRuntimeFeature_XThread = 17,
+    XGameRuntimeFeature_XUser = 18,
+    XGameRuntimeFeature_XError = 19,
+};
+
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameRuntimeInitialize(void);
 OPENSCARLETT_GDK_API void OPENSCARLETT_GDK_CALL XGameRuntimeUninitialize(void);
+OPENSCARLETT_GDK_API bool OPENSCARLETT_GDK_CALL XGameRuntimeIsFeatureAvailable(
+    XGameRuntimeFeature feature);
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameGetXboxTitleId(uint32_t* titleId);
 
 // ---------------------------------------------------------------------------
@@ -338,6 +363,180 @@ OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XUserGetGamerPictureResul
     uint8_t* buffer,
     size_t* bufferUsed);
 
+struct XUserAppLocalDeviceId {
+    uint8_t value[32];
+};
+static_assert(sizeof(XUserAppLocalDeviceId) == 32, "XUserAppLocalDeviceId must be 32 bytes");
+
+enum XUserGetTokenAndSignatureOptions : uint32_t {
+    XUserGetTokenAndSignatureOptions_None = 0x00,
+    XUserGetTokenAndSignatureOptions_ForceRefresh = 0x01,
+    XUserGetTokenAndSignatureOptions_AllUsers = 0x02,
+};
+
+struct XUserGetTokenAndSignatureHttpHeader {
+    const char* name;
+    const char* value;
+};
+
+struct XUserGetTokenAndSignatureData {
+    size_t tokenSize;
+    size_t signatureSize;
+    const char* token;
+    const char* signature;
+};
+
+struct XUserGetTokenAndSignatureUtf16HttpHeader {
+    const wchar_t* name;
+    const wchar_t* value;
+};
+
+struct XUserGetTokenAndSignatureUtf16Data {
+    size_t tokenCount;
+    size_t signatureCount;
+    const wchar_t* token;
+    const wchar_t* signature;
+};
+
+enum XUserDefaultAudioEndpointKind : uint32_t {
+    XUserDefaultAudioEndpointKind_CommunicationRender = 0,
+    XUserDefaultAudioEndpointKind_CommunicationCapture = 1,
+};
+
+enum XUserChangeEvent : uint32_t {
+    XUserChangeEvent_SignedInAgain = 0,
+    XUserChangeEvent_SigningOut = 1,
+    XUserChangeEvent_SignedOut = 2,
+    XUserChangeEvent_Gamertag = 3,
+    XUserChangeEvent_GamerPicture = 4,
+    XUserChangeEvent_Privileges = 5,
+};
+
+struct XUserDeviceAssociationChange {
+    XUserAppLocalDeviceId deviceId;
+    XUserLocalId oldUser;
+    XUserLocalId newUser;
+};
+
+typedef struct XUserSignOutDeferral* XUserSignOutDeferralHandle;
+
+typedef void(OPENSCARLETT_GDK_CALL* XUserChangeEventCallback)(
+    void* context,
+    XUserLocalId userLocalId,
+    XUserChangeEvent event);
+typedef void(OPENSCARLETT_GDK_CALL* XUserDefaultAudioEndpointUtf16ChangedCallback)(
+    void* context,
+    XUserLocalId user,
+    XUserDefaultAudioEndpointKind defaultAudioEndpointKind,
+    const wchar_t* endpointIdUtf16);
+typedef void(OPENSCARLETT_GDK_CALL* XUserDeviceAssociationChangedCallback)(
+    void* context,
+    const XUserDeviceAssociationChange* change);
+
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XUserGetIsGuest(
+    XUserHandle user,
+    bool* isGuest);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XUserFindUserById(
+    uint64_t userId,
+    XUserHandle* handle);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XUserFindUserByLocalId(
+    XUserLocalId userLocalId,
+    XUserHandle* handle);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XUserFindForDevice(
+    const XUserAppLocalDeviceId* deviceId,
+    XUserHandle* handle);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XUserGetTokenAndSignatureAsync(
+    XUserHandle user,
+    XUserGetTokenAndSignatureOptions options,
+    const char* method,
+    const char* url,
+    size_t headerCount,
+    const XUserGetTokenAndSignatureHttpHeader* headers,
+    size_t bodySize,
+    const void* bodyBuffer,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XUserGetTokenAndSignatureResultSize(
+    XAsyncBlock* async,
+    size_t* bufferSize);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XUserGetTokenAndSignatureResult(
+    XAsyncBlock* async,
+    size_t bufferSize,
+    void* buffer,
+    XUserGetTokenAndSignatureData** ptrToBuffer,
+    size_t* bufferUsed);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XUserGetTokenAndSignatureUtf16Async(
+    XUserHandle user,
+    XUserGetTokenAndSignatureOptions options,
+    const wchar_t* method,
+    const wchar_t* url,
+    size_t headerCount,
+    const XUserGetTokenAndSignatureUtf16HttpHeader* headers,
+    size_t bodySize,
+    const void* bodyBuffer,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XUserGetTokenAndSignatureUtf16ResultSize(
+    XAsyncBlock* async,
+    size_t* bufferSize);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XUserGetTokenAndSignatureUtf16Result(
+    XAsyncBlock* async,
+    size_t bufferSize,
+    void* buffer,
+    XUserGetTokenAndSignatureUtf16Data** ptrToBuffer,
+    size_t* bufferUsed);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XUserGetDefaultAudioEndpointUtf16(
+    XUserLocalId user,
+    XUserDefaultAudioEndpointKind defaultAudioEndpointKind,
+    size_t endpointIdUtf16Count,
+    wchar_t* endpointIdUtf16,
+    size_t* endpointIdUtf16Used);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XUserGetSignOutDeferral(
+    XUserSignOutDeferralHandle* deferral);
+OPENSCARLETT_GDK_API void OPENSCARLETT_GDK_CALL XUserCloseSignOutDeferralHandle(
+    XUserSignOutDeferralHandle deferral);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XUserRegisterForChangeEvent(
+    XTaskQueueHandle queue,
+    void* context,
+    XUserChangeEventCallback callback,
+    XTaskQueueRegistrationToken* token);
+OPENSCARLETT_GDK_API bool OPENSCARLETT_GDK_CALL XUserUnregisterForChangeEvent(
+    XTaskQueueRegistrationToken token,
+    bool wait);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XUserRegisterForDefaultAudioEndpointUtf16Changed(
+    XTaskQueueHandle queue,
+    void* context,
+    XUserDefaultAudioEndpointUtf16ChangedCallback callback,
+    XTaskQueueRegistrationToken* token);
+OPENSCARLETT_GDK_API bool OPENSCARLETT_GDK_CALL XUserUnregisterForDefaultAudioEndpointUtf16Changed(
+    XTaskQueueRegistrationToken token,
+    bool wait);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XUserRegisterForDeviceAssociationChanged(
+    XTaskQueueHandle queue,
+    void* context,
+    XUserDeviceAssociationChangedCallback callback,
+    XTaskQueueRegistrationToken* token);
+OPENSCARLETT_GDK_API bool OPENSCARLETT_GDK_CALL XUserUnregisterForDeviceAssociationChanged(
+    XTaskQueueRegistrationToken token,
+    bool wait);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XUserResolveIssueWithUiAsync(
+    XUserHandle user,
+    const char* url,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XUserResolveIssueWithUiResult(
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XUserResolveIssueWithUiUtf16Async(
+    XUserHandle user,
+    const wchar_t* url,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XUserResolveIssueWithUiUtf16Result(
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XUserResolvePrivilegeWithUiAsync(
+    XUserHandle user,
+    XUserPrivilegeOptions options,
+    XUserPrivilege privilege,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XUserResolvePrivilegeWithUiResult(
+    XAsyncBlock* async);
+
 // ---------------------------------------------------------------------------
 // XGameSave
 // ---------------------------------------------------------------------------
@@ -431,6 +630,16 @@ OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameSaveGetRemainingQuot
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameSaveEnumerateContainerInfoByName(
     XGameSaveProviderHandle provider,
     const char* containerNamePrefix,
+    void* context,
+    XGameSaveContainerInfoCallback callback);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameSaveEnumerateBlobInfoByName(
+    XGameSaveContainerHandle container,
+    const char* blobNamePrefix,
+    void* context,
+    XGameSaveBlobInfoCallback callback);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameSaveGetContainerInfo(
+    XGameSaveProviderHandle provider,
+    const char* containerName,
     void* context,
     XGameSaveContainerInfoCallback callback);
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameSaveReadBlobDataAsync(
@@ -587,6 +796,168 @@ OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XPackageEnumerateChunkAva
     void* context,
     XPackageChunkAvailabilityCallback callback);
 
+typedef struct XPackageMountObject* XPackageMountHandle;
+typedef struct XPackageInstallationMonitor* XPackageInstallationMonitorHandle;
+
+enum XPackageKind : uint32_t {
+    XPackageKind_Game = 0,
+    XPackageKind_Content = 1,
+};
+
+enum XPackageEnumerationScope : uint32_t {
+    XPackageEnumerationScope_ThisOnly = 0,
+    XPackageEnumerationScope_ThisAndRelated = 1,
+};
+
+struct XPackageDetails {
+    const char* packageIdentifier;
+    XVersion version;
+    XPackageKind kind;
+    const char* displayName;
+    const char* description;
+    const char* publisher;
+    const char* storeId;
+    bool installing;
+    uint32_t index;
+    uint32_t count;
+    bool ageRestricted;
+    const char* titleID;
+};
+
+struct XPackageFeature {
+    const char* id;
+    const char* displayName;
+    const char* tags;
+    bool hidden;
+    uint32_t storeIdCount;
+    const char* storeIds;
+};
+
+struct XPackageInstallationProgress {
+    uint64_t totalBytes;
+    uint64_t installedBytes;
+    uint64_t launchBytes;
+    bool launchable;
+    bool completed;
+};
+
+struct XPackageWriteStats {
+    uint64_t interval;
+    uint64_t budget;
+    uint64_t elapsed;
+    uint64_t bytesWritten;
+};
+
+typedef bool(OPENSCARLETT_GDK_CALL* XPackageEnumerationCallback)(
+    void* context,
+    const XPackageDetails* details);
+typedef bool(OPENSCARLETT_GDK_CALL* XPackageFeatureEnumerationCallback)(
+    void* context,
+    const XPackageFeature* feature);
+typedef void(OPENSCARLETT_GDK_CALL* XPackageInstallationProgressCallback)(
+    void* context,
+    XPackageInstallationMonitorHandle monitor);
+typedef void(OPENSCARLETT_GDK_CALL* XPackageInstalledCallback)(
+    void* context,
+    const XPackageDetails* details);
+
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XPackageMount(
+    const char* packageIdentifier,
+    XPackageMountHandle* mount);
+OPENSCARLETT_GDK_API void OPENSCARLETT_GDK_CALL XPackageCloseMountHandle(
+    XPackageMountHandle mount);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XPackageGetMountPathSize(
+    XPackageMountHandle mount,
+    size_t* pathSize);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XPackageGetMountPath(
+    XPackageMountHandle mount,
+    size_t pathSize,
+    char* path);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XPackageGetUserLocale(
+    size_t localeSize,
+    char* locale);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XPackageGetWriteStats(
+    XPackageWriteStats* writeStats);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XPackageCreateInstallationMonitor(
+    const char* packageIdentifier,
+    uint32_t selectorCount,
+    const XPackageChunkSelector* selectors,
+    uint32_t minimumUpdateIntervalMs,
+    XTaskQueueHandle queue,
+    XPackageInstallationMonitorHandle* installationMonitor);
+OPENSCARLETT_GDK_API void OPENSCARLETT_GDK_CALL XPackageCloseInstallationMonitorHandle(
+    XPackageInstallationMonitorHandle installationMonitor);
+OPENSCARLETT_GDK_API void OPENSCARLETT_GDK_CALL XPackageGetInstallationProgress(
+    XPackageInstallationMonitorHandle installationMonitor,
+    XPackageInstallationProgress* progress);
+OPENSCARLETT_GDK_API bool OPENSCARLETT_GDK_CALL XPackageUpdateInstallationMonitor(
+    XPackageInstallationMonitorHandle installationMonitor);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XPackageRegisterInstallationProgressChanged(
+    XPackageInstallationMonitorHandle installationMonitor,
+    void* context,
+    XPackageInstallationProgressCallback callback,
+    XTaskQueueRegistrationToken* token);
+OPENSCARLETT_GDK_API bool OPENSCARLETT_GDK_CALL XPackageUnregisterInstallationProgressChanged(
+    XPackageInstallationMonitorHandle installationMonitor,
+    XTaskQueueRegistrationToken token,
+    bool wait);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XPackageRegisterPackageInstalled(
+    XTaskQueueHandle queue,
+    void* context,
+    XPackageInstalledCallback callback,
+    XTaskQueueRegistrationToken* token);
+OPENSCARLETT_GDK_API bool OPENSCARLETT_GDK_CALL XPackageUnregisterPackageInstalled(
+    XTaskQueueRegistrationToken token,
+    bool wait);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XPackageEnumeratePackages(
+    XPackageKind kind,
+    XPackageEnumerationScope scope,
+    void* context,
+    XPackageEnumerationCallback callback);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XPackageEnumerateFeatures(
+    const char* packageIdentifier,
+    void* context,
+    XPackageFeatureEnumerationCallback callback);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XPackageFindChunkAvailability(
+    const char* packageIdentifier,
+    uint32_t selectorCount,
+    const XPackageChunkSelector* selectors,
+    XPackageChunkAvailability* availability);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XPackageEstimateDownloadSize(
+    const char* packageIdentifier,
+    uint32_t selectorCount,
+    const XPackageChunkSelector* selectors,
+    uint64_t* downloadSize,
+    bool* shouldPresentUserConfirmation);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XPackageChangeChunkInstallOrder(
+    const char* packageIdentifier,
+    uint32_t chunkCount,
+    const uint32_t* chunkIds);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XPackageInstallChunks(
+    const char* packageIdentifier,
+    uint32_t selectorCount,
+    const XPackageChunkSelector* selectors,
+    uint32_t minimumUpdateIntervalMs,
+    bool suppressUserConfirmation,
+    XTaskQueueHandle queue,
+    XPackageInstallationMonitorHandle* installationMonitor);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XPackageInstallChunksAsync(
+    const char* packageIdentifier,
+    uint32_t selectorCount,
+    const XPackageChunkSelector* selectors,
+    uint32_t minimumUpdateIntervalMs,
+    bool suppressUserConfirmation,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XPackageInstallChunksResult(
+    XAsyncBlock* async,
+    XPackageInstallationMonitorHandle* installationMonitor);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XPackageUninstallChunks(
+    const char* packageIdentifier,
+    uint32_t selectorCount,
+    const XPackageChunkSelector* selectors);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XPackageUninstallUWPInstance(
+    const char* packageName);
+
 // ---------------------------------------------------------------------------
 // XDisplay
 // ---------------------------------------------------------------------------
@@ -609,11 +980,13 @@ OPENSCARLETT_GDK_API XDisplayHdrModeResult OPENSCARLETT_GDK_CALL XDisplayTryEnab
     XDisplayHdrModeInfo* displayHdrModeInfo);
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XDisplayTryAcquireTimeoutDeferral(
     XDisplayTimeoutDeferralHandle* handle);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XDisplayAcquireTimeoutDeferral(
+    XDisplayTimeoutDeferralHandle* handle);
 OPENSCARLETT_GDK_API void OPENSCARLETT_GDK_CALL XDisplayCloseTimeoutDeferralHandle(
     XDisplayTimeoutDeferralHandle handle);
 
 // ---------------------------------------------------------------------------
-// GDK Static Import Runtime Dispatch (InitializeApiImpl / QueryApiImpl)
+// XgrGuid (forward declaration for XStore & QueryApiImpl)
 // ---------------------------------------------------------------------------
 struct XgrGuid {
     uint32_t data1;
@@ -623,6 +996,803 @@ struct XgrGuid {
 };
 static_assert(sizeof(XgrGuid) == 16, "XgrGuid must be 16 bytes");
 
+// ---------------------------------------------------------------------------
+// XStore
+// ---------------------------------------------------------------------------
+typedef struct XStoreContext* XStoreContextHandle;
+typedef struct XStoreLicense* XStoreLicenseHandle;
+typedef struct XStoreProductQuery* XStoreProductQueryHandle;
+
+constexpr size_t XSTORE_STORE_SKU_ID_SIZE = 18;
+constexpr size_t XSTORE_IN_APP_OFFER_TOKEN_MAX_SIZE = 64;
+constexpr size_t XSTORE_TRIAL_UNIQUE_ID_MAX_SIZE = 64;
+constexpr size_t XSTORE_PRICE_MAX_SIZE = 16;
+constexpr size_t XSTORE_PACKAGE_IDENTIFIER_MAX_LENGTH = 33;
+
+enum XStoreProductKind : uint32_t {
+    XStoreProductKind_None = 0x00,
+    XStoreProductKind_Consumable = 0x01,
+    XStoreProductKind_Durable = 0x02,
+    XStoreProductKind_Game = 0x04,
+    XStoreProductKind_Pass = 0x08,
+    XStoreProductKind_UnmanagedConsumable = 0x10,
+};
+
+enum XStoreCanLicenseStatus : uint32_t {
+    XStoreCanLicenseStatus_NotLicensableToUser = 0,
+    XStoreCanLicenseStatus_Licensable = 1,
+    XStoreCanLicenseStatus_LicenseActionNotApplicableToProduct = 2,
+};
+
+enum XStoreDurationUnit : uint32_t {
+    XStoreDurationUnit_Minute = 0,
+    XStoreDurationUnit_Hour = 1,
+    XStoreDurationUnit_Day = 2,
+    XStoreDurationUnit_Week = 3,
+    XStoreDurationUnit_Month = 4,
+    XStoreDurationUnit_Year = 5,
+};
+
+struct XStoreGameLicense {
+    char skuStoreId[XSTORE_STORE_SKU_ID_SIZE];
+    bool isActive;
+    bool isTrialOwnedByThisUser;
+    bool isDiscLicense;
+    bool isTrial;
+    uint32_t trialTimeRemainingInSeconds;
+    char trialUniqueId[XSTORE_TRIAL_UNIQUE_ID_MAX_SIZE];
+    int64_t expirationDate;
+};
+
+struct XStoreAddonLicense {
+    char skuStoreId[XSTORE_STORE_SKU_ID_SIZE];
+    char inAppOfferToken[XSTORE_IN_APP_OFFER_TOKEN_MAX_SIZE];
+    bool isActive;
+    int64_t expirationDate;
+};
+
+struct XStoreCanAcquireLicenseResult {
+    char licensableSku[9];
+    XStoreCanLicenseStatus status;
+};
+
+struct XStorePrice {
+    float basePrice;
+    float price;
+    float recurrencePrice;
+    const char* currencyCode;
+    char formattedBasePrice[XSTORE_PRICE_MAX_SIZE];
+    char formattedPrice[XSTORE_PRICE_MAX_SIZE];
+    char formattedRecurrencePrice[XSTORE_PRICE_MAX_SIZE];
+    bool isOnSale;
+    int64_t saleEndDate;
+};
+
+struct XStoreImage {
+    const char* uri;
+    uint32_t height;
+    uint32_t width;
+    const char* caption;
+    const char* imagePurposeTag;
+};
+
+struct XStoreVideo {
+    const char* uri;
+    uint32_t height;
+    uint32_t width;
+    const char* caption;
+    const char* videoPurposeTag;
+    XStoreImage previewImage;
+};
+
+struct XStoreAvailability {
+    const char* availabilityId;
+    XStorePrice price;
+    int64_t endDate;
+};
+
+struct XStoreCollectionData {
+    int64_t acquiredDate;
+    int64_t startDate;
+    int64_t endDate;
+    bool isTrial;
+    uint32_t trialTimeRemainingInSeconds;
+    uint32_t quantity;
+    const char* campaignId;
+    const char* developerOfferId;
+};
+
+struct XStoreSubscriptionInfo {
+    bool hasTrialPeriod;
+    XStoreDurationUnit trialPeriodUnit;
+    uint32_t trialPeriod;
+    XStoreDurationUnit billingPeriodUnit;
+    uint32_t billingPeriod;
+};
+
+struct XStoreSku {
+    const char* skuId;
+    const char* title;
+    const char* description;
+    const char* language;
+    XStorePrice price;
+    bool isTrial;
+    bool isInUserCollection;
+    XStoreCollectionData collectionData;
+    bool isSubscription;
+    XStoreSubscriptionInfo subscriptionInfo;
+    uint32_t bundledSkusCount;
+    const char** bundledSkus;
+    uint32_t imagesCount;
+    XStoreImage* images;
+    uint32_t videosCount;
+    XStoreVideo* videos;
+    uint32_t availabilitiesCount;
+    XStoreAvailability* availabilities;
+};
+
+struct XStoreProduct {
+    const char* storeId;
+    const char* title;
+    const char* description;
+    const char* language;
+    const char* inAppOfferToken;
+    char* linkUri;
+    XStoreProductKind productKind;
+    XStorePrice price;
+    bool hasDigitalDownload;
+    bool isInUserCollection;
+    uint32_t keywordsCount;
+    const char** keywords;
+    uint32_t skusCount;
+    XStoreSku* skus;
+    uint32_t imagesCount;
+    XStoreImage* images;
+    uint32_t videosCount;
+    XStoreVideo* videos;
+};
+
+struct XStoreConsumableResult {
+    uint32_t quantity;
+};
+
+struct XStorePackageUpdate {
+    char packageIdentifier[XSTORE_PACKAGE_IDENTIFIER_MAX_LENGTH];
+    bool isMandatory;
+};
+
+typedef bool(OPENSCARLETT_GDK_CALL* XStoreProductQueryCallback)(
+    const XStoreProduct* product,
+    void* context);
+typedef void(OPENSCARLETT_GDK_CALL* XStoreGameLicenseChangedCallback)(void* context);
+typedef void(OPENSCARLETT_GDK_CALL* XStorePackageLicenseLostCallback)(void* context);
+
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreCreateContext(
+    XUserHandle user,
+    XStoreContextHandle* storeContextHandle);
+OPENSCARLETT_GDK_API void OPENSCARLETT_GDK_CALL XStoreCloseContextHandle(
+    XStoreContextHandle storeContextHandle);
+OPENSCARLETT_GDK_API void OPENSCARLETT_GDK_CALL XStoreCloseLicenseHandle(
+    XStoreLicenseHandle storeLicenseHandle);
+OPENSCARLETT_GDK_API void OPENSCARLETT_GDK_CALL XStoreCloseProductsQueryHandle(
+    XStoreProductQueryHandle productQueryHandle);
+OPENSCARLETT_GDK_API bool OPENSCARLETT_GDK_CALL XStoreIsLicenseValid(
+    XStoreLicenseHandle storeLicenseHandle);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreQueryGameLicenseAsync(
+    XStoreContextHandle storeContextHandle,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreQueryGameLicenseResult(
+    XAsyncBlock* async,
+    XStoreGameLicense* license);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreRegisterGameLicenseChanged(
+    XStoreContextHandle storeContextHandle,
+    XTaskQueueHandle queue,
+    void* context,
+    XStoreGameLicenseChangedCallback callback,
+    XTaskQueueRegistrationToken* token);
+OPENSCARLETT_GDK_API bool OPENSCARLETT_GDK_CALL XStoreUnregisterGameLicenseChanged(
+    XStoreContextHandle storeContextHandle,
+    XTaskQueueRegistrationToken token,
+    bool wait);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreRegisterPackageLicenseLost(
+    XStoreLicenseHandle licenseHandle,
+    XTaskQueueHandle queue,
+    void* context,
+    XStorePackageLicenseLostCallback callback,
+    XTaskQueueRegistrationToken* token);
+OPENSCARLETT_GDK_API bool OPENSCARLETT_GDK_CALL XStoreUnregisterPackageLicenseLost(
+    XStoreLicenseHandle licenseHandle,
+    XTaskQueueRegistrationToken token,
+    bool wait);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreQueryAddOnLicensesAsync(
+    XStoreContextHandle storeContextHandle,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreQueryAddOnLicensesResultCount(
+    XAsyncBlock* async,
+    uint32_t* count);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreQueryAddOnLicensesResult(
+    XAsyncBlock* async,
+    uint32_t count,
+    XStoreAddonLicense* addOnLicenses);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreQueryProductForCurrentGameAsync(
+    XStoreContextHandle storeContextHandle,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreQueryProductForCurrentGameResult(
+    XAsyncBlock* async,
+    XStoreProductQueryHandle* productQueryHandle);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreQueryProductForPackageAsync(
+    XStoreContextHandle storeContextHandle,
+    XStoreProductKind productKinds,
+    const char* packageIdentifier,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreQueryProductForPackageResult(
+    XAsyncBlock* async,
+    XStoreProductQueryHandle* productQueryHandle);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreQueryAssociatedProductsAsync(
+    XStoreContextHandle storeContextHandle,
+    XStoreProductKind productKinds,
+    uint32_t maxItemsToRetrievePerPage,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreQueryAssociatedProductsResult(
+    XAsyncBlock* async,
+    XStoreProductQueryHandle* productQueryHandle);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreQueryEntitledProductsAsync(
+    XStoreContextHandle storeContextHandle,
+    XStoreProductKind productKinds,
+    uint32_t maxItemsToRetrievePerPage,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreQueryEntitledProductsResult(
+    XAsyncBlock* async,
+    XStoreProductQueryHandle* productQueryHandle);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreQueryProductsAsync(
+    XStoreContextHandle storeContextHandle,
+    XStoreProductKind productKinds,
+    const char** storeIds,
+    size_t storeIdsCount,
+    const char** actionFilters,
+    size_t actionFiltersCount,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreQueryProductsResult(
+    XAsyncBlock* async,
+    XStoreProductQueryHandle* productQueryHandle);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreEnumerateProductsQuery(
+    XStoreProductQueryHandle productQueryHandle,
+    void* context,
+    XStoreProductQueryCallback callback);
+OPENSCARLETT_GDK_API bool OPENSCARLETT_GDK_CALL XStoreProductsQueryHasMorePages(
+    XStoreProductQueryHandle productQueryHandle);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreProductsQueryNextPageAsync(
+    XStoreProductQueryHandle productQueryHandle,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreProductsQueryNextPageResult(
+    XAsyncBlock* async,
+    XStoreProductQueryHandle* productQueryHandle);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreCanAcquireLicenseForPackageAsync(
+    XStoreContextHandle storeContextHandle,
+    const char* packageIdentifier,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreCanAcquireLicenseForPackageResult(
+    XAsyncBlock* async,
+    XStoreCanAcquireLicenseResult* storeCanAcquireLicenseResult);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreCanAcquireLicenseForStoreIdAsync(
+    XStoreContextHandle storeContextHandle,
+    const char* storeProductId,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreCanAcquireLicenseForStoreIdResult(
+    XAsyncBlock* async,
+    XStoreCanAcquireLicenseResult* storeCanAcquireLicenseResult);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreAcquireLicenseForPackageAsync(
+    XStoreContextHandle storeContextHandle,
+    const char* packageIdentifier,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreAcquireLicenseForPackageResult(
+    XAsyncBlock* async,
+    XStoreLicenseHandle* storeLicenseHandle);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreAcquireLicenseForDurablesAsync(
+    XStoreContextHandle storeContextHandle,
+    const char* storeId,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreAcquireLicenseForDurablesResult(
+    XAsyncBlock* async,
+    XStoreLicenseHandle* storeLicenseHandle);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreQueryConsumableBalanceRemainingAsync(
+    XStoreContextHandle storeContextHandle,
+    const char* storeProductId,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreQueryConsumableBalanceRemainingResult(
+    XAsyncBlock* async,
+    XStoreConsumableResult* consumableResult);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreReportConsumableFulfillmentAsync(
+    XStoreContextHandle storeContextHandle,
+    const char* storeProductId,
+    uint32_t quantity,
+    XgrGuid trackingId,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreReportConsumableFulfillmentResult(
+    XAsyncBlock* async,
+    XStoreConsumableResult* consumableResult);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreQueryGameAndDlcPackageUpdatesAsync(
+    XStoreContextHandle storeContextHandle,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreQueryGameAndDlcPackageUpdatesResultCount(
+    XAsyncBlock* async,
+    uint32_t* count);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreQueryGameAndDlcPackageUpdatesResult(
+    XAsyncBlock* async,
+    uint32_t count,
+    XStorePackageUpdate* packageUpdates);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreDownloadPackageUpdatesAsync(
+    XStoreContextHandle storeContextHandle,
+    const char** packageIdentifiers,
+    size_t packageIdentifiersCount,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreDownloadPackageUpdatesResult(
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreDownloadAndInstallPackageUpdatesAsync(
+    XStoreContextHandle storeContextHandle,
+    const char** packageIdentifiers,
+    size_t packageIdentifiersCount,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreDownloadAndInstallPackageUpdatesResult(
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreDownloadAndInstallPackagesAsync(
+    XStoreContextHandle storeContextHandle,
+    const char** storeIds,
+    size_t storeIdsCount,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreDownloadAndInstallPackagesResultCount(
+    XAsyncBlock* async,
+    uint32_t* count);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreDownloadAndInstallPackagesResult(
+    XAsyncBlock* async,
+    uint32_t count,
+    char (*packageIdentifiers)[XSTORE_PACKAGE_IDENTIFIER_MAX_LENGTH]);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreGetUserCollectionsIdAsync(
+    XStoreContextHandle storeContextHandle,
+    const char* serviceTicket,
+    const char* publisherUserId,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreGetUserCollectionsIdResultSize(
+    XAsyncBlock* async,
+    size_t* size);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreGetUserCollectionsIdResult(
+    XAsyncBlock* async,
+    size_t size,
+    char* result);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreGetUserPurchaseIdAsync(
+    XStoreContextHandle storeContextHandle,
+    const char* serviceTicket,
+    const char* publisherUserId,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreGetUserPurchaseIdResultSize(
+    XAsyncBlock* async,
+    size_t* size);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreGetUserPurchaseIdResult(
+    XAsyncBlock* async,
+    size_t size,
+    char* result);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreQueryLicenseTokenAsync(
+    XStoreContextHandle storeContextHandle,
+    const char** productIds,
+    size_t productIdsCount,
+    const char* customDeveloperString,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreQueryLicenseTokenResultSize(
+    XAsyncBlock* async,
+    size_t* size);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreQueryLicenseTokenResult(
+    XAsyncBlock* async,
+    size_t size,
+    char* result);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreQueryPackageIdentifier(
+    const char* storeId,
+    size_t size,
+    char* packageIdentifier);
+OPENSCARLETT_GDK_API bool OPENSCARLETT_GDK_CALL XStoreIsAvailabilityPurchasable(
+    const XStoreAvailability availability);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreShowAssociatedProductsUIAsync(
+    XStoreContextHandle storeContextHandle,
+    const char* storeId,
+    XStoreProductKind productKinds,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreShowAssociatedProductsUIResult(
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreShowProductPageUIAsync(
+    XStoreContextHandle storeContextHandle,
+    const char* storeId,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreShowProductPageUIResult(
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreShowPurchaseUIAsync(
+    XStoreContextHandle storeContextHandle,
+    const char* storeId,
+    const char* name,
+    const char* extendedJsonData,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreShowPurchaseUIResult(
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreShowRateAndReviewUIAsync(
+    XStoreContextHandle storeContextHandle,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreShowRateAndReviewUIResult(
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreShowRedeemTokenUIAsync(
+    XStoreContextHandle storeContextHandle,
+    const char* token,
+    const char** allowedStoreIds,
+    size_t allowedStoreIdsCount,
+    bool disallowCsvRedemption,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XStoreShowRedeemTokenUIResult(
+    XAsyncBlock* async);
+
+// ---------------------------------------------------------------------------
+// XGameUi
+// ---------------------------------------------------------------------------
+enum XGameUiNotificationPositionHint : uint32_t {
+    XGameUiNotificationPositionHint_BottomCenter = 0,
+    XGameUiNotificationPositionHint_BottomLeft = 1,
+    XGameUiNotificationPositionHint_BottomRight = 2,
+    XGameUiNotificationPositionHint_TopCenter = 3,
+    XGameUiNotificationPositionHint_TopLeft = 4,
+    XGameUiNotificationPositionHint_TopRight = 5,
+};
+
+enum XGameUiMessageDialogButton : uint32_t {
+    XGameUiMessageDialogButton_First = 0,
+    XGameUiMessageDialogButton_Second = 1,
+    XGameUiMessageDialogButton_Third = 2,
+};
+
+enum XGameUiTextEntryInputScope : uint32_t {
+    XGameUiTextEntryInputScope_Default = 0,
+    XGameUiTextEntryInputScope_Url = 1,
+    XGameUiTextEntryInputScope_EmailSmtpAddress = 5,
+    XGameUiTextEntryInputScope_Number = 29,
+    XGameUiTextEntryInputScope_Password = 31,
+    XGameUiTextEntryInputScope_TelephoneNumber = 32,
+    XGameUiTextEntryInputScope_Alphanumeric = 40,
+    XGameUiTextEntryInputScope_Search = 50,
+};
+
+enum XGameUiWebAuthenticationOptions : uint32_t {
+    XGameUiWebAuthenticationOptions_None = 0x00,
+    XGameUiWebAuthenticationOptions_PreferFullscreen = 0x01,
+};
+
+struct XGameUiWebAuthenticationResultData {
+    XGameResult responseStatus;
+    size_t responseCompletionUriSize;
+    const char* responseCompletionUri;
+};
+
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUiSetNotificationPositionHint(
+    XGameUiNotificationPositionHint position);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUiShowMessageDialogAsync(
+    XAsyncBlock* async,
+    const char* titleText,
+    const char* contentText,
+    const char* firstButtonText,
+    const char* secondButtonText,
+    const char* thirdButtonText,
+    XGameUiMessageDialogButton defaultButton,
+    XGameUiMessageDialogButton cancelButton);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUiShowMessageDialogResult(
+    XAsyncBlock* async,
+    XGameUiMessageDialogButton* resultButton);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUiShowErrorDialogAsync(
+    XAsyncBlock* async,
+    XGameResult errorCode,
+    const char* context);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUiShowErrorDialogResult(
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUiShowTextEntryAsync(
+    XAsyncBlock* async,
+    const char* titleText,
+    const char* descriptionText,
+    const char* defaultText,
+    XGameUiTextEntryInputScope inputScope,
+    uint32_t maxTextLength);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUiShowTextEntryResultSize(
+    XAsyncBlock* async,
+    uint32_t* resultTextBufferSize);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUiShowTextEntryResult(
+    XAsyncBlock* async,
+    uint32_t resultTextBufferSize,
+    char* resultTextBuffer,
+    uint32_t* resultTextBufferUsed);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUiShowAchievementsAsync(
+    XAsyncBlock* async,
+    XUserHandle requestingUser,
+    uint32_t titleId);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUiShowAchievementsResult(
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUiShowPlayerPickerAsync(
+    XAsyncBlock* async,
+    XUserHandle requestingUser,
+    const char* promptText,
+    uint32_t selectFromPlayersCount,
+    const uint64_t* selectFromPlayers,
+    uint32_t preSelectedPlayersCount,
+    const uint64_t* preSelectedPlayers,
+    uint32_t minSelectionCount,
+    uint32_t maxSelectionCount);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUiShowPlayerPickerResultCount(
+    XAsyncBlock* async,
+    uint32_t* resultPlayersCount);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUiShowPlayerPickerResult(
+    XAsyncBlock* async,
+    uint32_t resultPlayersCount,
+    uint64_t* resultPlayers,
+    uint32_t* resultPlayersUsed);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUiShowPlayerProfileCardAsync(
+    XAsyncBlock* async,
+    XUserHandle requestingUser,
+    uint64_t targetPlayer);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUiShowPlayerProfileCardResult(
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUiShowSendGameInviteAsync(
+    XAsyncBlock* async,
+    XUserHandle requestingUser,
+    const char* sessionConfigurationId,
+    const char* sessionTemplateName,
+    const char* sessionId,
+    const char* invitationText,
+    const char* customActivationContext);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUiShowSendGameInviteResult(
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUiShowWebAuthenticationAsync(
+    XAsyncBlock* async,
+    XUserHandle requestingUser,
+    const char* requestUri,
+    const char* completionUri);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUiShowWebAuthenticationWithOptionsAsync(
+    XAsyncBlock* async,
+    XUserHandle requestingUser,
+    const char* requestUri,
+    const char* completionUri,
+    XGameUiWebAuthenticationOptions options);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUiShowWebAuthenticationResultSize(
+    XAsyncBlock* async,
+    size_t* bufferSize);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUiShowWebAuthenticationResult(
+    XAsyncBlock* async,
+    size_t bufferSize,
+    void* buffer,
+    XGameUiWebAuthenticationResultData** ptrToBuffer,
+    size_t* bufferUsed);
+
+// ---------------------------------------------------------------------------
+// XNetworking
+// ---------------------------------------------------------------------------
+enum XNetworkingConnectivityLevelHint : uint32_t {
+    XNetworkingConnectivityLevelHint_Unknown = 0,
+    XNetworkingConnectivityLevelHint_None = 1,
+    XNetworkingConnectivityLevelHint_LocalAccess = 2,
+    XNetworkingConnectivityLevelHint_InternetAccess = 3,
+    XNetworkingConnectivityLevelHint_ConstrainedInternetAccess = 4,
+};
+
+enum XNetworkingConnectivityCostHint : uint32_t {
+    XNetworkingConnectivityCostHint_Unknown = 0,
+    XNetworkingConnectivityCostHint_Unrestricted = 1,
+    XNetworkingConnectivityCostHint_Fixed = 2,
+    XNetworkingConnectivityCostHint_Variable = 3,
+};
+
+struct XNetworkingConnectivityHint {
+    XNetworkingConnectivityLevelHint connectivityLevel;
+    XNetworkingConnectivityCostHint connectivityCost;
+    uint32_t ianaInterfaceType;
+    bool networkInitialized;
+    bool approachingDataLimit;
+    bool overDataLimit;
+    bool roaming;
+};
+
+struct XNetworkingThumbprint {
+    uint32_t thumbprintType;
+    size_t thumbprintBufferByteCount;
+    uint8_t* thumbprintBuffer;
+};
+
+struct XNetworkingSecurityInformation {
+    uint32_t enabledHttpSecurityProtocolFlags;
+    size_t thumbprintCount;
+    XNetworkingThumbprint* thumbprints;
+};
+
+typedef void(OPENSCARLETT_GDK_CALL* XNetworkingConnectivityHintChangedCallback)(
+    void* context,
+    const XNetworkingConnectivityHint* connectivityHint);
+typedef void(OPENSCARLETT_GDK_CALL* XNetworkingPreferredLocalUdpMultiplayerPortChangedCallback)(
+    void* context,
+    uint16_t preferredLocalUdpMultiplayerPort);
+
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XNetworkingGetConnectivityHint(
+    XNetworkingConnectivityHint* connectivityHint);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XNetworkingQueryConnectivityHint(
+    XNetworkingConnectivityHint* connectivityHint);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XNetworkingQueryPreferredLocalUdpMultiplayerPort(
+    uint16_t* preferredLocalUdpMultiplayerPort);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XNetworkingQueryPreferredLocalUdpMultiplayerPortAsync(
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult(
+    XAsyncBlock* async,
+    uint16_t* preferredLocalUdpMultiplayerPort);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XNetworkingRegisterConnectivityHintChanged(
+    XTaskQueueHandle queue,
+    void* context,
+    XNetworkingConnectivityHintChangedCallback callback,
+    XTaskQueueRegistrationToken* token);
+OPENSCARLETT_GDK_API bool OPENSCARLETT_GDK_CALL XNetworkingUnregisterConnectivityHintChanged(
+    XTaskQueueRegistrationToken token,
+    bool wait);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged(
+    XTaskQueueHandle queue,
+    void* context,
+    XNetworkingPreferredLocalUdpMultiplayerPortChangedCallback callback,
+    XTaskQueueRegistrationToken* token);
+OPENSCARLETT_GDK_API bool OPENSCARLETT_GDK_CALL XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged(
+    XTaskQueueRegistrationToken token,
+    bool wait);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XNetworkingQuerySecurityInformationForUrlAsync(
+    const char* url,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XNetworkingQuerySecurityInformationForUrlAsyncResultSize(
+    XAsyncBlock* async,
+    size_t* securityInformationBufferByteCount);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XNetworkingQuerySecurityInformationForUrlAsyncResult(
+    XAsyncBlock* async,
+    size_t securityInformationBufferByteCount,
+    size_t* securityInformationBufferByteCountUsed,
+    uint8_t* securityInformationBuffer,
+    XNetworkingSecurityInformation** pointerToSecurityInformation);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XNetworkingQuerySecurityInformationForUrlUtf16Async(
+    const wchar_t* url,
+    XAsyncBlock* async);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XNetworkingQuerySecurityInformationForUrlUtf16AsyncResultSize(
+    XAsyncBlock* async,
+    size_t* securityInformationBufferByteCount);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XNetworkingQuerySecurityInformationForUrlUtf16AsyncResult(
+    XAsyncBlock* async,
+    size_t securityInformationBufferByteCount,
+    size_t* securityInformationBufferByteCountUsed,
+    uint8_t* securityInformationBuffer,
+    XNetworkingSecurityInformation** pointerToSecurityInformation);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XNetworkingVerifyServerCertificate(
+    void* requestHandle,
+    const XNetworkingSecurityInformation* securityInformation);
+
+// ---------------------------------------------------------------------------
+// Core Runtime Extensions (PLS, XThread, XError, XGameEvent, XGameInvite, XLaunch, XAccessibility)
+// ---------------------------------------------------------------------------
+enum XErrorOptions : uint32_t {
+    XErrorOptions_None = 0x00,
+    XErrorOptions_OutputDebugStringOnError = 0x01,
+    XErrorOptions_DebugBreakOnError = 0x02,
+    XErrorOptions_FailFastOnError = 0x04,
+};
+
+typedef bool(OPENSCARLETT_GDK_CALL* XErrorCallback)(
+    XGameResult hr,
+    const char* msg,
+    void* context);
+
+struct XGameEventDescriptor {
+    uint16_t id;
+    uint8_t version;
+    uint8_t channel;
+    uint8_t level;
+    uint8_t opcode;
+    uint16_t task;
+    uint64_t keyword;
+};
+
+struct XGameEventDataDescriptor {
+    uint64_t ptr;
+    uint32_t size;
+    uint32_t reserved;
+};
+
+typedef void(OPENSCARLETT_GDK_CALL* XGameInviteEventCallback)(
+    void* context,
+    const char* inviteUri);
+
+enum XHighContrastMode : uint32_t {
+    XHighContrastMode_Off = 0,
+    XHighContrastMode_Dark = 1,
+    XHighContrastMode_Light = 2,
+    XHighContrastMode_Other = 3,
+};
+
+enum XClosedCaptionFontEdgeAttribute : uint32_t {
+    XClosedCaptionFontEdgeAttribute_Default = 0,
+    XClosedCaptionFontEdgeAttribute_NoEdgeAttribute = 1,
+    XClosedCaptionFontEdgeAttribute_RaisedEdges = 2,
+    XClosedCaptionFontEdgeAttribute_DepressedEdges = 3,
+    XClosedCaptionFontEdgeAttribute_UniformedEdges = 4,
+    XClosedCaptionFontEdgeAttribute_DropShadowedEdges = 5,
+};
+
+enum XClosedCaptionFontStyle : uint32_t {
+    XClosedCaptionFontStyle_Default = 0,
+    XClosedCaptionFontStyle_MonospacedWithSerifs = 1,
+    XClosedCaptionFontStyle_ProportionalWithSerifs = 2,
+    XClosedCaptionFontStyle_MonospacedWithoutSerifs = 3,
+    XClosedCaptionFontStyle_ProportionalWithoutSerifs = 4,
+    XClosedCaptionFontStyle_Casual = 5,
+    XClosedCaptionFontStyle_Cursive = 6,
+    XClosedCaptionFontStyle_SmallCapitals = 7,
+};
+
+struct XColor {
+    uint8_t A;
+    uint8_t R;
+    uint8_t G;
+    uint8_t B;
+};
+
+struct XClosedCaptionProperties {
+    XColor BackgroundColor;
+    XColor FontColor;
+    XColor WindowColor;
+    XClosedCaptionFontEdgeAttribute FontEdgeAttribute;
+    XClosedCaptionFontStyle FontStyle;
+    float FontScale;
+    bool Enabled;
+};
+
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XPersistentLocalStorageGetPathSize(
+    size_t* pathSize);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XPersistentLocalStorageGetPath(
+    size_t pathSize,
+    char* path,
+    size_t* pathUsed);
+OPENSCARLETT_GDK_API bool OPENSCARLETT_GDK_CALL XThreadIsTimeSensitive(void);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XThreadSetTimeSensitive(
+    bool isTimeSensitiveThread);
+OPENSCARLETT_GDK_API void OPENSCARLETT_GDK_CALL XThreadAssertNotTimeSensitive(void);
+OPENSCARLETT_GDK_API bool OPENSCARLETT_GDK_CALL XThreadVerifyNotTimeSensitive(void);
+OPENSCARLETT_GDK_API void OPENSCARLETT_GDK_CALL XErrorReport(
+    XGameResult hr,
+    const char* msg);
+OPENSCARLETT_GDK_API void OPENSCARLETT_GDK_CALL XErrorSetCallback(
+    XErrorCallback callback,
+    void* context);
+OPENSCARLETT_GDK_API void OPENSCARLETT_GDK_CALL XErrorSetOptions(
+    XErrorOptions optionsDebuggerPresent,
+    XErrorOptions optionsDebuggerNotPresent);
+OPENSCARLETT_GDK_API uint32_t OPENSCARLETT_GDK_CALL XGameEventWrite(
+    uint64_t regHandle,
+    const XGameEventDescriptor* eventDescriptor,
+    uint32_t userDataCount,
+    XGameEventDataDescriptor* userData);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameInviteRegisterForEvent(
+    XTaskQueueHandle queue,
+    void* context,
+    XGameInviteEventCallback callback,
+    XTaskQueueRegistrationToken* token);
+OPENSCARLETT_GDK_API bool OPENSCARLETT_GDK_CALL XGameInviteUnregisterForEvent(
+    XTaskQueueRegistrationToken token,
+    bool wait);
+OPENSCARLETT_GDK_API void OPENSCARLETT_GDK_CALL XLaunchNewGame(
+    const char* exePath,
+    const char* args,
+    XUserHandle defaultUser);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XLaunchUri(
+    XUserHandle requestingUser,
+    const char* uri);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XHighContrastGetMode(
+    XHighContrastMode* mode);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XClosedCaptionGetProperties(
+    XClosedCaptionProperties* properties);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XClosedCaptionSetEnabled(
+    bool enabled);
+
+// ---------------------------------------------------------------------------
+// GDK Static Import Runtime Dispatch (InitializeApiImpl / QueryApiImpl)
+// ---------------------------------------------------------------------------
 constexpr XgrGuid XGR_IID_IUNKNOWN = {
     0x00000000u, 0x0000u, 0x0000u, {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
 
@@ -642,6 +1812,14 @@ constexpr XgrGuid XGR_API_GUID_PACKAGE = {
     0x4F534752u, 0x0007u, 0x4000u, {0x80, 0x07, 0x00, 0x58, 0x50, 0x4B, 0x00, 0x07}};
 constexpr XgrGuid XGR_API_GUID_DISPLAY = {
     0x4F534752u, 0x0008u, 0x4000u, {0x80, 0x08, 0x00, 0x58, 0x44, 0x50, 0x00, 0x08}};
+constexpr XgrGuid XGR_API_GUID_STORE = {
+    0x4F534752u, 0x0009u, 0x4000u, {0x80, 0x09, 0x00, 0x58, 0x53, 0x54, 0x00, 0x09}};
+constexpr XgrGuid XGR_API_GUID_GAME_UI = {
+    0x4F534752u, 0x000Au, 0x4000u, {0x80, 0x0A, 0x00, 0x58, 0x55, 0x49, 0x00, 0x0A}};
+constexpr XgrGuid XGR_API_GUID_NETWORKING = {
+    0x4F534752u, 0x000Bu, 0x4000u, {0x80, 0x0B, 0x00, 0x58, 0x4E, 0x57, 0x00, 0x0B}};
+constexpr XgrGuid XGR_API_GUID_CORE_RUNTIME = {
+    0x4F534752u, 0x000Cu, 0x4000u, {0x80, 0x0C, 0x00, 0x58, 0x43, 0x52, 0x00, 0x0C}};
 
 typedef XGameResult(OPENSCARLETT_GDK_CALL* XgrQueryInterfaceFn)(
     const void* self,
@@ -693,6 +1871,25 @@ struct IXgrTaskQueueApiVtable {
     void(OPENSCARLETT_GDK_CALL* XTaskQueueUnregisterMonitor)(
         XTaskQueueHandle queue,
         XTaskQueueRegistrationToken token);
+    // Extended TaskQueue entries
+    XGameResult(OPENSCARLETT_GDK_CALL* XTaskQueueGetPort)(
+        XTaskQueueHandle queue,
+        XTaskQueuePort port,
+        XTaskQueuePortHandle* portHandle);
+    XGameResult(OPENSCARLETT_GDK_CALL* XTaskQueueCreateComposite)(
+        XTaskQueuePortHandle workPort,
+        XTaskQueuePortHandle completionPort,
+        XTaskQueueHandle* queue);
+    XGameResult(OPENSCARLETT_GDK_CALL* XTaskQueueRegisterWaiter)(
+        XTaskQueueHandle queue,
+        XTaskQueuePort port,
+        void* waitHandle,
+        void* callbackContext,
+        XTaskQueueCallback callback,
+        XTaskQueueRegistrationToken* token);
+    void(OPENSCARLETT_GDK_CALL* XTaskQueueUnregisterWaiter)(
+        XTaskQueueHandle queue,
+        XTaskQueueRegistrationToken token);
 };
 
 struct IXgrAsyncApiVtable {
@@ -726,6 +1923,10 @@ struct IXgrAsyncApiVtable {
         void* buffer,
         size_t* bufferUsed);
     void(OPENSCARLETT_GDK_CALL* XAsyncCancel)(XAsyncBlock* asyncBlock);
+    // Extended Async entry
+    XGameResult(OPENSCARLETT_GDK_CALL* XAsyncRun)(
+        XAsyncBlock* asyncBlock,
+        XAsyncWork work);
 };
 
 struct IXgrUserApiVtable {
@@ -765,6 +1966,115 @@ struct IXgrUserApiVtable {
         XUserPrivilegeDenyReason* reason);
     XGameResult(OPENSCARLETT_GDK_CALL* XUserGetMaxUsers)(uint32_t* maxUsers);
     int32_t(OPENSCARLETT_GDK_CALL* XUserCompare)(XUserHandle user1, XUserHandle user2);
+    // Extended XUser entries (full XGamingRuntimeThunks parity)
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserGetGamerPictureAsync)(
+        XUserHandle user,
+        XUserGamerPictureSize pictureSize,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserGetGamerPictureResultSize)(
+        XAsyncBlock* async,
+        size_t* bufferSize);
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserGetGamerPictureResult)(
+        XAsyncBlock* async,
+        size_t bufferSize,
+        uint8_t* buffer,
+        size_t* bufferUsed);
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserGetIsGuest)(XUserHandle user, bool* isGuest);
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserFindUserById)(uint64_t userId, XUserHandle* handle);
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserFindUserByLocalId)(
+        XUserLocalId userLocalId,
+        XUserHandle* handle);
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserFindForDevice)(
+        const XUserAppLocalDeviceId* deviceId,
+        XUserHandle* handle);
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserGetTokenAndSignatureAsync)(
+        XUserHandle user,
+        XUserGetTokenAndSignatureOptions options,
+        const char* method,
+        const char* url,
+        size_t headerCount,
+        const XUserGetTokenAndSignatureHttpHeader* headers,
+        size_t bodySize,
+        const void* bodyBuffer,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserGetTokenAndSignatureResultSize)(
+        XAsyncBlock* async,
+        size_t* bufferSize);
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserGetTokenAndSignatureResult)(
+        XAsyncBlock* async,
+        size_t bufferSize,
+        void* buffer,
+        XUserGetTokenAndSignatureData** ptrToBuffer,
+        size_t* bufferUsed);
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserGetTokenAndSignatureUtf16Async)(
+        XUserHandle user,
+        XUserGetTokenAndSignatureOptions options,
+        const wchar_t* method,
+        const wchar_t* url,
+        size_t headerCount,
+        const XUserGetTokenAndSignatureUtf16HttpHeader* headers,
+        size_t bodySize,
+        const void* bodyBuffer,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserGetTokenAndSignatureUtf16ResultSize)(
+        XAsyncBlock* async,
+        size_t* bufferSize);
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserGetTokenAndSignatureUtf16Result)(
+        XAsyncBlock* async,
+        size_t bufferSize,
+        void* buffer,
+        XUserGetTokenAndSignatureUtf16Data** ptrToBuffer,
+        size_t* bufferUsed);
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserGetDefaultAudioEndpointUtf16)(
+        XUserLocalId user,
+        XUserDefaultAudioEndpointKind defaultAudioEndpointKind,
+        size_t endpointIdUtf16Count,
+        wchar_t* endpointIdUtf16,
+        size_t* endpointIdUtf16Used);
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserGetSignOutDeferral)(
+        XUserSignOutDeferralHandle* deferral);
+    void(OPENSCARLETT_GDK_CALL* XUserCloseSignOutDeferralHandle)(
+        XUserSignOutDeferralHandle deferral);
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserRegisterForChangeEvent)(
+        XTaskQueueHandle queue,
+        void* context,
+        XUserChangeEventCallback callback,
+        XTaskQueueRegistrationToken* token);
+    bool(OPENSCARLETT_GDK_CALL* XUserUnregisterForChangeEvent)(
+        XTaskQueueRegistrationToken token,
+        bool wait);
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserRegisterForDefaultAudioEndpointUtf16Changed)(
+        XTaskQueueHandle queue,
+        void* context,
+        XUserDefaultAudioEndpointUtf16ChangedCallback callback,
+        XTaskQueueRegistrationToken* token);
+    bool(OPENSCARLETT_GDK_CALL* XUserUnregisterForDefaultAudioEndpointUtf16Changed)(
+        XTaskQueueRegistrationToken token,
+        bool wait);
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserRegisterForDeviceAssociationChanged)(
+        XTaskQueueHandle queue,
+        void* context,
+        XUserDeviceAssociationChangedCallback callback,
+        XTaskQueueRegistrationToken* token);
+    bool(OPENSCARLETT_GDK_CALL* XUserUnregisterForDeviceAssociationChanged)(
+        XTaskQueueRegistrationToken token,
+        bool wait);
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserResolveIssueWithUiAsync)(
+        XUserHandle user,
+        const char* url,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserResolveIssueWithUiResult)(XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserResolveIssueWithUiUtf16Async)(
+        XUserHandle user,
+        const wchar_t* url,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserResolveIssueWithUiUtf16Result)(XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserResolvePrivilegeWithUiAsync)(
+        XUserHandle user,
+        XUserPrivilegeOptions options,
+        XUserPrivilege privilege,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XUserResolvePrivilegeWithUiResult)(XAsyncBlock* async);
 };
 
 struct IXgrGameSaveApiVtable {
@@ -825,6 +2135,47 @@ struct IXgrGameSaveApiVtable {
     XGameResult(OPENSCARLETT_GDK_CALL* XGameSaveGetRemainingQuota)(
         XGameSaveProviderHandle provider,
         int64_t* remainingQuota);
+    // Extended XGameSave entries
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameSaveEnumerateContainerInfoByName)(
+        XGameSaveProviderHandle provider,
+        const char* containerNamePrefix,
+        void* context,
+        XGameSaveContainerInfoCallback callback);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameSaveEnumerateBlobInfoByName)(
+        XGameSaveContainerHandle container,
+        const char* blobNamePrefix,
+        void* context,
+        XGameSaveBlobInfoCallback callback);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameSaveGetContainerInfo)(
+        XGameSaveProviderHandle provider,
+        const char* containerName,
+        void* context,
+        XGameSaveContainerInfoCallback callback);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameSaveReadBlobDataAsync)(
+        XGameSaveContainerHandle container,
+        const char** blobNames,
+        uint32_t countOfBlobs,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameSaveReadBlobDataResult)(
+        XAsyncBlock* async,
+        size_t blobsSize,
+        XGameSaveBlob* blobData,
+        uint32_t* countOfBlobs);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameSaveSubmitUpdateAsync)(
+        XGameSaveUpdateHandle updateContext,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameSaveSubmitUpdateResult)(XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameSaveDeleteContainerAsync)(
+        XGameSaveProviderHandle provider,
+        const char* name,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameSaveDeleteContainerResult)(XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameSaveGetRemainingQuotaAsync)(
+        XGameSaveProviderHandle provider,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameSaveGetRemainingQuotaResult)(
+        XAsyncBlock* async,
+        int64_t* remainingQuota);
 };
 
 struct IXgrSystemApiVtable {
@@ -847,6 +2198,8 @@ struct IXgrSystemApiVtable {
     XSystemAnalyticsInfo(OPENSCARLETT_GDK_CALL* XSystemGetAnalyticsInfo)(void);
     XSystemRuntimeInfo(OPENSCARLETT_GDK_CALL* XSystemGetRuntimeInfo)(void);
     bool(OPENSCARLETT_GDK_CALL* XSystemIsHandleValid)(void* handle);
+    // Extended System entry
+    bool(OPENSCARLETT_GDK_CALL* XGameRuntimeIsFeatureAvailable)(XGameRuntimeFeature feature);
 };
 
 struct IXgrMemApiVtable {
@@ -878,6 +2231,98 @@ struct IXgrPackageApiVtable {
         const XPackageChunkSelector* selectors,
         void* context,
         XPackageChunkAvailabilityCallback callback);
+    // Extended XPackage entries (full XGamingRuntimeThunks parity)
+    XGameResult(OPENSCARLETT_GDK_CALL* XPackageMount)(
+        const char* packageIdentifier,
+        XPackageMountHandle* mount);
+    void(OPENSCARLETT_GDK_CALL* XPackageCloseMountHandle)(XPackageMountHandle mount);
+    XGameResult(OPENSCARLETT_GDK_CALL* XPackageGetMountPathSize)(
+        XPackageMountHandle mount,
+        size_t* pathSize);
+    XGameResult(OPENSCARLETT_GDK_CALL* XPackageGetMountPath)(
+        XPackageMountHandle mount,
+        size_t pathSize,
+        char* path);
+    XGameResult(OPENSCARLETT_GDK_CALL* XPackageGetUserLocale)(size_t localeSize, char* locale);
+    XGameResult(OPENSCARLETT_GDK_CALL* XPackageGetWriteStats)(XPackageWriteStats* writeStats);
+    XGameResult(OPENSCARLETT_GDK_CALL* XPackageCreateInstallationMonitor)(
+        const char* packageIdentifier,
+        uint32_t selectorCount,
+        const XPackageChunkSelector* selectors,
+        uint32_t minimumUpdateIntervalMs,
+        XTaskQueueHandle queue,
+        XPackageInstallationMonitorHandle* installationMonitor);
+    void(OPENSCARLETT_GDK_CALL* XPackageCloseInstallationMonitorHandle)(
+        XPackageInstallationMonitorHandle installationMonitor);
+    void(OPENSCARLETT_GDK_CALL* XPackageGetInstallationProgress)(
+        XPackageInstallationMonitorHandle installationMonitor,
+        XPackageInstallationProgress* progress);
+    bool(OPENSCARLETT_GDK_CALL* XPackageUpdateInstallationMonitor)(
+        XPackageInstallationMonitorHandle installationMonitor);
+    XGameResult(OPENSCARLETT_GDK_CALL* XPackageRegisterInstallationProgressChanged)(
+        XPackageInstallationMonitorHandle installationMonitor,
+        void* context,
+        XPackageInstallationProgressCallback callback,
+        XTaskQueueRegistrationToken* token);
+    bool(OPENSCARLETT_GDK_CALL* XPackageUnregisterInstallationProgressChanged)(
+        XPackageInstallationMonitorHandle installationMonitor,
+        XTaskQueueRegistrationToken token,
+        bool wait);
+    XGameResult(OPENSCARLETT_GDK_CALL* XPackageRegisterPackageInstalled)(
+        XTaskQueueHandle queue,
+        void* context,
+        XPackageInstalledCallback callback,
+        XTaskQueueRegistrationToken* token);
+    bool(OPENSCARLETT_GDK_CALL* XPackageUnregisterPackageInstalled)(
+        XTaskQueueRegistrationToken token,
+        bool wait);
+    XGameResult(OPENSCARLETT_GDK_CALL* XPackageEnumeratePackages)(
+        XPackageKind kind,
+        XPackageEnumerationScope scope,
+        void* context,
+        XPackageEnumerationCallback callback);
+    XGameResult(OPENSCARLETT_GDK_CALL* XPackageEnumerateFeatures)(
+        const char* packageIdentifier,
+        void* context,
+        XPackageFeatureEnumerationCallback callback);
+    XGameResult(OPENSCARLETT_GDK_CALL* XPackageFindChunkAvailability)(
+        const char* packageIdentifier,
+        uint32_t selectorCount,
+        const XPackageChunkSelector* selectors,
+        XPackageChunkAvailability* availability);
+    XGameResult(OPENSCARLETT_GDK_CALL* XPackageEstimateDownloadSize)(
+        const char* packageIdentifier,
+        uint32_t selectorCount,
+        const XPackageChunkSelector* selectors,
+        uint64_t* downloadSize,
+        bool* shouldPresentUserConfirmation);
+    XGameResult(OPENSCARLETT_GDK_CALL* XPackageChangeChunkInstallOrder)(
+        const char* packageIdentifier,
+        uint32_t chunkCount,
+        const uint32_t* chunkIds);
+    XGameResult(OPENSCARLETT_GDK_CALL* XPackageInstallChunks)(
+        const char* packageIdentifier,
+        uint32_t selectorCount,
+        const XPackageChunkSelector* selectors,
+        uint32_t minimumUpdateIntervalMs,
+        bool suppressUserConfirmation,
+        XTaskQueueHandle queue,
+        XPackageInstallationMonitorHandle* installationMonitor);
+    XGameResult(OPENSCARLETT_GDK_CALL* XPackageInstallChunksAsync)(
+        const char* packageIdentifier,
+        uint32_t selectorCount,
+        const XPackageChunkSelector* selectors,
+        uint32_t minimumUpdateIntervalMs,
+        bool suppressUserConfirmation,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XPackageInstallChunksResult)(
+        XAsyncBlock* async,
+        XPackageInstallationMonitorHandle* installationMonitor);
+    XGameResult(OPENSCARLETT_GDK_CALL* XPackageUninstallChunks)(
+        const char* packageIdentifier,
+        uint32_t selectorCount,
+        const XPackageChunkSelector* selectors);
+    XGameResult(OPENSCARLETT_GDK_CALL* XPackageUninstallUWPInstance)(const char* packageName);
 };
 
 struct IXgrDisplayApiVtable {
@@ -892,6 +2337,468 @@ struct IXgrDisplayApiVtable {
         XDisplayTimeoutDeferralHandle* handle);
     void(OPENSCARLETT_GDK_CALL* XDisplayCloseTimeoutDeferralHandle)(
         XDisplayTimeoutDeferralHandle handle);
+    // Extended Display entry
+    XGameResult(OPENSCARLETT_GDK_CALL* XDisplayAcquireTimeoutDeferral)(
+        XDisplayTimeoutDeferralHandle* handle);
+};
+
+struct IXgrStoreApiVtable {
+    XgrQueryInterfaceFn QueryInterface;
+    XgrAddRefFn AddRef;
+    XgrReleaseFn Release;
+
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreCreateContext)(
+        XUserHandle user,
+        XStoreContextHandle* storeContextHandle);
+    void(OPENSCARLETT_GDK_CALL* XStoreCloseContextHandle)(XStoreContextHandle storeContextHandle);
+    void(OPENSCARLETT_GDK_CALL* XStoreCloseLicenseHandle)(XStoreLicenseHandle storeLicenseHandle);
+    void(OPENSCARLETT_GDK_CALL* XStoreCloseProductsQueryHandle)(
+        XStoreProductQueryHandle productQueryHandle);
+    bool(OPENSCARLETT_GDK_CALL* XStoreIsLicenseValid)(XStoreLicenseHandle storeLicenseHandle);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreQueryGameLicenseAsync)(
+        XStoreContextHandle storeContextHandle,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreQueryGameLicenseResult)(
+        XAsyncBlock* async,
+        XStoreGameLicense* license);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreRegisterGameLicenseChanged)(
+        XStoreContextHandle storeContextHandle,
+        XTaskQueueHandle queue,
+        void* context,
+        XStoreGameLicenseChangedCallback callback,
+        XTaskQueueRegistrationToken* token);
+    bool(OPENSCARLETT_GDK_CALL* XStoreUnregisterGameLicenseChanged)(
+        XStoreContextHandle storeContextHandle,
+        XTaskQueueRegistrationToken token,
+        bool wait);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreRegisterPackageLicenseLost)(
+        XStoreLicenseHandle licenseHandle,
+        XTaskQueueHandle queue,
+        void* context,
+        XStorePackageLicenseLostCallback callback,
+        XTaskQueueRegistrationToken* token);
+    bool(OPENSCARLETT_GDK_CALL* XStoreUnregisterPackageLicenseLost)(
+        XStoreLicenseHandle licenseHandle,
+        XTaskQueueRegistrationToken token,
+        bool wait);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreQueryAddOnLicensesAsync)(
+        XStoreContextHandle storeContextHandle,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreQueryAddOnLicensesResultCount)(
+        XAsyncBlock* async,
+        uint32_t* count);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreQueryAddOnLicensesResult)(
+        XAsyncBlock* async,
+        uint32_t count,
+        XStoreAddonLicense* addOnLicenses);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreQueryProductForCurrentGameAsync)(
+        XStoreContextHandle storeContextHandle,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreQueryProductForCurrentGameResult)(
+        XAsyncBlock* async,
+        XStoreProductQueryHandle* productQueryHandle);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreQueryProductForPackageAsync)(
+        XStoreContextHandle storeContextHandle,
+        XStoreProductKind productKinds,
+        const char* packageIdentifier,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreQueryProductForPackageResult)(
+        XAsyncBlock* async,
+        XStoreProductQueryHandle* productQueryHandle);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreQueryAssociatedProductsAsync)(
+        XStoreContextHandle storeContextHandle,
+        XStoreProductKind productKinds,
+        uint32_t maxItemsToRetrievePerPage,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreQueryAssociatedProductsResult)(
+        XAsyncBlock* async,
+        XStoreProductQueryHandle* productQueryHandle);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreQueryEntitledProductsAsync)(
+        XStoreContextHandle storeContextHandle,
+        XStoreProductKind productKinds,
+        uint32_t maxItemsToRetrievePerPage,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreQueryEntitledProductsResult)(
+        XAsyncBlock* async,
+        XStoreProductQueryHandle* productQueryHandle);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreQueryProductsAsync)(
+        XStoreContextHandle storeContextHandle,
+        XStoreProductKind productKinds,
+        const char** storeIds,
+        size_t storeIdsCount,
+        const char** actionFilters,
+        size_t actionFiltersCount,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreQueryProductsResult)(
+        XAsyncBlock* async,
+        XStoreProductQueryHandle* productQueryHandle);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreEnumerateProductsQuery)(
+        XStoreProductQueryHandle productQueryHandle,
+        void* context,
+        XStoreProductQueryCallback callback);
+    bool(OPENSCARLETT_GDK_CALL* XStoreProductsQueryHasMorePages)(
+        XStoreProductQueryHandle productQueryHandle);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreProductsQueryNextPageAsync)(
+        XStoreProductQueryHandle productQueryHandle,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreProductsQueryNextPageResult)(
+        XAsyncBlock* async,
+        XStoreProductQueryHandle* productQueryHandle);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreCanAcquireLicenseForPackageAsync)(
+        XStoreContextHandle storeContextHandle,
+        const char* packageIdentifier,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreCanAcquireLicenseForPackageResult)(
+        XAsyncBlock* async,
+        XStoreCanAcquireLicenseResult* storeCanAcquireLicenseResult);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreCanAcquireLicenseForStoreIdAsync)(
+        XStoreContextHandle storeContextHandle,
+        const char* storeProductId,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreCanAcquireLicenseForStoreIdResult)(
+        XAsyncBlock* async,
+        XStoreCanAcquireLicenseResult* storeCanAcquireLicenseResult);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreAcquireLicenseForPackageAsync)(
+        XStoreContextHandle storeContextHandle,
+        const char* packageIdentifier,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreAcquireLicenseForPackageResult)(
+        XAsyncBlock* async,
+        XStoreLicenseHandle* storeLicenseHandle);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreAcquireLicenseForDurablesAsync)(
+        XStoreContextHandle storeContextHandle,
+        const char* storeId,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreAcquireLicenseForDurablesResult)(
+        XAsyncBlock* async,
+        XStoreLicenseHandle* storeLicenseHandle);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreQueryConsumableBalanceRemainingAsync)(
+        XStoreContextHandle storeContextHandle,
+        const char* storeProductId,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreQueryConsumableBalanceRemainingResult)(
+        XAsyncBlock* async,
+        XStoreConsumableResult* consumableResult);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreReportConsumableFulfillmentAsync)(
+        XStoreContextHandle storeContextHandle,
+        const char* storeProductId,
+        uint32_t quantity,
+        XgrGuid trackingId,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreReportConsumableFulfillmentResult)(
+        XAsyncBlock* async,
+        XStoreConsumableResult* consumableResult);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreQueryGameAndDlcPackageUpdatesAsync)(
+        XStoreContextHandle storeContextHandle,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreQueryGameAndDlcPackageUpdatesResultCount)(
+        XAsyncBlock* async,
+        uint32_t* count);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreQueryGameAndDlcPackageUpdatesResult)(
+        XAsyncBlock* async,
+        uint32_t count,
+        XStorePackageUpdate* packageUpdates);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreDownloadPackageUpdatesAsync)(
+        XStoreContextHandle storeContextHandle,
+        const char** packageIdentifiers,
+        size_t packageIdentifiersCount,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreDownloadPackageUpdatesResult)(XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreDownloadAndInstallPackageUpdatesAsync)(
+        XStoreContextHandle storeContextHandle,
+        const char** packageIdentifiers,
+        size_t packageIdentifiersCount,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreDownloadAndInstallPackageUpdatesResult)(
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreDownloadAndInstallPackagesAsync)(
+        XStoreContextHandle storeContextHandle,
+        const char** storeIds,
+        size_t storeIdsCount,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreDownloadAndInstallPackagesResultCount)(
+        XAsyncBlock* async,
+        uint32_t* count);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreDownloadAndInstallPackagesResult)(
+        XAsyncBlock* async,
+        uint32_t count,
+        char (*packageIdentifiers)[XSTORE_PACKAGE_IDENTIFIER_MAX_LENGTH]);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreGetUserCollectionsIdAsync)(
+        XStoreContextHandle storeContextHandle,
+        const char* serviceTicket,
+        const char* publisherUserId,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreGetUserCollectionsIdResultSize)(
+        XAsyncBlock* async,
+        size_t* size);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreGetUserCollectionsIdResult)(
+        XAsyncBlock* async,
+        size_t size,
+        char* result);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreGetUserPurchaseIdAsync)(
+        XStoreContextHandle storeContextHandle,
+        const char* serviceTicket,
+        const char* publisherUserId,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreGetUserPurchaseIdResultSize)(
+        XAsyncBlock* async,
+        size_t* size);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreGetUserPurchaseIdResult)(
+        XAsyncBlock* async,
+        size_t size,
+        char* result);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreQueryLicenseTokenAsync)(
+        XStoreContextHandle storeContextHandle,
+        const char** productIds,
+        size_t productIdsCount,
+        const char* customDeveloperString,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreQueryLicenseTokenResultSize)(
+        XAsyncBlock* async,
+        size_t* size);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreQueryLicenseTokenResult)(
+        XAsyncBlock* async,
+        size_t size,
+        char* result);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreQueryPackageIdentifier)(
+        const char* storeId,
+        size_t size,
+        char* packageIdentifier);
+    bool(OPENSCARLETT_GDK_CALL* XStoreIsAvailabilityPurchasable)(
+        const XStoreAvailability availability);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreShowAssociatedProductsUIAsync)(
+        XStoreContextHandle storeContextHandle,
+        const char* storeId,
+        XStoreProductKind productKinds,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreShowAssociatedProductsUIResult)(XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreShowProductPageUIAsync)(
+        XStoreContextHandle storeContextHandle,
+        const char* storeId,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreShowProductPageUIResult)(XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreShowPurchaseUIAsync)(
+        XStoreContextHandle storeContextHandle,
+        const char* storeId,
+        const char* name,
+        const char* extendedJsonData,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreShowPurchaseUIResult)(XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreShowRateAndReviewUIAsync)(
+        XStoreContextHandle storeContextHandle,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreShowRateAndReviewUIResult)(XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreShowRedeemTokenUIAsync)(
+        XStoreContextHandle storeContextHandle,
+        const char* token,
+        const char** allowedStoreIds,
+        size_t allowedStoreIdsCount,
+        bool disallowCsvRedemption,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XStoreShowRedeemTokenUIResult)(XAsyncBlock* async);
+};
+
+struct IXgrGameUiApiVtable {
+    XgrQueryInterfaceFn QueryInterface;
+    XgrAddRefFn AddRef;
+    XgrReleaseFn Release;
+
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameUiSetNotificationPositionHint)(
+        XGameUiNotificationPositionHint position);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameUiShowMessageDialogAsync)(
+        XAsyncBlock* async,
+        const char* titleText,
+        const char* contentText,
+        const char* firstButtonText,
+        const char* secondButtonText,
+        const char* thirdButtonText,
+        XGameUiMessageDialogButton defaultButton,
+        XGameUiMessageDialogButton cancelButton);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameUiShowMessageDialogResult)(
+        XAsyncBlock* async,
+        XGameUiMessageDialogButton* resultButton);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameUiShowErrorDialogAsync)(
+        XAsyncBlock* async,
+        XGameResult errorCode,
+        const char* context);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameUiShowErrorDialogResult)(XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameUiShowTextEntryAsync)(
+        XAsyncBlock* async,
+        const char* titleText,
+        const char* descriptionText,
+        const char* defaultText,
+        XGameUiTextEntryInputScope inputScope,
+        uint32_t maxTextLength);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameUiShowTextEntryResultSize)(
+        XAsyncBlock* async,
+        uint32_t* resultTextBufferSize);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameUiShowTextEntryResult)(
+        XAsyncBlock* async,
+        uint32_t resultTextBufferSize,
+        char* resultTextBuffer,
+        uint32_t* resultTextBufferUsed);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameUiShowAchievementsAsync)(
+        XAsyncBlock* async,
+        XUserHandle requestingUser,
+        uint32_t titleId);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameUiShowAchievementsResult)(XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameUiShowPlayerPickerAsync)(
+        XAsyncBlock* async,
+        XUserHandle requestingUser,
+        const char* promptText,
+        uint32_t selectFromPlayersCount,
+        const uint64_t* selectFromPlayers,
+        uint32_t preSelectedPlayersCount,
+        const uint64_t* preSelectedPlayers,
+        uint32_t minSelectionCount,
+        uint32_t maxSelectionCount);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameUiShowPlayerPickerResultCount)(
+        XAsyncBlock* async,
+        uint32_t* resultPlayersCount);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameUiShowPlayerPickerResult)(
+        XAsyncBlock* async,
+        uint32_t resultPlayersCount,
+        uint64_t* resultPlayers,
+        uint32_t* resultPlayersUsed);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameUiShowPlayerProfileCardAsync)(
+        XAsyncBlock* async,
+        XUserHandle requestingUser,
+        uint64_t targetPlayer);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameUiShowPlayerProfileCardResult)(XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameUiShowSendGameInviteAsync)(
+        XAsyncBlock* async,
+        XUserHandle requestingUser,
+        const char* sessionConfigurationId,
+        const char* sessionTemplateName,
+        const char* sessionId,
+        const char* invitationText,
+        const char* customActivationContext);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameUiShowSendGameInviteResult)(XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameUiShowWebAuthenticationAsync)(
+        XAsyncBlock* async,
+        XUserHandle requestingUser,
+        const char* requestUri,
+        const char* completionUri);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameUiShowWebAuthenticationWithOptionsAsync)(
+        XAsyncBlock* async,
+        XUserHandle requestingUser,
+        const char* requestUri,
+        const char* completionUri,
+        XGameUiWebAuthenticationOptions options);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameUiShowWebAuthenticationResultSize)(
+        XAsyncBlock* async,
+        size_t* bufferSize);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameUiShowWebAuthenticationResult)(
+        XAsyncBlock* async,
+        size_t bufferSize,
+        void* buffer,
+        XGameUiWebAuthenticationResultData** ptrToBuffer,
+        size_t* bufferUsed);
+};
+
+struct IXgrNetworkingApiVtable {
+    XgrQueryInterfaceFn QueryInterface;
+    XgrAddRefFn AddRef;
+    XgrReleaseFn Release;
+
+    XGameResult(OPENSCARLETT_GDK_CALL* XNetworkingGetConnectivityHint)(
+        XNetworkingConnectivityHint* connectivityHint);
+    XGameResult(OPENSCARLETT_GDK_CALL* XNetworkingQueryConnectivityHint)(
+        XNetworkingConnectivityHint* connectivityHint);
+    XGameResult(OPENSCARLETT_GDK_CALL* XNetworkingQueryPreferredLocalUdpMultiplayerPort)(
+        uint16_t* preferredLocalUdpMultiplayerPort);
+    XGameResult(OPENSCARLETT_GDK_CALL* XNetworkingQueryPreferredLocalUdpMultiplayerPortAsync)(
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult)(
+        XAsyncBlock* async,
+        uint16_t* preferredLocalUdpMultiplayerPort);
+    XGameResult(OPENSCARLETT_GDK_CALL* XNetworkingRegisterConnectivityHintChanged)(
+        XTaskQueueHandle queue,
+        void* context,
+        XNetworkingConnectivityHintChangedCallback callback,
+        XTaskQueueRegistrationToken* token);
+    bool(OPENSCARLETT_GDK_CALL* XNetworkingUnregisterConnectivityHintChanged)(
+        XTaskQueueRegistrationToken token,
+        bool wait);
+    XGameResult(OPENSCARLETT_GDK_CALL* XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged)(
+        XTaskQueueHandle queue,
+        void* context,
+        XNetworkingPreferredLocalUdpMultiplayerPortChangedCallback callback,
+        XTaskQueueRegistrationToken* token);
+    bool(OPENSCARLETT_GDK_CALL* XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged)(
+        XTaskQueueRegistrationToken token,
+        bool wait);
+    XGameResult(OPENSCARLETT_GDK_CALL* XNetworkingQuerySecurityInformationForUrlAsync)(
+        const char* url,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XNetworkingQuerySecurityInformationForUrlAsyncResultSize)(
+        XAsyncBlock* async,
+        size_t* securityInformationBufferByteCount);
+    XGameResult(OPENSCARLETT_GDK_CALL* XNetworkingQuerySecurityInformationForUrlAsyncResult)(
+        XAsyncBlock* async,
+        size_t securityInformationBufferByteCount,
+        size_t* securityInformationBufferByteCountUsed,
+        uint8_t* securityInformationBuffer,
+        XNetworkingSecurityInformation** pointerToSecurityInformation);
+    XGameResult(OPENSCARLETT_GDK_CALL* XNetworkingQuerySecurityInformationForUrlUtf16Async)(
+        const wchar_t* url,
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XNetworkingQuerySecurityInformationForUrlUtf16AsyncResultSize)(
+        XAsyncBlock* async,
+        size_t* securityInformationBufferByteCount);
+    XGameResult(OPENSCARLETT_GDK_CALL* XNetworkingQuerySecurityInformationForUrlUtf16AsyncResult)(
+        XAsyncBlock* async,
+        size_t securityInformationBufferByteCount,
+        size_t* securityInformationBufferByteCountUsed,
+        uint8_t* securityInformationBuffer,
+        XNetworkingSecurityInformation** pointerToSecurityInformation);
+    XGameResult(OPENSCARLETT_GDK_CALL* XNetworkingVerifyServerCertificate)(
+        void* requestHandle,
+        const XNetworkingSecurityInformation* securityInformation);
+};
+
+struct IXgrCoreRuntimeApiVtable {
+    XgrQueryInterfaceFn QueryInterface;
+    XgrAddRefFn AddRef;
+    XgrReleaseFn Release;
+
+    bool(OPENSCARLETT_GDK_CALL* XGameRuntimeIsFeatureAvailable)(XGameRuntimeFeature feature);
+    XGameResult(OPENSCARLETT_GDK_CALL* XPersistentLocalStorageGetPathSize)(size_t* pathSize);
+    XGameResult(OPENSCARLETT_GDK_CALL* XPersistentLocalStorageGetPath)(
+        size_t pathSize,
+        char* path,
+        size_t* pathUsed);
+    bool(OPENSCARLETT_GDK_CALL* XThreadIsTimeSensitive)(void);
+    XGameResult(OPENSCARLETT_GDK_CALL* XThreadSetTimeSensitive)(bool isTimeSensitiveThread);
+    void(OPENSCARLETT_GDK_CALL* XThreadAssertNotTimeSensitive)(void);
+    bool(OPENSCARLETT_GDK_CALL* XThreadVerifyNotTimeSensitive)(void);
+    void(OPENSCARLETT_GDK_CALL* XErrorReport)(XGameResult hr, const char* msg);
+    void(OPENSCARLETT_GDK_CALL* XErrorSetCallback)(XErrorCallback callback, void* context);
+    void(OPENSCARLETT_GDK_CALL* XErrorSetOptions)(
+        XErrorOptions optionsDebuggerPresent,
+        XErrorOptions optionsDebuggerNotPresent);
+    uint32_t(OPENSCARLETT_GDK_CALL* XGameEventWrite)(
+        uint64_t regHandle,
+        const XGameEventDescriptor* eventDescriptor,
+        uint32_t userDataCount,
+        XGameEventDataDescriptor* userData);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameInviteRegisterForEvent)(
+        XTaskQueueHandle queue,
+        void* context,
+        XGameInviteEventCallback callback,
+        XTaskQueueRegistrationToken* token);
+    bool(OPENSCARLETT_GDK_CALL* XGameInviteUnregisterForEvent)(
+        XTaskQueueRegistrationToken token,
+        bool wait);
+    void(OPENSCARLETT_GDK_CALL* XLaunchNewGame)(
+        const char* exePath,
+        const char* args,
+        XUserHandle defaultUser);
+    XGameResult(OPENSCARLETT_GDK_CALL* XLaunchUri)(XUserHandle requestingUser, const char* uri);
+    XGameResult(OPENSCARLETT_GDK_CALL* XHighContrastGetMode)(XHighContrastMode* mode);
+    XGameResult(OPENSCARLETT_GDK_CALL* XClosedCaptionGetProperties)(
+        XClosedCaptionProperties* properties);
+    XGameResult(OPENSCARLETT_GDK_CALL* XClosedCaptionSetEnabled)(bool enabled);
 };
 
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL InitializeApiImpl(void);

@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -219,6 +220,25 @@ XGameResult CopyStringResult(
         return XGR_E_NOT_SUFFICIENT_BUFFER;
     }
     std::memcpy(buffer, src.c_str(), needed);
+    return XGR_S_OK;
+}
+
+XGameResult CopyWideStringResult(
+    const std::wstring& src,
+    size_t buffer_count,
+    wchar_t* buffer,
+    size_t* used_count) {
+    const size_t needed = src.size() + 1;
+    if (used_count) {
+        *used_count = needed;
+    }
+    if (!buffer) {
+        return XGR_E_INVALIDARG;
+    }
+    if (buffer_count < needed) {
+        return XGR_E_NOT_SUFFICIENT_BUFFER;
+    }
+    std::memcpy(buffer, src.c_str(), needed * sizeof(wchar_t));
     return XGR_S_OK;
 }
 
@@ -547,13 +567,71 @@ struct XDisplayTimeoutDeferral {
     std::atomic<uint32_t> active{1};
 };
 
+struct XUserSignOutDeferral {
+    std::atomic<uint32_t> active{1};
+};
+
+struct XStoreContext {
+    uint64_t xuid = 0;
+};
+
+struct XStoreLicense {
+    std::string identifier;
+    bool valid = true;
+};
+
+struct XStoreProductBacking {
+    std::string store_id;
+    std::string title;
+    std::string description;
+    std::string language;
+    std::string offer_token;
+    std::string link_uri;
+    std::string currency_code;
+    std::string sku_id;
+    std::string availability_id;
+    XStoreAvailability availability{};
+    XStoreSku sku{};
+    XStoreProduct product{};
+};
+
+struct XStoreProductQuery {
+    std::deque<XStoreProductBacking> products;
+};
+
+struct XPackageMountObject {
+    std::string package_id;
+    std::string mount_path;
+};
+
+struct XPackageInstallationMonitor {
+    std::string package_id;
+    uint64_t total_bytes = 1024ULL * 1024ULL;
+};
+
 namespace {
+
+enum RegFamily : uint32_t {
+    kRegUserChange = 1,
+    kRegUserAudioEndpoint = 2,
+    kRegUserDeviceAssoc = 3,
+    kRegStoreGameLicense = 4,
+    kRegStorePackageLicense = 5,
+    kRegNetConnectivity = 6,
+    kRegNetUdpPort = 7,
+    kRegPackageProgress = 8,
+    kRegPackageInstalled = 9,
+    kRegGameInvite = 10,
+};
+
+thread_local bool g_thread_time_sensitive = false;
 
 struct RuntimeState {
     std::mutex mutex;
     std::atomic<int32_t> init_count{0};
     std::atomic<int32_t> api_impl_init_count{0};
-    std::atomic<uint32_t> vtable_refs[8]{1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u};
+    std::atomic<uint32_t> vtable_refs[12]{
+        1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u};
 
     // Task queues
     std::unordered_map<XTaskQueueObject*, std::shared_ptr<XTaskQueueObject>> live_queues;
@@ -578,6 +656,34 @@ struct RuntimeState {
     std::mutex mem_mutex;
     XMemAllocFunction alloc_hook = nullptr;
     XMemFreeFunction free_hook = nullptr;
+
+    // Registration tokens (shared across XUser, XStore, XNetworking, XPackage, XGameInvite)
+    std::mutex reg_mutex;
+    uint64_t next_reg_token = 1;
+    std::unordered_map<uint64_t, uint32_t> live_reg_tokens;
+
+    // XStore handles
+    std::mutex store_mutex;
+    std::unordered_map<XStoreContext*, std::shared_ptr<XStoreContext>> live_store_contexts;
+    std::unordered_map<XStoreLicense*, std::shared_ptr<XStoreLicense>> live_store_licenses;
+    std::unordered_map<XStoreProductQuery*, std::shared_ptr<XStoreProductQuery>> live_store_queries;
+
+    // XPackage handles
+    std::mutex package_mutex;
+    std::unordered_map<XPackageMountObject*, std::shared_ptr<XPackageMountObject>> live_package_mounts;
+    std::unordered_map<XPackageInstallationMonitor*, std::shared_ptr<XPackageInstallationMonitor>>
+        live_install_monitors;
+
+    // XGameUi & XAccessibility & XError state
+    std::atomic<uint32_t> ui_notification_hint{
+        static_cast<uint32_t>(XGameUiNotificationPositionHint_BottomCenter)};
+    std::atomic<bool> closed_caption_enabled{false};
+
+    std::mutex error_mutex;
+    XErrorCallback error_callback = nullptr;
+    void* error_callback_ctx = nullptr;
+    XErrorOptions error_opts_debugger = XErrorOptions_None;
+    XErrorOptions error_opts_no_debugger = XErrorOptions_None;
 };
 
 RuntimeState& GetRuntime() {
@@ -1184,6 +1290,665 @@ XGameResult OPENSCARLETT_GDK_CALL GameSaveQuotaProvider(
     }
 }
 
+// ===========================================================================
+// Shared Registration Token, Package & Store Helpers
+// ===========================================================================
+XTaskQueueRegistrationToken AllocateRegToken(uint32_t family) {
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.reg_mutex);
+    const uint64_t tok = rt.next_reg_token++;
+    rt.live_reg_tokens[tok] = family;
+    return XTaskQueueRegistrationToken{tok};
+}
+
+bool ReleaseRegToken(uint32_t family, XTaskQueueRegistrationToken token) {
+    if (token.token == 0) {
+        return false;
+    }
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.reg_mutex);
+    auto it = rt.live_reg_tokens.find(token.token);
+    if (it == rt.live_reg_tokens.end() || it->second != family) {
+        return false;
+    }
+    rt.live_reg_tokens.erase(it);
+    return true;
+}
+
+std::string CurrentPackageIdentifier() {
+    std::string pkg_id = GetEnvString("OPENSCARLETT_PACKAGE_ID");
+    if (pkg_id.empty()) {
+        pkg_id = "OpenScarlett.Title_1.0.0.0_x64__openscarlett0";
+    }
+    return pkg_id;
+}
+
+std::string CurrentPackageMountPath() {
+    std::string env_root = GetEnvString("OPENSCARLETT_PACKAGE_ROOT");
+    if (!env_root.empty()) {
+        return env_root;
+    }
+    std::error_code ec;
+    fs::path cwd = fs::current_path(ec);
+    if (!ec && !cwd.empty()) {
+        return cwd.string();
+    }
+    return "E:\\OpenScarlett";
+}
+
+constexpr const char* kDefaultStoreId = "9OS000000001";
+constexpr const char* kDefaultSkuStoreId = "9OS000000001/0001";
+
+std::shared_ptr<XStoreContext> LookupStoreContext(XStoreContextHandle h) {
+    if (!h) return nullptr;
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.store_mutex);
+    auto it = rt.live_store_contexts.find(h);
+    return it == rt.live_store_contexts.end() ? nullptr : it->second;
+}
+
+std::shared_ptr<XStoreLicense> LookupStoreLicense(XStoreLicenseHandle h) {
+    if (!h) return nullptr;
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.store_mutex);
+    auto it = rt.live_store_licenses.find(h);
+    return it == rt.live_store_licenses.end() ? nullptr : it->second;
+}
+
+std::shared_ptr<XStoreProductQuery> LookupStoreQuery(XStoreProductQueryHandle h) {
+    if (!h) return nullptr;
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.store_mutex);
+    auto it = rt.live_store_queries.find(h);
+    return it == rt.live_store_queries.end() ? nullptr : it->second;
+}
+
+XStoreProductQueryHandle CreateStoreProductQueryHandle(bool include_current_game) {
+    auto q = std::make_shared<XStoreProductQuery>();
+    if (include_current_game) {
+        q->products.emplace_back();
+        XStoreProductBacking& b = q->products.back();
+        b.store_id = kDefaultStoreId;
+        b.title = "OpenScarlett Title";
+        b.description = "Clean-room local OpenScarlett title";
+        b.language = "en-US";
+        b.offer_token = "";
+        b.link_uri = "ms-windows-store://pdp/?productid=9OS000000001";
+        b.currency_code = "USD";
+        b.sku_id = "0001";
+        b.availability_id = "AVAIL0000001";
+
+        XStorePrice price{};
+        price.basePrice = 0.0f;
+        price.price = 0.0f;
+        price.recurrencePrice = 0.0f;
+        price.currencyCode = b.currency_code.c_str();
+        std::snprintf(price.formattedBasePrice, sizeof(price.formattedBasePrice), "%s", "$0.00");
+        std::snprintf(price.formattedPrice, sizeof(price.formattedPrice), "%s", "$0.00");
+        std::snprintf(price.formattedRecurrencePrice, sizeof(price.formattedRecurrencePrice), "%s", "$0.00");
+        price.isOnSale = false;
+        price.saleEndDate = 0;
+
+        b.availability.availabilityId = b.availability_id.c_str();
+        b.availability.price = price;
+        b.availability.endDate = 0;
+
+        b.sku.skuId = b.sku_id.c_str();
+        b.sku.title = b.title.c_str();
+        b.sku.description = b.description.c_str();
+        b.sku.language = b.language.c_str();
+        b.sku.price = price;
+        b.sku.isTrial = false;
+        b.sku.isInUserCollection = true;
+        b.sku.collectionData.acquiredDate = 0;
+        b.sku.collectionData.startDate = 0;
+        b.sku.collectionData.endDate = 0;
+        b.sku.collectionData.isTrial = false;
+        b.sku.collectionData.trialTimeRemainingInSeconds = 0;
+        b.sku.collectionData.quantity = 1;
+        b.sku.collectionData.campaignId = "";
+        b.sku.collectionData.developerOfferId = "";
+        b.sku.isSubscription = false;
+        b.sku.availabilitiesCount = 1;
+        b.sku.availabilities = &b.availability;
+
+        b.product.storeId = b.store_id.c_str();
+        b.product.title = b.title.c_str();
+        b.product.description = b.description.c_str();
+        b.product.language = b.language.c_str();
+        b.product.inAppOfferToken = b.offer_token.c_str();
+        b.product.linkUri = b.link_uri.data();
+        b.product.productKind = XStoreProductKind_Game;
+        b.product.price = price;
+        b.product.hasDigitalDownload = true;
+        b.product.isInUserCollection = true;
+        b.product.skusCount = 1;
+        b.product.skus = &b.sku;
+    }
+
+    XStoreProductQueryHandle raw = q.get();
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.store_mutex);
+    rt.live_store_queries[raw] = std::move(q);
+    return raw;
+}
+
+XStoreLicenseHandle CreateStoreLicenseHandle(const std::string& ident) {
+    auto lic = std::make_shared<XStoreLicense>();
+    lic->identifier = ident.empty() ? CurrentPackageIdentifier() : ident;
+    lic->valid = true;
+    XStoreLicenseHandle raw = lic.get();
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.store_mutex);
+    rt.live_store_licenses[raw] = std::move(lic);
+    return raw;
+}
+
+XPackageInstallationMonitorHandle CreateInstallMonitorHandle(const char* pkg_id) {
+    auto mon = std::make_shared<XPackageInstallationMonitor>();
+    mon->package_id = (pkg_id && *pkg_id) ? pkg_id : CurrentPackageIdentifier();
+    mon->total_bytes = 1024ULL * 1024ULL;
+    XPackageInstallationMonitorHandle raw = mon.get();
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.package_mutex);
+    rt.live_install_monitors[raw] = std::move(mon);
+    return raw;
+}
+
+// ===========================================================================
+// Reusable Clean-Room Async Providers
+// ===========================================================================
+struct VoidAsyncCtx {
+    XGameResult result = XGR_S_OK;
+};
+
+XGameResult OPENSCARLETT_GDK_CALL VoidAsyncProvider(
+    XAsyncOp op,
+    const XAsyncProviderData* data) {
+    auto* ctx = static_cast<VoidAsyncCtx*>(data->context);
+    switch (op) {
+        case XAsyncOp_Begin:
+            return XGR_S_OK;
+        case XAsyncOp_DoWork:
+            XAsyncComplete(data->async, ctx ? ctx->result : XGR_S_OK, 0);
+            return XGR_E_PENDING;
+        case XAsyncOp_Cleanup:
+            delete ctx;
+            return XGR_S_OK;
+        default:
+            return XGR_S_OK;
+    }
+}
+
+XGameResult StartVoidAsync(
+    XAsyncBlock* async,
+    const void* id,
+    const char* id_name,
+    XGameResult result_hr = XGR_S_OK) {
+    if (!async) return XGR_E_INVALIDARG;
+    auto* ctx = new (std::nothrow) VoidAsyncCtx{result_hr};
+    if (!ctx) return XGR_E_OUTOFMEMORY;
+    XGameResult hr = XAsyncBegin(async, ctx, id, id_name, &VoidAsyncProvider);
+    if (hr < 0) {
+        delete ctx;
+        return hr;
+    }
+    hr = XAsyncSchedule(async, 0);
+    if (hr < 0) {
+        XAsyncComplete(async, hr, 0);
+    }
+    return hr;
+}
+
+template <typename T>
+struct PodAsyncCtx {
+    T value{};
+};
+
+template <typename T>
+XGameResult OPENSCARLETT_GDK_CALL PodAsyncProvider(
+    XAsyncOp op,
+    const XAsyncProviderData* data) {
+    auto* ctx = static_cast<PodAsyncCtx<T>*>(data->context);
+    switch (op) {
+        case XAsyncOp_Begin:
+            return XGR_S_OK;
+        case XAsyncOp_DoWork:
+            XAsyncComplete(data->async, XGR_S_OK, sizeof(T));
+            return XGR_E_PENDING;
+        case XAsyncOp_GetResult:
+            if (!data->buffer || data->bufferSize < sizeof(T)) {
+                return XGR_E_NOT_SUFFICIENT_BUFFER;
+            }
+            std::memcpy(data->buffer, &ctx->value, sizeof(T));
+            return XGR_S_OK;
+        case XAsyncOp_Cleanup:
+            delete ctx;
+            return XGR_S_OK;
+        default:
+            return XGR_S_OK;
+    }
+}
+
+template <typename T>
+XGameResult StartPodAsync(
+    XAsyncBlock* async,
+    const void* id,
+    const char* id_name,
+    const T& value) {
+    if (!async) return XGR_E_INVALIDARG;
+    auto* ctx = new (std::nothrow) PodAsyncCtx<T>{value};
+    if (!ctx) return XGR_E_OUTOFMEMORY;
+    XGameResult hr = XAsyncBegin(async, ctx, id, id_name, &PodAsyncProvider<T>);
+    if (hr < 0) {
+        delete ctx;
+        return hr;
+    }
+    hr = XAsyncSchedule(async, 0);
+    if (hr < 0) {
+        XAsyncComplete(async, hr, 0);
+    }
+    return hr;
+}
+
+struct StringAsyncCtx {
+    std::string value;
+};
+
+XGameResult OPENSCARLETT_GDK_CALL StringAsyncProvider(
+    XAsyncOp op,
+    const XAsyncProviderData* data) {
+    auto* ctx = static_cast<StringAsyncCtx*>(data->context);
+    switch (op) {
+        case XAsyncOp_Begin:
+            return XGR_S_OK;
+        case XAsyncOp_DoWork:
+            XAsyncComplete(data->async, XGR_S_OK, ctx->value.size() + 1);
+            return XGR_E_PENDING;
+        case XAsyncOp_GetResult: {
+            const size_t needed = ctx->value.size() + 1;
+            if (!data->buffer || data->bufferSize < needed) {
+                return XGR_E_NOT_SUFFICIENT_BUFFER;
+            }
+            std::memcpy(data->buffer, ctx->value.c_str(), needed);
+            return XGR_S_OK;
+        }
+        case XAsyncOp_Cleanup:
+            delete ctx;
+            return XGR_S_OK;
+        default:
+            return XGR_S_OK;
+    }
+}
+
+XGameResult StartStringAsync(
+    XAsyncBlock* async,
+    const void* id,
+    const char* id_name,
+    std::string value) {
+    if (!async) return XGR_E_INVALIDARG;
+    auto* ctx = new (std::nothrow) StringAsyncCtx{std::move(value)};
+    if (!ctx) return XGR_E_OUTOFMEMORY;
+    XGameResult hr = XAsyncBegin(async, ctx, id, id_name, &StringAsyncProvider);
+    if (hr < 0) {
+        delete ctx;
+        return hr;
+    }
+    hr = XAsyncSchedule(async, 0);
+    if (hr < 0) {
+        XAsyncComplete(async, hr, 0);
+    }
+    return hr;
+}
+
+// Identity tags for new async operations
+const char kIdUserTokenSig[] = "XUserGetTokenAndSignatureAsync";
+const char kIdUserTokenSigUtf16[] = "XUserGetTokenAndSignatureUtf16Async";
+const char kIdUserResolveIssue[] = "XUserResolveIssueWithUiAsync";
+const char kIdUserResolveIssueUtf16[] = "XUserResolveIssueWithUiUtf16Async";
+const char kIdUserResolvePriv[] = "XUserResolvePrivilegeWithUiAsync";
+
+const char kIdStoreGameLicense[] = "XStoreQueryGameLicenseAsync";
+const char kIdStoreAddOnLicenses[] = "XStoreQueryAddOnLicensesAsync";
+const char kIdStoreProdCurrentGame[] = "XStoreQueryProductForCurrentGameAsync";
+const char kIdStoreProdPackage[] = "XStoreQueryProductForPackageAsync";
+const char kIdStoreAssocProds[] = "XStoreQueryAssociatedProductsAsync";
+const char kIdStoreEntitledProds[] = "XStoreQueryEntitledProductsAsync";
+const char kIdStoreQueryProds[] = "XStoreQueryProductsAsync";
+const char kIdStoreNextPage[] = "XStoreProductsQueryNextPageAsync";
+const char kIdStoreCanAcquirePkg[] = "XStoreCanAcquireLicenseForPackageAsync";
+const char kIdStoreCanAcquireStoreId[] = "XStoreCanAcquireLicenseForStoreIdAsync";
+const char kIdStoreAcquirePkg[] = "XStoreAcquireLicenseForPackageAsync";
+const char kIdStoreAcquireDurable[] = "XStoreAcquireLicenseForDurablesAsync";
+const char kIdStoreConsumableBal[] = "XStoreQueryConsumableBalanceRemainingAsync";
+const char kIdStoreConsumableFulfill[] = "XStoreReportConsumableFulfillmentAsync";
+const char kIdStorePkgUpdates[] = "XStoreQueryGameAndDlcPackageUpdatesAsync";
+const char kIdStoreDownloadUpdates[] = "XStoreDownloadPackageUpdatesAsync";
+const char kIdStoreDownloadInstallUpdates[] = "XStoreDownloadAndInstallPackageUpdatesAsync";
+const char kIdStoreDownloadInstallPkgs[] = "XStoreDownloadAndInstallPackagesAsync";
+const char kIdStoreCollectionsId[] = "XStoreGetUserCollectionsIdAsync";
+const char kIdStorePurchaseId[] = "XStoreGetUserPurchaseIdAsync";
+const char kIdStoreLicenseToken[] = "XStoreQueryLicenseTokenAsync";
+const char kIdStoreShowAssocUi[] = "XStoreShowAssociatedProductsUIAsync";
+const char kIdStoreShowProdUi[] = "XStoreShowProductPageUIAsync";
+const char kIdStoreShowPurchaseUi[] = "XStoreShowPurchaseUIAsync";
+const char kIdStoreShowRateUi[] = "XStoreShowRateAndReviewUIAsync";
+const char kIdStoreShowRedeemUi[] = "XStoreShowRedeemTokenUIAsync";
+
+const char kIdUiMessageDialog[] = "XGameUiShowMessageDialogAsync";
+const char kIdUiErrorDialog[] = "XGameUiShowErrorDialogAsync";
+const char kIdUiTextEntry[] = "XGameUiShowTextEntryAsync";
+const char kIdUiAchievements[] = "XGameUiShowAchievementsAsync";
+const char kIdUiPlayerPicker[] = "XGameUiShowPlayerPickerAsync";
+const char kIdUiProfileCard[] = "XGameUiShowPlayerProfileCardAsync";
+const char kIdUiSendInvite[] = "XGameUiShowSendGameInviteAsync";
+const char kIdUiWebAuth[] = "XGameUiShowWebAuthenticationAsync";
+
+const char kIdNetUdpPort[] = "XNetworkingQueryPreferredLocalUdpMultiplayerPortAsync";
+const char kIdNetSecInfo[] = "XNetworkingQuerySecurityInformationForUrlAsync";
+const char kIdNetSecInfoUtf16[] = "XNetworkingQuerySecurityInformationForUrlUtf16Async";
+
+const char kIdPackageInstallChunks[] = "XPackageInstallChunksAsync";
+
+// Specialized async providers
+struct TokenSigAsyncCtx {
+    std::string token;
+    std::string signature;
+};
+
+XGameResult OPENSCARLETT_GDK_CALL TokenSigProvider(
+    XAsyncOp op,
+    const XAsyncProviderData* data) {
+    auto* ctx = static_cast<TokenSigAsyncCtx*>(data->context);
+    switch (op) {
+        case XAsyncOp_Begin:
+            return XGR_S_OK;
+        case XAsyncOp_DoWork: {
+            const size_t req = sizeof(XUserGetTokenAndSignatureData) +
+                               (ctx->token.size() + 1) +
+                               (ctx->signature.size() + 1);
+            XAsyncComplete(data->async, XGR_S_OK, req);
+            return XGR_E_PENDING;
+        }
+        case XAsyncOp_GetResult: {
+            const size_t tok_sz = ctx->token.size() + 1;
+            const size_t sig_sz = ctx->signature.size() + 1;
+            const size_t req = sizeof(XUserGetTokenAndSignatureData) + tok_sz + sig_sz;
+            if (!data->buffer || data->bufferSize < req) {
+                return XGR_E_NOT_SUFFICIENT_BUFFER;
+            }
+            auto* out = static_cast<XUserGetTokenAndSignatureData*>(data->buffer);
+            auto* base = static_cast<uint8_t*>(data->buffer);
+            char* tok_dst = reinterpret_cast<char*>(base + sizeof(XUserGetTokenAndSignatureData));
+            char* sig_dst = tok_dst + tok_sz;
+            std::memcpy(tok_dst, ctx->token.c_str(), tok_sz);
+            std::memcpy(sig_dst, ctx->signature.c_str(), sig_sz);
+            out->tokenSize = tok_sz;
+            out->signatureSize = sig_sz;
+            out->token = tok_dst;
+            out->signature = sig_dst;
+            return XGR_S_OK;
+        }
+        case XAsyncOp_Cleanup:
+            delete ctx;
+            return XGR_S_OK;
+        default:
+            return XGR_S_OK;
+    }
+}
+
+struct TokenSigUtf16AsyncCtx {
+    std::wstring token;
+    std::wstring signature;
+};
+
+XGameResult OPENSCARLETT_GDK_CALL TokenSigUtf16Provider(
+    XAsyncOp op,
+    const XAsyncProviderData* data) {
+    auto* ctx = static_cast<TokenSigUtf16AsyncCtx*>(data->context);
+    switch (op) {
+        case XAsyncOp_Begin:
+            return XGR_S_OK;
+        case XAsyncOp_DoWork: {
+            const size_t req = sizeof(XUserGetTokenAndSignatureUtf16Data) +
+                               (ctx->token.size() + 1) * sizeof(wchar_t) +
+                               (ctx->signature.size() + 1) * sizeof(wchar_t);
+            XAsyncComplete(data->async, XGR_S_OK, req);
+            return XGR_E_PENDING;
+        }
+        case XAsyncOp_GetResult: {
+            const size_t tok_cnt = ctx->token.size() + 1;
+            const size_t sig_cnt = ctx->signature.size() + 1;
+            const size_t req = sizeof(XUserGetTokenAndSignatureUtf16Data) +
+                               tok_cnt * sizeof(wchar_t) +
+                               sig_cnt * sizeof(wchar_t);
+            if (!data->buffer || data->bufferSize < req) {
+                return XGR_E_NOT_SUFFICIENT_BUFFER;
+            }
+            auto* out = static_cast<XUserGetTokenAndSignatureUtf16Data*>(data->buffer);
+            auto* base = static_cast<uint8_t*>(data->buffer);
+            wchar_t* tok_dst = reinterpret_cast<wchar_t*>(
+                base + sizeof(XUserGetTokenAndSignatureUtf16Data));
+            wchar_t* sig_dst = tok_dst + tok_cnt;
+            std::memcpy(tok_dst, ctx->token.c_str(), tok_cnt * sizeof(wchar_t));
+            std::memcpy(sig_dst, ctx->signature.c_str(), sig_cnt * sizeof(wchar_t));
+            out->tokenCount = tok_cnt;
+            out->signatureCount = sig_cnt;
+            out->token = tok_dst;
+            out->signature = sig_dst;
+            return XGR_S_OK;
+        }
+        case XAsyncOp_Cleanup:
+            delete ctx;
+            return XGR_S_OK;
+        default:
+            return XGR_S_OK;
+    }
+}
+
+struct StoreProductQueryAsyncCtx {
+    bool include_current_game = false;
+    XStoreProductQueryHandle query_handle = nullptr;
+};
+
+XGameResult OPENSCARLETT_GDK_CALL StoreProductQueryProvider(
+    XAsyncOp op,
+    const XAsyncProviderData* data) {
+    auto* ctx = static_cast<StoreProductQueryAsyncCtx*>(data->context);
+    switch (op) {
+        case XAsyncOp_Begin:
+            return XGR_S_OK;
+        case XAsyncOp_DoWork:
+            ctx->query_handle = CreateStoreProductQueryHandle(ctx->include_current_game);
+            XAsyncComplete(data->async, XGR_S_OK, sizeof(XStoreProductQueryHandle));
+            return XGR_E_PENDING;
+        case XAsyncOp_GetResult: {
+            if (!data->buffer || data->bufferSize < sizeof(XStoreProductQueryHandle)) {
+                return XGR_E_NOT_SUFFICIENT_BUFFER;
+            }
+            XStoreProductQueryHandle h = ctx->query_handle;
+            ctx->query_handle = nullptr;
+            std::memcpy(data->buffer, &h, sizeof(h));
+            return XGR_S_OK;
+        }
+        case XAsyncOp_Cleanup:
+            if (ctx->query_handle) {
+                XStoreCloseProductsQueryHandle(ctx->query_handle);
+                ctx->query_handle = nullptr;
+            }
+            delete ctx;
+            return XGR_S_OK;
+        default:
+            return XGR_S_OK;
+    }
+}
+
+XGameResult StartStoreProductQueryAsync(
+    XAsyncBlock* async,
+    const void* id,
+    const char* id_name,
+    bool include_current_game) {
+    if (!async) return XGR_E_INVALIDARG;
+    auto* ctx = new (std::nothrow) StoreProductQueryAsyncCtx{include_current_game, nullptr};
+    if (!ctx) return XGR_E_OUTOFMEMORY;
+    XGameResult hr = XAsyncBegin(async, ctx, id, id_name, &StoreProductQueryProvider);
+    if (hr < 0) {
+        delete ctx;
+        return hr;
+    }
+    hr = XAsyncSchedule(async, 0);
+    if (hr < 0) {
+        XAsyncComplete(async, hr, 0);
+    }
+    return hr;
+}
+
+struct StoreAcquireLicenseAsyncCtx {
+    std::string identifier;
+    XStoreLicenseHandle license_handle = nullptr;
+};
+
+XGameResult OPENSCARLETT_GDK_CALL StoreAcquireLicenseProvider(
+    XAsyncOp op,
+    const XAsyncProviderData* data) {
+    auto* ctx = static_cast<StoreAcquireLicenseAsyncCtx*>(data->context);
+    switch (op) {
+        case XAsyncOp_Begin:
+            return XGR_S_OK;
+        case XAsyncOp_DoWork:
+            ctx->license_handle = CreateStoreLicenseHandle(ctx->identifier);
+            XAsyncComplete(data->async, XGR_S_OK, sizeof(XStoreLicenseHandle));
+            return XGR_E_PENDING;
+        case XAsyncOp_GetResult: {
+            if (!data->buffer || data->bufferSize < sizeof(XStoreLicenseHandle)) {
+                return XGR_E_NOT_SUFFICIENT_BUFFER;
+            }
+            XStoreLicenseHandle h = ctx->license_handle;
+            ctx->license_handle = nullptr;
+            std::memcpy(data->buffer, &h, sizeof(h));
+            return XGR_S_OK;
+        }
+        case XAsyncOp_Cleanup:
+            if (ctx->license_handle) {
+                XStoreCloseLicenseHandle(ctx->license_handle);
+                ctx->license_handle = nullptr;
+            }
+            delete ctx;
+            return XGR_S_OK;
+        default:
+            return XGR_S_OK;
+    }
+}
+
+struct UiPlayerPickerAsyncCtx {
+    std::vector<uint64_t> players;
+};
+
+XGameResult OPENSCARLETT_GDK_CALL UiPlayerPickerProvider(
+    XAsyncOp op,
+    const XAsyncProviderData* data) {
+    auto* ctx = static_cast<UiPlayerPickerAsyncCtx*>(data->context);
+    switch (op) {
+        case XAsyncOp_Begin:
+            return XGR_S_OK;
+        case XAsyncOp_DoWork:
+            XAsyncComplete(data->async, XGR_S_OK, ctx->players.size() * sizeof(uint64_t));
+            return XGR_E_PENDING;
+        case XAsyncOp_GetResult: {
+            const size_t req = ctx->players.size() * sizeof(uint64_t);
+            if (req == 0) return XGR_S_OK;
+            if (!data->buffer || data->bufferSize < req) {
+                return XGR_E_NOT_SUFFICIENT_BUFFER;
+            }
+            std::memcpy(data->buffer, ctx->players.data(), req);
+            return XGR_S_OK;
+        }
+        case XAsyncOp_Cleanup:
+            delete ctx;
+            return XGR_S_OK;
+        default:
+            return XGR_S_OK;
+    }
+}
+
+struct UiWebAuthAsyncCtx {
+    std::string completion_uri;
+};
+
+XGameResult OPENSCARLETT_GDK_CALL UiWebAuthProvider(
+    XAsyncOp op,
+    const XAsyncProviderData* data) {
+    auto* ctx = static_cast<UiWebAuthAsyncCtx*>(data->context);
+    switch (op) {
+        case XAsyncOp_Begin:
+            return XGR_S_OK;
+        case XAsyncOp_DoWork: {
+            const size_t req =
+                sizeof(XGameUiWebAuthenticationResultData) + (ctx->completion_uri.size() + 1);
+            XAsyncComplete(data->async, XGR_S_OK, req);
+            return XGR_E_PENDING;
+        }
+        case XAsyncOp_GetResult: {
+            const size_t uri_sz = ctx->completion_uri.size() + 1;
+            const size_t req = sizeof(XGameUiWebAuthenticationResultData) + uri_sz;
+            if (!data->buffer || data->bufferSize < req) {
+                return XGR_E_NOT_SUFFICIENT_BUFFER;
+            }
+            auto* out = static_cast<XGameUiWebAuthenticationResultData*>(data->buffer);
+            auto* base = static_cast<uint8_t*>(data->buffer);
+            char* uri_dst =
+                reinterpret_cast<char*>(base + sizeof(XGameUiWebAuthenticationResultData));
+            std::memcpy(uri_dst, ctx->completion_uri.c_str(), uri_sz);
+            out->responseStatus = XGR_E_ABORT;
+            out->responseCompletionUriSize = uri_sz;
+            out->responseCompletionUri = uri_dst;
+            return XGR_S_OK;
+        }
+        case XAsyncOp_Cleanup:
+            delete ctx;
+            return XGR_S_OK;
+        default:
+            return XGR_S_OK;
+    }
+}
+
+struct PackageInstallChunksAsyncCtx {
+    std::string package_id;
+    XPackageInstallationMonitorHandle monitor = nullptr;
+};
+
+XGameResult OPENSCARLETT_GDK_CALL PackageInstallChunksProvider(
+    XAsyncOp op,
+    const XAsyncProviderData* data) {
+    auto* ctx = static_cast<PackageInstallChunksAsyncCtx*>(data->context);
+    switch (op) {
+        case XAsyncOp_Begin:
+            return XGR_S_OK;
+        case XAsyncOp_DoWork:
+            ctx->monitor = CreateInstallMonitorHandle(ctx->package_id.c_str());
+            XAsyncComplete(data->async, XGR_S_OK, sizeof(XPackageInstallationMonitorHandle));
+            return XGR_E_PENDING;
+        case XAsyncOp_GetResult: {
+            if (!data->buffer || data->bufferSize < sizeof(XPackageInstallationMonitorHandle)) {
+                return XGR_E_NOT_SUFFICIENT_BUFFER;
+            }
+            XPackageInstallationMonitorHandle h = ctx->monitor;
+            ctx->monitor = nullptr;
+            std::memcpy(data->buffer, &h, sizeof(h));
+            return XGR_S_OK;
+        }
+        case XAsyncOp_Cleanup:
+            if (ctx->monitor) {
+                XPackageCloseInstallationMonitorHandle(ctx->monitor);
+                ctx->monitor = nullptr;
+            }
+            delete ctx;
+            return XGR_S_OK;
+        default:
+            return XGR_S_OK;
+    }
+}
+
 }  // namespace
 
 extern "C" {
@@ -1226,6 +1991,11 @@ void OPENSCARLETT_GDK_CALL XGameRuntimeUninitialize(void) {
         }
     }
     RecordOk("XGameRuntimeUninitialize");
+}
+
+bool OPENSCARLETT_GDK_CALL XGameRuntimeIsFeatureAvailable(XGameRuntimeFeature feature) {
+    RecordOk("XGameRuntimeIsFeatureAvailable");
+    return static_cast<uint32_t>(feature) <= static_cast<uint32_t>(XGameRuntimeFeature_XError);
 }
 
 XGameResult OPENSCARLETT_GDK_CALL XGameGetXboxTitleId(uint32_t* titleId) {
@@ -2228,6 +2998,378 @@ XGameResult OPENSCARLETT_GDK_CALL XUserGetGamerPictureResult(
     return RecordHr("XUserGetGamerPictureResult", hr);
 }
 
+XGameResult OPENSCARLETT_GDK_CALL XUserGetIsGuest(XUserHandle user, bool* isGuest) {
+    if (!user || !isGuest) {
+        return RecordHr("XUserGetIsGuest", XGR_E_INVALIDARG);
+    }
+    if (!LookupUser(user)) {
+        return RecordHr("XUserGetIsGuest", XGR_E_HANDLE);
+    }
+    *isGuest = false;
+    return RecordHr("XUserGetIsGuest", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XUserFindUserById(uint64_t userId, XUserHandle* handle) {
+    if (!handle) {
+        return RecordHr("XUserFindUserById", XGR_E_INVALIDARG);
+    }
+    *handle = nullptr;
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.user_mutex);
+    for (auto& [raw, u] : rt.live_users) {
+        if (u && u->xuid == userId) {
+            u->ref_count.fetch_add(1, std::memory_order_relaxed);
+            *handle = raw;
+            return RecordHr("XUserFindUserById", XGR_S_OK);
+        }
+    }
+    return RecordHr("XUserFindUserById", XGR_E_NOT_FOUND);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XUserFindUserByLocalId(
+    XUserLocalId userLocalId,
+    XUserHandle* handle) {
+    if (!handle) {
+        return RecordHr("XUserFindUserByLocalId", XGR_E_INVALIDARG);
+    }
+    *handle = nullptr;
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.user_mutex);
+    for (auto& [raw, u] : rt.live_users) {
+        if (u && u->local_id == userLocalId.value) {
+            u->ref_count.fetch_add(1, std::memory_order_relaxed);
+            *handle = raw;
+            return RecordHr("XUserFindUserByLocalId", XGR_S_OK);
+        }
+    }
+    return RecordHr("XUserFindUserByLocalId", XGR_E_NOT_FOUND);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XUserFindForDevice(
+    const XUserAppLocalDeviceId* deviceId,
+    XUserHandle* handle) {
+    if (!deviceId || !handle) {
+        return RecordHr("XUserFindForDevice", XGR_E_INVALIDARG);
+    }
+    *handle = nullptr;
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.user_mutex);
+    if (!rt.live_users.empty()) {
+        auto it = rt.live_users.begin();
+        it->second->ref_count.fetch_add(1, std::memory_order_relaxed);
+        *handle = it->first;
+        return RecordHr("XUserFindForDevice", XGR_S_OK);
+    }
+    auto u = CreateDefaultUserObj();
+    XUserHandle raw = u.get();
+    rt.live_users[raw] = std::move(u);
+    *handle = raw;
+    return RecordHr("XUserFindForDevice", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XUserGetTokenAndSignatureAsync(
+    XUserHandle user,
+    XUserGetTokenAndSignatureOptions /*options*/,
+    const char* method,
+    const char* url,
+    size_t /*headerCount*/,
+    const XUserGetTokenAndSignatureHttpHeader* /*headers*/,
+    size_t /*bodySize*/,
+    const void* /*bodyBuffer*/,
+    XAsyncBlock* async) {
+    if (!user || !method || !url || !async) {
+        return RecordHr("XUserGetTokenAndSignatureAsync", XGR_E_INVALIDARG);
+    }
+    auto u = LookupUser(user);
+    if (!u) {
+        return RecordHr("XUserGetTokenAndSignatureAsync", XGR_E_HANDLE);
+    }
+    auto* ctx = new (std::nothrow) TokenSigAsyncCtx();
+    if (!ctx) {
+        return RecordHr("XUserGetTokenAndSignatureAsync", XGR_E_OUTOFMEMORY);
+    }
+    ctx->token = "XBL3.0 x=" + FormatXuidHex(u->xuid) + ";openscarlett-offline-token";
+    ctx->signature = "openscarlett-offline-sig";
+    XGameResult hr = XAsyncBegin(async, ctx, kIdUserTokenSig, kIdUserTokenSig, &TokenSigProvider);
+    if (hr < 0) {
+        delete ctx;
+        return RecordHr("XUserGetTokenAndSignatureAsync", hr);
+    }
+    hr = XAsyncSchedule(async, 0);
+    if (hr < 0) {
+        XAsyncComplete(async, hr, 0);
+    }
+    return RecordHr("XUserGetTokenAndSignatureAsync", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XUserGetTokenAndSignatureResultSize(
+    XAsyncBlock* async,
+    size_t* bufferSize) {
+    if (!async || !bufferSize) {
+        return RecordHr("XUserGetTokenAndSignatureResultSize", XGR_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XUserGetTokenAndSignatureResultSize", hr);
+    }
+    hr = XAsyncGetResultSize(async, bufferSize);
+    return RecordHr("XUserGetTokenAndSignatureResultSize", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XUserGetTokenAndSignatureResult(
+    XAsyncBlock* async,
+    size_t bufferSize,
+    void* buffer,
+    XUserGetTokenAndSignatureData** ptrToBuffer,
+    size_t* bufferUsed) {
+    if (!async || !buffer || !ptrToBuffer) {
+        return RecordHr("XUserGetTokenAndSignatureResult", XGR_E_INVALIDARG);
+    }
+    *ptrToBuffer = nullptr;
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XUserGetTokenAndSignatureResult", hr);
+    }
+    hr = XAsyncGetResult(async, kIdUserTokenSig, bufferSize, buffer, bufferUsed);
+    if (hr >= 0) {
+        *ptrToBuffer = static_cast<XUserGetTokenAndSignatureData*>(buffer);
+    }
+    return RecordHr("XUserGetTokenAndSignatureResult", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XUserGetTokenAndSignatureUtf16Async(
+    XUserHandle user,
+    XUserGetTokenAndSignatureOptions /*options*/,
+    const wchar_t* method,
+    const wchar_t* url,
+    size_t /*headerCount*/,
+    const XUserGetTokenAndSignatureUtf16HttpHeader* /*headers*/,
+    size_t /*bodySize*/,
+    const void* /*bodyBuffer*/,
+    XAsyncBlock* async) {
+    if (!user || !method || !url || !async) {
+        return RecordHr("XUserGetTokenAndSignatureUtf16Async", XGR_E_INVALIDARG);
+    }
+    auto u = LookupUser(user);
+    if (!u) {
+        return RecordHr("XUserGetTokenAndSignatureUtf16Async", XGR_E_HANDLE);
+    }
+    auto* ctx = new (std::nothrow) TokenSigUtf16AsyncCtx();
+    if (!ctx) {
+        return RecordHr("XUserGetTokenAndSignatureUtf16Async", XGR_E_OUTOFMEMORY);
+    }
+    const std::string hex = FormatXuidHex(u->xuid);
+    ctx->token = L"XBL3.0 x=";
+    for (char c : hex) {
+        ctx->token.push_back(static_cast<wchar_t>(c));
+    }
+    ctx->token += L";openscarlett-offline-token";
+    ctx->signature = L"openscarlett-offline-sig";
+    XGameResult hr = XAsyncBegin(
+        async, ctx, kIdUserTokenSigUtf16, kIdUserTokenSigUtf16, &TokenSigUtf16Provider);
+    if (hr < 0) {
+        delete ctx;
+        return RecordHr("XUserGetTokenAndSignatureUtf16Async", hr);
+    }
+    hr = XAsyncSchedule(async, 0);
+    if (hr < 0) {
+        XAsyncComplete(async, hr, 0);
+    }
+    return RecordHr("XUserGetTokenAndSignatureUtf16Async", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XUserGetTokenAndSignatureUtf16ResultSize(
+    XAsyncBlock* async,
+    size_t* bufferSize) {
+    if (!async || !bufferSize) {
+        return RecordHr("XUserGetTokenAndSignatureUtf16ResultSize", XGR_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XUserGetTokenAndSignatureUtf16ResultSize", hr);
+    }
+    hr = XAsyncGetResultSize(async, bufferSize);
+    return RecordHr("XUserGetTokenAndSignatureUtf16ResultSize", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XUserGetTokenAndSignatureUtf16Result(
+    XAsyncBlock* async,
+    size_t bufferSize,
+    void* buffer,
+    XUserGetTokenAndSignatureUtf16Data** ptrToBuffer,
+    size_t* bufferUsed) {
+    if (!async || !buffer || !ptrToBuffer) {
+        return RecordHr("XUserGetTokenAndSignatureUtf16Result", XGR_E_INVALIDARG);
+    }
+    *ptrToBuffer = nullptr;
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XUserGetTokenAndSignatureUtf16Result", hr);
+    }
+    hr = XAsyncGetResult(async, kIdUserTokenSigUtf16, bufferSize, buffer, bufferUsed);
+    if (hr >= 0) {
+        *ptrToBuffer = static_cast<XUserGetTokenAndSignatureUtf16Data*>(buffer);
+    }
+    return RecordHr("XUserGetTokenAndSignatureUtf16Result", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XUserGetDefaultAudioEndpointUtf16(
+    XUserLocalId /*user*/,
+    XUserDefaultAudioEndpointKind defaultAudioEndpointKind,
+    size_t endpointIdUtf16Count,
+    wchar_t* endpointIdUtf16,
+    size_t* endpointIdUtf16Used) {
+    const std::wstring ep =
+        (defaultAudioEndpointKind == XUserDefaultAudioEndpointKind_CommunicationCapture)
+            ? L"{0.0.1.00000000}.{openscarlett-audio-capture}"
+            : L"{0.0.0.00000000}.{openscarlett-audio-render}";
+    return RecordHr(
+        "XUserGetDefaultAudioEndpointUtf16",
+        CopyWideStringResult(ep, endpointIdUtf16Count, endpointIdUtf16, endpointIdUtf16Used));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XUserGetSignOutDeferral(XUserSignOutDeferralHandle* deferral) {
+    if (!deferral) {
+        return RecordHr("XUserGetSignOutDeferral", XGR_E_INVALIDARG);
+    }
+    auto* d = new (std::nothrow) XUserSignOutDeferral();
+    if (!d) {
+        *deferral = nullptr;
+        return RecordHr("XUserGetSignOutDeferral", XGR_E_OUTOFMEMORY);
+    }
+    *deferral = d;
+    return RecordHr("XUserGetSignOutDeferral", XGR_S_OK);
+}
+
+void OPENSCARLETT_GDK_CALL XUserCloseSignOutDeferralHandle(XUserSignOutDeferralHandle deferral) {
+    RecordOk("XUserCloseSignOutDeferralHandle");
+    delete deferral;
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XUserRegisterForChangeEvent(
+    XTaskQueueHandle /*queue*/,
+    void* /*context*/,
+    XUserChangeEventCallback callback,
+    XTaskQueueRegistrationToken* token) {
+    if (!callback || !token) {
+        return RecordHr("XUserRegisterForChangeEvent", XGR_E_INVALIDARG);
+    }
+    *token = AllocateRegToken(kRegUserChange);
+    return RecordHr("XUserRegisterForChangeEvent", XGR_S_OK);
+}
+
+bool OPENSCARLETT_GDK_CALL XUserUnregisterForChangeEvent(
+    XTaskQueueRegistrationToken token,
+    bool /*wait*/) {
+    RecordOk("XUserUnregisterForChangeEvent");
+    return ReleaseRegToken(kRegUserChange, token);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XUserRegisterForDefaultAudioEndpointUtf16Changed(
+    XTaskQueueHandle /*queue*/,
+    void* /*context*/,
+    XUserDefaultAudioEndpointUtf16ChangedCallback callback,
+    XTaskQueueRegistrationToken* token) {
+    if (!callback || !token) {
+        return RecordHr("XUserRegisterForDefaultAudioEndpointUtf16Changed", XGR_E_INVALIDARG);
+    }
+    *token = AllocateRegToken(kRegUserAudioEndpoint);
+    return RecordHr("XUserRegisterForDefaultAudioEndpointUtf16Changed", XGR_S_OK);
+}
+
+bool OPENSCARLETT_GDK_CALL XUserUnregisterForDefaultAudioEndpointUtf16Changed(
+    XTaskQueueRegistrationToken token,
+    bool /*wait*/) {
+    RecordOk("XUserUnregisterForDefaultAudioEndpointUtf16Changed");
+    return ReleaseRegToken(kRegUserAudioEndpoint, token);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XUserRegisterForDeviceAssociationChanged(
+    XTaskQueueHandle /*queue*/,
+    void* /*context*/,
+    XUserDeviceAssociationChangedCallback callback,
+    XTaskQueueRegistrationToken* token) {
+    if (!callback || !token) {
+        return RecordHr("XUserRegisterForDeviceAssociationChanged", XGR_E_INVALIDARG);
+    }
+    *token = AllocateRegToken(kRegUserDeviceAssoc);
+    return RecordHr("XUserRegisterForDeviceAssociationChanged", XGR_S_OK);
+}
+
+bool OPENSCARLETT_GDK_CALL XUserUnregisterForDeviceAssociationChanged(
+    XTaskQueueRegistrationToken token,
+    bool /*wait*/) {
+    RecordOk("XUserUnregisterForDeviceAssociationChanged");
+    return ReleaseRegToken(kRegUserDeviceAssoc, token);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XUserResolveIssueWithUiAsync(
+    XUserHandle user,
+    const char* /*url*/,
+    XAsyncBlock* async) {
+    if (!user || !async) {
+        return RecordHr("XUserResolveIssueWithUiAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupUser(user)) {
+        return RecordHr("XUserResolveIssueWithUiAsync", XGR_E_HANDLE);
+    }
+    return RecordHr(
+        "XUserResolveIssueWithUiAsync",
+        StartVoidAsync(async, kIdUserResolveIssue, kIdUserResolveIssue, XGR_S_OK));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XUserResolveIssueWithUiResult(XAsyncBlock* async) {
+    if (!async) {
+        return RecordHr("XUserResolveIssueWithUiResult", XGR_E_INVALIDARG);
+    }
+    return RecordHr("XUserResolveIssueWithUiResult", XAsyncGetStatus(async, true));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XUserResolveIssueWithUiUtf16Async(
+    XUserHandle user,
+    const wchar_t* /*url*/,
+    XAsyncBlock* async) {
+    if (!user || !async) {
+        return RecordHr("XUserResolveIssueWithUiUtf16Async", XGR_E_INVALIDARG);
+    }
+    if (!LookupUser(user)) {
+        return RecordHr("XUserResolveIssueWithUiUtf16Async", XGR_E_HANDLE);
+    }
+    return RecordHr(
+        "XUserResolveIssueWithUiUtf16Async",
+        StartVoidAsync(async, kIdUserResolveIssueUtf16, kIdUserResolveIssueUtf16, XGR_S_OK));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XUserResolveIssueWithUiUtf16Result(XAsyncBlock* async) {
+    if (!async) {
+        return RecordHr("XUserResolveIssueWithUiUtf16Result", XGR_E_INVALIDARG);
+    }
+    return RecordHr("XUserResolveIssueWithUiUtf16Result", XAsyncGetStatus(async, true));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XUserResolvePrivilegeWithUiAsync(
+    XUserHandle user,
+    XUserPrivilegeOptions /*options*/,
+    XUserPrivilege /*privilege*/,
+    XAsyncBlock* async) {
+    if (!user || !async) {
+        return RecordHr("XUserResolvePrivilegeWithUiAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupUser(user)) {
+        return RecordHr("XUserResolvePrivilegeWithUiAsync", XGR_E_HANDLE);
+    }
+    return RecordHr(
+        "XUserResolvePrivilegeWithUiAsync",
+        StartVoidAsync(async, kIdUserResolvePriv, kIdUserResolvePriv, XGR_S_OK));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XUserResolvePrivilegeWithUiResult(XAsyncBlock* async) {
+    if (!async) {
+        return RecordHr("XUserResolvePrivilegeWithUiResult", XGR_E_INVALIDARG);
+    }
+    return RecordHr("XUserResolvePrivilegeWithUiResult", XAsyncGetStatus(async, true));
+}
+
 // ===========================================================================
 // XGameSave (persistent disk storage under OPENSCARLETT_SAVE_ROOT or E:\)
 // ===========================================================================
@@ -2788,6 +3930,89 @@ XGameResult OPENSCARLETT_GDK_CALL XGameSaveEnumerateContainerInfoByName(
     return RecordHr("XGameSaveEnumerateContainerInfoByName", XGR_S_OK);
 }
 
+XGameResult OPENSCARLETT_GDK_CALL XGameSaveEnumerateBlobInfoByName(
+    XGameSaveContainerHandle container,
+    const char* blobNamePrefix,
+    void* context,
+    XGameSaveBlobInfoCallback callback) {
+    if (!container || !callback) {
+        return RecordHr("XGameSaveEnumerateBlobInfoByName", XGR_E_INVALIDARG);
+    }
+    fs::path dir;
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.save_mutex);
+        auto it = rt.live_containers.find(container);
+        if (it == rt.live_containers.end()) {
+            return RecordHr("XGameSaveEnumerateBlobInfoByName", XGR_E_HANDLE);
+        }
+        dir = it->second->container_dir;
+    }
+
+    ContainerMeta meta{};
+    if (!LoadContainerMeta(dir, meta)) {
+        return RecordHr("XGameSaveEnumerateBlobInfoByName", XGR_S_OK);
+    }
+    const std::string prefix = blobNamePrefix ? blobNamePrefix : "";
+    for (const auto& [blob_name, file_name] : meta.blobs) {
+        if (!prefix.empty() && blob_name.rfind(prefix, 0) != 0) {
+            continue;
+        }
+        std::error_code ec;
+        const auto sz = fs::file_size(dir / file_name, ec);
+        XGameSaveBlobInfo info{};
+        info.name = blob_name.c_str();
+        info.size = ec ? 0u : static_cast<uint32_t>(sz);
+        if (!callback(&info, context)) {
+            break;
+        }
+    }
+    return RecordHr("XGameSaveEnumerateBlobInfoByName", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameSaveGetContainerInfo(
+    XGameSaveProviderHandle provider,
+    const char* containerName,
+    void* context,
+    XGameSaveContainerInfoCallback callback) {
+    if (!provider || !containerName || !*containerName || !callback) {
+        return RecordHr("XGameSaveGetContainerInfo", XGR_E_INVALIDARG);
+    }
+    fs::path root_dir;
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.save_mutex);
+        auto it = rt.live_providers.find(provider);
+        if (it == rt.live_providers.end()) {
+            return RecordHr("XGameSaveGetContainerInfo", XGR_E_HANDLE);
+        }
+        root_dir = it->second->root_dir;
+    }
+
+    const fs::path cdir = root_dir / EncodePathToken(containerName);
+    ContainerMeta meta{};
+    if (!LoadContainerMeta(cdir, meta)) {
+        return RecordHr("XGameSaveGetContainerInfo", XGR_E_GS_BLOB_NOT_FOUND);
+    }
+
+    uint64_t total_size = 0;
+    for (const auto& [_, file_name] : meta.blobs) {
+        std::error_code fec;
+        const auto sz = fs::file_size(cdir / file_name, fec);
+        if (!fec) total_size += sz;
+    }
+
+    XGameSaveContainerInfo info{};
+    info.name = meta.name.c_str();
+    info.displayName = meta.display_name.c_str();
+    info.blobCount = static_cast<uint32_t>(meta.blobs.size());
+    info.totalSize = total_size;
+    info.lastModifiedTime = meta.last_modified;
+    info.needsSync = false;
+    (void)callback(&info, context);
+    return RecordHr("XGameSaveGetContainerInfo", XGR_S_OK);
+}
+
 XGameResult OPENSCARLETT_GDK_CALL XGameSaveReadBlobDataAsync(
     XGameSaveContainerHandle container,
     const char** blobNames,
@@ -3133,6 +4358,352 @@ XGameResult OPENSCARLETT_GDK_CALL XPackageEnumerateChunkAvailability(
     return RecordHr("XPackageEnumerateChunkAvailability", XGR_S_OK);
 }
 
+XGameResult OPENSCARLETT_GDK_CALL XPackageMount(
+    const char* packageIdentifier,
+    XPackageMountHandle* mount) {
+    if (!packageIdentifier || !*packageIdentifier || !mount) {
+        return RecordHr("XPackageMount", XGR_E_INVALIDARG);
+    }
+    *mount = nullptr;
+    auto m = std::make_shared<XPackageMountObject>();
+    m->package_id = packageIdentifier;
+    m->mount_path = CurrentPackageMountPath();
+    XPackageMountHandle raw = m.get();
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.package_mutex);
+        rt.live_package_mounts[raw] = std::move(m);
+    }
+    *mount = raw;
+    return RecordHr("XPackageMount", XGR_S_OK);
+}
+
+void OPENSCARLETT_GDK_CALL XPackageCloseMountHandle(XPackageMountHandle mount) {
+    RecordOk("XPackageCloseMountHandle");
+    if (!mount) return;
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.package_mutex);
+    rt.live_package_mounts.erase(mount);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XPackageGetMountPathSize(
+    XPackageMountHandle mount,
+    size_t* pathSize) {
+    if (!mount || !pathSize) {
+        return RecordHr("XPackageGetMountPathSize", XGR_E_INVALIDARG);
+    }
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.package_mutex);
+    auto it = rt.live_package_mounts.find(mount);
+    if (it == rt.live_package_mounts.end()) {
+        return RecordHr("XPackageGetMountPathSize", XGR_E_HANDLE);
+    }
+    *pathSize = it->second->mount_path.size() + 1;
+    return RecordHr("XPackageGetMountPathSize", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XPackageGetMountPath(
+    XPackageMountHandle mount,
+    size_t pathSize,
+    char* path) {
+    if (!mount || !path) {
+        return RecordHr("XPackageGetMountPath", XGR_E_INVALIDARG);
+    }
+    std::string mp;
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.package_mutex);
+        auto it = rt.live_package_mounts.find(mount);
+        if (it == rt.live_package_mounts.end()) {
+            return RecordHr("XPackageGetMountPath", XGR_E_HANDLE);
+        }
+        mp = it->second->mount_path;
+    }
+    return RecordHr("XPackageGetMountPath", CopyStringResult(mp, pathSize, path, nullptr));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XPackageGetUserLocale(size_t localeSize, char* locale) {
+    std::string loc = GetEnvString("OPENSCARLETT_LOCALE");
+    if (loc.empty()) loc = "en-US";
+    return RecordHr("XPackageGetUserLocale", CopyStringResult(loc, localeSize, locale, nullptr));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XPackageGetWriteStats(XPackageWriteStats* writeStats) {
+    if (!writeStats) {
+        return RecordHr("XPackageGetWriteStats", XGR_E_INVALIDARG);
+    }
+    writeStats->interval = 300000ULL;
+    writeStats->budget = 1024ULL * 1024ULL * 1024ULL;
+    writeStats->elapsed = 1000ULL;
+    writeStats->bytesWritten = 0ULL;
+    return RecordHr("XPackageGetWriteStats", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XPackageCreateInstallationMonitor(
+    const char* packageIdentifier,
+    uint32_t /*selectorCount*/,
+    const XPackageChunkSelector* /*selectors*/,
+    uint32_t /*minimumUpdateIntervalMs*/,
+    XTaskQueueHandle /*queue*/,
+    XPackageInstallationMonitorHandle* installationMonitor) {
+    if (!packageIdentifier || !*packageIdentifier || !installationMonitor) {
+        return RecordHr("XPackageCreateInstallationMonitor", XGR_E_INVALIDARG);
+    }
+    *installationMonitor = CreateInstallMonitorHandle(packageIdentifier);
+    return RecordHr("XPackageCreateInstallationMonitor", XGR_S_OK);
+}
+
+void OPENSCARLETT_GDK_CALL XPackageCloseInstallationMonitorHandle(
+    XPackageInstallationMonitorHandle installationMonitor) {
+    RecordOk("XPackageCloseInstallationMonitorHandle");
+    if (!installationMonitor) return;
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.package_mutex);
+    rt.live_install_monitors.erase(installationMonitor);
+}
+
+void OPENSCARLETT_GDK_CALL XPackageGetInstallationProgress(
+    XPackageInstallationMonitorHandle installationMonitor,
+    XPackageInstallationProgress* progress) {
+    RecordOk("XPackageGetInstallationProgress");
+    if (!progress) return;
+    uint64_t total = 1024ULL * 1024ULL;
+    if (installationMonitor) {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.package_mutex);
+        auto it = rt.live_install_monitors.find(installationMonitor);
+        if (it != rt.live_install_monitors.end()) {
+            total = it->second->total_bytes;
+        }
+    }
+    progress->totalBytes = total;
+    progress->installedBytes = total;
+    progress->launchBytes = total;
+    progress->launchable = true;
+    progress->completed = true;
+}
+
+bool OPENSCARLETT_GDK_CALL XPackageUpdateInstallationMonitor(
+    XPackageInstallationMonitorHandle /*installationMonitor*/) {
+    RecordOk("XPackageUpdateInstallationMonitor");
+    return false;
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XPackageRegisterInstallationProgressChanged(
+    XPackageInstallationMonitorHandle installationMonitor,
+    void* /*context*/,
+    XPackageInstallationProgressCallback callback,
+    XTaskQueueRegistrationToken* token) {
+    if (!installationMonitor || !callback || !token) {
+        return RecordHr("XPackageRegisterInstallationProgressChanged", XGR_E_INVALIDARG);
+    }
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.package_mutex);
+        if (rt.live_install_monitors.find(installationMonitor) == rt.live_install_monitors.end()) {
+            return RecordHr("XPackageRegisterInstallationProgressChanged", XGR_E_HANDLE);
+        }
+    }
+    *token = AllocateRegToken(kRegPackageProgress);
+    return RecordHr("XPackageRegisterInstallationProgressChanged", XGR_S_OK);
+}
+
+bool OPENSCARLETT_GDK_CALL XPackageUnregisterInstallationProgressChanged(
+    XPackageInstallationMonitorHandle /*installationMonitor*/,
+    XTaskQueueRegistrationToken token,
+    bool /*wait*/) {
+    RecordOk("XPackageUnregisterInstallationProgressChanged");
+    return ReleaseRegToken(kRegPackageProgress, token);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XPackageRegisterPackageInstalled(
+    XTaskQueueHandle /*queue*/,
+    void* /*context*/,
+    XPackageInstalledCallback callback,
+    XTaskQueueRegistrationToken* token) {
+    if (!callback || !token) {
+        return RecordHr("XPackageRegisterPackageInstalled", XGR_E_INVALIDARG);
+    }
+    *token = AllocateRegToken(kRegPackageInstalled);
+    return RecordHr("XPackageRegisterPackageInstalled", XGR_S_OK);
+}
+
+bool OPENSCARLETT_GDK_CALL XPackageUnregisterPackageInstalled(
+    XTaskQueueRegistrationToken token,
+    bool /*wait*/) {
+    RecordOk("XPackageUnregisterPackageInstalled");
+    return ReleaseRegToken(kRegPackageInstalled, token);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XPackageEnumeratePackages(
+    XPackageKind kind,
+    XPackageEnumerationScope /*scope*/,
+    void* context,
+    XPackageEnumerationCallback callback) {
+    if (!callback) {
+        return RecordHr("XPackageEnumeratePackages", XGR_E_INVALIDARG);
+    }
+    if (kind == XPackageKind_Game) {
+        const std::string pkg_id = CurrentPackageIdentifier();
+        uint32_t tid = 0x5CA00001u;
+        (void)XGameGetXboxTitleId(&tid);
+        char tid_buf[16]{};
+        std::snprintf(tid_buf, sizeof(tid_buf), "%08X", tid);
+
+        XPackageDetails details{};
+        details.packageIdentifier = pkg_id.c_str();
+        details.version.major = 1;
+        details.version.minor = 0;
+        details.version.build = 0;
+        details.version.revision = 0;
+        details.kind = XPackageKind_Game;
+        details.displayName = "OpenScarlett Title";
+        details.description = "Clean-room local OpenScarlett title";
+        details.publisher = "OpenScarlett";
+        details.storeId = kDefaultStoreId;
+        details.installing = false;
+        details.index = 0;
+        details.count = 1;
+        details.ageRestricted = false;
+        details.titleID = tid_buf;
+        (void)callback(context, &details);
+    }
+    return RecordHr("XPackageEnumeratePackages", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XPackageEnumerateFeatures(
+    const char* packageIdentifier,
+    void* context,
+    XPackageFeatureEnumerationCallback callback) {
+    if (!packageIdentifier || !*packageIdentifier || !callback) {
+        return RecordHr("XPackageEnumerateFeatures", XGR_E_INVALIDARG);
+    }
+    XPackageFeature feat{};
+    feat.id = "BaseGame";
+    feat.displayName = "Base Game";
+    feat.tags = "default";
+    feat.hidden = false;
+    feat.storeIdCount = 0;
+    feat.storeIds = nullptr;
+    (void)callback(context, &feat);
+    return RecordHr("XPackageEnumerateFeatures", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XPackageFindChunkAvailability(
+    const char* packageIdentifier,
+    uint32_t /*selectorCount*/,
+    const XPackageChunkSelector* /*selectors*/,
+    XPackageChunkAvailability* availability) {
+    if (!packageIdentifier || !*packageIdentifier || !availability) {
+        return RecordHr("XPackageFindChunkAvailability", XGR_E_INVALIDARG);
+    }
+    *availability = XPackageChunkAvailability_Ready;
+    return RecordHr("XPackageFindChunkAvailability", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XPackageEstimateDownloadSize(
+    const char* packageIdentifier,
+    uint32_t /*selectorCount*/,
+    const XPackageChunkSelector* /*selectors*/,
+    uint64_t* downloadSize,
+    bool* shouldPresentUserConfirmation) {
+    if (!packageIdentifier || !*packageIdentifier || !downloadSize) {
+        return RecordHr("XPackageEstimateDownloadSize", XGR_E_INVALIDARG);
+    }
+    *downloadSize = 0ULL;
+    if (shouldPresentUserConfirmation) {
+        *shouldPresentUserConfirmation = false;
+    }
+    return RecordHr("XPackageEstimateDownloadSize", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XPackageChangeChunkInstallOrder(
+    const char* packageIdentifier,
+    uint32_t /*chunkCount*/,
+    const uint32_t* /*chunkIds*/) {
+    if (!packageIdentifier || !*packageIdentifier) {
+        return RecordHr("XPackageChangeChunkInstallOrder", XGR_E_INVALIDARG);
+    }
+    return RecordHr("XPackageChangeChunkInstallOrder", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XPackageInstallChunks(
+    const char* packageIdentifier,
+    uint32_t /*selectorCount*/,
+    const XPackageChunkSelector* /*selectors*/,
+    uint32_t /*minimumUpdateIntervalMs*/,
+    bool /*suppressUserConfirmation*/,
+    XTaskQueueHandle /*queue*/,
+    XPackageInstallationMonitorHandle* installationMonitor) {
+    if (!packageIdentifier || !*packageIdentifier || !installationMonitor) {
+        return RecordHr("XPackageInstallChunks", XGR_E_INVALIDARG);
+    }
+    *installationMonitor = CreateInstallMonitorHandle(packageIdentifier);
+    return RecordHr("XPackageInstallChunks", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XPackageInstallChunksAsync(
+    const char* packageIdentifier,
+    uint32_t /*selectorCount*/,
+    const XPackageChunkSelector* /*selectors*/,
+    uint32_t /*minimumUpdateIntervalMs*/,
+    bool /*suppressUserConfirmation*/,
+    XAsyncBlock* async) {
+    if (!packageIdentifier || !*packageIdentifier || !async) {
+        return RecordHr("XPackageInstallChunksAsync", XGR_E_INVALIDARG);
+    }
+    auto* ctx = new (std::nothrow) PackageInstallChunksAsyncCtx{packageIdentifier, nullptr};
+    if (!ctx) {
+        return RecordHr("XPackageInstallChunksAsync", XGR_E_OUTOFMEMORY);
+    }
+    XGameResult hr = XAsyncBegin(
+        async, ctx, kIdPackageInstallChunks, kIdPackageInstallChunks,
+        &PackageInstallChunksProvider);
+    if (hr < 0) {
+        delete ctx;
+        return RecordHr("XPackageInstallChunksAsync", hr);
+    }
+    hr = XAsyncSchedule(async, 0);
+    if (hr < 0) {
+        XAsyncComplete(async, hr, 0);
+    }
+    return RecordHr("XPackageInstallChunksAsync", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XPackageInstallChunksResult(
+    XAsyncBlock* async,
+    XPackageInstallationMonitorHandle* installationMonitor) {
+    if (!async || !installationMonitor) {
+        return RecordHr("XPackageInstallChunksResult", XGR_E_INVALIDARG);
+    }
+    *installationMonitor = nullptr;
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XPackageInstallChunksResult", hr);
+    }
+    hr = XAsyncGetResult(
+        async, kIdPackageInstallChunks, sizeof(XPackageInstallationMonitorHandle),
+        installationMonitor, nullptr);
+    return RecordHr("XPackageInstallChunksResult", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XPackageUninstallChunks(
+    const char* packageIdentifier,
+    uint32_t /*selectorCount*/,
+    const XPackageChunkSelector* /*selectors*/) {
+    if (!packageIdentifier || !*packageIdentifier) {
+        return RecordHr("XPackageUninstallChunks", XGR_E_INVALIDARG);
+    }
+    return RecordHr("XPackageUninstallChunks", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XPackageUninstallUWPInstance(const char* packageName) {
+    if (!packageName || !*packageName) {
+        return RecordHr("XPackageUninstallUWPInstance", XGR_E_INVALIDARG);
+    }
+    return RecordHr("XPackageUninstallUWPInstance", XGR_S_OK);
+}
+
 // ===========================================================================
 // XDisplay
 // ===========================================================================
@@ -3162,10 +4733,1787 @@ XGameResult OPENSCARLETT_GDK_CALL XDisplayTryAcquireTimeoutDeferral(
     return RecordHr("XDisplayTryAcquireTimeoutDeferral", XGR_S_OK);
 }
 
+XGameResult OPENSCARLETT_GDK_CALL XDisplayAcquireTimeoutDeferral(
+    XDisplayTimeoutDeferralHandle* handle) {
+    const XGameResult hr = XDisplayTryAcquireTimeoutDeferral(handle);
+    return RecordHr("XDisplayAcquireTimeoutDeferral", hr);
+}
+
 void OPENSCARLETT_GDK_CALL XDisplayCloseTimeoutDeferralHandle(
     XDisplayTimeoutDeferralHandle handle) {
     RecordOk("XDisplayCloseTimeoutDeferralHandle");
     delete handle;
+}
+
+// ===========================================================================
+// XStore (clean-room offline/owned-title defaults)
+// ===========================================================================
+XGameResult OPENSCARLETT_GDK_CALL XStoreCreateContext(
+    XUserHandle user,
+    XStoreContextHandle* storeContextHandle) {
+    if (!storeContextHandle) {
+        return RecordHr("XStoreCreateContext", XGR_E_INVALIDARG);
+    }
+    *storeContextHandle = nullptr;
+    uint64_t xuid = DefaultUserXuid();
+    if (user) {
+        auto u = LookupUser(user);
+        if (!u) {
+            return RecordHr("XStoreCreateContext", XGR_E_HANDLE);
+        }
+        xuid = u->xuid;
+    }
+    auto ctx = std::make_shared<XStoreContext>();
+    ctx->xuid = xuid;
+    XStoreContextHandle raw = ctx.get();
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.store_mutex);
+        rt.live_store_contexts[raw] = std::move(ctx);
+    }
+    *storeContextHandle = raw;
+    return RecordHr("XStoreCreateContext", XGR_S_OK);
+}
+
+void OPENSCARLETT_GDK_CALL XStoreCloseContextHandle(XStoreContextHandle storeContextHandle) {
+    RecordOk("XStoreCloseContextHandle");
+    if (!storeContextHandle) return;
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.store_mutex);
+    rt.live_store_contexts.erase(storeContextHandle);
+}
+
+void OPENSCARLETT_GDK_CALL XStoreCloseLicenseHandle(XStoreLicenseHandle storeLicenseHandle) {
+    RecordOk("XStoreCloseLicenseHandle");
+    if (!storeLicenseHandle) return;
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.store_mutex);
+    rt.live_store_licenses.erase(storeLicenseHandle);
+}
+
+void OPENSCARLETT_GDK_CALL XStoreCloseProductsQueryHandle(
+    XStoreProductQueryHandle productQueryHandle) {
+    RecordOk("XStoreCloseProductsQueryHandle");
+    if (!productQueryHandle) return;
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.store_mutex);
+    rt.live_store_queries.erase(productQueryHandle);
+}
+
+bool OPENSCARLETT_GDK_CALL XStoreIsLicenseValid(XStoreLicenseHandle storeLicenseHandle) {
+    RecordOk("XStoreIsLicenseValid");
+    auto lic = LookupStoreLicense(storeLicenseHandle);
+    return lic != nullptr && lic->valid;
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreQueryGameLicenseAsync(
+    XStoreContextHandle storeContextHandle,
+    XAsyncBlock* async) {
+    if (!storeContextHandle || !async) {
+        return RecordHr("XStoreQueryGameLicenseAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupStoreContext(storeContextHandle)) {
+        return RecordHr("XStoreQueryGameLicenseAsync", XGR_E_HANDLE);
+    }
+    XStoreGameLicense lic{};
+    std::snprintf(lic.skuStoreId, sizeof(lic.skuStoreId), "%s", kDefaultSkuStoreId);
+    lic.isActive = true;
+    lic.isTrialOwnedByThisUser = false;
+    lic.isDiscLicense = false;
+    lic.isTrial = false;
+    lic.trialTimeRemainingInSeconds = 0;
+    lic.trialUniqueId[0] = '\0';
+    lic.expirationDate = 0;
+    return RecordHr(
+        "XStoreQueryGameLicenseAsync",
+        StartPodAsync<XStoreGameLicense>(async, kIdStoreGameLicense, kIdStoreGameLicense, lic));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreQueryGameLicenseResult(
+    XAsyncBlock* async,
+    XStoreGameLicense* license) {
+    if (!async || !license) {
+        return RecordHr("XStoreQueryGameLicenseResult", XGR_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XStoreQueryGameLicenseResult", hr);
+    }
+    hr = XAsyncGetResult(async, kIdStoreGameLicense, sizeof(XStoreGameLicense), license, nullptr);
+    return RecordHr("XStoreQueryGameLicenseResult", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreRegisterGameLicenseChanged(
+    XStoreContextHandle storeContextHandle,
+    XTaskQueueHandle /*queue*/,
+    void* /*context*/,
+    XStoreGameLicenseChangedCallback callback,
+    XTaskQueueRegistrationToken* token) {
+    if (!storeContextHandle || !callback || !token) {
+        return RecordHr("XStoreRegisterGameLicenseChanged", XGR_E_INVALIDARG);
+    }
+    if (!LookupStoreContext(storeContextHandle)) {
+        return RecordHr("XStoreRegisterGameLicenseChanged", XGR_E_HANDLE);
+    }
+    *token = AllocateRegToken(kRegStoreGameLicense);
+    return RecordHr("XStoreRegisterGameLicenseChanged", XGR_S_OK);
+}
+
+bool OPENSCARLETT_GDK_CALL XStoreUnregisterGameLicenseChanged(
+    XStoreContextHandle storeContextHandle,
+    XTaskQueueRegistrationToken token,
+    bool /*wait*/) {
+    RecordOk("XStoreUnregisterGameLicenseChanged");
+    if (!LookupStoreContext(storeContextHandle)) {
+        return false;
+    }
+    return ReleaseRegToken(kRegStoreGameLicense, token);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreRegisterPackageLicenseLost(
+    XStoreLicenseHandle licenseHandle,
+    XTaskQueueHandle /*queue*/,
+    void* /*context*/,
+    XStorePackageLicenseLostCallback callback,
+    XTaskQueueRegistrationToken* token) {
+    if (!licenseHandle || !callback || !token) {
+        return RecordHr("XStoreRegisterPackageLicenseLost", XGR_E_INVALIDARG);
+    }
+    if (!LookupStoreLicense(licenseHandle)) {
+        return RecordHr("XStoreRegisterPackageLicenseLost", XGR_E_HANDLE);
+    }
+    *token = AllocateRegToken(kRegStorePackageLicense);
+    return RecordHr("XStoreRegisterPackageLicenseLost", XGR_S_OK);
+}
+
+bool OPENSCARLETT_GDK_CALL XStoreUnregisterPackageLicenseLost(
+    XStoreLicenseHandle licenseHandle,
+    XTaskQueueRegistrationToken token,
+    bool /*wait*/) {
+    RecordOk("XStoreUnregisterPackageLicenseLost");
+    if (!LookupStoreLicense(licenseHandle)) {
+        return false;
+    }
+    return ReleaseRegToken(kRegStorePackageLicense, token);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreQueryAddOnLicensesAsync(
+    XStoreContextHandle storeContextHandle,
+    XAsyncBlock* async) {
+    if (!storeContextHandle || !async) {
+        return RecordHr("XStoreQueryAddOnLicensesAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupStoreContext(storeContextHandle)) {
+        return RecordHr("XStoreQueryAddOnLicensesAsync", XGR_E_HANDLE);
+    }
+    return RecordHr(
+        "XStoreQueryAddOnLicensesAsync",
+        StartVoidAsync(async, kIdStoreAddOnLicenses, kIdStoreAddOnLicenses, XGR_S_OK));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreQueryAddOnLicensesResultCount(
+    XAsyncBlock* async,
+    uint32_t* count) {
+    if (!async || !count) {
+        return RecordHr("XStoreQueryAddOnLicensesResultCount", XGR_E_INVALIDARG);
+    }
+    const XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XStoreQueryAddOnLicensesResultCount", hr);
+    }
+    *count = 0u;
+    return RecordHr("XStoreQueryAddOnLicensesResultCount", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreQueryAddOnLicensesResult(
+    XAsyncBlock* async,
+    uint32_t /*count*/,
+    XStoreAddonLicense* /*addOnLicenses*/) {
+    if (!async) {
+        return RecordHr("XStoreQueryAddOnLicensesResult", XGR_E_INVALIDARG);
+    }
+    const XGameResult hr = XAsyncGetStatus(async, true);
+    return RecordHr("XStoreQueryAddOnLicensesResult", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreQueryProductForCurrentGameAsync(
+    XStoreContextHandle storeContextHandle,
+    XAsyncBlock* async) {
+    if (!storeContextHandle || !async) {
+        return RecordHr("XStoreQueryProductForCurrentGameAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupStoreContext(storeContextHandle)) {
+        return RecordHr("XStoreQueryProductForCurrentGameAsync", XGR_E_HANDLE);
+    }
+    return RecordHr(
+        "XStoreQueryProductForCurrentGameAsync",
+        StartStoreProductQueryAsync(async, kIdStoreProdCurrentGame, kIdStoreProdCurrentGame, true));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreQueryProductForCurrentGameResult(
+    XAsyncBlock* async,
+    XStoreProductQueryHandle* productQueryHandle) {
+    if (!async || !productQueryHandle) {
+        return RecordHr("XStoreQueryProductForCurrentGameResult", XGR_E_INVALIDARG);
+    }
+    *productQueryHandle = nullptr;
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XStoreQueryProductForCurrentGameResult", hr);
+    }
+    hr = XAsyncGetResult(
+        async, kIdStoreProdCurrentGame, sizeof(XStoreProductQueryHandle),
+        productQueryHandle, nullptr);
+    return RecordHr("XStoreQueryProductForCurrentGameResult", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreQueryProductForPackageAsync(
+    XStoreContextHandle storeContextHandle,
+    XStoreProductKind productKinds,
+    const char* packageIdentifier,
+    XAsyncBlock* async) {
+    if (!storeContextHandle || !packageIdentifier || !*packageIdentifier || !async) {
+        return RecordHr("XStoreQueryProductForPackageAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupStoreContext(storeContextHandle)) {
+        return RecordHr("XStoreQueryProductForPackageAsync", XGR_E_HANDLE);
+    }
+    const bool include_game =
+        ((static_cast<uint32_t>(productKinds) & static_cast<uint32_t>(XStoreProductKind_Game)) != 0) &&
+        (CurrentPackageIdentifier() == packageIdentifier);
+    return RecordHr(
+        "XStoreQueryProductForPackageAsync",
+        StartStoreProductQueryAsync(async, kIdStoreProdPackage, kIdStoreProdPackage, include_game));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreQueryProductForPackageResult(
+    XAsyncBlock* async,
+    XStoreProductQueryHandle* productQueryHandle) {
+    if (!async || !productQueryHandle) {
+        return RecordHr("XStoreQueryProductForPackageResult", XGR_E_INVALIDARG);
+    }
+    *productQueryHandle = nullptr;
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XStoreQueryProductForPackageResult", hr);
+    }
+    hr = XAsyncGetResult(
+        async, kIdStoreProdPackage, sizeof(XStoreProductQueryHandle),
+        productQueryHandle, nullptr);
+    return RecordHr("XStoreQueryProductForPackageResult", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreQueryAssociatedProductsAsync(
+    XStoreContextHandle storeContextHandle,
+    XStoreProductKind /*productKinds*/,
+    uint32_t /*maxItemsToRetrievePerPage*/,
+    XAsyncBlock* async) {
+    if (!storeContextHandle || !async) {
+        return RecordHr("XStoreQueryAssociatedProductsAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupStoreContext(storeContextHandle)) {
+        return RecordHr("XStoreQueryAssociatedProductsAsync", XGR_E_HANDLE);
+    }
+    return RecordHr(
+        "XStoreQueryAssociatedProductsAsync",
+        StartStoreProductQueryAsync(async, kIdStoreAssocProds, kIdStoreAssocProds, false));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreQueryAssociatedProductsResult(
+    XAsyncBlock* async,
+    XStoreProductQueryHandle* productQueryHandle) {
+    if (!async || !productQueryHandle) {
+        return RecordHr("XStoreQueryAssociatedProductsResult", XGR_E_INVALIDARG);
+    }
+    *productQueryHandle = nullptr;
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XStoreQueryAssociatedProductsResult", hr);
+    }
+    hr = XAsyncGetResult(
+        async, kIdStoreAssocProds, sizeof(XStoreProductQueryHandle),
+        productQueryHandle, nullptr);
+    return RecordHr("XStoreQueryAssociatedProductsResult", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreQueryEntitledProductsAsync(
+    XStoreContextHandle storeContextHandle,
+    XStoreProductKind productKinds,
+    uint32_t /*maxItemsToRetrievePerPage*/,
+    XAsyncBlock* async) {
+    if (!storeContextHandle || !async) {
+        return RecordHr("XStoreQueryEntitledProductsAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupStoreContext(storeContextHandle)) {
+        return RecordHr("XStoreQueryEntitledProductsAsync", XGR_E_HANDLE);
+    }
+    const bool include_game =
+        (static_cast<uint32_t>(productKinds) & static_cast<uint32_t>(XStoreProductKind_Game)) != 0;
+    return RecordHr(
+        "XStoreQueryEntitledProductsAsync",
+        StartStoreProductQueryAsync(
+            async, kIdStoreEntitledProds, kIdStoreEntitledProds, include_game));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreQueryEntitledProductsResult(
+    XAsyncBlock* async,
+    XStoreProductQueryHandle* productQueryHandle) {
+    if (!async || !productQueryHandle) {
+        return RecordHr("XStoreQueryEntitledProductsResult", XGR_E_INVALIDARG);
+    }
+    *productQueryHandle = nullptr;
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XStoreQueryEntitledProductsResult", hr);
+    }
+    hr = XAsyncGetResult(
+        async, kIdStoreEntitledProds, sizeof(XStoreProductQueryHandle),
+        productQueryHandle, nullptr);
+    return RecordHr("XStoreQueryEntitledProductsResult", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreQueryProductsAsync(
+    XStoreContextHandle storeContextHandle,
+    XStoreProductKind /*productKinds*/,
+    const char** storeIds,
+    size_t storeIdsCount,
+    const char** /*actionFilters*/,
+    size_t /*actionFiltersCount*/,
+    XAsyncBlock* async) {
+    if (!storeContextHandle || !async) {
+        return RecordHr("XStoreQueryProductsAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupStoreContext(storeContextHandle)) {
+        return RecordHr("XStoreQueryProductsAsync", XGR_E_HANDLE);
+    }
+    bool include_game = false;
+    if (storeIds && storeIdsCount > 0) {
+        for (size_t i = 0; i < storeIdsCount; ++i) {
+            if (storeIds[i] && std::strcmp(storeIds[i], kDefaultStoreId) == 0) {
+                include_game = true;
+                break;
+            }
+        }
+    }
+    return RecordHr(
+        "XStoreQueryProductsAsync",
+        StartStoreProductQueryAsync(async, kIdStoreQueryProds, kIdStoreQueryProds, include_game));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreQueryProductsResult(
+    XAsyncBlock* async,
+    XStoreProductQueryHandle* productQueryHandle) {
+    if (!async || !productQueryHandle) {
+        return RecordHr("XStoreQueryProductsResult", XGR_E_INVALIDARG);
+    }
+    *productQueryHandle = nullptr;
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XStoreQueryProductsResult", hr);
+    }
+    hr = XAsyncGetResult(
+        async, kIdStoreQueryProds, sizeof(XStoreProductQueryHandle),
+        productQueryHandle, nullptr);
+    return RecordHr("XStoreQueryProductsResult", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreEnumerateProductsQuery(
+    XStoreProductQueryHandle productQueryHandle,
+    void* context,
+    XStoreProductQueryCallback callback) {
+    if (!productQueryHandle || !callback) {
+        return RecordHr("XStoreEnumerateProductsQuery", XGR_E_INVALIDARG);
+    }
+    auto q = LookupStoreQuery(productQueryHandle);
+    if (!q) {
+        return RecordHr("XStoreEnumerateProductsQuery", XGR_E_HANDLE);
+    }
+    for (const auto& backing : q->products) {
+        if (!callback(&backing.product, context)) {
+            break;
+        }
+    }
+    return RecordHr("XStoreEnumerateProductsQuery", XGR_S_OK);
+}
+
+bool OPENSCARLETT_GDK_CALL XStoreProductsQueryHasMorePages(
+    XStoreProductQueryHandle productQueryHandle) {
+    RecordOk("XStoreProductsQueryHasMorePages");
+    (void)productQueryHandle;
+    return false;
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreProductsQueryNextPageAsync(
+    XStoreProductQueryHandle productQueryHandle,
+    XAsyncBlock* async) {
+    if (!productQueryHandle || !async) {
+        return RecordHr("XStoreProductsQueryNextPageAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupStoreQuery(productQueryHandle)) {
+        return RecordHr("XStoreProductsQueryNextPageAsync", XGR_E_HANDLE);
+    }
+    return RecordHr(
+        "XStoreProductsQueryNextPageAsync",
+        StartStoreProductQueryAsync(async, kIdStoreNextPage, kIdStoreNextPage, false));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreProductsQueryNextPageResult(
+    XAsyncBlock* async,
+    XStoreProductQueryHandle* productQueryHandle) {
+    if (!async || !productQueryHandle) {
+        return RecordHr("XStoreProductsQueryNextPageResult", XGR_E_INVALIDARG);
+    }
+    *productQueryHandle = nullptr;
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XStoreProductsQueryNextPageResult", hr);
+    }
+    hr = XAsyncGetResult(
+        async, kIdStoreNextPage, sizeof(XStoreProductQueryHandle),
+        productQueryHandle, nullptr);
+    return RecordHr("XStoreProductsQueryNextPageResult", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreCanAcquireLicenseForPackageAsync(
+    XStoreContextHandle storeContextHandle,
+    const char* packageIdentifier,
+    XAsyncBlock* async) {
+    if (!storeContextHandle || !packageIdentifier || !*packageIdentifier || !async) {
+        return RecordHr("XStoreCanAcquireLicenseForPackageAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupStoreContext(storeContextHandle)) {
+        return RecordHr("XStoreCanAcquireLicenseForPackageAsync", XGR_E_HANDLE);
+    }
+    XStoreCanAcquireLicenseResult res{};
+    std::snprintf(res.licensableSku, sizeof(res.licensableSku), "%s", "0001");
+    res.status = XStoreCanLicenseStatus_Licensable;
+    return RecordHr(
+        "XStoreCanAcquireLicenseForPackageAsync",
+        StartPodAsync<XStoreCanAcquireLicenseResult>(
+            async, kIdStoreCanAcquirePkg, kIdStoreCanAcquirePkg, res));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreCanAcquireLicenseForPackageResult(
+    XAsyncBlock* async,
+    XStoreCanAcquireLicenseResult* storeCanAcquireLicenseResult) {
+    if (!async || !storeCanAcquireLicenseResult) {
+        return RecordHr("XStoreCanAcquireLicenseForPackageResult", XGR_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XStoreCanAcquireLicenseForPackageResult", hr);
+    }
+    hr = XAsyncGetResult(
+        async, kIdStoreCanAcquirePkg, sizeof(XStoreCanAcquireLicenseResult),
+        storeCanAcquireLicenseResult, nullptr);
+    return RecordHr("XStoreCanAcquireLicenseForPackageResult", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreCanAcquireLicenseForStoreIdAsync(
+    XStoreContextHandle storeContextHandle,
+    const char* storeProductId,
+    XAsyncBlock* async) {
+    if (!storeContextHandle || !storeProductId || !*storeProductId || !async) {
+        return RecordHr("XStoreCanAcquireLicenseForStoreIdAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupStoreContext(storeContextHandle)) {
+        return RecordHr("XStoreCanAcquireLicenseForStoreIdAsync", XGR_E_HANDLE);
+    }
+    XStoreCanAcquireLicenseResult res{};
+    if (std::strcmp(storeProductId, kDefaultStoreId) == 0) {
+        std::snprintf(res.licensableSku, sizeof(res.licensableSku), "%s", "0001");
+        res.status = XStoreCanLicenseStatus_Licensable;
+    } else {
+        res.licensableSku[0] = '\0';
+        res.status = XStoreCanLicenseStatus_NotLicensableToUser;
+    }
+    return RecordHr(
+        "XStoreCanAcquireLicenseForStoreIdAsync",
+        StartPodAsync<XStoreCanAcquireLicenseResult>(
+            async, kIdStoreCanAcquireStoreId, kIdStoreCanAcquireStoreId, res));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreCanAcquireLicenseForStoreIdResult(
+    XAsyncBlock* async,
+    XStoreCanAcquireLicenseResult* storeCanAcquireLicenseResult) {
+    if (!async || !storeCanAcquireLicenseResult) {
+        return RecordHr("XStoreCanAcquireLicenseForStoreIdResult", XGR_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XStoreCanAcquireLicenseForStoreIdResult", hr);
+    }
+    hr = XAsyncGetResult(
+        async, kIdStoreCanAcquireStoreId, sizeof(XStoreCanAcquireLicenseResult),
+        storeCanAcquireLicenseResult, nullptr);
+    return RecordHr("XStoreCanAcquireLicenseForStoreIdResult", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreAcquireLicenseForPackageAsync(
+    XStoreContextHandle storeContextHandle,
+    const char* packageIdentifier,
+    XAsyncBlock* async) {
+    if (!storeContextHandle || !packageIdentifier || !*packageIdentifier || !async) {
+        return RecordHr("XStoreAcquireLicenseForPackageAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupStoreContext(storeContextHandle)) {
+        return RecordHr("XStoreAcquireLicenseForPackageAsync", XGR_E_HANDLE);
+    }
+    auto* ctx = new (std::nothrow) StoreAcquireLicenseAsyncCtx{packageIdentifier, nullptr};
+    if (!ctx) {
+        return RecordHr("XStoreAcquireLicenseForPackageAsync", XGR_E_OUTOFMEMORY);
+    }
+    XGameResult hr = XAsyncBegin(
+        async, ctx, kIdStoreAcquirePkg, kIdStoreAcquirePkg, &StoreAcquireLicenseProvider);
+    if (hr < 0) {
+        delete ctx;
+        return RecordHr("XStoreAcquireLicenseForPackageAsync", hr);
+    }
+    hr = XAsyncSchedule(async, 0);
+    if (hr < 0) {
+        XAsyncComplete(async, hr, 0);
+    }
+    return RecordHr("XStoreAcquireLicenseForPackageAsync", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreAcquireLicenseForPackageResult(
+    XAsyncBlock* async,
+    XStoreLicenseHandle* storeLicenseHandle) {
+    if (!async || !storeLicenseHandle) {
+        return RecordHr("XStoreAcquireLicenseForPackageResult", XGR_E_INVALIDARG);
+    }
+    *storeLicenseHandle = nullptr;
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XStoreAcquireLicenseForPackageResult", hr);
+    }
+    hr = XAsyncGetResult(
+        async, kIdStoreAcquirePkg, sizeof(XStoreLicenseHandle), storeLicenseHandle, nullptr);
+    return RecordHr("XStoreAcquireLicenseForPackageResult", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreAcquireLicenseForDurablesAsync(
+    XStoreContextHandle storeContextHandle,
+    const char* storeId,
+    XAsyncBlock* async) {
+    if (!storeContextHandle || !storeId || !*storeId || !async) {
+        return RecordHr("XStoreAcquireLicenseForDurablesAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupStoreContext(storeContextHandle)) {
+        return RecordHr("XStoreAcquireLicenseForDurablesAsync", XGR_E_HANDLE);
+    }
+    auto* ctx = new (std::nothrow) StoreAcquireLicenseAsyncCtx{storeId, nullptr};
+    if (!ctx) {
+        return RecordHr("XStoreAcquireLicenseForDurablesAsync", XGR_E_OUTOFMEMORY);
+    }
+    XGameResult hr = XAsyncBegin(
+        async, ctx, kIdStoreAcquireDurable, kIdStoreAcquireDurable, &StoreAcquireLicenseProvider);
+    if (hr < 0) {
+        delete ctx;
+        return RecordHr("XStoreAcquireLicenseForDurablesAsync", hr);
+    }
+    hr = XAsyncSchedule(async, 0);
+    if (hr < 0) {
+        XAsyncComplete(async, hr, 0);
+    }
+    return RecordHr("XStoreAcquireLicenseForDurablesAsync", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreAcquireLicenseForDurablesResult(
+    XAsyncBlock* async,
+    XStoreLicenseHandle* storeLicenseHandle) {
+    if (!async || !storeLicenseHandle) {
+        return RecordHr("XStoreAcquireLicenseForDurablesResult", XGR_E_INVALIDARG);
+    }
+    *storeLicenseHandle = nullptr;
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XStoreAcquireLicenseForDurablesResult", hr);
+    }
+    hr = XAsyncGetResult(
+        async, kIdStoreAcquireDurable, sizeof(XStoreLicenseHandle), storeLicenseHandle, nullptr);
+    return RecordHr("XStoreAcquireLicenseForDurablesResult", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreQueryConsumableBalanceRemainingAsync(
+    XStoreContextHandle storeContextHandle,
+    const char* storeProductId,
+    XAsyncBlock* async) {
+    if (!storeContextHandle || !storeProductId || !*storeProductId || !async) {
+        return RecordHr("XStoreQueryConsumableBalanceRemainingAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupStoreContext(storeContextHandle)) {
+        return RecordHr("XStoreQueryConsumableBalanceRemainingAsync", XGR_E_HANDLE);
+    }
+    XStoreConsumableResult res{0u};
+    return RecordHr(
+        "XStoreQueryConsumableBalanceRemainingAsync",
+        StartPodAsync<XStoreConsumableResult>(
+            async, kIdStoreConsumableBal, kIdStoreConsumableBal, res));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreQueryConsumableBalanceRemainingResult(
+    XAsyncBlock* async,
+    XStoreConsumableResult* consumableResult) {
+    if (!async || !consumableResult) {
+        return RecordHr("XStoreQueryConsumableBalanceRemainingResult", XGR_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XStoreQueryConsumableBalanceRemainingResult", hr);
+    }
+    hr = XAsyncGetResult(
+        async, kIdStoreConsumableBal, sizeof(XStoreConsumableResult), consumableResult, nullptr);
+    return RecordHr("XStoreQueryConsumableBalanceRemainingResult", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreReportConsumableFulfillmentAsync(
+    XStoreContextHandle storeContextHandle,
+    const char* storeProductId,
+    uint32_t /*quantity*/,
+    XgrGuid /*trackingId*/,
+    XAsyncBlock* async) {
+    if (!storeContextHandle || !storeProductId || !*storeProductId || !async) {
+        return RecordHr("XStoreReportConsumableFulfillmentAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupStoreContext(storeContextHandle)) {
+        return RecordHr("XStoreReportConsumableFulfillmentAsync", XGR_E_HANDLE);
+    }
+    XStoreConsumableResult res{0u};
+    return RecordHr(
+        "XStoreReportConsumableFulfillmentAsync",
+        StartPodAsync<XStoreConsumableResult>(
+            async, kIdStoreConsumableFulfill, kIdStoreConsumableFulfill, res));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreReportConsumableFulfillmentResult(
+    XAsyncBlock* async,
+    XStoreConsumableResult* consumableResult) {
+    if (!async || !consumableResult) {
+        return RecordHr("XStoreReportConsumableFulfillmentResult", XGR_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XStoreReportConsumableFulfillmentResult", hr);
+    }
+    hr = XAsyncGetResult(
+        async, kIdStoreConsumableFulfill, sizeof(XStoreConsumableResult),
+        consumableResult, nullptr);
+    return RecordHr("XStoreReportConsumableFulfillmentResult", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreQueryGameAndDlcPackageUpdatesAsync(
+    XStoreContextHandle storeContextHandle,
+    XAsyncBlock* async) {
+    if (!storeContextHandle || !async) {
+        return RecordHr("XStoreQueryGameAndDlcPackageUpdatesAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupStoreContext(storeContextHandle)) {
+        return RecordHr("XStoreQueryGameAndDlcPackageUpdatesAsync", XGR_E_HANDLE);
+    }
+    return RecordHr(
+        "XStoreQueryGameAndDlcPackageUpdatesAsync",
+        StartVoidAsync(async, kIdStorePkgUpdates, kIdStorePkgUpdates, XGR_S_OK));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreQueryGameAndDlcPackageUpdatesResultCount(
+    XAsyncBlock* async,
+    uint32_t* count) {
+    if (!async || !count) {
+        return RecordHr("XStoreQueryGameAndDlcPackageUpdatesResultCount", XGR_E_INVALIDARG);
+    }
+    const XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XStoreQueryGameAndDlcPackageUpdatesResultCount", hr);
+    }
+    *count = 0u;
+    return RecordHr("XStoreQueryGameAndDlcPackageUpdatesResultCount", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreQueryGameAndDlcPackageUpdatesResult(
+    XAsyncBlock* async,
+    uint32_t /*count*/,
+    XStorePackageUpdate* /*packageUpdates*/) {
+    if (!async) {
+        return RecordHr("XStoreQueryGameAndDlcPackageUpdatesResult", XGR_E_INVALIDARG);
+    }
+    return RecordHr("XStoreQueryGameAndDlcPackageUpdatesResult", XAsyncGetStatus(async, true));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreDownloadPackageUpdatesAsync(
+    XStoreContextHandle storeContextHandle,
+    const char** /*packageIdentifiers*/,
+    size_t /*packageIdentifiersCount*/,
+    XAsyncBlock* async) {
+    if (!storeContextHandle || !async) {
+        return RecordHr("XStoreDownloadPackageUpdatesAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupStoreContext(storeContextHandle)) {
+        return RecordHr("XStoreDownloadPackageUpdatesAsync", XGR_E_HANDLE);
+    }
+    return RecordHr(
+        "XStoreDownloadPackageUpdatesAsync",
+        StartVoidAsync(async, kIdStoreDownloadUpdates, kIdStoreDownloadUpdates, XGR_S_OK));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreDownloadPackageUpdatesResult(XAsyncBlock* async) {
+    if (!async) {
+        return RecordHr("XStoreDownloadPackageUpdatesResult", XGR_E_INVALIDARG);
+    }
+    return RecordHr("XStoreDownloadPackageUpdatesResult", XAsyncGetStatus(async, true));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreDownloadAndInstallPackageUpdatesAsync(
+    XStoreContextHandle storeContextHandle,
+    const char** /*packageIdentifiers*/,
+    size_t /*packageIdentifiersCount*/,
+    XAsyncBlock* async) {
+    if (!storeContextHandle || !async) {
+        return RecordHr("XStoreDownloadAndInstallPackageUpdatesAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupStoreContext(storeContextHandle)) {
+        return RecordHr("XStoreDownloadAndInstallPackageUpdatesAsync", XGR_E_HANDLE);
+    }
+    return RecordHr(
+        "XStoreDownloadAndInstallPackageUpdatesAsync",
+        StartVoidAsync(
+            async, kIdStoreDownloadInstallUpdates, kIdStoreDownloadInstallUpdates, XGR_S_OK));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreDownloadAndInstallPackageUpdatesResult(XAsyncBlock* async) {
+    if (!async) {
+        return RecordHr("XStoreDownloadAndInstallPackageUpdatesResult", XGR_E_INVALIDARG);
+    }
+    return RecordHr(
+        "XStoreDownloadAndInstallPackageUpdatesResult", XAsyncGetStatus(async, true));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreDownloadAndInstallPackagesAsync(
+    XStoreContextHandle storeContextHandle,
+    const char** /*storeIds*/,
+    size_t /*storeIdsCount*/,
+    XAsyncBlock* async) {
+    if (!storeContextHandle || !async) {
+        return RecordHr("XStoreDownloadAndInstallPackagesAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupStoreContext(storeContextHandle)) {
+        return RecordHr("XStoreDownloadAndInstallPackagesAsync", XGR_E_HANDLE);
+    }
+    return RecordHr(
+        "XStoreDownloadAndInstallPackagesAsync",
+        StartVoidAsync(async, kIdStoreDownloadInstallPkgs, kIdStoreDownloadInstallPkgs, XGR_S_OK));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreDownloadAndInstallPackagesResultCount(
+    XAsyncBlock* async,
+    uint32_t* count) {
+    if (!async || !count) {
+        return RecordHr("XStoreDownloadAndInstallPackagesResultCount", XGR_E_INVALIDARG);
+    }
+    const XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XStoreDownloadAndInstallPackagesResultCount", hr);
+    }
+    *count = 0u;
+    return RecordHr("XStoreDownloadAndInstallPackagesResultCount", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreDownloadAndInstallPackagesResult(
+    XAsyncBlock* async,
+    uint32_t /*count*/,
+    char (*/*packageIdentifiers*/)[XSTORE_PACKAGE_IDENTIFIER_MAX_LENGTH]) {
+    if (!async) {
+        return RecordHr("XStoreDownloadAndInstallPackagesResult", XGR_E_INVALIDARG);
+    }
+    return RecordHr("XStoreDownloadAndInstallPackagesResult", XAsyncGetStatus(async, true));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreGetUserCollectionsIdAsync(
+    XStoreContextHandle storeContextHandle,
+    const char* /*serviceTicket*/,
+    const char* /*publisherUserId*/,
+    XAsyncBlock* async) {
+    if (!storeContextHandle || !async) {
+        return RecordHr("XStoreGetUserCollectionsIdAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupStoreContext(storeContextHandle)) {
+        return RecordHr("XStoreGetUserCollectionsIdAsync", XGR_E_HANDLE);
+    }
+    return RecordHr(
+        "XStoreGetUserCollectionsIdAsync",
+        StartStringAsync(
+            async, kIdStoreCollectionsId, kIdStoreCollectionsId,
+            "openscarlett-offline-collections-id"));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreGetUserCollectionsIdResultSize(
+    XAsyncBlock* async,
+    size_t* size) {
+    if (!async || !size) {
+        return RecordHr("XStoreGetUserCollectionsIdResultSize", XGR_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XStoreGetUserCollectionsIdResultSize", hr);
+    }
+    return RecordHr("XStoreGetUserCollectionsIdResultSize", XAsyncGetResultSize(async, size));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreGetUserCollectionsIdResult(
+    XAsyncBlock* async,
+    size_t size,
+    char* result) {
+    if (!async || !result) {
+        return RecordHr("XStoreGetUserCollectionsIdResult", XGR_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XStoreGetUserCollectionsIdResult", hr);
+    }
+    return RecordHr(
+        "XStoreGetUserCollectionsIdResult",
+        XAsyncGetResult(async, kIdStoreCollectionsId, size, result, nullptr));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreGetUserPurchaseIdAsync(
+    XStoreContextHandle storeContextHandle,
+    const char* /*serviceTicket*/,
+    const char* /*publisherUserId*/,
+    XAsyncBlock* async) {
+    if (!storeContextHandle || !async) {
+        return RecordHr("XStoreGetUserPurchaseIdAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupStoreContext(storeContextHandle)) {
+        return RecordHr("XStoreGetUserPurchaseIdAsync", XGR_E_HANDLE);
+    }
+    return RecordHr(
+        "XStoreGetUserPurchaseIdAsync",
+        StartStringAsync(
+            async, kIdStorePurchaseId, kIdStorePurchaseId,
+            "openscarlett-offline-purchase-id"));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreGetUserPurchaseIdResultSize(
+    XAsyncBlock* async,
+    size_t* size) {
+    if (!async || !size) {
+        return RecordHr("XStoreGetUserPurchaseIdResultSize", XGR_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XStoreGetUserPurchaseIdResultSize", hr);
+    }
+    return RecordHr("XStoreGetUserPurchaseIdResultSize", XAsyncGetResultSize(async, size));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreGetUserPurchaseIdResult(
+    XAsyncBlock* async,
+    size_t size,
+    char* result) {
+    if (!async || !result) {
+        return RecordHr("XStoreGetUserPurchaseIdResult", XGR_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XStoreGetUserPurchaseIdResult", hr);
+    }
+    return RecordHr(
+        "XStoreGetUserPurchaseIdResult",
+        XAsyncGetResult(async, kIdStorePurchaseId, size, result, nullptr));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreQueryLicenseTokenAsync(
+    XStoreContextHandle storeContextHandle,
+    const char** /*productIds*/,
+    size_t /*productIdsCount*/,
+    const char* /*customDeveloperString*/,
+    XAsyncBlock* async) {
+    if (!storeContextHandle || !async) {
+        return RecordHr("XStoreQueryLicenseTokenAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupStoreContext(storeContextHandle)) {
+        return RecordHr("XStoreQueryLicenseTokenAsync", XGR_E_HANDLE);
+    }
+    return RecordHr(
+        "XStoreQueryLicenseTokenAsync",
+        StartStringAsync(
+            async, kIdStoreLicenseToken, kIdStoreLicenseToken,
+            "openscarlett-offline-license-token"));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreQueryLicenseTokenResultSize(
+    XAsyncBlock* async,
+    size_t* size) {
+    if (!async || !size) {
+        return RecordHr("XStoreQueryLicenseTokenResultSize", XGR_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XStoreQueryLicenseTokenResultSize", hr);
+    }
+    return RecordHr("XStoreQueryLicenseTokenResultSize", XAsyncGetResultSize(async, size));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreQueryLicenseTokenResult(
+    XAsyncBlock* async,
+    size_t size,
+    char* result) {
+    if (!async || !result) {
+        return RecordHr("XStoreQueryLicenseTokenResult", XGR_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XStoreQueryLicenseTokenResult", hr);
+    }
+    return RecordHr(
+        "XStoreQueryLicenseTokenResult",
+        XAsyncGetResult(async, kIdStoreLicenseToken, size, result, nullptr));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreQueryPackageIdentifier(
+    const char* storeId,
+    size_t size,
+    char* packageIdentifier) {
+    if (!storeId || !*storeId || !packageIdentifier) {
+        return RecordHr("XStoreQueryPackageIdentifier", XGR_E_INVALIDARG);
+    }
+    std::string pkg = CurrentPackageIdentifier();
+    if (pkg.size() >= XSTORE_PACKAGE_IDENTIFIER_MAX_LENGTH) {
+        pkg.resize(XSTORE_PACKAGE_IDENTIFIER_MAX_LENGTH - 1);
+    }
+    return RecordHr(
+        "XStoreQueryPackageIdentifier",
+        CopyStringResult(pkg, size, packageIdentifier, nullptr));
+}
+
+bool OPENSCARLETT_GDK_CALL XStoreIsAvailabilityPurchasable(
+    const XStoreAvailability availability) {
+    RecordOk("XStoreIsAvailabilityPurchasable");
+    return availability.availabilityId != nullptr && availability.availabilityId[0] != '\0';
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreShowAssociatedProductsUIAsync(
+    XStoreContextHandle storeContextHandle,
+    const char* /*storeId*/,
+    XStoreProductKind /*productKinds*/,
+    XAsyncBlock* async) {
+    if (!storeContextHandle || !async) {
+        return RecordHr("XStoreShowAssociatedProductsUIAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupStoreContext(storeContextHandle)) {
+        return RecordHr("XStoreShowAssociatedProductsUIAsync", XGR_E_HANDLE);
+    }
+    return RecordHr(
+        "XStoreShowAssociatedProductsUIAsync",
+        StartVoidAsync(async, kIdStoreShowAssocUi, kIdStoreShowAssocUi, XGR_S_OK));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreShowAssociatedProductsUIResult(XAsyncBlock* async) {
+    if (!async) {
+        return RecordHr("XStoreShowAssociatedProductsUIResult", XGR_E_INVALIDARG);
+    }
+    return RecordHr("XStoreShowAssociatedProductsUIResult", XAsyncGetStatus(async, true));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreShowProductPageUIAsync(
+    XStoreContextHandle storeContextHandle,
+    const char* /*storeId*/,
+    XAsyncBlock* async) {
+    if (!storeContextHandle || !async) {
+        return RecordHr("XStoreShowProductPageUIAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupStoreContext(storeContextHandle)) {
+        return RecordHr("XStoreShowProductPageUIAsync", XGR_E_HANDLE);
+    }
+    return RecordHr(
+        "XStoreShowProductPageUIAsync",
+        StartVoidAsync(async, kIdStoreShowProdUi, kIdStoreShowProdUi, XGR_S_OK));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreShowProductPageUIResult(XAsyncBlock* async) {
+    if (!async) {
+        return RecordHr("XStoreShowProductPageUIResult", XGR_E_INVALIDARG);
+    }
+    return RecordHr("XStoreShowProductPageUIResult", XAsyncGetStatus(async, true));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreShowPurchaseUIAsync(
+    XStoreContextHandle storeContextHandle,
+    const char* /*storeId*/,
+    const char* /*name*/,
+    const char* /*extendedJsonData*/,
+    XAsyncBlock* async) {
+    if (!storeContextHandle || !async) {
+        return RecordHr("XStoreShowPurchaseUIAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupStoreContext(storeContextHandle)) {
+        return RecordHr("XStoreShowPurchaseUIAsync", XGR_E_HANDLE);
+    }
+    return RecordHr(
+        "XStoreShowPurchaseUIAsync",
+        StartVoidAsync(async, kIdStoreShowPurchaseUi, kIdStoreShowPurchaseUi, XGR_E_ABORT));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreShowPurchaseUIResult(XAsyncBlock* async) {
+    if (!async) {
+        return RecordHr("XStoreShowPurchaseUIResult", XGR_E_INVALIDARG);
+    }
+    return RecordHr("XStoreShowPurchaseUIResult", XAsyncGetStatus(async, true));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreShowRateAndReviewUIAsync(
+    XStoreContextHandle storeContextHandle,
+    XAsyncBlock* async) {
+    if (!storeContextHandle || !async) {
+        return RecordHr("XStoreShowRateAndReviewUIAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupStoreContext(storeContextHandle)) {
+        return RecordHr("XStoreShowRateAndReviewUIAsync", XGR_E_HANDLE);
+    }
+    return RecordHr(
+        "XStoreShowRateAndReviewUIAsync",
+        StartVoidAsync(async, kIdStoreShowRateUi, kIdStoreShowRateUi, XGR_S_OK));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreShowRateAndReviewUIResult(XAsyncBlock* async) {
+    if (!async) {
+        return RecordHr("XStoreShowRateAndReviewUIResult", XGR_E_INVALIDARG);
+    }
+    return RecordHr("XStoreShowRateAndReviewUIResult", XAsyncGetStatus(async, true));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreShowRedeemTokenUIAsync(
+    XStoreContextHandle storeContextHandle,
+    const char* /*token*/,
+    const char** /*allowedStoreIds*/,
+    size_t /*allowedStoreIdsCount*/,
+    bool /*disallowCsvRedemption*/,
+    XAsyncBlock* async) {
+    if (!storeContextHandle || !async) {
+        return RecordHr("XStoreShowRedeemTokenUIAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupStoreContext(storeContextHandle)) {
+        return RecordHr("XStoreShowRedeemTokenUIAsync", XGR_E_HANDLE);
+    }
+    return RecordHr(
+        "XStoreShowRedeemTokenUIAsync",
+        StartVoidAsync(async, kIdStoreShowRedeemUi, kIdStoreShowRedeemUi, XGR_S_OK));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XStoreShowRedeemTokenUIResult(XAsyncBlock* async) {
+    if (!async) {
+        return RecordHr("XStoreShowRedeemTokenUIResult", XGR_E_INVALIDARG);
+    }
+    return RecordHr("XStoreShowRedeemTokenUIResult", XAsyncGetStatus(async, true));
+}
+
+// ===========================================================================
+// XGameUi (non-blocking offline/local defaults)
+// ===========================================================================
+XGameResult OPENSCARLETT_GDK_CALL XGameUiSetNotificationPositionHint(
+    XGameUiNotificationPositionHint position) {
+    GetRuntime().ui_notification_hint.store(
+        static_cast<uint32_t>(position), std::memory_order_release);
+    return RecordHr("XGameUiSetNotificationPositionHint", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUiShowMessageDialogAsync(
+    XAsyncBlock* async,
+    const char* /*titleText*/,
+    const char* /*contentText*/,
+    const char* /*firstButtonText*/,
+    const char* /*secondButtonText*/,
+    const char* /*thirdButtonText*/,
+    XGameUiMessageDialogButton defaultButton,
+    XGameUiMessageDialogButton /*cancelButton*/) {
+    if (!async) {
+        return RecordHr("XGameUiShowMessageDialogAsync", XGR_E_INVALIDARG);
+    }
+    return RecordHr(
+        "XGameUiShowMessageDialogAsync",
+        StartPodAsync<XGameUiMessageDialogButton>(
+            async, kIdUiMessageDialog, kIdUiMessageDialog, defaultButton));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUiShowMessageDialogResult(
+    XAsyncBlock* async,
+    XGameUiMessageDialogButton* resultButton) {
+    if (!async || !resultButton) {
+        return RecordHr("XGameUiShowMessageDialogResult", XGR_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XGameUiShowMessageDialogResult", hr);
+    }
+    hr = XAsyncGetResult(
+        async, kIdUiMessageDialog, sizeof(XGameUiMessageDialogButton), resultButton, nullptr);
+    return RecordHr("XGameUiShowMessageDialogResult", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUiShowErrorDialogAsync(
+    XAsyncBlock* async,
+    XGameResult /*errorCode*/,
+    const char* /*context*/) {
+    if (!async) {
+        return RecordHr("XGameUiShowErrorDialogAsync", XGR_E_INVALIDARG);
+    }
+    return RecordHr(
+        "XGameUiShowErrorDialogAsync",
+        StartVoidAsync(async, kIdUiErrorDialog, kIdUiErrorDialog, XGR_S_OK));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUiShowErrorDialogResult(XAsyncBlock* async) {
+    if (!async) {
+        return RecordHr("XGameUiShowErrorDialogResult", XGR_E_INVALIDARG);
+    }
+    return RecordHr("XGameUiShowErrorDialogResult", XAsyncGetStatus(async, true));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUiShowTextEntryAsync(
+    XAsyncBlock* async,
+    const char* /*titleText*/,
+    const char* /*descriptionText*/,
+    const char* defaultText,
+    XGameUiTextEntryInputScope /*inputScope*/,
+    uint32_t maxTextLength) {
+    if (!async) {
+        return RecordHr("XGameUiShowTextEntryAsync", XGR_E_INVALIDARG);
+    }
+    std::string text = defaultText ? defaultText : "";
+    if (maxTextLength > 0 && text.size() > maxTextLength) {
+        text.resize(maxTextLength);
+    }
+    return RecordHr(
+        "XGameUiShowTextEntryAsync",
+        StartStringAsync(async, kIdUiTextEntry, kIdUiTextEntry, std::move(text)));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUiShowTextEntryResultSize(
+    XAsyncBlock* async,
+    uint32_t* resultTextBufferSize) {
+    if (!async || !resultTextBufferSize) {
+        return RecordHr("XGameUiShowTextEntryResultSize", XGR_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XGameUiShowTextEntryResultSize", hr);
+    }
+    size_t sz = 0;
+    hr = XAsyncGetResultSize(async, &sz);
+    if (hr >= 0) {
+        *resultTextBufferSize = static_cast<uint32_t>(sz);
+    }
+    return RecordHr("XGameUiShowTextEntryResultSize", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUiShowTextEntryResult(
+    XAsyncBlock* async,
+    uint32_t resultTextBufferSize,
+    char* resultTextBuffer,
+    uint32_t* resultTextBufferUsed) {
+    if (!async || !resultTextBuffer) {
+        return RecordHr("XGameUiShowTextEntryResult", XGR_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XGameUiShowTextEntryResult", hr);
+    }
+    size_t used = 0;
+    hr = XAsyncGetResult(async, kIdUiTextEntry, resultTextBufferSize, resultTextBuffer, &used);
+    if (hr >= 0 && resultTextBufferUsed) {
+        *resultTextBufferUsed = static_cast<uint32_t>(used);
+    }
+    return RecordHr("XGameUiShowTextEntryResult", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUiShowAchievementsAsync(
+    XAsyncBlock* async,
+    XUserHandle /*requestingUser*/,
+    uint32_t /*titleId*/) {
+    if (!async) {
+        return RecordHr("XGameUiShowAchievementsAsync", XGR_E_INVALIDARG);
+    }
+    return RecordHr(
+        "XGameUiShowAchievementsAsync",
+        StartVoidAsync(async, kIdUiAchievements, kIdUiAchievements, XGR_S_OK));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUiShowAchievementsResult(XAsyncBlock* async) {
+    if (!async) {
+        return RecordHr("XGameUiShowAchievementsResult", XGR_E_INVALIDARG);
+    }
+    return RecordHr("XGameUiShowAchievementsResult", XAsyncGetStatus(async, true));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUiShowPlayerPickerAsync(
+    XAsyncBlock* async,
+    XUserHandle /*requestingUser*/,
+    const char* /*promptText*/,
+    uint32_t /*selectFromPlayersCount*/,
+    const uint64_t* /*selectFromPlayers*/,
+    uint32_t preSelectedPlayersCount,
+    const uint64_t* preSelectedPlayers,
+    uint32_t /*minSelectionCount*/,
+    uint32_t maxSelectionCount) {
+    if (!async) {
+        return RecordHr("XGameUiShowPlayerPickerAsync", XGR_E_INVALIDARG);
+    }
+    auto* ctx = new (std::nothrow) UiPlayerPickerAsyncCtx();
+    if (!ctx) {
+        return RecordHr("XGameUiShowPlayerPickerAsync", XGR_E_OUTOFMEMORY);
+    }
+    if (preSelectedPlayers && preSelectedPlayersCount > 0) {
+        const uint32_t limit =
+            (maxSelectionCount > 0) ? std::min(preSelectedPlayersCount, maxSelectionCount)
+                                    : preSelectedPlayersCount;
+        ctx->players.assign(preSelectedPlayers, preSelectedPlayers + limit);
+    }
+    XGameResult hr = XAsyncBegin(
+        async, ctx, kIdUiPlayerPicker, kIdUiPlayerPicker, &UiPlayerPickerProvider);
+    if (hr < 0) {
+        delete ctx;
+        return RecordHr("XGameUiShowPlayerPickerAsync", hr);
+    }
+    hr = XAsyncSchedule(async, 0);
+    if (hr < 0) {
+        XAsyncComplete(async, hr, 0);
+    }
+    return RecordHr("XGameUiShowPlayerPickerAsync", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUiShowPlayerPickerResultCount(
+    XAsyncBlock* async,
+    uint32_t* resultPlayersCount) {
+    if (!async || !resultPlayersCount) {
+        return RecordHr("XGameUiShowPlayerPickerResultCount", XGR_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XGameUiShowPlayerPickerResultCount", hr);
+    }
+    size_t sz = 0;
+    hr = XAsyncGetResultSize(async, &sz);
+    if (hr >= 0) {
+        *resultPlayersCount = static_cast<uint32_t>(sz / sizeof(uint64_t));
+    }
+    return RecordHr("XGameUiShowPlayerPickerResultCount", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUiShowPlayerPickerResult(
+    XAsyncBlock* async,
+    uint32_t resultPlayersCount,
+    uint64_t* resultPlayers,
+    uint32_t* resultPlayersUsed) {
+    if (!async) {
+        return RecordHr("XGameUiShowPlayerPickerResult", XGR_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XGameUiShowPlayerPickerResult", hr);
+    }
+    size_t req_bytes = 0;
+    hr = XAsyncGetResultSize(async, &req_bytes);
+    if (hr < 0) {
+        return RecordHr("XGameUiShowPlayerPickerResult", hr);
+    }
+    if (req_bytes == 0) {
+        if (resultPlayersUsed) *resultPlayersUsed = 0u;
+        return RecordHr("XGameUiShowPlayerPickerResult", XGR_S_OK);
+    }
+    if (!resultPlayers) {
+        return RecordHr("XGameUiShowPlayerPickerResult", XGR_E_INVALIDARG);
+    }
+    size_t used_bytes = 0;
+    hr = XAsyncGetResult(
+        async, kIdUiPlayerPicker, static_cast<size_t>(resultPlayersCount) * sizeof(uint64_t),
+        resultPlayers, &used_bytes);
+    if (hr >= 0 && resultPlayersUsed) {
+        *resultPlayersUsed = static_cast<uint32_t>(used_bytes / sizeof(uint64_t));
+    }
+    return RecordHr("XGameUiShowPlayerPickerResult", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUiShowPlayerProfileCardAsync(
+    XAsyncBlock* async,
+    XUserHandle /*requestingUser*/,
+    uint64_t /*targetPlayer*/) {
+    if (!async) {
+        return RecordHr("XGameUiShowPlayerProfileCardAsync", XGR_E_INVALIDARG);
+    }
+    return RecordHr(
+        "XGameUiShowPlayerProfileCardAsync",
+        StartVoidAsync(async, kIdUiProfileCard, kIdUiProfileCard, XGR_S_OK));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUiShowPlayerProfileCardResult(XAsyncBlock* async) {
+    if (!async) {
+        return RecordHr("XGameUiShowPlayerProfileCardResult", XGR_E_INVALIDARG);
+    }
+    return RecordHr("XGameUiShowPlayerProfileCardResult", XAsyncGetStatus(async, true));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUiShowSendGameInviteAsync(
+    XAsyncBlock* async,
+    XUserHandle /*requestingUser*/,
+    const char* /*sessionConfigurationId*/,
+    const char* /*sessionTemplateName*/,
+    const char* /*sessionId*/,
+    const char* /*invitationText*/,
+    const char* /*customActivationContext*/) {
+    if (!async) {
+        return RecordHr("XGameUiShowSendGameInviteAsync", XGR_E_INVALIDARG);
+    }
+    return RecordHr(
+        "XGameUiShowSendGameInviteAsync",
+        StartVoidAsync(async, kIdUiSendInvite, kIdUiSendInvite, XGR_S_OK));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUiShowSendGameInviteResult(XAsyncBlock* async) {
+    if (!async) {
+        return RecordHr("XGameUiShowSendGameInviteResult", XGR_E_INVALIDARG);
+    }
+    return RecordHr("XGameUiShowSendGameInviteResult", XAsyncGetStatus(async, true));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUiShowWebAuthenticationWithOptionsAsync(
+    XAsyncBlock* async,
+    XUserHandle /*requestingUser*/,
+    const char* requestUri,
+    const char* completionUri,
+    XGameUiWebAuthenticationOptions /*options*/) {
+    if (!async || !requestUri || !*requestUri) {
+        return RecordHr("XGameUiShowWebAuthenticationWithOptionsAsync", XGR_E_INVALIDARG);
+    }
+    auto* ctx = new (std::nothrow) UiWebAuthAsyncCtx{completionUri ? completionUri : ""};
+    if (!ctx) {
+        return RecordHr("XGameUiShowWebAuthenticationWithOptionsAsync", XGR_E_OUTOFMEMORY);
+    }
+    XGameResult hr = XAsyncBegin(async, ctx, kIdUiWebAuth, kIdUiWebAuth, &UiWebAuthProvider);
+    if (hr < 0) {
+        delete ctx;
+        return RecordHr("XGameUiShowWebAuthenticationWithOptionsAsync", hr);
+    }
+    hr = XAsyncSchedule(async, 0);
+    if (hr < 0) {
+        XAsyncComplete(async, hr, 0);
+    }
+    return RecordHr("XGameUiShowWebAuthenticationWithOptionsAsync", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUiShowWebAuthenticationAsync(
+    XAsyncBlock* async,
+    XUserHandle requestingUser,
+    const char* requestUri,
+    const char* completionUri) {
+    const XGameResult hr = XGameUiShowWebAuthenticationWithOptionsAsync(
+        async, requestingUser, requestUri, completionUri, XGameUiWebAuthenticationOptions_None);
+    return RecordHr("XGameUiShowWebAuthenticationAsync", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUiShowWebAuthenticationResultSize(
+    XAsyncBlock* async,
+    size_t* bufferSize) {
+    if (!async || !bufferSize) {
+        return RecordHr("XGameUiShowWebAuthenticationResultSize", XGR_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XGameUiShowWebAuthenticationResultSize", hr);
+    }
+    return RecordHr("XGameUiShowWebAuthenticationResultSize", XAsyncGetResultSize(async, bufferSize));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUiShowWebAuthenticationResult(
+    XAsyncBlock* async,
+    size_t bufferSize,
+    void* buffer,
+    XGameUiWebAuthenticationResultData** ptrToBuffer,
+    size_t* bufferUsed) {
+    if (!async || !buffer || !ptrToBuffer) {
+        return RecordHr("XGameUiShowWebAuthenticationResult", XGR_E_INVALIDARG);
+    }
+    *ptrToBuffer = nullptr;
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XGameUiShowWebAuthenticationResult", hr);
+    }
+    hr = XAsyncGetResult(async, kIdUiWebAuth, bufferSize, buffer, bufferUsed);
+    if (hr >= 0) {
+        *ptrToBuffer = static_cast<XGameUiWebAuthenticationResultData*>(buffer);
+    }
+    return RecordHr("XGameUiShowWebAuthenticationResult", hr);
+}
+
+// ===========================================================================
+// XNetworking (clean-room PC/local connectivity & TLS info)
+// ===========================================================================
+XGameResult OPENSCARLETT_GDK_CALL XNetworkingGetConnectivityHint(
+    XNetworkingConnectivityHint* connectivityHint) {
+    if (!connectivityHint) {
+        return RecordHr("XNetworkingGetConnectivityHint", XGR_E_INVALIDARG);
+    }
+    connectivityHint->connectivityLevel = XNetworkingConnectivityLevelHint_InternetAccess;
+    connectivityHint->connectivityCost = XNetworkingConnectivityCostHint_Unrestricted;
+    connectivityHint->ianaInterfaceType = 6u;  // IF_TYPE_ETHERNET_CSMACD
+    connectivityHint->networkInitialized = true;
+    connectivityHint->approachingDataLimit = false;
+    connectivityHint->overDataLimit = false;
+    connectivityHint->roaming = false;
+    return RecordHr("XNetworkingGetConnectivityHint", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XNetworkingQueryConnectivityHint(
+    XNetworkingConnectivityHint* connectivityHint) {
+    const XGameResult hr = XNetworkingGetConnectivityHint(connectivityHint);
+    return RecordHr("XNetworkingQueryConnectivityHint", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XNetworkingQueryPreferredLocalUdpMultiplayerPort(
+    uint16_t* preferredLocalUdpMultiplayerPort) {
+    if (!preferredLocalUdpMultiplayerPort) {
+        return RecordHr("XNetworkingQueryPreferredLocalUdpMultiplayerPort", XGR_E_INVALIDARG);
+    }
+    *preferredLocalUdpMultiplayerPort = 3074u;
+    return RecordHr("XNetworkingQueryPreferredLocalUdpMultiplayerPort", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XNetworkingQueryPreferredLocalUdpMultiplayerPortAsync(
+    XAsyncBlock* async) {
+    if (!async) {
+        return RecordHr("XNetworkingQueryPreferredLocalUdpMultiplayerPortAsync", XGR_E_INVALIDARG);
+    }
+    const uint16_t port = 3074u;
+    return RecordHr(
+        "XNetworkingQueryPreferredLocalUdpMultiplayerPortAsync",
+        StartPodAsync<uint16_t>(async, kIdNetUdpPort, kIdNetUdpPort, port));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult(
+    XAsyncBlock* async,
+    uint16_t* preferredLocalUdpMultiplayerPort) {
+    if (!async || !preferredLocalUdpMultiplayerPort) {
+        return RecordHr(
+            "XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult", XGR_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult", hr);
+    }
+    hr = XAsyncGetResult(
+        async, kIdNetUdpPort, sizeof(uint16_t), preferredLocalUdpMultiplayerPort, nullptr);
+    return RecordHr("XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XNetworkingRegisterConnectivityHintChanged(
+    XTaskQueueHandle /*queue*/,
+    void* /*context*/,
+    XNetworkingConnectivityHintChangedCallback callback,
+    XTaskQueueRegistrationToken* token) {
+    if (!callback || !token) {
+        return RecordHr("XNetworkingRegisterConnectivityHintChanged", XGR_E_INVALIDARG);
+    }
+    *token = AllocateRegToken(kRegNetConnectivity);
+    return RecordHr("XNetworkingRegisterConnectivityHintChanged", XGR_S_OK);
+}
+
+bool OPENSCARLETT_GDK_CALL XNetworkingUnregisterConnectivityHintChanged(
+    XTaskQueueRegistrationToken token,
+    bool /*wait*/) {
+    RecordOk("XNetworkingUnregisterConnectivityHintChanged");
+    return ReleaseRegToken(kRegNetConnectivity, token);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged(
+    XTaskQueueHandle /*queue*/,
+    void* /*context*/,
+    XNetworkingPreferredLocalUdpMultiplayerPortChangedCallback callback,
+    XTaskQueueRegistrationToken* token) {
+    if (!callback || !token) {
+        return RecordHr(
+            "XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged", XGR_E_INVALIDARG);
+    }
+    *token = AllocateRegToken(kRegNetUdpPort);
+    return RecordHr("XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged", XGR_S_OK);
+}
+
+bool OPENSCARLETT_GDK_CALL XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged(
+    XTaskQueueRegistrationToken token,
+    bool /*wait*/) {
+    RecordOk("XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged");
+    return ReleaseRegToken(kRegNetUdpPort, token);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XNetworkingQuerySecurityInformationForUrlAsync(
+    const char* url,
+    XAsyncBlock* async) {
+    if (!url || !*url || !async) {
+        return RecordHr("XNetworkingQuerySecurityInformationForUrlAsync", XGR_E_INVALIDARG);
+    }
+    XNetworkingSecurityInformation info{};
+    info.enabledHttpSecurityProtocolFlags = 0x00000A00u;  // TLS 1.1 | TLS 1.2
+    info.thumbprintCount = 0;
+    info.thumbprints = nullptr;
+    return RecordHr(
+        "XNetworkingQuerySecurityInformationForUrlAsync",
+        StartPodAsync<XNetworkingSecurityInformation>(async, kIdNetSecInfo, kIdNetSecInfo, info));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XNetworkingQuerySecurityInformationForUrlAsyncResultSize(
+    XAsyncBlock* async,
+    size_t* securityInformationBufferByteCount) {
+    if (!async || !securityInformationBufferByteCount) {
+        return RecordHr(
+            "XNetworkingQuerySecurityInformationForUrlAsyncResultSize", XGR_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XNetworkingQuerySecurityInformationForUrlAsyncResultSize", hr);
+    }
+    return RecordHr(
+        "XNetworkingQuerySecurityInformationForUrlAsyncResultSize",
+        XAsyncGetResultSize(async, securityInformationBufferByteCount));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XNetworkingQuerySecurityInformationForUrlAsyncResult(
+    XAsyncBlock* async,
+    size_t securityInformationBufferByteCount,
+    size_t* securityInformationBufferByteCountUsed,
+    uint8_t* securityInformationBuffer,
+    XNetworkingSecurityInformation** pointerToSecurityInformation) {
+    if (!async || !securityInformationBuffer || !pointerToSecurityInformation) {
+        return RecordHr("XNetworkingQuerySecurityInformationForUrlAsyncResult", XGR_E_INVALIDARG);
+    }
+    *pointerToSecurityInformation = nullptr;
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XNetworkingQuerySecurityInformationForUrlAsyncResult", hr);
+    }
+    hr = XAsyncGetResult(
+        async, kIdNetSecInfo, securityInformationBufferByteCount,
+        securityInformationBuffer, securityInformationBufferByteCountUsed);
+    if (hr >= 0) {
+        *pointerToSecurityInformation =
+            reinterpret_cast<XNetworkingSecurityInformation*>(securityInformationBuffer);
+    }
+    return RecordHr("XNetworkingQuerySecurityInformationForUrlAsyncResult", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XNetworkingQuerySecurityInformationForUrlUtf16Async(
+    const wchar_t* url,
+    XAsyncBlock* async) {
+    if (!url || !*url || !async) {
+        return RecordHr("XNetworkingQuerySecurityInformationForUrlUtf16Async", XGR_E_INVALIDARG);
+    }
+    XNetworkingSecurityInformation info{};
+    info.enabledHttpSecurityProtocolFlags = 0x00000A00u;  // TLS 1.1 | TLS 1.2
+    info.thumbprintCount = 0;
+    info.thumbprints = nullptr;
+    return RecordHr(
+        "XNetworkingQuerySecurityInformationForUrlUtf16Async",
+        StartPodAsync<XNetworkingSecurityInformation>(
+            async, kIdNetSecInfoUtf16, kIdNetSecInfoUtf16, info));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XNetworkingQuerySecurityInformationForUrlUtf16AsyncResultSize(
+    XAsyncBlock* async,
+    size_t* securityInformationBufferByteCount) {
+    if (!async || !securityInformationBufferByteCount) {
+        return RecordHr(
+            "XNetworkingQuerySecurityInformationForUrlUtf16AsyncResultSize", XGR_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XNetworkingQuerySecurityInformationForUrlUtf16AsyncResultSize", hr);
+    }
+    return RecordHr(
+        "XNetworkingQuerySecurityInformationForUrlUtf16AsyncResultSize",
+        XAsyncGetResultSize(async, securityInformationBufferByteCount));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XNetworkingQuerySecurityInformationForUrlUtf16AsyncResult(
+    XAsyncBlock* async,
+    size_t securityInformationBufferByteCount,
+    size_t* securityInformationBufferByteCountUsed,
+    uint8_t* securityInformationBuffer,
+    XNetworkingSecurityInformation** pointerToSecurityInformation) {
+    if (!async || !securityInformationBuffer || !pointerToSecurityInformation) {
+        return RecordHr(
+            "XNetworkingQuerySecurityInformationForUrlUtf16AsyncResult", XGR_E_INVALIDARG);
+    }
+    *pointerToSecurityInformation = nullptr;
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XNetworkingQuerySecurityInformationForUrlUtf16AsyncResult", hr);
+    }
+    hr = XAsyncGetResult(
+        async, kIdNetSecInfoUtf16, securityInformationBufferByteCount,
+        securityInformationBuffer, securityInformationBufferByteCountUsed);
+    if (hr >= 0) {
+        *pointerToSecurityInformation =
+            reinterpret_cast<XNetworkingSecurityInformation*>(securityInformationBuffer);
+    }
+    return RecordHr("XNetworkingQuerySecurityInformationForUrlUtf16AsyncResult", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XNetworkingVerifyServerCertificate(
+    void* requestHandle,
+    const XNetworkingSecurityInformation* securityInformation) {
+    if (!requestHandle || !securityInformation) {
+        return RecordHr("XNetworkingVerifyServerCertificate", XGR_E_INVALIDARG);
+    }
+    return RecordHr("XNetworkingVerifyServerCertificate", XGR_S_OK);
+}
+
+// ===========================================================================
+// Core Runtime Extensions (PLS, XThread, XError, XGameEvent, XGameInvite, XLaunch, XAccessibility)
+// ===========================================================================
+XGameResult OPENSCARLETT_GDK_CALL XPersistentLocalStorageGetPathSize(size_t* pathSize) {
+    if (!pathSize) {
+        return RecordHr("XPersistentLocalStorageGetPathSize", XGR_E_INVALIDARG);
+    }
+    const fs::path pls_dir = ResolveSaveRoot() / "pls";
+    std::error_code ec;
+    fs::create_directories(pls_dir, ec);
+    const std::string pls_str = pls_dir.string();
+    *pathSize = pls_str.size() + 1;
+    return RecordHr("XPersistentLocalStorageGetPathSize", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XPersistentLocalStorageGetPath(
+    size_t pathSize,
+    char* path,
+    size_t* pathUsed) {
+    const fs::path pls_dir = ResolveSaveRoot() / "pls";
+    std::error_code ec;
+    fs::create_directories(pls_dir, ec);
+    const std::string pls_str = pls_dir.string();
+    return RecordHr(
+        "XPersistentLocalStorageGetPath",
+        CopyStringResult(pls_str, pathSize, path, pathUsed));
+}
+
+bool OPENSCARLETT_GDK_CALL XThreadIsTimeSensitive(void) {
+    RecordOk("XThreadIsTimeSensitive");
+    return g_thread_time_sensitive;
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XThreadSetTimeSensitive(bool isTimeSensitiveThread) {
+    g_thread_time_sensitive = isTimeSensitiveThread;
+    return RecordHr("XThreadSetTimeSensitive", XGR_S_OK);
+}
+
+void OPENSCARLETT_GDK_CALL XThreadAssertNotTimeSensitive(void) {
+    RecordOk("XThreadAssertNotTimeSensitive");
+}
+
+bool OPENSCARLETT_GDK_CALL XThreadVerifyNotTimeSensitive(void) {
+    RecordOk("XThreadVerifyNotTimeSensitive");
+    return !g_thread_time_sensitive;
+}
+
+void OPENSCARLETT_GDK_CALL XErrorReport(XGameResult hr, const char* msg) {
+    RecordOk("XErrorReport");
+    XErrorCallback cb = nullptr;
+    void* ctx = nullptr;
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.error_mutex);
+        cb = rt.error_callback;
+        ctx = rt.error_callback_ctx;
+    }
+    if (cb) {
+        (void)cb(hr, msg ? msg : "", ctx);
+    }
+}
+
+void OPENSCARLETT_GDK_CALL XErrorSetCallback(XErrorCallback callback, void* context) {
+    RecordOk("XErrorSetCallback");
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.error_mutex);
+    rt.error_callback = callback;
+    rt.error_callback_ctx = context;
+}
+
+void OPENSCARLETT_GDK_CALL XErrorSetOptions(
+    XErrorOptions optionsDebuggerPresent,
+    XErrorOptions optionsDebuggerNotPresent) {
+    RecordOk("XErrorSetOptions");
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.error_mutex);
+    rt.error_opts_debugger = optionsDebuggerPresent;
+    rt.error_opts_no_debugger = optionsDebuggerNotPresent;
+}
+
+uint32_t OPENSCARLETT_GDK_CALL XGameEventWrite(
+    uint64_t /*regHandle*/,
+    const XGameEventDescriptor* /*eventDescriptor*/,
+    uint32_t /*userDataCount*/,
+    XGameEventDataDescriptor* /*userData*/) {
+    RecordOk("XGameEventWrite");
+    return 0u;  // ERROR_SUCCESS
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameInviteRegisterForEvent(
+    XTaskQueueHandle /*queue*/,
+    void* /*context*/,
+    XGameInviteEventCallback callback,
+    XTaskQueueRegistrationToken* token) {
+    if (!callback || !token) {
+        return RecordHr("XGameInviteRegisterForEvent", XGR_E_INVALIDARG);
+    }
+    *token = AllocateRegToken(kRegGameInvite);
+    return RecordHr("XGameInviteRegisterForEvent", XGR_S_OK);
+}
+
+bool OPENSCARLETT_GDK_CALL XGameInviteUnregisterForEvent(
+    XTaskQueueRegistrationToken token,
+    bool /*wait*/) {
+    RecordOk("XGameInviteUnregisterForEvent");
+    return ReleaseRegToken(kRegGameInvite, token);
+}
+
+void OPENSCARLETT_GDK_CALL XLaunchNewGame(
+    const char* /*exePath*/,
+    const char* /*args*/,
+    XUserHandle /*defaultUser*/) {
+    RecordOk("XLaunchNewGame");
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XLaunchUri(
+    XUserHandle /*requestingUser*/,
+    const char* uri) {
+    if (!uri || !*uri) {
+        return RecordHr("XLaunchUri", XGR_E_INVALIDARG);
+    }
+    return RecordHr("XLaunchUri", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XHighContrastGetMode(XHighContrastMode* mode) {
+    if (!mode) {
+        return RecordHr("XHighContrastGetMode", XGR_E_INVALIDARG);
+    }
+    *mode = XHighContrastMode_Off;
+    return RecordHr("XHighContrastGetMode", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XClosedCaptionGetProperties(
+    XClosedCaptionProperties* properties) {
+    if (!properties) {
+        return RecordHr("XClosedCaptionGetProperties", XGR_E_INVALIDARG);
+    }
+    properties->BackgroundColor = XColor{255u, 0u, 0u, 0u};
+    properties->FontColor = XColor{255u, 255u, 255u, 255u};
+    properties->WindowColor = XColor{0u, 0u, 0u, 0u};
+    properties->FontEdgeAttribute = XClosedCaptionFontEdgeAttribute_Default;
+    properties->FontStyle = XClosedCaptionFontStyle_Default;
+    properties->FontScale = 1.0f;
+    properties->Enabled = GetRuntime().closed_caption_enabled.load(std::memory_order_acquire);
+    return RecordHr("XClosedCaptionGetProperties", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XClosedCaptionSetEnabled(bool enabled) {
+    GetRuntime().closed_caption_enabled.store(enabled, std::memory_order_release);
+    return RecordHr("XClosedCaptionSetEnabled", XGR_S_OK);
 }
 
 }  // extern "C"
@@ -3207,7 +6555,11 @@ enum XgrApiIndex : size_t {
     kApiMem = 5,
     kApiPackage = 6,
     kApiDisplay = 7,
-    kApiCount = 8,
+    kApiStore = 8,
+    kApiGameUi = 9,
+    kApiNetworking = 10,
+    kApiCoreRuntime = 11,
+    kApiCount = 12,
 };
 
 extern const IXgrTaskQueueApiVtable g_task_queue_vtable;
@@ -3218,6 +6570,10 @@ extern const IXgrSystemApiVtable g_system_vtable;
 extern const IXgrMemApiVtable g_mem_vtable;
 extern const IXgrPackageApiVtable g_package_vtable;
 extern const IXgrDisplayApiVtable g_display_vtable;
+extern const IXgrStoreApiVtable g_store_vtable;
+extern const IXgrGameUiApiVtable g_game_ui_vtable;
+extern const IXgrNetworkingApiVtable g_networking_vtable;
+extern const IXgrCoreRuntimeApiVtable g_core_runtime_vtable;
 
 int FindApiIndexByVtablePtr(const void* self) noexcept {
     if (self == &g_task_queue_vtable) return static_cast<int>(kApiTaskQueue);
@@ -3228,6 +6584,10 @@ int FindApiIndexByVtablePtr(const void* self) noexcept {
     if (self == &g_mem_vtable) return static_cast<int>(kApiMem);
     if (self == &g_package_vtable) return static_cast<int>(kApiPackage);
     if (self == &g_display_vtable) return static_cast<int>(kApiDisplay);
+    if (self == &g_store_vtable) return static_cast<int>(kApiStore);
+    if (self == &g_game_ui_vtable) return static_cast<int>(kApiGameUi);
+    if (self == &g_networking_vtable) return static_cast<int>(kApiNetworking);
+    if (self == &g_core_runtime_vtable) return static_cast<int>(kApiCoreRuntime);
     return -1;
 }
 
@@ -3290,6 +6650,10 @@ const IXgrTaskQueueApiVtable g_task_queue_vtable = {
     &XTaskQueueTerminate,
     &XTaskQueueRegisterMonitor,
     &XTaskQueueUnregisterMonitor,
+    &XTaskQueueGetPort,
+    &XTaskQueueCreateComposite,
+    &XTaskQueueRegisterWaiter,
+    &XTaskQueueUnregisterWaiter,
 };
 
 const IXgrAsyncApiVtable g_async_vtable = {
@@ -3303,6 +6667,7 @@ const IXgrAsyncApiVtable g_async_vtable = {
     &XAsyncGetResultSize,
     &XAsyncGetResult,
     &XAsyncCancel,
+    &XAsyncRun,
 };
 
 const IXgrUserApiVtable g_user_vtable = {
@@ -3321,6 +6686,34 @@ const IXgrUserApiVtable g_user_vtable = {
     &XUserCheckPrivilege,
     &XUserGetMaxUsers,
     &XUserCompare,
+    &XUserGetGamerPictureAsync,
+    &XUserGetGamerPictureResultSize,
+    &XUserGetGamerPictureResult,
+    &XUserGetIsGuest,
+    &XUserFindUserById,
+    &XUserFindUserByLocalId,
+    &XUserFindForDevice,
+    &XUserGetTokenAndSignatureAsync,
+    &XUserGetTokenAndSignatureResultSize,
+    &XUserGetTokenAndSignatureResult,
+    &XUserGetTokenAndSignatureUtf16Async,
+    &XUserGetTokenAndSignatureUtf16ResultSize,
+    &XUserGetTokenAndSignatureUtf16Result,
+    &XUserGetDefaultAudioEndpointUtf16,
+    &XUserGetSignOutDeferral,
+    &XUserCloseSignOutDeferralHandle,
+    &XUserRegisterForChangeEvent,
+    &XUserUnregisterForChangeEvent,
+    &XUserRegisterForDefaultAudioEndpointUtf16Changed,
+    &XUserUnregisterForDefaultAudioEndpointUtf16Changed,
+    &XUserRegisterForDeviceAssociationChanged,
+    &XUserUnregisterForDeviceAssociationChanged,
+    &XUserResolveIssueWithUiAsync,
+    &XUserResolveIssueWithUiResult,
+    &XUserResolveIssueWithUiUtf16Async,
+    &XUserResolveIssueWithUiUtf16Result,
+    &XUserResolvePrivilegeWithUiAsync,
+    &XUserResolvePrivilegeWithUiResult,
 };
 
 const IXgrGameSaveApiVtable g_game_save_vtable = {
@@ -3343,6 +6736,17 @@ const IXgrGameSaveApiVtable g_game_save_vtable = {
     &XGameSaveEnumerateBlobInfo,
     &XGameSaveDeleteContainer,
     &XGameSaveGetRemainingQuota,
+    &XGameSaveEnumerateContainerInfoByName,
+    &XGameSaveEnumerateBlobInfoByName,
+    &XGameSaveGetContainerInfo,
+    &XGameSaveReadBlobDataAsync,
+    &XGameSaveReadBlobDataResult,
+    &XGameSaveSubmitUpdateAsync,
+    &XGameSaveSubmitUpdateResult,
+    &XGameSaveDeleteContainerAsync,
+    &XGameSaveDeleteContainerResult,
+    &XGameSaveGetRemainingQuotaAsync,
+    &XGameSaveGetRemainingQuotaResult,
 };
 
 const IXgrSystemApiVtable g_system_vtable = {
@@ -3358,6 +6762,7 @@ const IXgrSystemApiVtable g_system_vtable = {
     &XSystemGetAnalyticsInfo,
     &XSystemGetRuntimeInfo,
     &XSystemIsHandleValid,
+    &XGameRuntimeIsFeatureAvailable,
 };
 
 const IXgrMemApiVtable g_mem_vtable = {
@@ -3378,6 +6783,30 @@ const IXgrPackageApiVtable g_package_vtable = {
     &XPackageGetCurrentProcessPackageIdentifier,
     &XPackageIsPackagedProcess,
     &XPackageEnumerateChunkAvailability,
+    &XPackageMount,
+    &XPackageCloseMountHandle,
+    &XPackageGetMountPathSize,
+    &XPackageGetMountPath,
+    &XPackageGetUserLocale,
+    &XPackageGetWriteStats,
+    &XPackageCreateInstallationMonitor,
+    &XPackageCloseInstallationMonitorHandle,
+    &XPackageGetInstallationProgress,
+    &XPackageUpdateInstallationMonitor,
+    &XPackageRegisterInstallationProgressChanged,
+    &XPackageUnregisterInstallationProgressChanged,
+    &XPackageRegisterPackageInstalled,
+    &XPackageUnregisterPackageInstalled,
+    &XPackageEnumeratePackages,
+    &XPackageEnumerateFeatures,
+    &XPackageFindChunkAvailability,
+    &XPackageEstimateDownloadSize,
+    &XPackageChangeChunkInstallOrder,
+    &XPackageInstallChunks,
+    &XPackageInstallChunksAsync,
+    &XPackageInstallChunksResult,
+    &XPackageUninstallChunks,
+    &XPackageUninstallUWPInstance,
 };
 
 const IXgrDisplayApiVtable g_display_vtable = {
@@ -3387,6 +6816,157 @@ const IXgrDisplayApiVtable g_display_vtable = {
     &XDisplayTryEnableHdrMode,
     &XDisplayTryAcquireTimeoutDeferral,
     &XDisplayCloseTimeoutDeferralHandle,
+    &XDisplayAcquireTimeoutDeferral,
+};
+
+const IXgrStoreApiVtable g_store_vtable = {
+    &XgrVtableQueryInterface,
+    &XgrVtableAddRef,
+    &XgrVtableRelease,
+    &XStoreCreateContext,
+    &XStoreCloseContextHandle,
+    &XStoreCloseLicenseHandle,
+    &XStoreCloseProductsQueryHandle,
+    &XStoreIsLicenseValid,
+    &XStoreQueryGameLicenseAsync,
+    &XStoreQueryGameLicenseResult,
+    &XStoreRegisterGameLicenseChanged,
+    &XStoreUnregisterGameLicenseChanged,
+    &XStoreRegisterPackageLicenseLost,
+    &XStoreUnregisterPackageLicenseLost,
+    &XStoreQueryAddOnLicensesAsync,
+    &XStoreQueryAddOnLicensesResultCount,
+    &XStoreQueryAddOnLicensesResult,
+    &XStoreQueryProductForCurrentGameAsync,
+    &XStoreQueryProductForCurrentGameResult,
+    &XStoreQueryProductForPackageAsync,
+    &XStoreQueryProductForPackageResult,
+    &XStoreQueryAssociatedProductsAsync,
+    &XStoreQueryAssociatedProductsResult,
+    &XStoreQueryEntitledProductsAsync,
+    &XStoreQueryEntitledProductsResult,
+    &XStoreQueryProductsAsync,
+    &XStoreQueryProductsResult,
+    &XStoreEnumerateProductsQuery,
+    &XStoreProductsQueryHasMorePages,
+    &XStoreProductsQueryNextPageAsync,
+    &XStoreProductsQueryNextPageResult,
+    &XStoreCanAcquireLicenseForPackageAsync,
+    &XStoreCanAcquireLicenseForPackageResult,
+    &XStoreCanAcquireLicenseForStoreIdAsync,
+    &XStoreCanAcquireLicenseForStoreIdResult,
+    &XStoreAcquireLicenseForPackageAsync,
+    &XStoreAcquireLicenseForPackageResult,
+    &XStoreAcquireLicenseForDurablesAsync,
+    &XStoreAcquireLicenseForDurablesResult,
+    &XStoreQueryConsumableBalanceRemainingAsync,
+    &XStoreQueryConsumableBalanceRemainingResult,
+    &XStoreReportConsumableFulfillmentAsync,
+    &XStoreReportConsumableFulfillmentResult,
+    &XStoreQueryGameAndDlcPackageUpdatesAsync,
+    &XStoreQueryGameAndDlcPackageUpdatesResultCount,
+    &XStoreQueryGameAndDlcPackageUpdatesResult,
+    &XStoreDownloadPackageUpdatesAsync,
+    &XStoreDownloadPackageUpdatesResult,
+    &XStoreDownloadAndInstallPackageUpdatesAsync,
+    &XStoreDownloadAndInstallPackageUpdatesResult,
+    &XStoreDownloadAndInstallPackagesAsync,
+    &XStoreDownloadAndInstallPackagesResultCount,
+    &XStoreDownloadAndInstallPackagesResult,
+    &XStoreGetUserCollectionsIdAsync,
+    &XStoreGetUserCollectionsIdResultSize,
+    &XStoreGetUserCollectionsIdResult,
+    &XStoreGetUserPurchaseIdAsync,
+    &XStoreGetUserPurchaseIdResultSize,
+    &XStoreGetUserPurchaseIdResult,
+    &XStoreQueryLicenseTokenAsync,
+    &XStoreQueryLicenseTokenResultSize,
+    &XStoreQueryLicenseTokenResult,
+    &XStoreQueryPackageIdentifier,
+    &XStoreIsAvailabilityPurchasable,
+    &XStoreShowAssociatedProductsUIAsync,
+    &XStoreShowAssociatedProductsUIResult,
+    &XStoreShowProductPageUIAsync,
+    &XStoreShowProductPageUIResult,
+    &XStoreShowPurchaseUIAsync,
+    &XStoreShowPurchaseUIResult,
+    &XStoreShowRateAndReviewUIAsync,
+    &XStoreShowRateAndReviewUIResult,
+    &XStoreShowRedeemTokenUIAsync,
+    &XStoreShowRedeemTokenUIResult,
+};
+
+const IXgrGameUiApiVtable g_game_ui_vtable = {
+    &XgrVtableQueryInterface,
+    &XgrVtableAddRef,
+    &XgrVtableRelease,
+    &XGameUiSetNotificationPositionHint,
+    &XGameUiShowMessageDialogAsync,
+    &XGameUiShowMessageDialogResult,
+    &XGameUiShowErrorDialogAsync,
+    &XGameUiShowErrorDialogResult,
+    &XGameUiShowTextEntryAsync,
+    &XGameUiShowTextEntryResultSize,
+    &XGameUiShowTextEntryResult,
+    &XGameUiShowAchievementsAsync,
+    &XGameUiShowAchievementsResult,
+    &XGameUiShowPlayerPickerAsync,
+    &XGameUiShowPlayerPickerResultCount,
+    &XGameUiShowPlayerPickerResult,
+    &XGameUiShowPlayerProfileCardAsync,
+    &XGameUiShowPlayerProfileCardResult,
+    &XGameUiShowSendGameInviteAsync,
+    &XGameUiShowSendGameInviteResult,
+    &XGameUiShowWebAuthenticationAsync,
+    &XGameUiShowWebAuthenticationWithOptionsAsync,
+    &XGameUiShowWebAuthenticationResultSize,
+    &XGameUiShowWebAuthenticationResult,
+};
+
+const IXgrNetworkingApiVtable g_networking_vtable = {
+    &XgrVtableQueryInterface,
+    &XgrVtableAddRef,
+    &XgrVtableRelease,
+    &XNetworkingGetConnectivityHint,
+    &XNetworkingQueryConnectivityHint,
+    &XNetworkingQueryPreferredLocalUdpMultiplayerPort,
+    &XNetworkingQueryPreferredLocalUdpMultiplayerPortAsync,
+    &XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult,
+    &XNetworkingRegisterConnectivityHintChanged,
+    &XNetworkingUnregisterConnectivityHintChanged,
+    &XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged,
+    &XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged,
+    &XNetworkingQuerySecurityInformationForUrlAsync,
+    &XNetworkingQuerySecurityInformationForUrlAsyncResultSize,
+    &XNetworkingQuerySecurityInformationForUrlAsyncResult,
+    &XNetworkingQuerySecurityInformationForUrlUtf16Async,
+    &XNetworkingQuerySecurityInformationForUrlUtf16AsyncResultSize,
+    &XNetworkingQuerySecurityInformationForUrlUtf16AsyncResult,
+    &XNetworkingVerifyServerCertificate,
+};
+
+const IXgrCoreRuntimeApiVtable g_core_runtime_vtable = {
+    &XgrVtableQueryInterface,
+    &XgrVtableAddRef,
+    &XgrVtableRelease,
+    &XGameRuntimeIsFeatureAvailable,
+    &XPersistentLocalStorageGetPathSize,
+    &XPersistentLocalStorageGetPath,
+    &XThreadIsTimeSensitive,
+    &XThreadSetTimeSensitive,
+    &XThreadAssertNotTimeSensitive,
+    &XThreadVerifyNotTimeSensitive,
+    &XErrorReport,
+    &XErrorSetCallback,
+    &XErrorSetOptions,
+    &XGameEventWrite,
+    &XGameInviteRegisterForEvent,
+    &XGameInviteUnregisterForEvent,
+    &XLaunchNewGame,
+    &XLaunchUri,
+    &XHighContrastGetMode,
+    &XClosedCaptionGetProperties,
+    &XClosedCaptionSetEnabled,
 };
 
 }  // namespace
@@ -3439,6 +7019,14 @@ XGameResult OPENSCARLETT_GDK_CALL QueryApiImpl(
         vtable = &g_package_vtable;
     } else if (XgrGuidEquals(*apiId, XGR_API_GUID_DISPLAY)) {
         vtable = &g_display_vtable;
+    } else if (XgrGuidEquals(*apiId, XGR_API_GUID_STORE)) {
+        vtable = &g_store_vtable;
+    } else if (XgrGuidEquals(*apiId, XGR_API_GUID_GAME_UI)) {
+        vtable = &g_game_ui_vtable;
+    } else if (XgrGuidEquals(*apiId, XGR_API_GUID_NETWORKING)) {
+        vtable = &g_networking_vtable;
+    } else if (XgrGuidEquals(*apiId, XGR_API_GUID_CORE_RUNTIME)) {
+        vtable = &g_core_runtime_vtable;
     }
 
     if (!vtable) {

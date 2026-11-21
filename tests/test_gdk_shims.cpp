@@ -942,6 +942,614 @@ void TestXsapi() {
     std::printf("[PASS] Microsoft.Xbox.Services.GDK.C.dll (XSAPI profile, achievements, presence, social, stats)\n");
 }
 
+// ===========================================================================
+// 6. xgameruntime.dll Thunks Parity & QueryApiImpl (12 GUID tables) tests
+// ===========================================================================
+void OPENSCARLETT_GDK_CALL DummyUserChangeCb(void*, XUserLocalId, XUserChangeEvent) {}
+void OPENSCARLETT_GDK_CALL DummyAudioEpCb(void*, XUserLocalId, XUserDefaultAudioEndpointKind, const wchar_t*) {}
+void OPENSCARLETT_GDK_CALL DummyDevAssocCb(void*, const XUserDeviceAssociationChange*) {}
+void OPENSCARLETT_GDK_CALL DummyStoreLicenseCb(void*) {}
+void OPENSCARLETT_GDK_CALL DummyNetHintCb(void*, const XNetworkingConnectivityHint*) {}
+void OPENSCARLETT_GDK_CALL DummyNetPortCb(void*, uint16_t) {}
+void OPENSCARLETT_GDK_CALL DummyPkgProgressCb(void*, XPackageInstallationMonitorHandle) {}
+void OPENSCARLETT_GDK_CALL DummyPkgInstalledCb(void*, const XPackageDetails*) {}
+void OPENSCARLETT_GDK_CALL DummyInviteCb(void*, const char*) {}
+
+bool OPENSCARLETT_GDK_CALL EnumStoreProductCb(const XStoreProduct* prod, void* ctx) {
+    auto* ids = static_cast<std::vector<std::string>*>(ctx);
+    if (prod && prod->storeId) {
+        ids->emplace_back(prod->storeId);
+    }
+    return true;
+}
+
+bool OPENSCARLETT_GDK_CALL EnumPackageDetailsCb(void* ctx, const XPackageDetails* details) {
+    auto* names = static_cast<std::vector<std::string>*>(ctx);
+    if (details && details->packageIdentifier) {
+        names->emplace_back(details->packageIdentifier);
+    }
+    return true;
+}
+
+bool OPENSCARLETT_GDK_CALL EnumPackageFeatureCb(void* ctx, const XPackageFeature* feat) {
+    auto* ids = static_cast<std::vector<std::string>*>(ctx);
+    if (feat && feat->id) {
+        ids->emplace_back(feat->id);
+    }
+    return true;
+}
+
+bool OPENSCARLETT_GDK_CALL TestErrorCb(XGameResult hr, const char* msg, void* ctx) {
+    auto* hits = static_cast<std::atomic<int>*>(ctx);
+    if (hr == XGR_E_FAIL && msg && std::strcmp(msg, "synthetic_error") == 0) {
+        hits->fetch_add(1, std::memory_order_relaxed);
+    }
+    return true;
+}
+
+void TestXGameRuntimeThunksParity() {
+    OS_REQUIRE(InitializeApiImpl() == XGR_S_OK);
+
+    // --- 1. XUser* full parity (direct + QueryApiImpl) ---
+    void* raw_user_vt = nullptr;
+    OS_REQUIRE(QueryApiImpl(&XGR_API_GUID_USER, &raw_user_vt) == XGR_S_OK && raw_user_vt != nullptr);
+    const auto* user_vt = static_cast<const IXgrUserApiVtable*>(raw_user_vt);
+
+    XUserHandle user = nullptr;
+    {
+        XAsyncBlock ab{};
+        OS_REQUIRE(user_vt->XUserAddAsync(XUserAddOptions_AddDefaultUserSilently, &ab) == XGR_S_OK);
+        OS_REQUIRE(user_vt->XUserAddResult(&ab, &user) == XGR_S_OK && user != nullptr);
+
+        bool is_guest = true;
+        OS_REQUIRE(XUserGetIsGuest(user, &is_guest) == XGR_S_OK && !is_guest);
+
+        uint64_t xuid = 0;
+        XUserLocalId lid{};
+        OS_REQUIRE(XUserGetId(user, &xuid) == XGR_S_OK && xuid != 0);
+        OS_REQUIRE(XUserGetLocalId(user, &lid) == XGR_S_OK && lid.value != 0);
+
+        XUserHandle found_by_id = nullptr;
+        OS_REQUIRE(user_vt->XUserFindUserById(xuid, &found_by_id) == XGR_S_OK && found_by_id != nullptr);
+        OS_REQUIRE(XUserCompare(user, found_by_id) == 0);
+        XUserCloseHandle(found_by_id);
+
+        XUserHandle found_by_lid = nullptr;
+        OS_REQUIRE(user_vt->XUserFindUserByLocalId(lid, &found_by_lid) == XGR_S_OK && found_by_lid != nullptr);
+        XUserCloseHandle(found_by_lid);
+
+        XUserAppLocalDeviceId dev_id{};
+        dev_id.value[0] = 0x42;
+        XUserHandle found_dev = nullptr;
+        OS_REQUIRE(user_vt->XUserFindForDevice(&dev_id, &found_dev) == XGR_S_OK && found_dev != nullptr);
+        XUserCloseHandle(found_dev);
+
+        // Token & signature (UTF-8)
+        {
+            XAsyncBlock tab{};
+            OS_REQUIRE(user_vt->XUserGetTokenAndSignatureAsync(
+                           user, XUserGetTokenAndSignatureOptions_None,
+                           "GET", "https://example.invalid/api",
+                           0, nullptr, 0, nullptr, &tab) == XGR_S_OK);
+            size_t tsz = 0;
+            OS_REQUIRE(user_vt->XUserGetTokenAndSignatureResultSize(&tab, &tsz) == XGR_S_OK);
+            OS_REQUIRE(tsz > sizeof(XUserGetTokenAndSignatureData));
+            std::vector<uint8_t> tbuf(tsz, 0);
+            XUserGetTokenAndSignatureData* tdata = nullptr;
+            size_t tused = 0;
+            OS_REQUIRE(user_vt->XUserGetTokenAndSignatureResult(
+                           &tab, tbuf.size(), tbuf.data(), &tdata, &tused) == XGR_S_OK);
+            OS_REQUIRE(tdata != nullptr && tdata->token != nullptr && tdata->signature != nullptr);
+            OS_REQUIRE(std::strstr(tdata->token, "XBL3.0") != nullptr);
+            OS_REQUIRE(tused == tsz);
+        }
+
+        // Token & signature (UTF-16)
+        {
+            XAsyncBlock wab{};
+            OS_REQUIRE(XUserGetTokenAndSignatureUtf16Async(
+                           user, XUserGetTokenAndSignatureOptions_ForceRefresh,
+                           L"POST", L"https://example.invalid/utf16",
+                           0, nullptr, 0, nullptr, &wab) == XGR_S_OK);
+            size_t wsz = 0;
+            OS_REQUIRE(XUserGetTokenAndSignatureUtf16ResultSize(&wab, &wsz) == XGR_S_OK);
+            OS_REQUIRE(wsz > sizeof(XUserGetTokenAndSignatureUtf16Data));
+            std::vector<uint8_t> wbuf(wsz, 0);
+            XUserGetTokenAndSignatureUtf16Data* wdata = nullptr;
+            size_t wused = 0;
+            OS_REQUIRE(XUserGetTokenAndSignatureUtf16Result(
+                           &wab, wbuf.size(), wbuf.data(), &wdata, &wused) == XGR_S_OK);
+            OS_REQUIRE(wdata != nullptr && wdata->token != nullptr && wdata->signature != nullptr);
+            OS_REQUIRE(wdata->tokenCount > 5 && wdata->signatureCount > 5);
+        }
+
+        // Default audio endpoint UTF-16
+        wchar_t ep[128]{};
+        size_t ep_used = 0;
+        OS_REQUIRE(user_vt->XUserGetDefaultAudioEndpointUtf16(
+                       lid, XUserDefaultAudioEndpointKind_CommunicationRender,
+                       128, ep, &ep_used) == XGR_S_OK);
+        OS_REQUIRE(ep_used > 1 && ep[0] == L'{');
+
+        // Sign-out deferral
+        XUserSignOutDeferralHandle sdef = nullptr;
+        OS_REQUIRE(XUserGetSignOutDeferral(&sdef) == XGR_S_OK && sdef != nullptr);
+        XUserCloseSignOutDeferralHandle(sdef);
+
+        // Change / audio / device registrations
+        XTaskQueueRegistrationToken tok1{}, tok2{}, tok3{};
+        OS_REQUIRE(XUserRegisterForChangeEvent(nullptr, nullptr, &DummyUserChangeCb, &tok1) == XGR_S_OK);
+        OS_REQUIRE(tok1.token != 0 && XUserUnregisterForChangeEvent(tok1, true));
+        OS_REQUIRE(!XUserUnregisterForChangeEvent(tok1, true));
+
+        OS_REQUIRE(XUserRegisterForDefaultAudioEndpointUtf16Changed(
+                       nullptr, nullptr, &DummyAudioEpCb, &tok2) == XGR_S_OK);
+        OS_REQUIRE(XUserUnregisterForDefaultAudioEndpointUtf16Changed(tok2, true));
+
+        OS_REQUIRE(XUserRegisterForDeviceAssociationChanged(
+                       nullptr, nullptr, &DummyDevAssocCb, &tok3) == XGR_S_OK);
+        OS_REQUIRE(XUserUnregisterForDeviceAssociationChanged(tok3, true));
+
+        // Resolve issue & privilege UI asyncs
+        {
+            XAsyncBlock r1{}, r2{}, r3{};
+            OS_REQUIRE(XUserResolveIssueWithUiAsync(user, "https://example.invalid", &r1) == XGR_S_OK);
+            OS_REQUIRE(XUserResolveIssueWithUiResult(&r1) == XGR_S_OK);
+            OS_REQUIRE(XUserResolveIssueWithUiUtf16Async(user, L"https://example.invalid", &r2) == XGR_S_OK);
+            OS_REQUIRE(XUserResolveIssueWithUiUtf16Result(&r2) == XGR_S_OK);
+            OS_REQUIRE(user_vt->XUserResolvePrivilegeWithUiAsync(
+                           user, XUserPrivilegeOptions_None, XUserPrivilege_Multiplayer, &r3) == XGR_S_OK);
+            OS_REQUIRE(user_vt->XUserResolvePrivilegeWithUiResult(&r3) == XGR_S_OK);
+        }
+    }
+
+    // --- 2. XStore* full parity (direct + QueryApiImpl) ---
+    void* raw_store_vt = nullptr;
+    OS_REQUIRE(QueryApiImpl(&XGR_API_GUID_STORE, &raw_store_vt) == XGR_S_OK && raw_store_vt != nullptr);
+    const auto* store_vt = static_cast<const IXgrStoreApiVtable*>(raw_store_vt);
+    {
+        XStoreContextHandle sctx = nullptr;
+        OS_REQUIRE(store_vt->XStoreCreateContext(user, &sctx) == XGR_S_OK && sctx != nullptr);
+
+        // Owned game license
+        {
+            XAsyncBlock ab{};
+            OS_REQUIRE(store_vt->XStoreQueryGameLicenseAsync(sctx, &ab) == XGR_S_OK);
+            XStoreGameLicense lic{};
+            OS_REQUIRE(store_vt->XStoreQueryGameLicenseResult(&ab, &lic) == XGR_S_OK);
+            OS_REQUIRE(lic.isActive && !lic.isTrial && std::strlen(lic.skuStoreId) > 0);
+        }
+
+        // License changed registration
+        XTaskQueueRegistrationToken ltok{};
+        OS_REQUIRE(XStoreRegisterGameLicenseChanged(sctx, nullptr, nullptr, &DummyStoreLicenseCb, &ltok) == XGR_S_OK);
+        OS_REQUIRE(XStoreUnregisterGameLicenseChanged(sctx, ltok, true));
+
+        // Add-on licenses (0)
+        {
+            XAsyncBlock ab{};
+            OS_REQUIRE(XStoreQueryAddOnLicensesAsync(sctx, &ab) == XGR_S_OK);
+            uint32_t cnt = 99u;
+            OS_REQUIRE(XStoreQueryAddOnLicensesResultCount(&ab, &cnt) == XGR_S_OK && cnt == 0u);
+            OS_REQUIRE(XStoreQueryAddOnLicensesResult(&ab, 0u, nullptr) == XGR_S_OK);
+        }
+
+        // Product query for current game + enumeration + pagination
+        {
+            XAsyncBlock ab{};
+            OS_REQUIRE(store_vt->XStoreQueryProductForCurrentGameAsync(sctx, &ab) == XGR_S_OK);
+            XStoreProductQueryHandle qh = nullptr;
+            OS_REQUIRE(store_vt->XStoreQueryProductForCurrentGameResult(&ab, &qh) == XGR_S_OK && qh != nullptr);
+            std::vector<std::string> ids;
+            OS_REQUIRE(store_vt->XStoreEnumerateProductsQuery(qh, &ids, &EnumStoreProductCb) == XGR_S_OK);
+            OS_REQUIRE(ids.size() == 1 && !ids[0].empty());
+            OS_REQUIRE(!store_vt->XStoreProductsQueryHasMorePages(qh));
+
+            XAsyncBlock np{};
+            OS_REQUIRE(XStoreProductsQueryNextPageAsync(qh, &np) == XGR_S_OK);
+            XStoreProductQueryHandle qh2 = nullptr;
+            OS_REQUIRE(XStoreProductsQueryNextPageResult(&np, &qh2) == XGR_S_OK && qh2 != nullptr);
+            XStoreCloseProductsQueryHandle(qh2);
+            XStoreCloseProductsQueryHandle(qh);
+        }
+
+        // Package, associated, entitled, explicit store ID queries
+        {
+            char cur_pkg[128]{};
+            OS_REQUIRE(XPackageGetCurrentProcessPackageIdentifier(sizeof(cur_pkg), cur_pkg) == XGR_S_OK);
+
+            XAsyncBlock ab1{}, ab2{}, ab3{}, ab4{};
+            OS_REQUIRE(XStoreQueryProductForPackageAsync(sctx, XStoreProductKind_Game, cur_pkg, &ab1) == XGR_S_OK);
+            XStoreProductQueryHandle q1 = nullptr;
+            OS_REQUIRE(XStoreQueryProductForPackageResult(&ab1, &q1) == XGR_S_OK && q1 != nullptr);
+            XStoreCloseProductsQueryHandle(q1);
+
+            OS_REQUIRE(XStoreQueryAssociatedProductsAsync(sctx, XStoreProductKind_Durable, 10, &ab2) == XGR_S_OK);
+            XStoreProductQueryHandle q2 = nullptr;
+            OS_REQUIRE(XStoreQueryAssociatedProductsResult(&ab2, &q2) == XGR_S_OK && q2 != nullptr);
+            XStoreCloseProductsQueryHandle(q2);
+
+            OS_REQUIRE(XStoreQueryEntitledProductsAsync(sctx, XStoreProductKind_Game, 10, &ab3) == XGR_S_OK);
+            XStoreProductQueryHandle q3 = nullptr;
+            OS_REQUIRE(XStoreQueryEntitledProductsResult(&ab3, &q3) == XGR_S_OK && q3 != nullptr);
+            XStoreCloseProductsQueryHandle(q3);
+
+            const char* sids[] = {"9OS000000001"};
+            OS_REQUIRE(XStoreQueryProductsAsync(sctx, XStoreProductKind_Game, sids, 1, nullptr, 0, &ab4) == XGR_S_OK);
+            XStoreProductQueryHandle q4 = nullptr;
+            OS_REQUIRE(XStoreQueryProductsResult(&ab4, &q4) == XGR_S_OK && q4 != nullptr);
+            XStoreCloseProductsQueryHandle(q4);
+
+            // CanAcquire + Acquire license for package & durable + IsLicenseValid + LicenseLost
+            XAsyncBlock ca1{}, ca2{}, ac1{}, ac2{};
+            OS_REQUIRE(XStoreCanAcquireLicenseForPackageAsync(sctx, cur_pkg, &ca1) == XGR_S_OK);
+            XStoreCanAcquireLicenseResult car1{};
+            OS_REQUIRE(XStoreCanAcquireLicenseForPackageResult(&ca1, &car1) == XGR_S_OK);
+            OS_REQUIRE(car1.status == XStoreCanLicenseStatus_Licensable);
+
+            OS_REQUIRE(XStoreCanAcquireLicenseForStoreIdAsync(sctx, "9OS000000001", &ca2) == XGR_S_OK);
+            XStoreCanAcquireLicenseResult car2{};
+            OS_REQUIRE(XStoreCanAcquireLicenseForStoreIdResult(&ca2, &car2) == XGR_S_OK);
+            OS_REQUIRE(car2.status == XStoreCanLicenseStatus_Licensable);
+
+            OS_REQUIRE(XStoreAcquireLicenseForPackageAsync(sctx, cur_pkg, &ac1) == XGR_S_OK);
+            XStoreLicenseHandle l1 = nullptr;
+            OS_REQUIRE(XStoreAcquireLicenseForPackageResult(&ac1, &l1) == XGR_S_OK && l1 != nullptr);
+            OS_REQUIRE(XStoreIsLicenseValid(l1));
+            XTaskQueueRegistrationToken lost_tok{};
+            OS_REQUIRE(XStoreRegisterPackageLicenseLost(l1, nullptr, nullptr, &DummyStoreLicenseCb, &lost_tok) == XGR_S_OK);
+            OS_REQUIRE(XStoreUnregisterPackageLicenseLost(l1, lost_tok, true));
+            XStoreCloseLicenseHandle(l1);
+            OS_REQUIRE(!XStoreIsLicenseValid(l1));
+
+            OS_REQUIRE(XStoreAcquireLicenseForDurablesAsync(sctx, "9OS000000001", &ac2) == XGR_S_OK);
+            XStoreLicenseHandle l2 = nullptr;
+            OS_REQUIRE(XStoreAcquireLicenseForDurablesResult(&ac2, &l2) == XGR_S_OK && l2 != nullptr);
+            OS_REQUIRE(XStoreIsLicenseValid(l2));
+            XStoreCloseLicenseHandle(l2);
+        }
+
+        // Consumables, updates, tokens, package id, availability, UI
+        {
+            XAsyncBlock cb{}, cf{};
+            OS_REQUIRE(XStoreQueryConsumableBalanceRemainingAsync(sctx, "9CON00000001", &cb) == XGR_S_OK);
+            XStoreConsumableResult cres{42u};
+            OS_REQUIRE(XStoreQueryConsumableBalanceRemainingResult(&cb, &cres) == XGR_S_OK && cres.quantity == 0u);
+
+            XgrGuid trk{1, 2, 3, {4, 5, 6, 7, 8, 9, 10, 11}};
+            OS_REQUIRE(XStoreReportConsumableFulfillmentAsync(sctx, "9CON00000001", 1u, trk, &cf) == XGR_S_OK);
+            OS_REQUIRE(XStoreReportConsumableFulfillmentResult(&cf, &cres) == XGR_S_OK && cres.quantity == 0u);
+
+            XAsyncBlock u1{}, u2{}, u3{}, u4{};
+            OS_REQUIRE(XStoreQueryGameAndDlcPackageUpdatesAsync(sctx, &u1) == XGR_S_OK);
+            uint32_t ucnt = 5u;
+            OS_REQUIRE(XStoreQueryGameAndDlcPackageUpdatesResultCount(&u1, &ucnt) == XGR_S_OK && ucnt == 0u);
+            OS_REQUIRE(XStoreQueryGameAndDlcPackageUpdatesResult(&u1, 0u, nullptr) == XGR_S_OK);
+
+            OS_REQUIRE(XStoreDownloadPackageUpdatesAsync(sctx, nullptr, 0, &u2) == XGR_S_OK);
+            OS_REQUIRE(XStoreDownloadPackageUpdatesResult(&u2) == XGR_S_OK);
+            OS_REQUIRE(XStoreDownloadAndInstallPackageUpdatesAsync(sctx, nullptr, 0, &u3) == XGR_S_OK);
+            OS_REQUIRE(XStoreDownloadAndInstallPackageUpdatesResult(&u3) == XGR_S_OK);
+            OS_REQUIRE(XStoreDownloadAndInstallPackagesAsync(sctx, nullptr, 0, &u4) == XGR_S_OK);
+            uint32_t dcnt = 5u;
+            OS_REQUIRE(XStoreDownloadAndInstallPackagesResultCount(&u4, &dcnt) == XGR_S_OK && dcnt == 0u);
+            OS_REQUIRE(XStoreDownloadAndInstallPackagesResult(&u4, 0u, nullptr) == XGR_S_OK);
+
+            // Collections ID, Purchase ID, License Token
+            XAsyncBlock cid_ab{}, pid_ab{}, ltok_ab{};
+            size_t sz = 0;
+            char str_buf[128]{};
+            OS_REQUIRE(XStoreGetUserCollectionsIdAsync(sctx, "ticket", "pubuser", &cid_ab) == XGR_S_OK);
+            OS_REQUIRE(XStoreGetUserCollectionsIdResultSize(&cid_ab, &sz) == XGR_S_OK && sz > 1 && sz < sizeof(str_buf));
+            OS_REQUIRE(XStoreGetUserCollectionsIdResult(&cid_ab, sizeof(str_buf), str_buf) == XGR_S_OK);
+            OS_REQUIRE(std::strlen(str_buf) > 0);
+
+            OS_REQUIRE(XStoreGetUserPurchaseIdAsync(sctx, "ticket", "pubuser", &pid_ab) == XGR_S_OK);
+            OS_REQUIRE(XStoreGetUserPurchaseIdResultSize(&pid_ab, &sz) == XGR_S_OK && sz > 1 && sz < sizeof(str_buf));
+            OS_REQUIRE(XStoreGetUserPurchaseIdResult(&pid_ab, sizeof(str_buf), str_buf) == XGR_S_OK);
+
+            const char* pids[] = {"9OS000000001"};
+            OS_REQUIRE(XStoreQueryLicenseTokenAsync(sctx, pids, 1, "devstr", &ltok_ab) == XGR_S_OK);
+            OS_REQUIRE(XStoreQueryLicenseTokenResultSize(&ltok_ab, &sz) == XGR_S_OK && sz > 1 && sz < sizeof(str_buf));
+            OS_REQUIRE(XStoreQueryLicenseTokenResult(&ltok_ab, sizeof(str_buf), str_buf) == XGR_S_OK);
+
+            char pkg_out[XSTORE_PACKAGE_IDENTIFIER_MAX_LENGTH]{};
+            OS_REQUIRE(XStoreQueryPackageIdentifier("9OS000000001", sizeof(pkg_out), pkg_out) == XGR_S_OK);
+            OS_REQUIRE(std::strlen(pkg_out) > 0);
+
+            XStoreAvailability avail{};
+            OS_REQUIRE(!XStoreIsAvailabilityPurchasable(avail));
+            avail.availabilityId = "AVAIL0000001";
+            OS_REQUIRE(XStoreIsAvailabilityPurchasable(avail));
+
+            XAsyncBlock ui1{}, ui2{}, ui3{}, ui4{}, ui5{};
+            OS_REQUIRE(XStoreShowAssociatedProductsUIAsync(sctx, "9OS000000001", XStoreProductKind_Durable, &ui1) == XGR_S_OK);
+            OS_REQUIRE(XStoreShowAssociatedProductsUIResult(&ui1) == XGR_S_OK);
+            OS_REQUIRE(XStoreShowProductPageUIAsync(sctx, "9OS000000001", &ui2) == XGR_S_OK);
+            OS_REQUIRE(XStoreShowProductPageUIResult(&ui2) == XGR_S_OK);
+            OS_REQUIRE(XStoreShowPurchaseUIAsync(sctx, "9OS000000001", nullptr, nullptr, &ui3) == XGR_S_OK);
+            OS_REQUIRE(XStoreShowPurchaseUIResult(&ui3) == XGR_E_ABORT);
+            OS_REQUIRE(XStoreShowRateAndReviewUIAsync(sctx, &ui4) == XGR_S_OK);
+            OS_REQUIRE(XStoreShowRateAndReviewUIResult(&ui4) == XGR_S_OK);
+            OS_REQUIRE(XStoreShowRedeemTokenUIAsync(sctx, nullptr, nullptr, 0, false, &ui5) == XGR_S_OK);
+            OS_REQUIRE(XStoreShowRedeemTokenUIResult(&ui5) == XGR_S_OK);
+        }
+
+        store_vt->XStoreCloseContextHandle(sctx);
+    }
+
+    // --- 3. XGameUi* full parity (direct + QueryApiImpl) ---
+    void* raw_ui_vt = nullptr;
+    OS_REQUIRE(QueryApiImpl(&XGR_API_GUID_GAME_UI, &raw_ui_vt) == XGR_S_OK && raw_ui_vt != nullptr);
+    const auto* ui_vt = static_cast<const IXgrGameUiApiVtable*>(raw_ui_vt);
+    {
+        OS_REQUIRE(ui_vt->XGameUiSetNotificationPositionHint(XGameUiNotificationPositionHint_TopRight) == XGR_S_OK);
+
+        XAsyncBlock m_ab{};
+        OS_REQUIRE(ui_vt->XGameUiShowMessageDialogAsync(
+                       &m_ab, "Title", "Body", "OK", "Cancel", nullptr,
+                       XGameUiMessageDialogButton_Second, XGameUiMessageDialogButton_Second) == XGR_S_OK);
+        XGameUiMessageDialogButton btn = XGameUiMessageDialogButton_First;
+        OS_REQUIRE(ui_vt->XGameUiShowMessageDialogResult(&m_ab, &btn) == XGR_S_OK);
+        OS_REQUIRE(btn == XGameUiMessageDialogButton_Second);
+
+        XAsyncBlock e_ab{};
+        OS_REQUIRE(XGameUiShowErrorDialogAsync(&e_ab, XGR_E_FAIL, "ctx") == XGR_S_OK);
+        OS_REQUIRE(XGameUiShowErrorDialogResult(&e_ab) == XGR_S_OK);
+
+        XAsyncBlock t_ab{};
+        OS_REQUIRE(XGameUiShowTextEntryAsync(
+                       &t_ab, "Name", "Enter name", "ScarlettHero",
+                       XGameUiTextEntryInputScope_Default, 8) == XGR_S_OK);
+        uint32_t tsz = 0;
+        OS_REQUIRE(XGameUiShowTextEntryResultSize(&t_ab, &tsz) == XGR_S_OK && tsz == 9u);
+        char tbuf[32]{};
+        uint32_t tused = 0;
+        OS_REQUIRE(XGameUiShowTextEntryResult(&t_ab, sizeof(tbuf), tbuf, &tused) == XGR_S_OK);
+        OS_REQUIRE(std::strcmp(tbuf, "Scarlett") == 0 && tused == 9u);
+
+        XAsyncBlock a_ab{}, p_ab{}, pc_ab{}, inv_ab{};
+        OS_REQUIRE(XGameUiShowAchievementsAsync(&a_ab, user, 0x5CA00001u) == XGR_S_OK);
+        OS_REQUIRE(XGameUiShowAchievementsResult(&a_ab) == XGR_S_OK);
+
+        const uint64_t pre[2] = {0x1111ULL, 0x2222ULL};
+        OS_REQUIRE(XGameUiShowPlayerPickerAsync(&p_ab, user, "Pick", 2, pre, 2, pre, 0, 2) == XGR_S_OK);
+        uint32_t pcnt = 0;
+        OS_REQUIRE(XGameUiShowPlayerPickerResultCount(&p_ab, &pcnt) == XGR_S_OK && pcnt == 2u);
+        uint64_t pout[2]{};
+        uint32_t pused = 0;
+        OS_REQUIRE(XGameUiShowPlayerPickerResult(&p_ab, 2, pout, &pused) == XGR_S_OK);
+        OS_REQUIRE(pused == 2u && pout[0] == 0x1111ULL && pout[1] == 0x2222ULL);
+
+        OS_REQUIRE(XGameUiShowPlayerProfileCardAsync(&pc_ab, user, 0x1111ULL) == XGR_S_OK);
+        OS_REQUIRE(XGameUiShowPlayerProfileCardResult(&pc_ab) == XGR_S_OK);
+        OS_REQUIRE(XGameUiShowSendGameInviteAsync(&inv_ab, user, "scid", "tmpl", "sid", "hi", nullptr) == XGR_S_OK);
+        OS_REQUIRE(XGameUiShowSendGameInviteResult(&inv_ab) == XGR_S_OK);
+
+        XAsyncBlock wa_ab{};
+        OS_REQUIRE(XGameUiShowWebAuthenticationAsync(
+                       &wa_ab, user, "https://login.invalid", "https://done.invalid") == XGR_S_OK);
+        size_t wasz = 0;
+        OS_REQUIRE(XGameUiShowWebAuthenticationResultSize(&wa_ab, &wasz) == XGR_S_OK && wasz > sizeof(XGameUiWebAuthenticationResultData));
+        std::vector<uint8_t> wabuf(wasz, 0);
+        XGameUiWebAuthenticationResultData* wadata = nullptr;
+        size_t waused = 0;
+        OS_REQUIRE(XGameUiShowWebAuthenticationResult(&wa_ab, wabuf.size(), wabuf.data(), &wadata, &waused) == XGR_S_OK);
+        OS_REQUIRE(wadata != nullptr && wadata->responseStatus == XGR_E_ABORT);
+        OS_REQUIRE(std::strcmp(wadata->responseCompletionUri, "https://done.invalid") == 0);
+    }
+
+    // --- 4. XNetworking* full parity (direct + QueryApiImpl) ---
+    void* raw_net_vt = nullptr;
+    OS_REQUIRE(QueryApiImpl(&XGR_API_GUID_NETWORKING, &raw_net_vt) == XGR_S_OK && raw_net_vt != nullptr);
+    const auto* net_vt = static_cast<const IXgrNetworkingApiVtable*>(raw_net_vt);
+    {
+        XNetworkingConnectivityHint hint{};
+        OS_REQUIRE(net_vt->XNetworkingGetConnectivityHint(&hint) == XGR_S_OK);
+        OS_REQUIRE(hint.networkInitialized && hint.connectivityLevel == XNetworkingConnectivityLevelHint_InternetAccess);
+
+        XNetworkingConnectivityHint hint2{};
+        OS_REQUIRE(net_vt->XNetworkingQueryConnectivityHint(&hint2) == XGR_S_OK && hint2.networkInitialized);
+
+        uint16_t port = 0;
+        OS_REQUIRE(net_vt->XNetworkingQueryPreferredLocalUdpMultiplayerPort(&port) == XGR_S_OK && port == 3074u);
+
+        XAsyncBlock pab{};
+        OS_REQUIRE(XNetworkingQueryPreferredLocalUdpMultiplayerPortAsync(&pab) == XGR_S_OK);
+        uint16_t async_port = 0;
+        OS_REQUIRE(XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult(&pab, &async_port) == XGR_S_OK && async_port == 3074u);
+
+        XTaskQueueRegistrationToken ntok1{}, ntok2{};
+        OS_REQUIRE(XNetworkingRegisterConnectivityHintChanged(nullptr, nullptr, &DummyNetHintCb, &ntok1) == XGR_S_OK);
+        OS_REQUIRE(XNetworkingUnregisterConnectivityHintChanged(ntok1, true));
+        OS_REQUIRE(XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged(nullptr, nullptr, &DummyNetPortCb, &ntok2) == XGR_S_OK);
+        OS_REQUIRE(XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged(ntok2, true));
+
+        // Security info UTF-8 & UTF-16 + VerifyServerCertificate
+        XAsyncBlock sec1{}, sec2{};
+        OS_REQUIRE(XNetworkingQuerySecurityInformationForUrlAsync("https://xboxlive.com", &sec1) == XGR_S_OK);
+        size_t ssz1 = 0;
+        OS_REQUIRE(XNetworkingQuerySecurityInformationForUrlAsyncResultSize(&sec1, &ssz1) == XGR_S_OK);
+        std::vector<uint8_t> sbuf1(ssz1, 0);
+        XNetworkingSecurityInformation* sinfo1 = nullptr;
+        size_t sused1 = 0;
+        OS_REQUIRE(XNetworkingQuerySecurityInformationForUrlAsyncResult(&sec1, sbuf1.size(), &sused1, sbuf1.data(), &sinfo1) == XGR_S_OK);
+        OS_REQUIRE(sinfo1 != nullptr && sinfo1->enabledHttpSecurityProtocolFlags != 0u);
+        int dummy_req = 1;
+        OS_REQUIRE(XNetworkingVerifyServerCertificate(&dummy_req, sinfo1) == XGR_S_OK);
+
+        OS_REQUIRE(XNetworkingQuerySecurityInformationForUrlUtf16Async(L"https://xboxlive.com", &sec2) == XGR_S_OK);
+        size_t ssz2 = 0;
+        OS_REQUIRE(XNetworkingQuerySecurityInformationForUrlUtf16AsyncResultSize(&sec2, &ssz2) == XGR_S_OK);
+        std::vector<uint8_t> sbuf2(ssz2, 0);
+        XNetworkingSecurityInformation* sinfo2 = nullptr;
+        size_t sused2 = 0;
+        OS_REQUIRE(XNetworkingQuerySecurityInformationForUrlUtf16AsyncResult(&sec2, sbuf2.size(), &sused2, sbuf2.data(), &sinfo2) == XGR_S_OK);
+        OS_REQUIRE(sinfo2 != nullptr && sinfo2->enabledHttpSecurityProtocolFlags != 0u);
+    }
+
+    // --- 5. XPackage* full parity (direct + QueryApiImpl) ---
+    void* raw_pkg_vt = nullptr;
+    OS_REQUIRE(QueryApiImpl(&XGR_API_GUID_PACKAGE, &raw_pkg_vt) == XGR_S_OK && raw_pkg_vt != nullptr);
+    const auto* pkg_vt = static_cast<const IXgrPackageApiVtable*>(raw_pkg_vt);
+    {
+        char pkg_id[128]{};
+        OS_REQUIRE(pkg_vt->XPackageGetCurrentProcessPackageIdentifier(sizeof(pkg_id), pkg_id) == XGR_S_OK);
+
+        XPackageMountHandle mh = nullptr;
+        OS_REQUIRE(pkg_vt->XPackageMount(pkg_id, &mh) == XGR_S_OK && mh != nullptr);
+        size_t msz = 0;
+        OS_REQUIRE(pkg_vt->XPackageGetMountPathSize(mh, &msz) == XGR_S_OK && msz > 1);
+        std::vector<char> mpath(msz, '\0');
+        OS_REQUIRE(pkg_vt->XPackageGetMountPath(mh, mpath.size(), mpath.data()) == XGR_S_OK);
+        OS_REQUIRE(std::strlen(mpath.data()) > 0);
+        pkg_vt->XPackageCloseMountHandle(mh);
+
+        char loc[32]{};
+        OS_REQUIRE(XPackageGetUserLocale(sizeof(loc), loc) == XGR_S_OK && std::strlen(loc) >= 2);
+
+        XPackageWriteStats ws{};
+        OS_REQUIRE(XPackageGetWriteStats(&ws) == XGR_S_OK && ws.budget > 0);
+
+        XPackageInstallationMonitorHandle mon = nullptr;
+        OS_REQUIRE(XPackageCreateInstallationMonitor(pkg_id, 0, nullptr, 1000, nullptr, &mon) == XGR_S_OK && mon != nullptr);
+        XPackageInstallationProgress prog{};
+        XPackageGetInstallationProgress(mon, &prog);
+        OS_REQUIRE(prog.completed && prog.launchable && prog.installedBytes == prog.totalBytes);
+        OS_REQUIRE(!XPackageUpdateInstallationMonitor(mon));
+
+        XTaskQueueRegistrationToken ptok1{}, ptok2{};
+        OS_REQUIRE(XPackageRegisterInstallationProgressChanged(mon, nullptr, &DummyPkgProgressCb, &ptok1) == XGR_S_OK);
+        OS_REQUIRE(XPackageUnregisterInstallationProgressChanged(mon, ptok1, true));
+        XPackageCloseInstallationMonitorHandle(mon);
+
+        OS_REQUIRE(XPackageRegisterPackageInstalled(nullptr, nullptr, &DummyPkgInstalledCb, &ptok2) == XGR_S_OK);
+        OS_REQUIRE(XPackageUnregisterPackageInstalled(ptok2, true));
+
+        std::vector<std::string> pkgs;
+        OS_REQUIRE(XPackageEnumeratePackages(XPackageKind_Game, XPackageEnumerationScope_ThisOnly, &pkgs, &EnumPackageDetailsCb) == XGR_S_OK);
+        OS_REQUIRE(pkgs.size() == 1);
+
+        std::vector<std::string> feats;
+        OS_REQUIRE(XPackageEnumerateFeatures(pkg_id, &feats, &EnumPackageFeatureCb) == XGR_S_OK);
+        OS_REQUIRE(feats.size() == 1 && feats[0] == "BaseGame");
+
+        XPackageChunkAvailability cavail = XPackageChunkAvailability_Unavailable;
+        OS_REQUIRE(XPackageFindChunkAvailability(pkg_id, 0, nullptr, &cavail) == XGR_S_OK);
+        OS_REQUIRE(cavail == XPackageChunkAvailability_Ready);
+
+        uint64_t dl_sz = 999;
+        bool confirm = true;
+        OS_REQUIRE(XPackageEstimateDownloadSize(pkg_id, 0, nullptr, &dl_sz, &confirm) == XGR_S_OK);
+        OS_REQUIRE(dl_sz == 0 && !confirm);
+        OS_REQUIRE(XPackageChangeChunkInstallOrder(pkg_id, 0, nullptr) == XGR_S_OK);
+
+        XPackageInstallationMonitorHandle im1 = nullptr;
+        OS_REQUIRE(XPackageInstallChunks(pkg_id, 0, nullptr, 1000, true, nullptr, &im1) == XGR_S_OK && im1 != nullptr);
+        XPackageCloseInstallationMonitorHandle(im1);
+
+        XAsyncBlock ic_ab{};
+        OS_REQUIRE(XPackageInstallChunksAsync(pkg_id, 0, nullptr, 1000, true, &ic_ab) == XGR_S_OK);
+        XPackageInstallationMonitorHandle im2 = nullptr;
+        OS_REQUIRE(XPackageInstallChunksResult(&ic_ab, &im2) == XGR_S_OK && im2 != nullptr);
+        XPackageCloseInstallationMonitorHandle(im2);
+
+        OS_REQUIRE(XPackageUninstallChunks(pkg_id, 0, nullptr) == XGR_S_OK);
+        OS_REQUIRE(XPackageUninstallUWPInstance(pkg_id) == XGR_S_OK);
+    }
+
+    // --- 6. Core Runtime Parity (direct + QueryApiImpl) ---
+    void* raw_core_vt = nullptr;
+    OS_REQUIRE(QueryApiImpl(&XGR_API_GUID_CORE_RUNTIME, &raw_core_vt) == XGR_S_OK && raw_core_vt != nullptr);
+    const auto* core_vt = static_cast<const IXgrCoreRuntimeApiVtable*>(raw_core_vt);
+    {
+        OS_REQUIRE(core_vt->XGameRuntimeIsFeatureAvailable(XGameRuntimeFeature_XStore));
+        OS_REQUIRE(core_vt->XGameRuntimeIsFeatureAvailable(XGameRuntimeFeature_XNetworking));
+
+        // XDisplayAcquireTimeoutDeferral alias
+        XDisplayTimeoutDeferralHandle ddef = nullptr;
+        OS_REQUIRE(XDisplayAcquireTimeoutDeferral(&ddef) == XGR_S_OK && ddef != nullptr);
+        XDisplayCloseTimeoutDeferralHandle(ddef);
+
+        // XGameSaveEnumerateBlobInfoByName + XGameSaveGetContainerInfo
+        {
+            const char* kScid = "00000000-0000-0000-0000-00005ca0face";
+            XGameSaveProviderHandle prov = nullptr;
+            OS_REQUIRE(XGameSaveInitializeProvider(user, kScid, false, &prov) == XGR_S_OK);
+            (void)XGameSaveDeleteContainer(prov, "meta_slot");
+            XGameSaveContainerHandle cont = nullptr;
+            OS_REQUIRE(XGameSaveCreateContainer(prov, "meta_slot", &cont) == XGR_S_OK);
+            XGameSaveUpdateHandle upd = nullptr;
+            OS_REQUIRE(XGameSaveCreateUpdate(cont, "Meta Slot", &upd) == XGR_S_OK);
+            const uint8_t d1[4] = {1, 2, 3, 4};
+            OS_REQUIRE(XGameSaveSubmitBlobWrite(upd, "cfg_audio", d1, sizeof(d1)) == XGR_S_OK);
+            OS_REQUIRE(XGameSaveSubmitBlobWrite(upd, "sav_level1", d1, sizeof(d1)) == XGR_S_OK);
+            OS_REQUIRE(XGameSaveSubmitUpdate(upd) == XGR_S_OK);
+            XGameSaveCloseUpdate(upd);
+
+            std::vector<std::string> filtered_blobs;
+            OS_REQUIRE(XGameSaveEnumerateBlobInfoByName(cont, "cfg_", &filtered_blobs, &EnumBlobCb) == XGR_S_OK);
+            OS_REQUIRE(filtered_blobs.size() == 1 && filtered_blobs[0] == "cfg_audio");
+
+            EnumContainersCtx cinfo{};
+            OS_REQUIRE(XGameSaveGetContainerInfo(prov, "meta_slot", &cinfo, &EnumContainerCb) == XGR_S_OK);
+            OS_REQUIRE(cinfo.names.size() == 1 && cinfo.names[0] == "meta_slot" && cinfo.last_blob_count == 2);
+
+            XGameSaveCloseContainer(cont);
+            OS_REQUIRE(XGameSaveDeleteContainer(prov, "meta_slot") == XGR_S_OK);
+            XGameSaveCloseProvider(prov);
+        }
+
+        // Persistent Local Storage
+        size_t pls_sz = 0;
+        OS_REQUIRE(core_vt->XPersistentLocalStorageGetPathSize(&pls_sz) == XGR_S_OK && pls_sz > 1);
+        std::vector<char> pls_path(pls_sz, '\0');
+        size_t pls_used = 0;
+        OS_REQUIRE(core_vt->XPersistentLocalStorageGetPath(pls_path.size(), pls_path.data(), &pls_used) == XGR_S_OK);
+        OS_REQUIRE(pls_used == pls_sz && std::strlen(pls_path.data()) > 0);
+
+        // XThread
+        OS_REQUIRE(!core_vt->XThreadIsTimeSensitive());
+        OS_REQUIRE(core_vt->XThreadVerifyNotTimeSensitive());
+        OS_REQUIRE(core_vt->XThreadSetTimeSensitive(true) == XGR_S_OK);
+        OS_REQUIRE(core_vt->XThreadIsTimeSensitive());
+        OS_REQUIRE(!core_vt->XThreadVerifyNotTimeSensitive());
+        OS_REQUIRE(core_vt->XThreadSetTimeSensitive(false) == XGR_S_OK);
+        core_vt->XThreadAssertNotTimeSensitive();
+
+        // XError
+        std::atomic<int> err_hits{0};
+        core_vt->XErrorSetOptions(XErrorOptions_None, XErrorOptions_None);
+        core_vt->XErrorSetCallback(&TestErrorCb, &err_hits);
+        core_vt->XErrorReport(XGR_E_FAIL, "synthetic_error");
+        OS_REQUIRE(err_hits.load() == 1);
+        core_vt->XErrorSetCallback(nullptr, nullptr);
+
+        // XGameEventWrite, XGameInvite, XLaunch, XHighContrast, XClosedCaption
+        XGameEventDescriptor edesc{};
+        OS_REQUIRE(core_vt->XGameEventWrite(0, &edesc, 0, nullptr) == 0u);
+
+        XTaskQueueRegistrationToken itok{};
+        OS_REQUIRE(core_vt->XGameInviteRegisterForEvent(nullptr, nullptr, &DummyInviteCb, &itok) == XGR_S_OK);
+        OS_REQUIRE(core_vt->XGameInviteUnregisterForEvent(itok, true));
+
+        core_vt->XLaunchNewGame("game.exe", "", user);
+        OS_REQUIRE(core_vt->XLaunchUri(user, "ms-xbox://home") == XGR_S_OK);
+
+        XHighContrastMode hcm = XHighContrastMode_Other;
+        OS_REQUIRE(core_vt->XHighContrastGetMode(&hcm) == XGR_S_OK && hcm == XHighContrastMode_Off);
+
+        OS_REQUIRE(core_vt->XClosedCaptionSetEnabled(true) == XGR_S_OK);
+        XClosedCaptionProperties cc{};
+        OS_REQUIRE(core_vt->XClosedCaptionGetProperties(&cc) == XGR_S_OK && cc.Enabled && cc.FontScale == 1.0f);
+        OS_REQUIRE(core_vt->XClosedCaptionSetEnabled(false) == XGR_S_OK);
+    }
+
+    XUserCloseHandle(user);
+    UninitializeApiImpl();
+    std::printf("[PASS] xgameruntime.dll thunks parity (XUser, XStore, XGameUi, XNetworking, XPackage, Core + 12-GUID QueryApiImpl)\n");
+}
+
 }  // namespace
 
 int main() {
@@ -952,6 +1560,7 @@ int main() {
 #endif
 
     TestXGameRuntime();
+    TestXGameRuntimeThunksParity();
     TestGameInput();
     TestXAudio2AndAcpHal();
     TestDirectStorage();
