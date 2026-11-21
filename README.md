@@ -15,7 +15,7 @@ Because Xbox Series X|S runs on an **AMD Zen 2 x86-64 CPU** and a **Windows-deri
 
 ![OpenScarlett Status](docs/status.svg)
 
-**Overall Clean-Room Readiness:** `82.8%` · **Automated Tests:** `10/10` passing · **Host Verified:** `Windows 10 x64 + NVIDIA GTX 1650 Ti (D3D12 + Vulkan 1.4.329)`
+**Overall Clean-Room Readiness:** `93.9%` · **Automated Tests:** `11/11` passing · **Host Verified:** `Windows 10 x64 + NVIDIA GTX 1650 Ti (D3D12 + Vulkan 1.4.329)`
 
 | Subsystem | Area | Status | Progress | What Works Right Now | Verified On |
 | :--- | :--- | :--- | :---: | :--- | :--- |
@@ -27,7 +27,7 @@ Because Xbox Series X|S runs on an **AMD Zen 2 x86-64 CPU** and a **Windows-deri
 | **Xbox Unified Memory, `GpuTilePool` & `kernelx.dll`** | `Memory` | 🟣 Unit-Tested | `100%` | OS section-backed 64 KiB / 4 MiB physical-virtual placeholder aliasing + `kernelx.dll` | Windows 10 x64 |
 | **`d3d12_xs` Guest COM Proxy & `xg_xs` Swizzle** | `Graphics` | 🟢 Live-GPU Verified | `100%` | Modular `d3d12_xs` Device/Queue/CmdList COM proxies, `PresentX`, DXR 1.1 | GTX 1650 Ti + WARP |
 | **GDK Runtime (`xgameruntime`, `GameInput`, `XAudio2`, `dstorage_xs`, `XSAPI`)** | `GDK Shims` | 🟣 Unit-Tested | `100%` | GDK runtime, XUser, XGameSave, GameInput, XAudio2/AcpHal, DirectStorage, XSAPI | Queued (Sprint 1) |
-| **Hardware DXR Tier 1.1 Pipeline** | `Graphics` | ⚪ Planned | `0%` | Queued (Sprint 2): ID3D12Device5 DXR 1.1 + software BVH fallback for GTX 1650 Ti / WARP | Queued (Sprint 2) |
+| **Hardware DXR Tier 1.1 Pipeline** | `Graphics` | 🟣 Unit-Tested | `100%` | ID3D12Device5 BLAS/TLAS/SBT + software BVH fallback for non-RT GPUs | GTX 1650 Ti / WARP |
 | **Retail DRM / Encrypted `.xvc`/`.xvd` Decryption** | `Legal Boundary` | 🚫 Out of Scope | `0%` | Intentionally excluded — OpenScarlett is strictly clean-room and never extracts keys or bypasses DRM | N/A (Permanent Policy) |
 
 _Auto-generated from live CTest results via `python tools/generate_status.py --build-dir build`._
