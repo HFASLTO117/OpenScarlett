@@ -424,7 +424,7 @@ int RunGuestExecutable(int argc, char** argv) {
 
 void PrintUsage() {
     std::printf(
-        "OpenScarlett — Clean-room Xbox Series X|S (Scarlett) translation layer for Windows x64\n"
+        "OpenScarlett - Clean-room Xbox Series X|S (Scarlett) translation layer for Windows x64\n"
         "Usage:\n"
         "  openscarlett probe-gpu               Probe host D3D12, Vulkan, and DXC capabilities\n"
         "  openscarlett inspect <exe_or_dll>    Inspect PE32+ x64 imports, exports, TLS & .pdata\n"

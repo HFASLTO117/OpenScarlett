@@ -9,7 +9,7 @@
   </style>
   <rect width="900" height="522" rx="10" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
   <text class="h1" x="28" y="42">OpenScarlett — Live Subsystem Readiness: 100.0%</text>
-  <text class="sub" x="28" y="64">Windows 10/11 x64 · MIT Clean-Room · CTest: 19/19 passing · Target: Xbox Series X|S (Scarlett)</text>
+  <text class="sub" x="28" y="64">Windows 10/11 x64 · MIT Clean-Room · CTest: 23/23 passing · Target: Xbox Series X|S (Scarlett)</text>
   <line x1="28" y1="80" x2="872" y2="80" stroke="#21262d" stroke-width="1"/>
   <text class="sub" x="28" y="102">Legend:  ■ Green = Live GPU / Real Binary Verified   ■ Purple = Unit-Tested   ■ Amber = In Progress   ■ Grey = Planned</text>
   <line x1="28" y1="116" x2="872" y2="116" stroke="#21262d" stroke-width="1"/>
@@ -69,7 +69,7 @@
   <rect x="610" y="370" width="180" height="10" rx="5" fill="#2ea043"/>
   <text class="pct" x="872" y="380" text-anchor="end">100%</text>
   <line x1="28" y1="392" x2="872" y2="392" stroke="#161b22" stroke-width="1"/>
-  <text class="name" x="28" y="414">Hardware DXR Tier 1.1 Pipeline</text>
+  <text class="name" x="28" y="414">Hardware DXR Tier 1.1 Pipeline &amp; Multi-Pass GDK Workloads</text>
   <rect x="440" y="400" width="146" height="20" rx="10" fill="#2ea043"/>
   <text class="stage" x="513" y="414" text-anchor="middle">Live-GPU Verified</text>
   <rect x="610" y="404" width="180" height="10" rx="5" fill="#21262d"/>

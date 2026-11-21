@@ -766,7 +766,7 @@ int main() {
 
     // Crisp summary output
     std::printf("\n===================================================================================================================\n");
-    std::printf(" OpenScarlett Wave 2 — SimplePBR Multi-Frame 3D Cook-Torrance PBR (4x MSAA + D32_FLOAT + ResolveSubresource)\n");
+    std::printf(" OpenScarlett Wave 2 - SimplePBR Multi-Frame 3D Cook-Torrance PBR (4x MSAA + D32_FLOAT + ResolveSubresource)\n");
     std::printf("===================================================================================================================\n");
     auto print_report = [](const RunReport& r) {
         const auto& m = r.metrics;

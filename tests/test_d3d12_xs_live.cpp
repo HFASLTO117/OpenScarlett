@@ -174,9 +174,23 @@ bool TestAdapterSelection(openscarlett::D3D12AdapterInfo& out_hw_info) {
         hw_opts, hw_dev.Put(), hw_adapter.Put(), &out_hw_info);
     const bool has_hw_gpu = st.ok() && hw_dev.Get() != nullptr && !out_hw_info.is_warp;
     if (has_hw_gpu) {
-        OS_REQUIRE(out_hw_info.dedicated_video_memory_mb >= 1024ull);
-        OS_REQUIRE(out_hw_info.description.find("Intel") == std::string::npos);
-        OS_REQUIRE(out_hw_info.mesh_shader_tier >= 10u);
+        // On hybrid laptops with both an integrated GPU and a discrete GPU, verify we
+        // selected the high-performance discrete GPU rather than falling back to the iGPU.
+        std::vector<openscarlett::D3D12AdapterInfo> all_adapters;
+        bool has_discrete_non_intel = false;
+        if (openscarlett::EnumerateD3D12Adapters(all_adapters).ok()) {
+            for (const auto& a : all_adapters) {
+                if (!a.is_warp &&
+                    a.description.find("Intel") == std::string::npos &&
+                    a.dedicated_video_memory_mb >= 1024ull) {
+                    has_discrete_non_intel = true;
+                }
+            }
+        }
+        if (has_discrete_non_intel) {
+            OS_REQUIRE(out_hw_info.dedicated_video_memory_mb >= 1024ull);
+            OS_REQUIRE(out_hw_info.description.find("Intel") == std::string::npos);
+        }
 
         std::printf(
             "  HW Selected : %s | Vendor=0x%04X Device=0x%04X | VRAM=%llu MB | SM=0x%02X | MeshTier=%u | DXR=%u | Wave=%u..%u\n",
@@ -217,8 +231,8 @@ bool TestAdapterSelection(openscarlett::D3D12AdapterInfo& out_hw_info) {
 // ---------------------------------------------------------------------------
 // 2. d3d12_xs.dll Clear + PresentX Headless Readback Test (HW & WARP)
 // ---------------------------------------------------------------------------
-uint64_t RunClearAndPresentXTest(bool use_warp) {
-    const char* mode_label = use_warp ? "WARP" : "HW (GTX 1650 Ti)";
+uint64_t RunClearAndPresentXTest(bool use_warp, bool expect_mesh_shaders) {
+    const char* mode_label = use_warp ? "WARP" : "HW";
     std::printf("[Test 2 - %s] d3d12_xs ClearRenderTargetView + PresentX...\n", mode_label);
 
     OpenScarlettD3D12SetPreferWarp(use_warp ? 1 : 0);
@@ -238,7 +252,7 @@ uint64_t RunClearAndPresentXTest(bool use_warp) {
     D3D12XBOX_GPU_HARDWARE_INFO gpu_info{};
     OS_REQUIRE(SUCCEEDED(dev->GetGpuHardwareInfoX(&gpu_info)));
     OS_REQUIRE((gpu_info.IsWarp != 0) == use_warp);
-    if (!use_warp) {
+    if (!use_warp && expect_mesh_shaders) {
         OS_REQUIRE(gpu_info.MeshShaderTier >= 10u);
     }
     OS_REQUIRE(SUCCEEDED(dev->SetFrameIntervalX(nullptr, 16667u, 2u, 0u)));
@@ -841,7 +855,7 @@ void TestXgSwizzle() {
 // ---------------------------------------------------------------------------
 // 5. Live GPU FSR 1.0 (EASU + RCAS) on BOTH GTX 1650 Ti AND WARP
 // ---------------------------------------------------------------------------
-void TestLiveGpuFsr1(bool has_hw_gpu) {
+void TestLiveGpuFsr1(bool has_hw_gpu, bool expect_non_intel) {
     std::printf("[Test 5] Live GPU FSR 1.0 (EASU + RCAS) 64x64 -> 128x128 on HW & WARP...\n");
 
     constexpr uint32_t kInW = 64u;
@@ -895,7 +909,9 @@ void TestLiveGpuFsr1(bool has_hw_gpu) {
         openscarlett::FfxGpuFsrPipeline hw_fsr;
         OS_REQUIRE(hw_fsr.Initialize(/*prefer_warp=*/false).ok());
         OS_REQUIRE(!hw_fsr.AdapterInfo().is_warp);
-        OS_REQUIRE(hw_fsr.AdapterInfo().description.find("Intel") == std::string::npos);
+        if (expect_non_intel) {
+            OS_REQUIRE(hw_fsr.AdapterInfo().description.find("Intel") == std::string::npos);
+        }
 
         openscarlett::FrameBufferRgba8 hw_out;
         openscarlett::Fsr1DispatchStats hw_stats{};
@@ -962,20 +978,28 @@ int main() {
 #if defined(_WIN32)
     openscarlett::D3D12AdapterInfo hw_info{};
     const bool has_hw_gpu = TestAdapterSelection(hw_info);
+    const bool has_hw_mesh = has_hw_gpu && hw_info.mesh_shader_tier >= 10u;
+    const bool expect_non_intel =
+        has_hw_gpu && hw_info.description.find("Intel") == std::string::npos;
 
-    const uint64_t warp_clear_hash = RunClearAndPresentXTest(/*use_warp=*/true);
+    const uint64_t warp_clear_hash = RunClearAndPresentXTest(/*use_warp=*/true, false);
     if (has_hw_gpu) {
-        const uint64_t hw_clear_hash = RunClearAndPresentXTest(/*use_warp=*/false);
+        const uint64_t hw_clear_hash = RunClearAndPresentXTest(/*use_warp=*/false, has_hw_mesh);
         OS_REQUIRE(hw_clear_hash == warp_clear_hash);
         std::printf("  Clear+PresentX HW vs WARP hash match: 0x%016llX\n",
                     static_cast<unsigned long long>(hw_clear_hash));
-        TestLiveHardwareMeshShader();
+        if (has_hw_mesh) {
+            TestLiveHardwareMeshShader();
+        } else {
+            std::printf("  [SKIP] Hardware Mesh Shader test (HW adapter %s has MeshTier=%u < 10)\n",
+                        hw_info.description.c_str(), hw_info.mesh_shader_tier);
+        }
     } else {
         std::printf("  [SKIP] Hardware Mesh Shader test (no HW D3D12 GPU on runner)\n");
     }
 
     TestXgSwizzle();
-    TestLiveGpuFsr1(has_hw_gpu);
+    TestLiveGpuFsr1(has_hw_gpu, expect_non_intel);
 
     std::printf("ALL d3d12_xs / xg_xs / MeshShader / FSR1 LIVE GPU TESTS PASSED!\n");
     return 0;

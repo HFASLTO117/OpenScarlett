@@ -32,7 +32,7 @@ body:
     id: test_summary
     attributes:
       label: Test Summary
-      description: Auto-filled by `run_hardware_test.bat` (or paste from `hardware_test_report.md`).
+      description: Auto-filled by `run_hardware_test.bat` (if filling manually, paste just the summary line or table from `hardware_test_report.md`).
       placeholder: "13/13 passed (0 failed)"
     validations:
       required: true
@@ -41,7 +41,7 @@ body:
     id: full_report
     attributes:
       label: Probe & Test Output
-      description: Auto-filled by `run_hardware_test.bat`. If truncated, paste the full `hardware_test_report.md` (already copied to your clipboard).
+      description: Auto-filled by `run_hardware_test.bat`. If truncated or filling manually, paste the raw log / `hardware_test_report.md` here once (no need to paste into both boxes).
       render: text
     validations:
       required: false

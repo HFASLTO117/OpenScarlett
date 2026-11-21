@@ -850,7 +850,7 @@ int main() {
 
     // Print crisp compatibility & measured metrics summary table
     std::printf("\n===================================================================================================================\n");
-    std::printf(" OpenScarlett Sprint 3 — Live Official MIT Microsoft Xbox-GDK-Samples Bring-Up Matrix (%s)\n",
+    std::printf(" OpenScarlett Sprint 3 - Live Official MIT Microsoft Xbox-GDK-Samples Bring-Up Matrix (%s)\n",
                 has_official_gdk_samples ? "Official Microsoft HLSL" : "Fallback HLSL");
     std::printf("===================================================================================================================\n");
     std::printf(" %-22s | %-28s | %-7s | %-18s | %-34s | %-13s | %7s\n",

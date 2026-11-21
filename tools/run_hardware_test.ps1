@@ -93,13 +93,17 @@ $TestDescriptions = @{
     'test_d3d12_xs_autolift.exe'  = 'Live d3d12_xs XS2/Xbox-DXBC auto-lifting, disk shader cache & async PSO'
     'test_dxr_live.exe'           = 'DXR Tier 1.1 hardware raytracing / SAH BVH fallback'
     'test_secondary_shims.exe'    = 'xgameruntime QueryApiImpl dispatch & 9 secondary console/GDK shim DLLs'
-    'test_presentx_windowing.exe' = 'Interactive Win32 PresentX swapchains (60/120 Hz, waitable, Alt+Enter) & GameInput'
-    'test_gdk_live.exe'           = 'End-to-end live Xbox GDK samples via openscarlett run'
+    'test_presentx_windowing.exe'   = 'Interactive Win32 PresentX swapchains (60/120 Hz, waitable, Alt+Enter) & GameInput'
+    'test_gdk_live.exe'             = 'End-to-end live Xbox GDK samples (SimpleTriangle, SimpleMeshShader, SimpleCompute, SystemCombo)'
+    'test_gdk_simple_pbr.exe'       = 'Multi-frame 3D Cook-Torrance SimplePBR (4x MSAA, D32 depth, PBR textures, CBs)'
+    'test_gdk_meshlet_cull.exe'     = 'AS+MS+PS GPU frustum & normal-cone MeshletCull (MeshTier=10 + WARP fallback)'
+    'test_gdk_dxr_triangle.exe'     = 'End-to-end DXRTriangle (native lib_6_3 HW RT cores / SAH BVH fallback)'
+    'test_external_gdk_bringup.exe' = 'External GDK-header binaries, untouched MIT DirectStorageCombo & 19-DLL full stack'
 }
 
 Write-Host ''
 Write-Host '======================================================================' -ForegroundColor Cyan
-Write-Host '  OpenScarlett — Automatic Hardware Compatibility & Self-Test Suite'   -ForegroundColor Cyan
+Write-Host '  OpenScarlett - Automatic Hardware Compatibility & Self-Test Suite'    -ForegroundColor Cyan
 Write-Host '======================================================================' -ForegroundColor Cyan
 Write-Host '  Testing D3D12, Vulkan, Mesh Shaders, DXR 1.1, VA Aliasing & GDK Shims' -ForegroundColor Gray
 Write-Host '  Privacy: No personal paths or usernames are saved. Nothing is sent'   -ForegroundColor Gray
@@ -201,7 +205,7 @@ try {
         $tname = $tf.Name
         $desc = if ($TestDescriptions.ContainsKey($tname)) { $TestDescriptions[$tname] } else { 'OpenScarlett hardware/runtime test' }
 
-        Write-Host ("  [{0,2}/{1,2}] {2} — {3}" -f $idx, $testFiles.Count, $tname, $desc) -ForegroundColor White
+        Write-Host ("  [{0,2}/{1,2}] {2} - {3}" -f $idx, $testFiles.Count, $tname, $desc) -ForegroundColor White
 
         $sw = [System.Diagnostics.Stopwatch]::StartNew()
         $outLines = @(& $tf.FullName 2>&1 | ForEach-Object { $_.ToString() })
@@ -362,7 +366,7 @@ $fullLogText
             $issueUrl = $compactUrlCandidate
             $urlMode = 'compact'
         } else {
-            $fallbackNote = "(Full report is in your clipboard / hardware_test_report.md — press Ctrl+V here to paste it.)"
+            $fallbackNote = "(Full raw test log is in your clipboard - press Ctrl+V here to paste it.)"
             $issueUrl = "$baseUrl?" + (($paramsBase + @("full_report=$([Uri]::EscapeDataString($fallbackNote))")) -join '&')
             $urlMode = 'clipboard'
         }
@@ -370,14 +374,19 @@ $fullLogText
         Write-Host ''
         $ans = Read-Host '  Open GitHub in your browser with this report pre-filled to submit? [Y/n]'
         if ([string]::IsNullOrWhiteSpace($ans) -or $ans.Trim().ToLowerInvariant().StartsWith('y')) {
+            if ($urlMode -ne 'complete') {
+                # Summary table is already pre-filled in the Test Summary field; place ONLY the raw
+                # log on the clipboard so pressing Ctrl+V in Probe & Test Output avoids duplication.
+                try { Set-Clipboard -Value $fullLogText } catch {}
+            }
             try {
                 Start-Process $issueUrl
                 Write-Host ''
                 Write-Host '  -> Opened pre-filled GitHub Issue in your browser!' -ForegroundColor Green
                 if ($urlMode -eq 'complete') {
-                    Write-Host '     Everything is already filled in — just review and click "Create".' -ForegroundColor Cyan
+                    Write-Host '     Everything is already filled in - just review and click "Create".' -ForegroundColor Cyan
                 } else {
-                    Write-Host '     Summary is pre-filled; press Ctrl+V in the log box if you want to include the full raw log.' -ForegroundColor Cyan
+                    Write-Host '     Summary is already pre-filled; optionally press Ctrl+V in "Probe & Test Output" to paste the full raw log.' -ForegroundColor Cyan
                 }
             } catch {
                 Write-Host "  Could not open browser automatically. Please submit hardware_test_report.md at:" -ForegroundColor Yellow

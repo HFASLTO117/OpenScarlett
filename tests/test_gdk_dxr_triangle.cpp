@@ -684,7 +684,7 @@ int main() {
 
     // Print summary table
     std::printf("\n===================================================================================================================\n");
-    std::printf(" OpenScarlett Wave 2 — DXRTriangle Bring-Up Results (lib_6_3 DXIL validated via dxc.exe)\n");
+    std::printf(" OpenScarlett Wave 2 - DXRTriangle Bring-Up Results (lib_6_3 DXIL validated via dxc.exe)\n");
     std::printf("===================================================================================================================\n");
     std::printf(" %-26s | %-15s | %-28s | %-18s | %-13s | %7s\n",
                 "Run", "Mode", "Adapter", "FNV-1a Hash", "Telemetry", "Time");

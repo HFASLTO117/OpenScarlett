@@ -60,6 +60,7 @@ def collect_components() -> list[Component]:
     has_dxr = has("src/gpu/dxr_hardware.cpp")
     has_fsr = has("src/middleware/ffx_gpu_fsr.cpp")
     has_gdk_runner = has("tests/test_gdk_live.cpp")
+    has_wave2 = has("tests/test_gdk_simple_pbr.cpp") and has("tests/test_external_gdk_bringup.cpp")
 
     return [
         Component(
@@ -144,15 +145,27 @@ def collect_components() -> list[Component]:
                 if has_secondary
                 else "113 exports across 6 DLLs: `XTaskQueue`/`XAsync`, `XUser`, disk `XGameSave`, live XInput+KB `GameInput`, `XAudio2`/`AcpHal` XMA2, `dstorage_xs` GDeflate+BCPack, `XSAPI`"
             ),
-            verified_on="Win10 & Win11 26H2 (`test_gdk_shims`, `test_secondary_shims`, `test_xg_dstorage`, `Xbox-GDK-Samples`)" if has_secondary else "Win10 & Win11 26H2 (`test_gdk_shims`, `Xbox-GDK-Samples`)",
+            verified_on=(
+                "Win10 & Win11 26H2 (`test_gdk_shims`, `test_secondary_shims`, `test_xg_dstorage`, `Xbox-GDK-Samples`, 19-DLL `test_external_gdk_bringup`)"
+                if has_wave2
+                else ("Win10 & Win11 26H2 (`test_gdk_shims`, `test_secondary_shims`, `test_xg_dstorage`, `Xbox-GDK-Samples`)" if has_secondary else "Win10 & Win11 26H2 (`test_gdk_shims`, `Xbox-GDK-Samples`)")
+            ),
         ),
         Component(
-            name="Hardware DXR Tier 1.1 Pipeline",
+            name="Hardware DXR Tier 1.1 Pipeline & Multi-Pass GDK Workloads",
             area="Graphics",
             stage="Live-GPU Verified" if has_dxr else "Planned",
             pct=100 if has_dxr else 0,
-            what_works="`ID3D12Device5` BLAS/TLAS/SBT ABI + live hardware RT-core path (`DXR=12`) + 12-bin SAH software BVH fallback (`XboxBvhBuilder.dll`)",
-            verified_on="RTX 2060 SUPER (`DXR=12` HW) + GTX 1650 Ti (`DXR=0` SW) + WARP (`test_dxr_live`, `test_secondary_shims`)",
+            what_works=(
+                "`ID3D12Device5` BLAS/TLAS/SBT + `lib_6_3` `DispatchRays` (HW RT cores + `XboxBvhBuilder.dll` SAH BVH), `SimplePBR` (4× MSAA/depth/CB/SRV), `MeshletCull` (`AS`+`MS`+`PS` frustum/cone culling)"
+                if has_wave2
+                else "`ID3D12Device5` BLAS/TLAS/SBT ABI + live hardware RT-core path (`DXR=12`) + 12-bin SAH software BVH fallback (`XboxBvhBuilder.dll`)"
+            ),
+            verified_on=(
+                "RTX 2060 SUPER (`DXR=12`) + GTX 1650 Ti (`MeshTier=10`, `DXR=0` SW) + WARP (`test_dxr_live`, `test_gdk_simple_pbr`, `test_gdk_meshlet_cull`, `test_gdk_dxr_triangle`)"
+                if has_wave2
+                else "RTX 2060 SUPER (`DXR=12` HW) + GTX 1650 Ti (`DXR=0` SW) + WARP (`test_dxr_live`, `test_secondary_shims`)"
+            ),
         ),
         Component(
             name="Retail DRM / Encrypted `.xvc`/`.xvd` Decryption",
