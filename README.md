@@ -82,7 +82,23 @@ All live measurements below were recorded on **Windows 10 x64** with **NVIDIA Ge
 
 ---
 
-## Quick Start (Windows 10 / 11 x64)
+## Help Us Test on Your Hardware (60 Seconds, No Visual Studio Needed!)
+
+OpenScarlett is currently developed and tested on a single machine (**Windows 10 x64 + NVIDIA GTX 1650 Ti**). **We urgently need community hardware test reports** on other GPUs and OS builds to catch real driver and architecture edge cases we cannot reproduce locally:
+
+- **NVIDIA RTX 20 / 30 / 40 / 50:** Real **DXR Tier 1.1 hardware ray tracing** (our GTX 1650 Ti has `DXR=0` and only tests the software BVH fallback).
+- **AMD Radeon RX 6000 / 7000 / 9000 & Handheld APUs (ROG Ally / Legion Go / Steam Deck Windows):** Native **Wave64** shaders (matching Xbox Series X|S RDNA2) and AMD D3D12/Vulkan driver behavior.
+- **Intel Arc & Integrated GPUs (Xe / Vega / RDNA iGPU):** Subgroup/wave-size quirks (`Wave8`/`Wave16`/`Wave32`) and UMA memory heaps.
+- **Windows 11 (23H2 / 24H2 / 25H2):** `VirtualAlloc2` / `MapViewOfFile3` placeholder memory aliasing and newer D3D12 / WinRT runtimes.
+
+### 3-Step Test & Automatic Report
+1. Download the latest **`OpenScarlett-*-win64.zip`** from [**GitHub Releases**](https://github.com/californiaAlmonds/OpenScarlett/releases/latest) and unzip it anywhere (everything — including open-source `dxc.exe` — is bundled; **no Visual Studio or SDK needed**).
+2. Double-click **`run_hardware_test.bat`** — it explains each step live, shows your GPU capabilities + pass/fail results right in the console, and writes a privacy-sanitized `hardware_test_report.md` (usernames and local paths are automatically stripped).
+3. Press **Enter** when prompted — it opens a **pre-filled GitHub Hardware Report** in your browser. Just review and click **Create**! *(Failures on new hardware are just as helpful as passes!)*
+
+---
+
+## Quick Start (Build from Source — Windows 10 / 11 x64)
 
 ### Requirements
 - Windows 10 (1903+) or Windows 11 (x64)
@@ -123,6 +139,6 @@ ctest --test-dir build --output-on-failure
 
 ## Contributing & License
 
-Contributions, bug reports, hardware probe logs, and clean-room PRs are welcome! See [`AGENTS.md`](AGENTS.md) for engineering guidelines and coding standards.
+Hardware test reports, bug reports, and clean-room PRs are all welcome! See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the 60-second hardware test guide and clean-room contribution rules, and [`AGENTS.md`](AGENTS.md) for engineering guidelines.
 
 Licensed under the **[MIT License](LICENSE)**.

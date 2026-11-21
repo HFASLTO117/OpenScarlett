@@ -1,0 +1,64 @@
+name: Hardware Compatibility Report
+description: Submit your automatic OpenScarlett hardware self-test results (no coding required!)
+title: "[HW Report] "
+labels: ["hardware-report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for helping test **OpenScarlett** on real PC hardware!
+
+        **Fastest way to fill this out:** Download the latest `OpenScarlett-win64.zip` from [Releases](https://github.com/californiaAlmonds/OpenScarlett/releases/latest), unzip it, and double-click **`run_hardware_test.bat`** — it runs all tests automatically and opens this page pre-filled!
+
+        > **Clean-Room Policy:** Please submit **only** OpenScarlett self-test reports or results from open-source GDK samples. Do not upload retail game binaries, keys, or encrypted `.xvc`/`.xvd` dumps.
+
+  - type: input
+    id: os_version
+    attributes:
+      label: Windows Version & Build
+      placeholder: "e.g. Windows 11 24H2 x64 (Build 26100.2894)"
+    validations:
+      required: true
+
+  - type: input
+    id: gpu_summary
+    attributes:
+      label: GPU(s) & Driver Capabilities
+      placeholder: "e.g. NVIDIA RTX 4070 / AMD RX 7800 XT / Intel Arc B580 (auto-filled by run_hardware_test.bat)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: test_summary
+    attributes:
+      label: Test Summary
+      description: Auto-filled by `run_hardware_test.bat` (or paste from `hardware_test_report.md`).
+      placeholder: "13/13 passed (0 failed)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: full_report
+    attributes:
+      label: Probe & Test Output
+      description: Auto-filled by `run_hardware_test.bat`. If truncated, paste the full `hardware_test_report.md` (already copied to your clipboard).
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Extra Notes (Optional)
+      description: GPU driver version, laptop hybrid graphics behavior, anything unusual you noticed.
+      placeholder: "e.g. GeForce 566.36 / Adrenalin 25.1.1 / tested on ROG Ally / etc."
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: clean_room
+    attributes:
+      label: Clean-Room Confirmation
+      options:
+        - label: This report contains only OpenScarlett test output (no retail game files, keys, or personal data).
+          required: true

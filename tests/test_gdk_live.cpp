@@ -198,6 +198,22 @@ void AssertNoDllsInDir(const fs::path& dir) {
 
 fs::path FindDxcExe() {
     std::error_code ec;
+    wchar_t self_buf[MAX_PATH]{};
+    const DWORD self_len = ::GetModuleFileNameW(nullptr, self_buf, static_cast<DWORD>(MAX_PATH));
+    if (self_len > 0 && self_len < MAX_PATH) {
+        const auto beside = fs::path(self_buf).parent_path() / L"dxc.exe";
+        if (fs::exists(beside, ec)) return beside;
+    }
+    wchar_t env_dxc[1024]{};
+    const DWORD env_len = ::GetEnvironmentVariableW(L"OPENSCARLETT_DXC_PATH", env_dxc, static_cast<DWORD>(1024));
+    if (env_len > 0 && env_len < 1024 && fs::exists(env_dxc, ec)) {
+        return fs::path(env_dxc);
+    }
+    wchar_t path_buf[MAX_PATH]{};
+    const DWORD path_len = ::SearchPathW(nullptr, L"dxc.exe", nullptr, static_cast<DWORD>(MAX_PATH), path_buf, nullptr);
+    if (path_len > 0 && path_len < MAX_PATH && fs::exists(path_buf, ec)) {
+        return fs::path(path_buf);
+    }
     const wchar_t* candidates[] = {
         LR"(C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\dxc.exe)",
         LR"(C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\dxc.exe)",

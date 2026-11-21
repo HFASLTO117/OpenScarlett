@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -83,20 +84,63 @@ int RunProbeGpu() {
         std::printf("Vulkan       : unavailable (%s)\n", vk_status.message.c_str());
     }
 
-    const char* dxc_candidates[] = {
-        R"(C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\dxc.exe)",
-        R"(C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\dxc.exe)",
-    };
-    bool found_dxc = false;
-    for (const char* p : dxc_candidates) {
-        if (std::filesystem::exists(p)) {
-            std::printf("DXC (DXIL)   : %s\n", p);
-            found_dxc = true;
-            break;
+    std::filesystem::path detected_dxc;
+    std::error_code dxc_ec;
+#if defined(_WIN32)
+    {
+        char self_buf[MAX_PATH]{};
+        const DWORD self_len = GetModuleFileNameA(nullptr, self_buf, static_cast<DWORD>(sizeof(self_buf)));
+        if (self_len > 0 && self_len < sizeof(self_buf)) {
+            const auto beside = std::filesystem::path(self_buf).parent_path() / "dxc.exe";
+            if (std::filesystem::exists(beside, dxc_ec)) {
+                detected_dxc = beside;
+            }
+        }
+        if (detected_dxc.empty()) {
+            char env_dxc[1024]{};
+            const DWORD env_len = GetEnvironmentVariableA("OPENSCARLETT_DXC_PATH", env_dxc, static_cast<DWORD>(sizeof(env_dxc)));
+            if (env_len > 0 && env_len < sizeof(env_dxc) && std::filesystem::exists(env_dxc, dxc_ec)) {
+                detected_dxc = env_dxc;
+            }
+        }
+        if (detected_dxc.empty()) {
+            char path_buf[MAX_PATH]{};
+            const DWORD path_len = SearchPathA(nullptr, "dxc.exe", nullptr, static_cast<DWORD>(sizeof(path_buf)), path_buf, nullptr);
+            if (path_len > 0 && path_len < sizeof(path_buf) && std::filesystem::exists(path_buf, dxc_ec)) {
+                detected_dxc = path_buf;
+            }
         }
     }
-    if (!found_dxc) {
-        std::printf("DXC (DXIL)   : not detected in default Windows Kits paths\n");
+#endif
+    if (detected_dxc.empty()) {
+        const char* dxc_candidates[] = {
+            R"(C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\dxc.exe)",
+            R"(C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\dxc.exe)",
+        };
+        for (const char* p : dxc_candidates) {
+            if (std::filesystem::exists(p, dxc_ec)) {
+                detected_dxc = p;
+                break;
+            }
+        }
+    }
+    if (detected_dxc.empty()) {
+        const std::filesystem::path kits_bin(R"(C:\Program Files (x86)\Windows Kits\10\bin)");
+        if (std::filesystem::exists(kits_bin, dxc_ec)) {
+            std::vector<std::filesystem::path> found;
+            for (const auto& entry : std::filesystem::directory_iterator(kits_bin, dxc_ec)) {
+                if (!entry.is_directory()) continue;
+                const auto cand = entry.path() / "x64" / "dxc.exe";
+                if (std::filesystem::exists(cand, dxc_ec)) found.push_back(cand);
+            }
+            std::sort(found.begin(), found.end());
+            if (!found.empty()) detected_dxc = found.back();
+        }
+    }
+    if (!detected_dxc.empty()) {
+        std::printf("DXC (DXIL)   : %s\n", detected_dxc.string().c_str());
+    } else {
+        std::printf("DXC (DXIL)   : not detected (bundle dxc.exe or install Windows SDK)\n");
     }
     return 0;
 }

@@ -340,9 +340,32 @@ std::string MakeUniqueTempPath(const char* prefix, const char* ext) {
 #if defined(_WIN32)
 std::string ResolveDxcExecutable(const std::string& requested_path) {
     std::error_code ec;
+    // 1. Prefer bundled dxc.exe right beside the running executable (portable tester bundles)
+    char self_buf[MAX_PATH]{};
+    const DWORD self_len = GetModuleFileNameA(nullptr, self_buf, static_cast<DWORD>(sizeof(self_buf)));
+    if (self_len > 0 && self_len < sizeof(self_buf)) {
+        const auto beside_exe = std::filesystem::path(self_buf).parent_path() / "dxc.exe";
+        if (std::filesystem::exists(beside_exe, ec)) {
+            return beside_exe.string();
+        }
+    }
+    // 2. Explicit environment override
+    char env_dxc[1024]{};
+    const DWORD env_len = GetEnvironmentVariableA("OPENSCARLETT_DXC_PATH", env_dxc, static_cast<DWORD>(sizeof(env_dxc)));
+    if (env_len > 0 && env_len < sizeof(env_dxc) && std::filesystem::exists(env_dxc, ec)) {
+        return std::string(env_dxc);
+    }
+    // 3. Explicit caller-requested path
     if (!requested_path.empty() && std::filesystem::exists(requested_path, ec)) {
         return requested_path;
     }
+    // 4. System PATH
+    char path_buf[MAX_PATH]{};
+    const DWORD path_len = SearchPathA(nullptr, "dxc.exe", nullptr, static_cast<DWORD>(sizeof(path_buf)), path_buf, nullptr);
+    if (path_len > 0 && path_len < sizeof(path_buf) && std::filesystem::exists(path_buf, ec)) {
+        return std::string(path_buf);
+    }
+    // 5. Windows 10/11 SDK fallback
     const std::filesystem::path kits_bin(R"(C:\Program Files (x86)\Windows Kits\10\bin)");
     if (std::filesystem::exists(kits_bin, ec)) {
         std::vector<std::filesystem::path> found;

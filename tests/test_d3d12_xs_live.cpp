@@ -122,6 +122,22 @@ bool CompileHlslWithDxc(
 
 std::string FindDxcExecutable() {
     std::error_code ec;
+    char self_buf[MAX_PATH]{};
+    const DWORD self_len = GetModuleFileNameA(nullptr, self_buf, static_cast<DWORD>(sizeof(self_buf)));
+    if (self_len > 0 && self_len < sizeof(self_buf)) {
+        auto beside = std::filesystem::path(self_buf).parent_path() / "dxc.exe";
+        if (std::filesystem::exists(beside, ec)) return beside.string();
+    }
+    char env_dxc[1024]{};
+    const DWORD env_len = GetEnvironmentVariableA("OPENSCARLETT_DXC_PATH", env_dxc, static_cast<DWORD>(sizeof(env_dxc)));
+    if (env_len > 0 && env_len < sizeof(env_dxc) && std::filesystem::exists(env_dxc, ec)) {
+        return std::string(env_dxc);
+    }
+    char path_buf[MAX_PATH]{};
+    const DWORD path_len = SearchPathA(nullptr, "dxc.exe", nullptr, static_cast<DWORD>(sizeof(path_buf)), path_buf, nullptr);
+    if (path_len > 0 && path_len < sizeof(path_buf) && std::filesystem::exists(path_buf, ec)) {
+        return std::string(path_buf);
+    }
     const char* candidates[] = {
         R"(C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\dxc.exe)",
         R"(C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\dxc.exe)",
