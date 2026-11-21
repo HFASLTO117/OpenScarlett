@@ -259,15 +259,27 @@ OS_HC_API int32_t OS_SHIM_CALL HCAddMockResponseForTest(
 OS_HC_API void OS_SHIM_CALL HCClearMockResponsesForTest(void);
 
 // ===========================================================================
-// 5. XCurl.dll — Xbox Curl Easy + Multi C ABI (offline-safe loopback)
+// 5. XCurl.dll — Xbox Curl Easy + Multi + URL + Share C ABI (offline-safe)
 // ===========================================================================
 typedef void* XCurlEasyHandle;
 typedef void* XCurlMultiHandle;
+typedef void* XCurlShareHandle;
+typedef struct XCurlU* XCurlUHandle;
 
 struct XCurlSlist {
     char* data;
     XCurlSlist* next;
 };
+
+struct XCurlWaitFd {
+    uintptr_t fd;
+    int16_t events;
+    int16_t revents;
+};
+
+constexpr int16_t XCURL_WAIT_POLLIN = 0x0001;
+constexpr int16_t XCURL_WAIT_POLLPRI = 0x0002;
+constexpr int16_t XCURL_WAIT_POLLOUT = 0x0004;
 
 enum XCurlCode : int32_t {
     XCURLE_OK = 0,
@@ -281,48 +293,198 @@ enum XCurlCode : int32_t {
 };
 
 enum XCurlMCode : int32_t {
+    XCURLM_CALL_MULTI_PERFORM = -1,
     XCURLM_OK = 0,
     XCURLM_BAD_HANDLE = 1,
     XCURLM_BAD_EASY_HANDLE = 2,
     XCURLM_OUT_OF_MEMORY = 3,
+    XCURLM_INTERNAL_ERROR = 4,
+    XCURLM_BAD_SOCKET = 5,
+    XCURLM_UNKNOWN_OPTION = 6,
     XCURLM_ADDED_ALREADY = 7,
+    XCURLM_RECURSIVE_API_CALL = 8,
+    XCURLM_WAKEUP_FAILURE = 9,
+    XCURLM_BAD_FUNCTION_ARGUMENT = 10,
+};
+
+enum XCurlSHCode : int32_t {
+    XCURLSHE_OK = 0,
+    XCURLSHE_BAD_OPTION = 1,
+    XCURLSHE_IN_USE = 2,
+    XCURLSHE_INVALID = 3,
+    XCURLSHE_NOMEM = 4,
+    XCURLSHE_NOT_BUILT_IN = 5,
+};
+
+enum XCurlUCode : int32_t {
+    XCURLUE_OK = 0,
+    XCURLUE_BAD_HANDLE = 1,
+    XCURLUE_BAD_PARTPOINTER = 2,
+    XCURLUE_MALFORMED_INPUT = 3,
+    XCURLUE_BAD_PORT_NUMBER = 4,
+    XCURLUE_UNSUPPORTED_SCHEME = 5,
+    XCURLUE_URLDECODE = 6,
+    XCURLUE_OUT_OF_MEMORY = 7,
+    XCURLUE_USER_NOT_ALLOWED = 8,
+    XCURLUE_UNKNOWN_PART = 9,
+    XCURLUE_NO_SCHEME = 10,
+    XCURLUE_NO_USER = 11,
+    XCURLUE_NO_PASSWORD = 12,
+    XCURLUE_NO_OPTIONS = 13,
+    XCURLUE_NO_HOST = 14,
+    XCURLUE_NO_PORT = 15,
+    XCURLUE_NO_QUERY = 16,
+    XCURLUE_NO_FRAGMENT = 17,
+};
+
+enum XCurlUPart : int32_t {
+    XCURLUPART_URL = 0,
+    XCURLUPART_SCHEME = 1,
+    XCURLUPART_USER = 2,
+    XCURLUPART_PASSWORD = 3,
+    XCURLUPART_OPTIONS = 4,
+    XCURLUPART_HOST = 5,
+    XCURLUPART_PORT = 6,
+    XCURLUPART_PATH = 7,
+    XCURLUPART_QUERY = 8,
+    XCURLUPART_FRAGMENT = 9,
+    XCURLUPART_ZONEID = 10,
+};
+
+constexpr uint32_t XCURLU_DEFAULT_PORT = (1u << 0);
+constexpr uint32_t XCURLU_NO_DEFAULT_PORT = (1u << 1);
+constexpr uint32_t XCURLU_DEFAULT_SCHEME = (1u << 2);
+constexpr uint32_t XCURLU_NON_SUPPORT_SCHEME = (1u << 3);
+constexpr uint32_t XCURLU_PATH_AS_IS = (1u << 4);
+constexpr uint32_t XCURLU_DISALLOW_USER = (1u << 5);
+constexpr uint32_t XCURLU_URLDECODE = (1u << 6);
+constexpr uint32_t XCURLU_URLENCODE = (1u << 7);
+constexpr uint32_t XCURLU_APPENDQUERY = (1u << 8);
+constexpr uint32_t XCURLU_GUESS_SCHEME = (1u << 9);
+
+enum XCurlSslSet : int32_t {
+    XCURLSSLSET_OK = 0,
+    XCURLSSLSET_UNKNOWN_BACKEND = 1,
+    XCURLSSLSET_TOO_LATE = 2,
+    XCURLSSLSET_NO_BACKENDS = 3,
+};
+
+struct XCurlVersionInfoData {
+    int32_t age;
+    const char* version;
+    uint32_t version_num;
+    const char* host;
+    int32_t features;
+    const char* ssl_version;
+    long ssl_version_num;
+    const char* libz_version;
+    const char* const* protocols;
+    const char* ares;
+    int32_t ares_num;
+    const char* libidn;
+    int32_t iconv_ver_num;
+    const char* libssh_version;
+    uint32_t brotli_ver_num;
+    const char* brotli_version;
+    uint32_t nghttp2_ver_num;
+    const char* nghttp2_version;
+    const char* quic_version;
+    const char* cainfo;
+    const char* capath;
 };
 
 enum XCurlOption : int32_t {
     XCURLOPT_TIMEOUT = 13,
+    XCURLOPT_INFILESIZE = 14,
+    XCURLOPT_LOW_SPEED_LIMIT = 19,
+    XCURLOPT_LOW_SPEED_TIME = 20,
     XCURLOPT_VERBOSE = 41,
+    XCURLOPT_NOPROGRESS = 43,
     XCURLOPT_NOBODY = 44,
+    XCURLOPT_FAILONERROR = 45,
+    XCURLOPT_UPLOAD = 46,
     XCURLOPT_POST = 47,
     XCURLOPT_FOLLOWLOCATION = 52,
+    XCURLOPT_PUT = 54,
+    XCURLOPT_PROXYPORT = 59,
     XCURLOPT_POSTFIELDSIZE = 60,
     XCURLOPT_SSL_VERIFYPEER = 64,
+    XCURLOPT_MAXREDIRS = 68,
+    XCURLOPT_FRESH_CONNECT = 74,
+    XCURLOPT_FORBID_REUSE = 75,
+    XCURLOPT_CONNECTTIMEOUT = 78,
     XCURLOPT_HTTPGET = 80,
     XCURLOPT_SSL_VERIFYHOST = 81,
+    XCURLOPT_HTTP_VERSION = 84,
+    XCURLOPT_DNS_CACHE_TIMEOUT = 92,
+    XCURLOPT_BUFFERSIZE = 98,
     XCURLOPT_NOSIGNAL = 99,
     XCURLOPT_TIMEOUT_MS = 155,
     XCURLOPT_CONNECTTIMEOUT_MS = 156,
+    XCURLOPT_TCP_KEEPALIVE = 213,
+    XCURLOPT_PIPEWAIT = 237,
     XCURLOPT_WRITEDATA = 10001,
     XCURLOPT_URL = 10002,
+    XCURLOPT_PROXY = 10004,
+    XCURLOPT_READDATA = 10009,
+    XCURLOPT_ERRORBUFFER = 10010,
     XCURLOPT_POSTFIELDS = 10015,
     XCURLOPT_USERAGENT = 10018,
     XCURLOPT_HTTPHEADER = 10023,
     XCURLOPT_HEADERDATA = 10029,
     XCURLOPT_CUSTOMREQUEST = 10036,
+    XCURLOPT_XFERINFODATA = 10057,
+    XCURLOPT_CAINFO = 10065,
+    XCURLOPT_DEBUGDATA = 10095,
+    XCURLOPT_CAPATH = 10097,
+    XCURLOPT_SHARE = 10100,
+    XCURLOPT_ACCEPT_ENCODING = 10102,
     XCURLOPT_PRIVATE = 10103,
+    XCURLOPT_SSL_CTX_DATA = 10109,
     XCURLOPT_COPYPOSTFIELDS = 10165,
     XCURLOPT_WRITEFUNCTION = 20011,
+    XCURLOPT_READFUNCTION = 20012,
+    XCURLOPT_PROGRESSFUNCTION = 20056,
     XCURLOPT_HEADERFUNCTION = 20079,
+    XCURLOPT_DEBUGFUNCTION = 20094,
+    XCURLOPT_SSL_CTX_FUNCTION = 20108,
+    XCURLOPT_XFERINFOFUNCTION = 20219,
+    XCURLOPT_INFILESIZE_LARGE = 30115,
+    XCURLOPT_POSTFIELDSIZE_LARGE = 30120,
+};
+
+enum XCurlMultiOption : int32_t {
+    XCURLMOPT_PIPELINING = 3,
+    XCURLMOPT_MAXCONNECTS = 6,
+    XCURLMOPT_MAX_HOST_CONNECTIONS = 7,
+    XCURLMOPT_MAX_PIPELINE_LENGTH = 8,
+    XCURLMOPT_MAX_TOTAL_CONNECTIONS = 13,
+    XCURLMOPT_MAX_CONCURRENT_STREAMS = 16,
+    XCURLMOPT_SOCKETDATA = 10002,
+    XCURLMOPT_TIMERDATA = 10005,
+    XCURLMOPT_SOCKETFUNCTION = 20001,
+    XCURLMOPT_TIMERFUNCTION = 20004,
 };
 
 enum XCurlInfo : int32_t {
     XCURLINFO_EFFECTIVE_URL = 0x100001,
     XCURLINFO_CONTENT_TYPE = 0x100012,
+    XCURLINFO_SCHEME = 0x100031,
     XCURLINFO_RESPONSE_CODE = 0x200002,
     XCURLINFO_HEADER_SIZE = 0x20000B,
     XCURLINFO_REQUEST_SIZE = 0x20000C,
+    XCURLINFO_REDIRECT_COUNT = 0x200014,
+    XCURLINFO_HTTP_CONNECTCODE = 0x200016,
+    XCURLINFO_OS_ERRNO = 0x200019,
+    XCURLINFO_NUM_CONNECTS = 0x20001A,
     XCURLINFO_TOTAL_TIME = 0x300003,
     XCURLINFO_SIZE_DOWNLOAD = 0x300008,
     XCURLINFO_PRIVATE = 0x400015,
+    XCURLINFO_SIZE_UPLOAD_T = 0x600007,
+    XCURLINFO_SIZE_DOWNLOAD_T = 0x600008,
+    XCURLINFO_SPEED_DOWNLOAD_T = 0x600009,
+    XCURLINFO_CONTENT_LENGTH_DOWNLOAD_T = 0x60000F,
+    XCURLINFO_TOTAL_TIME_T = 0x600032,
 };
 
 enum XCurlMsgType : int32_t {
@@ -345,13 +507,35 @@ typedef size_t(OS_SHIM_CDECL* XCurlWriteCallback)(
     size_t nmemb,
     void* userdata);
 
+typedef void*(OS_SHIM_CDECL* XCurlMallocCallback)(size_t size);
+typedef void(OS_SHIM_CDECL* XCurlFreeCallback)(void* ptr);
+typedef void*(OS_SHIM_CDECL* XCurlReallocCallback)(void* ptr, size_t size);
+typedef char*(OS_SHIM_CDECL* XCurlStrdupCallback)(const char* str);
+typedef void*(OS_SHIM_CDECL* XCurlCallocCallback)(size_t nmemb, size_t size);
+
 constexpr long XCURL_GLOBAL_DEFAULT = 3L;
+constexpr int32_t XCURLVERSION_NOW = 9;
 
 OS_XCURL_API int32_t OS_SHIM_CDECL curl_global_init(long flags);
+OS_XCURL_API int32_t OS_SHIM_CDECL curl_global_init_mem(
+    long flags,
+    XCurlMallocCallback m,
+    XCurlFreeCallback f,
+    XCurlReallocCallback r,
+    XCurlStrdupCallback s,
+    XCurlCallocCallback c);
 OS_XCURL_API void OS_SHIM_CDECL curl_global_cleanup(void);
+OS_XCURL_API int32_t OS_SHIM_CDECL curl_global_sslset(
+    int32_t id,
+    const char* name,
+    const void*** avail);
 OS_XCURL_API const char* OS_SHIM_CDECL curl_version(void);
+OS_XCURL_API XCurlVersionInfoData* OS_SHIM_CDECL curl_version_info(int32_t age);
+OS_XCURL_API int64_t OS_SHIM_CDECL curl_getdate(const char* p, const int64_t* unused);
+OS_XCURL_API void OS_SHIM_CDECL curl_free(void* p);
 
 OS_XCURL_API XCurlEasyHandle OS_SHIM_CDECL curl_easy_init(void);
+OS_XCURL_API XCurlEasyHandle OS_SHIM_CDECL curl_easy_duphandle(XCurlEasyHandle curl);
 OS_XCURL_API void OS_SHIM_CDECL curl_easy_cleanup(XCurlEasyHandle curl);
 OS_XCURL_API void OS_SHIM_CDECL curl_easy_reset(XCurlEasyHandle curl);
 OS_XCURL_API int32_t OS_SHIM_CDECL curl_easy_setopt(
@@ -364,6 +548,17 @@ OS_XCURL_API int32_t OS_SHIM_CDECL curl_easy_getinfo(
     int32_t info,
     ...);
 OS_XCURL_API const char* OS_SHIM_CDECL curl_easy_strerror(int32_t code);
+OS_XCURL_API char* OS_SHIM_CDECL curl_easy_escape(
+    XCurlEasyHandle curl,
+    const char* string,
+    int32_t length);
+OS_XCURL_API char* OS_SHIM_CDECL curl_easy_unescape(
+    XCurlEasyHandle curl,
+    const char* string,
+    int32_t length,
+    int32_t* outlength);
+OS_XCURL_API char* OS_SHIM_CDECL curl_escape(const char* string, int32_t length);
+OS_XCURL_API char* OS_SHIM_CDECL curl_unescape(const char* string, int32_t length);
 
 OS_XCURL_API XCurlSlist* OS_SHIM_CDECL curl_slist_append(
     XCurlSlist* list,
@@ -381,9 +576,60 @@ OS_XCURL_API int32_t OS_SHIM_CDECL curl_multi_remove_handle(
 OS_XCURL_API int32_t OS_SHIM_CDECL curl_multi_perform(
     XCurlMultiHandle multi_handle,
     int32_t* running_handles);
+OS_XCURL_API int32_t OS_SHIM_CDECL curl_multi_poll(
+    XCurlMultiHandle multi_handle,
+    XCurlWaitFd extra_fds[],
+    uint32_t extra_nfds,
+    int32_t timeout_ms,
+    int32_t* numfds);
+OS_XCURL_API int32_t OS_SHIM_CDECL curl_multi_wait(
+    XCurlMultiHandle multi_handle,
+    XCurlWaitFd extra_fds[],
+    uint32_t extra_nfds,
+    int32_t timeout_ms,
+    int32_t* numfds);
+OS_XCURL_API int32_t OS_SHIM_CDECL curl_multi_wakeup(XCurlMultiHandle multi_handle);
+OS_XCURL_API int32_t OS_SHIM_CDECL curl_multi_setopt(
+    XCurlMultiHandle multi_handle,
+    int32_t option,
+    ...);
+OS_XCURL_API const char* OS_SHIM_CDECL curl_multi_strerror(int32_t code);
 OS_XCURL_API XCurlMsg* OS_SHIM_CDECL curl_multi_info_read(
     XCurlMultiHandle multi_handle,
     int32_t* msgs_in_queue);
+
+OS_XCURL_API XCurlShareHandle OS_SHIM_CDECL curl_share_init(void);
+OS_XCURL_API int32_t OS_SHIM_CDECL curl_share_cleanup(XCurlShareHandle share);
+OS_XCURL_API int32_t OS_SHIM_CDECL curl_share_setopt(
+    XCurlShareHandle share,
+    int32_t option,
+    ...);
+OS_XCURL_API const char* OS_SHIM_CDECL curl_share_strerror(int32_t code);
+
+OS_XCURL_API XCurlUHandle OS_SHIM_CDECL curl_url(void);
+OS_XCURL_API void OS_SHIM_CDECL curl_url_cleanup(XCurlUHandle handle);
+OS_XCURL_API XCurlUHandle OS_SHIM_CDECL curl_url_dup(XCurlUHandle in);
+OS_XCURL_API int32_t OS_SHIM_CDECL curl_url_get(
+    XCurlUHandle handle,
+    int32_t what,
+    char** part,
+    uint32_t flags);
+OS_XCURL_API int32_t OS_SHIM_CDECL curl_url_set(
+    XCurlUHandle handle,
+    int32_t what,
+    const char* part,
+    uint32_t flags);
+
+OS_XCURL_API int32_t OS_SHIM_CDECL xcurl_global_init_mem(
+    long flags,
+    XCurlMallocCallback m,
+    XCurlFreeCallback f,
+    XCurlReallocCallback r,
+    XCurlStrdupCallback s,
+    XCurlCallocCallback c);
+OS_XCURL_API void OS_SHIM_CDECL xcurl_global_suspend(void);
+OS_XCURL_API void OS_SHIM_CDECL xcurl_global_resume(void);
+OS_XCURL_API int32_t OS_SHIM_CDECL xcurl_global_set_request_limit(uint32_t requestLimit);
 
 // ===========================================================================
 // 6. Bink2Scarlett.dll — Bink2 Video Playback C ABI (backed by Bink2Decoder)
