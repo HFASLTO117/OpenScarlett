@@ -1078,7 +1078,7 @@ Status VulkanBackend::InitializeSoftwareFallback() {
     impl_->initialized = true;
     impl_->fallback_mode = true;
     device_info_ = VulkanDeviceInfo{};
-    device_info_.device_name = "ScarlettX Software SPIR-V Compute Fallback";
+    device_info_.device_name = "OpenScarlett Software SPIR-V Compute Fallback";
     device_info_.vendor_id = 0x5358;
     device_info_.device_id = 0x0001;
     device_info_.api_version = kVkApiVersion1_2;
@@ -1143,9 +1143,9 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
 
             VkApplicationInfo app_info{};
             app_info.sType = kVkStypeApplicationInfo;
-            app_info.pApplicationName = "ScarlettX";
+            app_info.pApplicationName = "OpenScarlett";
             app_info.applicationVersion = VkMakeApiVersion(0, 0, 1, 0);
-            app_info.pEngineName = "ScarlettX-Vulkan";
+            app_info.pEngineName = "OpenScarlett-Vulkan";
             app_info.engineVersion = VkMakeApiVersion(0, 0, 1, 0);
             app_info.apiVersion = target_api;
 
@@ -1346,7 +1346,7 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
             impl_->initialized = true;
             impl_->fallback_mode = false;
 
-            std::cerr << "[ScarlettX][vulkan] ICD Device: \"" << device_info_.device_name
+            std::cerr << "[OpenScarlett][vulkan] ICD Device: \"" << device_info_.device_name
                       << "\" API=" << device_info_.api_major << "." << device_info_.api_minor
                       << "." << device_info_.api_patch
                       << " vendor=0x" << std::hex << device_info_.vendor_id
@@ -1368,7 +1368,7 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
     if (!allow_software_fallback) {
         return Status::Error(StatusCode::DeviceError, failure_reason);
     }
-    std::cerr << "[ScarlettX][vulkan] Falling back to software SPIR-V compute (" << failure_reason << ")\n";
+    std::cerr << "[OpenScarlett][vulkan] Falling back to software SPIR-V compute (" << failure_reason << ")\n";
     return InitializeSoftwareFallback();
 }
 

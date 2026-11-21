@@ -3,6 +3,8 @@ build/
 build-*/
 out/
 .tmp/
+.tools/
+.worktrees/
 .vs/
 .vscode/
 .cache/

@@ -1342,7 +1342,7 @@ Status OptimizeRdna2Ir(Rdna2IrModule& module, Rdna2IrOptStats* out_stats) {
 
 std::string DumpRdna2Ir(const Rdna2IrModule& module) {
     std::ostringstream os;
-    os << "; ScarlettX RDNA2 SSA IR (blocks=" << module.blocks.size()
+    os << "; OpenScarlett RDNA2 SSA IR (blocks=" << module.blocks.size()
        << ", tg=" << module.threadgroup_x << "x" << module.threadgroup_y << "x" << module.threadgroup_z << ")\n";
     for (const auto& bb : module.blocks) {
         os << "bb" << bb.id << ":";
