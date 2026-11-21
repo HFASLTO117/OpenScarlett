@@ -230,7 +230,12 @@ private:
 
 #if defined(_WIN32)
 
-// Standard Windows Media Foundation GUIDs (defined inline to avoid hard-linking mfuuid.lib).
+// Standard COM & Windows Media Foundation GUIDs (defined inline to avoid hard-linking mfuuid.lib
+// and to stay portable across MSVC, Clang-CL, and MinGW-w64 without __uuidof()).
+constexpr GUID kIidClassFactory = {
+    0x00000001u, 0x0000u, 0x0000u, {0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
+constexpr GUID kIidImfTransform = {
+    0xbf94c121u, 0x5b05u, 0x4e6fu, {0x80, 0x00, 0xba, 0x59, 0x89, 0x61, 0x41, 0x4d}};
 constexpr GUID kClsidMsOpusDecoderMft = {
     0x63e17c10u, 0x2d43u, 0x4c42u, {0x8f, 0xe3, 0x8d, 0x8b, 0x63, 0xe4, 0x6a, 0x6a}};
 constexpr GUID kMftCategoryAudioDecoder = {
@@ -828,10 +833,10 @@ struct OpusMftDecoder::Impl {
             if (pfn_get_class) {
                 IClassFactory* factory = nullptr;
                 HRESULT hr = pfn_get_class(
-                    kClsidMsOpusDecoderMft, __uuidof(IClassFactory), reinterpret_cast<void**>(&factory));
+                    kClsidMsOpusDecoderMft, kIidClassFactory, reinterpret_cast<void**>(&factory));
                 if (SUCCEEDED(hr) && factory) {
                     hr = factory->CreateInstance(
-                        nullptr, __uuidof(IMFTransform), reinterpret_cast<void**>(&mft));
+                        nullptr, kIidImfTransform, reinterpret_cast<void**>(&mft));
                     factory->Release();
                     stats.last_hresult = static_cast<int32_t>(hr);
                     if (SUCCEEDED(hr) && mft) {
@@ -850,7 +855,7 @@ struct OpusMftDecoder::Impl {
                 kClsidMsOpusDecoderMft,
                 nullptr,
                 CLSCTX_INPROC_SERVER,
-                __uuidof(IMFTransform),
+                kIidImfTransform,
                 reinterpret_cast<void**>(&mft));
             stats.last_hresult = static_cast<int32_t>(hr);
             if (SUCCEEDED(hr) && mft) {
@@ -878,7 +883,7 @@ struct OpusMftDecoder::Impl {
                 for (UINT32 i = 0u; i < count; ++i) {
                     if (!mft && activates[i]) {
                         HRESULT act_hr = activates[i]->ActivateObject(
-                            __uuidof(IMFTransform), reinterpret_cast<void**>(&mft));
+                            kIidImfTransform, reinterpret_cast<void**>(&mft));
                         stats.last_hresult = static_cast<int32_t>(act_hr);
                         if (SUCCEEDED(act_hr) && mft) {
                             stats.backend_detail = "MSOpusDecoder.dll (MFTEnumEx)";

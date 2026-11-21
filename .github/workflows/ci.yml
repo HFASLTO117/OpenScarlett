@@ -201,6 +201,247 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
+  clang-cl-build-and-test:
+    name: Windows x64 Clang-CL (Release)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC x64 developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Locate Clang-CL and Ninja
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Command ninja -ErrorAction SilentlyContinue)) {
+            $vsNinja = Join-Path $env:VSINSTALLDIR "Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja"
+            if (Test-Path (Join-Path $vsNinja "ninja.exe")) {
+              Add-Content -Path $env:GITHUB_PATH -Value $vsNinja
+              $env:PATH = "$vsNinja;$env:PATH"
+            } else {
+              choco install ninja -y --no-progress
+            }
+          }
+          if (-not (Get-Command clang-cl -ErrorAction SilentlyContinue)) {
+            $llvmCandidates = @(
+              (Join-Path $env:VSINSTALLDIR "VC\Tools\Llvm\x64\bin"),
+              "C:\Program Files\LLVM\bin"
+            )
+            foreach ($dir in $llvmCandidates) {
+              if (Test-Path (Join-Path $dir "clang-cl.exe")) {
+                Add-Content -Path $env:GITHUB_PATH -Value $dir
+                $env:PATH = "$dir;$env:PATH"
+                break
+              }
+            }
+          }
+          clang-cl --version
+          cmake --version
+          ninja --version
+
+      - name: Configure (CMake + Ninja + Clang-CL)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake -S . -B build-clangcl -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_C_COMPILER=clang-cl `
+            -DCMAKE_CXX_COMPILER=clang-cl
+
+      - name: Build (Clang-CL)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          cmake --build build-clangcl --parallel
+
+      - name: Run CTest suite (Clang-CL)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $saveRoot = Join-Path $env:RUNNER_TEMP "openscarlett_saves_clangcl"
+          New-Item -ItemType Directory -Force -Path $saveRoot | Out-Null
+          $env:OPENSCARLETT_SAVE_ROOT = $saveRoot
+          ctest --test-dir build-clangcl --output-on-failure --verbose
+
+      - name: Publish Clang-CL test summary
+        if: always()
+        shell: pwsh
+        run: |
+          $summary = @()
+          $summary += "### Windows x64 Clang-CL (Release)"
+          $summary += ""
+          if (Get-Command clang-cl -ErrorAction SilentlyContinue) {
+            $ver = (& clang-cl --version 2>&1 | Select-Object -First 1)
+            $summary += "**Compiler:** ``$ver``"
+            $summary += ""
+          }
+          $lastTestLog = "build-clangcl/Testing/Temporary/LastTest.log"
+          if (Test-Path $lastTestLog) {
+            $logText = (Get-Content -Raw $lastTestLog) -replace "`r`n", "`n"
+            $testMatches = [regex]::Matches($logText, '(?ms)^\d+/\d+ Test: (\S+)\n.*?^Test (Passed|Failed)\.$')
+            if ($testMatches.Count -gt 0) {
+              $passed = ($testMatches | Where-Object { $_.Groups[2].Value -eq 'Passed' }).Count
+              $summary += "**CTest:** ``$passed/$($testMatches.Count)`` passing"
+              $summary += ""
+              $summary += "| Test | Result |"
+              $summary += "| :--- | :---: |"
+              foreach ($m in $testMatches) {
+                $icon = if ($m.Groups[2].Value -eq 'Passed') { 'PASS' } else { 'FAIL' }
+                $summary += "| ``$($m.Groups[1].Value)`` | $icon |"
+              }
+              $summary += ""
+            }
+          }
+          $summary -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+  mingw64-build:
+    name: Windows x64 MinGW-w64 (Non-Blocking Portability Check)
+    runs-on: windows-latest
+    continue-on-error: true
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2 MinGW-w64 toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+
+      - name: Verify MinGW-w64 toolchain
+        run: |
+          x86_64-w64-mingw32-g++ --version
+          cmake --version
+          ninja --version
+
+      - name: Configure (CMake + Ninja + MinGW-w64)
+        run: |
+          cmake -S . -B build-mingw -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
+            -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++
+
+      - name: Build core, d3d12_xs (PR #6 COM/.def), and portable shims
+        run: |
+          set +e
+          mkdir -p build-mingw
+          RESULTS_FILE="build-mingw/mingw_target_results.txt"
+          : > "$RESULTS_FILE"
+
+          PRIMARY_TARGETS=(
+            openscarlett_core
+            d3d12_xs
+          )
+          PORTABLE_TARGETS=(
+            xg_xs
+            winrt_xs
+            kernelx
+            xmem
+            xgameruntime
+            GameInput
+            AcpHal
+            dstorage_xs
+            Microsoft.Xbox.Services.GDK.C
+            pixevt
+            xcrdapi
+            libHttpClient.GDK
+            XCurl
+            Bink2Scarlett
+            amd_fidelityfx_upscaler_xbox
+            amd_fidelityfx_loader_xbox
+            XboxBvhBuilder
+            test_codecs
+            test_rdna2_core
+            test_winrt_xs
+            test_kernelx
+            test_d3d12_xs_live
+            test_xg_dstorage
+            test_dxr_live
+            test_secondary_shims
+          )
+
+          PRIMARY_FAIL=0
+          for t in "${PRIMARY_TARGETS[@]}"; do
+            echo "=== Building MinGW-w64 primary target: $t ==="
+            if cmake --build build-mingw --target "$t" --parallel; then
+              echo "PRIMARY|$t|PASS" >> "$RESULTS_FILE"
+            else
+              echo "PRIMARY|$t|FAIL" >> "$RESULTS_FILE"
+              PRIMARY_FAIL=1
+            fi
+          done
+
+          for t in "${PORTABLE_TARGETS[@]}"; do
+            echo "=== Building MinGW-w64 portable target: $t ==="
+            if cmake --build build-mingw --target "$t" --parallel; then
+              echo "PORTABLE|$t|PASS" >> "$RESULTS_FILE"
+            else
+              echo "PORTABLE|$t|FAIL" >> "$RESULTS_FILE"
+            fi
+          done
+
+          # Run clean-room MinGW unit tests that built cleanly
+          TEST_RESULTS_FILE="build-mingw/mingw_test_results.txt"
+          : > "$TEST_RESULTS_FILE"
+          export OPENSCARLETT_AUDIO_NULL=1
+          export OPENSCARLETT_SAVE_ROOT="${RUNNER_TEMP}/openscarlett_saves_mingw"
+          mkdir -p "$OPENSCARLETT_SAVE_ROOT"
+          for tst in test_codecs test_rdna2_core test_winrt_xs test_kernelx; do
+            if [ -x "build-mingw/${tst}.exe" ]; then
+              echo "=== Running MinGW-w64 test: $tst ==="
+              if "./build-mingw/${tst}.exe"; then
+                echo "$tst|PASS" >> "$TEST_RESULTS_FILE"
+              else
+                echo "$tst|FAIL" >> "$TEST_RESULTS_FILE"
+              fi
+            fi
+          done
+
+          exit $PRIMARY_FAIL
+
+      - name: Publish MinGW-w64 portability summary
+        if: always()
+        run: |
+          {
+            echo "### Windows x64 MinGW-w64 Portability Check (Non-Blocking)"
+            echo ""
+            echo "**Compiler:** \`$(x86_64-w64-mingw32-g++ --version | head -n 1)\`"
+            echo ""
+            if [ -f "build-mingw/mingw_target_results.txt" ]; then
+              PASS_CNT=$(grep -c '|PASS$' build-mingw/mingw_target_results.txt || true)
+              TOTAL_CNT=$(wc -l < build-mingw/mingw_target_results.txt | tr -d ' ')
+              echo "**Build Targets:** \`${PASS_CNT}/${TOTAL_CNT}\` built cleanly (verifies \`d3d12_xs_mingw.def\`, \`kernelx_mingw.def\`, \`xmem_mingw.def\`, and COM aggregate-return compatibility)"
+              echo ""
+              echo "| Tier | Target | Build |"
+              echo "| :--- | :--- | :---: |"
+              while IFS='|' read -r tier tgt res; do
+                echo "| ${tier} | \`${tgt}\` | ${res} |"
+              done < build-mingw/mingw_target_results.txt
+              echo ""
+            fi
+            if [ -s "build-mingw/mingw_test_results.txt" ]; then
+              echo "| MinGW Unit Test | Result |"
+              echo "| :--- | :---: |"
+              while IFS='|' read -r tst res; do
+                echo "| \`${tst}\` | ${res} |"
+              done < build-mingw/mingw_test_results.txt
+              echo ""
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
   publish-release:
     name: Publish Portable GitHub Release (${{ github.ref_name }})
     if: startsWith(github.ref, 'refs/tags/v')

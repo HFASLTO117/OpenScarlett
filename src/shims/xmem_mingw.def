@@ -1,0 +1,13 @@
+LIBRARY xmem.dll
+EXPORTS
+    XMemAlloc = XMemShim_XMemAlloc
+    XMemAllocDefault = XMemShim_XMemAllocDefault
+    XMemFree = XMemShim_XMemFree
+    XMemFreeDefault = XMemShim_XMemFreeDefault
+    XMemSize = XMemShim_XMemSize
+    XMemSizeDefault = XMemShim_XMemSizeDefault
+    XMemGetAuxiliaryTitleMemory = XMemShim_XMemGetAuxiliaryTitleMemory
+    XMemReleaseAuxiliaryTitleMemory = XMemShim_XMemReleaseAuxiliaryTitleMemory
+    XMemMapPhysicalPages = XMemShim_XMemMapPhysicalPages
+    XMemUnmapPhysicalPages = XMemShim_XMemUnmapPhysicalPages
+    XMemGetTelemetryCallCountForTest = XMemShim_GetTelemetryCallCountForTest
