@@ -38,6 +38,7 @@ int main(int argc, char** argv) {
     OS_REQUIRE(!rep.is_dll);
     OS_REQUIRE(rep.section_count >= 3);
     OS_REQUIRE(rep.total_imports > 10);
+    OS_REQUIRE(rep.exception_entry_count > 0);
 
     // 3. Reject invalid/truncated PE bytes cleanly
     PeInspectionReport bad;

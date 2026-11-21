@@ -1,7 +1,10 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 #include <vector>
 
 #include "openscarlett/core/status.h"
@@ -16,6 +19,26 @@ enum class DllCategory : uint8_t {
     Other = 4,
 };
 
+enum class DllRoutePolicy : uint8_t {
+    Shim = 0,
+    NativeGuestDll = 1,
+    Windows = 2,
+};
+
+struct DllRouteRule {
+    std::string canonical_name;
+    DllRoutePolicy policy = DllRoutePolicy::Windows;
+    int load_priority = 10;  // 0 = base shims, 1 = core shims, 2 = dependent shims, 10 = default
+};
+
+struct DllRouteDecision {
+    DllRoutePolicy policy = DllRoutePolicy::Windows;
+    std::string canonical_name;
+    std::wstring resolved_path;  // Non-empty when a backing Shim/NativeGuestDll file was located
+    int load_priority = 10;
+    bool from_override = false;
+};
+
 struct PeImportSymbol {
     std::string name;       // Empty when imported by ordinal only
     uint16_t ordinal = 0;
@@ -27,6 +50,30 @@ struct PeImportModule {
     std::string dll_name;
     DllCategory category = DllCategory::Other;
     std::vector<PeImportSymbol> symbols;
+};
+
+struct PeExportSymbol {
+    std::string name;       // Empty when exported by ordinal only
+    uint32_t ordinal = 0;
+    uint32_t rva = 0;
+    bool is_forwarded = false;
+    std::string forwarder;  // e.g. "kernelbase.CreateFileW" or "other.#42"
+};
+
+struct PeForwarderTarget {
+    std::string dll_name;     // Normalized with ".dll" suffix when omitted
+    std::string symbol_name;  // Empty when by_ordinal is true
+    uint16_t ordinal = 0;
+    bool by_ordinal = false;
+};
+
+struct PeForwarderResolution {
+    std::string final_dll;
+    std::string final_symbol;
+    uint16_t final_ordinal = 0;
+    bool by_ordinal = false;
+    uint32_t final_rva = 0;
+    std::vector<std::string> chain;
 };
 
 struct PeInspectionReport {
@@ -46,14 +93,114 @@ struct PeInspectionReport {
     uint32_t gdk_imports = 0;
     uint32_t delay_load_imports = 0;
     std::vector<PeImportModule> imports;
+
+    // Export directory & export forwarders (IMAGE_DIRECTORY_ENTRY_EXPORT)
+    uint32_t export_dir_rva = 0;
+    uint32_t export_dir_size = 0;
+    uint32_t export_ordinal_base = 0;
+    std::vector<PeExportSymbol> exports;
+
+    // TLS directory & callback RVAs (IMAGE_DIRECTORY_ENTRY_TLS)
+    uint32_t tls_dir_rva = 0;
+    uint32_t tls_dir_size = 0;
+    std::vector<uint32_t> tls_callback_rvas;
+
+    // x64 .pdata exception table (IMAGE_DIRECTORY_ENTRY_EXCEPTION)
+    uint32_t exception_dir_rva = 0;
+    uint32_t exception_dir_size = 0;
+    uint32_t exception_entry_count = 0;
 };
 
 const char* DllCategoryName(DllCategory category) noexcept;
 DllCategory ClassifyImportDll(const std::string& dll_name);
 
+const char* DllRoutePolicyName(DllRoutePolicy policy) noexcept;
+
+// Data-driven per-DLL routing table shared by apc_injector and hook_dll.
+class DllRoutingTable {
+public:
+    // Populates built-in routing rules for all 19 OpenScarlett Xbox/GDK shim DLLs.
+    DllRoutingTable();
+
+    // Builds the routing table with built-in rules plus OPENSCARLETT_DLL_ROUTING overrides.
+    static DllRoutingTable CreateWithEnvOverrides();
+
+    // Applies semicolon/comma-separated override rules such as:
+    //   "foo.dll=guest;dstorage_xs.dll=shim;user32.dll=windows"
+    void ApplyOverrides(std::string_view override_spec);
+
+    // Explicitly sets or overrides a single DLL's routing rule.
+    void SetRule(std::string_view dll_name, DllRoutePolicy policy, int load_priority = 1);
+
+    // Looks up an explicit rule for dll_name (case-insensitive, basename-normalized).
+    const DllRouteRule* FindRule(std::string_view dll_name) const;
+
+    // Decides whether to route dll_name to Shim, NativeGuestDll, or Windows.
+    DllRouteDecision ResolveRoute(std::string_view dll_name,
+                                  std::wstring_view shim_dir,
+                                  std::wstring_view guest_dir = {}) const;
+
+    DllRouteDecision ResolveRouteW(std::wstring_view dll_name,
+                                   std::wstring_view shim_dir,
+                                   std::wstring_view guest_dir = {}) const;
+
+    // Returns all configured rules ordered by (load_priority, canonical_name).
+    std::vector<DllRouteRule> ListRules() const;
+
+private:
+    static std::string NormalizeDllKey(std::string_view raw_name);
+    static std::string NormalizeCanonicalName(std::string_view raw_name);
+
+    struct Entry {
+        DllRouteRule rule;
+        bool from_override = false;
+    };
+    std::unordered_map<std::string, Entry> rules_;
+};
+
 Status InspectPeFile(const std::string& file_path, PeInspectionReport& out_report);
 Status InspectPeBytes(const std::vector<uint8_t>& bytes,
                       const std::string& label,
                       PeInspectionReport& out_report);
+
+// Parses a PE export forwarder string ("DLL.Symbol" or "DLL.#Ordinal").
+bool ParseExportForwarder(std::string_view forwarder, PeForwarderTarget& out_target);
+
+// Callback returning raw PE file bytes for a given DLL name (used for recursive forwarder resolution).
+using PeModuleBytesResolver =
+    std::function<Status(const std::string& dll_name, std::vector<uint8_t>& out_bytes)>;
+
+// Resolves a PE export-forwarder chain recursively up to max_depth (default 8) with cycle detection.
+Status ResolveExportForwarderChain(const std::string& start_dll,
+                                   const std::string& start_symbol,
+                                   uint16_t start_ordinal,
+                                   bool by_ordinal,
+                                   const PeModuleBytesResolver& resolver,
+                                   PeForwarderResolution& out_resolution,
+                                   uint32_t max_depth = 8);
+
+// Inspects an in-memory mapped PE32+ image to detect whether `proc_name_or_ordinal`
+// is a forwarded export and extracts its parsed forwarder target.
+bool LookupMappedPeExportForwarder(const void* module_base,
+                                   const char* proc_name_or_ordinal,
+                                   PeForwarderTarget& out_target,
+                                   std::string* out_raw_forwarder = nullptr);
+
+// Reads TLS callback RVAs from an in-memory mapped PE32+ image.
+bool ReadMappedPeTlsCallbackRvas(const void* module_base,
+                                 std::vector<uint32_t>& out_callback_rvas);
+
+// Clean-room helper to invoke all IMAGE_DIRECTORY_ENTRY_TLS callbacks on a mapped PE32+ image.
+// Returns the number of callbacks invoked.
+uint32_t InvokePeTlsCallbacks(void* module_base, uint32_t reason, void* reserved = nullptr);
+
+// Registers an x64 .pdata RUNTIME_FUNCTION table with Windows SEH via RtlAddFunctionTable.
+bool RegisterPeExceptionTable(void* module_base, uint32_t pdata_rva, uint32_t pdata_size);
+
+// Convenience helper: reads IMAGE_DIRECTORY_ENTRY_EXCEPTION from a mapped PE32+ image and registers it.
+bool RegisterPeExceptionTableFromImage(void* module_base, uint32_t* out_entry_count = nullptr);
+
+// Unregisters an x64 .pdata RUNTIME_FUNCTION table via RtlDeleteFunctionTable.
+bool UnregisterPeExceptionTable(void* module_base, uint32_t pdata_rva);
 
 }  // namespace openscarlett
