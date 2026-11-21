@@ -81,7 +81,7 @@ def collect_components() -> list[Component]:
             stage="Live-GPU Verified",
             pct=100,
             what_works="Zero-SDK dynamic `vulkan-1.dll` loader, SPIR-V 1.3 validator, live GPU compute/LDS/wave64 pipelines + software fallback",
-            verified_on="GTX 1650 Ti (Vk 1.4.329), RTX 2060 SUPER (Vk 1.4.351), AMD RX 7900 XTX (Vk 1.4.359) & RX 9070 XT (Vk 1.4.315)",
+            verified_on="NVIDIA GTX 1650 Ti, RTX 2060 SUPER & RTX 3080 Ti (Vk 1.4.329–357); AMD RX 7600, RX 7900 XTX & RX 9070 XT (Vk 1.4.315–359)",
         ),
         Component(
             name="Codecs, Opus/WASAPI Audio & GPU FSR 1.0 Upscaler",
@@ -93,7 +93,7 @@ def collect_components() -> list[Component]:
                 if has_opus
                 else "Microsoft GDeflate v1 (`0x04/0xFB`), Xbox BCPack (BC1–BC7), XMA2 2048B IMDCT audio, Bink2 `KB2i` DCT video, live D3D12 GPU FSR 1.0 EASU+RCAS"
             ),
-            verified_on="GTX 1650 Ti, RTX 2060 SUPER, AMD RX 7900 XTX & RX 9070 XT (`0 LSB` FSR1) + WARP (`test_codecs`, `test_audio_opus_wasapi`, `test_d3d12_xs_live`)" if has_opus else "GTX 1650 Ti, RTX 2060 SUPER, AMD RX 7900 XTX & RX 9070 XT + WARP (`test_codecs`, `test_d3d12_xs_live`)",
+            verified_on="6 PCs (GTX 1650 Ti, RTX 2060 SUPER/3080 Ti, AMD RX 7600/7900 XTX/9070 XT) + WARP (`test_codecs`, `test_audio_opus_wasapi`, `test_d3d12_xs_live`)" if has_opus else "6 PCs (NVIDIA + AMD RDNA3/4) + WARP (`test_codecs`, `test_d3d12_xs_live`)",
         ),
         Component(
             name="RDNA2 AAA Shader Lifter, CPU Interpreter & Disk Cache",
@@ -105,7 +105,7 @@ def collect_components() -> list[Component]:
                 if has_shader_cache
                 else "RDNA2 disassembler + SSA IR (const-fold/DCE) + SPIR-V 1.3 & DXIL SM 6.5 lifter (`MIMG`, `DS`/LDS + `S_BARRIER`, `wave64`→`wave32`, `VS`/`PS`/`CS`/`MS`/`AS`)"
             ),
-            verified_on="`spirv-val` + `dxc` SM 6.5 + GTX 1650 Ti, RTX 2060 SUPER, AMD RX 7900 XTX & RX 9070 XT (`MeshTier=10`) + WARP (`test_rdna2_lifter_live`, `test_d3d12_xs_autolift`)" if has_shader_cache else "`spirv-val` + `dxc` SM 6.5 + GTX 1650 Ti, RTX 2060 SUPER, AMD RX 7900 XTX & RX 9070 XT (`MeshTier=10`) + WARP",
+            verified_on="`spirv-val` + `dxc` SM 6.5 + 6 GPUs (NVIDIA Turing/Ampere + AMD RDNA3/RDNA4 `MeshTier=10`) + WARP (`test_rdna2_lifter_live`, `test_d3d12_xs_autolift`)" if has_shader_cache else "`spirv-val` + `dxc` SM 6.5 + 6 GPUs (NVIDIA + AMD `MeshTier=10`) + WARP",
         ),
         Component(
             name="WinRT Activation & HSTRING (`winrt_xs.dll`)",
@@ -133,7 +133,7 @@ def collect_components() -> list[Component]:
                 if (has_presentx_win and has_opus)
                 else "Modular `DeviceX`/`CommandQueueX`/`CommandListX` COM proxies with per-slot telemetry, `PresentX` (DXGI flip-model + readback), `DispatchMesh`, `xg_xs` `4KB_S`/`64KB_S`"
             ),
-            verified_on="GTX 1650 Ti, RTX 2060 SUPER, AMD RX 7900 XTX & RX 9070 XT (`MeshTier=10`) + WARP (`test_d3d12_xs_live`, `test_presentx_windowing`, `test_xg_dstorage`)" if has_presentx_win else "GTX 1650 Ti, RTX 2060 SUPER, AMD RX 7900 XTX & RX 9070 XT (`MeshTier=10`) + WARP",
+            verified_on="6 GPUs (GTX 1650 Ti, RTX 2060 SUPER/3080 Ti, AMD RX 7600/7900 XTX/9070 XT `MeshTier=10`) + WARP (`test_d3d12_xs_live`, `test_presentx_windowing`, `test_xg_dstorage`)" if has_presentx_win else "6 GPUs (NVIDIA + AMD `MeshTier=10`) + WARP",
         ),
         Component(
             name="GDK & Console Shims (16 DLLs + `QueryApiImpl`)",
@@ -162,9 +162,9 @@ def collect_components() -> list[Component]:
                 else "`ID3D12Device5` BLAS/TLAS/SBT ABI + live hardware RT-core path (`DXR=12`) + 12-bin SAH software BVH fallback (`XboxBvhBuilder.dll`)"
             ),
             verified_on=(
-                "RTX 2060 SUPER (`DXR=12`), AMD RX 7900 XTX & RX 9070 XT (`DXR=11` HW), GTX 1650 Ti (`MeshTier=10`, SW) + WARP (`test_dxr_live`, `test_gdk_simple_pbr`, `test_gdk_meshlet_cull`, `test_gdk_dxr_triangle`)"
+                "RTX 2060 SUPER & RTX 3080 Ti (`DXR=12`), AMD RX 7600/7900 XTX/9070 XT (`DXR=11` HW), GTX 1650 Ti (`MeshTier=10`, SW) + WARP (`test_dxr_live`, `test_gdk_simple_pbr`, `test_gdk_meshlet_cull`, `test_gdk_dxr_triangle`)"
                 if has_wave2
-                else "RTX 2060 SUPER (`DXR=12` HW), AMD RX 7900 XTX & RX 9070 XT (`DXR=11` HW), GTX 1650 Ti (`DXR=0` SW) + WARP (`test_dxr_live`, `test_secondary_shims`)"
+                else "RTX 2060 SUPER & RTX 3080 Ti (`DXR=12`), AMD RX 7600/7900 XTX/9070 XT (`DXR=11`), GTX 1650 Ti (`DXR=0` SW) + WARP (`test_dxr_live`, `test_secondary_shims`)"
             ),
         ),
         Component(
@@ -255,7 +255,7 @@ def render_markdown(components: list[Component], ctest: tuple[int, int] | None) 
         "",
         "![OpenScarlett Status](docs/status.svg)",
         "",
-        f"**Overall Clean-Room Readiness:** `{avg_pct:.1f}%` · **Automated Tests:** {test_str} · **Verified Hardware:** `Win10 + GTX 1650 Ti` · `Win11 26H2 + RTX 2060 SUPER (DXR=12)` · `Win11 26H2 + AMD RX 7900 XTX (Wave64/DXR=11)` · `Win11 26H2 + AMD RX 9070 XT (Wave64/DXR=11)`",
+        f"**Overall Clean-Room Readiness:** `{avg_pct:.1f}%` · **Automated Tests:** {test_str} · **Verified Hardware (6 PCs):** `Win10 + GTX 1650 Ti` · `Win11 25H2/26H2 + RTX 2060 SUPER & RTX 3080 Ti (DXR=12)` · `Win11 26H2 + AMD RX 7600, RX 7900 XTX & RX 9070 XT (Wave64/DXR=11)`",
         "",
         "| Subsystem | Area | Status | Progress | What Works Right Now | Verified On |",
         "| :--- | :--- | :--- | :---: | :--- | :--- |",
