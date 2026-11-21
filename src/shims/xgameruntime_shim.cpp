@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -24,6 +25,7 @@
 
 #if defined(_WIN32)
 #  include <malloc.h>
+#  include <windows.h>
 #endif
 
 namespace fs = std::filesystem;
@@ -49,14 +51,20 @@ inline void RecordOk(const char* sym) {
 }
 
 std::string GetEnvString(const char* name) {
-#if defined(_MSC_VER)
-    char* buf = nullptr;
-    size_t len = 0;
-    if (_dupenv_s(&buf, &len, name) != 0 || !buf) {
+#if defined(_WIN32)
+    if (!name || !*name) {
         return {};
     }
-    std::string out(buf);
-    std::free(buf);
+    const DWORD needed = GetEnvironmentVariableA(name, nullptr, 0);
+    if (needed == 0) {
+        return {};
+    }
+    std::string out(static_cast<size_t>(needed), '\0');
+    const DWORD written = GetEnvironmentVariableA(name, out.data(), needed);
+    if (written == 0 || written >= needed) {
+        return {};
+    }
+    out.resize(static_cast<size_t>(written));
     return out;
 #else
     const char* v = std::getenv(name);
@@ -475,6 +483,8 @@ namespace {
 struct RuntimeState {
     std::mutex mutex;
     std::atomic<int32_t> init_count{0};
+    std::atomic<int32_t> api_impl_init_count{0};
+    std::atomic<uint32_t> vtable_refs[8]{1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u};
 
     // Task queues
     std::unordered_map<XTaskQueueObject*, std::shared_ptr<XTaskQueueObject>> live_queues;
@@ -837,10 +847,22 @@ XGameResult OPENSCARLETT_GDK_CALL XGameGetXboxTitleId(uint32_t* titleId) {
     }
     uint32_t tid = 0x5CA00001u;
     std::string env = GetEnvString("OPENSCARLETT_TITLE_ID");
-    if (!env.empty()) {
-        try {
-            tid = static_cast<uint32_t>(std::stoul(env, nullptr, 0));
-        } catch (...) {
+    // Trim leading/trailing ASCII whitespace.
+    const size_t first = env.find_first_not_of(" \t\r\n");
+    if (first != std::string::npos) {
+        const size_t last = env.find_last_not_of(" \t\r\n");
+        const std::string trimmed = env.substr(first, last - first + 1);
+        if (!trimmed.empty() && trimmed[0] != '-') {
+            int base = 10;
+            if (trimmed.size() > 2 && trimmed[0] == '0' && (trimmed[1] == 'x' || trimmed[1] == 'X')) {
+                base = 16;
+            }
+            char* end_ptr = nullptr;
+            errno = 0;
+            const unsigned long long parsed = std::strtoull(trimmed.c_str(), &end_ptr, base);
+            if (errno == 0 && end_ptr && *end_ptr == '\0' && parsed <= 0xFFFFFFFFULL) {
+                tid = static_cast<uint32_t>(parsed);
+            }
         }
     }
     *titleId = tid;
@@ -2279,6 +2301,311 @@ void OPENSCARLETT_GDK_CALL XDisplayCloseTimeoutDeferralHandle(
     XDisplayTimeoutDeferralHandle handle) {
     RecordOk("XDisplayCloseTimeoutDeferralHandle");
     delete handle;
+}
+
+}  // extern "C"
+
+namespace {
+
+bool XgrGuidEquals(const XgrGuid& a, const XgrGuid& b) noexcept {
+    return a.data1 == b.data1 &&
+           a.data2 == b.data2 &&
+           a.data3 == b.data3 &&
+           std::memcmp(a.data4, b.data4, sizeof(a.data4)) == 0;
+}
+
+std::string FormatXgrGuid(const XgrGuid& g) {
+    char buf[64]{};
+    std::snprintf(
+        buf, sizeof(buf),
+        "{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+        g.data1,
+        static_cast<unsigned>(g.data2),
+        static_cast<unsigned>(g.data3),
+        static_cast<unsigned>(g.data4[0]),
+        static_cast<unsigned>(g.data4[1]),
+        static_cast<unsigned>(g.data4[2]),
+        static_cast<unsigned>(g.data4[3]),
+        static_cast<unsigned>(g.data4[4]),
+        static_cast<unsigned>(g.data4[5]),
+        static_cast<unsigned>(g.data4[6]),
+        static_cast<unsigned>(g.data4[7]));
+    return std::string(buf);
+}
+
+enum XgrApiIndex : size_t {
+    kApiTaskQueue = 0,
+    kApiAsync = 1,
+    kApiUser = 2,
+    kApiGameSave = 3,
+    kApiSystem = 4,
+    kApiMem = 5,
+    kApiPackage = 6,
+    kApiDisplay = 7,
+    kApiCount = 8,
+};
+
+extern const IXgrTaskQueueApiVtable g_task_queue_vtable;
+extern const IXgrAsyncApiVtable g_async_vtable;
+extern const IXgrUserApiVtable g_user_vtable;
+extern const IXgrGameSaveApiVtable g_game_save_vtable;
+extern const IXgrSystemApiVtable g_system_vtable;
+extern const IXgrMemApiVtable g_mem_vtable;
+extern const IXgrPackageApiVtable g_package_vtable;
+extern const IXgrDisplayApiVtable g_display_vtable;
+
+int FindApiIndexByVtablePtr(const void* self) noexcept {
+    if (self == &g_task_queue_vtable) return static_cast<int>(kApiTaskQueue);
+    if (self == &g_async_vtable) return static_cast<int>(kApiAsync);
+    if (self == &g_user_vtable) return static_cast<int>(kApiUser);
+    if (self == &g_game_save_vtable) return static_cast<int>(kApiGameSave);
+    if (self == &g_system_vtable) return static_cast<int>(kApiSystem);
+    if (self == &g_mem_vtable) return static_cast<int>(kApiMem);
+    if (self == &g_package_vtable) return static_cast<int>(kApiPackage);
+    if (self == &g_display_vtable) return static_cast<int>(kApiDisplay);
+    return -1;
+}
+
+uint32_t OPENSCARLETT_GDK_CALL XgrVtableAddRef(const void* self) {
+    const int idx = FindApiIndexByVtablePtr(self);
+    RecordOk("IXgrApiVtable::AddRef");
+    if (idx < 0 || idx >= static_cast<int>(kApiCount)) {
+        return 1u;
+    }
+    return GetRuntime().vtable_refs[idx].fetch_add(1u, std::memory_order_acq_rel) + 1u;
+}
+
+uint32_t OPENSCARLETT_GDK_CALL XgrVtableRelease(const void* self) {
+    const int idx = FindApiIndexByVtablePtr(self);
+    RecordOk("IXgrApiVtable::Release");
+    if (idx < 0 || idx >= static_cast<int>(kApiCount)) {
+        return 1u;
+    }
+    auto& ref = GetRuntime().vtable_refs[idx];
+    uint32_t cur = ref.load(std::memory_order_acquire);
+    while (cur > 1u) {
+        if (ref.compare_exchange_weak(cur, cur - 1u, std::memory_order_acq_rel)) {
+            return cur - 1u;
+        }
+    }
+    return 1u;
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XgrVtableQueryInterface(
+    const void* self,
+    const XgrGuid* riid,
+    void** ppvObject) {
+    if (!ppvObject) {
+        return RecordHr("IXgrApiVtable::QueryInterface", XGR_E_POINTER);
+    }
+    *ppvObject = nullptr;
+    if (!riid) {
+        return RecordHr("IXgrApiVtable::QueryInterface", XGR_E_INVALIDARG);
+    }
+    if (XgrGuidEquals(*riid, XGR_IID_IUNKNOWN) && FindApiIndexByVtablePtr(self) >= 0) {
+        XgrVtableAddRef(self);
+        *ppvObject = const_cast<void*>(self);
+        return RecordHr("IXgrApiVtable::QueryInterface", XGR_S_OK);
+    }
+    return QueryApiImpl(riid, ppvObject);
+}
+
+const IXgrTaskQueueApiVtable g_task_queue_vtable = {
+    &XgrVtableQueryInterface,
+    &XgrVtableAddRef,
+    &XgrVtableRelease,
+    &XTaskQueueCreate,
+    &XTaskQueueDuplicateHandle,
+    &XTaskQueueCloseHandle,
+    &XTaskQueueGetCurrentProcessTaskQueue,
+    &XTaskQueueSetCurrentProcessTaskQueue,
+    &XTaskQueueSubmitCallback,
+    &XTaskQueueSubmitDelayedCallback,
+    &XTaskQueueDispatch,
+    &XTaskQueueTerminate,
+    &XTaskQueueRegisterMonitor,
+    &XTaskQueueUnregisterMonitor,
+};
+
+const IXgrAsyncApiVtable g_async_vtable = {
+    &XgrVtableQueryInterface,
+    &XgrVtableAddRef,
+    &XgrVtableRelease,
+    &XAsyncBegin,
+    &XAsyncSchedule,
+    &XAsyncComplete,
+    &XAsyncGetStatus,
+    &XAsyncGetResultSize,
+    &XAsyncGetResult,
+    &XAsyncCancel,
+};
+
+const IXgrUserApiVtable g_user_vtable = {
+    &XgrVtableQueryInterface,
+    &XgrVtableAddRef,
+    &XgrVtableRelease,
+    &XUserAddAsync,
+    &XUserAddResult,
+    &XUserDuplicateHandle,
+    &XUserCloseHandle,
+    &XUserGetId,
+    &XUserGetLocalId,
+    &XUserGetGamertag,
+    &XUserGetState,
+    &XUserGetAgeGroup,
+    &XUserCheckPrivilege,
+    &XUserGetMaxUsers,
+    &XUserCompare,
+};
+
+const IXgrGameSaveApiVtable g_game_save_vtable = {
+    &XgrVtableQueryInterface,
+    &XgrVtableAddRef,
+    &XgrVtableRelease,
+    &XGameSaveInitializeProvider,
+    &XGameSaveInitializeProviderAsync,
+    &XGameSaveInitializeProviderResult,
+    &XGameSaveCloseProvider,
+    &XGameSaveCreateContainer,
+    &XGameSaveCloseContainer,
+    &XGameSaveCreateUpdate,
+    &XGameSaveSubmitBlobWrite,
+    &XGameSaveSubmitBlobDelete,
+    &XGameSaveSubmitUpdate,
+    &XGameSaveCloseUpdate,
+    &XGameSaveReadBlobData,
+    &XGameSaveEnumerateContainerInfo,
+    &XGameSaveEnumerateBlobInfo,
+    &XGameSaveDeleteContainer,
+    &XGameSaveGetRemainingQuota,
+};
+
+const IXgrSystemApiVtable g_system_vtable = {
+    &XgrVtableQueryInterface,
+    &XgrVtableAddRef,
+    &XgrVtableRelease,
+    &XGameRuntimeInitialize,
+    &XGameRuntimeUninitialize,
+    &XGameGetXboxTitleId,
+    &XSystemGetDeviceType,
+    &XSystemGetConsoleId,
+    &XSystemGetXboxLiveSandboxId,
+    &XSystemGetAnalyticsInfo,
+    &XSystemGetRuntimeInfo,
+    &XSystemIsHandleValid,
+};
+
+const IXgrMemApiVtable g_mem_vtable = {
+    &XgrVtableQueryInterface,
+    &XgrVtableAddRef,
+    &XgrVtableRelease,
+    &XMemAllocDefault,
+    &XMemFreeDefault,
+    &XMemAlloc,
+    &XMemFree,
+    &XMemSetAllocationHooks,
+};
+
+const IXgrPackageApiVtable g_package_vtable = {
+    &XgrVtableQueryInterface,
+    &XgrVtableAddRef,
+    &XgrVtableRelease,
+    &XPackageGetCurrentProcessPackageIdentifier,
+    &XPackageIsPackagedProcess,
+    &XPackageEnumerateChunkAvailability,
+};
+
+const IXgrDisplayApiVtable g_display_vtable = {
+    &XgrVtableQueryInterface,
+    &XgrVtableAddRef,
+    &XgrVtableRelease,
+    &XDisplayTryEnableHdrMode,
+    &XDisplayTryAcquireTimeoutDeferral,
+    &XDisplayCloseTimeoutDeferralHandle,
+};
+
+}  // namespace
+
+extern "C" {
+
+// ===========================================================================
+// GDK Static Import GUID COM Vtable Dispatch
+// ===========================================================================
+XGameResult OPENSCARLETT_GDK_CALL InitializeApiImpl(void) {
+    auto& rt = GetRuntime();
+    rt.api_impl_init_count.fetch_add(1, std::memory_order_acq_rel);
+    return RecordHr("InitializeApiImpl", XGR_S_OK);
+}
+
+void OPENSCARLETT_GDK_CALL UninitializeApiImpl(void) {
+    auto& rt = GetRuntime();
+    const int32_t prev = rt.api_impl_init_count.fetch_sub(1, std::memory_order_acq_rel);
+    if (prev <= 1) {
+        rt.api_impl_init_count.store(0, std::memory_order_release);
+    }
+    RecordOk("UninitializeApiImpl");
+}
+
+XGameResult OPENSCARLETT_GDK_CALL QueryApiImpl(
+    const XgrGuid* apiId,
+    void** ppApiVtable) {
+    if (!ppApiVtable) {
+        return RecordHr("QueryApiImpl", XGR_E_POINTER);
+    }
+    *ppApiVtable = nullptr;
+    if (!apiId) {
+        return RecordHr("QueryApiImpl", XGR_E_INVALIDARG);
+    }
+
+    const void* vtable = nullptr;
+    if (XgrGuidEquals(*apiId, XGR_API_GUID_TASK_QUEUE)) {
+        vtable = &g_task_queue_vtable;
+    } else if (XgrGuidEquals(*apiId, XGR_API_GUID_ASYNC)) {
+        vtable = &g_async_vtable;
+    } else if (XgrGuidEquals(*apiId, XGR_API_GUID_USER)) {
+        vtable = &g_user_vtable;
+    } else if (XgrGuidEquals(*apiId, XGR_API_GUID_GAME_SAVE)) {
+        vtable = &g_game_save_vtable;
+    } else if (XgrGuidEquals(*apiId, XGR_API_GUID_SYSTEM)) {
+        vtable = &g_system_vtable;
+    } else if (XgrGuidEquals(*apiId, XGR_API_GUID_MEM)) {
+        vtable = &g_mem_vtable;
+    } else if (XgrGuidEquals(*apiId, XGR_API_GUID_PACKAGE)) {
+        vtable = &g_package_vtable;
+    } else if (XgrGuidEquals(*apiId, XGR_API_GUID_DISPLAY)) {
+        vtable = &g_display_vtable;
+    }
+
+    if (!vtable) {
+        const std::string sym = "QueryApiImpl(" + FormatXgrGuid(*apiId) + ")";
+        openscarlett::CallTelemetry::Global().Record(
+            kModName, sym, openscarlett::CallOutcome::NotImplemented, XGR_E_NOINTERFACE, -1);
+        return XGR_E_NOINTERFACE;
+    }
+
+    XgrVtableAddRef(vtable);
+    *ppApiVtable = const_cast<void*>(vtable);
+    return RecordHr("QueryApiImpl", XGR_S_OK);
+}
+
+int32_t OPENSCARLETT_GDK_CALL XgrGetTelemetryCallCountForTest(
+    const char* symbolName,
+    uint64_t* outTotalCalls,
+    uint64_t* outNotImplCalls) {
+    if (!symbolName) {
+        return 0;
+    }
+    const auto entries = openscarlett::CallTelemetry::Global().Snapshot();
+    for (const auto& e : entries) {
+        if (e.module_name == kModName && e.symbol_name == symbolName) {
+            if (outTotalCalls) *outTotalCalls = e.total_calls;
+            if (outNotImplCalls) *outNotImplCalls = e.not_impl_calls;
+            return 1;
+        }
+    }
+    if (outTotalCalls) *outTotalCalls = 0;
+    if (outNotImplCalls) *outNotImplCalls = 0;
+    return 0;
 }
 
 }  // extern "C"
