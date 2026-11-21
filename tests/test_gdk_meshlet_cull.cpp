@@ -510,14 +510,20 @@ void BuildMeshletVertex(
     }
 }
 
-static const uint kTriVerts[18] = {
-    0, 4, 1,
-    1, 4, 2,
-    2, 4, 3,
-    3, 4, 0,
-    5, 8, 6,
-    6, 8, 7
-};
+uint MapFallbackVertexId(uint vid)
+{
+    if (vid < 12)
+    {
+        uint tri = vid / 3;
+        uint corner = vid - tri * 3;
+        if (corner == 1) return 4;
+        return (corner == 0) ? tri : ((tri + 1) & 3);
+    }
+    if (vid == 12) return 5;
+    if (vid == 13 || vid == 16) return 8;
+    if (vid == 14 || vid == 15) return 6;
+    return 7;
+}
 
 [RootSignature(FALLBACK_GFX_RS)]
 VertexOut main(uint vid : SV_VertexID, uint iid : SV_InstanceID)
@@ -536,7 +542,7 @@ VertexOut main(uint vid : SV_VertexID, uint iid : SV_InstanceID)
     MeshletDesc m = Meshlets[meshletIdx];
 
     float3 pos, nrm, col;
-    BuildMeshletVertex(m, kTriVerts[vid], pos, nrm, col);
+    BuildMeshletVertex(m, MapFallbackVertexId(vid), pos, nrm, col);
     o.Position = MulViewProj(pos);
     o.Color    = col;
     o.Normal   = nrm;
@@ -1063,6 +1069,8 @@ int main() {
     OS_REQUIRE(hw_tel_sum.HasModule("pixevt.dll"));
     OS_REQUIRE(hw_tel_sum.HasModule("vfs"));
     OS_REQUIRE(hw_tel_sum.HasSymbol("XGameGetXboxTitleId"));
+    OS_REQUIRE(hw_tel_sum.HasSymbol("PIXBeginEventOnCommandList"));
+    OS_REQUIRE(hw_tel_sum.HasSymbol("PIXReportCounter"));
     OS_REQUIRE(hw_tel_sum.HasSymbol("ID3D12DeviceX::CreateDepthStencilView", 21));
     OS_REQUIRE(hw_tel_sum.HasSymbol("ID3D12GraphicsCommandListX::ClearDepthStencilView", 47));
     OS_REQUIRE(hw_tel_sum.HasSymbol("ID3D12CommandQueueX::PresentX", 19));
@@ -1110,6 +1118,8 @@ int main() {
     OS_REQUIRE(wp_tel_sum.HasModule("pixevt.dll"));
     OS_REQUIRE(wp_tel_sum.HasModule("vfs"));
     OS_REQUIRE(wp_tel_sum.HasSymbol("XGameGetXboxTitleId"));
+    OS_REQUIRE(wp_tel_sum.HasSymbol("PIXBeginEventOnCommandList"));
+    OS_REQUIRE(wp_tel_sum.HasSymbol("PIXReportCounter"));
     OS_REQUIRE(wp_tel_sum.HasSymbol("ID3D12DeviceX::CreateDepthStencilView", 21));
     OS_REQUIRE(wp_tel_sum.HasSymbol("ID3D12GraphicsCommandListX::ClearDepthStencilView", 47));
     OS_REQUIRE(wp_tel_sum.HasSymbol("ID3D12GraphicsCommandListX::Dispatch", 14));
@@ -1128,6 +1138,10 @@ int main() {
 
     // Cross-compare rendered 256x256 PPM images between Run 1 (HW AS+MS+PS) and Run 2 (WARP CS+VS+PS)
     OS_REQUIRE(hw_ppm_rgb.size() == wp_ppm_rgb.size());
+    const int hw_non_bg = std::stoi(hw_metrics.at("non_bg_pixels"));
+    const int wp_non_bg = std::stoi(wp_metrics.at("non_bg_pixels"));
+    OS_REQUIRE(std::abs(hw_non_bg - wp_non_bg) <= 100);
+
     uint32_t diff_pixels = 0;
     int max_channel_diff = 0;
     for (size_t i = 0; i < hw_ppm_rgb.size(); i += 3u) {
@@ -1142,6 +1156,9 @@ int main() {
     }
     // Allow at most minor rasterization edge/rounding differences between HW GPU and WARP (< 2% of pixels)
     OS_REQUIRE(diff_pixels < 1300u);
+    if (hw_non_bg == wp_non_bg) {
+        OS_REQUIRE(max_channel_diff <= 4);
+    }
 
     std::printf(
         "\n=== OpenScarlett Wave 2 MeshletCull Summary ===\n"

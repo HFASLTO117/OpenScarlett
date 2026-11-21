@@ -417,21 +417,11 @@ D3D12_RESOURCE_BARRIER MakeTransition(
 
 int main(int argc, char** argv) {
     bool force_warp = false;
-    bool trace = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--warp") == 0) {
             force_warp = true;
-        } else if (std::strcmp(argv[i], "--trace") == 0) {
-            trace = true;
         }
     }
-    auto log_step = [&](const char* s) {
-        if (trace) {
-            std::fprintf(stderr, "[trace] %s\n", s);
-            std::fflush(stderr);
-        }
-    };
-    log_step("start");
 
     // 1. GDK Game Runtime initialization, Scarlett device check, and MicrosoftGame.Config TitleId check
     PIXBeginEventOnCpu(0xFF33AAFFull, "MeshletCull_Main");
@@ -851,7 +841,6 @@ int main(int argc, char** argv) {
         std::vector<uint8_t> cs_blob;
         std::vector<uint8_t> vs_blob;
         std::vector<uint8_t> ps_blob;
-        log_step("fallback: read shaders");
         if (!ReadWholeFileW(L"G:\\MeshletCullFallbackCS.cso", cs_blob)) {
             ::CloseHandle(fence_event);
             PIXEndEventOnCpu();
@@ -868,7 +857,6 @@ int main(int argc, char** argv) {
             return Fail("Read G:\\MeshletCullFallbackPS.cso", ::GetLastError());
         }
 
-        log_step("fallback: create cs root sig");
         hr = device->CreateRootSignature(
             0, cs_blob.data(), cs_blob.size(), IID_PPV_ARGS(root_sig_primary.Put()));
         if (FAILED(hr) || !root_sig_primary) {
@@ -877,7 +865,6 @@ int main(int argc, char** argv) {
             return Fail("CreateRootSignature(MeshletCullFallbackCS.cso)", hr);
         }
 
-        log_step("fallback: create cs pso");
         D3D12_COMPUTE_PIPELINE_STATE_DESC cs_pso_desc{};
         cs_pso_desc.pRootSignature = root_sig_primary.Get();
         cs_pso_desc.CS = {cs_blob.data(), cs_blob.size()};
@@ -888,7 +875,6 @@ int main(int argc, char** argv) {
             return Fail("CreateComputePipelineState(FallbackCS)", hr);
         }
 
-        log_step("fallback: create gfx root sig");
         hr = device->CreateRootSignature(
             0, vs_blob.data(), vs_blob.size(), IID_PPV_ARGS(root_sig_secondary.Put()));
         if (FAILED(hr) || !root_sig_secondary) {
@@ -897,7 +883,6 @@ int main(int argc, char** argv) {
             return Fail("CreateRootSignature(MeshletCullFallbackVS.cso)", hr);
         }
 
-        log_step("fallback: create gfx pso");
         D3D12_GRAPHICS_PIPELINE_STATE_DESC gfx_desc{};
         gfx_desc.pRootSignature = root_sig_secondary.Get();
         gfx_desc.VS = {vs_blob.data(), vs_blob.size()};
@@ -914,7 +899,6 @@ int main(int argc, char** argv) {
         gfx_desc.SampleDesc = {1, 0};
 
         hr = device->CreateGraphicsPipelineState(&gfx_desc, IID_PPV_ARGS(pso_secondary.Put()));
-        log_step("fallback: after gfx pso");
         if (FAILED(hr) || !pso_secondary) {
             ::CloseHandle(fence_event);
             PIXEndEventOnCpu();
@@ -979,7 +963,6 @@ int main(int argc, char** argv) {
         // Live Hardware Amplification + Mesh Shader dispatch (vtable slot 79!)
         cmd->DispatchMesh(1, 1, 1);
 
-        log_step("fallback: after draw");
         D3D12_RESOURCE_BARRIER end_barriers[2] = {
             MakeTransition(rt_tex.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
                            D3D12_RESOURCE_STATE_PRESENT),
@@ -1024,7 +1007,6 @@ int main(int argc, char** argv) {
 
         cmd->DrawInstanced(18, kMeshletCount, 0, 0);
 
-        log_step("fallback: after draw");
         D3D12_RESOURCE_BARRIER end_barriers[2] = {
             MakeTransition(rt_tex.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
                            D3D12_RESOURCE_STATE_PRESENT),
@@ -1044,11 +1026,9 @@ int main(int argc, char** argv) {
         return Fail("CommandListX::Close", hr);
     }
 
-    log_step("execute command list");
     ID3D12CommandList* lists[] = {cmd.Get()};
     queue->ExecuteCommandLists(1, lists);
 
-    log_step("presentx");
     PIXBeginEventOnCommandQueue(queue.Get(), 0xFFFF6644ull, "MeshletCull_PresentX");
     ID3D12Resource* plane_res[] = {rt_tex.Get()};
     D3D12XBOX_PRESENT_PLANE_PARAMETERS plane{};
@@ -1067,8 +1047,6 @@ int main(int argc, char** argv) {
         PIXEndEventOnCpu();
         return Fail("PresentX(1)", hr);
     }
-
-    log_step("fence signal/wait");
 
     hr = queue->Signal(fence.Get(), 1u);
     if (FAILED(hr)) {
