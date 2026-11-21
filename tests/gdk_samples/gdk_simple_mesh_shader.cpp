@@ -1,0 +1,529 @@
+// OpenScarlett Clean-Room MIT Standalone Xbox-ABI Guest Sample 2:
+// Mirrors Microsoft Xbox-GDK-Samples/Samples/IntroGraphics/SimpleMeshShader.
+//
+// Deliberately does NOT link openscarlett_core. Runs live on hardware Mesh Shaders
+// (NVIDIA GTX 1650 Ti, MeshTier=10) via `openscarlett run` in an isolated package dir.
+
+#include <windows.h>
+
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <unordered_set>
+#include <vector>
+
+#include "openscarlett/gdk/xgameruntime_abi.h"
+#include "openscarlett/gpu/d3d12_xs_abi.h"
+
+namespace {
+
+constexpr uint32_t kWidth = 256u;
+constexpr uint32_t kHeight = 256u;
+constexpr uint32_t D3D12XBOX_RESOURCE_FLAG_ALLOW_DCC = 0x80000000u;
+
+constexpr uint8_t kBgR = 0x14u;
+constexpr uint8_t kBgG = 0x18u;
+constexpr uint8_t kBgB = 0x24u;
+constexpr uint8_t kBgA = 0xFFu;
+
+template <typename T>
+class GuestComPtr {
+public:
+    GuestComPtr() = default;
+    ~GuestComPtr() { Reset(); }
+    GuestComPtr(const GuestComPtr&) = delete;
+    GuestComPtr& operator=(const GuestComPtr&) = delete;
+
+    void Reset(T* p = nullptr) noexcept {
+        if (ptr_) ptr_->Release();
+        ptr_ = p;
+    }
+    T* Get() const noexcept { return ptr_; }
+    T* operator->() const noexcept { return ptr_; }
+    explicit operator bool() const noexcept { return ptr_ != nullptr; }
+    T** Put() noexcept {
+        Reset();
+        return &ptr_;
+    }
+
+private:
+    T* ptr_ = nullptr;
+};
+
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)  // D3D12 pipeline state stream subobjects require pointer alignment
+#endif
+template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE TypeVal, typename InnerType>
+struct alignas(void*) PsoStreamSubobject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = TypeVal;
+    InnerType inner{};
+};
+
+struct MeshShaderPsoStream {
+    PsoStreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, ID3D12RootSignature*> root_sig;
+    PsoStreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, D3D12_SHADER_BYTECODE> ms;
+    PsoStreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHADER_BYTECODE> ps;
+    PsoStreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, D3D12_BLEND_DESC> blend;
+    PsoStreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, D3D12_RASTERIZER_DESC> rasterizer;
+    PsoStreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, D3D12_DEPTH_STENCIL_DESC> depth_stencil;
+    PsoStreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, UINT> sample_mask;
+    PsoStreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, DXGI_SAMPLE_DESC> sample_desc;
+    PsoStreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY> rt_formats;
+};
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+
+int Fail(const char* step, int64_t code = 0) {
+    std::fprintf(stderr, "[gdk_simple_mesh_shader] FAIL: %s (code=0x%llX)\n",
+                 step, static_cast<unsigned long long>(code));
+    std::fflush(stderr);
+    return 1;
+}
+
+bool ReadWholeFileW(const wchar_t* path, std::vector<uint8_t>& out) {
+    HANDLE h = ::CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    LARGE_INTEGER sz{};
+    if (!::GetFileSizeEx(h, &sz) || sz.QuadPart <= 0 || sz.QuadPart > 64 * 1024 * 1024) {
+        ::CloseHandle(h);
+        return false;
+    }
+    out.resize(static_cast<size_t>(sz.QuadPart));
+    DWORD total = 0;
+    while (total < static_cast<DWORD>(out.size())) {
+        DWORD chunk = 0;
+        if (!::ReadFile(h, out.data() + total,
+                        static_cast<DWORD>(out.size()) - total, &chunk, nullptr) ||
+            chunk == 0) {
+            ::CloseHandle(h);
+            return false;
+        }
+        total += chunk;
+    }
+    ::CloseHandle(h);
+    return true;
+}
+
+bool WriteWholeFileW(const wchar_t* path, const void* data, size_t size) {
+    HANDLE h = ::CreateFileW(path, GENERIC_WRITE, 0, nullptr,
+                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    size_t written_total = 0;
+    while (written_total < size) {
+        DWORD chunk = 0;
+        const DWORD to_write = static_cast<DWORD>(size - written_total);
+        if (!::WriteFile(h, bytes + written_total, to_write, &chunk, nullptr) || chunk == 0) {
+            ::CloseHandle(h);
+            return false;
+        }
+        written_total += chunk;
+    }
+    ::CloseHandle(h);
+    return true;
+}
+
+bool WritePpmW(const wchar_t* path, uint32_t width, uint32_t height, const uint8_t* rgba8) {
+    char header[64]{};
+    const int hdr_len = std::snprintf(header, sizeof(header), "P6\n%u %u\n255\n", width, height);
+    if (hdr_len <= 0) return false;
+
+    const size_t pixel_count = static_cast<size_t>(width) * height;
+    std::vector<uint8_t> ppm;
+    ppm.reserve(static_cast<size_t>(hdr_len) + pixel_count * 3u);
+    ppm.insert(ppm.end(), header, header + hdr_len);
+    for (size_t i = 0; i < pixel_count; ++i) {
+        ppm.push_back(rgba8[i * 4u + 0u]);
+        ppm.push_back(rgba8[i * 4u + 1u]);
+        ppm.push_back(rgba8[i * 4u + 2u]);
+    }
+    return WriteWholeFileW(path, ppm.data(), ppm.size());
+}
+
+double QpcMs(LARGE_INTEGER t0, LARGE_INTEGER t1, LARGE_INTEGER freq) {
+    if (freq.QuadPart == 0) return 0.0;
+    return static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 /
+           static_cast<double>(freq.QuadPart);
+}
+
+}  // namespace
+
+int main() {
+    // 1. GDK Game Runtime initialization & Scarlett check
+    if (XGameRuntimeInitialize() != XGR_S_OK) {
+        return Fail("XGameRuntimeInitialize");
+    }
+    const XSystemDeviceType dev_type = XSystemGetDeviceType();
+    if (dev_type != XSystemDeviceType_XboxScarlettAnaconda &&
+        dev_type != XSystemDeviceType_XboxScarlettLockhart &&
+        dev_type != XSystemDeviceType_XboxScarlettDevkit) {
+        return Fail("XSystemGetDeviceType not Scarlett", static_cast<int64_t>(dev_type));
+    }
+
+    // 2. Read precompiled Microsoft SimpleMeshShader ms_6_5 & ps_6_5 DXIL blobs from G:\ .
+    std::vector<uint8_t> ms_blob;
+    std::vector<uint8_t> ps_blob;
+    if (!ReadWholeFileW(L"G:\\SimpleTriangleMS.cso", ms_blob)) {
+        return Fail("Read G:\\SimpleTriangleMS.cso", ::GetLastError());
+    }
+    if (!ReadWholeFileW(L"G:\\SimpleTrianglePS.cso", ps_blob)) {
+        return Fail("Read G:\\SimpleTrianglePS.cso", ::GetLastError());
+    }
+
+    // 3. Create Hardware D3D12X device (GTX 1650 Ti with MeshTier=10)
+    OpenScarlettD3D12SetPreferWarp(0);
+    D3D12XBOX_CREATE_DEVICE_PARAMETERS dev_params{};
+    dev_params.Version = 1;
+    dev_params.PreferWarp = 0;
+
+    GuestComPtr<ID3D12DeviceX> device;
+    HRESULT hr = D3D12XboxCreateDevice(
+        nullptr, &dev_params, IID_ID3D12DeviceX, reinterpret_cast<void**>(device.Put()));
+    if (FAILED(hr) || !device) {
+        return Fail("D3D12XboxCreateDevice", hr);
+    }
+
+    D3D12XBOX_GPU_HARDWARE_INFO gpu_info{};
+    hr = device->GetGpuHardwareInfoX(&gpu_info);
+    if (FAILED(hr) || gpu_info.IsWarp != 0u) {
+        return Fail("Expected hardware GPU adapter for Mesh Shaders", hr);
+    }
+
+    // Exact Microsoft SimpleMeshShader.cpp feature support checks (SM 6.5 + MeshShaderTier >= 10)
+    D3D12_FEATURE_DATA_SHADER_MODEL sm{D3D_SHADER_MODEL_6_5};
+    hr = device->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &sm, sizeof(sm));
+    if (FAILED(hr) || sm.HighestShaderModel < D3D_SHADER_MODEL_6_5) {
+        return Fail("Shader Model 6.5 not supported", hr);
+    }
+
+    D3D12_FEATURE_DATA_D3D12_OPTIONS7 opt7{};
+    hr = device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &opt7, sizeof(opt7));
+    if (FAILED(hr) || static_cast<uint32_t>(opt7.MeshShaderTier) < 10u) {
+        return Fail("D3D12_FEATURE_D3D12_OPTIONS7::MeshShaderTier < 10",
+                    static_cast<int64_t>(opt7.MeshShaderTier));
+    }
+
+    hr = device->SetFrameIntervalX(nullptr, 16667u, 2u, 0u);
+    if (FAILED(hr)) {
+        return Fail("SetFrameIntervalX", hr);
+    }
+    D3D12XBOX_FRAME_PIPELINE_TOKEN frame_token = 0;
+    hr = device->WaitFrameEventX(D3D12XBOX_FRAME_EVENT_ORIGIN, 1000u, nullptr, &frame_token);
+    if (FAILED(hr) || frame_token == 0) {
+        return Fail("WaitFrameEventX", hr);
+    }
+
+    // 4. Strip root signature directly from SimpleTriangleMS.cso bytecode
+    //    (exact Microsoft SimpleMeshShader.cpp line 281 pattern!)
+    GuestComPtr<ID3D12RootSignature> root_sig;
+    hr = device->CreateRootSignature(
+        0, ms_blob.data(), ms_blob.size(), IID_PPV_ARGS(root_sig.Put()));
+    if (FAILED(hr) || !root_sig) {
+        return Fail("CreateRootSignature(from SimpleTriangleMS.cso)", hr);
+    }
+
+    // 5. Build D3D12_PIPELINE_STATE_STREAM_DESC Mesh+Pixel PSO (ID3D12Device2::CreatePipelineState)
+    MeshShaderPsoStream stream{};
+    stream.root_sig.inner = root_sig.Get();
+    stream.ms.inner = {ms_blob.data(), ms_blob.size()};
+    stream.ps.inner = {ps_blob.data(), ps_blob.size()};
+
+    stream.blend.inner.AlphaToCoverageEnable = FALSE;
+    stream.blend.inner.IndependentBlendEnable = FALSE;
+    stream.blend.inner.RenderTarget[0].BlendEnable = FALSE;
+    stream.blend.inner.RenderTarget[0].LogicOpEnable = FALSE;
+    stream.blend.inner.RenderTarget[0].SrcBlend = D3D12_BLEND_ONE;
+    stream.blend.inner.RenderTarget[0].DestBlend = D3D12_BLEND_ZERO;
+    stream.blend.inner.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+    stream.blend.inner.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+    stream.blend.inner.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ZERO;
+    stream.blend.inner.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+    stream.blend.inner.RenderTarget[0].LogicOp = D3D12_LOGIC_OP_NOOP;
+    stream.blend.inner.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+    stream.rasterizer.inner.FillMode = D3D12_FILL_MODE_SOLID;
+    stream.rasterizer.inner.CullMode = D3D12_CULL_MODE_BACK;
+    stream.rasterizer.inner.FrontCounterClockwise = FALSE;
+    stream.rasterizer.inner.DepthClipEnable = TRUE;
+
+    stream.depth_stencil.inner.DepthEnable = FALSE;
+    stream.depth_stencil.inner.StencilEnable = FALSE;
+    stream.sample_mask.inner = UINT_MAX;
+    stream.sample_desc.inner = {1, 0};
+    stream.rt_formats.inner.NumRenderTargets = 1;
+    stream.rt_formats.inner.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+
+    D3D12_PIPELINE_STATE_STREAM_DESC stream_desc{};
+    stream_desc.SizeInBytes = sizeof(stream);
+    stream_desc.pPipelineStateSubobjectStream = &stream;
+
+    GuestComPtr<ID3D12PipelineState> mesh_pso;
+    hr = device->CreatePipelineState(&stream_desc, IID_PPV_ARGS(mesh_pso.Put()));
+    if (FAILED(hr) || !mesh_pso) {
+        return Fail("ID3D12Device2::CreatePipelineState(Mesh+Pixel)", hr);
+    }
+
+    // 6. Queue, Allocator, CommandListX, and Render Target
+    D3D12_COMMAND_QUEUE_DESC q_desc{};
+    q_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    GuestComPtr<ID3D12CommandQueueX> queue;
+    hr = device->CreateCommandQueue(
+        &q_desc, IID_ID3D12CommandQueueX, reinterpret_cast<void**>(queue.Put()));
+    if (FAILED(hr) || !queue) {
+        return Fail("CreateCommandQueue", hr);
+    }
+
+    GuestComPtr<ID3D12CommandAllocator> alloc;
+    hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(alloc.Put()));
+    if (FAILED(hr) || !alloc) {
+        return Fail("CreateCommandAllocator", hr);
+    }
+
+    GuestComPtr<ID3D12GraphicsCommandListX> cmd;
+    hr = device->CreateCommandList(
+        0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.Get(), mesh_pso.Get(),
+        IID_ID3D12GraphicsCommandListX, reinterpret_cast<void**>(cmd.Put()));
+    if (FAILED(hr) || !cmd) {
+        return Fail("CreateCommandList", hr);
+    }
+
+    D3D12_HEAP_PROPERTIES default_heap{};
+    default_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC rt_desc{};
+    rt_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    rt_desc.Width = kWidth;
+    rt_desc.Height = kHeight;
+    rt_desc.DepthOrArraySize = 1;
+    rt_desc.MipLevels = 1;
+    rt_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    rt_desc.SampleDesc.Count = 1;
+    rt_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    rt_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(
+        static_cast<uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) |
+        D3D12XBOX_RESOURCE_FLAG_ALLOW_DCC);
+
+    D3D12_CLEAR_VALUE clear_val{};
+    clear_val.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    clear_val.Color[0] = static_cast<float>(kBgR) / 255.0f;
+    clear_val.Color[1] = static_cast<float>(kBgG) / 255.0f;
+    clear_val.Color[2] = static_cast<float>(kBgB) / 255.0f;
+    clear_val.Color[3] = 1.0f;
+
+    GuestComPtr<ID3D12Resource> rt;
+    hr = device->CreateCommittedResource(
+        &default_heap, D3D12_HEAP_FLAG_ALLOW_DISPLAY, &rt_desc,
+        D3D12_RESOURCE_STATE_COMMON, &clear_val, IID_PPV_ARGS(rt.Put()));
+    if (FAILED(hr) || !rt) {
+        return Fail("CreateCommittedResource(RT)", hr);
+    }
+
+    D3D12_DESCRIPTOR_HEAP_DESC rtv_heap_desc{};
+    rtv_heap_desc.NumDescriptors = 1;
+    rtv_heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    GuestComPtr<ID3D12DescriptorHeap> rtv_heap;
+    hr = device->CreateDescriptorHeap(&rtv_heap_desc, IID_PPV_ARGS(rtv_heap.Put()));
+    if (FAILED(hr) || !rtv_heap) {
+        return Fail("CreateDescriptorHeap(RTV)", hr);
+    }
+    const D3D12_CPU_DESCRIPTOR_HANDLE rtv_handle = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    device->CreateRenderTargetView(rt.Get(), nullptr, rtv_handle);
+
+    // 7. Record & execute CommandListX::DispatchMesh(1, 1, 1) (vtable slot 79) + PresentX
+    LARGE_INTEGER qpc_freq{};
+    LARGE_INTEGER qpc_start{};
+    LARGE_INTEGER qpc_end{};
+    ::QueryPerformanceFrequency(&qpc_freq);
+    ::QueryPerformanceCounter(&qpc_start);
+
+    D3D12_RESOURCE_BARRIER to_rt{};
+    to_rt.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    to_rt.Transition.pResource = rt.Get();
+    to_rt.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    to_rt.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    to_rt.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    cmd->ResourceBarrier(1, &to_rt);
+
+    cmd->OMSetRenderTargets(1, &rtv_handle, FALSE, nullptr);
+    cmd->ClearRenderTargetView(rtv_handle, clear_val.Color, 0, nullptr);
+
+    D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(kWidth), static_cast<float>(kHeight), 0.0f, 1.0f};
+    D3D12_RECT scissor{0, 0, static_cast<LONG>(kWidth), static_cast<LONG>(kHeight)};
+    cmd->RSSetViewports(1, &vp);
+    cmd->RSSetScissorRects(1, &scissor);
+
+    cmd->SetGraphicsRootSignature(root_sig.Get());
+    cmd->SetPipelineState(mesh_pso.Get());
+    cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+    // Real hardware Mesh Shader dispatch (ID3D12GraphicsCommandListX::DispatchMesh slot 79!)
+    cmd->DispatchMesh(1, 1, 1);
+
+    D3D12_RESOURCE_BARRIER to_present{};
+    to_present.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    to_present.Transition.pResource = rt.Get();
+    to_present.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    to_present.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    to_present.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    cmd->ResourceBarrier(1, &to_present);
+
+    hr = cmd->Close();
+    if (FAILED(hr)) {
+        return Fail("CommandListX::Close", hr);
+    }
+
+    ID3D12CommandList* lists[] = {cmd.Get()};
+    queue->ExecuteCommandLists(1, lists);
+
+    ID3D12Resource* plane_res[] = {rt.Get()};
+    D3D12XBOX_PRESENT_PLANE_PARAMETERS plane{};
+    plane.Token = frame_token;
+    plane.ResourceCount = 1;
+    plane.ppResources = plane_res;
+    plane.ResourceState = D3D12_RESOURCE_STATE_PRESENT;
+
+    D3D12XBOX_PRESENT_PARAMETERS pres_params{};
+    pres_params.SyncInterval = 1;
+
+    hr = queue->PresentX(1, &plane, &pres_params, nullptr);
+    if (FAILED(hr)) {
+        return Fail("PresentX(1)", hr);
+    }
+    ::QueryPerformanceCounter(&qpc_end);
+    const double frame_ms = QpcMs(qpc_start, qpc_end, qpc_freq);
+
+    // 8. Read back rendered mesh shader frame & verify interpolated RGB triangle
+    uint64_t frame_hash = 0;
+    uint32_t out_w = 0;
+    uint32_t out_h = 0;
+    hr = OpenScarlettD3D12GetLastPresentHash(queue.Get(), &frame_hash, &out_w, &out_h);
+    if (FAILED(hr) || out_w != kWidth || out_h != kHeight || frame_hash == 0ull) {
+        return Fail("OpenScarlettD3D12GetLastPresentHash", hr);
+    }
+
+    std::vector<uint8_t> pixels(static_cast<size_t>(kWidth) * kHeight * 4u, 0u);
+    uint32_t copied = 0;
+    hr = OpenScarlettD3D12CopyLastPresentPixels(
+        queue.Get(), pixels.data(), static_cast<uint32_t>(pixels.size()), &copied);
+    if (FAILED(hr) || copied != pixels.size()) {
+        return Fail("OpenScarlettD3D12CopyLastPresentPixels", hr);
+    }
+
+    auto pixel_at = [&](uint32_t x, uint32_t y) -> const uint8_t* {
+        return &pixels[(static_cast<size_t>(y) * kWidth + x) * 4u];
+    };
+
+    const uint8_t* bg = pixel_at(0, 0);
+    if (bg[0] != kBgR || bg[1] != kBgG || bg[2] != kBgB || bg[3] != kBgA) {
+        return Fail("Background clear pixel mismatch");
+    }
+
+    // SimpleTriangleMS.hlsl vertices:
+    //   v0 (-0.5,-0.5) bottom-left  = Red   (1,0,0)
+    //   v1 ( 0.0, 0.5) top-center   = Green (0,1,0)
+    //   v2 ( 0.5,-0.5) bottom-right = Blue  (0,0,1)
+    const uint8_t* bl_px = pixel_at(72, 188);
+    if (bl_px[0] < 200u || bl_px[1] > 45u || bl_px[2] > 45u) {
+        return Fail("Bottom-left Red mesh vertex verification failed");
+    }
+    const uint8_t* top_px = pixel_at(128, 72);
+    if (top_px[1] < 200u || top_px[0] > 45u || top_px[2] > 45u) {
+        return Fail("Top Green mesh vertex verification failed");
+    }
+    const uint8_t* br_px = pixel_at(184, 188);
+    if (br_px[2] < 200u || br_px[0] > 45u || br_px[1] > 45u) {
+        return Fail("Bottom-right Blue mesh vertex verification failed");
+    }
+    const uint8_t* center = pixel_at(128, 128);
+    if (center[1] < 90u || center[0] < 40u || center[2] < 40u || center[3] != 255u) {
+        return Fail("Center mesh triangle pixel verification failed");
+    }
+
+    uint32_t non_bg_pixels = 0;
+    std::unordered_set<uint32_t> unique_rgb;
+    unique_rgb.reserve(4096);
+    for (uint32_t i = 0; i < kWidth * kHeight; ++i) {
+        const uint8_t r = pixels[i * 4u + 0u];
+        const uint8_t g = pixels[i * 4u + 1u];
+        const uint8_t b = pixels[i * 4u + 2u];
+        if (r != kBgR || g != kBgG || b != kBgB) {
+            ++non_bg_pixels;
+        }
+        unique_rgb.insert((static_cast<uint32_t>(r) << 16) |
+                          (static_cast<uint32_t>(g) << 8) |
+                          static_cast<uint32_t>(b));
+    }
+    if (non_bg_pixels < 7500u || non_bg_pixels > 9000u) {
+        return Fail("Unexpected mesh shader triangle pixel count", non_bg_pixels);
+    }
+    if (unique_rgb.size() < 1000u) {
+        return Fail("Too few interpolated colors in mesh triangle",
+                    static_cast<int64_t>(unique_rgb.size()));
+    }
+
+    if (!WritePpmW(L"T:\\simple_mesh_shader.ppm", kWidth, kHeight, pixels.data())) {
+        return Fail("Write T:\\simple_mesh_shader.ppm", ::GetLastError());
+    }
+
+    char metrics_buf[512]{};
+    const int metrics_len = std::snprintf(
+        metrics_buf, sizeof(metrics_buf),
+        "sample=SimpleMeshShader\n"
+        "adapter=%s\n"
+        "is_warp=%u\n"
+        "mesh_tier=%u\n"
+        "width=%u\n"
+        "height=%u\n"
+        "fnv1a=0x%016llX\n"
+        "non_bg_pixels=%u\n"
+        "unique_colors=%zu\n"
+        "frame_ms=%.3f\n",
+        gpu_info.AdapterName,
+        gpu_info.IsWarp,
+        static_cast<unsigned>(opt7.MeshShaderTier),
+        out_w,
+        out_h,
+        static_cast<unsigned long long>(frame_hash),
+        non_bg_pixels,
+        unique_rgb.size(),
+        frame_ms);
+    if (metrics_len <= 0 ||
+        !WriteWholeFileW(L"T:\\metrics.txt", metrics_buf, static_cast<size_t>(metrics_len))) {
+        return Fail("Write T:\\metrics.txt", ::GetLastError());
+    }
+
+    hr = queue->PresentX(0, nullptr, nullptr, nullptr);
+    if (FAILED(hr)) {
+        return Fail("PresentX(0) blank teardown", hr);
+    }
+
+    std::printf(
+        "[gdk_simple_mesh_shader] PASS | Adapter=%s (MeshTier=%u) | %ux%u | NonBG=%u | Colors=%zu | FNV1a=0x%016llX | %.2f ms\n",
+        gpu_info.AdapterName,
+        static_cast<unsigned>(opt7.MeshShaderTier),
+        out_w,
+        out_h,
+        non_bg_pixels,
+        unique_rgb.size(),
+        static_cast<unsigned long long>(frame_hash),
+        frame_ms);
+    std::fflush(stdout);
+
+    rtv_heap.Reset();
+    rt.Reset();
+    cmd.Reset();
+    alloc.Reset();
+    queue.Reset();
+    mesh_pso.Reset();
+    root_sig.Reset();
+    device.Reset();
+    XGameRuntimeUninitialize();
+    return 0;
+}

@@ -11,6 +11,7 @@
 
 #if defined(_WIN32)
 #include <windows.h>
+#include <winternl.h>
 #endif
 
 namespace openscarlett {
@@ -150,6 +151,228 @@ std::vector<wchar_t> BuildChildEnvironmentBlock(const std::wstring& shim_dir,
     return block;
 }
 
+// Redirect static PE imports of shimmed Xbox DLLs in the suspended child process BEFORE
+// LdrInitializeThunk runs. On Windows 10/11, C:\Windows\System32\ ships desktop stubs
+// named xgameruntime.dll, GameInput.dll, and XAudio2_9.dll which shadow PATH during
+// static import resolution. Rewriting matching IMAGE_IMPORT_DESCRIPTOR::Name RVAs in
+// the suspended child's memory to point to full absolute paths inside shim_dir guarantees
+// OpenScarlett's shims load BEFORE System32 with ZERO files copied to the guest folder!
+bool RedirectChildStaticXboxImports(HANDLE h_process,
+                                    const std::wstring& shim_dir_w) {
+#if defined(_M_X64) || defined(__x86_64__)
+    using PfnNtQueryInformationProcess = NTSTATUS(NTAPI*)(
+        HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
+    HMODULE h_ntdll = ::GetModuleHandleW(L"ntdll.dll");
+    auto fn_ntq = h_ntdll ? reinterpret_cast<PfnNtQueryInformationProcess>(
+                                ::GetProcAddress(h_ntdll, "NtQueryInformationProcess"))
+                          : nullptr;
+    if (!fn_ntq) {
+        return false;
+    }
+
+    PROCESS_BASIC_INFORMATION pbi{};
+    ULONG ret_len = 0;
+    if (fn_ntq(h_process, ProcessBasicInformation, &pbi, sizeof(pbi), &ret_len) != 0 ||
+        pbi.PebBaseAddress == nullptr) {
+        return false;
+    }
+
+    // Read PEB.ImageBaseAddress (offset 0x10 on Windows x64).
+    uintptr_t image_base = 0;
+    SIZE_T rw = 0;
+    const auto peb_addr = reinterpret_cast<uintptr_t>(pbi.PebBaseAddress);
+    if (!::ReadProcessMemory(h_process,
+                             reinterpret_cast<LPCVOID>(peb_addr + 0x10u),
+                             &image_base,
+                             sizeof(image_base),
+                             &rw) ||
+        rw != sizeof(image_base) || image_base == 0) {
+        return false;
+    }
+
+    IMAGE_DOS_HEADER dos{};
+    if (!::ReadProcessMemory(h_process, reinterpret_cast<LPCVOID>(image_base),
+                             &dos, sizeof(dos), &rw) ||
+        rw != sizeof(dos) || dos.e_magic != IMAGE_DOS_SIGNATURE || dos.e_lfanew <= 0) {
+        return false;
+    }
+
+    IMAGE_NT_HEADERS64 nt{};
+    if (!::ReadProcessMemory(h_process,
+                             reinterpret_cast<LPCVOID>(image_base + static_cast<uintptr_t>(dos.e_lfanew)),
+                             &nt, sizeof(nt), &rw) ||
+        rw != sizeof(nt) || nt.Signature != IMAGE_NT_SIGNATURE ||
+        nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        return false;
+    }
+
+    const uint32_t image_size = nt.OptionalHeader.SizeOfImage;
+    const auto& imp_dir = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (imp_dir.VirtualAddress == 0 || imp_dir.VirtualAddress >= image_size) {
+        return true;
+    }
+
+    struct ShimEntry {
+        const char* lower_name;
+        const wchar_t* canonical_w;
+        int priority;  // Lower loads first so base shims precede dependent shims (e.g. XSAPI -> xgameruntime)
+    };
+    static constexpr ShimEntry kShims[] = {
+        {"xgameruntime.dll", L"xgameruntime.dll", 0},
+        {"gameinput.dll", L"GameInput.dll", 0},
+        {"xaudio2_9.dll", L"XAudio2_9.dll", 0},
+        {"kernelx.dll", L"kernelx.dll", 1},
+        {"d3d12_xs.dll", L"d3d12_xs.dll", 1},
+        {"xg_xs.dll", L"xg_xs.dll", 1},
+        {"acphal.dll", L"AcpHal.dll", 1},
+        {"dstorage_xs.dll", L"dstorage_xs.dll", 1},
+        {"winrt_xs.dll", L"winrt_xs.dll", 1},
+        {"microsoft.xbox.services.gdk.c.dll", L"Microsoft.Xbox.Services.GDK.C.dll", 2},
+    };
+
+    auto match_shim = [&](const std::string& raw, std::wstring& out_full_w, int& out_prio) -> bool {
+        std::string lo = raw;
+        for (char& c : lo) {
+            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+        }
+        for (const auto& s : kShims) {
+            if (lo == s.lower_name) {
+                std::wstring full = shim_dir_w + L"\\" + s.canonical_w;
+                if (FileExistsW(full)) {
+                    out_full_w = std::move(full);
+                    out_prio = s.priority;
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    std::vector<IMAGE_IMPORT_DESCRIPTOR> descs;
+    std::vector<std::string> full_paths;
+    std::vector<int> priorities;
+    bool any_redirected = false;
+
+    const uintptr_t imp_table_addr = image_base + imp_dir.VirtualAddress;
+    for (size_t idx = 0; idx < 1024; ++idx) {
+        IMAGE_IMPORT_DESCRIPTOR d{};
+        if (!::ReadProcessMemory(h_process,
+                                 reinterpret_cast<LPCVOID>(imp_table_addr + idx * sizeof(d)),
+                                 &d, sizeof(d), &rw) ||
+            rw != sizeof(d)) {
+            break;
+        }
+        if (d.OriginalFirstThunk == 0 && d.Name == 0 && d.FirstThunk == 0) {
+            break;
+        }
+        std::string dll_name;
+        if (d.Name != 0 && d.Name < image_size) {
+            char name_buf[260]{};
+            const size_t max_read = std::min<size_t>(sizeof(name_buf) - 1, image_size - d.Name);
+            if (::ReadProcessMemory(h_process,
+                                    reinterpret_cast<LPCVOID>(image_base + d.Name),
+                                    name_buf, max_read, &rw) &&
+                rw > 0) {
+                name_buf[rw] = '\0';
+                dll_name = name_buf;
+            }
+        }
+
+        std::wstring full_w;
+        int prio = 10;
+        if (!dll_name.empty() && match_shim(dll_name, full_w, prio)) {
+            full_paths.push_back(WideToUtf8(full_w));
+            priorities.push_back(prio);
+            any_redirected = true;
+        } else {
+            full_paths.emplace_back();
+            priorities.push_back(10);
+        }
+        descs.push_back(d);
+    }
+
+    if (!any_redirected || descs.empty()) {
+        return true;
+    }
+
+    // Pack redirected full ASCII DLL paths into a contiguous buffer allocated within +2 GiB of image_base
+    // so every replacement Name RVA is a valid positive 32-bit offset from image_base.
+    std::vector<char> str_blob;
+    std::vector<uint32_t> str_offsets(descs.size(), 0u);
+    for (size_t i = 0; i < descs.size(); ++i) {
+        if (!full_paths[i].empty()) {
+            str_offsets[i] = static_cast<uint32_t>(str_blob.size());
+            str_blob.insert(str_blob.end(), full_paths[i].begin(), full_paths[i].end());
+            str_blob.push_back('\0');
+        }
+    }
+
+    const uintptr_t alloc_gran = 0x10000u;
+    const uintptr_t start_probe = (image_base + image_size + alloc_gran - 1u) & ~(alloc_gran - 1u);
+    const uintptr_t max_probe = image_base + 0x7FFE0000ull;
+    LPVOID remote_str_base = nullptr;
+    for (uintptr_t addr = start_probe; addr < max_probe; addr += alloc_gran) {
+        remote_str_base = ::VirtualAllocEx(h_process,
+                                           reinterpret_cast<LPVOID>(addr),
+                                           str_blob.size(),
+                                           MEM_COMMIT | MEM_RESERVE,
+                                           PAGE_READWRITE);
+        if (remote_str_base != nullptr) {
+            break;
+        }
+    }
+    if (!remote_str_base) {
+        return false;
+    }
+
+    if (!::WriteProcessMemory(h_process, remote_str_base, str_blob.data(), str_blob.size(), &rw) ||
+        rw != str_blob.size()) {
+        ::VirtualFreeEx(h_process, remote_str_base, 0, MEM_RELEASE);
+        return false;
+    }
+
+    const uint32_t blob_base_rva =
+        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(remote_str_base) - image_base);
+    for (size_t i = 0; i < descs.size(); ++i) {
+        if (!full_paths[i].empty()) {
+            descs[i].Name = blob_base_rva + str_offsets[i];
+            descs[i].TimeDateStamp = 0;
+        }
+    }
+
+    // Stable-sort descriptors so base shims (xgameruntime, GameInput, XAudio2_9) load before
+    // dependent shims (e.g. Microsoft.Xbox.Services.GDK.C.dll -> xgameruntime.dll).
+    std::vector<size_t> order(descs.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(),
+                     [&](size_t a, size_t b) { return priorities[a] < priorities[b]; });
+    std::vector<IMAGE_IMPORT_DESCRIPTOR> sorted_descs;
+    sorted_descs.reserve(descs.size());
+    for (size_t idx : order) {
+        sorted_descs.push_back(descs[idx]);
+    }
+
+    const size_t table_bytes = sorted_descs.size() * sizeof(IMAGE_IMPORT_DESCRIPTOR);
+    DWORD old_prot = 0;
+    if (!::VirtualProtectEx(h_process, reinterpret_cast<LPVOID>(imp_table_addr),
+                            table_bytes, PAGE_READWRITE, &old_prot)) {
+        return false;
+    }
+    const bool wrote_ok =
+        ::WriteProcessMemory(h_process, reinterpret_cast<LPVOID>(imp_table_addr),
+                             sorted_descs.data(), table_bytes, &rw) != 0 &&
+        rw == table_bytes;
+    DWORD dummy_prot = 0;
+    ::VirtualProtectEx(h_process, reinterpret_cast<LPVOID>(imp_table_addr),
+                       table_bytes, old_prot, &dummy_prot);
+    return wrote_ok;
+#else
+    (void)h_process;
+    (void)shim_dir_w;
+    return false;
+#endif
+}
+
 #endif  // _WIN32
 
 }  // namespace
@@ -255,6 +478,10 @@ Status LaunchWithApcHook(const LaunchOptions& options, LaunchResult& out_result)
     }
 
     out_result.process_id = static_cast<uint32_t>(pi.dwProcessId);
+
+    // Ensure static PE imports resolve OpenScarlett shims BEFORE C:\Windows\System32\
+    // (critical for xgameruntime.dll, GameInput.dll, XAudio2_9.dll on Windows 10/11).
+    (void)RedirectChildStaticXboxImports(pi.hProcess, shim_dir_w);
 
     auto abort_child = [&](StatusCode code, const char* step, DWORD err) -> Status {
         ::TerminateProcess(pi.hProcess, 1);

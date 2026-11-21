@@ -1,5 +1,6 @@
 #define OPENSCARLETT_BUILDING_WINRT 1
 #include "openscarlett/winrt/winrt_abi.h"
+#include "openscarlett/core/telemetry.h"
 
 #include <algorithm>
 #include <atomic>
@@ -23,6 +24,23 @@ extern "C" __declspec(dllimport) void* __stdcall CoTaskMemAlloc(size_t cb);
 namespace fs = std::filesystem;
 
 namespace {
+
+constexpr const char* kWinRtMod = "winrt_xs.dll";
+
+inline int32_t RecordWinRtHr(const char* sym, int32_t hr) {
+    openscarlett::CallTelemetry::Global().Record(
+        kWinRtMod,
+        sym,
+        hr >= 0 ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error,
+        hr,
+        -1);
+    return hr;
+}
+
+inline void RecordWinRtOk(const char* sym) {
+    openscarlett::CallTelemetry::Global().Record(
+        kWinRtMod, sym, openscarlett::CallOutcome::Ok, 0, -1);
+}
 
 // ---------------------------------------------------------------------------
 // HSTRING Internal Representation (exact 24-byte x64 ABI header)
@@ -1115,21 +1133,22 @@ extern "C" {
 // ===========================================================================
 int32_t RoInitialize(uint32_t initType) {
     if (initType != SX_RO_INIT_SINGLETHREADED && initType != SX_RO_INIT_MULTITHREADED) {
-        return SX_WINRT_E_INVALIDARG;
+        return RecordWinRtHr("RoInitialize", SX_WINRT_E_INVALIDARG);
     }
     if (g_tls_ro_state.init_count == 0) {
         g_tls_ro_state.init_count = 1;
         g_tls_ro_state.init_type = initType;
-        return SX_WINRT_S_OK;
+        return RecordWinRtHr("RoInitialize", SX_WINRT_S_OK);
     }
     if (g_tls_ro_state.init_type != initType) {
-        return SX_WINRT_RPC_E_CHANGED_MODE;
+        return RecordWinRtHr("RoInitialize", SX_WINRT_RPC_E_CHANGED_MODE);
     }
     ++g_tls_ro_state.init_count;
-    return SX_WINRT_S_FALSE;
+    return RecordWinRtHr("RoInitialize", SX_WINRT_S_FALSE);
 }
 
 void RoUninitialize(void) {
+    RecordWinRtOk("RoUninitialize");
     if (g_tls_ro_state.init_count > 0) {
         --g_tls_ro_state.init_count;
     }
@@ -1140,14 +1159,14 @@ int32_t RoGetActivationFactory(
     const SX_GUID* iid,
     void** factory) {
     if (!factory) {
-        return SX_WINRT_E_POINTER;
+        return RecordWinRtHr("RoGetActivationFactory", SX_WINRT_E_POINTER);
     }
     *factory = nullptr;
     if (g_tls_ro_state.init_count == 0) {
-        return SX_WINRT_CO_E_NOTINITIALIZED;
+        return RecordWinRtHr("RoGetActivationFactory", SX_WINRT_CO_E_NOTINITIALIZED);
     }
     if (!iid || WindowsIsStringEmpty(activatableClassId)) {
-        return SX_WINRT_E_INVALIDARG;
+        return RecordWinRtHr("RoGetActivationFactory", SX_WINRT_E_INVALIDARG);
     }
 
     const std::u16string class_id = HStringToU16(activatableClassId);
@@ -1169,47 +1188,47 @@ int32_t RoGetActivationFactory(
         SX_IActivationFactory* raw_factory = nullptr;
         const int32_t hr = custom_cb(activatableClassId, &raw_factory);
         if (hr < 0) {
-            return hr;
+            return RecordWinRtHr("RoGetActivationFactory", hr);
         }
         if (!raw_factory) {
-            return SX_WINRT_E_FAIL;
+            return RecordWinRtHr("RoGetActivationFactory", SX_WINRT_E_FAIL);
         }
         const int32_t qi_hr = raw_factory->lpVtbl->QueryInterface(raw_factory, iid, factory);
         raw_factory->lpVtbl->Release(raw_factory);
-        return qi_hr;
+        return RecordWinRtHr("RoGetActivationFactory", qi_hr);
     }
 
     // 2. Check built-in Xbox/UWP classes.
-    return CreateBuiltInFactory(class_id, iid, factory);
+    return RecordWinRtHr("RoGetActivationFactory", CreateBuiltInFactory(class_id, iid, factory));
 }
 
 int32_t RoActivateInstance(SX_HSTRING activatableClassId, void** instance) {
     if (!instance) {
-        return SX_WINRT_E_POINTER;
+        return RecordWinRtHr("RoActivateInstance", SX_WINRT_E_POINTER);
     }
     *instance = nullptr;
     if (g_tls_ro_state.init_count == 0) {
-        return SX_WINRT_CO_E_NOTINITIALIZED;
+        return RecordWinRtHr("RoActivateInstance", SX_WINRT_CO_E_NOTINITIALIZED);
     }
     if (WindowsIsStringEmpty(activatableClassId)) {
-        return SX_WINRT_E_INVALIDARG;
+        return RecordWinRtHr("RoActivateInstance", SX_WINRT_E_INVALIDARG);
     }
 
     SX_IActivationFactory* factory = nullptr;
     int32_t hr = RoGetActivationFactory(
         activatableClassId, &SX_IID_IActivationFactory, reinterpret_cast<void**>(&factory));
     if (hr < 0 || !factory) {
-        return hr < 0 ? hr : SX_WINRT_E_FAIL;
+        return RecordWinRtHr("RoActivateInstance", hr < 0 ? hr : SX_WINRT_E_FAIL);
     }
 
     SX_IInspectable* insp = nullptr;
     hr = factory->lpVtbl->ActivateInstance(factory, &insp);
     factory->lpVtbl->Release(factory);
     if (hr < 0) {
-        return hr;
+        return RecordWinRtHr("RoActivateInstance", hr);
     }
     *instance = insp;
-    return SX_WINRT_S_OK;
+    return RecordWinRtHr("RoActivateInstance", SX_WINRT_S_OK);
 }
 
 int32_t RoRegisterActivationFactories(
@@ -1218,21 +1237,21 @@ int32_t RoRegisterActivationFactories(
     uint32_t count,
     uint64_t* cookie) {
     if (!cookie) {
-        return SX_WINRT_E_POINTER;
+        return RecordWinRtHr("RoRegisterActivationFactories", SX_WINRT_E_POINTER);
     }
     *cookie = 0;
     if (g_tls_ro_state.init_count == 0) {
-        return SX_WINRT_CO_E_NOTINITIALIZED;
+        return RecordWinRtHr("RoRegisterActivationFactories", SX_WINRT_CO_E_NOTINITIALIZED);
     }
     if (!activatableClassIds || !activationFactoryCallbacks || count == 0) {
-        return SX_WINRT_E_INVALIDARG;
+        return RecordWinRtHr("RoRegisterActivationFactories", SX_WINRT_E_INVALIDARG);
     }
 
     std::vector<std::pair<std::u16string, SX_PFNGETACTIVATIONFACTORY>> validated;
     validated.reserve(count);
     for (uint32_t i = 0; i < count; ++i) {
         if (WindowsIsStringEmpty(activatableClassIds[i]) || !activationFactoryCallbacks[i]) {
-            return SX_WINRT_E_INVALIDARG;
+            return RecordWinRtHr("RoRegisterActivationFactories", SX_WINRT_E_INVALIDARG);
         }
         validated.emplace_back(HStringToU16(activatableClassIds[i]), activationFactoryCallbacks[i]);
     }
@@ -1244,10 +1263,11 @@ int32_t RoRegisterActivationFactories(
         reg.custom_factories.push_back(RegisteredFactoryEntry{assigned, std::move(cid), cb});
     }
     *cookie = assigned;
-    return SX_WINRT_S_OK;
+    return RecordWinRtHr("RoRegisterActivationFactories", SX_WINRT_S_OK);
 }
 
 void RoRevokeActivationFactories(uint64_t cookie) {
+    RecordWinRtOk("RoRevokeActivationFactories");
     if (cookie == 0) {
         return;
     }
@@ -1267,22 +1287,22 @@ int32_t WindowsCreateString(
     uint32_t length,
     SX_HSTRING* string) {
     if (!string) {
-        return SX_WINRT_E_INVALIDARG;
+        return RecordWinRtHr("WindowsCreateString", SX_WINRT_E_INVALIDARG);
     }
     *string = nullptr;
     if (length == 0) {
         // Per WinRT specification, empty string is represented by NULL HSTRING.
-        return SX_WINRT_S_OK;
+        return RecordWinRtHr("WindowsCreateString", SX_WINRT_S_OK);
     }
     if (!sourceString) {
-        return SX_WINRT_E_POINTER;
+        return RecordWinRtHr("WindowsCreateString", SX_WINRT_E_POINTER);
     }
 
     const size_t chars_bytes = (static_cast<size_t>(length) + 1) * sizeof(uint16_t);
     const size_t total_bytes = sizeof(SxHStringImpl) + chars_bytes;
     void* mem = ::operator new(total_bytes, std::nothrow);
     if (!mem) {
-        return SX_WINRT_E_OUTOFMEMORY;
+        return RecordWinRtHr("WindowsCreateString", SX_WINRT_E_OUTOFMEMORY);
     }
     auto* buf = reinterpret_cast<uint16_t*>(static_cast<uint8_t*>(mem) + sizeof(SxHStringImpl));
     std::memcpy(buf, sourceString, static_cast<size_t>(length) * sizeof(uint16_t));
@@ -1296,7 +1316,7 @@ int32_t WindowsCreateString(
         buf,
     };
     *string = reinterpret_cast<SX_HSTRING>(impl);
-    return SX_WINRT_S_OK;
+    return RecordWinRtHr("WindowsCreateString", SX_WINRT_S_OK);
 }
 
 int32_t WindowsCreateStringReference(
@@ -1305,21 +1325,21 @@ int32_t WindowsCreateStringReference(
     SX_HSTRING_HEADER* hstringHeader,
     SX_HSTRING* string) {
     if (!hstringHeader || !string) {
-        return SX_WINRT_E_INVALIDARG;
+        return RecordWinRtHr("WindowsCreateStringReference", SX_WINRT_E_INVALIDARG);
     }
     *string = nullptr;
     if (!sourceString) {
         if (length != 0) {
-            return SX_WINRT_E_POINTER;
+            return RecordWinRtHr("WindowsCreateStringReference", SX_WINRT_E_POINTER);
         }
-        return SX_WINRT_S_OK;
+        return RecordWinRtHr("WindowsCreateStringReference", SX_WINRT_S_OK);
     }
     // Fast-pass HSTRING requires null-termination at sourceString[length].
     if (sourceString[length] != 0) {
-        return SX_WINRT_E_INVALIDARG;
+        return RecordWinRtHr("WindowsCreateStringReference", SX_WINRT_E_INVALIDARG);
     }
     if (length == 0) {
-        return SX_WINRT_S_OK;
+        return RecordWinRtHr("WindowsCreateStringReference", SX_WINRT_S_OK);
     }
 
     auto* impl = new (hstringHeader->Reserved.Reserved2) SxHStringImpl{
@@ -1330,29 +1350,30 @@ int32_t WindowsCreateStringReference(
         sourceString,
     };
     *string = reinterpret_cast<SX_HSTRING>(impl);
-    return SX_WINRT_S_OK;
+    return RecordWinRtHr("WindowsCreateStringReference", SX_WINRT_S_OK);
 }
 
 int32_t WindowsDeleteString(SX_HSTRING string) {
     if (!string) {
-        return SX_WINRT_S_OK;
+        return RecordWinRtHr("WindowsDeleteString", SX_WINRT_S_OK);
     }
     SxHStringImpl* impl = AsImplMut(string);
     if ((impl->flags & kHStringMagicMask) != kHStringMagic) {
-        return SX_WINRT_E_INVALIDARG;
+        return RecordWinRtHr("WindowsDeleteString", SX_WINRT_E_INVALIDARG);
     }
     if ((impl->flags & kHStringFlagRef) != 0) {
         // Per WinRT spec, deleting a fast-pass string reference is a safe no-op.
-        return SX_WINRT_S_OK;
+        return RecordWinRtHr("WindowsDeleteString", SX_WINRT_S_OK);
     }
     if (impl->ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
         impl->~SxHStringImpl();
         ::operator delete(impl);
     }
-    return SX_WINRT_S_OK;
+    return RecordWinRtHr("WindowsDeleteString", SX_WINRT_S_OK);
 }
 
 const uint16_t* WindowsGetStringRawBuffer(SX_HSTRING string, uint32_t* length) {
+    RecordWinRtOk("WindowsGetStringRawBuffer");
     if (!string) {
         if (length) *length = 0;
         return kEmptyUtf16;
@@ -1363,6 +1384,7 @@ const uint16_t* WindowsGetStringRawBuffer(SX_HSTRING string, uint32_t* length) {
 }
 
 uint32_t WindowsGetStringLen(SX_HSTRING string) {
+    RecordWinRtOk("WindowsGetStringLen");
     if (!string) {
         return 0;
     }
@@ -1371,23 +1393,24 @@ uint32_t WindowsGetStringLen(SX_HSTRING string) {
 
 int32_t WindowsDuplicateString(SX_HSTRING string, SX_HSTRING* newString) {
     if (!newString) {
-        return SX_WINRT_E_INVALIDARG;
+        return RecordWinRtHr("WindowsDuplicateString", SX_WINRT_E_INVALIDARG);
     }
     *newString = nullptr;
     if (!string) {
-        return SX_WINRT_S_OK;
+        return RecordWinRtHr("WindowsDuplicateString", SX_WINRT_S_OK);
     }
     SxHStringImpl* impl = AsImplMut(string);
     if ((impl->flags & kHStringMagicMask) != kHStringMagic) {
-        return SX_WINRT_E_INVALIDARG;
+        return RecordWinRtHr("WindowsDuplicateString", SX_WINRT_E_INVALIDARG);
     }
     if ((impl->flags & kHStringFlagRef) != 0) {
         // Fast-pass references must be promoted to heap-allocated copies on duplicate.
-        return WindowsCreateString(impl->buffer, impl->length, newString);
+        return RecordWinRtHr("WindowsDuplicateString",
+                             WindowsCreateString(impl->buffer, impl->length, newString));
     }
     impl->ref_count.fetch_add(1, std::memory_order_relaxed);
     *newString = string;
-    return SX_WINRT_S_OK;
+    return RecordWinRtHr("WindowsDuplicateString", SX_WINRT_S_OK);
 }
 
 int32_t WindowsCompareStringOrdinal(
@@ -1395,7 +1418,7 @@ int32_t WindowsCompareStringOrdinal(
     SX_HSTRING string2,
     int32_t* result) {
     if (!result) {
-        return SX_WINRT_E_INVALIDARG;
+        return RecordWinRtHr("WindowsCompareStringOrdinal", SX_WINRT_E_INVALIDARG);
     }
     uint32_t len1 = 0;
     uint32_t len2 = 0;
@@ -1406,11 +1429,11 @@ int32_t WindowsCompareStringOrdinal(
     for (uint32_t i = 0; i < common; ++i) {
         if (buf1[i] < buf2[i]) {
             *result = -1;
-            return SX_WINRT_S_OK;
+            return RecordWinRtHr("WindowsCompareStringOrdinal", SX_WINRT_S_OK);
         }
         if (buf1[i] > buf2[i]) {
             *result = 1;
-            return SX_WINRT_S_OK;
+            return RecordWinRtHr("WindowsCompareStringOrdinal", SX_WINRT_S_OK);
         }
     }
     if (len1 < len2) {
@@ -1420,20 +1443,21 @@ int32_t WindowsCompareStringOrdinal(
     } else {
         *result = 0;
     }
-    return SX_WINRT_S_OK;
+    return RecordWinRtHr("WindowsCompareStringOrdinal", SX_WINRT_S_OK);
 }
 
 int32_t WindowsIsStringEmpty(SX_HSTRING string) {
+    RecordWinRtOk("WindowsIsStringEmpty");
     return (string == nullptr || AsImpl(string)->length == 0) ? 1 : 0;
 }
 
 int32_t WindowsStringHasEmbeddedNull(SX_HSTRING string, int32_t* hasEmbedNull) {
     if (!hasEmbedNull) {
-        return SX_WINRT_E_INVALIDARG;
+        return RecordWinRtHr("WindowsStringHasEmbeddedNull", SX_WINRT_E_INVALIDARG);
     }
     *hasEmbedNull = 0;
     if (!string) {
-        return SX_WINRT_S_OK;
+        return RecordWinRtHr("WindowsStringHasEmbeddedNull", SX_WINRT_S_OK);
     }
     uint32_t len = 0;
     const uint16_t* buf = WindowsGetStringRawBuffer(string, &len);
@@ -1443,7 +1467,7 @@ int32_t WindowsStringHasEmbeddedNull(SX_HSTRING string, int32_t* hasEmbedNull) {
             break;
         }
     }
-    return SX_WINRT_S_OK;
+    return RecordWinRtHr("WindowsStringHasEmbeddedNull", SX_WINRT_S_OK);
 }
 
 int32_t WindowsConcatString(
@@ -1451,7 +1475,7 @@ int32_t WindowsConcatString(
     SX_HSTRING string2,
     SX_HSTRING* newString) {
     if (!newString) {
-        return SX_WINRT_E_INVALIDARG;
+        return RecordWinRtHr("WindowsConcatString", SX_WINRT_E_INVALIDARG);
     }
     *newString = nullptr;
     uint32_t len1 = 0;
@@ -1459,12 +1483,13 @@ int32_t WindowsConcatString(
     const uint16_t* buf1 = WindowsGetStringRawBuffer(string1, &len1);
     const uint16_t* buf2 = WindowsGetStringRawBuffer(string2, &len2);
     if (len1 == 0 && len2 == 0) {
-        return SX_WINRT_S_OK;
+        return RecordWinRtHr("WindowsConcatString", SX_WINRT_S_OK);
     }
     std::vector<uint16_t> combined(static_cast<size_t>(len1) + len2);
     if (len1 > 0) std::memcpy(combined.data(), buf1, static_cast<size_t>(len1) * sizeof(uint16_t));
     if (len2 > 0) std::memcpy(combined.data() + len1, buf2, static_cast<size_t>(len2) * sizeof(uint16_t));
-    return WindowsCreateString(combined.data(), static_cast<uint32_t>(combined.size()), newString);
+    return RecordWinRtHr("WindowsConcatString",
+                         WindowsCreateString(combined.data(), static_cast<uint32_t>(combined.size()), newString));
 }
 
 int32_t WindowsSubstring(
@@ -1472,15 +1497,16 @@ int32_t WindowsSubstring(
     uint32_t startIndex,
     SX_HSTRING* newString) {
     if (!newString) {
-        return SX_WINRT_E_INVALIDARG;
+        return RecordWinRtHr("WindowsSubstring", SX_WINRT_E_INVALIDARG);
     }
     *newString = nullptr;
     uint32_t len = 0;
     const uint16_t* buf = WindowsGetStringRawBuffer(string, &len);
     if (startIndex > len) {
-        return SX_WINRT_E_BOUNDS;
+        return RecordWinRtHr("WindowsSubstring", SX_WINRT_E_BOUNDS);
     }
-    return WindowsCreateString(buf + startIndex, len - startIndex, newString);
+    return RecordWinRtHr("WindowsSubstring",
+                         WindowsCreateString(buf + startIndex, len - startIndex, newString));
 }
 
 int32_t WindowsSubstringWithSpecifiedLength(
@@ -1489,15 +1515,16 @@ int32_t WindowsSubstringWithSpecifiedLength(
     uint32_t length,
     SX_HSTRING* newString) {
     if (!newString) {
-        return SX_WINRT_E_INVALIDARG;
+        return RecordWinRtHr("WindowsSubstringWithSpecifiedLength", SX_WINRT_E_INVALIDARG);
     }
     *newString = nullptr;
     uint32_t total = 0;
     const uint16_t* buf = WindowsGetStringRawBuffer(string, &total);
     if (startIndex > total || length > total - startIndex) {
-        return SX_WINRT_E_BOUNDS;
+        return RecordWinRtHr("WindowsSubstringWithSpecifiedLength", SX_WINRT_E_BOUNDS);
     }
-    return WindowsCreateString(buf + startIndex, length, newString);
+    return RecordWinRtHr("WindowsSubstringWithSpecifiedLength",
+                         WindowsCreateString(buf + startIndex, length, newString));
 }
 
 }  // extern "C"
