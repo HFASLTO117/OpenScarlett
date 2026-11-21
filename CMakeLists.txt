@@ -7,6 +7,13 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 enable_testing()
 
+if(MSVC)
+    # Restore runtime std::mutex initialization so binaries built with VS 2022 17.10+
+    # remain ABI-compatible with all msvcp140.dll versions (< 14.40) and never crash
+    # with 0xC0000005 inside _Mtx_lock when an older VC++ runtime is loaded.
+    add_compile_definitions(_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
+endif()
+
 add_library(openscarlett_core STATIC
     src/core/status.cpp
     src/core/telemetry.cpp

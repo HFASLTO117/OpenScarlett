@@ -1,4 +1,4 @@
-﻿# OpenScarlett — 1-Click Portable Hardware & Self-Test Runner
+# OpenScarlett — 1-Click Portable Hardware & Self-Test Runner
 # Runs host GPU/OS probes + all OpenScarlett live tests, shows clear live results,
 # saves a privacy-sanitized Markdown report, and optionally opens a pre-filled GitHub Issue.
 
@@ -112,6 +112,25 @@ Write-Host ''
 
 $OsVersion = Get-FriendlyOsVersion
 Write-Host "  OS Detected : $OsVersion" -ForegroundColor White
+
+$VcRuntimeInfo = 'not found'
+$sysMsvcp = Join-Path $env:SystemRoot 'System32\msvcp140.dll'
+if (Test-Path $sysMsvcp) {
+    $sysMsvcpVer = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($sysMsvcp).FileVersion
+    $VcRuntimeInfo = "System32 msvcp140.dll $sysMsvcpVer"
+    Write-Host "  VC++ Runtime: $VcRuntimeInfo" -ForegroundColor Gray
+} else {
+    Write-Host '  VC++ Runtime: System32\msvcp140.dll not found (install Microsoft VC++ 2015-2022 x64 Redistributable)' -ForegroundColor Yellow
+}
+
+$localMsvcp = Join-Path $BundleDir 'msvcp140.dll'
+if (Test-Path $localMsvcp) {
+    $localMsvcpVer = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($localMsvcp).FileVersion
+    $VcRuntimeInfo += " | WARNING: local bundle msvcp140.dll $localMsvcpVer"
+    Write-Host "  [WARN] Local msvcp140.dll ($localMsvcpVer) found in bundle directory!" -ForegroundColor Red
+    Write-Host '         Stale CRT DLLs next to OpenScarlett EXEs can shadow System32 and cause crashes.' -ForegroundColor Yellow
+    Write-Host '         Please extract OpenScarlett into a clean, empty folder.' -ForegroundColor Yellow
+}
 
 Push-Location $BundleDir
 try {
@@ -277,6 +296,7 @@ try {
 
 - **Result:** **$passedCount/$totalCount passed** ($failedCount failed)
 - **OS:** $OsVersion
+- **VC++ Runtime:** $VcRuntimeInfo
 - **Primary GPU:** $gpuSummaryText
 - **UTC Timestamp:** $((Get-Date).ToUniversalTime().ToString('yyyy-MM-dd HH:mm:ss')) UTC
 

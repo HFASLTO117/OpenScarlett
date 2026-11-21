@@ -114,7 +114,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $stage = "dist/OpenScarlett-win64"
-          if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
+          if (Test-Path "dist") { Remove-Item -Recurse -Force "dist" }
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
           Copy-Item "build/openscarlett.exe" $stage
@@ -197,7 +197,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: OpenScarlett-win64-Release
-          path: dist/OpenScarlett-win64
+          path: dist
           retention-days: 30
           if-no-files-found: error
 
@@ -455,7 +455,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: OpenScarlett-win64-Release
-          path: release-stage/OpenScarlett-win64
+          path: release-stage
 
       - name: Create zip archive and SHA256 checksum
         shell: pwsh
@@ -463,7 +463,10 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $tag = "${{ github.ref_name }}"
           $zipName = "OpenScarlett-$tag-win64.zip"
-          Compress-Archive -Path "release-stage/OpenScarlett-win64/*" -DestinationPath $zipName -Force
+          $topDir = "release-stage/OpenScarlett-$tag-win64"
+          if (Test-Path $topDir) { Remove-Item -Recurse -Force $topDir }
+          Move-Item -Path "release-stage/OpenScarlett-win64" -Destination $topDir
+          Compress-Archive -Path $topDir -DestinationPath $zipName -Force
           $hash = (Get-FileHash -Path $zipName -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  $zipName" | Out-File -FilePath "$zipName.sha256" -Encoding ascii
           Get-Item $zipName, "$zipName.sha256" | Select-Object Name, Length | Format-Table -AutoSize
