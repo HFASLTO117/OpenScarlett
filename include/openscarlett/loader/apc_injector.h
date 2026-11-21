@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "openscarlett/core/status.h"
@@ -92,6 +93,42 @@ struct StoreBootstrapDiagnostic {
 StoreBootstrapDiagnostic DiagnoseStoreBootstrapper(const LaunchResult& result,
                                                    size_t tracked_telemetry_symbols,
                                                    bool telemetry_file_written);
+
+// Computes a non-clobbering per-PID child telemetry JSON path of the form:
+//   "<dir>\<stem>_pid<child_pid>_telemetry.json"
+// Strips trailing "_telemetry" and prior "_pid<N>" suffixes from the base stem so multi-level
+// parent -> child -> grandchild propagation produces clean, deterministic paths.
+std::wstring FormatChildTelemetryPathW(std::wstring_view base_telemetry_path, uint32_t child_pid);
+std::string FormatChildTelemetryPathUtf8(std::string_view base_telemetry_path, uint32_t child_pid);
+
+// Merges OpenScarlett's active OPENSCARLETT_* environment variables (plus shim_dir on PATH)
+// into a caller-supplied Win32 environment block (nullptr = inherit current process env,
+// ANSI or Unicode double-NUL-terminated block when non-null). Returns a sorted Unicode
+// double-NUL-terminated environment block suitable for CreateProcessW/A with
+// CREATE_UNICODE_ENVIRONMENT.
+std::vector<wchar_t> MergeOpenScarlettEnvironmentBlockW(const void* caller_env,
+                                                        bool caller_env_is_unicode,
+                                                        std::wstring_view shim_dir,
+                                                        std::wstring_view hook_dll_path,
+                                                        std::wstring_view telemetry_base_path,
+                                                        bool enable_child_per_pid_telemetry);
+
+// Redirects static PE imports of routed Xbox/GDK shims inside a suspended x64 child process
+// BEFORE LdrInitializeThunk runs. Returns false if the process is inaccessible or incompatible.
+bool RedirectSuspendedProcessStaticXboxImports(void* process_handle,
+                                               std::wstring_view shim_dir,
+                                               std::wstring_view guest_dir);
+
+// Injects openscarlett_hook.dll into an already-created suspended Win32 child process via
+// static PE import redirection + QueueUserAPC(LoadLibraryW, thread_handle, remoteHookDllPath).
+// Gracefully validates x64 architecture compatibility and NEVER terminates the target process
+// on failure (e.g. ERROR_ACCESS_DENIED on protected system/Store processes).
+Status InjectHookDllIntoSuspendedProcess(void* process_handle,
+                                         void* thread_handle,
+                                         std::wstring_view hook_dll_path,
+                                         std::wstring_view shim_dir,
+                                         std::wstring_view guest_dir,
+                                         uint32_t* out_win32_error = nullptr);
 
 // Launches an unmodified x64 Windows PE executable (or GDK package directory / MicrosoftGame.Config)
 // in a suspended state, prepends shim_dir to PATH, configures OpenScarlett VFS CoW overlay, TitleId,

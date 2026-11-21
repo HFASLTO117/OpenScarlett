@@ -280,7 +280,9 @@ DllCategory ClassifyImportDll(const std::string& dll_name) {
     if (lo == "d3d12_xs.dll" || lo == "d3d12_x.dll" || lo == "xg_xs.dll" || lo == "xg.dll" ||
         lo == "acphal.dll" || lo == "kernelx.dll" || lo == "xmem.dll" || lo == "dstorage_xs.dll" ||
         lo == "xboxbvhbuilder.dll" || lo == "chad.dll" || lo == "xapu.dll" || lo == "xcrdapi.dll" ||
-        lo == "pixevt.dll") {
+        lo == "pixevt.dll" ||
+        lo == "mfplat_xs.dll" || lo == "advapi32legacy.dll" ||
+        lo == "kerneltracecontrol.dll" || lo == "hix_xs.dll" || lo == "xbtp.dll") {
         return DllCategory::ConsoleExclusive;
     }
     if (lo == "xgameruntime.dll" || lo == "xgamingruntimethunks.dll" ||
@@ -304,7 +306,8 @@ DllCategory ClassifyImportDll(const std::string& dll_name) {
         lo == "shell32.dll" || lo == "ws2_32.dll" || lo == "bcrypt.dll" || lo == "crypt32.dll" ||
         lo == "ucrtbase.dll" || lo == "vcruntime140.dll" || lo == "vcruntime140_1.dll" ||
         lo == "msvcp140.dll" || lo == "d3d12.dll" || lo == "dxgi.dll" || lo == "rpcrt4.dll" ||
-        lo == "winmm.dll" || lo == "dbghelp.dll" || lo == "shlwapi.dll" || lo == "imm32.dll") {
+        lo == "winmm.dll" || lo == "dbghelp.dll" || lo == "shlwapi.dll" || lo == "imm32.dll" ||
+        lo == "mfplat.dll") {
         return DllCategory::WindowsNative;
     }
     return DllCategory::Other;
@@ -340,37 +343,46 @@ DllRoutingTable::DllRoutingTable() {
     struct BuiltinShimSpec {
         const char* canonical_name;
         int priority;
+        bool is_extended;
     };
-    // All 19 built-in OpenScarlett shims (10 existing + 9 Wave 1 secondary shims).
+    // 19 core Xbox/GDK shims + 5 diagnostic/media shims (mfplat_xs, advapi32legacy,
+    // KernelTraceControl, hix_xs, xbtp).
     static constexpr BuiltinShimSpec kBuiltinShims[] = {
         // Priority 0: base shims
-        {"kernelx.dll", 0},
-        {"xgameruntime.dll", 0},
-        {"GameInput.dll", 0},
-        {"XAudio2_9.dll", 0},
+        {"kernelx.dll", 0, false},
+        {"xgameruntime.dll", 0, false},
+        {"GameInput.dll", 0, false},
+        {"XAudio2_9.dll", 0, false},
         // Priority 1: core shims
-        {"d3d12_xs.dll", 1},
-        {"xg_xs.dll", 1},
-        {"AcpHal.dll", 1},
-        {"dstorage_xs.dll", 1},
-        {"winrt_xs.dll", 1},
-        {"xmem.dll", 1},
-        {"pixevt.dll", 1},
-        {"xcrdapi.dll", 1},
-        {"libHttpClient.GDK.dll", 1},
-        {"XCurl.dll", 1},
-        {"Bink2Scarlett.dll", 1},
-        {"amd_fidelityfx_upscaler_xbox.dll", 1},
-        {"XboxBvhBuilder.dll", 1},
+        {"d3d12_xs.dll", 1, false},
+        {"xg_xs.dll", 1, false},
+        {"AcpHal.dll", 1, false},
+        {"dstorage_xs.dll", 1, false},
+        {"winrt_xs.dll", 1, false},
+        {"xmem.dll", 1, false},
+        {"pixevt.dll", 1, false},
+        {"xcrdapi.dll", 1, false},
+        {"libHttpClient.GDK.dll", 1, false},
+        {"XCurl.dll", 1, false},
+        {"Bink2Scarlett.dll", 1, false},
+        {"amd_fidelityfx_upscaler_xbox.dll", 1, false},
+        {"XboxBvhBuilder.dll", 1, false},
         // Priority 2: dependent shims
-        {"Microsoft.Xbox.Services.GDK.C.dll", 2},
-        {"amd_fidelityfx_loader_xbox.dll", 2},
+        {"Microsoft.Xbox.Services.GDK.C.dll", 2, false},
+        {"amd_fidelityfx_loader_xbox.dll", 2, false},
+        // Extended diagnostic & media shims
+        {"mfplat_xs.dll", 1, true},
+        {"advapi32legacy.dll", 1, true},
+        {"KernelTraceControl.dll", 1, true},
+        {"hix_xs.dll", 1, true},
+        {"xbtp.dll", 1, true},
     };
     for (const auto& spec : kBuiltinShims) {
         const std::string key = NormalizeDllKey(spec.canonical_name);
         rules_[key] = Entry{
             DllRouteRule{spec.canonical_name, DllRoutePolicy::Shim, spec.priority},
             false,
+            spec.is_extended,
         };
     }
 }
@@ -404,7 +416,7 @@ void DllRoutingTable::SetRule(std::string_view dll_name, DllRoutePolicy policy, 
         const int prio = (policy == DllRoutePolicy::Shim)
                              ? load_priority
                              : ((policy == DllRoutePolicy::NativeGuestDll) ? 5 : 10);
-        rules_[key] = Entry{DllRouteRule{canonical, policy, prio}, true};
+        rules_[key] = Entry{DllRouteRule{canonical, policy, prio}, true, false};
     }
 }
 
@@ -483,12 +495,19 @@ const DllRouteRule* DllRoutingTable::FindRule(std::string_view dll_name) const {
             return &target_it->second.rule;
         }
     }
+    if (key == "xgamingruntimethunks.dll") {
+        auto target_it = rules_.find("xgameruntime.dll");
+        if (target_it != rules_.end()) {
+            return &target_it->second.rule;
+        }
+    }
     return nullptr;
 }
 
 DllRouteDecision DllRoutingTable::ResolveRoute(std::string_view dll_name,
                                                std::wstring_view shim_dir,
-                                               std::wstring_view guest_dir) const {
+                                               std::wstring_view guest_dir,
+                                               bool xbox_import_context) const {
     DllRouteDecision out{};
     const std::string canonical_in = NormalizeCanonicalName(dll_name);
     if (canonical_in.empty()) {
@@ -518,6 +537,14 @@ DllRouteDecision DllRoutingTable::ResolveRoute(std::string_view dll_name,
         // entry.rule.policy == DllRoutePolicy::Shim
         const std::wstring canon_w = Utf8ToWide(out.canonical_name);
         if (FileExistsInDirW(shim_dir, canon_w, out.resolved_path)) {
+            out.policy = DllRoutePolicy::Shim;
+            return out;
+        }
+        // If mfplat.dll was explicitly forced to '=shim', fall back to mfplat_xs.dll in shim_dir.
+        if (key == "mfplat.dll" && !shim_dir.empty() &&
+            FileExistsInDirW(shim_dir, L"mfplat_xs.dll", out.resolved_path)) {
+            out.canonical_name = "mfplat_xs.dll";
+            out.aliased = true;
             out.policy = DllRoutePolicy::Shim;
             return out;
         }
@@ -580,6 +607,39 @@ DllRouteDecision DllRoutingTable::ResolveRoute(std::string_view dll_name,
         }
     }
 
+    // 3b. Built-in XGamingRuntimeThunks.dll -> xgameruntime.dll alias routing:
+    //     If the guest ships its own XGamingRuntimeThunks.dll in guest_dir (and no explicit
+    //     OPENSCARLETT_DLL_ROUTING override was set), preserve NativeGuestDll so the guest's
+    //     thunk loader can call LoadLibrary("xgameruntime.dll"). Otherwise alias directly to
+    //     OpenScarlett's xgameruntime.dll shim.
+    if (key == "xgamingruntimethunks.dll") {
+        const std::wstring req_w = Utf8ToWide(canonical_in);
+        if (!guest_dir.empty() && FileExistsInDirW(guest_dir, req_w, out.resolved_path)) {
+            out.policy = DllRoutePolicy::NativeGuestDll;
+            out.load_priority = 5;
+            out.aliased = false;
+            return out;
+        }
+        auto xgr_it = rules_.find("xgameruntime.dll");
+        if (xgr_it != rules_.end()) {
+            return resolve_entry(xgr_it->second, true, xgr_it->second.from_override);
+        }
+    }
+
+    // 3c. Xbox-imported mfplat.dll -> mfplat_xs.dll routing:
+    //     Only active when xbox_import_context is true (a PE module that imports Xbox
+    //     console-exclusive DLLs) AND mfplat_xs.dll is available in shim_dir (or shim_dir is
+    //     empty for symbolic resolution), so desktop Win32 processes always get System32\mfplat.dll.
+    if (key == "mfplat.dll" && xbox_import_context) {
+        auto mf_it = rules_.find("mfplat_xs.dll");
+        if (mf_it != rules_.end() && mf_it->second.rule.policy == DllRoutePolicy::Shim) {
+            std::wstring probe_path;
+            if (shim_dir.empty() || FileExistsInDirW(shim_dir, L"mfplat_xs.dll", probe_path)) {
+                return resolve_entry(mf_it->second, true, mf_it->second.from_override);
+            }
+        }
+    }
+
     // 4. No explicit rule or alias: check if WindowsNative vs present in guest package directory.
     if (ClassifyImportDll(canonical_in) == DllCategory::WindowsNative) {
         out.policy = DllRoutePolicy::Windows;
@@ -601,11 +661,29 @@ DllRouteDecision DllRoutingTable::ResolveRoute(std::string_view dll_name,
 
 DllRouteDecision DllRoutingTable::ResolveRouteW(std::wstring_view dll_name,
                                                 std::wstring_view shim_dir,
-                                                std::wstring_view guest_dir) const {
-    return ResolveRoute(WideToUtf8(dll_name), shim_dir, guest_dir);
+                                                std::wstring_view guest_dir,
+                                                bool xbox_import_context) const {
+    return ResolveRoute(WideToUtf8(dll_name), shim_dir, guest_dir, xbox_import_context);
 }
 
 std::vector<DllRouteRule> DllRoutingTable::ListRules() const {
+    std::vector<DllRouteRule> out;
+    out.reserve(rules_.size());
+    for (const auto& kv : rules_) {
+        if (!kv.second.is_extended || kv.second.from_override) {
+            out.push_back(kv.second.rule);
+        }
+    }
+    std::sort(out.begin(), out.end(), [](const DllRouteRule& a, const DllRouteRule& b) {
+        if (a.load_priority != b.load_priority) {
+            return a.load_priority < b.load_priority;
+        }
+        return ToLower(a.canonical_name) < ToLower(b.canonical_name);
+    });
+    return out;
+}
+
+std::vector<DllRouteRule> DllRoutingTable::ListAllRules() const {
     std::vector<DllRouteRule> out;
     out.reserve(rules_.size());
     for (const auto& kv : rules_) {

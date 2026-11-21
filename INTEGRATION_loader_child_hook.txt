@@ -1,0 +1,31 @@
+OpenScarlett Worker 5 Integration Manifest
+==========================================
+Branch:   feat/loader-vfs-child-hook
+Worktree: E:\OpenScarlett\.worktrees\wt-loader-vfs-child-hook
+
+Modified Files:
+- include/openscarlett/loader/pe_inspector.h
+- src/loader/pe_inspector.cpp
+- include/openscarlett/loader/vfs_mounts.h
+- src/loader/vfs_mounts.cpp
+- include/openscarlett/loader/apc_injector.h
+- src/loader/apc_injector.cpp
+- src/loader/hook_dll.cpp
+
+New Files:
+- cmake/worker_loader_child_hook.cmake
+- tests/test_loader_child_hook_parity.cpp
+- INTEGRATION_loader_child_hook.txt
+
+CMake Integration:
+Add `cmake/worker_loader_child_hook.cmake` to the modular `foreach(_os_module_cmake ...)` list in root `CMakeLists.txt`.
+
+CTest Target Names:
+- test_loader_child_hook_parity
+
+Notes for Coordinator:
+- `DllRoutingTable::ListRules()` preserves the 19 core built-in shim entries (keeping existing `test_loader_vfs_config` 100% green without editing it), while `DllRoutingTable::ListAllRules()` returns all 24 built-in shims (19 core + 5 Worker 4 diagnostic/media shims: `mfplat_xs.dll`, `advapi32legacy.dll`, `KernelTraceControl.dll`, `hix_xs.dll`, `xbtp.dll`). All 24 are active in `FindRule()` and `ResolveRoute()`.
+- `XGamingRuntimeThunks.dll` routes to `xgameruntime.dll` via alias when not shipped in `guest_dir` (preserving `NativeGuestDll` when guest ships its own thunk DLL, and fully overridable via `OPENSCARLETT_DLL_ROUTING`).
+- `mfplat.dll` stays `WindowsNative` for desktop Win32 processes, and routes to `mfplat_xs.dll` when `xbox_import_context=true` (module statically imports ConsoleExclusive DLLs and `mfplat_xs.dll` is present in `shim_dir`) or when explicitly routed via `OPENSCARLETT_DLL_ROUTING`.
+- CoW VFS adds nested `G:\` read-only sub-mounts (`AddGameSubMount` + `OPENSCARLETT_VFS_G_SUBMOUNTS`), NTFS junction/symlink containment verification, relative path normalization, strict `S:\` -> `OPENSCARLETT_SAVE_ROOT`, and `forbid_system_drive_writes` guarding against `C:\` leakage.
+- `openscarlett_hook.dll` hooks `CreateProcessW` and `CreateProcessA` (IAT + kernel32/kernelbase GetProcAddress + real-address matching) to propagate `OPENSCARLETT_*` env vars (merging custom ANSI/Unicode `lpEnvironment`), inject `openscarlett_hook.dll` + static Xbox import routing via APC into suspended x64 children, assign non-clobbering `<stem>_pid<N>_telemetry.json` paths, preserve caller `CREATE_SUSPENDED`, and gracefully skip protected Store/System32 processes or `ERROR_ACCESS_DENIED`.

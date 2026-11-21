@@ -126,7 +126,10 @@ const char* DllRoutePolicyName(DllRoutePolicy policy) noexcept;
 // Data-driven per-DLL routing table shared by apc_injector and hook_dll.
 class DllRoutingTable {
 public:
-    // Populates built-in routing rules for all 19 OpenScarlett Xbox/GDK shim DLLs.
+    // Populates built-in routing rules for OpenScarlett's 19 core Xbox/GDK shims plus
+    // 5 diagnostic/media shims (mfplat_xs, advapi32legacy, KernelTraceControl, hix_xs, xbtp)
+    // and fallback alias routing (XGamingRuntimeThunks.dll -> xgameruntime.dll, and
+    // Xbox-imported mfplat.dll -> mfplat_xs.dll).
     DllRoutingTable();
 
     // Builds the routing table with built-in rules plus OPENSCARLETT_DLL_ROUTING overrides.
@@ -135,6 +138,7 @@ public:
     // Applies semicolon/comma-separated override rules such as:
     //   "foo.dll=guest;dstorage_xs.dll=shim;user32.dll=windows"
     //   "XGamingRuntimeThunks.dll=xgameruntime.dll;Microsoft.Xbox.Services.141.GDK.C.Thunks.dll=passthrough"
+    //   "mfplat.dll=mfplat_xs.dll"
     void ApplyOverrides(std::string_view override_spec);
 
     // Explicitly sets or overrides a single DLL's routing rule.
@@ -147,16 +151,25 @@ public:
     const DllRouteRule* FindRule(std::string_view dll_name) const;
 
     // Decides whether to route dll_name to Shim, NativeGuestDll, or Windows.
+    // Set xbox_import_context=true when resolving static imports of a PE module that imports
+    // Xbox console-exclusive DLLs (enables safe mfplat.dll -> mfplat_xs.dll routing without
+    // affecting desktop Win32 processes).
     DllRouteDecision ResolveRoute(std::string_view dll_name,
                                   std::wstring_view shim_dir,
-                                  std::wstring_view guest_dir = {}) const;
+                                  std::wstring_view guest_dir = {},
+                                  bool xbox_import_context = false) const;
 
     DllRouteDecision ResolveRouteW(std::wstring_view dll_name,
                                    std::wstring_view shim_dir,
-                                   std::wstring_view guest_dir = {}) const;
+                                   std::wstring_view guest_dir = {},
+                                   bool xbox_import_context = false) const;
 
-    // Returns all configured rules ordered by (load_priority, canonical_name).
+    // Returns the core built-in shim rules plus any explicit overrides ordered by (load_priority, canonical_name).
     std::vector<DllRouteRule> ListRules() const;
+
+    // Returns all configured rules (core + extended diagnostic/media shims + overrides)
+    // ordered by (load_priority, canonical_name).
+    std::vector<DllRouteRule> ListAllRules() const;
 
 private:
     static std::string NormalizeDllKey(std::string_view raw_name);
@@ -165,6 +178,7 @@ private:
     struct Entry {
         DllRouteRule rule;
         bool from_override = false;
+        bool is_extended = false;
     };
     std::unordered_map<std::string, Entry> rules_;
     std::unordered_map<std::string, std::string> aliases_;

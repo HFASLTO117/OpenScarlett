@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace openscarlett {
 
@@ -29,16 +30,26 @@ enum class VfsTranslateStatus : uint8_t {
     ReadOnlyViolation = 5,  // Write/Delete on G:/GAME: attempted with no CoW overlay configured
 };
 
+struct VfsSubMount {
+    std::wstring virtual_prefix;  // Normalized relative subpath under G:\ (e.g. L"DLC\\Pack1")
+    std::wstring host_root;       // Strictly read-only backing host directory for this sub-mount
+};
+
 struct VfsMountConfig {
     std::wstring g_root;          // Backing host directory for G: / GAME: (strictly read-only)
     std::wstring t_root;          // Backing host directory for T:
     std::wstring s_root;          // Backing host directory for S:
     std::wstring g_overlay_root;  // CoW overlay & whiteout directory for G: / GAME:
+    std::vector<VfsSubMount> g_sub_mounts;  // Optional nested read-only sub-mounts under G:/GAME:
+    bool forbid_system_drive_writes = false;  // When true, mutating operations targeting C:\ or %SystemDrive% are rejected
 };
 
 // Clean-room UTF-8 / UTF-16 conversion helpers (safe on Windows x64).
 std::wstring Utf8ToWide(std::string_view utf8);
 std::string WideToUtf8(std::wstring_view wide);
+
+// Returns true if the given path targets the Windows system drive (C:\ or %SystemDrive%).
+bool IsPathOnSystemDriveW(std::wstring_view path) noexcept;
 
 // Creates a directory tree iteratively using Win32 CreateDirectoryW (no C:\ fallback).
 bool EnsureDirectoryTreeW(std::wstring_view path);
@@ -73,6 +84,10 @@ public:
                                              std::wstring_view default_vfs_root = {});
 
     void Configure(const VfsMountConfig& config);
+
+    // Registers a read-only nested sub-mount under G:/GAME: (e.g. "DLC/Pack1" -> E:\dlc_pack1).
+    // All writes inside the sub-mount still redirect to g_overlay_root without touching host_ro_root.
+    bool AddGameSubMount(std::wstring_view virtual_subpath, std::wstring_view host_ro_root);
 
     // Creates T:\, S:\, and G_overlay backing directories on disk if configured (never touches g_root).
     bool EnsureWritableMounts() const;
@@ -119,6 +134,8 @@ public:
     const std::wstring& GetGameOverlayRoot() const noexcept { return g_overlay_root_; }
     const std::wstring& GetScratchRoot() const noexcept { return t_root_; }
     const std::wstring& GetSaveRoot() const noexcept { return s_root_; }
+    const std::vector<VfsSubMount>& GetGameSubMounts() const noexcept { return g_sub_mounts_; }
+    bool GetForbidSystemDriveWrites() const noexcept { return forbid_system_drive_writes_; }
 
 private:
     static std::wstring NormalizeRoot(std::wstring_view root);
@@ -127,6 +144,8 @@ private:
     std::wstring t_root_;
     std::wstring s_root_;
     std::wstring g_overlay_root_;
+    std::vector<VfsSubMount> g_sub_mounts_;
+    bool forbid_system_drive_writes_ = false;
 };
 
 }  // namespace openscarlett
