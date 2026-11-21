@@ -65,6 +65,48 @@ enum XG_BIND_FLAGS : uint32_t {
     XG_BIND_CUBE_MAP = 0x200u,
 };
 
+enum XG_CONSOLE_TYPE : uint32_t {
+    XG_CONSOLE_TYPE_SCARLETT_ANACONDA = 0u,  // Xbox Series X (52 CU, 16 pipes, 2 SE)
+    XG_CONSOLE_TYPE_SCARLETT_LOCKHART = 1u,  // Xbox Series S (20 CU, 8 pipes, 1 SE)
+};
+
+struct XG_SCARLETT_PIPE_CONFIG {
+    XG_CONSOLE_TYPE ConsoleType;
+    uint32_t NumPipes;
+    uint32_t PipeInterleaveBytes;
+    uint32_t NumBanks;
+    uint32_t NumShaderEngines;
+    uint32_t NumRenderBackends;
+    uint32_t PipeBits;
+    uint32_t BankBits;
+    uint32_t MaxCompressedFragments;
+    uint32_t HtileTileSizeBytes;
+    uint32_t DccBlockSizeBytes;
+    uint32_t CmaskTileWidthPixels;
+    uint32_t CmaskTileHeightPixels;
+};
+
+struct XG_METADATA_PLANE_INFO {
+    uint32_t Enabled;
+    uint32_t PipeAligned;
+    uint32_t MetaBlockWidth;
+    uint32_t MetaBlockHeight;
+    uint64_t OffsetBytes;
+    uint64_t SizeBytes;
+    uint64_t AlignmentBytes;
+    uint64_t SlicePitchBytes;
+};
+
+struct XG_RESOURCE_METADATA_LAYOUT {
+    uint64_t BaseSurfaceSizeBytes;
+    uint64_t TotalSizeWithMetadataBytes;
+    uint64_t BaseAlignmentBytes;
+    XG_SCARLETT_PIPE_CONFIG PipeConfig;
+    XG_METADATA_PLANE_INFO Htile;
+    XG_METADATA_PLANE_INFO Dcc;
+    XG_METADATA_PLANE_INFO Cmask;
+};
+
 struct XG_FORMAT_BLOCK_INFO {
     uint32_t dxgi_format;
     uint32_t block_width;
@@ -289,6 +331,15 @@ bool UntileSurface3D(
     uint32_t dst_row_pitch_bytes,
     uint32_t dst_slice_pitch_bytes) noexcept;
 
+bool QueryScarlettPipeConfig(
+    XG_CONSOLE_TYPE console_type,
+    XG_SCARLETT_PIPE_CONFIG& out_config) noexcept;
+
+bool ComputeTexture2DMetadataLayout(
+    const XG_TEXTURE2D_DESC& desc,
+    XG_CONSOLE_TYPE console_type,
+    XG_RESOURCE_METADATA_LAYOUT& out_meta) noexcept;
+
 }  // namespace openscarlett::xg
 
 extern "C" {
@@ -387,5 +438,24 @@ OPENSCARLETT_XG_API void __stdcall OpenScarlettXgResetTelemetry();
 OPENSCARLETT_XG_API int __stdcall OpenScarlettXgGetTelemetryEntry(
     const char* symbol_name,
     uint64_t* out_total_calls);
+
+OPENSCARLETT_XG_API int32_t __stdcall XGQueryScarlettPipeConfig(
+    XG_CONSOLE_TYPE console_type,
+    XG_SCARLETT_PIPE_CONFIG* pOutConfig);
+
+OPENSCARLETT_XG_API int32_t __stdcall XGComputeTexture2DMetadataLayout(
+    const XG_TEXTURE2D_DESC* pDesc,
+    XG_CONSOLE_TYPE console_type,
+    XG_RESOURCE_METADATA_LAYOUT* pOutMeta);
+
+OPENSCARLETT_XG_API int32_t __stdcall XGComputeHtileLayout(
+    const XG_TEXTURE2D_DESC* pDesc,
+    XG_CONSOLE_TYPE console_type,
+    XG_METADATA_PLANE_INFO* pOutHtile);
+
+OPENSCARLETT_XG_API int32_t __stdcall XGComputeCmaskLayout(
+    const XG_TEXTURE2D_DESC* pDesc,
+    XG_CONSOLE_TYPE console_type,
+    XG_METADATA_PLANE_INFO* pOutCmask);
 
 }  // extern "C"

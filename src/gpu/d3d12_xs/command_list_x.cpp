@@ -221,12 +221,18 @@ HRESULT STDMETHODCALLTYPE CommandListX::Close() {
 
 HRESULT STDMETHODCALLTYPE CommandListX::Reset(
     ID3D12CommandAllocator* pAllocator, ID3D12PipelineState* pInitialState) {
+    depth_bias_.store(0.0f, std::memory_order_relaxed);
+    depth_bias_clamp_.store(0.0f, std::memory_order_relaxed);
+    slope_scaled_depth_bias_.store(0.0f, std::memory_order_relaxed);
     const HRESULT hr = host_list_->Reset(pAllocator, pInitialState);
     RecordList("ID3D12GraphicsCommandListX::Reset", 10, hr);
     return hr;
 }
 
 void STDMETHODCALLTYPE CommandListX::ClearState(ID3D12PipelineState* pPipelineState) {
+    depth_bias_.store(0.0f, std::memory_order_relaxed);
+    depth_bias_clamp_.store(0.0f, std::memory_order_relaxed);
+    slope_scaled_depth_bias_.store(0.0f, std::memory_order_relaxed);
     host_list_->ClearState(pPipelineState);
     RecordList("ID3D12GraphicsCommandListX::ClearState", 11, S_OK);
 }
@@ -407,37 +413,49 @@ void STDMETHODCALLTYPE CommandListX::SetGraphicsRoot32BitConstants(
 
 void STDMETHODCALLTYPE CommandListX::SetComputeRootConstantBufferView(
     UINT RootParameterIndex, D3D12_GPU_VIRTUAL_ADDRESS BufferLocation) {
-    host_list_->SetComputeRootConstantBufferView(RootParameterIndex, BufferLocation);
+    const D3D12_GPU_VIRTUAL_ADDRESS translated =
+        device_x_ ? device_x_->TranslateGuestGpuVa(BufferLocation) : BufferLocation;
+    host_list_->SetComputeRootConstantBufferView(RootParameterIndex, translated);
     RecordList("ID3D12GraphicsCommandListX::SetComputeRootConstantBufferView", 37, S_OK);
 }
 
 void STDMETHODCALLTYPE CommandListX::SetGraphicsRootConstantBufferView(
     UINT RootParameterIndex, D3D12_GPU_VIRTUAL_ADDRESS BufferLocation) {
-    host_list_->SetGraphicsRootConstantBufferView(RootParameterIndex, BufferLocation);
+    const D3D12_GPU_VIRTUAL_ADDRESS translated =
+        device_x_ ? device_x_->TranslateGuestGpuVa(BufferLocation) : BufferLocation;
+    host_list_->SetGraphicsRootConstantBufferView(RootParameterIndex, translated);
     RecordList("ID3D12GraphicsCommandListX::SetGraphicsRootConstantBufferView", 38, S_OK);
 }
 
 void STDMETHODCALLTYPE CommandListX::SetComputeRootShaderResourceView(
     UINT RootParameterIndex, D3D12_GPU_VIRTUAL_ADDRESS BufferLocation) {
-    host_list_->SetComputeRootShaderResourceView(RootParameterIndex, BufferLocation);
+    const D3D12_GPU_VIRTUAL_ADDRESS translated =
+        device_x_ ? device_x_->TranslateGuestGpuVa(BufferLocation) : BufferLocation;
+    host_list_->SetComputeRootShaderResourceView(RootParameterIndex, translated);
     RecordList("ID3D12GraphicsCommandListX::SetComputeRootShaderResourceView", 39, S_OK);
 }
 
 void STDMETHODCALLTYPE CommandListX::SetGraphicsRootShaderResourceView(
     UINT RootParameterIndex, D3D12_GPU_VIRTUAL_ADDRESS BufferLocation) {
-    host_list_->SetGraphicsRootShaderResourceView(RootParameterIndex, BufferLocation);
+    const D3D12_GPU_VIRTUAL_ADDRESS translated =
+        device_x_ ? device_x_->TranslateGuestGpuVa(BufferLocation) : BufferLocation;
+    host_list_->SetGraphicsRootShaderResourceView(RootParameterIndex, translated);
     RecordList("ID3D12GraphicsCommandListX::SetGraphicsRootShaderResourceView", 40, S_OK);
 }
 
 void STDMETHODCALLTYPE CommandListX::SetComputeRootUnorderedAccessView(
     UINT RootParameterIndex, D3D12_GPU_VIRTUAL_ADDRESS BufferLocation) {
-    host_list_->SetComputeRootUnorderedAccessView(RootParameterIndex, BufferLocation);
+    const D3D12_GPU_VIRTUAL_ADDRESS translated =
+        device_x_ ? device_x_->TranslateGuestGpuVa(BufferLocation) : BufferLocation;
+    host_list_->SetComputeRootUnorderedAccessView(RootParameterIndex, translated);
     RecordList("ID3D12GraphicsCommandListX::SetComputeRootUnorderedAccessView", 41, S_OK);
 }
 
 void STDMETHODCALLTYPE CommandListX::SetGraphicsRootUnorderedAccessView(
     UINT RootParameterIndex, D3D12_GPU_VIRTUAL_ADDRESS BufferLocation) {
-    host_list_->SetGraphicsRootUnorderedAccessView(RootParameterIndex, BufferLocation);
+    const D3D12_GPU_VIRTUAL_ADDRESS translated =
+        device_x_ ? device_x_->TranslateGuestGpuVa(BufferLocation) : BufferLocation;
+    host_list_->SetGraphicsRootUnorderedAccessView(RootParameterIndex, translated);
     RecordList("ID3D12GraphicsCommandListX::SetGraphicsRootUnorderedAccessView", 42, S_OK);
 }
 
@@ -753,7 +771,7 @@ void STDMETHODCALLTYPE CommandListX::DispatchMesh(
                79, host_list6_ ? S_OK : E_NOINTERFACE);
 }
 
-// ID3D12GraphicsCommandListX (slots 80..81)
+// ID3D12GraphicsCommandListX (slots 80..85)
 void STDMETHODCALLTYPE CommandListX::SetGpuVirtualAddressHintX(uint64_t Hint) {
     gpu_va_hint_.store(Hint, std::memory_order_relaxed);
     RecordList("ID3D12GraphicsCommandListX::SetGpuVirtualAddressHintX", 80, S_OK);
@@ -762,6 +780,76 @@ void STDMETHODCALLTYPE CommandListX::SetGpuVirtualAddressHintX(uint64_t Hint) {
 ID3D12GraphicsCommandList* STDMETHODCALLTYPE CommandListX::GetUnderlyingHostCommandList() {
     RecordList("ID3D12GraphicsCommandListX::GetUnderlyingHostCommandList", 81, S_OK);
     return host_list_;
+}
+
+void STDMETHODCALLTYPE CommandListX::KickoffX() {
+    kickoff_count_.fetch_add(1ull, std::memory_order_relaxed);
+    RecordList("ID3D12GraphicsCommandListX::KickoffX", 82, S_OK);
+}
+
+void STDMETHODCALLTYPE CommandListX::Wait32BitValueX(
+    D3D12_GPU_VIRTUAL_ADDRESS Address,
+    uint32_t Value,
+    uint32_t Mask,
+    D3D12XBOX_WAIT_VALUE_OP Operation) {
+    (void)Address;
+    (void)Value;
+    (void)Mask;
+    (void)Operation;
+    if (host_list_) {
+        const D3D12_COMMAND_LIST_TYPE list_type = host_list_->GetType();
+        if (list_type == D3D12_COMMAND_LIST_TYPE_DIRECT ||
+            list_type == D3D12_COMMAND_LIST_TYPE_COMPUTE) {
+            D3D12_RESOURCE_BARRIER uav_barrier{};
+            uav_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            uav_barrier.UAV.pResource = nullptr;
+            host_list_->ResourceBarrier(1u, &uav_barrier);
+        }
+    }
+    RecordList("ID3D12GraphicsCommandListX::Wait32BitValueX", 83, S_OK);
+}
+
+void STDMETHODCALLTYPE CommandListX::Wait64BitValueX(
+    D3D12_GPU_VIRTUAL_ADDRESS Address,
+    uint64_t Value,
+    uint64_t Mask,
+    D3D12XBOX_WAIT_VALUE_OP Operation) {
+    (void)Address;
+    (void)Value;
+    (void)Mask;
+    (void)Operation;
+    if (host_list_) {
+        const D3D12_COMMAND_LIST_TYPE list_type = host_list_->GetType();
+        if (list_type == D3D12_COMMAND_LIST_TYPE_DIRECT ||
+            list_type == D3D12_COMMAND_LIST_TYPE_COMPUTE) {
+            D3D12_RESOURCE_BARRIER uav_barrier{};
+            uav_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            uav_barrier.UAV.pResource = nullptr;
+            host_list_->ResourceBarrier(1u, &uav_barrier);
+        }
+    }
+    RecordList("ID3D12GraphicsCommandListX::Wait64BitValueX", 84, S_OK);
+}
+
+void STDMETHODCALLTYPE CommandListX::RSSetDepthBiasX(
+    FLOAT DepthBias,
+    FLOAT DepthBiasClamp,
+    FLOAT SlopeScaledDepthBias) {
+    depth_bias_.store(DepthBias, std::memory_order_relaxed);
+    depth_bias_clamp_.store(DepthBiasClamp, std::memory_order_relaxed);
+    slope_scaled_depth_bias_.store(SlopeScaledDepthBias, std::memory_order_relaxed);
+    RecordList("ID3D12GraphicsCommandListX::RSSetDepthBiasX", 85, S_OK);
+}
+
+void CommandListX::GetDepthBiasXState(
+    float* out_depth_bias,
+    float* out_depth_bias_clamp,
+    float* out_slope_scaled_depth_bias) const noexcept {
+    if (out_depth_bias) *out_depth_bias = depth_bias_.load(std::memory_order_relaxed);
+    if (out_depth_bias_clamp) *out_depth_bias_clamp = depth_bias_clamp_.load(std::memory_order_relaxed);
+    if (out_slope_scaled_depth_bias) {
+        *out_slope_scaled_depth_bias = slope_scaled_depth_bias_.load(std::memory_order_relaxed);
+    }
 }
 
 }  // namespace openscarlett::d3d12_xs

@@ -56,6 +56,16 @@ enum D3D12XBOX_TONEMAP_MODE : uint32_t {
     D3D12XBOX_TONEMAP_NONE = 3u,
 };
 
+enum D3D12XBOX_WAIT_VALUE_OP : uint32_t {
+    D3D12XBOX_WAIT_VALUE_OP_ALWAYS = 0u,
+    D3D12XBOX_WAIT_VALUE_OP_LESS = 1u,
+    D3D12XBOX_WAIT_VALUE_OP_LESS_EQUAL = 2u,
+    D3D12XBOX_WAIT_VALUE_OP_EQUAL = 3u,
+    D3D12XBOX_WAIT_VALUE_OP_NOT_EQUAL = 4u,
+    D3D12XBOX_WAIT_VALUE_OP_GREATER_EQUAL = 5u,
+    D3D12XBOX_WAIT_VALUE_OP_GREATER = 6u,
+};
+
 struct D3D12XBOX_HDR10_METADATA {
     uint16_t RedPrimary[2] = {35400u, 14600u};    // BT.2020 (0.708, 0.292) in 0.00002 units
     uint16_t GreenPrimary[2] = {8500u, 39850u};   // BT.2020 (0.170, 0.797)
@@ -250,6 +260,17 @@ struct OPENSCARLETT_COM_UUID("4F534431-3258-434D-5100-000000000002") ID3D12Comma
 
     virtual HRESULT STDMETHODCALLTYPE SuspendX(uint32_t Flags) = 0;
     virtual HRESULT STDMETHODCALLTYPE ResumeX() = 0;
+    virtual HRESULT STDMETHODCALLTYPE KickoffX() = 0;
+    virtual HRESULT STDMETHODCALLTYPE Wait32BitValueX(
+        D3D12_GPU_VIRTUAL_ADDRESS Address,
+        uint32_t Value,
+        uint32_t Mask,
+        D3D12XBOX_WAIT_VALUE_OP Operation) = 0;
+    virtual HRESULT STDMETHODCALLTYPE Wait64BitValueX(
+        D3D12_GPU_VIRTUAL_ADDRESS Address,
+        uint64_t Value,
+        uint64_t Mask,
+        D3D12XBOX_WAIT_VALUE_OP Operation) = 0;
 };
 #ifdef __CRT_UUID_DECL
 __CRT_UUID_DECL(ID3D12CommandQueueX, 0x4F534431, 0x3258, 0x434D, 0x51, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02)
@@ -258,6 +279,21 @@ __CRT_UUID_DECL(ID3D12CommandQueueX, 0x4F534431, 0x3258, 0x434D, 0x51, 0x00, 0x0
 struct OPENSCARLETT_COM_UUID("4F534431-3258-434D-4C00-000000000003") ID3D12GraphicsCommandListX : public ID3D12GraphicsCommandList6 {
     virtual void STDMETHODCALLTYPE SetGpuVirtualAddressHintX(uint64_t Hint) = 0;
     virtual ID3D12GraphicsCommandList* STDMETHODCALLTYPE GetUnderlyingHostCommandList() = 0;
+    virtual void STDMETHODCALLTYPE KickoffX() = 0;
+    virtual void STDMETHODCALLTYPE Wait32BitValueX(
+        D3D12_GPU_VIRTUAL_ADDRESS Address,
+        uint32_t Value,
+        uint32_t Mask,
+        D3D12XBOX_WAIT_VALUE_OP Operation) = 0;
+    virtual void STDMETHODCALLTYPE Wait64BitValueX(
+        D3D12_GPU_VIRTUAL_ADDRESS Address,
+        uint64_t Value,
+        uint64_t Mask,
+        D3D12XBOX_WAIT_VALUE_OP Operation) = 0;
+    virtual void STDMETHODCALLTYPE RSSetDepthBiasX(
+        FLOAT DepthBias,
+        FLOAT DepthBiasClamp,
+        FLOAT SlopeScaledDepthBias) = 0;
 };
 #ifdef __CRT_UUID_DECL
 __CRT_UUID_DECL(ID3D12GraphicsCommandListX, 0x4F534431, 0x3258, 0x434D, 0x4C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03)
@@ -324,6 +360,17 @@ struct OPENSCARLETT_COM_UUID("4F534431-3258-554D-4500-000000000007") IOpenScarle
         uint32_t* out_flushed_count) = 0;
     virtual HRESULT STDMETHODCALLTYPE GetUnifiedTextureStats(
         D3D12XBOX_UNIFIED_TEXTURE_STATS* out_stats) = 0;
+    virtual HRESULT STDMETHODCALLTYPE AttachXMemAllocation(
+        uint64_t guest_va,
+        uint64_t byte_size,
+        uint64_t* out_desktop_gpu_va) = 0;
+    virtual HRESULT STDMETHODCALLTYPE DetachXMemAllocation(
+        uint64_t guest_va) = 0;
+    virtual HRESULT STDMETHODCALLTYPE ResolveXMemGpuVa(
+        uint64_t guest_va,
+        uint64_t* out_desktop_gpu_va) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetR9G9B9E5UavFallbackActive(
+        int* out_active) = 0;
 };
 #ifdef __CRT_UUID_DECL
 __CRT_UUID_DECL(IOpenScarlettUnifiedMemory, 0x4F534431, 0x3258, 0x554D, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07)
@@ -458,6 +505,61 @@ OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxEnableDccMetadata(
     ID3D12Device* pDevice,
     ID3D12Resource* pResource,
     uint32_t Flags);
+
+// Xbox CommandQueueX / CommandListX C wrappers, XMem GPU VA attachment, and R9G9B9E5 UAV fallback controls.
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12QueueKickoffX(
+    ID3D12CommandQueue* queue);
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12QueueWait32BitValueX(
+    ID3D12CommandQueue* queue,
+    D3D12_GPU_VIRTUAL_ADDRESS address,
+    uint32_t value,
+    uint32_t mask,
+    D3D12XBOX_WAIT_VALUE_OP operation);
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12QueueWait64BitValueX(
+    ID3D12CommandQueue* queue,
+    D3D12_GPU_VIRTUAL_ADDRESS address,
+    uint64_t value,
+    uint64_t mask,
+    D3D12XBOX_WAIT_VALUE_OP operation);
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12CommandListKickoffX(
+    ID3D12GraphicsCommandList* cmd_list);
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12CommandListRSSetDepthBiasX(
+    ID3D12GraphicsCommandList* cmd_list,
+    float depth_bias,
+    float depth_bias_clamp,
+    float slope_scaled_depth_bias);
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12CommandListGetDepthBiasX(
+    ID3D12GraphicsCommandList* cmd_list,
+    float* out_depth_bias,
+    float* out_depth_bias_clamp,
+    float* out_slope_scaled_depth_bias);
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12AttachXMemAllocation(
+    ID3D12Device* device,
+    uint64_t guest_va,
+    uint64_t byte_size,
+    uint64_t* out_desktop_gpu_va);
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12DetachXMemAllocation(
+    ID3D12Device* device,
+    uint64_t guest_va);
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12ResolveXMemGpuVa(
+    ID3D12Device* device,
+    uint64_t guest_va,
+    uint64_t* out_desktop_gpu_va);
+
+OPENSCARLETT_D3D12_API void WINAPI OpenScarlettD3D12SetForceR9G9B9E5UavFallback(
+    int force_fallback);
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12GetR9G9B9E5UavFallbackActive(
+    ID3D12Device* device,
+    int* out_active);
 
 }  // extern "C"
 

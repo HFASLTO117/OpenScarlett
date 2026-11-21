@@ -91,6 +91,7 @@ inline constexpr int32_t kVkStypeDeviceCreateInfo = 3;
 inline constexpr int32_t kVkStypeSubmitInfo = 4;
 inline constexpr int32_t kVkStypeMemoryAllocateInfo = 5;
 inline constexpr int32_t kVkStypeMappedMemoryRange = 6;
+inline constexpr int32_t kVkStypeBindSparseInfo = 7;
 inline constexpr int32_t kVkStypeFenceCreateInfo = 8;
 inline constexpr int32_t kVkStypeSemaphoreCreateInfo = 9;
 inline constexpr int32_t kVkStypeBufferCreateInfo = 12;
@@ -132,6 +133,17 @@ inline constexpr int32_t kVkStypePhysicalDeviceMeshShaderFeaturesExt = 100032800
 // Flags & enums
 inline constexpr uint32_t kVkQueueGraphicsBit = 0x00000001u;
 inline constexpr uint32_t kVkQueueComputeBit = 0x00000002u;
+inline constexpr uint32_t kVkQueueSparseBindingBit = 0x00000008u;
+inline constexpr uint32_t kVkImageCreateSparseBindingBit = 0x00000001u;
+inline constexpr uint32_t kVkImageCreateSparseResidencyBit = 0x00000002u;
+inline constexpr uint32_t kVkSparseImageFormatSingleMiptailBit = 0x00000001u;
+inline constexpr uint32_t kVkSparseImageFormatAlignedMipSizeBit = 0x00000002u;
+inline constexpr uint32_t kVkSparseImageFormatNonstandardBlockSizeBit = 0x00000004u;
+inline constexpr uint32_t kVkSparseMemoryBindMetadataBit = 0x00000001u;
+inline constexpr uint32_t kVkFeatSparseBinding = 44u;
+inline constexpr uint32_t kVkFeatSparseResidencyBuffer = 45u;
+inline constexpr uint32_t kVkFeatSparseResidencyImage2D = 46u;
+inline constexpr uint32_t kVkFeatSparseResidencyImage3D = 47u;
 inline constexpr uint32_t kVkMemoryPropertyDeviceLocalBit = 0x00000001u;
 inline constexpr uint32_t kVkMemoryPropertyHostVisibleBit = 0x00000002u;
 inline constexpr uint32_t kVkMemoryPropertyHostCoherentBit = 0x00000004u;
@@ -962,6 +974,79 @@ struct VkPresentInfoKHR {
     VkResult* pResults;
 };
 
+struct VkSparseImageFormatProperties {
+    VkFlags aspectMask;
+    VkExtent3D imageGranularity;
+    VkFlags flags;
+};
+
+struct VkSparseImageMemoryRequirements {
+    VkSparseImageFormatProperties formatProperties;
+    uint32_t imageMipTailFirstLod;
+    VkDeviceSize imageMipTailSize;
+    VkDeviceSize imageMipTailOffset;
+    VkDeviceSize imageMipTailStride;
+};
+static_assert(sizeof(VkSparseImageMemoryRequirements) == 48, "VkSparseImageMemoryRequirements x64 size");
+
+struct VkImageSubresource {
+    VkFlags aspectMask;
+    uint32_t mipLevel;
+    uint32_t arrayLayer;
+};
+
+struct VkSparseMemoryBind {
+    VkDeviceSize resourceOffset;
+    VkDeviceSize size;
+    VkDeviceMemory memory;
+    VkDeviceSize memoryOffset;
+    VkFlags flags;
+};
+
+struct VkSparseImageMemoryBind {
+    VkImageSubresource subresource;
+    VkOffset3D offset;
+    VkExtent3D extent;
+    VkDeviceMemory memory;
+    VkDeviceSize memoryOffset;
+    VkFlags flags;
+};
+static_assert(sizeof(VkSparseImageMemoryBind) == 64, "VkSparseImageMemoryBind x64 size");
+
+struct VkSparseBufferMemoryBindInfo {
+    VkBuffer buffer;
+    uint32_t bindCount;
+    const VkSparseMemoryBind* pBinds;
+};
+
+struct VkSparseImageOpaqueMemoryBindInfo {
+    VkImage image;
+    uint32_t bindCount;
+    const VkSparseMemoryBind* pBinds;
+};
+
+struct VkSparseImageMemoryBindInfo {
+    VkImage image;
+    uint32_t bindCount;
+    const VkSparseImageMemoryBind* pBinds;
+};
+
+struct VkBindSparseInfo {
+    int32_t sType;
+    const void* pNext;
+    uint32_t waitSemaphoreCount;
+    const VkSemaphore* pWaitSemaphores;
+    uint32_t bufferBindCount;
+    const VkSparseBufferMemoryBindInfo* pBufferBinds;
+    uint32_t imageOpaqueBindCount;
+    const VkSparseImageOpaqueMemoryBindInfo* pImageOpaqueBinds;
+    uint32_t imageBindCount;
+    const VkSparseImageMemoryBindInfo* pImageBinds;
+    uint32_t signalSemaphoreCount;
+    const VkSemaphore* pSignalSemaphores;
+};
+static_assert(sizeof(VkBindSparseInfo) == 96, "VkBindSparseInfo x64 size");
+
 // Function pointer typedefs
 using PFN_vkVoidFunction = void(SX_VKAPI_PTR*)();
 using PFN_vkGetInstanceProcAddr = PFN_vkVoidFunction(SX_VKAPI_PTR*)(VkInstance, const char*);
@@ -972,6 +1057,7 @@ using PFN_vkCreateInstance = VkResult(SX_VKAPI_PTR*)(const VkInstanceCreateInfo*
 using PFN_vkDestroyInstance = void(SX_VKAPI_PTR*)(VkInstance, const void*);
 using PFN_vkEnumeratePhysicalDevices = VkResult(SX_VKAPI_PTR*)(VkInstance, uint32_t*, VkPhysicalDevice*);
 using PFN_vkGetPhysicalDeviceProperties = void(SX_VKAPI_PTR*)(VkPhysicalDevice, VkPhysicalDevicePropertiesRaw*);
+using PFN_vkGetPhysicalDeviceFeatures = void(SX_VKAPI_PTR*)(VkPhysicalDevice, VkPhysicalDeviceFeatures*);
 using PFN_vkGetPhysicalDeviceFeatures2 = void(SX_VKAPI_PTR*)(VkPhysicalDevice, VkPhysicalDeviceFeatures2*);
 using PFN_vkGetPhysicalDeviceQueueFamilyProperties = void(SX_VKAPI_PTR*)(VkPhysicalDevice, uint32_t*, VkQueueFamilyProperties*);
 using PFN_vkGetPhysicalDeviceMemoryProperties = void(SX_VKAPI_PTR*)(VkPhysicalDevice, VkPhysicalDeviceMemoryProperties*);
@@ -981,6 +1067,7 @@ using PFN_vkDestroyDevice = void(SX_VKAPI_PTR*)(VkDevice, const void*);
 using PFN_vkDeviceWaitIdle = VkResult(SX_VKAPI_PTR*)(VkDevice);
 using PFN_vkGetDeviceQueue = void(SX_VKAPI_PTR*)(VkDevice, uint32_t, uint32_t, VkQueue*);
 using PFN_vkQueueSubmit = VkResult(SX_VKAPI_PTR*)(VkQueue, uint32_t, const VkSubmitInfo*, VkFence);
+using PFN_vkQueueBindSparse = VkResult(SX_VKAPI_PTR*)(VkQueue, uint32_t, const VkBindSparseInfo*, VkFence);
 using PFN_vkQueueWaitIdle = VkResult(SX_VKAPI_PTR*)(VkQueue);
 using PFN_vkCreateFence = VkResult(SX_VKAPI_PTR*)(VkDevice, const VkFenceCreateInfo*, const void*, VkFence*);
 using PFN_vkDestroyFence = void(SX_VKAPI_PTR*)(VkDevice, VkFence, const void*);
@@ -1025,6 +1112,7 @@ using PFN_vkDestroyRenderPass = void(SX_VKAPI_PTR*)(VkDevice, VkRenderPass, cons
 using PFN_vkCreateImage = VkResult(SX_VKAPI_PTR*)(VkDevice, const VkImageCreateInfo*, const void*, VkImage*);
 using PFN_vkDestroyImage = void(SX_VKAPI_PTR*)(VkDevice, VkImage, const void*);
 using PFN_vkGetImageMemoryRequirements = void(SX_VKAPI_PTR*)(VkDevice, VkImage, VkMemoryRequirements*);
+using PFN_vkGetImageSparseMemoryRequirements = void(SX_VKAPI_PTR*)(VkDevice, VkImage, uint32_t*, VkSparseImageMemoryRequirements*);
 using PFN_vkBindImageMemory = VkResult(SX_VKAPI_PTR*)(VkDevice, VkImage, VkDeviceMemory, VkDeviceSize);
 using PFN_vkCreateImageView = VkResult(SX_VKAPI_PTR*)(VkDevice, const VkImageViewCreateInfo*, const void*, VkImageView*);
 using PFN_vkDestroyImageView = void(SX_VKAPI_PTR*)(VkDevice, VkImageView, const void*);
@@ -1745,9 +1833,11 @@ struct SwShaderExecEnv {
     std::vector<uint8_t>* task_payload = nullptr;
 };
 
-SwVec4 SwSampleTexture2D(const VulkanTextureDesc& tex, float u, float v, bool linear) {
-    if (tex.mips.empty() || tex.mips[0].data.empty()) return {{0, 0, 0, 1}};
-    const auto& mip = tex.mips[0];
+SwVec4 SwSampleTexture2D(const VulkanTextureDesc& tex, float u, float v, bool linear, uint32_t mip_index = 0u) {
+    if (tex.mips.empty()) return {{0, 0, 0, 1}};
+    const uint32_t clamped_mip = std::min<uint32_t>(mip_index, static_cast<uint32_t>(tex.mips.size() - 1u));
+    const auto& mip = tex.mips[clamped_mip];
+    if (mip.data.empty()) return {{0, 0, 0, 1}};
     const uint32_t w = std::max<uint32_t>(1, mip.width);
     const uint32_t h = std::max<uint32_t>(1, mip.height);
     const float cu = std::clamp(u, 0.0f, 0.99999f);
@@ -2036,11 +2126,34 @@ bool ExecuteSwSpvModule(const SwSpvModule& mod, SwShaderExecEnv& env) {
             case kSpvOpImageSampleImplicitLod:
             case kSpvOpImageSampleExplicitLod:
                 if (wc >= 5 && spv[ip + 2] < mod.bound) {
-                    const uint32_t img_binding = regs[spv[ip + 3]].u[0];
+                    const auto& sampled_reg = regs[spv[ip + 3]];
+                    const uint32_t img_binding = sampled_reg.u[0];
+                    const uint32_t samp_binding = (sampled_reg.count >= 2u) ? sampled_reg.u[1] : img_binding;
                     const auto& uv = regs[spv[ip + 4]];
+                    float explicit_lod = 0.0f;
+                    if (op == kSpvOpImageSampleExplicitLod && wc >= 7 && (spv[ip + 5] & 0x2u) != 0u) {
+                        explicit_lod = regs[spv[ip + 6]].f(0);
+                    }
                     SwVec4 c = {{0, 0, 0, 1}};
-                    if (const auto* d = find_desc(img_binding)) {
-                        c = SwSampleTexture2D(d->texture, uv.f(0), uv.f(1), d->linear_filter);
+                    if (const auto* d_img = find_desc(img_binding)) {
+                        const VulkanDescriptorBinding* d_samp = find_desc(samp_binding);
+                        if (!d_samp) d_samp = d_img;
+                        const uint32_t total_mips = std::max<uint32_t>(
+                            1u, static_cast<uint32_t>(d_img->texture.mips.size()));
+                        const uint32_t base_mip = std::min(d_img->view_base_mip_level, total_mips - 1u);
+                        const uint32_t max_rem = total_mips - base_mip;
+                        const uint32_t level_cnt = (d_img->view_mip_level_count > 0u)
+                                                       ? std::min(d_img->view_mip_level_count, max_rem)
+                                                       : max_rem;
+                        const float biased = explicit_lod + d_samp->sampler_mip_lod_bias;
+                        const float clamped_lod =
+                            std::clamp(biased, d_samp->sampler_min_lod, d_samp->sampler_max_lod);
+                        const int32_t rel_mip = std::clamp(
+                            static_cast<int32_t>(std::floor(clamped_lod + 0.5f)),
+                            0, static_cast<int32_t>(level_cnt) - 1);
+                        const uint32_t abs_mip = base_mip + static_cast<uint32_t>(rel_mip);
+                        c = SwSampleTexture2D(
+                            d_img->texture, uv.f(0), uv.f(1), d_samp->linear_filter, abs_mip);
                     }
                     SwSpvVal out{}; out.count = 4;
                     for (uint32_t i = 0; i < 4; ++i) out.set_f(i, c.v[i]);
@@ -2553,11 +2666,17 @@ struct VulkanBackend::Impl {
     VkDevice device = nullptr;
     VkQueue compute_queue = nullptr;
     VkQueue graphics_queue = nullptr;
+    VkQueue sparse_queue = nullptr;
     VkCommandPool command_pool = kVkNullHandle;
     VkCommandPool graphics_command_pool = kVkNullHandle;
     uint32_t compute_queue_family = 0;
     uint32_t graphics_queue_family = 0;
+    uint32_t sparse_queue_family = 0;
     bool has_graphics_queue = false;
+    bool has_sparse_queue = false;
+    bool sparse_binding_enabled = false;
+    bool sparse_residency_2d_enabled = false;
+    bool sparse_residency_3d_enabled = false;
     bool mesh_shader_enabled = false;
     bool task_shader_enabled = false;
     bool win32_surface_enabled = false;
@@ -2574,6 +2693,7 @@ struct VulkanBackend::Impl {
     PFN_vkDestroyInstance vkDestroyInstance = nullptr;
     PFN_vkEnumeratePhysicalDevices vkEnumeratePhysicalDevices = nullptr;
     PFN_vkGetPhysicalDeviceProperties vkGetPhysicalDeviceProperties = nullptr;
+    PFN_vkGetPhysicalDeviceFeatures vkGetPhysicalDeviceFeatures = nullptr;
     PFN_vkGetPhysicalDeviceFeatures2 vkGetPhysicalDeviceFeatures2 = nullptr;
     PFN_vkGetPhysicalDeviceQueueFamilyProperties vkGetPhysicalDeviceQueueFamilyProperties = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties vkGetPhysicalDeviceMemoryProperties = nullptr;
@@ -2583,6 +2703,7 @@ struct VulkanBackend::Impl {
     PFN_vkDeviceWaitIdle vkDeviceWaitIdle = nullptr;
     PFN_vkGetDeviceQueue vkGetDeviceQueue = nullptr;
     PFN_vkQueueSubmit vkQueueSubmit = nullptr;
+    PFN_vkQueueBindSparse vkQueueBindSparse = nullptr;
     PFN_vkQueueWaitIdle vkQueueWaitIdle = nullptr;
     PFN_vkCreateFence vkCreateFence = nullptr;
     PFN_vkDestroyFence vkDestroyFence = nullptr;
@@ -2629,6 +2750,7 @@ struct VulkanBackend::Impl {
     PFN_vkCreateImage vkCreateImage = nullptr;
     PFN_vkDestroyImage vkDestroyImage = nullptr;
     PFN_vkGetImageMemoryRequirements vkGetImageMemoryRequirements = nullptr;
+    PFN_vkGetImageSparseMemoryRequirements vkGetImageSparseMemoryRequirements = nullptr;
     PFN_vkBindImageMemory vkBindImageMemory = nullptr;
     PFN_vkCreateImageView vkCreateImageView = nullptr;
     PFN_vkDestroyImageView vkDestroyImageView = nullptr;
@@ -2678,6 +2800,22 @@ struct VulkanBackend::Impl {
     };
     uint64_t next_swapchain_handle = 1;
     std::unordered_map<uint64_t, SwapchainRecord> swapchains;
+
+    struct ReservedImageRecord {
+        VulkanReservedResourceDesc desc;
+        VulkanResourceTilingInfo tiling;
+        VkImage image = kVkNullHandle;
+        VkDeviceMemory backing_memory = kVkNullHandle;
+        VkDeviceSize backing_memory_size = 0;
+        VkDeviceSize tile_alignment = 65536;
+        uint32_t backing_tile_capacity = 0;
+        bool is_icd = false;
+        std::unordered_map<uint64_t, std::vector<uint8_t>> sw_tiles;
+        std::unordered_map<uint64_t, bool> bound_tiles;
+        bool mip_tail_bound = false;
+    };
+    uint64_t next_reserved_handle = 1;
+    std::unordered_map<uint64_t, ReservedImageRecord> reserved_images;
 
     template <typename Fn>
     bool LoadInstProc(Fn& out, const char* name) {
@@ -2845,6 +2983,22 @@ struct VulkanBackend::Impl {
             rec.surface = kVkNullHandle;
         }
         rec.swapchain_images.clear();
+    }
+
+    void DestroyReservedImageRecord(ReservedImageRecord& rec) {
+        if (device && vkDeviceWaitIdle) {
+            vkDeviceWaitIdle(device);
+        }
+        if (device && rec.image != kVkNullHandle && vkDestroyImage) {
+            vkDestroyImage(device, rec.image, nullptr);
+            rec.image = kVkNullHandle;
+        }
+        if (device && rec.backing_memory != kVkNullHandle && vkFreeMemory) {
+            vkFreeMemory(device, rec.backing_memory, nullptr);
+            rec.backing_memory = kVkNullHandle;
+        }
+        rec.sw_tiles.clear();
+        rec.bound_tiles.clear();
     }
 
     Status ExecuteGraphicsOrMeshOnIcd(
@@ -3115,12 +3269,17 @@ struct VulkanBackend::Impl {
                                        dg.img, dg.img_mem);
                 if (!st.ok()) { cleanup(); return st; }
 
+                const uint32_t base_mip = std::min(d.view_base_mip_level, mip_cnt > 0u ? mip_cnt - 1u : 0u);
+                const uint32_t max_rem = (mip_cnt > base_mip) ? (mip_cnt - base_mip) : 1u;
+                const uint32_t level_cnt =
+                    (d.view_mip_level_count > 0u) ? std::min(d.view_mip_level_count, max_rem) : max_rem;
+
                 VkImageViewCreateInfo tiv{};
                 tiv.sType = kVkStypeImageViewCreateInfo;
                 tiv.image = dg.img;
                 tiv.viewType = dg.tex_copy.is_3d ? kVkImageViewType3D : kVkImageViewType2D;
                 tiv.format = static_cast<int32_t>(dg.tex_copy.format);
-                tiv.subresourceRange = {kVkImageAspectColorBit, 0, mip_cnt, 0, 1};
+                tiv.subresourceRange = {kVkImageAspectColorBit, base_mip, level_cnt, 0, 1};
                 if (vkCreateImageView(device, &tiv, nullptr, &dg.img_view) != kVkSuccess) {
                     cleanup();
                     return Status::Error(StatusCode::DeviceError, "vkCreateImageView(texture) failed");
@@ -3148,7 +3307,9 @@ struct VulkanBackend::Impl {
                 sci.addressModeU = kVkSamplerAddressModeClampToEdge;
                 sci.addressModeV = kVkSamplerAddressModeClampToEdge;
                 sci.addressModeW = kVkSamplerAddressModeClampToEdge;
-                sci.maxLod = 16.0f;
+                sci.mipLodBias = d.sampler_mip_lod_bias;
+                sci.minLod = d.sampler_min_lod;
+                sci.maxLod = d.sampler_max_lod;
                 if (vkCreateSampler(device, &sci, nullptr, &dg.sampler) != kVkSuccess) {
                     cleanup();
                     return Status::Error(StatusCode::DeviceError, "vkCreateSampler failed");
@@ -3530,6 +3691,11 @@ struct VulkanBackend::Impl {
     }
 
     void Cleanup() {
+        for (auto& [h, rec] : reserved_images) {
+            DestroyReservedImageRecord(rec);
+        }
+        reserved_images.clear();
+
         for (auto& [h, rec] : swapchains) {
             DestroySwapchainRecord(rec);
         }
@@ -3553,6 +3719,7 @@ struct VulkanBackend::Impl {
         }
         compute_queue = nullptr;
         graphics_queue = nullptr;
+        sparse_queue = nullptr;
         physical_device = nullptr;
         if (instance && vkDestroyInstance) {
             vkDestroyInstance(instance, nullptr);
@@ -3567,6 +3734,10 @@ struct VulkanBackend::Impl {
         vkGetInstanceProcAddr = nullptr;
         vkGetDeviceProcAddr = nullptr;
         has_graphics_queue = false;
+        has_sparse_queue = false;
+        sparse_binding_enabled = false;
+        sparse_residency_2d_enabled = false;
+        sparse_residency_3d_enabled = false;
         mesh_shader_enabled = false;
         task_shader_enabled = false;
         win32_surface_enabled = false;
@@ -3786,6 +3957,10 @@ Status VulkanBackend::InitializeSoftwareFallback() {
     device_info_.supports_win32_surface = false;
     device_info_.supports_swapchain = false;
     device_info_.supports_hdr10_colorspace = false;
+    device_info_.sparse_queue_family = 0;
+    device_info_.supports_sparse_binding = true;
+    device_info_.supports_sparse_residency_image_2d = true;
+    device_info_.supports_sparse_residency_image_3d = true;
     device_info_.is_hardware = false;
     device_info_.is_fallback = true;
     return Status::Ok();
@@ -3918,6 +4093,7 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
                 return false;
             }
 
+            impl_->LoadInstProc(impl_->vkGetPhysicalDeviceFeatures, "vkGetPhysicalDeviceFeatures");
             impl_->LoadInstProc(impl_->vkGetPhysicalDeviceFeatures2, "vkGetPhysicalDeviceFeatures2");
             if (has_khr_surface && has_khr_win32_surface) {
                 const bool wsi_inst_ok =
@@ -3956,6 +4132,7 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
             VkPhysicalDevicePropertiesRaw best_props{};
             uint32_t best_compute_qf = std::numeric_limits<uint32_t>::max();
             uint32_t best_graphics_qf = std::numeric_limits<uint32_t>::max();
+            uint32_t best_sparse_qf = std::numeric_limits<uint32_t>::max();
             int best_rank = -1;
 
             for (VkPhysicalDevice candidate : phys_devs) {
@@ -3971,6 +4148,7 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
 
                 uint32_t compute_qf = std::numeric_limits<uint32_t>::max();
                 uint32_t graphics_qf = std::numeric_limits<uint32_t>::max();
+                uint32_t sparse_qf = std::numeric_limits<uint32_t>::max();
                 for (uint32_t q = 0; q < qf_count; ++q) {
                     if (qfs[q].queueCount == 0) continue;
                     if ((qfs[q].queueFlags & kVkQueueGraphicsBit) != 0) {
@@ -3988,6 +4166,11 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
                             compute_qf = q;
                         }
                     }
+                    if ((qfs[q].queueFlags & kVkQueueSparseBindingBit) != 0) {
+                        if (sparse_qf == std::numeric_limits<uint32_t>::max() || q == graphics_qf) {
+                            sparse_qf = q;
+                        }
+                    }
                 }
                 if (compute_qf == std::numeric_limits<uint32_t>::max()) continue;
 
@@ -3998,6 +4181,7 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
                     best_props = props;
                     best_compute_qf = compute_qf;
                     best_graphics_qf = graphics_qf;
+                    best_sparse_qf = sparse_qf;
                 }
             }
 
@@ -4010,7 +4194,21 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
             impl_->compute_queue_family = best_compute_qf;
             impl_->has_graphics_queue = (best_graphics_qf != std::numeric_limits<uint32_t>::max());
             impl_->graphics_queue_family = impl_->has_graphics_queue ? best_graphics_qf : 0u;
+            impl_->has_sparse_queue = (best_sparse_qf != std::numeric_limits<uint32_t>::max());
+            impl_->sparse_queue_family = impl_->has_sparse_queue ? best_sparse_qf : 0u;
             impl_->vkGetPhysicalDeviceMemoryProperties(best_dev, &impl_->mem_props);
+
+            // Probe physical device core features for sparse binding / residency.
+            VkPhysicalDeviceFeatures supported_feats{};
+            if (impl_->vkGetPhysicalDeviceFeatures) {
+                impl_->vkGetPhysicalDeviceFeatures(best_dev, &supported_feats);
+            }
+            bool want_sparse_binding =
+                impl_->has_sparse_queue && (supported_feats.fields[kVkFeatSparseBinding] != 0u);
+            bool want_sparse_2d =
+                want_sparse_binding && (supported_feats.fields[kVkFeatSparseResidencyImage2D] != 0u);
+            bool want_sparse_3d =
+                want_sparse_binding && (supported_feats.fields[kVkFeatSparseResidencyImage3D] != 0u);
 
             // Probe device extensions (VK_KHR_swapchain, VK_EXT_mesh_shader)
             bool has_dev_swapchain = false;
@@ -4076,6 +4274,23 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
                 qci.pQueuePriorities = &queue_priority;
                 queue_cis.push_back(qci);
             }
+            if (impl_->has_sparse_queue &&
+                best_sparse_qf != best_compute_qf &&
+                (!impl_->has_graphics_queue || best_sparse_qf != best_graphics_qf)) {
+                VkDeviceQueueCreateInfo qci{};
+                qci.sType = kVkStypeDeviceQueueCreateInfo;
+                qci.queueFamilyIndex = best_sparse_qf;
+                qci.queueCount = 1;
+                qci.pQueuePriorities = &queue_priority;
+                queue_cis.push_back(qci);
+            }
+
+            VkPhysicalDeviceFeatures enabled_feats{};
+            if (want_sparse_binding) {
+                enabled_feats.fields[kVkFeatSparseBinding] = 1u;
+                if (want_sparse_2d) enabled_feats.fields[kVkFeatSparseResidencyImage2D] = 1u;
+                if (want_sparse_3d) enabled_feats.fields[kVkFeatSparseResidencyImage3D] = 1u;
+            }
 
             VkDeviceCreateInfo dev_ci{};
             dev_ci.sType = kVkStypeDeviceCreateInfo;
@@ -4084,8 +4299,17 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
             dev_ci.pQueueCreateInfos = queue_cis.data();
             dev_ci.enabledExtensionCount = static_cast<uint32_t>(dev_exts.size());
             dev_ci.ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data();
+            dev_ci.pEnabledFeatures = want_sparse_binding ? static_cast<const void*>(&enabled_feats) : nullptr;
 
             vr = impl_->vkCreateDevice(best_dev, &dev_ci, nullptr, &impl_->device);
+            if ((vr != kVkSuccess || !impl_->device) && want_sparse_binding) {
+                // Retry without sparse features if driver rejected them.
+                want_sparse_binding = false;
+                want_sparse_2d = false;
+                want_sparse_3d = false;
+                dev_ci.pEnabledFeatures = nullptr;
+                vr = impl_->vkCreateDevice(best_dev, &dev_ci, nullptr, &impl_->device);
+            }
             if ((vr != kVkSuccess || !impl_->device) && enable_mesh) {
                 // Retry without VK_EXT_mesh_shader if driver rejected feature chain
                 enable_mesh = false;
@@ -4184,6 +4408,14 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
                 impl_->has_graphics_queue = false;
             }
 
+            if (want_sparse_binding &&
+                impl_->LoadDevProc(impl_->vkGetImageSparseMemoryRequirements, "vkGetImageSparseMemoryRequirements") &&
+                impl_->LoadDevProc(impl_->vkQueueBindSparse, "vkQueueBindSparse")) {
+                impl_->sparse_binding_enabled = true;
+                impl_->sparse_residency_2d_enabled = want_sparse_2d;
+                impl_->sparse_residency_3d_enabled = want_sparse_3d;
+            }
+
             if (enable_mesh && impl_->has_graphics_queue &&
                 impl_->LoadDevProc(impl_->vkCmdDrawMeshTasksEXT, "vkCmdDrawMeshTasksEXT")) {
                 impl_->mesh_shader_enabled = true;
@@ -4234,6 +4466,21 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
                 }
             }
 
+            if (impl_->sparse_binding_enabled && impl_->has_sparse_queue) {
+                if (best_sparse_qf == best_compute_qf) {
+                    impl_->sparse_queue = impl_->compute_queue;
+                } else if (impl_->has_graphics_queue && best_sparse_qf == best_graphics_qf) {
+                    impl_->sparse_queue = impl_->graphics_queue;
+                } else {
+                    impl_->vkGetDeviceQueue(impl_->device, best_sparse_qf, 0, &impl_->sparse_queue);
+                }
+                if (!impl_->sparse_queue) {
+                    impl_->sparse_binding_enabled = false;
+                    impl_->sparse_residency_2d_enabled = false;
+                    impl_->sparse_residency_3d_enabled = false;
+                }
+            }
+
             best_props.deviceName[sizeof(best_props.deviceName) - 1] = '\0';
             device_info_ = VulkanDeviceInfo{};
             device_info_.device_name = best_props.deviceName;
@@ -4254,6 +4501,10 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
             device_info_.supports_win32_surface = impl_->win32_surface_enabled;
             device_info_.supports_swapchain = impl_->swapchain_enabled;
             device_info_.supports_hdr10_colorspace = impl_->hdr10_colorspace_enabled;
+            device_info_.sparse_queue_family = impl_->sparse_queue_family;
+            device_info_.supports_sparse_binding = impl_->sparse_binding_enabled;
+            device_info_.supports_sparse_residency_image_2d = impl_->sparse_residency_2d_enabled;
+            device_info_.supports_sparse_residency_image_3d = impl_->sparse_residency_3d_enabled;
             device_info_.is_hardware =
                 (device_info_.device_type == VulkanDeviceType::DiscreteGpu ||
                  device_info_.device_type == VulkanDeviceType::IntegratedGpu);
@@ -5290,6 +5541,572 @@ Status VulkanBackend::DestroyWin32Swapchain(uint64_t swapchain_handle) {
     }
     impl_->DestroySwapchainRecord(it->second);
     impl_->swapchains.erase(it);
+    return Status::Ok();
+}
+
+namespace {
+
+uint64_t MakeSparseTileKey(uint32_t mip, uint32_t layer, uint32_t tx, uint32_t ty, uint32_t tz) noexcept {
+    return (static_cast<uint64_t>(mip & 0xFu) << 60u) |
+           (static_cast<uint64_t>(layer & 0xFFu) << 52u) |
+           (static_cast<uint64_t>(tz & 0xFFFu) << 40u) |
+           (static_cast<uint64_t>(ty & 0xFFFFFu) << 20u) |
+           static_cast<uint64_t>(tx & 0xFFFFFu);
+}
+
+void ComputeStandardTileShape(VulkanImageFormat fmt, bool is_3d,
+                              uint32_t& out_w, uint32_t& out_h, uint32_t& out_d) noexcept {
+    const uint32_t bpp = BytesPerTexel(fmt);
+    if (is_3d) {
+        if (bpp >= 8u) { out_w = 32u; out_h = 16u; out_d = 16u; }
+        else { out_w = 32u; out_h = 32u; out_d = 16u; }
+    } else {
+        if (bpp >= 8u) { out_w = 128u; out_h = 64u; out_d = 1u; }
+        else { out_w = 128u; out_h = 128u; out_d = 1u; }
+    }
+}
+
+void PopulateResourceTilingFromSparseReq(
+    const VulkanReservedResourceDesc& desc,
+    uint32_t gran_w, uint32_t gran_h, uint32_t gran_d,
+    uint32_t mip_tail_first_lod,
+    uint64_t tile_size_bytes,
+    uint64_t mip_tail_offset,
+    uint64_t mip_tail_size,
+    uint64_t mip_tail_stride,
+    uint32_t sparse_flags,
+    bool is_icd,
+    VulkanResourceTilingInfo& out_tiling) {
+    out_tiling = VulkanResourceTilingInfo{};
+    out_tiling.tile_width_in_texels = std::max<uint32_t>(1u, gran_w);
+    out_tiling.tile_height_in_texels = std::max<uint32_t>(1u, gran_h);
+    out_tiling.tile_depth_in_texels = std::max<uint32_t>(1u, gran_d);
+    out_tiling.tile_size_bytes = std::max<uint64_t>(4096ull, tile_size_bytes);
+    out_tiling.mip_tail_offset_bytes = mip_tail_offset;
+    out_tiling.mip_tail_size_bytes = mip_tail_size;
+    out_tiling.mip_tail_stride_bytes = mip_tail_stride;
+    out_tiling.sparse_format_flags = sparse_flags;
+    out_tiling.executed_on_vulkan_icd = is_icd;
+
+    const uint32_t mips = std::max<uint32_t>(1u, desc.mip_levels);
+    const uint32_t layers = desc.is_3d ? 1u : std::max<uint32_t>(1u, desc.array_layers);
+    const uint32_t std_mips = std::min<uint32_t>(mip_tail_first_lod, mips);
+    const uint32_t packed_mips = mips - std_mips;
+
+    out_tiling.num_standard_mips = std_mips;
+    out_tiling.num_packed_mips = packed_mips;
+
+    uint32_t running_tile_index = 0u;
+    out_tiling.subresource_tilings.reserve(static_cast<size_t>(std_mips) * layers);
+    for (uint32_t layer = 0u; layer < layers; ++layer) {
+        for (uint32_t m = 0u; m < std_mips; ++m) {
+            const uint32_t mw = std::max<uint32_t>(1u, desc.width >> m);
+            const uint32_t mh = std::max<uint32_t>(1u, desc.height >> m);
+            const uint32_t md = desc.is_3d ? std::max<uint32_t>(1u, desc.depth >> m) : 1u;
+
+            VulkanSubresourceTiling st{};
+            st.width_in_tiles = (mw + out_tiling.tile_width_in_texels - 1u) / out_tiling.tile_width_in_texels;
+            st.height_in_tiles = (mh + out_tiling.tile_height_in_texels - 1u) / out_tiling.tile_height_in_texels;
+            st.depth_in_tiles = (md + out_tiling.tile_depth_in_texels - 1u) / out_tiling.tile_depth_in_texels;
+            st.start_tile_index_in_overall_resource = running_tile_index;
+            running_tile_index += st.width_in_tiles * st.height_in_tiles * st.depth_in_tiles;
+            out_tiling.subresource_tilings.push_back(st);
+        }
+    }
+
+    const uint32_t packed_tiles_per_tail =
+        (packed_mips > 0u)
+            ? static_cast<uint32_t>(
+                  (std::max<uint64_t>(mip_tail_size, out_tiling.tile_size_bytes) +
+                   out_tiling.tile_size_bytes - 1ull) /
+                  out_tiling.tile_size_bytes)
+            : 0u;
+    const bool single_miptail = (sparse_flags & kVkSparseImageFormatSingleMiptailBit) != 0u;
+    const uint32_t total_packed_tiles =
+        (packed_mips > 0u) ? (single_miptail ? packed_tiles_per_tail : (packed_tiles_per_tail * layers)) : 0u;
+
+    out_tiling.start_tile_index_in_overall_resource = running_tile_index;
+    out_tiling.num_tiles_for_packed_mips = total_packed_tiles;
+    out_tiling.num_tiles_for_entire_resource = running_tile_index + total_packed_tiles;
+}
+
+}  // namespace
+
+Status VulkanBackend::CreateReservedImage(const VulkanReservedResourceDesc& desc,
+                                          VulkanReservedResourceHandle& out_handle) {
+    if (!IsInitialized()) {
+        return Status::Error(StatusCode::DeviceError, "VulkanBackend is not initialized");
+    }
+    if (desc.width == 0u || desc.height == 0u || (desc.is_3d && desc.depth == 0u) ||
+        desc.mip_levels == 0u || desc.array_layers == 0u) {
+        return Status::Error(StatusCode::InvalidArgument, "Invalid reserved image dimensions");
+    }
+
+    out_handle = VulkanReservedResourceHandle{};
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+
+    Impl::ReservedImageRecord rec{};
+    rec.desc = desc;
+
+    const bool can_use_icd_sparse =
+        !impl_->fallback_mode && impl_->device != nullptr &&
+        impl_->sparse_binding_enabled &&
+        (desc.is_3d ? impl_->sparse_residency_3d_enabled : impl_->sparse_residency_2d_enabled) &&
+        impl_->vkGetImageSparseMemoryRequirements != nullptr &&
+        impl_->vkQueueBindSparse != nullptr &&
+        impl_->sparse_queue != nullptr;
+
+    if (can_use_icd_sparse) {
+        VkImageCreateInfo ici{};
+        ici.sType = kVkStypeImageCreateInfo;
+        ici.flags = kVkImageCreateSparseBindingBit | kVkImageCreateSparseResidencyBit;
+        ici.imageType = desc.is_3d ? kVkImageType3D : kVkImageType2D;
+        ici.format = static_cast<int32_t>(desc.format);
+        ici.extent = {desc.width, desc.height, desc.is_3d ? desc.depth : 1u};
+        ici.mipLevels = desc.mip_levels;
+        ici.arrayLayers = desc.is_3d ? 1u : desc.array_layers;
+        ici.samples = kVkSampleCount1Bit;
+        ici.tiling = kVkImageTilingOptimal;
+        ici.usage = kVkImageUsageTransferDstBit | kVkImageUsageTransferSrcBit | kVkImageUsageSampledBit;
+        ici.sharingMode = kVkSharingModeExclusive;
+        ici.initialLayout = kVkImageLayoutUndefined;
+
+        VkImage img = kVkNullHandle;
+        const VkResult vr = impl_->vkCreateImage(impl_->device, &ici, nullptr, &img);
+        if (vr != kVkSuccess || img == kVkNullHandle) {
+            return Status::Error(StatusCode::DeviceError,
+                                 "vkCreateImage(SPARSE_BINDING|SPARSE_RESIDENCY) failed (VkResult=" +
+                                     std::to_string(vr) + ")");
+        }
+
+        VkMemoryRequirements mem_req{};
+        impl_->vkGetImageMemoryRequirements(impl_->device, img, &mem_req);
+
+        uint32_t sparse_req_count = 0u;
+        impl_->vkGetImageSparseMemoryRequirements(impl_->device, img, &sparse_req_count, nullptr);
+        std::vector<VkSparseImageMemoryRequirements> sparse_reqs(sparse_req_count);
+        if (sparse_req_count > 0u) {
+            impl_->vkGetImageSparseMemoryRequirements(
+                impl_->device, img, &sparse_req_count, sparse_reqs.data());
+        }
+
+        const VkFlags target_aspect =
+            (desc.format == VulkanImageFormat::D32Sfloat) ? kVkImageAspectDepthBit : kVkImageAspectColorBit;
+        VkSparseImageMemoryRequirements chosen{};
+        bool found_aspect = false;
+        for (const auto& sr : sparse_reqs) {
+            if ((sr.formatProperties.aspectMask & target_aspect) != 0u) {
+                chosen = sr;
+                found_aspect = true;
+                break;
+            }
+        }
+        if (!found_aspect && !sparse_reqs.empty()) {
+            chosen = sparse_reqs[0];
+            found_aspect = true;
+        }
+
+        uint32_t gran_w = 128u, gran_h = 128u, gran_d = 1u;
+        ComputeStandardTileShape(desc.format, desc.is_3d, gran_w, gran_h, gran_d);
+        uint32_t mip_tail_first = desc.mip_levels;
+        uint64_t tail_off = 0ull, tail_sz = 0ull, tail_stride = 0ull;
+        uint32_t sp_flags = 0u;
+        if (found_aspect) {
+            if (chosen.formatProperties.imageGranularity.width > 0u) {
+                gran_w = chosen.formatProperties.imageGranularity.width;
+            }
+            if (chosen.formatProperties.imageGranularity.height > 0u) {
+                gran_h = chosen.formatProperties.imageGranularity.height;
+            }
+            if (chosen.formatProperties.imageGranularity.depth > 0u) {
+                gran_d = chosen.formatProperties.imageGranularity.depth;
+            }
+            mip_tail_first = chosen.imageMipTailFirstLod;
+            tail_off = chosen.imageMipTailOffset;
+            tail_sz = chosen.imageMipTailSize;
+            tail_stride = chosen.imageMipTailStride;
+            sp_flags = chosen.formatProperties.flags;
+        }
+
+        const uint64_t tile_bytes = std::max<uint64_t>(mem_req.alignment, 65536ull);
+        PopulateResourceTilingFromSparseReq(
+            desc, gran_w, gran_h, gran_d, mip_tail_first, tile_bytes,
+            tail_off, tail_sz, tail_stride, sp_flags, true, rec.tiling);
+
+        // Allocate a device-local backing pool sized for the entire sparse image (capped safely).
+        const uint32_t pool_tiles = std::max<uint32_t>(rec.tiling.num_tiles_for_entire_resource, 1u);
+        const VkDeviceSize pool_bytes = std::max<VkDeviceSize>(
+            mem_req.size, static_cast<VkDeviceSize>(pool_tiles) * tile_bytes);
+
+        bool coherent = false;
+        const uint32_t mem_idx = impl_->FindMemoryType(
+            mem_req.memoryTypeBits, kVkMemoryPropertyDeviceLocalBit, coherent);
+        if (mem_idx == std::numeric_limits<uint32_t>::max()) {
+            impl_->vkDestroyImage(impl_->device, img, nullptr);
+            return Status::Error(StatusCode::OutOfMemory, "No compatible memory type for sparse image");
+        }
+
+        VkMemoryAllocateInfo mai{};
+        mai.sType = kVkStypeMemoryAllocateInfo;
+        mai.allocationSize = pool_bytes;
+        mai.memoryTypeIndex = mem_idx;
+        VkDeviceMemory mem = kVkNullHandle;
+        if (impl_->vkAllocateMemory(impl_->device, &mai, nullptr, &mem) != kVkSuccess ||
+            mem == kVkNullHandle) {
+            impl_->vkDestroyImage(impl_->device, img, nullptr);
+            return Status::Error(StatusCode::OutOfMemory, "vkAllocateMemory(sparse pool) failed");
+        }
+
+        rec.image = img;
+        rec.backing_memory = mem;
+        rec.backing_memory_size = pool_bytes;
+        rec.tile_alignment = tile_bytes;
+        rec.backing_tile_capacity = static_cast<uint32_t>(pool_bytes / tile_bytes);
+        rec.is_icd = true;
+    } else {
+        // Software fallback / non-sparse device: compute exact standard 64 KiB D3D12/Vulkan tiling!
+        uint32_t gran_w = 128u, gran_h = 128u, gran_d = 1u;
+        ComputeStandardTileShape(desc.format, desc.is_3d, gran_w, gran_h, gran_d);
+        uint32_t mip_tail_first = desc.mip_levels;
+        for (uint32_t m = 0u; m < desc.mip_levels; ++m) {
+            const uint32_t mw = std::max<uint32_t>(1u, desc.width >> m);
+            const uint32_t mh = std::max<uint32_t>(1u, desc.height >> m);
+            const uint32_t md = desc.is_3d ? std::max<uint32_t>(1u, desc.depth >> m) : 1u;
+            if (mw < gran_w || mh < gran_h || (desc.is_3d && md < gran_d)) {
+                mip_tail_first = m;
+                break;
+            }
+        }
+        const uint64_t tail_size = (mip_tail_first < desc.mip_levels) ? 65536ull : 0ull;
+        PopulateResourceTilingFromSparseReq(
+            desc, gran_w, gran_h, gran_d, mip_tail_first, 65536ull,
+            0ull, tail_size, tail_size, 0u, false, rec.tiling);
+        rec.tile_alignment = 65536ull;
+        rec.backing_tile_capacity = std::max<uint32_t>(rec.tiling.num_tiles_for_entire_resource, 1u);
+        rec.is_icd = false;
+    }
+
+    const uint64_t handle = impl_->next_reserved_handle++;
+    out_handle.handle = handle;
+    out_handle.tiling = rec.tiling;
+    out_handle.executed_on_vulkan_icd = rec.is_icd;
+    impl_->reserved_images.emplace(handle, std::move(rec));
+    return Status::Ok();
+}
+
+Status VulkanBackend::GetReservedImageTiling(uint64_t reserved_handle,
+                                             VulkanResourceTilingInfo& out_tiling) const {
+    if (!IsInitialized()) {
+        return Status::Error(StatusCode::DeviceError, "VulkanBackend is not initialized");
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    auto it = impl_->reserved_images.find(reserved_handle);
+    if (it == impl_->reserved_images.end()) {
+        return Status::Error(StatusCode::NotFound, "Unknown Vulkan reserved image handle");
+    }
+    out_tiling = it->second.tiling;
+    return Status::Ok();
+}
+
+Status VulkanBackend::BindReservedImageTiles(uint64_t reserved_handle,
+                                             const std::vector<VulkanSparseTileMapping>& mappings) {
+    if (!IsInitialized()) {
+        return Status::Error(StatusCode::DeviceError, "VulkanBackend is not initialized");
+    }
+    if (mappings.empty()) {
+        return Status::Ok();
+    }
+
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    auto it = impl_->reserved_images.find(reserved_handle);
+    if (it == impl_->reserved_images.end()) {
+        return Status::Error(StatusCode::NotFound, "Unknown Vulkan reserved image handle");
+    }
+    auto& rec = it->second;
+
+    const VkFlags aspect =
+        (rec.desc.format == VulkanImageFormat::D32Sfloat) ? kVkImageAspectDepthBit : kVkImageAspectColorBit;
+
+    std::vector<VkSparseImageMemoryBind> img_binds;
+    std::vector<VkSparseMemoryBind> opaque_binds;
+
+    for (const auto& m : mappings) {
+        if (m.bind_mip_tail) {
+            if (rec.tiling.num_packed_mips > 0u && rec.tiling.mip_tail_size_bytes > 0ull) {
+                VkSparseMemoryBind ob{};
+                ob.resourceOffset = rec.tiling.mip_tail_offset_bytes +
+                                    static_cast<VkDeviceSize>(m.array_layer) * rec.tiling.mip_tail_stride_bytes;
+                ob.size = rec.tiling.mip_tail_size_bytes;
+                if (m.map_null) {
+                    ob.memory = kVkNullHandle;
+                    ob.memoryOffset = 0ull;
+                } else {
+                    const VkDeviceSize mem_off =
+                        static_cast<VkDeviceSize>(m.heap_tile_offset) * rec.tile_alignment;
+                    if (rec.is_icd && mem_off + ob.size > rec.backing_memory_size) {
+                        return Status::Error(StatusCode::InvalidArgument,
+                                             "Sparse mip-tail heap_tile_offset exceeds backing memory");
+                    }
+                    ob.memory = rec.backing_memory;
+                    ob.memoryOffset = mem_off;
+                }
+                opaque_binds.push_back(ob);
+            }
+            rec.mip_tail_bound = !m.map_null;
+            continue;
+        }
+
+        if (m.mip_level >= rec.desc.mip_levels ||
+            (!rec.desc.is_3d && m.array_layer >= rec.desc.array_layers)) {
+            return Status::Error(StatusCode::InvalidArgument, "Sparse tile mapping subresource out of range");
+        }
+        const uint32_t mw = std::max<uint32_t>(1u, rec.desc.width >> m.mip_level);
+        const uint32_t mh = std::max<uint32_t>(1u, rec.desc.height >> m.mip_level);
+        const uint32_t md = rec.desc.is_3d ? std::max<uint32_t>(1u, rec.desc.depth >> m.mip_level) : 1u;
+
+        const uint32_t tw = rec.tiling.tile_width_in_texels;
+        const uint32_t th = rec.tiling.tile_height_in_texels;
+        const uint32_t td = rec.tiling.tile_depth_in_texels;
+
+        const uint32_t cx = std::max<uint32_t>(1u, m.tile_count_x);
+        const uint32_t cy = std::max<uint32_t>(1u, m.tile_count_y);
+        const uint32_t cz = std::max<uint32_t>(1u, m.tile_count_z);
+
+        uint32_t heap_idx = m.heap_tile_offset;
+        for (uint32_t dz = 0u; dz < cz; ++dz) {
+            for (uint32_t dy = 0u; dy < cy; ++dy) {
+                for (uint32_t dx = 0u; dx < cx; ++dx) {
+                    const uint32_t tx = m.tile_x + dx;
+                    const uint32_t ty = m.tile_y + dy;
+                    const uint32_t tz = m.tile_z + dz;
+                    const uint32_t ox = tx * tw;
+                    const uint32_t oy = ty * th;
+                    const uint32_t oz = tz * td;
+                    if (ox >= mw || oy >= mh || oz >= md) {
+                        return Status::Error(StatusCode::InvalidArgument, "Sparse tile coordinate out of bounds");
+                    }
+                    const uint32_t ew = std::min<uint32_t>(tw, mw - ox);
+                    const uint32_t eh = std::min<uint32_t>(th, mh - oy);
+                    const uint32_t ed = std::min<uint32_t>(td, md - oz);
+
+                    VkSparseImageMemoryBind ib{};
+                    ib.subresource = {aspect, m.mip_level, rec.desc.is_3d ? 0u : m.array_layer};
+                    ib.offset = {static_cast<int32_t>(ox), static_cast<int32_t>(oy), static_cast<int32_t>(oz)};
+                    ib.extent = {ew, eh, ed};
+                    if (m.map_null) {
+                        ib.memory = kVkNullHandle;
+                        ib.memoryOffset = 0ull;
+                    } else {
+                        const VkDeviceSize mem_off = static_cast<VkDeviceSize>(heap_idx) * rec.tile_alignment;
+                        if (rec.is_icd && mem_off + rec.tile_alignment > rec.backing_memory_size) {
+                            return Status::Error(StatusCode::InvalidArgument,
+                                                 "Sparse tile heap_tile_offset exceeds backing memory");
+                        }
+                        ib.memory = rec.backing_memory;
+                        ib.memoryOffset = mem_off;
+                    }
+                    img_binds.push_back(ib);
+
+                    const uint64_t key = MakeSparseTileKey(m.mip_level, m.array_layer, tx, ty, tz);
+                    rec.bound_tiles[key] = !m.map_null;
+                    ++heap_idx;
+                }
+            }
+        }
+    }
+
+    if (rec.is_icd && impl_->vkQueueBindSparse && impl_->sparse_queue) {
+        VkSparseImageMemoryBindInfo img_bind_info{};
+        img_bind_info.image = rec.image;
+        img_bind_info.bindCount = static_cast<uint32_t>(img_binds.size());
+        img_bind_info.pBinds = img_binds.data();
+
+        VkSparseImageOpaqueMemoryBindInfo opaque_bind_info{};
+        opaque_bind_info.image = rec.image;
+        opaque_bind_info.bindCount = static_cast<uint32_t>(opaque_binds.size());
+        opaque_bind_info.pBinds = opaque_binds.data();
+
+        VkBindSparseInfo bsi{};
+        bsi.sType = kVkStypeBindSparseInfo;
+        bsi.imageOpaqueBindCount = opaque_binds.empty() ? 0u : 1u;
+        bsi.pImageOpaqueBinds = opaque_binds.empty() ? nullptr : &opaque_bind_info;
+        bsi.imageBindCount = img_binds.empty() ? 0u : 1u;
+        bsi.pImageBinds = img_binds.empty() ? nullptr : &img_bind_info;
+
+        const VkResult vr = impl_->vkQueueBindSparse(impl_->sparse_queue, 1u, &bsi, kVkNullHandle);
+        if (vr != kVkSuccess) {
+            return Status::Error(StatusCode::DeviceError,
+                                 "vkQueueBindSparse failed (VkResult=" + std::to_string(vr) + ")");
+        }
+        if (impl_->vkQueueWaitIdle(impl_->sparse_queue) != kVkSuccess) {
+            return Status::Error(StatusCode::DeviceError, "vkQueueWaitIdle(sparse) failed");
+        }
+    }
+
+    return Status::Ok();
+}
+
+Status VulkanBackend::UploadAndReadbackReservedImageTile(
+    uint64_t reserved_handle,
+    uint32_t mip_level,
+    uint32_t tile_x,
+    uint32_t tile_y,
+    const std::vector<uint8_t>& tile_pixels,
+    std::vector<uint8_t>& out_readback_pixels) {
+    if (!IsInitialized()) {
+        return Status::Error(StatusCode::DeviceError, "VulkanBackend is not initialized");
+    }
+    out_readback_pixels.clear();
+
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    auto it = impl_->reserved_images.find(reserved_handle);
+    if (it == impl_->reserved_images.end()) {
+        return Status::Error(StatusCode::NotFound, "Unknown Vulkan reserved image handle");
+    }
+    auto& rec = it->second;
+    if (mip_level >= rec.desc.mip_levels) {
+        return Status::Error(StatusCode::InvalidArgument, "Reserved image tile mip_level out of range");
+    }
+
+    const uint32_t mw = std::max<uint32_t>(1u, rec.desc.width >> mip_level);
+    const uint32_t mh = std::max<uint32_t>(1u, rec.desc.height >> mip_level);
+    const uint32_t tw = rec.tiling.tile_width_in_texels;
+    const uint32_t th = rec.tiling.tile_height_in_texels;
+    const uint32_t ox = tile_x * tw;
+    const uint32_t oy = tile_y * th;
+    if (ox >= mw || oy >= mh) {
+        return Status::Error(StatusCode::InvalidArgument, "Reserved image tile coordinates out of bounds");
+    }
+
+    const uint32_t ew = std::min<uint32_t>(tw, mw - ox);
+    const uint32_t eh = std::min<uint32_t>(th, mh - oy);
+    const uint32_t bpp = BytesPerTexel(rec.desc.format);
+    const size_t expected_bytes = static_cast<size_t>(ew) * eh * bpp;
+    if (tile_pixels.size() != expected_bytes) {
+        return Status::Error(StatusCode::InvalidArgument, "Tile pixel payload size mismatch");
+    }
+
+    const uint64_t key = MakeSparseTileKey(mip_level, 0u, tile_x, tile_y, 0u);
+    auto bit = rec.bound_tiles.find(key);
+    if (bit == rec.bound_tiles.end() || !bit->second) {
+        return Status::Error(StatusCode::InvalidArgument, "Requested sparse tile is not currently bound");
+    }
+
+    if (!rec.is_icd || !impl_->has_graphics_queue || !impl_->graphics_queue) {
+        rec.sw_tiles[key] = tile_pixels;
+        out_readback_pixels = tile_pixels;
+        return Status::Ok();
+    }
+
+    VkBuffer up_buf = kVkNullHandle, rb_buf = kVkNullHandle;
+    VkDeviceMemory up_mem = kVkNullHandle, rb_mem = kVkNullHandle;
+    bool up_coh = true, rb_coh = true;
+    VkCommandBuffer cmd = nullptr;
+
+    auto cleanup = [&]() {
+        if (cmd) { impl_->vkFreeCommandBuffers(impl_->device, impl_->graphics_command_pool, 1, &cmd); cmd = nullptr; }
+        if (rb_buf != kVkNullHandle) impl_->vkDestroyBuffer(impl_->device, rb_buf, nullptr);
+        if (up_buf != kVkNullHandle) impl_->vkDestroyBuffer(impl_->device, up_buf, nullptr);
+        if (rb_mem != kVkNullHandle) impl_->vkFreeMemory(impl_->device, rb_mem, nullptr);
+        if (up_mem != kVkNullHandle) impl_->vkFreeMemory(impl_->device, up_mem, nullptr);
+    };
+
+    Status st = impl_->CreateHostBuffer(expected_bytes, kVkBufferUsageTransferSrcBit, up_buf, up_mem, up_coh,
+                                        tile_pixels.data(), tile_pixels.size());
+    if (!st.ok()) { cleanup(); return st; }
+    st = impl_->CreateHostBuffer(expected_bytes, kVkBufferUsageTransferDstBit, rb_buf, rb_mem, rb_coh);
+    if (!st.ok()) { cleanup(); return st; }
+
+    VkCommandBufferAllocateInfo cba{};
+    cba.sType = kVkStypeCommandBufferAllocateInfo;
+    cba.commandPool = impl_->graphics_command_pool;
+    cba.level = kVkCommandBufferLevelPrimary;
+    cba.commandBufferCount = 1;
+    if (impl_->vkAllocateCommandBuffers(impl_->device, &cba, &cmd) != kVkSuccess || !cmd) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkAllocateCommandBuffers(sparse tile) failed");
+    }
+    VkCommandBufferBeginInfo cbi{kVkStypeCommandBufferBeginInfo, nullptr, kVkCommandBufferUsageOneTimeSubmitBit, nullptr};
+    if (impl_->vkBeginCommandBuffer(cmd, &cbi) != kVkSuccess) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkBeginCommandBuffer(sparse tile) failed");
+    }
+
+    const VkFlags aspect =
+        (rec.desc.format == VulkanImageFormat::D32Sfloat) ? kVkImageAspectDepthBit : kVkImageAspectColorBit;
+    impl_->CmdImageBarrier(cmd, rec.image, aspect,
+                           kVkImageLayoutUndefined, kVkImageLayoutTransferDstOptimal,
+                           kVkPipelineStageTopOfPipeBit, kVkPipelineStageTransferBit,
+                           0u, kVkAccessTransferWriteBit, rec.desc.mip_levels);
+
+    VkBufferImageCopy region{};
+    region.bufferOffset = 0u;
+    region.imageSubresource = {aspect, mip_level, 0u, 1u};
+    region.imageOffset = {static_cast<int32_t>(ox), static_cast<int32_t>(oy), 0};
+    region.imageExtent = {ew, eh, 1u};
+    impl_->vkCmdCopyBufferToImage(cmd, up_buf, rec.image, kVkImageLayoutTransferDstOptimal, 1u, &region);
+
+    impl_->CmdImageBarrier(cmd, rec.image, aspect,
+                           kVkImageLayoutTransferDstOptimal, kVkImageLayoutTransferSrcOptimal,
+                           kVkPipelineStageTransferBit, kVkPipelineStageTransferBit,
+                           kVkAccessTransferWriteBit, kVkAccessTransferReadBit, rec.desc.mip_levels);
+
+    impl_->vkCmdCopyImageToBuffer(cmd, rec.image, kVkImageLayoutTransferSrcOptimal, rb_buf, 1u, &region);
+
+    VkBufferMemoryBarrier bb{};
+    bb.sType = kVkStypeBufferMemoryBarrier;
+    bb.srcAccessMask = kVkAccessTransferWriteBit;
+    bb.dstAccessMask = kVkAccessHostReadBit;
+    bb.srcQueueFamilyIndex = kVkQueueFamilyIgnored;
+    bb.dstQueueFamilyIndex = kVkQueueFamilyIgnored;
+    bb.buffer = rb_buf;
+    bb.offset = 0u;
+    bb.size = expected_bytes;
+    impl_->vkCmdPipelineBarrier(cmd, kVkPipelineStageTransferBit, kVkPipelineStageHostBit,
+                                0u, 0u, nullptr, 1u, &bb, 0u, nullptr);
+
+    if (impl_->vkEndCommandBuffer(cmd) != kVkSuccess) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkEndCommandBuffer(sparse tile) failed");
+    }
+
+    VkSubmitInfo si{};
+    si.sType = kVkStypeSubmitInfo;
+    si.commandBufferCount = 1u;
+    si.pCommandBuffers = &cmd;
+    if (impl_->vkQueueSubmit(impl_->graphics_queue, 1u, &si, kVkNullHandle) != kVkSuccess ||
+        impl_->vkQueueWaitIdle(impl_->graphics_queue) != kVkSuccess) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "Sparse tile upload/readback submit failed");
+    }
+
+    void* mapped = nullptr;
+    if (impl_->vkMapMemory(impl_->device, rb_mem, 0u, expected_bytes, 0u, &mapped) != kVkSuccess || !mapped) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkMapMemory(sparse tile readback) failed");
+    }
+    if (!rb_coh) {
+        VkMappedMemoryRange rng{kVkStypeMappedMemoryRange, nullptr, rb_mem, 0u, kVkWholeSize};
+        impl_->vkInvalidateMappedMemoryRanges(impl_->device, 1u, &rng);
+    }
+    out_readback_pixels.resize(expected_bytes);
+    std::memcpy(out_readback_pixels.data(), mapped, expected_bytes);
+    impl_->vkUnmapMemory(impl_->device, rb_mem);
+    cleanup();
+    return Status::Ok();
+}
+
+Status VulkanBackend::DestroyReservedImage(uint64_t reserved_handle) {
+    if (!IsInitialized()) {
+        return Status::Error(StatusCode::DeviceError, "VulkanBackend is not initialized");
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    auto it = impl_->reserved_images.find(reserved_handle);
+    if (it == impl_->reserved_images.end()) {
+        return Status::Error(StatusCode::NotFound, "Unknown Vulkan reserved image handle");
+    }
+    impl_->DestroyReservedImageRecord(it->second);
+    impl_->reserved_images.erase(it);
     return Status::Ok();
 }
 

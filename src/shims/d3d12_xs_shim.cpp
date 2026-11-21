@@ -9,6 +9,7 @@
 #include <cstring>
 #include <new>
 
+#include "gpu/d3d12_xs/command_list_x.h"
 #include "gpu/d3d12_xs/device_x.h"
 #include "openscarlett/core/telemetry.h"
 #include "openscarlett/gpu/d3d12_adapter.h"
@@ -675,6 +676,151 @@ OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxEnableDccMetadata(
     (void)Flags;
     RecordExport("D3D12XboxEnableDccMetadata", E_NOTIMPL);
     return E_NOTIMPL;
+}
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12QueueKickoffX(
+    ID3D12CommandQueue* queue) {
+    if (!queue) return E_INVALIDARG;
+    ID3D12CommandQueueX* qx = nullptr;
+    HRESULT hr = queue->QueryInterface(IID_ID3D12CommandQueueX, reinterpret_cast<void**>(&qx));
+    if (FAILED(hr) || !qx) return FAILED(hr) ? hr : E_NOINTERFACE;
+    hr = qx->KickoffX();
+    qx->Release();
+    return hr;
+}
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12QueueWait32BitValueX(
+    ID3D12CommandQueue* queue,
+    D3D12_GPU_VIRTUAL_ADDRESS address,
+    uint32_t value,
+    uint32_t mask,
+    D3D12XBOX_WAIT_VALUE_OP operation) {
+    if (!queue) return E_INVALIDARG;
+    ID3D12CommandQueueX* qx = nullptr;
+    HRESULT hr = queue->QueryInterface(IID_ID3D12CommandQueueX, reinterpret_cast<void**>(&qx));
+    if (FAILED(hr) || !qx) return FAILED(hr) ? hr : E_NOINTERFACE;
+    hr = qx->Wait32BitValueX(address, value, mask, operation);
+    qx->Release();
+    return hr;
+}
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12QueueWait64BitValueX(
+    ID3D12CommandQueue* queue,
+    D3D12_GPU_VIRTUAL_ADDRESS address,
+    uint64_t value,
+    uint64_t mask,
+    D3D12XBOX_WAIT_VALUE_OP operation) {
+    if (!queue) return E_INVALIDARG;
+    ID3D12CommandQueueX* qx = nullptr;
+    HRESULT hr = queue->QueryInterface(IID_ID3D12CommandQueueX, reinterpret_cast<void**>(&qx));
+    if (FAILED(hr) || !qx) return FAILED(hr) ? hr : E_NOINTERFACE;
+    hr = qx->Wait64BitValueX(address, value, mask, operation);
+    qx->Release();
+    return hr;
+}
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12CommandListKickoffX(
+    ID3D12GraphicsCommandList* cmd_list) {
+    if (!cmd_list) return E_INVALIDARG;
+    ID3D12GraphicsCommandListX* clx = nullptr;
+    HRESULT hr = cmd_list->QueryInterface(
+        IID_ID3D12GraphicsCommandListX, reinterpret_cast<void**>(&clx));
+    if (FAILED(hr) || !clx) return FAILED(hr) ? hr : E_NOINTERFACE;
+    clx->KickoffX();
+    clx->Release();
+    return S_OK;
+}
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12CommandListRSSetDepthBiasX(
+    ID3D12GraphicsCommandList* cmd_list,
+    float depth_bias,
+    float depth_bias_clamp,
+    float slope_scaled_depth_bias) {
+    if (!cmd_list) return E_INVALIDARG;
+    ID3D12GraphicsCommandListX* clx = nullptr;
+    HRESULT hr = cmd_list->QueryInterface(
+        IID_ID3D12GraphicsCommandListX, reinterpret_cast<void**>(&clx));
+    if (FAILED(hr) || !clx) return FAILED(hr) ? hr : E_NOINTERFACE;
+    clx->RSSetDepthBiasX(depth_bias, depth_bias_clamp, slope_scaled_depth_bias);
+    clx->Release();
+    return S_OK;
+}
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12CommandListGetDepthBiasX(
+    ID3D12GraphicsCommandList* cmd_list,
+    float* out_depth_bias,
+    float* out_depth_bias_clamp,
+    float* out_slope_scaled_depth_bias) {
+    if (!cmd_list) return E_INVALIDARG;
+    ID3D12GraphicsCommandListX* clx = nullptr;
+    HRESULT hr = cmd_list->QueryInterface(
+        IID_ID3D12GraphicsCommandListX, reinterpret_cast<void**>(&clx));
+    if (FAILED(hr) || !clx) return FAILED(hr) ? hr : E_NOINTERFACE;
+    auto* impl = static_cast<openscarlett::d3d12_xs::CommandListX*>(clx);
+    impl->GetDepthBiasXState(out_depth_bias, out_depth_bias_clamp, out_slope_scaled_depth_bias);
+    clx->Release();
+    return S_OK;
+}
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12AttachXMemAllocation(
+    ID3D12Device* device,
+    uint64_t guest_va,
+    uint64_t byte_size,
+    uint64_t* out_desktop_gpu_va) {
+    if (!device) return E_INVALIDARG;
+    IOpenScarlettUnifiedMemory* um = nullptr;
+    HRESULT hr = device->QueryInterface(
+        IID_IOpenScarlettUnifiedMemory, reinterpret_cast<void**>(&um));
+    if (FAILED(hr) || !um) return FAILED(hr) ? hr : E_NOINTERFACE;
+    hr = um->AttachXMemAllocation(guest_va, byte_size, out_desktop_gpu_va);
+    um->Release();
+    return hr;
+}
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12DetachXMemAllocation(
+    ID3D12Device* device,
+    uint64_t guest_va) {
+    if (!device) return E_INVALIDARG;
+    IOpenScarlettUnifiedMemory* um = nullptr;
+    HRESULT hr = device->QueryInterface(
+        IID_IOpenScarlettUnifiedMemory, reinterpret_cast<void**>(&um));
+    if (FAILED(hr) || !um) return FAILED(hr) ? hr : E_NOINTERFACE;
+    hr = um->DetachXMemAllocation(guest_va);
+    um->Release();
+    return hr;
+}
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12ResolveXMemGpuVa(
+    ID3D12Device* device,
+    uint64_t guest_va,
+    uint64_t* out_desktop_gpu_va) {
+    if (!device) return E_INVALIDARG;
+    IOpenScarlettUnifiedMemory* um = nullptr;
+    HRESULT hr = device->QueryInterface(
+        IID_IOpenScarlettUnifiedMemory, reinterpret_cast<void**>(&um));
+    if (FAILED(hr) || !um) return FAILED(hr) ? hr : E_NOINTERFACE;
+    hr = um->ResolveXMemGpuVa(guest_va, out_desktop_gpu_va);
+    um->Release();
+    return hr;
+}
+
+OPENSCARLETT_D3D12_API void WINAPI OpenScarlettD3D12SetForceR9G9B9E5UavFallback(
+    int force_fallback) {
+    openscarlett::d3d12_xs::DeviceX::SetForceR9G9B9E5UavFallback(force_fallback != 0);
+}
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12GetR9G9B9E5UavFallbackActive(
+    ID3D12Device* device,
+    int* out_active) {
+    if (!device) return E_INVALIDARG;
+    if (!out_active) return E_POINTER;
+    IOpenScarlettUnifiedMemory* um = nullptr;
+    HRESULT hr = device->QueryInterface(
+        IID_IOpenScarlettUnifiedMemory, reinterpret_cast<void**>(&um));
+    if (FAILED(hr) || !um) return FAILED(hr) ? hr : E_NOINTERFACE;
+    hr = um->GetR9G9B9E5UavFallbackActive(out_active);
+    um->Release();
+    return hr;
 }
 
 }  // extern "C"

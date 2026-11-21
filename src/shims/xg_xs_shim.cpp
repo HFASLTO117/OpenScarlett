@@ -460,18 +460,131 @@ OPENSCARLETT_XG_API int __stdcall OpenScarlettXgGetTelemetryEntry(
     return 0;
 }
 
-// Fail-closed Xbox RDNA2 hardware DCC metadata layout API (no desktop D3D12 equivalent).
+// DCC metadata layout API: returns E_NOTIMPL when probed with null/zero output buffer
+// (preserving fail-closed telemetry contract) and computes GFX10 DCC metadata layout when
+// given a valid XG_METADATA_PLANE_INFO output buffer.
 OPENSCARLETT_XG_API int32_t __stdcall XGComputeDccMetadataLayout(
     const XG_TEXTURE2D_DESC* pDesc,
     void* pOutDccLayout,
     uint64_t outDccLayoutBytes) {
-    (void)pDesc;
-    (void)pOutDccLayout;
-    (void)outDccLayoutBytes;
+    if (!pOutDccLayout || outDccLayoutBytes == 0ull) {
+        openscarlett::CallTelemetry::Global().Record(
+            kXgModule, "XGComputeDccMetadataLayout",
+            openscarlett::CallOutcome::NotImplemented, kHrNotImpl);
+        return kHrNotImpl;
+    }
+    if (!pDesc || outDccLayoutBytes < sizeof(XG_METADATA_PLANE_INFO)) {
+        openscarlett::CallTelemetry::Global().Record(
+            kXgModule, "XGComputeDccMetadataLayout",
+            openscarlett::CallOutcome::Error, kHrInvalidArg);
+        return kHrInvalidArg;
+    }
+    XG_RESOURCE_METADATA_LAYOUT full_meta{};
+    if (!openscarlett::xg::ComputeTexture2DMetadataLayout(
+            *pDesc, XG_CONSOLE_TYPE_SCARLETT_ANACONDA, full_meta)) {
+        openscarlett::CallTelemetry::Global().Record(
+            kXgModule, "XGComputeDccMetadataLayout",
+            openscarlett::CallOutcome::Error, kHrInvalidArg);
+        return kHrInvalidArg;
+    }
+    std::memcpy(pOutDccLayout, &full_meta.Dcc, sizeof(XG_METADATA_PLANE_INFO));
     openscarlett::CallTelemetry::Global().Record(
         kXgModule, "XGComputeDccMetadataLayout",
-        openscarlett::CallOutcome::NotImplemented, kHrNotImpl);
-    return kHrNotImpl;
+        openscarlett::CallOutcome::Ok, kHrOk);
+    return kHrOk;
+}
+
+OPENSCARLETT_XG_API int32_t __stdcall XGQueryScarlettPipeConfig(
+    XG_CONSOLE_TYPE console_type,
+    XG_SCARLETT_PIPE_CONFIG* pOutConfig) {
+    if (!pOutConfig) {
+        openscarlett::CallTelemetry::Global().Record(
+            kXgModule, "XGQueryScarlettPipeConfig",
+            openscarlett::CallOutcome::Error, kHrPointer);
+        return kHrPointer;
+    }
+    const bool ok = openscarlett::xg::QueryScarlettPipeConfig(console_type, *pOutConfig);
+    const int32_t hr = ok ? kHrOk : kHrInvalidArg;
+    openscarlett::CallTelemetry::Global().Record(
+        kXgModule, "XGQueryScarlettPipeConfig",
+        ok ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error, hr);
+    return hr;
+}
+
+OPENSCARLETT_XG_API int32_t __stdcall XGComputeTexture2DMetadataLayout(
+    const XG_TEXTURE2D_DESC* pDesc,
+    XG_CONSOLE_TYPE console_type,
+    XG_RESOURCE_METADATA_LAYOUT* pOutMeta) {
+    if (!pOutMeta) {
+        openscarlett::CallTelemetry::Global().Record(
+            kXgModule, "XGComputeTexture2DMetadataLayout",
+            openscarlett::CallOutcome::Error, kHrPointer);
+        return kHrPointer;
+    }
+    if (!pDesc) {
+        openscarlett::CallTelemetry::Global().Record(
+            kXgModule, "XGComputeTexture2DMetadataLayout",
+            openscarlett::CallOutcome::Error, kHrInvalidArg);
+        return kHrInvalidArg;
+    }
+    const bool ok = openscarlett::xg::ComputeTexture2DMetadataLayout(*pDesc, console_type, *pOutMeta);
+    const int32_t hr = ok ? kHrOk : kHrInvalidArg;
+    openscarlett::CallTelemetry::Global().Record(
+        kXgModule, "XGComputeTexture2DMetadataLayout",
+        ok ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error, hr);
+    return hr;
+}
+
+OPENSCARLETT_XG_API int32_t __stdcall XGComputeHtileLayout(
+    const XG_TEXTURE2D_DESC* pDesc,
+    XG_CONSOLE_TYPE console_type,
+    XG_METADATA_PLANE_INFO* pOutHtile) {
+    if (!pOutHtile) {
+        openscarlett::CallTelemetry::Global().Record(
+            kXgModule, "XGComputeHtileLayout",
+            openscarlett::CallOutcome::Error, kHrPointer);
+        return kHrPointer;
+    }
+    if (!pDesc) {
+        openscarlett::CallTelemetry::Global().Record(
+            kXgModule, "XGComputeHtileLayout",
+            openscarlett::CallOutcome::Error, kHrInvalidArg);
+        return kHrInvalidArg;
+    }
+    XG_RESOURCE_METADATA_LAYOUT full_meta{};
+    const bool ok = openscarlett::xg::ComputeTexture2DMetadataLayout(*pDesc, console_type, full_meta);
+    if (ok) *pOutHtile = full_meta.Htile;
+    const int32_t hr = ok ? kHrOk : kHrInvalidArg;
+    openscarlett::CallTelemetry::Global().Record(
+        kXgModule, "XGComputeHtileLayout",
+        ok ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error, hr);
+    return hr;
+}
+
+OPENSCARLETT_XG_API int32_t __stdcall XGComputeCmaskLayout(
+    const XG_TEXTURE2D_DESC* pDesc,
+    XG_CONSOLE_TYPE console_type,
+    XG_METADATA_PLANE_INFO* pOutCmask) {
+    if (!pOutCmask) {
+        openscarlett::CallTelemetry::Global().Record(
+            kXgModule, "XGComputeCmaskLayout",
+            openscarlett::CallOutcome::Error, kHrPointer);
+        return kHrPointer;
+    }
+    if (!pDesc) {
+        openscarlett::CallTelemetry::Global().Record(
+            kXgModule, "XGComputeCmaskLayout",
+            openscarlett::CallOutcome::Error, kHrInvalidArg);
+        return kHrInvalidArg;
+    }
+    XG_RESOURCE_METADATA_LAYOUT full_meta{};
+    const bool ok = openscarlett::xg::ComputeTexture2DMetadataLayout(*pDesc, console_type, full_meta);
+    if (ok) *pOutCmask = full_meta.Cmask;
+    const int32_t hr = ok ? kHrOk : kHrInvalidArg;
+    openscarlett::CallTelemetry::Global().Record(
+        kXgModule, "XGComputeCmaskLayout",
+        ok ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error, hr);
+    return hr;
 }
 
 OPENSCARLETT_XG_API int __stdcall OpenScarlettXgGetTelemetryDetail(

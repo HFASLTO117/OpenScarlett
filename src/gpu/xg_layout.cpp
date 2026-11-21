@@ -1443,4 +1443,194 @@ bool UntileSurface3D(
     return true;
 }
 
+namespace {
+
+bool IsDepthFormat(uint32_t dxgi_format) noexcept {
+    switch (static_cast<DXGI_FORMAT>(dxgi_format)) {
+        case DXGI_FORMAT_D16_UNORM:
+        case DXGI_FORMAT_D24_UNORM_S8_UINT:
+        case DXGI_FORMAT_D32_FLOAT:
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+        case DXGI_FORMAT_R24G8_TYPELESS:
+        case DXGI_FORMAT_R32G8X24_TYPELESS:
+        case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+        case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool IsDepthCapableTypeless(uint32_t dxgi_format) noexcept {
+    switch (static_cast<DXGI_FORMAT>(dxgi_format)) {
+        case DXGI_FORMAT_R16_TYPELESS:
+        case DXGI_FORMAT_R32_TYPELESS:
+            return true;
+        default:
+            return IsDepthFormat(dxgi_format);
+    }
+}
+
+}  // namespace
+
+bool QueryScarlettPipeConfig(
+    XG_CONSOLE_TYPE console_type,
+    XG_SCARLETT_PIPE_CONFIG& out_config) noexcept {
+    std::memset(&out_config, 0, sizeof(out_config));
+    switch (console_type) {
+        case XG_CONSOLE_TYPE_SCARLETT_ANACONDA:
+            out_config.ConsoleType = XG_CONSOLE_TYPE_SCARLETT_ANACONDA;
+            out_config.NumPipes = 16u;
+            out_config.PipeInterleaveBytes = 256u;
+            out_config.NumBanks = 16u;
+            out_config.NumShaderEngines = 2u;
+            out_config.NumRenderBackends = 16u;
+            out_config.PipeBits = 4u;
+            out_config.BankBits = 4u;
+            out_config.MaxCompressedFragments = 8u;
+            out_config.HtileTileSizeBytes = 65536u;
+            out_config.DccBlockSizeBytes = 256u;
+            out_config.CmaskTileWidthPixels = 8u;
+            out_config.CmaskTileHeightPixels = 8u;
+            return true;
+        case XG_CONSOLE_TYPE_SCARLETT_LOCKHART:
+            out_config.ConsoleType = XG_CONSOLE_TYPE_SCARLETT_LOCKHART;
+            out_config.NumPipes = 8u;
+            out_config.PipeInterleaveBytes = 256u;
+            out_config.NumBanks = 8u;
+            out_config.NumShaderEngines = 1u;
+            out_config.NumRenderBackends = 8u;
+            out_config.PipeBits = 3u;
+            out_config.BankBits = 3u;
+            out_config.MaxCompressedFragments = 8u;
+            out_config.HtileTileSizeBytes = 65536u;
+            out_config.DccBlockSizeBytes = 256u;
+            out_config.CmaskTileWidthPixels = 8u;
+            out_config.CmaskTileHeightPixels = 8u;
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool ComputeTexture2DMetadataLayout(
+    const XG_TEXTURE2D_DESC& desc,
+    XG_CONSOLE_TYPE console_type,
+    XG_RESOURCE_METADATA_LAYOUT& out_meta) noexcept {
+    std::memset(&out_meta, 0, sizeof(out_meta));
+
+    XG_SCARLETT_PIPE_CONFIG pipe_cfg{};
+    if (!QueryScarlettPipeConfig(console_type, pipe_cfg)) {
+        return false;
+    }
+
+    XG_RESOURCE_LAYOUT base_layout{};
+    if (!ComputeTexture2DLayout(desc, base_layout)) {
+        return false;
+    }
+
+    out_meta.BaseSurfaceSizeBytes = base_layout.SizeBytes;
+    out_meta.BaseAlignmentBytes = base_layout.BaseAlignmentBytes;
+    out_meta.PipeConfig = pipe_cfg;
+
+    const bool is_tiled = (desc.TileMode != XG_TILE_MODE_LINEAR);
+    const uint32_t sample_count = (desc.SampleCount == 0u) ? 1u : desc.SampleCount;
+    const uint32_t array_size = base_layout.ArraySize;
+    const uint64_t pipe_align =
+        static_cast<uint64_t>(pipe_cfg.NumPipes) * static_cast<uint64_t>(pipe_cfg.PipeInterleaveBytes);
+
+    uint64_t cursor = base_layout.SizeBytes;
+
+    // 1. HTILE metadata plane (GFX10 hierarchical Z/stencil: 4 bytes per 8x8 pixel block).
+    const bool is_depth =
+        ((desc.BindFlags & XG_BIND_DEPTH_STENCIL) != 0u && IsDepthCapableTypeless(desc.Format)) ||
+        IsDepthFormat(desc.Format);
+    if (is_tiled && is_depth) {
+        const uint64_t htile_align = std::max<uint64_t>(
+            pipe_align,
+            (base_layout.BaseAlignmentBytes >= 65536ull) ? 65536ull : 4096ull);
+        const uint32_t meta_block_w = 8u * pipe_cfg.NumPipes;
+        const uint32_t meta_block_h = 8u * pipe_cfg.NumBanks;
+
+        uint64_t htile_slice_bytes = 0ull;
+        for (uint32_t m = 0u; m < base_layout.MipLevels; ++m) {
+            const uint32_t mw = std::max(1u, desc.Width >> m);
+            const uint32_t mh = std::max(1u, desc.Height >> m);
+            const uint32_t blocks_x = (mw + 7u) / 8u;
+            const uint32_t blocks_y = (mh + 7u) / 8u;
+            const uint64_t mip_bytes =
+                static_cast<uint64_t>(blocks_x) * static_cast<uint64_t>(blocks_y) * 4ull;
+            htile_slice_bytes += AlignUpU64(mip_bytes, pipe_align);
+        }
+        htile_slice_bytes = AlignUpU64(std::max<uint64_t>(htile_slice_bytes, pipe_align), htile_align);
+
+        cursor = AlignUpU64(cursor, htile_align);
+        out_meta.Htile.Enabled = 1u;
+        out_meta.Htile.PipeAligned = 1u;
+        out_meta.Htile.MetaBlockWidth = meta_block_w;
+        out_meta.Htile.MetaBlockHeight = meta_block_h;
+        out_meta.Htile.OffsetBytes = cursor;
+        out_meta.Htile.SlicePitchBytes = htile_slice_bytes;
+        out_meta.Htile.SizeBytes = htile_slice_bytes * array_size;
+        out_meta.Htile.AlignmentBytes = htile_align;
+        cursor += out_meta.Htile.SizeBytes;
+    }
+
+    // 2. DCC metadata plane (GFX10 Delta Color Compression: 1 byte per 256-byte color block).
+    const bool dcc_eligible =
+        is_tiled && !is_depth && (base_layout.FormatInfo.is_compressed == 0u) &&
+        ((desc.BindFlags & (XG_BIND_RENDER_TARGET | XG_BIND_SHADER_RESOURCE | XG_BIND_UNORDERED_ACCESS)) != 0u);
+    if (dcc_eligible) {
+        const uint64_t dcc_align = std::max<uint64_t>(
+            pipe_align,
+            (base_layout.BaseAlignmentBytes >= 65536ull) ? 65536ull : 4096ull);
+        // Per-slice color payload scales with sample_count; DCC stores 1B per 256B block.
+        const uint64_t per_slice_color_bytes =
+            (base_layout.PlaneSizes[0] / std::max(1u, array_size)) * sample_count;
+        const uint64_t raw_dcc_slice =
+            (per_slice_color_bytes + pipe_cfg.DccBlockSizeBytes - 1ull) / pipe_cfg.DccBlockSizeBytes;
+        const uint64_t dcc_slice_bytes = AlignUpU64(
+            std::max<uint64_t>(raw_dcc_slice, pipe_align), dcc_align);
+
+        cursor = AlignUpU64(cursor, dcc_align);
+        out_meta.Dcc.Enabled = 1u;
+        out_meta.Dcc.PipeAligned = 1u;
+        out_meta.Dcc.MetaBlockWidth = (base_layout.FormatInfo.bytes_per_block <= 4u) ? 256u : 128u;
+        out_meta.Dcc.MetaBlockHeight = (base_layout.FormatInfo.bytes_per_block <= 2u) ? 256u : 128u;
+        out_meta.Dcc.OffsetBytes = cursor;
+        out_meta.Dcc.SlicePitchBytes = dcc_slice_bytes;
+        out_meta.Dcc.SizeBytes = dcc_slice_bytes * array_size;
+        out_meta.Dcc.AlignmentBytes = dcc_align;
+        cursor += out_meta.Dcc.SizeBytes;
+    }
+
+    // 3. CMASK metadata plane (GFX10 fast-clear / MSAA color mask: 4 bits per 8x8 pixel block).
+    const bool cmask_eligible =
+        is_tiled && !is_depth && (base_layout.FormatInfo.is_compressed == 0u) &&
+        ((desc.BindFlags & XG_BIND_RENDER_TARGET) != 0u || sample_count > 1u);
+    if (cmask_eligible) {
+        const uint64_t cmask_align = std::max<uint64_t>(pipe_align, 2048ull);
+        const uint32_t tiles_x = (desc.Width + pipe_cfg.CmaskTileWidthPixels - 1u) / pipe_cfg.CmaskTileWidthPixels;
+        const uint32_t tiles_y = (desc.Height + pipe_cfg.CmaskTileHeightPixels - 1u) / pipe_cfg.CmaskTileHeightPixels;
+        const uint64_t total_blocks = static_cast<uint64_t>(tiles_x) * static_cast<uint64_t>(tiles_y);
+        const uint64_t raw_cmask_bytes = (total_blocks + 1ull) / 2ull;  // 4 bits per 8x8 block
+        const uint64_t cmask_slice_bytes = AlignUpU64(
+            std::max<uint64_t>(raw_cmask_bytes, 256ull), cmask_align);
+
+        cursor = AlignUpU64(cursor, cmask_align);
+        out_meta.Cmask.Enabled = 1u;
+        out_meta.Cmask.PipeAligned = 1u;
+        out_meta.Cmask.MetaBlockWidth = pipe_cfg.CmaskTileWidthPixels * pipe_cfg.NumPipes;
+        out_meta.Cmask.MetaBlockHeight = pipe_cfg.CmaskTileHeightPixels * pipe_cfg.NumBanks;
+        out_meta.Cmask.OffsetBytes = cursor;
+        out_meta.Cmask.SlicePitchBytes = cmask_slice_bytes;
+        out_meta.Cmask.SizeBytes = cmask_slice_bytes * array_size;
+        out_meta.Cmask.AlignmentBytes = cmask_align;
+        cursor += out_meta.Cmask.SizeBytes;
+    }
+
+    out_meta.TotalSizeWithMetadataBytes = AlignUpU64(cursor, out_meta.BaseAlignmentBytes);
+    return true;
+}
+
 }  // namespace openscarlett::xg
