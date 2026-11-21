@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -10,8 +11,12 @@
 namespace openscarlett::d3d12_xs {
 
 class DeviceX;
+struct WindowCallbackState;
 
-class CommandQueueX final : public ID3D12CommandQueueX, public IOpenScarlettPresentCapture {
+class CommandQueueX final
+    : public ID3D12CommandQueueX,
+      public IOpenScarlettPresentCapture,
+      public IOpenScarlettPresentWindow {
 public:
     CommandQueueX(DeviceX* parent_device,
                   ID3D12CommandQueue* host_queue,
@@ -93,12 +98,24 @@ public:
         uint32_t buffer_bytes,
         uint32_t* out_copied_bytes) override;
 
+    // IOpenScarlettPresentWindow
+    HRESULT STDMETHODCALLTYPE GetPresentWindowState(
+        D3D12XBOX_PRESENT_WINDOW_STATE* out_state) override;
+    HRESULT STDMETHODCALLTYPE ToggleBorderlessFullscreen() override;
+    HANDLE STDMETHODCALLTYPE GetFrameLatencyWaitableObject() override;
+    HRESULT STDMETHODCALLTYPE SetWindowCloseBehavior(BOOL post_quit_on_close) override;
+
 private:
     HRESULT EnsurePresentHelperObjectsLocked();
-    HRESULT EnsureSwapChainLocked(HWND hwnd, uint32_t width, uint32_t height, DXGI_FORMAT format);
+    HRESULT EnsureSwapChainLocked(
+        HWND hwnd, uint32_t width, uint32_t height, DXGI_FORMAT format, bool force_resize);
     HRESULT EnsureReadbackBufferLocked(uint64_t required_bytes);
     HRESULT WaitForInternalFenceLocked();
+    void AttachWindowSubclassLocked(HWND hwnd);
+    void DetachWindowSubclassLocked();
+    void ReleaseSwapChainLocked();
     void ReleasePresentObjectsLocked();
+    void PaceFrameLocked(uint32_t frame_interval_us);
 
     std::atomic<ULONG> ref_count_{1};
     DeviceX* device_x_ = nullptr;
@@ -107,6 +124,8 @@ private:
 
     std::mutex present_mutex_;
     HWND attached_hwnd_ = nullptr;
+    HWND subclassed_hwnd_ = nullptr;
+    std::shared_ptr<WindowCallbackState> window_state_;
     bool readback_capture_enabled_ = true;
 
     ID3D12CommandAllocator* present_alloc_ = nullptr;
@@ -123,8 +142,20 @@ private:
     uint32_t swapchain_width_ = 0;
     uint32_t swapchain_height_ = 0;
     DXGI_FORMAT swapchain_format_ = DXGI_FORMAT_UNKNOWN;
+    uint32_t swapchain_flags_ = 0;
+    uint32_t swapchain_buffer_count_ = 0;
+    uint32_t swapchain_max_latency_ = 0;
+    bool swapchain_occluded_ = false;
+    HANDLE frame_latency_waitable_object_ = nullptr;
+
+    int64_t qpc_freq_ = 0;
+    int64_t last_paced_qpc_ = 0;
+    int64_t last_present_qpc_ = 0;
+    HANDLE pacing_timer_ = nullptr;
 
     uint64_t present_count_ = 0;
+    uint64_t latency_waits_ = 0;
+    double last_frame_ms_ = 0.0;
     uint64_t last_present_hash_ = 0;
     uint32_t last_present_width_ = 0;
     uint32_t last_present_height_ = 0;

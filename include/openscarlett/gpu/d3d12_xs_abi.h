@@ -94,6 +94,21 @@ struct D3D12XBOX_PRESENT_PARAMETERS {
     HWND OutputWindow;
 };
 
+struct D3D12XBOX_PRESENT_WINDOW_STATE {
+    uint32_t width;
+    uint32_t height;
+    uint32_t is_fullscreen;
+    uint32_t is_minimized;
+    uint32_t is_active;
+    uint32_t close_requested;
+    uint32_t swapchain_flags;
+    uint32_t frame_interval_us;
+    uint32_t max_frame_latency;
+    uint64_t present_count;
+    uint64_t latency_waits;
+    double last_frame_ms;
+};
+
 // Clean-room OpenScarlett COM interface IIDs for Xbox D3D12X proxy interfaces.
 // {4F534431-3258-4445-5600-000000000001}
 inline constexpr GUID IID_ID3D12DeviceX = {
@@ -110,6 +125,10 @@ inline constexpr GUID IID_ID3D12GraphicsCommandListX = {
 // {4F534431-3258-5052-4300-000000000004}
 inline constexpr GUID IID_IOpenScarlettPresentCapture = {
     0x4F534431u, 0x3258u, 0x5052u, {0x43u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x04u}};
+
+// {4F534431-3258-5052-5700-000000000005}
+inline constexpr GUID IID_IOpenScarlettPresentWindow = {
+    0x4F534431u, 0x3258u, 0x5052u, {0x57u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x05u}};
 
 struct __declspec(uuid("4F534431-3258-4445-5600-000000000001")) ID3D12DeviceX : public ID3D12Device6 {
     virtual HRESULT STDMETHODCALLTYPE SetFrameIntervalX(
@@ -173,6 +192,15 @@ struct __declspec(uuid("4F534431-3258-5052-4300-000000000004")) IOpenScarlettPre
         uint32_t* out_copied_bytes) = 0;
 };
 
+struct __declspec(uuid("4F534431-3258-5052-5700-000000000005")) IOpenScarlettPresentWindow : public IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE GetPresentWindowState(
+        D3D12XBOX_PRESENT_WINDOW_STATE* out_state) = 0;
+    virtual HRESULT STDMETHODCALLTYPE ToggleBorderlessFullscreen() = 0;
+    // Returns borrowed waitable latency handle owned by CommandQueueX (do not CloseHandle).
+    virtual HANDLE STDMETHODCALLTYPE GetFrameLatencyWaitableObject() = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetWindowCloseBehavior(BOOL post_quit_on_close) = 0;
+};
+
 extern "C" {
 
 OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12CreateDeviceX(
@@ -208,6 +236,22 @@ OPENSCARLETT_D3D12_API int WINAPI OpenScarlettD3D12GetTelemetryEntry(
     const char* symbol_name,
     int32_t* out_vtable_slot,
     uint64_t* out_total_calls);
+
+// Interactive Win32 swapchain & windowing helpers exported by d3d12_xs.dll.
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12GetPresentWindowState(
+    ID3D12CommandQueue* queue,
+    D3D12XBOX_PRESENT_WINDOW_STATE* out_state);
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12ToggleBorderlessFullscreen(
+    ID3D12CommandQueue* queue);
+
+// Returns borrowed DXGI frame latency waitable handle owned by CommandQueueX (do not CloseHandle).
+OPENSCARLETT_D3D12_API HANDLE WINAPI OpenScarlettD3D12GetFrameLatencyWaitableObject(
+    ID3D12CommandQueue* queue);
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12SetWindowCloseBehavior(
+    ID3D12CommandQueue* queue,
+    int post_quit_on_close);
 
 }  // extern "C"
 

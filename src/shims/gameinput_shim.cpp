@@ -11,6 +11,7 @@
 #include <deque>
 #include <mutex>
 #include <new>
+#include <unordered_set>
 #include <vector>
 
 #if defined(_WIN32)
@@ -203,7 +204,9 @@ void PollGamepadAndKeyboard(
         }
     }
 
-    // Merge Win32 keyboard fallback for playability without physical controller.
+    // Merge Win32 keyboard fallback for playability without physical controller:
+    // WASD -> left stick, IJKL -> right stick, Space/Enter -> A, Backspace/Ctrl -> B,
+    // E -> X, Q -> Y, Shift -> LB/RB, Z/C -> LT/RT, Esc -> Menu, Tab -> View.
     auto is_down = [](int vk) -> bool {
         return (GetAsyncKeyState(vk) & 0x8000) != 0;
     };
@@ -214,29 +217,54 @@ void PollGamepadAndKeyboard(
     if (is_down('S')) kb_ly -= 1.0f;
     if (is_down('D')) kb_lx += 1.0f;
     if (is_down('A')) kb_lx -= 1.0f;
-    if (kb_lx != 0.0f) out_gamepad.leftThumbstickX = std::clamp(out_gamepad.leftThumbstickX + kb_lx, -1.0f, 1.0f);
-    if (kb_ly != 0.0f) out_gamepad.leftThumbstickY = std::clamp(out_gamepad.leftThumbstickY + kb_ly, -1.0f, 1.0f);
+    if (kb_lx != 0.0f) {
+        out_gamepad.leftThumbstickX = std::clamp(out_gamepad.leftThumbstickX + kb_lx, -1.0f, 1.0f);
+    }
+    if (kb_ly != 0.0f) {
+        out_gamepad.leftThumbstickY = std::clamp(out_gamepad.leftThumbstickY + kb_ly, -1.0f, 1.0f);
+    }
+
+    float kb_rx = 0.0f;
+    float kb_ry = 0.0f;
+    if (is_down('I')) kb_ry += 1.0f;
+    if (is_down('K')) kb_ry -= 1.0f;
+    if (is_down('L')) kb_rx += 1.0f;
+    if (is_down('J')) kb_rx -= 1.0f;
+    if (kb_rx != 0.0f) {
+        out_gamepad.rightThumbstickX = std::clamp(out_gamepad.rightThumbstickX + kb_rx, -1.0f, 1.0f);
+    }
+    if (kb_ry != 0.0f) {
+        out_gamepad.rightThumbstickY = std::clamp(out_gamepad.rightThumbstickY + kb_ry, -1.0f, 1.0f);
+    }
 
     if (is_down(VK_UP)) out_gamepad.buttons |= GameInputGamepadDPadUp;
     if (is_down(VK_DOWN)) out_gamepad.buttons |= GameInputGamepadDPadDown;
     if (is_down(VK_LEFT)) out_gamepad.buttons |= GameInputGamepadDPadLeft;
     if (is_down(VK_RIGHT)) out_gamepad.buttons |= GameInputGamepadDPadRight;
     if (is_down(VK_SPACE) || is_down(VK_RETURN)) out_gamepad.buttons |= GameInputGamepadA;
-    if (is_down(VK_BACK)) out_gamepad.buttons |= GameInputGamepadB;
-    if (is_down(VK_ESCAPE)) out_gamepad.buttons |= GameInputGamepadMenu;
-    if (is_down(VK_TAB)) out_gamepad.buttons |= GameInputGamepadView;
-    if (is_down(VK_LSHIFT)) out_gamepad.buttons |= GameInputGamepadLeftShoulder;
-    if (is_down(VK_RSHIFT)) out_gamepad.buttons |= GameInputGamepadRightShoulder;
+    if (is_down(VK_BACK) || is_down(VK_LCONTROL) || is_down(VK_RCONTROL)) {
+        out_gamepad.buttons |= GameInputGamepadB;
+    }
     if (is_down('E')) out_gamepad.buttons |= GameInputGamepadX;
     if (is_down('Q')) out_gamepad.buttons |= GameInputGamepadY;
+    if (is_down(VK_LSHIFT)) out_gamepad.buttons |= GameInputGamepadLeftShoulder;
+    if (is_down(VK_RSHIFT)) out_gamepad.buttons |= GameInputGamepadRightShoulder;
+    if (is_down(VK_ESCAPE)) out_gamepad.buttons |= GameInputGamepadMenu;
+    if (is_down(VK_TAB)) out_gamepad.buttons |= GameInputGamepadView;
+    if (is_down('Z')) out_gamepad.leftTrigger = std::max(out_gamepad.leftTrigger, 1.0f);
+    if (is_down('C')) out_gamepad.rightTrigger = std::max(out_gamepad.rightTrigger, 1.0f);
 
-    // Collect currently pressed Win32 keys for GetKeyState.
+    // Collect currently pressed Win32 keys for GetKeyState:
+    // full A-Z, 0-9, F1-F12, arrows, modifiers, Enter, Space, Esc, Tab, Backspace.
     static constexpr uint8_t kTrackedVks[] = {
-        'W', 'A', 'S', 'D', 'E', 'Q', 'R', 'F', 'Z', 'X', 'C', 'V',
+        'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M',
+        'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
         '0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
-        VK_SPACE, VK_RETURN, VK_BACK, VK_ESCAPE, VK_TAB,
-        VK_LSHIFT, VK_RSHIFT, VK_LCONTROL, VK_RCONTROL,
-        VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT
+        VK_F1, VK_F2, VK_F3, VK_F4, VK_F5, VK_F6,
+        VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12,
+        VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT,
+        VK_LSHIFT, VK_RSHIFT, VK_LCONTROL, VK_RCONTROL, VK_LMENU, VK_RMENU,
+        VK_RETURN, VK_SPACE, VK_ESCAPE, VK_TAB, VK_BACK
     };
     for (uint8_t vk : kTrackedVks) {
         if (is_down(vk)) {
@@ -461,6 +489,8 @@ public:
     }
 
     uint64_t Sequence() const { return seq_; }
+    GameInputKind KindRaw() const { return kind_; }
+    IGameInputDevice* DevicePtr() const { return device_; }
 
 private:
     std::atomic<uint32_t> ref_count_{1};
@@ -472,13 +502,33 @@ private:
     std::vector<GameInputKeyState> keys_;
 };
 
+class GameInputImpl;
+
+struct LiveGameInputRegistry {
+    std::mutex mutex;
+    std::unordered_set<GameInputImpl*> instances;
+};
+
+LiveGameInputRegistry& GetLiveGameInputRegistry() {
+    static LiveGameInputRegistry reg;
+    return reg;
+}
+
 class GameInputImpl final : public IGameInput {
 public:
     GameInputImpl() {
         default_device_ = new GameInputDeviceImpl(0);
+        auto& reg = GetLiveGameInputRegistry();
+        std::lock_guard<std::mutex> lk(reg.mutex);
+        reg.instances.insert(this);
     }
 
     ~GameInputImpl() {
+        {
+            auto& reg = GetLiveGameInputRegistry();
+            std::lock_guard<std::mutex> lk(reg.mutex);
+            reg.instances.erase(this);
+        }
         for (auto* r : history_) {
             if (r) r->Release();
         }
@@ -537,9 +587,23 @@ public:
 
         GameInputGamepadState gp{};
         std::vector<GameInputKeyState> keys;
-        uint32_t active_slot = target_dev->ActiveSlot();
-        PollGamepadAndKeyboard(active_slot, gp, keys, active_slot);
-        target_dev->SetActiveSlot(active_slot);
+        const bool input_allowed = ShouldAllowInput();
+
+        bool use_injected = false;
+        if (input_allowed) {
+            std::lock_guard<std::mutex> lk(mutex_);
+            if (test_inject_enabled_) {
+                gp = injected_gamepad_;
+                keys = injected_keys_;
+                use_injected = true;
+            }
+        }
+
+        if (input_allowed && !use_injected) {
+            uint32_t active_slot = target_dev->ActiveSlot();
+            PollGamepadAndKeyboard(active_slot, gp, keys, active_slot);
+            target_dev->SetActiveSlot(active_slot);
+        }
 
         const GameInputKind resolved_kind =
             (inputKind == GameInputKindUnknown)
@@ -548,7 +612,10 @@ public:
 
         std::lock_guard<std::mutex> lk(mutex_);
         const uint64_t seq = next_seq_++;
-        const uint64_t ts = QueryTimestampMicros();
+        const uint64_t raw_ts = QueryTimestampMicros();
+        const uint64_t ts = (raw_ts >= last_ts_) ? raw_ts : last_ts_;
+        last_ts_ = ts;
+
         auto* r = new (std::nothrow) GameInputReadingImpl(
             resolved_kind, seq, ts, target_dev, gp, std::move(keys));
         if (!r) {
@@ -569,8 +636,8 @@ public:
 
     int32_t OPENSCARLETT_GAMEINPUT_CALL GetNextReading(
         IGameInputReading* referenceReading,
-        GameInputKind /*inputKind*/,
-        IGameInputDevice* /*device*/,
+        GameInputKind inputKind,
+        IGameInputDevice* device,
         IGameInputReading** reading) override {
         if (!referenceReading || !reading) {
             return RecordHr("IGameInput::GetNextReading", GAMEINPUT_E_INVALIDARG, 5);
@@ -579,19 +646,20 @@ public:
         const uint64_t ref_seq = static_cast<GameInputReadingImpl*>(referenceReading)->Sequence();
         std::lock_guard<std::mutex> lk(mutex_);
         for (auto* r : history_) {
-            if (r->Sequence() > ref_seq) {
-                r->AddRef();
-                *reading = r;
-                return RecordHr("IGameInput::GetNextReading", GAMEINPUT_S_OK, 5);
-            }
+            if (r->Sequence() <= ref_seq) continue;
+            if (inputKind != GameInputKindUnknown && (r->KindRaw() & inputKind) == 0) continue;
+            if (device && r->DevicePtr() != device) continue;
+            r->AddRef();
+            *reading = r;
+            return RecordHr("IGameInput::GetNextReading", GAMEINPUT_S_OK, 5);
         }
         return RecordHr("IGameInput::GetNextReading", GAMEINPUT_E_READING_NOT_FOUND, 5);
     }
 
     int32_t OPENSCARLETT_GAMEINPUT_CALL GetPreviousReading(
         IGameInputReading* referenceReading,
-        GameInputKind /*inputKind*/,
-        IGameInputDevice* /*device*/,
+        GameInputKind inputKind,
+        IGameInputDevice* device,
         IGameInputReading** reading) override {
         if (!referenceReading || !reading) {
             return RecordHr("IGameInput::GetPreviousReading", GAMEINPUT_E_INVALIDARG, 6);
@@ -600,28 +668,100 @@ public:
         const uint64_t ref_seq = static_cast<GameInputReadingImpl*>(referenceReading)->Sequence();
         std::lock_guard<std::mutex> lk(mutex_);
         for (auto it = history_.rbegin(); it != history_.rend(); ++it) {
-            if ((*it)->Sequence() < ref_seq) {
-                (*it)->AddRef();
-                *reading = *it;
-                return RecordHr("IGameInput::GetPreviousReading", GAMEINPUT_S_OK, 6);
-            }
+            auto* r = *it;
+            if (r->Sequence() >= ref_seq) continue;
+            if (inputKind != GameInputKindUnknown && (r->KindRaw() & inputKind) == 0) continue;
+            if (device && r->DevicePtr() != device) continue;
+            r->AddRef();
+            *reading = r;
+            return RecordHr("IGameInput::GetPreviousReading", GAMEINPUT_S_OK, 6);
         }
         return RecordHr("IGameInput::GetPreviousReading", GAMEINPUT_E_READING_NOT_FOUND, 6);
     }
 
     void OPENSCARLETT_GAMEINPUT_CALL SetFocusPolicy(uint32_t policy) override {
         RecordOk("IGameInput::SetFocusPolicy", 7);
-        focus_policy_.store(policy, std::memory_order_relaxed);
+        focus_policy_.store(policy, std::memory_order_release);
+    }
+
+    void SetTargetWindow(void* hwnd) {
+        target_hwnd_.store(hwnd, std::memory_order_release);
+    }
+
+    void SetInjectedTestState(
+        const GameInputGamepadState* gp,
+        const GameInputKeyState* keys,
+        uint32_t key_count,
+        bool enable) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        test_inject_enabled_ = enable;
+        if (!enable) {
+            injected_gamepad_ = GameInputGamepadState{};
+            injected_keys_.clear();
+            return;
+        }
+        injected_gamepad_ = gp ? *gp : GameInputGamepadState{};
+        injected_keys_.clear();
+        if (keys && key_count > 0u) {
+            injected_keys_.assign(keys, keys + key_count);
+        }
     }
 
 private:
+    bool ShouldAllowInput() const noexcept {
+        const uint32_t policy = focus_policy_.load(std::memory_order_acquire);
+        if ((policy & GameInputEnableBackgroundInput) != 0u) {
+            return true;
+        }
+        const uint32_t fg_gate_mask =
+            GameInputDisableBackgroundInput | GameInputExclusiveForegroundInput;
+        if ((policy & fg_gate_mask) == 0u) {
+            // GameInputDefaultFocusPolicy allows input cleanly in console/headless hosts.
+            return true;
+        }
+#if defined(_WIN32)
+        HWND fg = GetForegroundWindow();
+        if (!fg) {
+            return false;
+        }
+        HWND target = reinterpret_cast<HWND>(target_hwnd_.load(std::memory_order_acquire));
+        if (target && IsWindow(target) != FALSE) {
+            return (fg == target) ||
+                   (IsChild(target, fg) != FALSE) ||
+                   (GetAncestor(fg, GA_ROOTOWNER) == target);
+        }
+        DWORD fg_pid = 0;
+        GetWindowThreadProcessId(fg, &fg_pid);
+        return fg_pid == GetCurrentProcessId();
+#else
+        return true;
+#endif
+    }
+
     std::atomic<uint32_t> ref_count_{1};
-    std::atomic<uint32_t> focus_policy_{0};
+    std::atomic<uint32_t> focus_policy_{GameInputDefaultFocusPolicy};
+    std::atomic<void*> target_hwnd_{nullptr};
     GameInputDeviceImpl* default_device_ = nullptr;
     std::mutex mutex_;
     uint64_t next_seq_ = 1;
+    uint64_t last_ts_ = 0;
     std::deque<GameInputReadingImpl*> history_;
+    bool test_inject_enabled_ = false;
+    GameInputGamepadState injected_gamepad_{};
+    std::vector<GameInputKeyState> injected_keys_;
 };
+
+GameInputImpl* AcquireLiveGameInput(IGameInput* input) {
+    if (!input) return nullptr;
+    auto* candidate = static_cast<GameInputImpl*>(input);
+    auto& reg = GetLiveGameInputRegistry();
+    std::lock_guard<std::mutex> lk(reg.mutex);
+    if (reg.instances.find(candidate) == reg.instances.end()) {
+        return nullptr;
+    }
+    candidate->AddRef();
+    return candidate;
+}
 
 }  // namespace
 
@@ -638,6 +778,36 @@ int32_t OPENSCARLETT_GAMEINPUT_CALL GameInputCreate(IGameInput** gameInput) {
     }
     *gameInput = obj;
     return RecordHr("GameInputCreate", GAMEINPUT_S_OK);
+}
+
+int32_t OPENSCARLETT_GAMEINPUT_CALL OpenScarlettGameInputSetTargetWindow(
+    IGameInput* input, void* hwnd) {
+    GameInputImpl* impl = AcquireLiveGameInput(input);
+    if (!impl) {
+        return RecordHr("OpenScarlettGameInputSetTargetWindow", GAMEINPUT_E_INVALIDARG);
+    }
+    impl->SetTargetWindow(hwnd);
+    impl->Release();
+    return RecordHr("OpenScarlettGameInputSetTargetWindow", GAMEINPUT_S_OK);
+}
+
+int32_t OPENSCARLETT_GAMEINPUT_CALL OpenScarlettGameInputInjectTestState(
+    IGameInput* input,
+    const GameInputGamepadState* gp,
+    const GameInputKeyState* keys,
+    uint32_t key_count,
+    int enable) {
+    GameInputImpl* impl = AcquireLiveGameInput(input);
+    if (!impl) {
+        return RecordHr("OpenScarlettGameInputInjectTestState", GAMEINPUT_E_INVALIDARG);
+    }
+    if (enable != 0 && key_count > 0u && !keys) {
+        impl->Release();
+        return RecordHr("OpenScarlettGameInputInjectTestState", GAMEINPUT_E_INVALIDARG);
+    }
+    impl->SetInjectedTestState(gp, keys, key_count, enable != 0);
+    impl->Release();
+    return RecordHr("OpenScarlettGameInputInjectTestState", GAMEINPUT_S_OK);
 }
 
 }  // extern "C"
