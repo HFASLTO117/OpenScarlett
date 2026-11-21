@@ -2,4 +2,4 @@ blank_issues_enabled: true
 contact_links:
   - name: Download Latest Portable Test Bundle (Windows x64)
     url: https://github.com/californiaAlmonds/OpenScarlett/releases/latest
-    about: Grab the prebuilt .zip and double-click run_hardware_test.bat (no Visual Studio required).
+    about: Grab the prebuilt .zip and run run_hardware_test.ps1 with PowerShell (no Visual Studio required).

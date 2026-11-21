@@ -121,7 +121,7 @@ jobs:
           Get-ChildItem "build" -Filter "*.dll" | Copy-Item -Destination $stage
           Get-ChildItem "build" -Filter "test_*.exe" | Copy-Item -Destination $stage
           Get-ChildItem "build" -Filter "gdk_*.exe" | Copy-Item -Destination $stage
-          Copy-Item "tools/run_hardware_test.bat", "tools/run_hardware_test.ps1" $stage
+          Copy-Item "tools/run_hardware_test.ps1" $stage
           Copy-Item "README.md", "LICENSE" $stage
 
           # Bundle open-source DirectXShaderCompiler (dxc.exe + dxcompiler.dll + dxil.dll)
@@ -176,7 +176,7 @@ jobs:
           Write-Host "Running portable bundle smoke test (hiding build/ so hardcoded build paths fail CI)..."
           Rename-Item -Path "build" -NewName "build_hidden_for_smoke"
           try {
-            & "$stage\run_hardware_test.bat" --no-pause
+            & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$stage\run_hardware_test.ps1" -NoPause
             if ($LASTEXITCODE -ne 0) {
               throw "Portable bundle smoke test failed with exit code $LASTEXITCODE"
             }
@@ -252,7 +252,8 @@ jobs:
           cmake -S . -B build-clangcl -G Ninja `
             -DCMAKE_BUILD_TYPE=Release `
             -DCMAKE_C_COMPILER=clang-cl `
-            -DCMAKE_CXX_COMPILER=clang-cl
+            -DCMAKE_CXX_COMPILER=clang-cl `
+            -DCMAKE_CXX_FLAGS="/D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
 
       - name: Build (Clang-CL)
         shell: pwsh
@@ -325,6 +326,7 @@ jobs:
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
+          suppress-deprecation-warnings: msystem-mingw64
           update: false
           install: >-
             mingw-w64-x86_64-gcc
@@ -495,7 +497,7 @@ jobs:
           **Zero coding or Visual Studio required!** Help us test OpenScarlett across real PC GPUs (NVIDIA RTX, AMD RDNA2/3/4, Intel Arc/iGPU) and Windows 10/11 builds:
 
           1. Download **`$zipName`** below and extract it anywhere.
-          2. Double-click **`run_hardware_test.bat`** — it probes your GPU(s) and runs the full automated suite (zero-SDK Vulkan 1.4 graphics & ``VK_EXT_mesh_shader``, HDR10 ST.2084 & scRGB ``PresentX``, D3D12 COM proxies, Mesh Shaders, FSR 1.0, ``VirtualAlloc2`` aliasing, RDNA2 shader lifting & ISA catches, DXR 1.1, ``XDisplay``/``X3DAudio``/``XAudio2FX``, and live Xbox GDK workloads including ``SimpleLighting``, ``HDRCubeMap``, and ``VulkanMeshShowcase``).
+          2. Right-click **`run_hardware_test.ps1`** → **Run with PowerShell** (or run ``powershell -ExecutionPolicy Bypass -File .\run_hardware_test.ps1``) — it probes your GPU(s) and runs the full automated suite (zero-SDK Vulkan 1.4 graphics & ``VK_EXT_mesh_shader``, HDR10 ST.2084 & scRGB ``PresentX``, D3D12 COM proxies, Mesh Shaders, FSR 1.0, ``VirtualAlloc2`` aliasing, RDNA2 shader lifting & ISA catches, DXR 1.1, ``XDisplay``/``X3DAudio``/``XAudio2FX``, and live Xbox GDK workloads including ``SimpleLighting``, ``HDRCubeMap``, and ``VulkanMeshShowcase``).
           3. Press **Enter** when prompted to open a **pre-filled GitHub Hardware Report** (with personal paths/usernames automatically stripped) and click **Create**!
 
           ### What's New in $tag

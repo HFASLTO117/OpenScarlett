@@ -1,4 +1,6 @@
+#ifndef OPENSCARLETT_BUILDING_D3D12_XS
 #define OPENSCARLETT_BUILDING_D3D12_XS 1
+#endif
 #include "openscarlett/gpu/d3d12_xs_abi.h"
 
 #include <algorithm>

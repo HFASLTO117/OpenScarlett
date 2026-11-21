@@ -21,6 +21,16 @@ endif()
 
 if(OPENSCARLETT_IS_CLANG_CL)
     message(STATUS "OpenScarlett portability profile: Clang-CL (${CMAKE_CXX_COMPILER_VERSION}, MSVC frontend)")
+    # Allow Clang-CL (e.g., LLVM 20 bundled with VS) to build against newer MSVC STL headers (e.g., VS 18 / 14.52+).
+    add_compile_definitions(_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH)
+    add_compile_options(
+        $<$<COMPILE_LANGUAGE:CXX>:-Wno-unknown-pragmas>
+        $<$<COMPILE_LANGUAGE:CXX>:-Wno-language-extension-token>
+        $<$<COMPILE_LANGUAGE:CXX>:-Wno-microsoft-enum-value>
+        $<$<COMPILE_LANGUAGE:CXX>:-Wno-gnu-anonymous-struct>
+        $<$<COMPILE_LANGUAGE:CXX>:-Wno-nested-anon-types>
+        $<$<COMPILE_LANGUAGE:C>:-Wno-unknown-pragmas>
+    )
 elseif(OPENSCARLETT_IS_MINGW)
     message(STATUS "OpenScarlett portability profile: MinGW-w64 (${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION})")
 elseif(MSVC)
@@ -36,7 +46,9 @@ function(_openscarlett_apply_portability_to_target tgt)
 
     if(OPENSCARLETT_IS_CLANG_CL)
         # Clang-CL already inherits /W4 from existing if(MSVC) rules.
-        # Keep diagnostics strict while avoiding Windows SDK / MSVC-extension noise.
+        # Keep diagnostics strict while avoiding Windows SDK / MSVC-extension noise,
+        # and allow Clang-CL (e.g. LLVM 20) against newer MSVC STL headers (e.g. 14.52+).
+        target_compile_definitions(${tgt} PRIVATE _ALLOW_COMPILER_AND_STL_VERSION_MISMATCH)
         target_compile_options(${tgt} PRIVATE
             $<$<COMPILE_LANGUAGE:CXX>:-Wno-unknown-pragmas>
             $<$<COMPILE_LANGUAGE:CXX>:-Wno-language-extension-token>

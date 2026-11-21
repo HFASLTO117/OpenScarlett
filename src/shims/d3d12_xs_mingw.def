@@ -18,3 +18,18 @@ EXPORTS
     OpenScarlettD3D12ToggleBorderlessFullscreen
     OpenScarlettD3D12GetFrameLatencyWaitableObject
     OpenScarlettD3D12SetWindowCloseBehavior
+    OpenScarlettD3D12SetPresentConfig
+    OpenScarlettD3D12SetHdrMetaData
+    OpenScarlettD3D12GetHdrSwapChainState
+    OpenScarlettD3D12CopyLastPresentRawPixels
+    OpenScarlettD3D12LinearNitsToPqSt2084
+    OpenScarlettD3D12PqSt2084ToLinearNits
+    OpenScarlettD3D12ToneMapLinearRgbToSdrRgba8
+    OpenScarlettD3D12RegisterUnifiedTexture
+    OpenScarlettD3D12UnregisterUnifiedTexture
+    OpenScarlettD3D12NotifyVirtualRemap
+    OpenScarlettD3D12FlushDirtyUnifiedTextures
+    OpenScarlettD3D12GetUnifiedTextureStats
+    OpenScarlettD3D12GetTelemetryDetail
+    D3D12XboxCreateDmaCommandQueue
+    D3D12XboxEnableDccMetadata

@@ -15,7 +15,7 @@ Because Xbox Series X|S runs on an **AMD Zen 2 x86-64 CPU** and a **Windows-deri
 >
 > **How to help in 3 clicks:**
 > 1. **[⬇️ Download the latest `OpenScarlett-*-win64.zip`](https://github.com/californiaAlmonds/OpenScarlett/releases/latest)** and extract anywhere *(everything — including open-source `dxc.exe` — is bundled; zero coding or SDK required)*.
-> 2. **Double-click `run_hardware_test.bat`** — runs all GPU/OS tests live with clear progress and automatically strips usernames & local folder paths.
+> 2. **Run `run_hardware_test.ps1`** *(right-click → **Run with PowerShell**, or `powershell -ExecutionPolicy Bypass -File .\run_hardware_test.ps1`)* — runs all GPU/OS tests live with clear progress and automatically strips usernames & local folder paths.
 > 3. **Press `Enter`** when prompted — opens a **pre-filled GitHub Hardware Report** in your browser. Just review and click **Create**! *(Failures on new hardware are just as valuable as passes!)*
 >
 > | Most Wanted Hardware | Why It Helps OpenScarlett |

@@ -8,7 +8,7 @@ body:
       value: |
         Thank you for helping test **OpenScarlett** on real PC hardware!
 
-        **Fastest way to fill this out:** Download the latest `OpenScarlett-win64.zip` from [Releases](https://github.com/californiaAlmonds/OpenScarlett/releases/latest), unzip it, and double-click **`run_hardware_test.bat`** — it runs all tests automatically and opens this page pre-filled!
+        **Fastest way to fill this out:** Download the latest `OpenScarlett-win64.zip` from [Releases](https://github.com/californiaAlmonds/OpenScarlett/releases/latest), unzip it, and run **`run_hardware_test.ps1`** *(right-click → Run with PowerShell)* — it runs all tests automatically and opens this page pre-filled!
 
         > **Clean-Room Policy:** Please submit **only** OpenScarlett self-test reports or results from open-source GDK samples. Do not upload retail game binaries, keys, or encrypted `.xvc`/`.xvd` dumps.
 
@@ -24,7 +24,7 @@ body:
     id: gpu_summary
     attributes:
       label: GPU(s) & Driver Capabilities
-      placeholder: "e.g. NVIDIA RTX 4070 / AMD RX 7800 XT / Intel Arc B580 (auto-filled by run_hardware_test.bat)"
+      placeholder: "e.g. NVIDIA RTX 4070 / AMD RX 7800 XT / Intel Arc B580 (auto-filled by run_hardware_test.ps1)"
     validations:
       required: true
 
@@ -32,8 +32,8 @@ body:
     id: test_summary
     attributes:
       label: Test Summary
-      description: Auto-filled by `run_hardware_test.bat` (if filling manually, paste just the summary line or table from `hardware_test_report.md`).
-      placeholder: "13/13 passed (0 failed)"
+      description: Auto-filled by `run_hardware_test.ps1` (if filling manually, paste just the summary line or table from `hardware_test_report.md`).
+      placeholder: "29/29 passed (0 failed)"
     validations:
       required: true
 
@@ -41,7 +41,7 @@ body:
     id: full_report
     attributes:
       label: Probe & Test Output
-      description: Auto-filled by `run_hardware_test.bat`. If truncated or filling manually, paste the raw log / `hardware_test_report.md` here once (no need to paste into both boxes).
+      description: Auto-filled by `run_hardware_test.ps1`. If truncated or filling manually, paste the raw log / `hardware_test_report.md` here once (no need to paste into both boxes).
       render: text
     validations:
       required: false

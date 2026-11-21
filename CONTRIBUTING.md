@@ -15,7 +15,7 @@ OpenScarlett is currently developed and verified primarily on a single laptop (*
 
 ### How to Run & Submit in 60 Seconds
 1. Download the latest **`OpenScarlett-*-win64.zip`** from [GitHub Releases](https://github.com/californiaAlmonds/OpenScarlett/releases/latest) and extract it anywhere.
-2. Double-click **`run_hardware_test.bat`**.
+2. Right-click **`run_hardware_test.ps1`** → **Run with PowerShell** *(or run `powershell -ExecutionPolicy Bypass -File .\run_hardware_test.ps1`)*.
    - It shows live progress as it probes your GPU(s) and runs all automated tests (Vulkan compute, D3D12 COM proxies, Mesh Shaders, GPU FSR 1.0, `VirtualAlloc2` memory aliasing, RDNA2 shader lifting, DXR 1.1, and live Xbox GDK samples).
    - It saves a privacy-sanitized `hardware_test_report.md` (automatically stripping your Windows username and local folder paths) and copies it to your clipboard.
 3. Press **Enter** (`Y`) when prompted — it opens a **pre-filled GitHub Hardware Report issue** in your browser. Review and click **Create**!
