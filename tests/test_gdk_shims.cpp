@@ -945,7 +945,7 @@ void TestXsapi() {
 }  // namespace
 
 int main() {
-#if defined(_MSC_VER)
+#if defined(_WIN32)
     _putenv_s("OPENSCARLETT_AUDIO_NULL", "1");
 #else
     setenv("OPENSCARLETT_AUDIO_NULL", "1", 1);

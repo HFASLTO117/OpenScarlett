@@ -1,0 +1,43 @@
+LIBRARY kernelx.dll
+EXPORTS
+    VirtualAllocFromApp = KernelXVirtualAllocFromApp
+    VirtualProtectFromApp = KernelXVirtualProtectFromApp
+    CreateWaitableTimerExW = KernelXCreateWaitableTimerExW
+    QueryUnbiasedInterruptTime = KernelXQueryUnbiasedInterruptTime
+    TitleMemoryStatus
+    ToolingMemoryStatus
+    XMemAlloc
+    XMemAllocDefault
+    XMemFree
+    XMemFreeDefault
+    XMemSize
+    XMemSizeDefault
+    XMemGetAuxiliaryTitleMemory
+    XMemReleaseAuxiliaryTitleMemory
+    AllocateTitlePhysicalPages
+    FreeTitlePhysicalPages
+    MapTitleVirtualMemory
+    UnmapTitleVirtualMemory
+    MapTitlePhysicalPages
+    UnmapTitlePhysicalPages
+    XMemMapPhysicalPages
+    XMemUnmapPhysicalPages
+    QueryTitlePhysicalPages
+    KernelXVirtualAllocFromApp
+    KernelXVirtualProtectFromApp
+    KernelXVirtualFree
+    GetConsoleType
+    GetSystemOSVersion
+    XGetProcessorCount
+    SetThreadName
+    GetThreadName
+    KernelXCreateWaitableTimerExW
+    KernelXQueryUnbiasedInterruptTime
+    KernelXCreateTilePool
+    KernelXDestroyTilePool
+    KernelXReserveTiledResource
+    KernelXReleaseTiledResource
+    KernelXMapTileRange
+    KernelXResetTelemetry
+    KernelXGetTelemetryCallCount
+    KernelXWriteTelemetryJson

@@ -88,8 +88,8 @@ std::string WideToUtf8(const wchar_t* wide) {
 
 uint32_t ProbeHighestShaderModel(ID3D12Device* device) noexcept {
     static constexpr D3D_SHADER_MODEL kCandidates[] = {
-        D3D_SHADER_MODEL_6_7,
-        D3D_SHADER_MODEL_6_6,
+        static_cast<D3D_SHADER_MODEL>(0x67),  // D3D_SHADER_MODEL_6_7
+        static_cast<D3D_SHADER_MODEL>(0x66),  // D3D_SHADER_MODEL_6_6
         D3D_SHADER_MODEL_6_5,
         D3D_SHADER_MODEL_6_4,
         D3D_SHADER_MODEL_6_3,
@@ -110,7 +110,7 @@ uint32_t ProbeHighestShaderModel(ID3D12Device* device) noexcept {
 
 uint32_t ProbeMaxFeatureLevel(ID3D12Device* device) noexcept {
     static constexpr D3D_FEATURE_LEVEL kLevels[] = {
-        D3D_FEATURE_LEVEL_12_2,
+        static_cast<D3D_FEATURE_LEVEL>(0xc200),  // D3D_FEATURE_LEVEL_12_2
         D3D_FEATURE_LEVEL_12_1,
         D3D_FEATURE_LEVEL_12_0,
         D3D_FEATURE_LEVEL_11_1,
