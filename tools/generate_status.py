@@ -73,7 +73,7 @@ def collect_components() -> list[Component]:
             stage="Live-Binary Verified" if has_hook else "Unit-Tested",
             pct=100 if has_hook else 50,
             what_works=(
-                "`MicrosoftGame.Config` XML loader, CoW overlay VFS (`G:/GAME:/T:/S:`), PE forwarders/TLS/`.pdata` SEH, Kahn topological DLL init ordering, 19-DLL routing, `--backend=vulkan`, APC hook + unified telemetry"
+                "`MicrosoftGame.Config` XML loader, portable CoW overlay VFS (`G:/GAME:/T:/S:`), PE forwarders/TLS/`.pdata` SEH, Kahn topological DLL init, 19-DLL + versioned/thunk alias routing (`OPENSCARLETT_DLL_ROUTING`), `--backend=vulkan`, Store-bootstrap diagnostics + unified telemetry"
                 if (has_game_config and has_gdk_ext)
                 else "`MicrosoftGame.Config` XML loader, read-only CoW overlay VFS (`G:/GAME:/T:/S:`), PE export-forwarder/TLS/`.pdata` SEH (`RtlAddFunctionTable`), 19-DLL data-driven routing, APC hook + unified JSON telemetry"
             ),
@@ -153,7 +153,7 @@ def collect_components() -> list[Component]:
             stage="Live-Binary Verified" if has_gdk_runner else ("Unit-Tested" if has_xgr else "Planned"),
             pct=100 if has_xgr else 0,
             what_works=(
-                "19 console/GDK DLLs: `xgameruntime` (12-table `QueryApiImpl`, `XDisplay` HDR, `XLauncher`/`XGameUI`, `XGameInvite`, `XAccessibility`, `XSpeechSynthesizer`), `GameInput`, `XAudio2_9`/`X3DAudio`/`AcpHal`, `dstorage_xs`, `XSAPI`, `pixevt`, `xmem`, `xcrdapi`, `libHttpClient.GDK`, `XCurl`, `Bink2Scarlett`, FidelityFX, `XboxBvhBuilder`"
+                "19 console/GDK DLLs: `xgameruntime` (286 exports, 15-table + 3-arg real-thunk `QueryApiImpl`, `XUser`/`XStore`/`XGameUi`/`XNetworking`/`XPackage`/`XDisplay`/`XSpeechSynthesizer`), `GameInput`, `XAudio2_9`/`X3DAudio`/`AcpHal`, `dstorage_xs`, `XSAPI` (178 exports), `XCurl` (46 exports, 16/16 real thunk imports), `pixevt`, `xmem`, `xcrdapi`, `libHttpClient.GDK`, `Bink2Scarlett`, FidelityFX, `XboxBvhBuilder`"
                 if has_gdk_ext
                 else "16 console/GDK DLLs (`xgameruntime` 8-table `QueryApiImpl`, `GameInput`, `XAudio2_9`, `AcpHal`, hardened `dstorage_xs`, `XSAPI`, `pixevt`, `xmem`, `xcrdapi`, `libHttpClient.GDK`, `XCurl`, `Bink2Scarlett`, FidelityFX loader/upscaler, `XboxBvhBuilder`)"
             ),
@@ -302,7 +302,7 @@ def main() -> int:
         txt = readme.read_text(encoding="utf-8")
         pat = re.compile(r"<!-- OPENSCARLETT_STATUS_START -->.*?<!-- OPENSCARLETT_STATUS_END -->", re.DOTALL)
         if pat.search(txt):
-            txt = pat.sub(md, txt)
+            txt = pat.sub(lambda _: md, txt)
         else:
             txt = txt + "\n\n" + md + "\n"
         readme.write_text(txt, encoding="utf-8")
