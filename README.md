@@ -15,7 +15,7 @@ Because Xbox Series X|S runs on an **AMD Zen 2 x86-64 CPU** and a **Windows-deri
 
 ![OpenScarlett Status](docs/status.svg)
 
-**Overall Clean-Room Readiness:** `47.2%` · **Automated Tests:** `7/7` passing · **Host Verified:** `Windows 10 x64 + NVIDIA GTX 1650 Ti (D3D12 + Vulkan 1.4.329)`
+**Overall Clean-Room Readiness:** `58.3%` · **Automated Tests:** `8/8` passing · **Host Verified:** `Windows 10 x64 + NVIDIA GTX 1650 Ti (D3D12 + Vulkan 1.4.329)`
 
 | Subsystem | Area | Status | Progress | What Works Right Now | Verified On |
 | :--- | :--- | :--- | :---: | :--- | :--- |
@@ -24,7 +24,7 @@ Because Xbox Series X|S runs on an **AMD Zen 2 x86-64 CPU** and a **Windows-deri
 | **Production Codecs (GDeflate / BCPack / XMA2 / Bink2)** | `Media & IO` | 🟣 Unit-Tested | `80%` | Microsoft GDeflate v1 (`0x04/0xFB`), Xbox BCPack (BC1–BC7), XMA2 2048B IMDCT audio, Bink2 `KB2i` DCT video | Windows 10 x64 (`test_codecs`) |
 | **RDNA2 / GFX10.3 Shader Decoder & Lifter** | `Shaders` | 🟡 In Progress | `45%` | RDNA2/GFX10.3 binary decoder + CFG/SSA IR (constant folding + DCE); SPIR-V + DXC SM6.5/Mesh/Wave64 lifter next | Windows 10 x64 (`test_rdna2_core`) |
 | **WinRT Activation & HSTRING (`winrt_xs.dll`)** | `Runtime` | 🟣 Unit-Tested | `100%` | 20 exports: `RoInitialize`, activation factories, zero-alloc `HSTRING`, Xbox `AnalyticsInfo`/`ApplicationData` | Windows 10 x64 (`test_winrt_xs`) |
-| **Xbox Unified Memory, `GpuTilePool` & `kernelx.dll`** | `Memory` | ⚪ Planned | `0%` | Next sprint: Win10 `VirtualAlloc2`/`MapViewOfFile3` aliasing, 64 KiB `GpuTilePool`, `kernelx.dll` | Queued (Sprint 1) |
+| **Xbox Unified Memory, `GpuTilePool` & `kernelx.dll`** | `Memory` | 🟣 Unit-Tested | `100%` | OS section-backed 64 KiB / 4 MiB physical-virtual placeholder aliasing + `kernelx.dll` | Windows 10 x64 |
 | **`d3d12_xs` Guest COM Proxy & `xg_xs` Swizzle** | `Graphics` | ⚪ Planned | `0%` | Next sprint: modular `device_x`/`queue_x`/`cmdlist_x` COM proxies with live slot telemetry + `xg_xs` | Queued (Sprint 1) |
 | **GDK Runtime (`xgameruntime`, `GameInput`, `XAudio2`, `dstorage_xs`, `XSAPI`)** | `GDK Shims` | ⚪ Planned | `0%` | Next sprint: clean-room GDK DLL shims verified against live Microsoft `Xbox-GDK-Samples` | Queued (Sprint 1) |
 | **Hardware DXR Tier 1.1 Pipeline** | `Graphics` | ⚪ Planned | `0%` | Queued (Sprint 2): ID3D12Device5 DXR 1.1 + software BVH fallback for GTX 1650 Ti / WARP | Queued (Sprint 2) |
