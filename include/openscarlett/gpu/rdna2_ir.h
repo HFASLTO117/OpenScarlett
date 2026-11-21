@@ -28,8 +28,32 @@ enum class IrOp : uint16_t {
     ThreadIdX,
     StageInput,     // Vertex/Pixel input lane (e.g. PS interpolated PARAM0 channel 0..3)
     LoadRootConst,  // Read 32-bit scalar constant from b0[imm_u32]
-    LoadUav,        // Load 32-bit word from u0 at byte offset operands[0]
-    StoreUav,       // Store operands[1] to u0 at byte offset operands[0]
+    LoadUav,        // Load 32-bit word from uav[imm_u32] at byte offset operands[0]
+    StoreUav,       // Store operands[1] to uav[imm_u32] at byte offset operands[0]
+
+    // Texture / Image ops (MIMG)
+    ImageSample,    // operands: [u_f32, v_f32, lod_f32], imm_u32 = channel (0..3) -> f32
+    ImageLoad,      // operands: [x_u32, y_u32], imm_u32 = channel (0..3) -> f32
+    ImageStore,     // operands: [x_u32, y_u32, r_f32, g_f32, b_f32, a_f32] -> void
+
+    // Workgroup shared memory / LDS ops (DS)
+    LdsLoad,        // operands: [byte_addr_u32] -> u32
+    LdsStore,       // operands: [byte_addr_u32, val_u32] -> void
+    LdsAtomicAdd,   // operands: [byte_addr_u32, val_u32] -> prev_u32
+
+    // Wave / Subgroup ops (wave32 native or wave64-on-wave32 emulation)
+    WaveLaneId,             // [] -> lane_id u32 (0..wave_size-1)
+    WaveReadFirstLane,      // [val] -> u32
+    WaveReadLaneAt,         // [val, lane_idx_u32] -> u32
+    WaveBallotLo,           // [pred_bool] -> u32 (lanes 0..31)
+    WaveBallotHi,           // [pred_bool] -> u32 (lanes 32..63)
+    WaveActiveCountBits64,  // [ballot_lo_u32, ballot_hi_u32] -> u32
+    WavePrefixCount64,      // [mask_u32, init_u32], imm_u32=0 (lo32) / 1 (hi32) / 2 (combined [lo, hi]) -> u32
+
+    // Mesh & Amplification Shader ops (SM 6.5)
+    SetMeshOutputCounts,    // [vert_count_u32, prim_count_u32] -> void
+    ExportMeshPrim,         // [i0_u32, i1_u32, i2_u32] (imm_u32=0) or [packed_u32] (imm_u32=1) -> void
+    DispatchMeshGroups,     // [gx_u32, gy_u32, gz_u32] -> void
 
     // Floating-point arithmetic
     FAdd,
@@ -125,14 +149,28 @@ struct Rdna2IrModule {
     uint32_t threadgroup_z = 1;
     uint32_t sgpr_count = 16;
     uint32_t vgpr_count = 16;
+    uint32_t wave_size = 32;
 
     uint32_t next_value_id = 1;
     uint32_t max_root_const_index = 0;
     bool uses_root_constants = false;
     bool uses_uav = false;
+    bool uses_uav0 = false;
+    bool uses_uav1 = false;
+    bool uses_lds = false;
+    uint32_t lds_size_dwords = 1024;
+    bool uses_texture_srv = false;
+    bool uses_texture_sample = false;
+    bool uses_texture_load = false;
+    bool uses_texture_uav = false;
+    bool uses_wave64_emulation = false;
     bool exports_pos0 = false;
     bool exports_mrt0 = false;
     bool exports_param0 = false;
+    bool exports_prim = false;
+    bool mesh_has_payload = true;
+    uint32_t mesh_max_vertices = 64;
+    uint32_t mesh_max_primitives = 64;
 
     std::vector<IrBasicBlock> blocks;
     Rdna2IrOptStats opt_stats{};

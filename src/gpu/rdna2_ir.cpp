@@ -79,6 +79,22 @@ const char* IrOpName(IrOp op) noexcept {
         case IrOp::LoadRootConst: return "load_root_const";
         case IrOp::LoadUav:       return "load_uav";
         case IrOp::StoreUav:      return "store_uav";
+        case IrOp::ImageSample:   return "image_sample";
+        case IrOp::ImageLoad:     return "image_load";
+        case IrOp::ImageStore:    return "image_store";
+        case IrOp::LdsLoad:       return "lds_load";
+        case IrOp::LdsStore:      return "lds_store";
+        case IrOp::LdsAtomicAdd:  return "lds_atomic_add";
+        case IrOp::WaveLaneId:            return "wave_lane_id";
+        case IrOp::WaveReadFirstLane:     return "wave_read_first_lane";
+        case IrOp::WaveReadLaneAt:        return "wave_read_lane_at";
+        case IrOp::WaveBallotLo:          return "wave_ballot_lo";
+        case IrOp::WaveBallotHi:          return "wave_ballot_hi";
+        case IrOp::WaveActiveCountBits64: return "wave_active_count_bits64";
+        case IrOp::WavePrefixCount64:     return "wave_prefix_count64";
+        case IrOp::SetMeshOutputCounts:   return "set_mesh_output_counts";
+        case IrOp::ExportMeshPrim:        return "export_mesh_prim";
+        case IrOp::DispatchMeshGroups:    return "dispatch_mesh_groups";
         case IrOp::FAdd:          return "fadd";
         case IrOp::FSub:          return "fsub";
         case IrOp::FMul:          return "fmul";
@@ -140,6 +156,12 @@ const char* IrTypeName(IrType type) noexcept {
 bool IrOpHasSideEffects(IrOp op) noexcept {
     switch (op) {
         case IrOp::StoreUav:
+        case IrOp::ImageStore:
+        case IrOp::LdsStore:
+        case IrOp::LdsAtomicAdd:
+        case IrOp::SetMeshOutputCounts:
+        case IrOp::ExportMeshPrim:
+        case IrOp::DispatchMeshGroups:
         case IrOp::Barrier:
         case IrOp::Branch:
         case IrOp::CondBranch:
@@ -162,6 +184,8 @@ Status BuildRdna2Ir(
     out_module.threadgroup_z = container.threadgroup_z;
     out_module.sgpr_count = container.sgpr_count;
     out_module.vgpr_count = container.vgpr_count;
+    out_module.wave_size = (container.wave_size == 64u) ? 64u : 32u;
+    out_module.uses_wave64_emulation = (out_module.wave_size == 64u);
 
     if (instructions.empty()) {
         return Status::Error(StatusCode::ParseError, "Cannot build IR from empty instruction stream");
@@ -396,7 +420,9 @@ Status BuildRdna2Ir(
                 state.vgpr[idx] = get_ps_input(idx);
                 return state.vgpr[idx];
             }
-            if ((out_module.stage == ShaderStage::Compute || out_module.stage == ShaderStage::Vertex) && idx == 0u) {
+            if ((out_module.stage == ShaderStage::Compute || out_module.stage == ShaderStage::Vertex ||
+                 out_module.stage == ShaderStage::Mesh || out_module.stage == ShaderStage::Amplification) &&
+                idx == 0u) {
                 state.vgpr[idx] = get_tid_x();
                 return state.vgpr[idx];
             }
@@ -410,6 +436,18 @@ Status BuildRdna2Ir(
                 return state.sgpr[idx];
             }
             return get_zero_u32();
+        };
+
+        // Per-block cache for 64-lane ballot masks derived from a predicate value.
+        std::unordered_map<IrValueId, std::pair<IrValueId, IrValueId>> ballot_cache;
+        auto get_ballot_pair = [&](IrValueId pred_bool) -> std::pair<IrValueId, IrValueId> {
+            auto it = ballot_cache.find(pred_bool);
+            if (it != ballot_cache.end()) return it->second;
+            out_module.uses_wave64_emulation = true;
+            IrValueId lo = emit_in_bb(IrOp::WaveBallotLo, IrType::U32, {pred_bool});
+            IrValueId hi = emit_in_bb(IrOp::WaveBallotHi, IrType::U32, {pred_bool});
+            ballot_cache[pred_bool] = {lo, hi};
+            return {lo, hi};
         };
 
         auto eval_operand = [&](const Rdna2Operand& op, bool expect_float) -> IrValueId {
@@ -439,7 +477,12 @@ Status BuildRdna2Ir(
                     }
                     break;
                 case Rdna2OperandKind::VccLo:
+                case Rdna2OperandKind::VccHi:
                     val = (state.vcc != kInvalidIrValue) ? state.vcc : get_zero_u32();
+                    break;
+                case Rdna2OperandKind::ExecLo:
+                case Rdna2OperandKind::ExecHi:
+                    val = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, 0xFFFFFFFFu, 0.0f);
                     break;
                 case Rdna2OperandKind::Scc:
                     val = (state.scc != kInvalidIrValue) ? state.scc : get_zero_u32();
@@ -562,6 +605,29 @@ Status BuildRdna2Ir(
                 case Rdna2Opcode::S_NOT_B32:
                     write_dst(inst.dst, emit_in_bb(IrOp::BitNot, IrType::U32, {eval_operand(inst.src[0], false)}));
                     break;
+                case Rdna2Opcode::S_BCNT1_I32_B64: {
+                    out_module.uses_wave64_emulation = true;
+                    IrValueId lo = kInvalidIrValue;
+                    IrValueId hi = kInvalidIrValue;
+                    if (inst.src[0].kind == Rdna2OperandKind::VccLo || inst.src[0].kind == Rdna2OperandKind::VccHi) {
+                        auto pair = get_ballot_pair(ensure_bool(state.vcc));
+                        lo = pair.first;
+                        hi = pair.second;
+                    } else if (inst.src[0].kind == Rdna2OperandKind::ExecLo || inst.src[0].kind == Rdna2OperandKind::ExecHi) {
+                        lo = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, 0xFFFFFFFFu, 0.0f);
+                        hi = emit_in_bb(IrOp::ConstU32, IrType::U32, {},
+                                        (out_module.wave_size == 64u) ? 0xFFFFFFFFu : 0u, 0.0f);
+                    } else if (inst.src[0].kind == Rdna2OperandKind::Sgpr) {
+                        const uint8_t idx = static_cast<uint8_t>(inst.src[0].reg_index);
+                        lo = read_sgpr(idx);
+                        hi = (idx + 1u < 106u) ? read_sgpr(static_cast<uint8_t>(idx + 1u)) : get_zero_u32();
+                    } else {
+                        lo = eval_operand(inst.src[0], false);
+                        hi = get_zero_u32();
+                    }
+                    write_dst(inst.dst, emit_in_bb(IrOp::WaveActiveCountBits64, IrType::U32, {lo, hi}));
+                    break;
+                }
                 case Rdna2Opcode::S_GETPC_B64: {
                     IrValueId pc_lo = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, (inst.word_offset + 1u) * 4u, 0.0f);
                     write_dst(inst.dst, pc_lo);
@@ -637,6 +703,32 @@ Status BuildRdna2Ir(
                 case Rdna2Opcode::S_BARRIER:
                     emit_in_bb(IrOp::Barrier, IrType::Void);
                     break;
+                case Rdna2Opcode::S_SENDMSG: {
+                    const uint16_t msg_id = static_cast<uint16_t>(static_cast<uint16_t>(inst.simm16) & 0xFu);
+                    if (out_module.stage == ShaderStage::Mesh || msg_id == kRdna2SendMsgGsAllocReq) {
+                        const uint32_t imm_v = (static_cast<uint32_t>(static_cast<uint16_t>(inst.simm16)) >> 4) & 0x3Fu;
+                        const uint32_t imm_p = (static_cast<uint32_t>(static_cast<uint16_t>(inst.simm16)) >> 10) & 0x3Fu;
+                        IrValueId vcnt = (state.sgpr[0] != kInvalidIrValue)
+                                             ? state.sgpr[0]
+                                             : emit_in_bb(IrOp::ConstU32, IrType::U32, {}, imm_v ? imm_v : 3u, 0.0f);
+                        IrValueId pcnt = (state.sgpr[1] != kInvalidIrValue)
+                                             ? state.sgpr[1]
+                                             : emit_in_bb(IrOp::ConstU32, IrType::U32, {}, imm_p ? imm_p : 1u, 0.0f);
+                        emit_in_bb(IrOp::SetMeshOutputCounts, IrType::Void, {vcnt, pcnt});
+                    } else if (out_module.stage == ShaderStage::Amplification || msg_id == kRdna2SendMsgDispatchMesh) {
+                        IrValueId gx = (state.sgpr[0] != kInvalidIrValue)
+                                           ? state.sgpr[0]
+                                           : emit_in_bb(IrOp::ConstU32, IrType::U32, {}, 1u, 0.0f);
+                        IrValueId gy = (state.sgpr[1] != kInvalidIrValue)
+                                           ? state.sgpr[1]
+                                           : emit_in_bb(IrOp::ConstU32, IrType::U32, {}, 1u, 0.0f);
+                        IrValueId gz = (state.sgpr[2] != kInvalidIrValue)
+                                           ? state.sgpr[2]
+                                           : emit_in_bb(IrOp::ConstU32, IrType::U32, {}, 1u, 0.0f);
+                        emit_in_bb(IrOp::DispatchMeshGroups, IrType::Void, {gx, gy, gz});
+                    }
+                    break;
+                }
                 case Rdna2Opcode::S_ENDPGM:
                     emit_in_bb(IrOp::Return, IrType::Void);
                     terminated = true;
@@ -789,6 +881,13 @@ Status BuildRdna2Ir(
                     write_dst(inst.dst, eval_operand(inst.src[0], is_flt));
                     break;
                 }
+                case Rdna2Opcode::V_READFIRSTLANE_B32: {
+                    out_module.uses_wave64_emulation = true;
+                    IrValueId val = eval_operand(inst.src[0], false);
+                    const IrType t = (get_type(val) == IrType::F32) ? IrType::F32 : IrType::U32;
+                    write_dst(inst.dst, emit_in_bb(IrOp::WaveReadFirstLane, t, {val}));
+                    break;
+                }
                 case Rdna2Opcode::V_CVT_F32_I32:
                     write_dst(inst.dst, emit_in_bb(IrOp::I2F, IrType::F32, {eval_operand(inst.src[0], false)}));
                     break;
@@ -872,6 +971,48 @@ Status BuildRdna2Ir(
                     write_dst(inst.dst, apply_clamp(r, inst.clamp));
                     break;
                 }
+                case Rdna2Opcode::V_MUL_LO_U32:
+                    write_dst(inst.dst, emit_in_bb(IrOp::IMul, IrType::U32, {
+                        eval_operand(inst.src[0], false),
+                        eval_operand(inst.src[1], false),
+                    }));
+                    break;
+                case Rdna2Opcode::V_MBCNT_LO_U32_B32: {
+                    out_module.uses_wave64_emulation = true;
+                    IrValueId mask = kInvalidIrValue;
+                    if (inst.src[0].kind == Rdna2OperandKind::VccLo) {
+                        mask = get_ballot_pair(ensure_bool(state.vcc)).first;
+                    } else if (inst.src[0].kind == Rdna2OperandKind::ExecLo) {
+                        mask = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, 0xFFFFFFFFu, 0.0f);
+                    } else {
+                        mask = eval_operand(inst.src[0], false);
+                    }
+                    IrValueId init = eval_operand(inst.src[1], false);
+                    write_dst(inst.dst, emit_in_bb(IrOp::WavePrefixCount64, IrType::U32, {mask, init}, 0u));
+                    break;
+                }
+                case Rdna2Opcode::V_MBCNT_HI_U32_B32: {
+                    out_module.uses_wave64_emulation = true;
+                    IrValueId mask = kInvalidIrValue;
+                    if (inst.src[0].kind == Rdna2OperandKind::VccHi || inst.src[0].kind == Rdna2OperandKind::VccLo) {
+                        mask = get_ballot_pair(ensure_bool(state.vcc)).second;
+                    } else if (inst.src[0].kind == Rdna2OperandKind::ExecHi || inst.src[0].kind == Rdna2OperandKind::ExecLo) {
+                        mask = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, 0xFFFFFFFFu, 0.0f);
+                    } else {
+                        mask = eval_operand(inst.src[0], false);
+                    }
+                    IrValueId init = eval_operand(inst.src[1], false);
+                    write_dst(inst.dst, emit_in_bb(IrOp::WavePrefixCount64, IrType::U32, {mask, init}, 1u));
+                    break;
+                }
+                case Rdna2Opcode::V_READLANE_B32: {
+                    out_module.uses_wave64_emulation = true;
+                    IrValueId val = eval_operand(inst.src[0], false);
+                    IrValueId lane = eval_operand(inst.src[1], false);
+                    const IrType t = (get_type(val) == IrType::F32) ? IrType::F32 : IrType::U32;
+                    write_dst(inst.dst, emit_in_bb(IrOp::WaveReadLaneAt, t, {val, lane}));
+                    break;
+                }
                 case Rdna2Opcode::V_ADD3_U32: {
                     IrValueId ab = emit_in_bb(IrOp::IAdd, IrType::U32, {eval_operand(inst.src[0], false), eval_operand(inst.src[1], false)});
                     write_dst(inst.dst, emit_in_bb(IrOp::IAdd, IrType::U32, {ab, eval_operand(inst.src[2], false)}));
@@ -896,11 +1037,12 @@ Status BuildRdna2Ir(
                         write_dst(inst.dst, get_root_const(slot));
                     } else {
                         out_module.uses_uav = true;
+                        out_module.uses_uav0 = true;
                         IrValueId off = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, byte_off, 0.0f);
                         if (inst.soffset < 106u) {
                             off = emit_in_bb(IrOp::IAdd, IrType::U32, {off, read_sgpr(inst.soffset)});
                         }
-                        write_dst(inst.dst, emit_in_bb(IrOp::LoadUav, IrType::U32, {off}));
+                        write_dst(inst.dst, emit_in_bb(IrOp::LoadUav, IrType::U32, {off}, 0u));
                     }
                     break;
                 }
@@ -908,7 +1050,13 @@ Status BuildRdna2Ir(
                 // ----- MUBUF -----
                 case Rdna2Opcode::BUFFER_LOAD_DWORD:
                 case Rdna2Opcode::BUFFER_STORE_DWORD: {
+                    const uint32_t uav_slot = (inst.srsrc == 0u) ? 0u : 1u;
                     out_module.uses_uav = true;
+                    if (uav_slot == 0u) {
+                        out_module.uses_uav0 = true;
+                    } else {
+                        out_module.uses_uav1 = true;
+                    }
                     IrValueId addr = kInvalidIrValue;
                     if (inst.offen) {
                         addr = eval_operand(inst.src[1], false);
@@ -929,11 +1077,141 @@ Status BuildRdna2Ir(
                         addr = emit_in_bb(IrOp::IAdd, IrType::U32, {addr, soff_v});
                     }
                     if (inst.opcode == Rdna2Opcode::BUFFER_LOAD_DWORD) {
-                        write_dst(inst.dst, emit_in_bb(IrOp::LoadUav, IrType::U32, {addr}));
+                        write_dst(inst.dst, emit_in_bb(IrOp::LoadUav, IrType::U32, {addr}, uav_slot));
                     } else {
                         IrValueId data = eval_operand(inst.src[0], false);
-                        emit_in_bb(IrOp::StoreUav, IrType::Void, {addr, data});
+                        emit_in_bb(IrOp::StoreUav, IrType::Void, {addr, data}, uav_slot);
                     }
+                    break;
+                }
+
+                // ----- MIMG -----
+                case Rdna2Opcode::IMAGE_LOAD: {
+                    out_module.uses_texture_srv = true;
+                    out_module.uses_texture_load = true;
+                    const uint8_t vaddr_base = static_cast<uint8_t>(inst.src[0].reg_index);
+                    const uint8_t vdata_base = static_cast<uint8_t>(inst.dst.reg_index);
+                    IrValueId x = read_vgpr(vaddr_base, false);
+                    IrValueId y = read_vgpr(static_cast<uint8_t>(vaddr_base + 1u), false);
+                    const uint8_t dmask = inst.mimg_dmask ? inst.mimg_dmask : 0xFu;
+                    uint8_t out_reg = vdata_base;
+                    for (uint32_t ch = 0; ch < 4u; ++ch) {
+                        if ((dmask & (1u << ch)) != 0u) {
+                            state.vgpr[out_reg++] = emit_in_bb(IrOp::ImageLoad, IrType::F32, {x, y}, ch);
+                        }
+                    }
+                    break;
+                }
+                case Rdna2Opcode::IMAGE_SAMPLE:
+                case Rdna2Opcode::IMAGE_SAMPLE_LZ: {
+                    out_module.uses_texture_srv = true;
+                    out_module.uses_texture_sample = true;
+                    const uint8_t vaddr_base = static_cast<uint8_t>(inst.src[0].reg_index);
+                    const uint8_t vdata_base = static_cast<uint8_t>(inst.dst.reg_index);
+                    IrValueId u = read_vgpr(vaddr_base, true);
+                    IrValueId v = read_vgpr(static_cast<uint8_t>(vaddr_base + 1u), true);
+                    IrValueId lod = get_zero_f32();
+                    if (inst.opcode == Rdna2Opcode::IMAGE_SAMPLE &&
+                        vaddr_base + 2u < 256u && state.vgpr[vaddr_base + 2u] != kInvalidIrValue) {
+                        lod = state.vgpr[vaddr_base + 2u];
+                    }
+                    const uint8_t dmask = inst.mimg_dmask ? inst.mimg_dmask : 0xFu;
+                    uint8_t out_reg = vdata_base;
+                    for (uint32_t ch = 0; ch < 4u; ++ch) {
+                        if ((dmask & (1u << ch)) != 0u) {
+                            state.vgpr[out_reg++] = emit_in_bb(IrOp::ImageSample, IrType::F32, {u, v, lod}, ch);
+                        }
+                    }
+                    break;
+                }
+                case Rdna2Opcode::IMAGE_STORE: {
+                    out_module.uses_texture_uav = true;
+                    const uint8_t vdata_base = static_cast<uint8_t>(inst.src[0].reg_index);
+                    const uint8_t vaddr_base = static_cast<uint8_t>(inst.src[1].reg_index);
+                    IrValueId x = read_vgpr(vaddr_base, false);
+                    IrValueId y = read_vgpr(static_cast<uint8_t>(vaddr_base + 1u), false);
+                    const uint8_t dmask = inst.mimg_dmask ? inst.mimg_dmask : 0xFu;
+                    IrValueId rgba[4]{};
+                    uint8_t in_reg = vdata_base;
+                    for (uint32_t ch = 0; ch < 4u; ++ch) {
+                        if ((dmask & (1u << ch)) != 0u) {
+                            rgba[ch] = read_vgpr(in_reg++, true);
+                        } else if (ch == 3u) {
+                            rgba[ch] = emit_in_bb(IrOp::ConstF32, IrType::F32, {}, FloatToBits(1.0f), 1.0f);
+                        } else {
+                            rgba[ch] = get_zero_f32();
+                        }
+                    }
+                    emit_in_bb(IrOp::ImageStore, IrType::Void, {x, y, rgba[0], rgba[1], rgba[2], rgba[3]});
+                    break;
+                }
+
+                // ----- DS (LDS Shared Memory & Swizzle) -----
+                case Rdna2Opcode::DS_WRITE_B32: {
+                    out_module.uses_lds = true;
+                    IrValueId addr = eval_operand(inst.src[0], false);
+                    if (inst.mem_offset != 0) {
+                        IrValueId off = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, static_cast<uint32_t>(inst.mem_offset), 0.0f);
+                        addr = emit_in_bb(IrOp::IAdd, IrType::U32, {addr, off});
+                    }
+                    IrValueId data = eval_operand(inst.src[1], false);
+                    emit_in_bb(IrOp::LdsStore, IrType::Void, {addr, data});
+                    break;
+                }
+                case Rdna2Opcode::DS_READ_B32: {
+                    out_module.uses_lds = true;
+                    IrValueId addr = eval_operand(inst.src[0], false);
+                    if (inst.mem_offset != 0) {
+                        IrValueId off = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, static_cast<uint32_t>(inst.mem_offset), 0.0f);
+                        addr = emit_in_bb(IrOp::IAdd, IrType::U32, {addr, off});
+                    }
+                    write_dst(inst.dst, emit_in_bb(IrOp::LdsLoad, IrType::U32, {addr}));
+                    break;
+                }
+                case Rdna2Opcode::DS_ADD_U32:
+                case Rdna2Opcode::DS_ADD_RTN_U32: {
+                    out_module.uses_lds = true;
+                    IrValueId addr = eval_operand(inst.src[0], false);
+                    if (inst.mem_offset != 0) {
+                        IrValueId off = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, static_cast<uint32_t>(inst.mem_offset), 0.0f);
+                        addr = emit_in_bb(IrOp::IAdd, IrType::U32, {addr, off});
+                    }
+                    IrValueId data = eval_operand(inst.src[1], false);
+                    IrValueId prev = emit_in_bb(IrOp::LdsAtomicAdd, IrType::U32, {addr, data});
+                    if (inst.opcode == Rdna2Opcode::DS_ADD_RTN_U32) {
+                        write_dst(inst.dst, prev);
+                    }
+                    break;
+                }
+                case Rdna2Opcode::DS_SWIZZLE_B32: {
+                    out_module.uses_wave64_emulation = true;
+                    IrValueId val = eval_operand(inst.src[0], false);
+                    IrValueId lane = emit_in_bb(IrOp::WaveLaneId, IrType::U32);
+                    const uint32_t swiz = static_cast<uint32_t>(inst.mem_offset) & 0xFFFFu;
+                    IrValueId target_lane = lane;
+                    if ((swiz & 0x8000u) != 0u) {
+                        const uint32_t and_m = (swiz & 0x1Fu) | 0x20u;
+                        const uint32_t or_m = (swiz >> 5) & 0x1Fu;
+                        const uint32_t xor_m = (swiz >> 10) & 0x1Fu;
+                        IrValueId c_and = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, and_m, 0.0f);
+                        IrValueId c_or = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, or_m, 0.0f);
+                        IrValueId c_xor = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, xor_m, 0.0f);
+                        IrValueId t1 = emit_in_bb(IrOp::BitAnd, IrType::U32, {lane, c_and});
+                        IrValueId t2 = emit_in_bb(IrOp::BitOr, IrType::U32, {t1, c_or});
+                        target_lane = emit_in_bb(IrOp::BitXor, IrType::U32, {t2, c_xor});
+                    } else {
+                        IrValueId c_3 = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, 3u, 0.0f);
+                        IrValueId c_inv3 = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, ~3u, 0.0f);
+                        IrValueId c_1 = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, 1u, 0.0f);
+                        IrValueId c_swiz = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, swiz, 0.0f);
+                        IrValueId quad_base = emit_in_bb(IrOp::BitAnd, IrType::U32, {lane, c_inv3});
+                        IrValueId q_lane = emit_in_bb(IrOp::BitAnd, IrType::U32, {lane, c_3});
+                        IrValueId shift = emit_in_bb(IrOp::Shl, IrType::U32, {q_lane, c_1});
+                        IrValueId shifted = emit_in_bb(IrOp::Shr, IrType::U32, {c_swiz, shift});
+                        IrValueId sel = emit_in_bb(IrOp::BitAnd, IrType::U32, {shifted, c_3});
+                        target_lane = emit_in_bb(IrOp::BitOr, IrType::U32, {quad_base, sel});
+                    }
+                    write_dst(inst.dst, emit_in_bb(IrOp::WaveReadLaneAt, IrType::U32, {val, target_lane}));
                     break;
                 }
 
@@ -941,29 +1219,44 @@ Status BuildRdna2Ir(
                 case Rdna2Opcode::GLOBAL_LOAD_DWORD:
                 case Rdna2Opcode::FLAT_LOAD_DWORD: {
                     out_module.uses_uav = true;
+                    out_module.uses_uav0 = true;
                     IrValueId addr = eval_operand(inst.src[0], false);
                     if (inst.mem_offset != 0) {
                         IrValueId off = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, static_cast<uint32_t>(inst.mem_offset), 0.0f);
                         addr = emit_in_bb(IrOp::IAdd, IrType::U32, {addr, off});
                     }
-                    write_dst(inst.dst, emit_in_bb(IrOp::LoadUav, IrType::U32, {addr}));
+                    write_dst(inst.dst, emit_in_bb(IrOp::LoadUav, IrType::U32, {addr}, 0u));
                     break;
                 }
                 case Rdna2Opcode::GLOBAL_STORE_DWORD:
                 case Rdna2Opcode::FLAT_STORE_DWORD: {
                     out_module.uses_uav = true;
+                    out_module.uses_uav0 = true;
                     IrValueId addr = eval_operand(inst.src[0], false);
                     if (inst.mem_offset != 0) {
                         IrValueId off = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, static_cast<uint32_t>(inst.mem_offset), 0.0f);
                         addr = emit_in_bb(IrOp::IAdd, IrType::U32, {addr, off});
                     }
                     IrValueId data = eval_operand(inst.src[1], false);
-                    emit_in_bb(IrOp::StoreUav, IrType::Void, {addr, data});
+                    emit_in_bb(IrOp::StoreUav, IrType::Void, {addr, data}, 0u);
                     break;
                 }
 
                 // ----- EXP -----
                 case Rdna2Opcode::EXP: {
+                    if (inst.exp_target == static_cast<uint8_t>(Rdna2ExportTarget::Prim)) {
+                        out_module.exports_prim = true;
+                        if (inst.exp_en == 0x1u) {
+                            IrValueId packed = eval_operand(inst.src[0], false);
+                            emit_in_bb(IrOp::ExportMeshPrim, IrType::Void, {packed}, 1u);
+                        } else {
+                            IrValueId i0 = eval_operand(inst.src[0], false);
+                            IrValueId i1 = eval_operand(inst.src[1], false);
+                            IrValueId i2 = eval_operand(inst.src[2], false);
+                            emit_in_bb(IrOp::ExportMeshPrim, IrType::Void, {i0, i1, i2}, 0u);
+                        }
+                        break;
+                    }
                     std::vector<IrValueId> ch(4);
                     for (uint8_t c = 0; c < 4; ++c) {
                         if ((inst.exp_en & (1u << c)) != 0u) {
@@ -1094,7 +1387,12 @@ Status OptimizeRdna2Ir(Rdna2IrModule& module, Rdna2IrOptStats* out_stats) {
                 if (inst.id == kInvalidIrValue || IrOpHasSideEffects(inst.op)) continue;
                 if (inst.op == IrOp::ConstU32 || inst.op == IrOp::ConstF32 ||
                     inst.op == IrOp::ThreadIdX || inst.op == IrOp::StageInput ||
-                    inst.op == IrOp::LoadRootConst || inst.op == IrOp::LoadUav) {
+                    inst.op == IrOp::LoadRootConst || inst.op == IrOp::LoadUav ||
+                    inst.op == IrOp::ImageSample || inst.op == IrOp::ImageLoad ||
+                    inst.op == IrOp::LdsLoad || inst.op == IrOp::WaveLaneId ||
+                    inst.op == IrOp::WaveReadFirstLane || inst.op == IrOp::WaveReadLaneAt ||
+                    inst.op == IrOp::WaveBallotLo || inst.op == IrOp::WaveBallotHi ||
+                    inst.op == IrOp::WaveActiveCountBits64 || inst.op == IrOp::WavePrefixCount64) {
                     continue;
                 }
 
@@ -1295,6 +1593,9 @@ Status OptimizeRdna2Ir(Rdna2IrModule& module, Rdna2IrOptStats* out_stats) {
     for (const auto& bb : module.blocks) {
         for (const auto& inst : bb.instructions) {
             if (IrOpHasSideEffects(inst.op)) {
+                if (inst.id != kInvalidIrValue) {
+                    live.insert(inst.id);
+                }
                 for (IrValueId op_id : inst.operands) {
                     mark_use(op_id);
                 }

@@ -13,7 +13,14 @@ namespace openscarlett {
 // Clean-room Scarlett RDNA2 / GFX10.3 ('XS2\0') Shader Container
 // ---------------------------------------------------------------------------
 constexpr uint32_t kXs2ContainerVersion = 1u;
+constexpr uint32_t kXs2ContainerVersionV2 = 2u;
 constexpr uint32_t kXs2HeaderSizeBytes = 40u;
+constexpr uint32_t kXs2HeaderSizeBytesV2 = 44u;
+constexpr uint32_t kXs2SgprFlagWave64 = 0x80000000u;
+
+// Public RDNA2 / GFX10.3 S_SENDMSG message IDs
+constexpr uint16_t kRdna2SendMsgGsAllocReq = 9u;
+constexpr uint16_t kRdna2SendMsgDispatchMesh = 10u;
 
 struct Xs2ShaderContainer {
     uint32_t version = kXs2ContainerVersion;
@@ -24,6 +31,7 @@ struct Xs2ShaderContainer {
     uint32_t threadgroup_y = 1;
     uint32_t threadgroup_z = 1;
     uint32_t entry_offset = kXs2HeaderSizeBytes;
+    uint32_t wave_size = 32;  // 32 (native RDNA2 wave32) or 64 (wave64)
     std::vector<uint32_t> code_words;
 };
 
@@ -46,6 +54,8 @@ enum class Rdna2Encoding : uint8_t {
     VOP3,
     SMEM,
     MUBUF,
+    MIMG,
+    DS,
     FLAT,
     EXP,
 };
@@ -74,6 +84,7 @@ enum class Rdna2Opcode : uint16_t {
     // SOP1
     S_MOV_B32,
     S_NOT_B32,
+    S_BCNT1_I32_B64,
     S_GETPC_B64,
 
     // SOPC
@@ -107,6 +118,7 @@ enum class Rdna2Opcode : uint16_t {
     S_CBRANCH_EXECNZ,
     S_WAITCNT,
     S_BARRIER,
+    S_SENDMSG,
 
     // VOP2
     V_CNDMASK_B32,
@@ -133,6 +145,7 @@ enum class Rdna2Opcode : uint16_t {
     // VOP1
     V_NOP,
     V_MOV_B32,
+    V_READFIRSTLANE_B32,
     V_CVT_F32_I32,
     V_CVT_I32_F32,
     V_CVT_F32_U32,
@@ -159,9 +172,13 @@ enum class Rdna2Opcode : uint16_t {
     V_CMP_GT_U32,
     V_CMP_GE_U32,
 
-    // VOP3 (native 3-operand)
+    // VOP3 (native 3-operand / wave ops)
     V_FMA_F32,
     V_MAD_F32,
+    V_MUL_LO_U32,
+    V_MBCNT_LO_U32_B32,
+    V_MBCNT_HI_U32_B32,
+    V_READLANE_B32,
     V_ADD3_U32,
     V_DOT2_F32_F16,
 
@@ -172,6 +189,19 @@ enum class Rdna2Opcode : uint16_t {
     // MUBUF
     BUFFER_LOAD_DWORD,
     BUFFER_STORE_DWORD,
+
+    // MIMG
+    IMAGE_LOAD,
+    IMAGE_STORE,
+    IMAGE_SAMPLE,
+    IMAGE_SAMPLE_LZ,
+
+    // DS (LDS / Shared Memory & Swizzle)
+    DS_ADD_U32,
+    DS_WRITE_B32,
+    DS_ADD_RTN_U32,
+    DS_SWIZZLE_B32,
+    DS_READ_B32,
 
     // FLAT / GLOBAL
     GLOBAL_LOAD_DWORD,
@@ -216,6 +246,9 @@ struct Rdna2Operand {
     static Rdna2Operand LiteralU32(uint32_t bits);
     static Rdna2Operand LiteralF32(float val);
     static Rdna2Operand VccLo();
+    static Rdna2Operand VccHi();
+    static Rdna2Operand ExecLo();
+    static Rdna2Operand ExecHi();
     static Rdna2Operand Scc();
     static Rdna2Operand Null();
 };
@@ -235,6 +268,7 @@ enum class Rdna2ExportTarget : uint8_t {
     Pos1 = 13,
     Pos2 = 14,
     Pos3 = 15,
+    Prim = 20,  // GFX10.3 NGG / Mesh primitive connectivity export
     Param0 = 32,
     Param1 = 33,
     Param2 = 34,
@@ -256,9 +290,10 @@ struct Rdna2Instruction {
 
     // Immediate / modifier / memory / export metadata
     int16_t simm16 = 0;       // SOPK / SOPP signed 16-bit immediate
-    int32_t mem_offset = 0;   // SMEM (21-bit signed), MUBUF (12-bit unsigned), FLAT/GLOBAL (12-bit signed)
+    int32_t mem_offset = 0;   // SMEM (21-bit signed), MUBUF (12-bit unsigned), FLAT/GLOBAL (12-bit signed), DS (16-bit)
     uint8_t sbase = 0;        // SMEM base SGPR index (s[sbase*2])
-    uint8_t srsrc = 0;        // MUBUF descriptor SGPR base (s[srsrc*4])
+    uint8_t srsrc = 0;        // MUBUF/MIMG descriptor SGPR base (s[srsrc*4])
+    uint8_t ssamp = 0;        // MIMG sampler descriptor SGPR base (s[ssamp*4])
     uint8_t soffset = 0;      // SMEM / MUBUF scalar offset code
     uint8_t saddr = 0x7Fu;    // GLOBAL/FLAT scalar base SGPR (0x7F = off)
     uint8_t flat_seg = 0;     // 0=FLAT, 1=SCRATCH, 2=GLOBAL
@@ -269,6 +304,16 @@ struct Rdna2Instruction {
     bool dlc = false;
     bool clamp = false;
     uint8_t omod = 0;
+
+    // MIMG metadata
+    uint8_t mimg_dmask = 0;
+    uint8_t mimg_dim = 0;
+    bool mimg_unrm = false;
+
+    // DS metadata
+    uint8_t ds_offset0 = 0;
+    uint8_t ds_offset1 = 0;
+    bool ds_gds = false;
 
     // EXP metadata
     uint8_t exp_target = 0;
@@ -351,6 +396,27 @@ public:
         bool idxen = false,
         uint8_t soffset = 128);
 
+    // MIMG (64-bit: IMAGE_LOAD, IMAGE_STORE, IMAGE_SAMPLE, IMAGE_SAMPLE_LZ)
+    void EmitMimg(
+        Rdna2Opcode op,
+        uint8_t vdata,
+        uint8_t vaddr,
+        uint8_t srsrc_sgpr,
+        uint8_t ssamp_sgpr = 0,
+        uint8_t dmask = 0xFu,
+        uint8_t dim = 1u,
+        bool unrm = false);
+
+    // DS (64-bit: DS_WRITE_B32, DS_READ_B32, DS_ADD_U32, DS_ADD_RTN_U32, DS_SWIZZLE_B32)
+    void EmitDs(
+        Rdna2Opcode op,
+        uint8_t vdst,
+        uint8_t addr,
+        uint8_t data0 = 0,
+        uint8_t data1 = 0,
+        uint16_t offset = 0,
+        bool gds = false);
+
     // GLOBAL / FLAT (64-bit)
     void EmitGlobal(
         Rdna2Opcode op,
@@ -378,7 +444,8 @@ public:
         uint32_t tg_y = 1,
         uint32_t tg_z = 1,
         uint32_t sgpr_count = 16,
-        uint32_t vgpr_count = 16) const;
+        uint32_t vgpr_count = 16,
+        uint32_t wave_size = 32) const;
 
 private:
     std::vector<uint32_t> words_;
