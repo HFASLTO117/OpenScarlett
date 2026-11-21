@@ -99,13 +99,19 @@ $TestDescriptions = @{
     'test_gdk_meshlet_cull.exe'     = 'AS+MS+PS GPU frustum & normal-cone MeshletCull (MeshTier=10 + WARP fallback)'
     'test_gdk_dxr_triangle.exe'     = 'End-to-end DXRTriangle (native lib_6_3 HW RT cores / SAH BVH fallback)'
     'test_external_gdk_bringup.exe' = 'External GDK-header binaries, untouched MIT DirectStorageCombo & 19-DLL full stack'
+    'test_vulkan_graphics_live.exe' = 'Full Vulkan 1.2/1.4 graphics, 4x MSAA, 3D textures, VK_EXT_mesh_shader & Win32 swapchain'
+    'test_hdr10_d3d12.exe'          = 'HDR10 ST.2084 & scRGB PresentX, SDR tone-map, default Texture2DArray SRV & VA remap'
+    'test_gdk_extended_loader.exe'  = 'XDisplay HDR, XGameUI/Invite/Speech, X3DAudio/XAudio2FX & topological DLL init order'
+    'test_gdk_simple_lighting.exe'  = 'DirectXTK12-style 3D Blinn-Phong SimpleLighting (D3D12 HW/WARP & Vulkan 1.4 parity)'
+    'test_gdk_hdr_cubemap.exe'      = 'HDRCubeMap (FP16 TextureCube + default Array SRV + HDR10 ST.2084 + SDR tone-map)'
+    'test_vulkan_mesh_showcase.exe' = 'VulkanMeshShowcase (RDNA2 XS2 AS+MS+PS + 3D LUT: Vulkan 1.4 vs D3D12 MeshTier=10)'
 }
 
 Write-Host ''
 Write-Host '======================================================================' -ForegroundColor Cyan
 Write-Host '  OpenScarlett - Automatic Hardware Compatibility & Self-Test Suite'    -ForegroundColor Cyan
 Write-Host '======================================================================' -ForegroundColor Cyan
-Write-Host '  Testing D3D12, Vulkan, Mesh Shaders, DXR 1.1, VA Aliasing & GDK Shims' -ForegroundColor Gray
+Write-Host '  Testing D3D12, Vulkan 1.4 Graphics/Mesh, HDR10, DXR 1.1 & GDK Shims' -ForegroundColor Gray
 Write-Host '  Privacy: No personal paths or usernames are saved. Nothing is sent'   -ForegroundColor Gray
 Write-Host '           until you explicitly confirm at the end.'                    -ForegroundColor Gray
 Write-Host ''

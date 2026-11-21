@@ -9,32 +9,32 @@
   </style>
   <rect width="900" height="522" rx="10" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
   <text class="h1" x="28" y="42">OpenScarlett — Live Subsystem Readiness: 100.0%</text>
-  <text class="sub" x="28" y="64">Windows 10/11 x64 · MIT Clean-Room · CTest: 26/26 passing · Target: Xbox Series X|S (Scarlett)</text>
+  <text class="sub" x="28" y="64">Windows 10/11 x64 · MIT Clean-Room · CTest: 29/29 passing · Target: Xbox Series X|S (Scarlett)</text>
   <line x1="28" y1="80" x2="872" y2="80" stroke="#21262d" stroke-width="1"/>
   <text class="sub" x="28" y="102">Legend:  ■ Green = Live GPU / Real Binary Verified   ■ Purple = Unit-Tested   ■ Amber = In Progress   ■ Grey = Planned</text>
   <line x1="28" y1="116" x2="872" y2="116" stroke="#21262d" stroke-width="1"/>
-  <text class="name" x="28" y="142">PE32+ Loader, `MicrosoftGame.Config`, CoW VFS &amp; Telemetry</text>
+  <text class="name" x="28" y="142">PE32+ Loader, `MicrosoftGame.Config`, CoW VFS &amp; Topo Init</text>
   <rect x="440" y="128" width="146" height="20" rx="10" fill="#2ea043"/>
   <text class="stage" x="513" y="142" text-anchor="middle">Live-Binary Verified</text>
   <rect x="610" y="132" width="180" height="10" rx="5" fill="#21262d"/>
   <rect x="610" y="132" width="180" height="10" rx="5" fill="#2ea043"/>
   <text class="pct" x="872" y="142" text-anchor="end">100%</text>
   <line x1="28" y1="154" x2="872" y2="154" stroke="#161b22" stroke-width="1"/>
-  <text class="name" x="28" y="176">Vulkan 1.2/1.4 Dynamic Compute Backend</text>
+  <text class="name" x="28" y="176">Vulkan 1.2/1.4 Dynamic Graphics, `VK_EXT_mesh_shader` &amp; Swapchain</text>
   <rect x="440" y="162" width="146" height="20" rx="10" fill="#2ea043"/>
   <text class="stage" x="513" y="176" text-anchor="middle">Live-GPU Verified</text>
   <rect x="610" y="166" width="180" height="10" rx="5" fill="#21262d"/>
   <rect x="610" y="166" width="180" height="10" rx="5" fill="#2ea043"/>
   <text class="pct" x="872" y="176" text-anchor="end">100%</text>
   <line x1="28" y1="188" x2="872" y2="188" stroke="#161b22" stroke-width="1"/>
-  <text class="name" x="28" y="210">Codecs, Opus/WASAPI Audio &amp; GPU FSR 1.0 Upscaler</text>
+  <text class="name" x="28" y="210">Codecs, Opus/WASAPI, `X3DAudio`/`XAudio2FX` &amp; GPU FSR 1.0</text>
   <rect x="440" y="196" width="146" height="20" rx="10" fill="#2ea043"/>
   <text class="stage" x="513" y="210" text-anchor="middle">Live-GPU Verified</text>
   <rect x="610" y="200" width="180" height="10" rx="5" fill="#21262d"/>
   <rect x="610" y="200" width="180" height="10" rx="5" fill="#2ea043"/>
   <text class="pct" x="872" y="210" text-anchor="end">100%</text>
   <line x1="28" y1="222" x2="872" y2="222" stroke="#161b22" stroke-width="1"/>
-  <text class="name" x="28" y="244">RDNA2 AAA Shader Lifter, CPU Interpreter &amp; Disk Cache</text>
+  <text class="name" x="28" y="244">RDNA2 AAA Shader Lifter, ISA Hardening &amp; Disk Cache</text>
   <rect x="440" y="230" width="146" height="20" rx="10" fill="#2ea043"/>
   <text class="stage" x="513" y="244" text-anchor="middle">Live-GPU Verified</text>
   <rect x="610" y="234" width="180" height="10" rx="5" fill="#21262d"/>
@@ -55,21 +55,21 @@
   <rect x="610" y="302" width="180" height="10" rx="5" fill="#2ea043"/>
   <text class="pct" x="872" y="312" text-anchor="end">100%</text>
   <line x1="28" y1="324" x2="872" y2="324" stroke="#161b22" stroke-width="1"/>
-  <text class="name" x="28" y="346">`d3d12_xs.dll` Proxy, Interactive `PresentX` &amp; Full `xg_xs`</text>
+  <text class="name" x="28" y="346">`d3d12_xs.dll` Proxy, HDR10 `PresentX` &amp; Full `xg_xs`</text>
   <rect x="440" y="332" width="146" height="20" rx="10" fill="#2ea043"/>
   <text class="stage" x="513" y="346" text-anchor="middle">Live-GPU Verified</text>
   <rect x="610" y="336" width="180" height="10" rx="5" fill="#21262d"/>
   <rect x="610" y="336" width="180" height="10" rx="5" fill="#2ea043"/>
   <text class="pct" x="872" y="346" text-anchor="end">100%</text>
   <line x1="28" y1="358" x2="872" y2="358" stroke="#161b22" stroke-width="1"/>
-  <text class="name" x="28" y="380">GDK &amp; Console Shims (16 DLLs + `QueryApiImpl`)</text>
+  <text class="name" x="28" y="380">GDK &amp; Console Shims (19 DLLs + `XDisplay`/`XGameUI`/`QueryApiImpl`)</text>
   <rect x="440" y="366" width="146" height="20" rx="10" fill="#2ea043"/>
   <text class="stage" x="513" y="380" text-anchor="middle">Live-Binary Verified</text>
   <rect x="610" y="370" width="180" height="10" rx="5" fill="#21262d"/>
   <rect x="610" y="370" width="180" height="10" rx="5" fill="#2ea043"/>
   <text class="pct" x="872" y="380" text-anchor="end">100%</text>
   <line x1="28" y1="392" x2="872" y2="392" stroke="#161b22" stroke-width="1"/>
-  <text class="name" x="28" y="414">Hardware DXR Tier 1.1 Pipeline &amp; Multi-Pass GDK Workloads</text>
+  <text class="name" x="28" y="414">DXR Tier 1.1, HDR10 &amp; Cross-API Real-Binary GDK Workloads</text>
   <rect x="440" y="400" width="146" height="20" rx="10" fill="#2ea043"/>
   <text class="stage" x="513" y="414" text-anchor="middle">Live-GPU Verified</text>
   <rect x="610" y="404" width="180" height="10" rx="5" fill="#21262d"/>

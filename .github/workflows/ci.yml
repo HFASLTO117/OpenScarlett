@@ -482,11 +482,18 @@ jobs:
           $notes = @"
           ## OpenScarlett $tag — Portable Windows x64 Hardware Test Bundle
 
-          **Zero coding or Visual Studio required!** Help us test OpenScarlett across real PC GPUs (NVIDIA RTX, AMD RDNA2/3, Intel Arc/iGPU) and Windows 10/11 builds:
+          **Zero coding or Visual Studio required!** Help us test OpenScarlett across real PC GPUs (NVIDIA RTX, AMD RDNA2/3/4, Intel Arc/iGPU) and Windows 10/11 builds:
 
           1. Download **`$zipName`** below and extract it anywhere.
-          2. Double-click **`run_hardware_test.bat`** — it probes your GPU(s), runs all automated tests (Vulkan, D3D12 COM proxies, Mesh Shaders, FSR 1.0, ``VirtualAlloc2`` aliasing, RDNA2 shader lifting, DXR 1.1, and live Xbox GDK samples), and displays live results.
+          2. Double-click **`run_hardware_test.bat`** — it probes your GPU(s) and runs the full automated suite (zero-SDK Vulkan 1.4 graphics & ``VK_EXT_mesh_shader``, HDR10 ST.2084 & scRGB ``PresentX``, D3D12 COM proxies, Mesh Shaders, FSR 1.0, ``VirtualAlloc2`` aliasing, RDNA2 shader lifting & ISA catches, DXR 1.1, ``XDisplay``/``X3DAudio``/``XAudio2FX``, and live Xbox GDK workloads including ``SimpleLighting``, ``HDRCubeMap``, and ``VulkanMeshShowcase``).
           3. Press **Enter** when prompted to open a **pre-filled GitHub Hardware Report** (with personal paths/usernames automatically stripped) and click **Create**!
+
+          ### What's New in $tag
+          - **Full Zero-SDK Vulkan 1.2/1.4 Graphics Backend**: Graphics queue, ``RGBA8``/``FP16``/``D32F``, 4x MSAA resolve, native ``VK_EXT_mesh_shader`` (``Task+Mesh+PS``), mipmapped 2D & 3D volume textures, Win32 swapchain + ``VK_EXT_swapchain_colorspace`` HDR10 probe, and ``openscarlett run --backend=vulkan``.
+          - **5 RDNA2 / GFX10.3 ISA & Wave64 Catches**: Zero-initialized LDS at shader entry, exact ``f16`` FMA vs unfused denormal-flushing MAD, encoding-size 16-bit ``VOP3`` classification, ``s_bcnt1_i32_b32`` vs ``b64`` high-word fix, helper-lane quad ``ddx``/``ddy`` derivatives, bounded ``wave64``-on-``wave32`` mesh dispatcher, and WARP ``1.0.22`` guard.
+          - **HDR10 ST.2084 & D3D12 Proxy Hardening**: HDR10 (``R10G10B10A2`` + ``G2084_P2020``) & scRGB (``FP16``) ``PresentX`` swapchains with ACES/Reinhard SDR tone-map fallback, default ``Texture2DArray`` SRV slice preservation, unified-memory placed texture remap tracking, and fail-closed ``E_NOTIMPL`` stubs.
+          - **Extended GDK, Spatial Audio & Topological Loader**: ``XDisplay`` HDR, ``XLauncher``/``XGameUI``, ``XGameInvite``, ``XAccessibility``, ``XSpeechSynthesizer``, ``X3DAudio`` (panning/Doppler) & ``XAudio2FX`` (Reverb/VolumeMeter), and Kahn topological DLL initialization ordering.
+          - **3 New Real-Binary Cross-API GDK Workloads**: ``SimpleLighting`` (``0.0000`` MAE Vulkan 1.4 vs D3D12), ``HDRCubeMap`` (FP16 Cube + Default Array SRV + ST.2084), and ``VulkanMeshShowcase`` (raw ``XS2\0`` ``AS``+``MS``+``PS`` + 32x32x32 3D LUT with ``0.0000`` MAE Vulkan 1.4 vs D3D12 ``MeshTier=10``).
 
           > **Clean-Room Policy:** 100% MIT open-source code. Contains bundled open-source Microsoft ``dxc.exe``/``dxcompiler.dll``/``dxil.dll`` so no Windows SDK is required. Never decrypts retail ``.xvc``/``.xvd`` packages.
           "@
