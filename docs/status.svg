@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="900" height="522" viewBox="0 0 900 522" role="img" aria-label="OpenScarlett Status: 69.4%">
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="522" viewBox="0 0 900 522" role="img" aria-label="OpenScarlett Status: 82.8%">
   <style>
     text { font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif; }
     .h1 { font-size: 22px; font-weight: 700; fill: #e6edf3; }
@@ -8,8 +8,8 @@
     .pct { font-size: 12px; fill: #c9d1d9; font-weight: 600; }
   </style>
   <rect width="900" height="522" rx="10" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
-  <text class="h1" x="28" y="42">OpenScarlett — Live Subsystem Readiness: 69.4%</text>
-  <text class="sub" x="28" y="64">Windows 10/11 x64 · MIT Clean-Room · CTest: 9/9 passing · Target: Xbox Series X|S (Scarlett)</text>
+  <text class="h1" x="28" y="42">OpenScarlett — Live Subsystem Readiness: 82.8%</text>
+  <text class="sub" x="28" y="64">Windows 10/11 x64 · MIT Clean-Room · CTest: 10/10 passing · Target: Xbox Series X|S (Scarlett)</text>
   <line x1="28" y1="80" x2="872" y2="80" stroke="#21262d" stroke-width="1"/>
   <text class="sub" x="28" y="102">Legend:  ■ Green = Live GPU / Real Binary Verified   ■ Purple = Unit-Tested   ■ Amber = In Progress   ■ Grey = Planned</text>
   <line x1="28" y1="116" x2="872" y2="116" stroke="#21262d" stroke-width="1"/>
@@ -28,11 +28,11 @@
   <text class="pct" x="872" y="176" text-anchor="end">100%</text>
   <line x1="28" y1="188" x2="872" y2="188" stroke="#161b22" stroke-width="1"/>
   <text class="name" x="28" y="210">Production Codecs (GDeflate / BCPack / XMA2 / Bink2)</text>
-  <rect x="440" y="196" width="146" height="20" rx="10" fill="#8957e5"/>
-  <text class="stage" x="513" y="210" text-anchor="middle">Unit-Tested</text>
+  <rect x="440" y="196" width="146" height="20" rx="10" fill="#2ea043"/>
+  <text class="stage" x="513" y="210" text-anchor="middle">Live-GPU Verified</text>
   <rect x="610" y="200" width="180" height="10" rx="5" fill="#21262d"/>
-  <rect x="610" y="200" width="144" height="10" rx="5" fill="#8957e5"/>
-  <text class="pct" x="872" y="210" text-anchor="end">80%</text>
+  <rect x="610" y="200" width="180" height="10" rx="5" fill="#2ea043"/>
+  <text class="pct" x="872" y="210" text-anchor="end">100%</text>
   <line x1="28" y1="222" x2="872" y2="222" stroke="#161b22" stroke-width="1"/>
   <text class="name" x="28" y="244">RDNA2 / GFX10.3 Shader Decoder &amp; Lifter</text>
   <rect x="440" y="230" width="146" height="20" rx="10" fill="#d29922"/>
@@ -56,10 +56,11 @@
   <text class="pct" x="872" y="312" text-anchor="end">100%</text>
   <line x1="28" y1="324" x2="872" y2="324" stroke="#161b22" stroke-width="1"/>
   <text class="name" x="28" y="346">`d3d12_xs` Guest COM Proxy &amp; `xg_xs` Swizzle</text>
-  <rect x="440" y="332" width="146" height="20" rx="10" fill="#484f58"/>
-  <text class="stage" x="513" y="346" text-anchor="middle">Planned</text>
+  <rect x="440" y="332" width="146" height="20" rx="10" fill="#2ea043"/>
+  <text class="stage" x="513" y="346" text-anchor="middle">Live-GPU Verified</text>
   <rect x="610" y="336" width="180" height="10" rx="5" fill="#21262d"/>
-  <text class="pct" x="872" y="346" text-anchor="end">0%</text>
+  <rect x="610" y="336" width="180" height="10" rx="5" fill="#2ea043"/>
+  <text class="pct" x="872" y="346" text-anchor="end">100%</text>
   <line x1="28" y1="358" x2="872" y2="358" stroke="#161b22" stroke-width="1"/>
   <text class="name" x="28" y="380">GDK Runtime (`xgameruntime`, `GameInput`, `XAudio2`, `dstorage_xs`, `XSAPI`)</text>
   <rect x="440" y="366" width="146" height="20" rx="10" fill="#8957e5"/>
