@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <string>
@@ -23,6 +24,101 @@
 namespace {
 
 constexpr const char* kModName = "dstorage_xs.dll";
+
+#if defined(_WIN32)
+using PfnQueryTitlePhysicalPages = int32_t(__stdcall*)(
+    const void*, uint64_t*, uint64_t*, uint32_t*);
+using PfnXMemSize = size_t(__stdcall*)(void*, uint64_t);
+
+bool IsWin32ProtectWritable(DWORD prot) {
+    if ((prot & (PAGE_GUARD | PAGE_NOACCESS)) != 0u) {
+        return false;
+    }
+    const DWORD base = prot & 0xFFu;
+    return base == PAGE_READWRITE ||
+           base == PAGE_WRITECOPY ||
+           base == PAGE_EXECUTE_READWRITE ||
+           base == PAGE_EXECUTE_WRITECOPY;
+}
+#endif
+
+struct DestinationClassification {
+    bool is_physical_page = false;
+    bool is_xmem = false;
+    uint64_t physical_id = 0;
+    uint64_t physical_mapping_size = 0;
+};
+
+int32_t ValidateAndClassifyDestination(
+    void* dst_ptr,
+    size_t dst_cap,
+    DestinationClassification& out_class) {
+    out_class = DestinationClassification{};
+    if (!dst_ptr || dst_cap == 0u) {
+        return OS_DSTORAGE_E_INVALIDARG;
+    }
+
+#if defined(_WIN32)
+    // Verify the entire destination range is committed and writable (supports multi-region
+    // physical-page mappings created via MapViewOfFile3).
+    uintptr_t cursor = reinterpret_cast<uintptr_t>(dst_ptr);
+    if (cursor + dst_cap < cursor) {
+        return OS_DSTORAGE_E_INVALIDARG;
+    }
+    size_t remaining = dst_cap;
+    while (remaining > 0u) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<LPCVOID>(cursor), &mbi, sizeof(mbi)) == 0u) {
+            return OS_DSTORAGE_E_INVALIDARG;
+        }
+        if (mbi.State != MEM_COMMIT || !IsWin32ProtectWritable(mbi.Protect)) {
+            return OS_DSTORAGE_E_INVALIDARG;
+        }
+        const uintptr_t region_end =
+            reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+        if (region_end <= cursor) {
+            return OS_DSTORAGE_E_INVALIDARG;
+        }
+        const size_t avail = static_cast<size_t>(region_end - cursor);
+        const size_t step = std::min(remaining, avail);
+        cursor += step;
+        remaining -= step;
+    }
+
+    // Dynamically inspect kernelx.dll if loaded in-process to identify physical-page
+    // and XMem allocations without adding a static link cycle.
+    HMODULE h_kx = GetModuleHandleW(L"kernelx.dll");
+    if (h_kx) {
+        auto fn_query = reinterpret_cast<PfnQueryTitlePhysicalPages>(
+            reinterpret_cast<void*>(GetProcAddress(h_kx, "QueryTitlePhysicalPages")));
+        if (fn_query) {
+            uint64_t phys_id = 0u;
+            uint64_t map_size = 0u;
+            uint32_t flags = 0u;
+            if (fn_query(dst_ptr, &phys_id, &map_size, &flags) != 0) {
+                out_class.is_physical_page = true;
+                out_class.physical_id = phys_id;
+                out_class.physical_mapping_size = map_size;
+                if (map_size > 0u && dst_cap > map_size) {
+                    return OS_DSTORAGE_E_REQUEST_TOO_LARGE;
+                }
+            }
+        }
+        auto fn_xmem_size = reinterpret_cast<PfnXMemSize>(
+            reinterpret_cast<void*>(GetProcAddress(h_kx, "XMemSize")));
+        if (fn_xmem_size) {
+            const size_t xsz = fn_xmem_size(dst_ptr, 0u);
+            if (xsz > 0u) {
+                out_class.is_xmem = true;
+            }
+        }
+    }
+#else
+    (void)dst_ptr;
+    (void)dst_cap;
+#endif
+    return OS_DSTORAGE_S_OK;
+}
 
 inline int32_t RecordHr(const char* sym, int32_t hr, int32_t slot = -1) {
     openscarlett::CallTelemetry::Global().Record(
@@ -114,10 +210,26 @@ public:
 #endif
     }
 
-    int32_t ReadAt(uint64_t offset, uint32_t size, std::vector<uint8_t>& out) {
+    int32_t ReadAt(
+        uint64_t offset,
+        uint32_t size,
+        std::vector<uint8_t>& out,
+        const std::atomic<bool>* cancel_flag = nullptr) {
         std::lock_guard<std::mutex> lk(io_mutex_);
 #if defined(_WIN32)
         if (file_handle_ == INVALID_HANDLE_VALUE || !file_handle_) {
+            return OS_DSTORAGE_E_IO_ERROR;
+        }
+        if (cancel_flag && cancel_flag->load(std::memory_order_acquire)) {
+            return OS_DSTORAGE_E_CANCELLED;
+        }
+        if (offset + static_cast<uint64_t>(size) < offset) {
+            return OS_DSTORAGE_E_INVALIDARG;
+        }
+        LARGE_INTEGER file_sz{};
+        if (!GetFileSizeEx(file_handle_, &file_sz) ||
+            file_sz.QuadPart < 0 ||
+            offset + static_cast<uint64_t>(size) > static_cast<uint64_t>(file_sz.QuadPart)) {
             return OS_DSTORAGE_E_IO_ERROR;
         }
         LARGE_INTEGER pos{};
@@ -126,10 +238,16 @@ public:
             return OS_DSTORAGE_E_IO_ERROR;
         }
         out.resize(size);
+        constexpr uint32_t kReadChunkBytes = 65536u;
         uint32_t total_read = 0;
         while (total_read < size) {
+            if (cancel_flag && cancel_flag->load(std::memory_order_acquire)) {
+                out.clear();
+                return OS_DSTORAGE_E_CANCELLED;
+            }
+            const DWORD to_read = static_cast<DWORD>(std::min<uint32_t>(size - total_read, kReadChunkBytes));
             DWORD chunk = 0;
-            if (!ReadFile(file_handle_, out.data() + total_read, size - total_read, &chunk, nullptr)) {
+            if (!ReadFile(file_handle_, out.data() + total_read, to_read, &chunk, nullptr)) {
                 return OS_DSTORAGE_E_IO_ERROR;
             }
             if (chunk == 0) {
@@ -142,6 +260,7 @@ public:
         (void)offset;
         (void)size;
         (void)out;
+        (void)cancel_flag;
         return OS_DSTORAGE_E_IO_ERROR;
 #endif
     }
@@ -250,7 +369,14 @@ private:
 // ===========================================================================
 class DStorageQueueImpl final : public IDStorageQueueX {
 public:
-    explicit DStorageQueueImpl(const DSTORAGE_QUEUE_DESC& desc) : desc_(desc) {
+    explicit DStorageQueueImpl(
+        const DSTORAGE_QUEUE_DESC& desc,
+        std::shared_ptr<std::atomic<uint32_t>> staging_size_ref = nullptr)
+        : desc_(desc),
+          staging_size_ref_(staging_size_ref
+                                ? std::move(staging_size_ref)
+                                : std::make_shared<std::atomic<uint32_t>>(
+                                      DSTORAGE_DEFAULT_STAGING_BUFFER_SIZE)) {
         if (desc_.Capacity < DSTORAGE_MIN_QUEUE_CAPACITY) {
             desc_.Capacity = DSTORAGE_MIN_QUEUE_CAPACITY;
         } else if (desc_.Capacity > DSTORAGE_MAX_QUEUE_CAPACITY) {
@@ -389,19 +515,38 @@ public:
         uint64_t mask, uint64_t value) override {
         RecordOk("IDStorageQueueX::CancelRequestsWithTag", 7);
         std::lock_guard<std::mutex> lk(mutex_);
-        auto cancel_in = [&](std::deque<QueueItem>& q) {
+        auto cancel_in = [&](std::deque<QueueItem>& q, uint64_t& counter) {
             for (auto& item : q) {
                 if (item.kind == QueueItem::Kind::Request &&
+                    !item.canceled &&
                     (item.request.CancellationTag & mask) == value) {
                     item.canceled = true;
+                    ++counter;
                 }
             }
         };
-        cancel_in(staged_);
-        cancel_in(active_);
-        if (executing_request_ && (executing_tag_ & mask) == value) {
+        cancel_in(staged_, staged_canceled_count_);
+        cancel_in(active_, submitted_canceled_count_);
+        if (executing_request_ && !executing_canceled_ &&
+            (executing_tag_ & mask) == value) {
             executing_canceled_ = true;
+            current_cancel_requested_.store(true, std::memory_order_release);
+            ++inflight_canceled_count_;
         }
+    }
+
+    void GetQueueStats(DSTORAGE_QUEUE_STATS& out) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        out.StagedCanceled = staged_canceled_count_;
+        out.SubmittedCanceled = submitted_canceled_count_;
+        out.InFlightCanceled = inflight_canceled_count_;
+        out.CompletedOk = completed_ok_count_.load(std::memory_order_acquire);
+        out.CompletedFailed = completed_failed_count_.load(std::memory_order_acquire);
+        out.CompletedCanceled = completed_canceled_count_.load(std::memory_order_acquire);
+        out.PhysicalPageWrites = physical_page_writes_.load(std::memory_order_acquire);
+        out.XMemDestinationWrites = xmem_destination_writes_.load(std::memory_order_acquire);
+        out.StagingBufferSize = staging_size_ref_->load(std::memory_order_acquire);
+        out.LastIntermediateSize = last_intermediate_size_.load(std::memory_order_acquire);
     }
 
     void OPENSCARLETT_DSTORAGE_CALL Close() override {
@@ -481,10 +626,28 @@ private:
     };
 
     int32_t ExecuteRequest(const DSTORAGE_REQUEST& req) {
+        auto is_canceled = [&]() -> bool {
+            return current_cancel_requested_.load(std::memory_order_acquire);
+        };
+        if (is_canceled()) {
+            return OS_DSTORAGE_E_CANCELLED;
+        }
+
         if (req.Options.DestinationType != DSTORAGE_REQUEST_DESTINATION_MEMORY ||
             !req.Destination.Memory.Buffer || req.Destination.Memory.Size == 0) {
             return OS_DSTORAGE_E_INVALIDARG;
         }
+
+        auto* dst_ptr = static_cast<uint8_t*>(req.Destination.Memory.Buffer);
+        const size_t dst_cap = req.Destination.Memory.Size;
+        DestinationClassification dst_class{};
+        const int32_t dst_hr = ValidateAndClassifyDestination(dst_ptr, dst_cap, dst_class);
+        if (dst_hr < 0) {
+            return dst_hr;
+        }
+
+        const size_t staging_limit =
+            static_cast<size_t>(staging_size_ref_->load(std::memory_order_acquire));
 
         // 1. Acquire raw source bytes (file or memory).
         std::vector<uint8_t> file_buf;
@@ -495,9 +658,13 @@ private:
             if (!req.Source.File.Source || req.Source.File.Size == 0) {
                 return OS_DSTORAGE_E_INVALIDARG;
             }
+            if (req.Options.CompressionFormat != DSTORAGE_COMPRESSION_FORMAT_NONE &&
+                req.Source.File.Size > staging_limit) {
+                return OS_DSTORAGE_E_STAGING_BUFFER_TOO_SMALL;
+            }
             auto* file_impl = static_cast<DStorageFileImpl*>(req.Source.File.Source);
             const int32_t rd_hr = file_impl->ReadAt(
-                req.Source.File.Offset, req.Source.File.Size, file_buf);
+                req.Source.File.Offset, req.Source.File.Size, file_buf, &current_cancel_requested_);
             if (rd_hr < 0) {
                 return rd_hr;
             }
@@ -507,40 +674,141 @@ private:
             if (!req.Source.Memory.Source || req.Source.Memory.Size == 0) {
                 return OS_DSTORAGE_E_INVALIDARG;
             }
+            if (req.Options.CompressionFormat != DSTORAGE_COMPRESSION_FORMAT_NONE &&
+                req.Source.Memory.Size > staging_limit) {
+                return OS_DSTORAGE_E_STAGING_BUFFER_TOO_SMALL;
+            }
             src_ptr = static_cast<const uint8_t*>(req.Source.Memory.Source);
             src_size = req.Source.Memory.Size;
         } else {
             return OS_DSTORAGE_E_INVALIDARG;
         }
 
-        auto* dst_ptr = static_cast<uint8_t*>(req.Destination.Memory.Buffer);
-        const size_t dst_cap = req.Destination.Memory.Size;
+        if (is_canceled()) {
+            return OS_DSTORAGE_E_CANCELLED;
+        }
 
-        // 2. Decompress or copy according to CompressionFormat.
+        auto record_destination_write = [&]() {
+            if (dst_class.is_physical_page) {
+                physical_page_writes_.fetch_add(1u, std::memory_order_relaxed);
+                RecordOk("DirectStorage::DecompressToPhysicalPages");
+            }
+            if (dst_class.is_xmem) {
+                xmem_destination_writes_.fetch_add(1u, std::memory_order_relaxed);
+            }
+        };
+
+        // 2. Decompress or copy according to CompressionFormat with intermediate_size bounds validation.
         switch (req.Options.CompressionFormat) {
             case DSTORAGE_COMPRESSION_FORMAT_NONE: {
                 if (src_size > dst_cap) {
                     return OS_DSTORAGE_E_REQUEST_TOO_LARGE;
                 }
-                std::memcpy(dst_ptr, src_ptr, src_size);
+                if (req.UncompressedSize != 0u && req.UncompressedSize != src_size) {
+                    return OS_DSTORAGE_E_INVALIDARG;
+                }
+                if (is_canceled()) {
+                    return OS_DSTORAGE_E_CANCELLED;
+                }
+                constexpr size_t kCopyChunk = 65536u;
+                size_t copied = 0u;
+                while (copied < src_size) {
+                    if (is_canceled()) {
+                        return OS_DSTORAGE_E_CANCELLED;
+                    }
+                    const size_t step = std::min(src_size - copied, kCopyChunk);
+                    std::memcpy(dst_ptr + copied, src_ptr + copied, step);
+                    copied += step;
+                }
+                record_destination_write();
                 return OS_DSTORAGE_S_OK;
             }
 
             case DSTORAGE_COMPRESSION_FORMAT_GDEFLATE: {
-                size_t out_size = 0;
+                size_t header_uncompressed = 0u;
+                if (!openscarlett::GDeflateIsValidStream(src_ptr, src_size) ||
+                    !openscarlett::GDeflateGetUncompressedSize(src_ptr, src_size, &header_uncompressed) ||
+                    header_uncompressed == 0u) {
+                    return OS_DSTORAGE_E_DECOMPRESSION_ERROR;
+                }
+                last_intermediate_size_.store(
+                    static_cast<uint32_t>(std::min<size_t>(header_uncompressed, UINT32_MAX)),
+                    std::memory_order_release);
+                if (header_uncompressed > staging_limit ||
+                    (req.UncompressedSize != 0u && req.UncompressedSize > staging_limit)) {
+                    return OS_DSTORAGE_E_STAGING_BUFFER_TOO_SMALL;
+                }
+                if (header_uncompressed > dst_cap ||
+                    (req.UncompressedSize != 0u && req.UncompressedSize > dst_cap)) {
+                    return OS_DSTORAGE_E_REQUEST_TOO_LARGE;
+                }
+                if (req.UncompressedSize != 0u && header_uncompressed != req.UncompressedSize) {
+                    return OS_DSTORAGE_E_DECOMPRESSION_ERROR;
+                }
+                if (is_canceled()) {
+                    return OS_DSTORAGE_E_CANCELLED;
+                }
+
+                size_t out_size = 0u;
+                if (dst_class.is_physical_page) {
+                    // Direct zero-copy decompression into kernelx/xmem physical-page mapping.
+                    const auto res = openscarlett::GDeflateDecompress(
+                        src_ptr, src_size, dst_ptr, dst_cap, &out_size);
+                    if (res != openscarlett::GDeflateResult::Ok) {
+                        return OS_DSTORAGE_E_DECOMPRESSION_ERROR;
+                    }
+                    if (req.UncompressedSize != 0u && out_size != req.UncompressedSize) {
+                        return OS_DSTORAGE_E_DECOMPRESSION_ERROR;
+                    }
+                    record_destination_write();
+                    return OS_DSTORAGE_S_OK;
+                }
+
+                std::vector<uint8_t> staging(header_uncompressed);
                 const auto res = openscarlett::GDeflateDecompress(
-                    src_ptr, src_size, dst_ptr, dst_cap, &out_size);
+                    src_ptr, src_size, staging.data(), staging.size(), &out_size);
                 if (res != openscarlett::GDeflateResult::Ok) {
                     return OS_DSTORAGE_E_DECOMPRESSION_ERROR;
                 }
-                if (req.UncompressedSize != 0 && out_size != req.UncompressedSize) {
+                if (out_size > dst_cap) {
+                    return OS_DSTORAGE_E_REQUEST_TOO_LARGE;
+                }
+                if (req.UncompressedSize != 0u && out_size != req.UncompressedSize) {
                     return OS_DSTORAGE_E_DECOMPRESSION_ERROR;
                 }
+                if (is_canceled()) {
+                    return OS_DSTORAGE_E_CANCELLED;
+                }
+                if (out_size > 0u) {
+                    std::memcpy(dst_ptr, staging.data(), out_size);
+                }
+                record_destination_write();
                 return OS_DSTORAGE_S_OK;
             }
 
             case DSTORAGE_COMPRESSION_FORMAT_ZLIB:
             case DSTORAGE_COMPRESSION_FORMAT_BCPACK: {
+                openscarlett::BcPackHeader hdr{};
+                if (!openscarlett::BcPackParseHeader(src_ptr, src_size, hdr).ok() ||
+                    hdr.original_size == 0u) {
+                    return OS_DSTORAGE_E_DECOMPRESSION_ERROR;
+                }
+                last_intermediate_size_.store(hdr.original_size, std::memory_order_release);
+                if (static_cast<size_t>(hdr.original_size) > staging_limit ||
+                    (req.UncompressedSize != 0u && req.UncompressedSize > staging_limit)) {
+                    return OS_DSTORAGE_E_STAGING_BUFFER_TOO_SMALL;
+                }
+                if (static_cast<size_t>(hdr.original_size) > dst_cap ||
+                    (req.UncompressedSize != 0u && req.UncompressedSize > dst_cap)) {
+                    return OS_DSTORAGE_E_REQUEST_TOO_LARGE;
+                }
+                if (req.UncompressedSize != 0u && hdr.original_size != req.UncompressedSize) {
+                    return OS_DSTORAGE_E_DECOMPRESSION_ERROR;
+                }
+                if (is_canceled()) {
+                    return OS_DSTORAGE_E_CANCELLED;
+                }
+
                 std::vector<uint8_t> unpacked;
                 const auto st = openscarlett::BcPackDecompress(src_ptr, src_size, unpacked);
                 if (!st.ok()) {
@@ -549,12 +817,16 @@ private:
                 if (unpacked.size() > dst_cap) {
                     return OS_DSTORAGE_E_REQUEST_TOO_LARGE;
                 }
-                if (req.UncompressedSize != 0 && unpacked.size() != req.UncompressedSize) {
+                if (req.UncompressedSize != 0u && unpacked.size() != req.UncompressedSize) {
                     return OS_DSTORAGE_E_DECOMPRESSION_ERROR;
+                }
+                if (is_canceled()) {
+                    return OS_DSTORAGE_E_CANCELLED;
                 }
                 if (!unpacked.empty()) {
                     std::memcpy(dst_ptr, unpacked.data(), unpacked.size());
                 }
+                record_destination_write();
                 return OS_DSTORAGE_S_OK;
             }
 
@@ -595,6 +867,7 @@ private:
                     executing_request_ = true;
                     executing_tag_ = item.request.CancellationTag;
                     executing_canceled_ = item.canceled;
+                    current_cancel_requested_.store(item.canceled, std::memory_order_release);
                 }
             }
             space_cv_.notify_all();
@@ -605,17 +878,23 @@ private:
                     if (!item.canceled) {
                         hr = ExecuteRequest(item.request);
                     }
-                    bool was_canceled = item.canceled;
+                    bool was_canceled = item.canceled || (hr == OS_DSTORAGE_E_CANCELLED);
                     {
                         std::lock_guard<std::mutex> lk(mutex_);
                         was_canceled = was_canceled || executing_canceled_;
                         executing_request_ = false;
                         executing_tag_ = 0u;
                         executing_canceled_ = false;
+                        current_cancel_requested_.store(false, std::memory_order_release);
                     }
-                    if (!was_canceled && hr < 0) {
+                    if (was_canceled) {
+                        completed_canceled_count_.fetch_add(1u, std::memory_order_relaxed);
+                    } else if (hr < 0) {
+                        completed_failed_count_.fetch_add(1u, std::memory_order_relaxed);
                         if (batch_hr >= 0) batch_hr = hr;
                         RecordFailure(hr, item.request);
+                    } else {
+                        completed_ok_count_.fetch_add(1u, std::memory_order_relaxed);
                     }
                     if (item.request.Options.SourceType == DSTORAGE_REQUEST_SOURCE_FILE &&
                         item.request.Source.File.Source) {
@@ -677,6 +956,7 @@ private:
 
     std::atomic<uint32_t> ref_count_{1};
     DSTORAGE_QUEUE_DESC desc_{};
+    std::shared_ptr<std::atomic<uint32_t>> staging_size_ref_;
     uint16_t auto_submit_threshold_ = DSTORAGE_MIN_QUEUE_CAPACITY / 2u;
     std::string name_storage_;
 
@@ -688,6 +968,16 @@ private:
     bool executing_request_ = false;
     uint64_t executing_tag_ = 0u;
     bool executing_canceled_ = false;
+    std::atomic<bool> current_cancel_requested_{false};
+    uint64_t staged_canceled_count_ = 0u;
+    uint64_t submitted_canceled_count_ = 0u;
+    uint64_t inflight_canceled_count_ = 0u;
+    std::atomic<uint64_t> completed_ok_count_{0u};
+    std::atomic<uint64_t> completed_failed_count_{0u};
+    std::atomic<uint64_t> completed_canceled_count_{0u};
+    std::atomic<uint64_t> physical_page_writes_{0u};
+    std::atomic<uint64_t> xmem_destination_writes_{0u};
+    std::atomic<uint32_t> last_intermediate_size_{0u};
     std::deque<QueueItem> staged_;
     std::deque<QueueItem> active_;
     std::thread worker_;
@@ -744,7 +1034,7 @@ public:
             !GuidEquals(riid, IID_OS_DStorage_IUnknown)) {
             return RecordHr("IDStorageFactoryX::CreateQueue", OS_DSTORAGE_E_NOINTERFACE, 3);
         }
-        auto* q = new (std::nothrow) DStorageQueueImpl(*desc);
+        auto* q = new (std::nothrow) DStorageQueueImpl(*desc, staging_size_);
         if (!q) {
             return RecordHr("IDStorageFactoryX::CreateQueue", OS_DSTORAGE_E_OUTOFMEMORY, 3);
         }
@@ -810,14 +1100,23 @@ public:
     }
 
     int32_t OPENSCARLETT_DSTORAGE_CALL SetStagingBufferSize(uint32_t size) override {
-        staging_size_.store(size, std::memory_order_relaxed);
+        if (size < DSTORAGE_MIN_STAGING_BUFFER_SIZE || size > DSTORAGE_MAX_STAGING_BUFFER_SIZE) {
+            return RecordHr("IDStorageFactoryX::SetStagingBufferSize",
+                            OS_DSTORAGE_E_STAGING_BUFFER_INVALID, 7);
+        }
+        staging_size_->store(size, std::memory_order_release);
         return RecordHr("IDStorageFactoryX::SetStagingBufferSize", OS_DSTORAGE_S_OK, 7);
+    }
+
+    uint32_t GetStagingBufferSizeValue() const {
+        return staging_size_->load(std::memory_order_acquire);
     }
 
 private:
     std::atomic<uint32_t> ref_count_{1};
     std::atomic<uint32_t> debug_flags_{0};
-    std::atomic<uint32_t> staging_size_{32u * 1024u * 1024u};
+    std::shared_ptr<std::atomic<uint32_t>> staging_size_{
+        std::make_shared<std::atomic<uint32_t>>(DSTORAGE_DEFAULT_STAGING_BUFFER_SIZE)};
 };
 
 struct GlobalDStorageConfig {
@@ -878,6 +1177,163 @@ int32_t OPENSCARLETT_DSTORAGE_CALL DStorageSetConfiguration1(
     std::lock_guard<std::mutex> lk(cfg.mutex);
     cfg.config = *configuration;
     return RecordHr("DStorageSetConfiguration1", OS_DSTORAGE_S_OK);
+}
+
+int32_t OPENSCARLETT_DSTORAGE_CALL OpenScarlettDStorageGetQueueStats(
+    IDStorageQueueX* queue, DSTORAGE_QUEUE_STATS* outStats) {
+    if (!queue || !outStats) {
+        return RecordHr("OpenScarlettDStorageGetQueueStats", OS_DSTORAGE_E_INVALIDARG);
+    }
+    std::memset(outStats, 0, sizeof(*outStats));
+    auto* impl = static_cast<DStorageQueueImpl*>(queue);
+    impl->GetQueueStats(*outStats);
+    return RecordHr("OpenScarlettDStorageGetQueueStats", OS_DSTORAGE_S_OK);
+}
+
+int32_t OPENSCARLETT_DSTORAGE_CALL OpenScarlettDStorageGetStagingBufferSize(
+    IDStorageFactoryX* factory, uint32_t* outSize) {
+    if (!factory || !outSize) {
+        return RecordHr("OpenScarlettDStorageGetStagingBufferSize", OS_DSTORAGE_E_INVALIDARG);
+    }
+    auto* impl = static_cast<DStorageFactoryImpl*>(factory);
+    *outSize = impl->GetStagingBufferSizeValue();
+    return RecordHr("OpenScarlettDStorageGetStagingBufferSize", OS_DSTORAGE_S_OK);
+}
+
+int32_t OPENSCARLETT_DSTORAGE_CALL OpenScarlettDStorageDecompressWithIntermediate(
+    DSTORAGE_COMPRESSION_FORMAT format,
+    const void* src,
+    size_t src_size,
+    void* dst,
+    size_t dst_size,
+    size_t intermediate_size,
+    size_t* out_decompressed_size) {
+    if (out_decompressed_size) {
+        *out_decompressed_size = 0u;
+    }
+    if (!src || !dst || src_size == 0u || dst_size == 0u) {
+        return RecordHr("OpenScarlettDStorageDecompressWithIntermediate", OS_DSTORAGE_E_INVALIDARG);
+    }
+    if (intermediate_size == 0u || intermediate_size > DSTORAGE_MAX_STAGING_BUFFER_SIZE) {
+        return RecordHr("OpenScarlettDStorageDecompressWithIntermediate",
+                        OS_DSTORAGE_E_STAGING_BUFFER_INVALID);
+    }
+
+    DestinationClassification dst_class{};
+    const int32_t dst_hr = ValidateAndClassifyDestination(dst, dst_size, dst_class);
+    if (dst_hr < 0) {
+        return RecordHr("OpenScarlettDStorageDecompressWithIntermediate", dst_hr);
+    }
+
+    const auto* src_bytes = static_cast<const uint8_t*>(src);
+    auto* dst_bytes = static_cast<uint8_t*>(dst);
+
+    switch (format) {
+        case DSTORAGE_COMPRESSION_FORMAT_NONE: {
+            if (intermediate_size < src_size) {
+                return RecordHr("OpenScarlettDStorageDecompressWithIntermediate",
+                                OS_DSTORAGE_E_STAGING_BUFFER_TOO_SMALL);
+            }
+            if (dst_size < src_size) {
+                return RecordHr("OpenScarlettDStorageDecompressWithIntermediate",
+                                OS_DSTORAGE_E_REQUEST_TOO_LARGE);
+            }
+            std::memcpy(dst_bytes, src_bytes, src_size);
+            if (out_decompressed_size) {
+                *out_decompressed_size = src_size;
+            }
+            if (dst_class.is_physical_page) {
+                RecordOk("DirectStorage::DecompressToPhysicalPages");
+            }
+            return RecordHr("OpenScarlettDStorageDecompressWithIntermediate", OS_DSTORAGE_S_OK);
+        }
+
+        case DSTORAGE_COMPRESSION_FORMAT_GDEFLATE: {
+            size_t required = 0u;
+            if (!openscarlett::GDeflateIsValidStream(src_bytes, src_size) ||
+                !openscarlett::GDeflateGetUncompressedSize(src_bytes, src_size, &required) ||
+                required == 0u) {
+                return RecordHr("OpenScarlettDStorageDecompressWithIntermediate",
+                                OS_DSTORAGE_E_DECOMPRESSION_ERROR);
+            }
+            if (intermediate_size < required) {
+                return RecordHr("OpenScarlettDStorageDecompressWithIntermediate",
+                                OS_DSTORAGE_E_STAGING_BUFFER_TOO_SMALL);
+            }
+            if (dst_size < required) {
+                return RecordHr("OpenScarlettDStorageDecompressWithIntermediate",
+                                OS_DSTORAGE_E_REQUEST_TOO_LARGE);
+            }
+            size_t out_sz = 0u;
+            if (dst_class.is_physical_page) {
+                const auto res = openscarlett::GDeflateDecompress(
+                    src_bytes, src_size, dst_bytes, dst_size, &out_sz);
+                if (res != openscarlett::GDeflateResult::Ok) {
+                    return RecordHr("OpenScarlettDStorageDecompressWithIntermediate",
+                                    OS_DSTORAGE_E_DECOMPRESSION_ERROR);
+                }
+                RecordOk("DirectStorage::DecompressToPhysicalPages");
+            } else {
+                std::vector<uint8_t> staging(intermediate_size);
+                const auto res = openscarlett::GDeflateDecompress(
+                    src_bytes, src_size, staging.data(), staging.size(), &out_sz);
+                if (res != openscarlett::GDeflateResult::Ok) {
+                    return RecordHr("OpenScarlettDStorageDecompressWithIntermediate",
+                                    OS_DSTORAGE_E_DECOMPRESSION_ERROR);
+                }
+                if (out_sz > dst_size) {
+                    return RecordHr("OpenScarlettDStorageDecompressWithIntermediate",
+                                    OS_DSTORAGE_E_REQUEST_TOO_LARGE);
+                }
+                std::memcpy(dst_bytes, staging.data(), out_sz);
+            }
+            if (out_decompressed_size) {
+                *out_decompressed_size = out_sz;
+            }
+            return RecordHr("OpenScarlettDStorageDecompressWithIntermediate", OS_DSTORAGE_S_OK);
+        }
+
+        case DSTORAGE_COMPRESSION_FORMAT_ZLIB:
+        case DSTORAGE_COMPRESSION_FORMAT_BCPACK: {
+            openscarlett::BcPackHeader hdr{};
+            if (!openscarlett::BcPackParseHeader(src_bytes, src_size, hdr).ok() ||
+                hdr.original_size == 0u) {
+                return RecordHr("OpenScarlettDStorageDecompressWithIntermediate",
+                                OS_DSTORAGE_E_DECOMPRESSION_ERROR);
+            }
+            if (intermediate_size < static_cast<size_t>(hdr.original_size)) {
+                return RecordHr("OpenScarlettDStorageDecompressWithIntermediate",
+                                OS_DSTORAGE_E_STAGING_BUFFER_TOO_SMALL);
+            }
+            if (dst_size < static_cast<size_t>(hdr.original_size)) {
+                return RecordHr("OpenScarlettDStorageDecompressWithIntermediate",
+                                OS_DSTORAGE_E_REQUEST_TOO_LARGE);
+            }
+            std::vector<uint8_t> unpacked;
+            if (!openscarlett::BcPackDecompress(src_bytes, src_size, unpacked).ok()) {
+                return RecordHr("OpenScarlettDStorageDecompressWithIntermediate",
+                                OS_DSTORAGE_E_DECOMPRESSION_ERROR);
+            }
+            if (unpacked.size() > dst_size) {
+                return RecordHr("OpenScarlettDStorageDecompressWithIntermediate",
+                                OS_DSTORAGE_E_REQUEST_TOO_LARGE);
+            }
+            if (!unpacked.empty()) {
+                std::memcpy(dst_bytes, unpacked.data(), unpacked.size());
+            }
+            if (out_decompressed_size) {
+                *out_decompressed_size = unpacked.size();
+            }
+            if (dst_class.is_physical_page) {
+                RecordOk("DirectStorage::DecompressToPhysicalPages");
+            }
+            return RecordHr("OpenScarlettDStorageDecompressWithIntermediate", OS_DSTORAGE_S_OK);
+        }
+
+        default:
+            return RecordHr("OpenScarlettDStorageDecompressWithIntermediate",
+                            OS_DSTORAGE_E_INVALIDARG);
+    }
 }
 
 }  // extern "C"

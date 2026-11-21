@@ -1,6 +1,10 @@
 // Clean-room MIT xmem.dll shim forwarding Xbox memory allocations to kernelx.dll
 // while recording xmem.dll call telemetry.
 
+#if defined(_WIN32)
+#  include <windows.h>
+#endif
+
 #include "openscarlett/kernel/kernelx_abi.h"
 #include "openscarlett/core/telemetry.h"
 
@@ -13,6 +17,7 @@
 // from kernelx.dll without C++ symbol redeclaration conflicts.
 #pragma comment(linker, "/export:XMemAlloc=XMemShim_XMemAlloc")
 #pragma comment(linker, "/export:XMemAllocDefault=XMemShim_XMemAllocDefault")
+#pragma comment(linker, "/export:XMemAllocAligned=XMemShim_XMemAllocAligned")
 #pragma comment(linker, "/export:XMemFree=XMemShim_XMemFree")
 #pragma comment(linker, "/export:XMemFreeDefault=XMemShim_XMemFreeDefault")
 #pragma comment(linker, "/export:XMemSize=XMemShim_XMemSize")
@@ -54,14 +59,37 @@ void* OPENSCARLETT_KERNELX_CALL XMemShim_XMemAllocDefault(size_t dwSize, uint64_
     return ptr;
 }
 
+void* OPENSCARLETT_KERNELX_CALL XMemShim_XMemAllocAligned(
+    size_t dwSize, size_t alignment, uint64_t dwAllocAttributes) {
+    void* ptr = ::XMemAllocAligned(dwSize, alignment, dwAllocAttributes);
+    RecordOutcome("XMemAllocAligned", ptr != nullptr);
+    return ptr;
+}
+
 void OPENSCARLETT_KERNELX_CALL XMemShim_XMemFree(void* pAddress, uint64_t dwAllocAttributes) {
+#if defined(_WIN32)
+    SetLastError(0u);
+#endif
     ::XMemFree(pAddress, dwAllocAttributes);
-    RecordOutcome("XMemFree", true);
+#if defined(_WIN32)
+    const bool ok = (pAddress == nullptr) || (GetLastError() == 0u);
+#else
+    const bool ok = true;
+#endif
+    RecordOutcome("XMemFree", ok);
 }
 
 void OPENSCARLETT_KERNELX_CALL XMemShim_XMemFreeDefault(void* pAddress, uint64_t dwAllocAttributes) {
+#if defined(_WIN32)
+    SetLastError(0u);
+#endif
     ::XMemFreeDefault(pAddress, dwAllocAttributes);
-    RecordOutcome("XMemFreeDefault", true);
+#if defined(_WIN32)
+    const bool ok = (pAddress == nullptr) || (GetLastError() == 0u);
+#else
+    const bool ok = true;
+#endif
+    RecordOutcome("XMemFreeDefault", ok);
 }
 
 size_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemSize(void* pAddress, uint64_t dwAllocAttributes) {

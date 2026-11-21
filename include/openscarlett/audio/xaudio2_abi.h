@@ -513,6 +513,36 @@ OPENSCARLETT_XAUDIO2_API int32_t OPENSCARLETT_XAUDIO2_CALL OpenScarlettXAudio2Ge
     IXAudio2* pXAudio2,
     OS_XAUDIO2_BACKEND_INFO* out_info);
 
+// WASAPI MMDevice endpoint ID validation, normalization, and probing helpers.
+// Accepts NULL/empty/"default", canonical IMMDevice IDs "{0.0.0.00000000}.{guid}",
+// WinRT/PnP device paths "\\?\SWD#MMDEVAPI#{0.0.0.00000000}.{guid}#{interface-guid}",
+// and bare "{guid}" strings (both wide and narrow).
+struct OS_XAUDIO2_ENDPOINT_PROBE {
+    uint32_t format_valid;
+    uint32_t is_default;
+    uint32_t exact_device_found;
+    uint32_t fallback_used;
+    int32_t wasapi_hresult;
+    uint32_t mix_sample_rate;
+    uint32_t mix_channels;
+    uint32_t mix_bits_per_sample;
+    wchar_t canonical_id[256];
+};
+
+OPENSCARLETT_XAUDIO2_API int32_t OPENSCARLETT_XAUDIO2_CALL OpenScarlettXAudio2ValidateEndpointIdW(
+    const wchar_t* deviceId,
+    wchar_t* outCanonicalId,
+    uint32_t outCanonicalChars);
+
+OPENSCARLETT_XAUDIO2_API int32_t OPENSCARLETT_XAUDIO2_CALL OpenScarlettXAudio2ValidateEndpointIdA(
+    const char* deviceId,
+    char* outCanonicalId,
+    uint32_t outCanonicalChars);
+
+OPENSCARLETT_XAUDIO2_API int32_t OPENSCARLETT_XAUDIO2_CALL OpenScarlettXAudio2ProbeWasapiEndpointW(
+    const wchar_t* deviceId,
+    OS_XAUDIO2_ENDPOINT_PROBE* outProbe);
+
 #ifdef __cplusplus
 }
 #endif

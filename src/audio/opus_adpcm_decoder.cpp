@@ -472,6 +472,9 @@ Status ImaAdpcmDecoder::DecodeBlocksInt16(
     const uint32_t header_bytes = static_cast<uint32_t>(ch) * 4u;
     const uint32_t align = config_.block_align;
     const uint32_t target_spb = config_.samples_per_block;
+    if (align < header_bytes || target_spb == 0u) {
+        return Status::Error(StatusCode::InvalidArgument, "Invalid IMA-ADPCM decoder block parameters");
+    }
 
     size_t offset = 0u;
     while (offset < block_bytes) {
@@ -1238,10 +1241,13 @@ Status OpusMftDecoder::Initialize(const OpusDecoderConfig& config) {
     if (config.channels == 0u || config.channels > 2u) {
         return Status::Error(StatusCode::InvalidArgument, "Opus decoder supports 1 or 2 channels");
     }
-    impl_->config = config;
-    if (impl_->config.sample_rate == 0u) {
-        impl_->config.sample_rate = 48000u;
+    const uint32_t sr = (config.sample_rate != 0u) ? config.sample_rate : 48000u;
+    if (sr != 8000u && sr != 12000u && sr != 16000u && sr != 24000u && sr != 48000u) {
+        return Status::Error(StatusCode::InvalidArgument,
+                             "Opus decoder sample rate must be 8000, 12000, 16000, 24000, or 48000 Hz");
     }
+    impl_->config = config;
+    impl_->config.sample_rate = sr;
     impl_->stats = OpusDecodeStats{};
     impl_->stats.output_sample_rate = impl_->config.sample_rate;
     impl_->stats.output_channels = impl_->config.channels;
