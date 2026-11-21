@@ -46,10 +46,40 @@ void SetNullAudioEnv(bool enabled) {
 #endif
 }
 
-bool HostHasMsOpusDecoderDll() {
+bool HostSupportsNativeOpusMft() {
 #if defined(_WIN32)
-    const DWORD attrs = GetFileAttributesW(L"C:\\Windows\\System32\\MSOpusDecoder.dll");
-    return attrs != INVALID_FILE_ATTRIBUTES;
+    // Require BOTH MSOpusDecoder.dll AND a functional Media Foundation runtime (mfplat.dll).
+    // Headless Windows Server CI runners may omit Media Foundation even if MSOpusDecoder.dll is absent/stubbed.
+    HMODULE opus_mod = LoadLibraryW(L"MSOpusDecoder.dll");
+    if (!opus_mod) {
+        return false;
+    }
+    const bool has_class_factory = (GetProcAddress(opus_mod, "DllGetClassObject") != nullptr);
+    FreeLibrary(opus_mod);
+    if (!has_class_factory) {
+        return false;
+    }
+
+    HMODULE mfplat = LoadLibraryW(L"mfplat.dll");
+    if (!mfplat) {
+        return false;
+    }
+    using PfnMfStartup = HRESULT(STDAPICALLTYPE*)(ULONG, DWORD);
+    using PfnMfShutdown = HRESULT(STDAPICALLTYPE*)();
+    auto fn_start = reinterpret_cast<PfnMfStartup>(
+        reinterpret_cast<void*>(GetProcAddress(mfplat, "MFStartup")));
+    auto fn_stop = reinterpret_cast<PfnMfShutdown>(
+        reinterpret_cast<void*>(GetProcAddress(mfplat, "MFShutdown")));
+    bool mf_ok = false;
+    if (fn_start && fn_stop) {
+        constexpr ULONG kMfVer = (0x0002u << 16u) | 0x0070u;
+        if (SUCCEEDED(fn_start(kMfVer, 0x1u))) {
+            mf_ok = true;
+            fn_stop();
+        }
+    }
+    FreeLibrary(mfplat);
+    return mf_ok;
 #else
     return false;
 #endif
@@ -175,7 +205,7 @@ void TestImaAdpcmCodecDirect() {
 void TestOpusMftDecoderDirect() {
     std::printf("[Test 2] Opus (0x704F) Native MSOpusDecoder.dll MFT Decoding...\n");
 
-    const bool expect_native_mft = HostHasMsOpusDecoderDll();
+    const bool expect_native_mft = HostSupportsNativeOpusMft();
 
     for (uint16_t ch : {uint16_t{1u}, uint16_t{2u}}) {
         openscarlett::OpusMftDecoder dec;
@@ -400,7 +430,7 @@ void TestXAudio2CodecsDeterministicNullMode() {
 
         OS_XAUDIO2_BACKEND_INFO binfo2{};
         OS_REQUIRE(OpenScarlettXAudio2GetBackendInfo(xa, &binfo2) == OS_XAUDIO2_S_OK);
-        if (HostHasMsOpusDecoderDll()) {
+        if (HostSupportsNativeOpusMft()) {
             OS_REQUIRE(binfo2.opus_mft_active_voices == 1u);
         }
 

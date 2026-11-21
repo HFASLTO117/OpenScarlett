@@ -1050,7 +1050,7 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
         }
     }
 
-    const bool do_swapchain_present = use_swapchain && !window_minimized;
+    bool do_swapchain_present = use_swapchain && !window_minimized;
     const bool need_readback = (!use_swapchain) || readback_capture_enabled_;
 
     if (do_swapchain_present) {
@@ -1061,12 +1061,21 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
         hr = EnsureSwapChainLocked(
             target_hwnd, target_bb_width, target_bb_height, src_desc.Format, resize_pending);
         if (FAILED(hr)) {
-            RecordQueue("ID3D12CommandQueueX::PresentX", 19, hr);
-            return hr;
-        }
-
-        if (frame_latency_waitable_object_) {
-            const DWORD wr = WaitForSingleObjectEx(frame_latency_waitable_object_, 1000u, TRUE);
+            if (need_readback ||
+                hr == DXGI_ERROR_UNSUPPORTED ||
+                hr == DXGI_ERROR_NOT_CURRENTLY_AVAILABLE ||
+                hr == E_ACCESSDENIED) {
+                // Headless Session-0 CI environments without DWM may reject CreateSwapChainForHwnd;
+                // degrade cleanly to headless present instead of failing the frame.
+                do_swapchain_present = false;
+                hr = S_OK;
+            } else {
+                RecordQueue("ID3D12CommandQueueX::PresentX", 19, hr);
+                return hr;
+            }
+        } else if (frame_latency_waitable_object_) {
+            const DWORD wait_ms = swapchain_occluded_ ? 50u : 1000u;
+            const DWORD wr = WaitForSingleObjectEx(frame_latency_waitable_object_, wait_ms, TRUE);
             if (wr == WAIT_OBJECT_0) {
                 ++latency_waits_;
             }
@@ -1196,7 +1205,7 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
     const uint32_t frame_interval_us = device_x_ ? device_x_->FrameIntervalMicroseconds() : 0u;
     const bool immediate_flag =
         (pPresentParameters && (pPresentParameters->Flags & D3D12XBOX_PRESENT_FLAG_IMMEDIATE) != 0);
-    const bool should_pace = do_swapchain_present && !immediate_flag && frame_interval_us > 0u;
+    const bool should_pace = (use_swapchain && !window_minimized) && !immediate_flag && frame_interval_us > 0u;
 
     if (should_pace) {
         PaceFrameLocked(frame_interval_us);

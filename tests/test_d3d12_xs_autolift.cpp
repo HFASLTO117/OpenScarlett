@@ -521,10 +521,14 @@ int main() {
     // Test 2: Second Run Hits On-Disk Shader Cache (DiskHit >= 1) + Identical Execution
     // -----------------------------------------------------------------------
     OpenScarlettD3D12ResetTelemetry();
+    uint32_t dev2_sm = has_hw ? hw_info.highest_shader_model : 0x62u;
     {
         // Fresh DeviceX instance = clean empty in-memory cache; must hit on-disk cache!
         DeviceXHarness dev2;
         dev2.Init(/*use_warp=*/!has_hw);
+        if (dev2.gpu_info.HighestShaderModel != 0u) {
+            dev2_sm = dev2.gpu_info.HighestShaderModel;
+        }
         std::vector<uint32_t> run2_out;
         dev2.RunComputeShader(cs_xs2, cs_input, run2_out);
         OS_REQUIRE(run2_out == cpu_ref.uav1);
@@ -539,7 +543,7 @@ int main() {
         sc.ClearMemoryCache();
         sc.ResetStats();
         ShaderCacheLiftRequest req{};
-        req.highest_shader_model = has_hw ? hw_info.highest_shader_model : 0x62u;
+        req.highest_shader_model = dev2_sm ? dev2_sm : 0x60u;
         CachedShaderResult cached{};
         OS_REQUIRE(sc.GetOrLiftXboxShader(cs_xs2.data(), cs_xs2.size(), req, cached).ok());
         OS_REQUIRE(cached.from_disk_cache);
@@ -742,9 +746,13 @@ int main() {
         // Now disable async mode and create a fresh DeviceX: real compiled DXIL must hit disk cache & match CPU!
         SetEnvironmentVariableA("OPENSCARLETT_ASYNC_PSO", "0");
         OpenScarlettD3D12ResetTelemetry();
+        uint32_t verify_sm = dev2_sm;
         {
             DeviceXHarness verify_dev;
             verify_dev.Init(/*use_warp=*/!has_hw);
+            if (verify_dev.gpu_info.HighestShaderModel != 0u) {
+                verify_sm = verify_dev.gpu_info.HighestShaderModel;
+            }
             std::vector<uint32_t> real_out;
             verify_dev.RunComputeShader(cs_async, cs_input, real_out);
             OS_REQUIRE(real_out == cpu_async.uav1);
@@ -759,7 +767,7 @@ int main() {
             local_cache.EnableAsyncPsoCompilation(true);
 
             ShaderCacheLiftRequest req{};
-            req.highest_shader_model = has_hw ? hw_info.highest_shader_model : 0x62u;
+            req.highest_shader_model = verify_sm ? verify_sm : 0x60u;
             CachedShaderResult standin{};
             OS_REQUIRE(local_cache.GetOrLiftXboxShader(cs_async2.data(), cs_async2.size(), req, standin).ok());
             OS_REQUIRE(standin.is_standin_async);
