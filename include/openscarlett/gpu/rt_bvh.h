@@ -83,6 +83,28 @@ void MakeScaleTranslation3x4(float sx, float sy, float sz,
                              float tx, float ty, float tz,
                              float out[3][4]) noexcept;
 void MakeRotationY3x4(float radians, float tx, float ty, float tz, float out[3][4]) noexcept;
+bool InvertTransform3x4(const float in[3][4], float out[3][4]) noexcept;
+
+// Public ray-primitive intersection helpers shared by SAH BVH2 and RDNA2 BVH4 traversal.
+bool IntersectRayAabb(const RtAabb& box,
+                      const RtRay& ray,
+                      float t_best,
+                      float& out_t_near) noexcept;
+bool IntersectRayTriangle(const RtTriangle& tri,
+                          const RtRay& ray,
+                          float t_best,
+                          float& out_t,
+                          float& out_u,
+                          float& out_v,
+                          Vec3& out_normal) noexcept;
+
+// Read-only view of a single binary SAH BVH node for downstream encoders (e.g., RDNA2 BVH4).
+struct BvhNodeView {
+    RtAabb bounds;
+    uint32_t left_first = 0;   // left child index if tri_count == 0, else first triangle index
+    uint32_t right_child = 0;  // right child index if tri_count == 0
+    uint32_t tri_count = 0;
+};
 
 // Clean-room binned Surface Area Heuristic (SAH) software BVH for DXR acceleration
 // structure traversal and deterministic fallback on non-DXR GPUs and WARP.
@@ -102,6 +124,11 @@ public:
     uint32_t MaxTreeDepth() const noexcept { return max_tree_depth_; }
     uint32_t TriangleCount() const noexcept { return static_cast<uint32_t>(triangles_.size()); }
     RtAabb RootBounds() const noexcept { return nodes_.empty() ? RtAabb{} : nodes_[0].bounds; }
+
+    // Read-only inspection accessors for RDNA2 BVH4 serialization/verification.
+    bool GetNodeView(uint32_t index, BvhNodeView& out_node) const noexcept;
+    const std::vector<RtTriangle>& Triangles() const noexcept { return triangles_; }
+    const std::vector<uint32_t>& TriangleIndices() const noexcept { return tri_indices_; }
 
 private:
     struct BvhNode {

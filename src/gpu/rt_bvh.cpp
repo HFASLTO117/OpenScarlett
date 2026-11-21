@@ -236,6 +236,66 @@ void MakeRotationY3x4(float radians, float tx, float ty, float tz, float out[3][
     out[2][0] = -s;   out[2][1] = 0.0f; out[2][2] = c;    out[2][3] = tz;
 }
 
+bool InvertTransform3x4(const float in[3][4], float out[3][4]) noexcept {
+    const float a00 = in[0][0], a01 = in[0][1], a02 = in[0][2];
+    const float a10 = in[1][0], a11 = in[1][1], a12 = in[1][2];
+    const float a20 = in[2][0], a21 = in[2][1], a22 = in[2][2];
+
+    const float c00 = a11 * a22 - a12 * a21;
+    const float c01 = a12 * a20 - a10 * a22;
+    const float c02 = a10 * a21 - a11 * a20;
+    const float det = a00 * c00 + a01 * c01 + a02 * c02;
+    if (std::fabs(det) < 1e-8f || !std::isfinite(det)) {
+        return false;
+    }
+
+    const float inv_det = 1.0f / det;
+    const float r00 = c00 * inv_det;
+    const float r01 = (a02 * a21 - a01 * a22) * inv_det;
+    const float r02 = (a01 * a12 - a02 * a11) * inv_det;
+    const float r10 = c01 * inv_det;
+    const float r11 = (a00 * a22 - a02 * a20) * inv_det;
+    const float r12 = (a02 * a10 - a00 * a12) * inv_det;
+    const float r20 = c02 * inv_det;
+    const float r21 = (a01 * a20 - a00 * a21) * inv_det;
+    const float r22 = (a00 * a11 - a01 * a10) * inv_det;
+
+    const float tx = in[0][3], ty = in[1][3], tz = in[2][3];
+    out[0][0] = r00; out[0][1] = r01; out[0][2] = r02; out[0][3] = -(r00 * tx + r01 * ty + r02 * tz);
+    out[1][0] = r10; out[1][1] = r11; out[1][2] = r12; out[1][3] = -(r10 * tx + r11 * ty + r12 * tz);
+    out[2][0] = r20; out[2][1] = r21; out[2][2] = r22; out[2][3] = -(r20 * tx + r21 * ty + r22 * tz);
+    return true;
+}
+
+bool IntersectRayAabb(const RtAabb& box,
+                      const RtRay& ray,
+                      float t_best,
+                      float& out_t_near) noexcept {
+    return IntersectAabb(box, ray, t_best, out_t_near);
+}
+
+bool IntersectRayTriangle(const RtTriangle& tri,
+                          const RtRay& ray,
+                          float t_best,
+                          float& out_t,
+                          float& out_u,
+                          float& out_v,
+                          Vec3& out_normal) noexcept {
+    return IntersectTriangle(tri, ray, t_best, out_t, out_u, out_v, out_normal);
+}
+
+bool BvhAccelerationStructure::GetNodeView(uint32_t index, BvhNodeView& out_node) const noexcept {
+    if (index >= nodes_.size()) {
+        return false;
+    }
+    const BvhNode& n = nodes_[index];
+    out_node.bounds = n.bounds;
+    out_node.left_first = n.left_first;
+    out_node.right_child = n.right_child;
+    out_node.tri_count = n.tri_count;
+    return true;
+}
+
 Status BvhAccelerationStructure::Build(const std::vector<RtTriangle>& triangles) {
     if (triangles.empty()) {
         return Status::Error(StatusCode::RaytracingError, "Cannot build BVH from 0 triangles");

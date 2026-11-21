@@ -8,10 +8,14 @@
 
 namespace openscarlett {
 
-static constexpr uint32_t kBcPackMagic = 0x4B504342u;  // 'BCPK' little-endian
+static constexpr uint32_t kBcPackMagic = 0x4B504342u;          // 'BCPK' little-endian
+static constexpr uint32_t kBcPackMipChainMagic = 0x4D504342u;  // 'BCPM' little-endian
 static constexpr uint16_t kBcPackVersion = 1u;
 static constexpr uint32_t kBcPackMaxDimension = 16384u;
 static constexpr uint32_t kBcPackMaxPlanes = 8u;
+static constexpr uint32_t kBcPackMaxMipLevels = 15u;
+static constexpr uint32_t kBcPackEndpointRingCapacity = 64u;
+static constexpr uint32_t kBcPackMaxSelectorTableEntries = 256u;
 
 enum class BcFormat : uint32_t {
     Unknown = 0,
@@ -59,6 +63,8 @@ enum class BcPlaneCodec : uint8_t {
     LzRle = 1,
     CanonicalHuffman = 2,
     LzRleHuffman = 3,
+    EndpointRingWindow = 4,
+    SelectorIndexTable = 5,
 };
 
 struct BcPackPlaneDescriptor {
@@ -94,11 +100,52 @@ struct BcPackStats {
     double compression_ratio = 1.0;  // compressed_size / original_size
 };
 
+struct BcPackCompressOptions {
+    bool force_transform = false;
+    BcPlaneTransform forced_transform = BcPlaneTransform::None;
+    bool force_codec = false;
+    BcPlaneCodec forced_codec = BcPlaneCodec::Raw;
+    bool enable_specialized_codecs = true;
+};
+
+struct BcPackMipLevelInfo {
+    uint32_t mip_level = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t block_width = 0;
+    uint32_t block_height = 0;
+    uint32_t block_count = 0;
+    uint64_t byte_size = 0;
+};
+
+struct BcPackMipChainHeader {
+    uint32_t magic = kBcPackMipChainMagic;
+    uint16_t version = kBcPackVersion;
+    uint16_t flags = 0;
+    BcFormat format = BcFormat::Unknown;
+    uint32_t base_width = 0;
+    uint32_t base_height = 0;
+    uint32_t mip_count = 0;
+    std::vector<uint32_t> mip_offsets;
+    std::vector<uint32_t> mip_compressed_sizes;
+};
+
 // Returns exact byte size of a single 4x4 block for the given BC format (0 if invalid).
 uint32_t BcFormatBlockBytes(BcFormat format) noexcept;
 
 // Computes expected uncompressed byte size for a BC texture surface (0 on invalid/overflow).
 uint64_t BcCalculateSurfaceSize(BcFormat format, uint32_t width, uint32_t height) noexcept;
+
+// Computes maximum valid mip count (down to 1x1) for a surface (0 if dimensions invalid).
+uint32_t BcCalculateMaxMipLevels(uint32_t base_width, uint32_t base_height) noexcept;
+
+// Computes block dimensions and byte size for a specific mip level (handles NPOT and < 4x4 mips).
+bool BcCalculateMipLevelInfo(
+    BcFormat format,
+    uint32_t base_width,
+    uint32_t base_height,
+    uint32_t mip_level,
+    BcPackMipLevelInfo& out_info) noexcept;
 
 // Computes IEEE 802.3 CRC32 over a byte range.
 uint32_t BcPackCrc32(const uint8_t* data, size_t size) noexcept;
@@ -107,13 +154,24 @@ uint32_t BcPackCrc32(const uint8_t* data, size_t size) noexcept;
 Status BcPackParseHeader(const uint8_t* src, size_t src_size, BcPackHeader& out_header);
 
 // Compresses a BC1/BC2/BC3/BC4/BC5/BC6H/BC7 GPU texture surface losslessly using
-// BC-block plane separation, spatial delta/XOR decorrelation, and LZ-RLE + Canonical Huffman coding.
+// BC-block plane separation, spatial delta/XOR decorrelation, and entropy coding.
 Status BcPackCompress(
     BcFormat format,
     uint32_t width,
     uint32_t height,
     const uint8_t* src_blocks,
     size_t src_size,
+    std::vector<uint8_t>& out_compressed,
+    BcPackStats* out_stats = nullptr);
+
+// Compresses a BC surface with explicit codec/transform options (for deterministic testing).
+Status BcPackCompressWithOptions(
+    BcFormat format,
+    uint32_t width,
+    uint32_t height,
+    const uint8_t* src_blocks,
+    size_t src_size,
+    const BcPackCompressOptions& options,
     std::vector<uint8_t>& out_compressed,
     BcPackStats* out_stats = nullptr);
 
@@ -124,5 +182,42 @@ Status BcPackDecompress(
     size_t src_size,
     std::vector<uint8_t>& out_blocks,
     BcPackHeader* out_header = nullptr);
+
+// Decompresses a BCPack stream into a caller-provided fixed buffer, strictly rejecting
+// undersized output buffers before writing.
+Status BcPackDecompressInto(
+    const uint8_t* src,
+    size_t src_size,
+    uint8_t* dst_blocks,
+    size_t dst_capacity,
+    size_t* out_written = nullptr,
+    BcPackHeader* out_header = nullptr);
+
+// Multi-mip BCPack container helpers (supports NPOT dimensions and sub-4x4 tail mips).
+Status BcPackCompressMipChain(
+    BcFormat format,
+    uint32_t base_width,
+    uint32_t base_height,
+    const std::vector<std::vector<uint8_t>>& mip_surfaces,
+    std::vector<uint8_t>& out_compressed);
+
+Status BcPackParseMipChainHeader(
+    const uint8_t* src,
+    size_t src_size,
+    BcPackMipChainHeader& out_header);
+
+Status BcPackDecompressMipChain(
+    const uint8_t* src,
+    size_t src_size,
+    std::vector<std::vector<uint8_t>>& out_mip_surfaces,
+    BcPackMipChainHeader* out_header = nullptr);
+
+// Generates a deterministic clean-room synthetic BC1..BC7 surface for round-trip testing.
+Status BcGenerateSyntheticSurface(
+    BcFormat format,
+    uint32_t width,
+    uint32_t height,
+    uint32_t seed,
+    std::vector<uint8_t>& out_blocks);
 
 }  // namespace openscarlett
