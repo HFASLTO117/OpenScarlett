@@ -36,7 +36,9 @@ int RunProbeGpu() {
             adapter->GetDesc1(&desc);
             char name[256]{};
             WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof(name), nullptr, nullptr);
-            bool is_sw = (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
+            bool is_sw = ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0) ||
+                         (desc.VendorId == 0x1414u &&
+                          (desc.DeviceId == 0x008Cu || desc.DedicatedVideoMemory == 0));
 
             Microsoft::WRL::ComPtr<ID3D12Device> dev;
             HRESULT hr = D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&dev));

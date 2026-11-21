@@ -68,7 +68,8 @@ void VerifyTelemetryJson(const fs::path& json_path) {
 void TestVfsMountsUnit() {
     using namespace openscarlett;
 
-    const fs::path unit_root = fs::path(R"(E:\OpenScarlett\.tmp\sprint1-loader\vfs_unit)");
+    const fs::path unit_root =
+        (fs::path(OPENSCARLETT_BINARY_DIR) / ".tmp_apc_loader" / "vfs_unit").make_preferred();
     std::error_code ec;
     fs::remove_all(unit_root, ec);
 
@@ -141,8 +142,8 @@ void TestLiveApcInjectionAndCli() {
     OS_REQUIRE(fs::exists(build_dir / "openscarlett_hook.dll"));
     OS_REQUIRE(fs::exists(build_dir / "winrt_xs.dll"));
 
-    // Prepare completely isolated guest folder on E:\ with ZERO shim DLLs inside it.
-    const fs::path sandbox_root = fs::path(R"(E:\OpenScarlett\.tmp\sprint1-loader\apc_e2e)");
+    // Prepare completely isolated guest folder inside build dir (on E:\ locally, portable in CI) with ZERO shim DLLs.
+    const fs::path sandbox_root = (build_dir / ".tmp_apc_loader" / "apc_e2e").make_preferred();
     std::error_code ec;
     fs::remove_all(sandbox_root, ec);
 
@@ -231,7 +232,8 @@ void TestCrossDllTelemetryForwarding() {
 
     const fs::path build_dir = fs::path(OPENSCARLETT_BINARY_DIR);
     const fs::path hook_dll = build_dir / "openscarlett_hook.dll";
-    const fs::path forward_json = fs::path(R"(E:\OpenScarlett\.tmp\sprint1-loader\apc_e2e\telemetry_forward.json)");
+    const fs::path forward_json =
+        (build_dir / ".tmp_apc_loader" / "apc_e2e" / "telemetry_forward.json").make_preferred();
     std::error_code ec;
     fs::remove(forward_json, ec);
 

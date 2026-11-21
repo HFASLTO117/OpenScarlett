@@ -125,6 +125,16 @@ uint32_t ProbeMaxFeatureLevel(ID3D12Device* device) noexcept {
     return static_cast<uint32_t>(D3D_FEATURE_LEVEL_12_0);
 }
 
+bool IsSoftwareOrWarpAdapter(const DXGI_ADAPTER_DESC1& desc) noexcept {
+    if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0) return true;
+    // Microsoft Basic Render Driver / WARP (VID 0x1414, DID 0x008C) can enumerate
+    // without DXGI_ADAPTER_FLAG_SOFTWARE on headless/Hyper-V Windows Server hosts.
+    if (desc.VendorId == 0x1414u && (desc.DeviceId == 0x008Cu || desc.DedicatedVideoMemory == 0)) {
+        return true;
+    }
+    return false;
+}
+
 bool TryCreateHostDevice(
     PfnD3D12CreateDevice create_fn,
     IDXGIAdapter1* adapter,
@@ -188,7 +198,7 @@ Status QueryD3D12DeviceAdapterInfo(
             out_info.shared_system_memory_bytes = static_cast<uint64_t>(desc.SharedSystemMemory);
             out_info.luid_low = desc.AdapterLuid.LowPart;
             out_info.luid_high = desc.AdapterLuid.HighPart;
-            out_info.is_warp = (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
+            out_info.is_warp = IsSoftwareOrWarpAdapter(desc);
         }
     } else {
         const LUID luid = device->GetAdapterLuid();
@@ -291,7 +301,7 @@ Status SelectD3D12AdapterAndCreateDevice(
             }
             DXGI_ADAPTER_DESC1 desc{};
             if (FAILED(adapter->GetDesc1(&desc))) continue;
-            if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0) continue;
+            if (IsSoftwareOrWarpAdapter(desc)) continue;
 
             Candidate c;
             c.dedicated_vram = static_cast<uint64_t>(desc.DedicatedVideoMemory);

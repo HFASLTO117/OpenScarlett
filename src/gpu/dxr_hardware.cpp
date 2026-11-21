@@ -160,6 +160,16 @@ std::string WideToUtf8(const wchar_t* wide) {
     return out;
 }
 
+bool IsSoftwareOrWarpAdapter(const DXGI_ADAPTER_DESC1& desc) noexcept {
+    if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0) return true;
+    // Microsoft Basic Render Driver / WARP (VID 0x1414, DID 0x008C) can enumerate
+    // without DXGI_ADAPTER_FLAG_SOFTWARE on headless/Hyper-V Windows Server hosts.
+    if (desc.VendorId == 0x1414u && (desc.DeviceId == 0x008Cu || desc.DedicatedVideoMemory == 0)) {
+        return true;
+    }
+    return false;
+}
+
 void PopulateAdapterCaps(IDXGIAdapter1* adapter, DxrCapabilities& caps) {
     if (!adapter) {
         return;
@@ -167,7 +177,7 @@ void PopulateAdapterCaps(IDXGIAdapter1* adapter, DxrCapabilities& caps) {
     DXGI_ADAPTER_DESC1 desc{};
     if (SUCCEEDED(adapter->GetDesc1(&desc))) {
         caps.adapter_description = WideToUtf8(desc.Description);
-        caps.adapter_is_warp = (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
+        caps.adapter_is_warp = IsSoftwareOrWarpAdapter(desc);
         caps.vendor_id = desc.VendorId;
         caps.device_id = desc.DeviceId;
         caps.dedicated_video_memory = static_cast<uint64_t>(desc.DedicatedVideoMemory);
@@ -507,7 +517,7 @@ Status DxrHardwareEngine::Initialize(const DxrInitOptions& options) {
                 }
                 DXGI_ADAPTER_DESC1 desc{};
                 if (SUCCEEDED(candidate->GetDesc1(&desc)) &&
-                    (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0) {
+                    !IsSoftwareOrWarpAdapter(desc)) {
                     HRESULT dev_hr = D3D12CreateDevice(
                         candidate, D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&created_device));
                     if (FAILED(dev_hr)) {
