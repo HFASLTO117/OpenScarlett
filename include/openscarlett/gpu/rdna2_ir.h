@@ -33,6 +33,7 @@ enum class IrOp : uint16_t {
 
     // Texture / Image ops (MIMG)
     ImageSample,        // operands: [u_f32, v_f32, lod_f32], imm_u32 = channel (0..3) -> f32
+    ImageSampleImplicit,// operands: [u_f32, v_f32], imm_u32 = channel (0..3) -> f32 (PS helper-lane quad derivatives)
     ImageLoad,          // operands: [x_u32, y_u32], imm_u32 = channel (0..3) -> f32
     ImageLoadMip,       // operands: [x_u32, y_u32, z_or_face_u32, mip_u32], imm_u32 = ch | (dim << 4) -> f32
     ImageStore,         // operands: [x_u32, y_u32, r_f32, g_f32, b_f32, a_f32] -> void
@@ -67,7 +68,9 @@ enum class IrOp : uint16_t {
     FAdd,
     FSub,
     FMul,
-    FFma,
+    FFma,           // Single-rounding fused multiply-add (preserves subnormals)
+    FMad,           // Unfused denormal-flushing multiply then add (distinct from FFma)
+    FFma16,         // Low-16-bit fused f16 multiply-add, imm_u32 = (op_sel & 7) | (clamp << 16) -> u32 (lo16 f16)
     FMin,
     FMax,
     FRcp,
@@ -87,6 +90,7 @@ enum class IrOp : uint16_t {
     BitOr,
     BitXor,
     BitNot,
+    BitCount32,     // operands: [src_u32] -> u32 (strictly low 32-bit popcount for S_BCNT1_I32_B32)
     Shl,
     Shr,
 
@@ -184,6 +188,7 @@ struct Rdna2IrModule {
     uint32_t scratch_size_dwords = 64;
     bool uses_texture_srv = false;
     bool uses_texture_sample = false;
+    bool uses_pixel_quad_derivatives = false;
     bool uses_texture_load = false;
     bool uses_texture2d_mip_srv = false;
     bool uses_texture3d_srv = false;

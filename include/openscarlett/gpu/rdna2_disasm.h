@@ -162,6 +162,7 @@ enum class Rdna2Opcode : uint16_t {
     // SOP1
     S_MOV_B32,
     S_NOT_B32,
+    S_BCNT1_I32_B32,
     S_BCNT1_I32_B64,
     S_GETPC_B64,
 
@@ -210,7 +211,13 @@ enum class Rdna2Opcode : uint16_t {
     V_MAX_I32,
     V_MIN_U32,
     V_MAX_U32,
+    V_MAC_F32,
+    V_MADMK_F32,
+    V_MADAK_F32,
     V_FMAC_F32,
+    V_FMAC_F16,
+    V_FMAMK_F16,
+    V_FMAAK_F16,
     V_AND_B32,
     V_OR_B32,
     V_XOR_B32,
@@ -250,13 +257,24 @@ enum class Rdna2Opcode : uint16_t {
     V_CMP_GT_U32,
     V_CMP_GE_U32,
 
-    // VOP3 (native 3-operand / wave / bitfield ops)
+    // VOP3 (native 3-operand / wave / bitfield / 16-bit ops)
     V_FMA_F32,
+    V_FMA_F16,
     V_MAD_F32,
     V_BFE_U32,
     V_BFE_I32,
     V_BFI_B32,
     V_MUL_LO_U32,
+    V_ADD_NC_U16,
+    V_SUB_NC_U16,
+    V_MIN_U16,
+    V_MAX_U16,
+    V_MIN_I16,
+    V_MAX_I16,
+    V_MUL_LO_U16,
+    V_LSHLREV_B16,
+    V_LSHRREV_B16,
+    V_MAD_U16,
     V_MBCNT_LO_U32_B32,
     V_MBCNT_HI_U32_B32,
     V_READLANE_B32,
@@ -371,6 +389,20 @@ enum class Rdna2ExportTarget : uint8_t {
     Param3 = 35,
 };
 
+enum class Rdna2OperandWidth : uint8_t {
+    Bits32 = 32,
+    Bits16 = 16,
+    Bits64 = 64,
+};
+
+enum class Rdna2DataKind : uint8_t {
+    Untyped = 0,
+    Float,
+    UnsignedInt,
+    SignedInt,
+    Packed16,
+};
+
 struct Rdna2Instruction {
     uint32_t word_offset = 0;   // Index of word0 in code_words
     uint32_t word_count = 1;    // 1 (32-bit), 2 (64-bit), or 3 (VOP3 + literal32)
@@ -379,6 +411,9 @@ struct Rdna2Instruction {
     Rdna2Encoding encoding = Rdna2Encoding::Unknown;
     Rdna2Opcode opcode = Rdna2Opcode::Unknown;
     uint16_t raw_opcode = 0;
+    Rdna2OperandWidth operand_width = Rdna2OperandWidth::Bits32;
+    Rdna2DataKind data_kind = Rdna2DataKind::Untyped;
+    uint8_t vop3_op_sel = 0;    // VOP3 bits [14:11] for 16-bit operand/dst half selection
 
     Rdna2Operand dst{};
     Rdna2Operand src[4]{};
@@ -440,6 +475,10 @@ bool EncodeRdna2SourceOperand(
 
 const char* Rdna2OpcodeName(Rdna2Opcode op) noexcept;
 const char* Rdna2EncodingName(Rdna2Encoding enc) noexcept;
+// Structural VOP3 (0xD4..0xD7 / 64-bit) & 16-bit instruction classification by encoding/metadata (no _e64 string checks).
+bool IsVop3EncodingWord(uint32_t word0) noexcept;
+bool IsVop3Int16Instruction(const Rdna2Instruction& inst) noexcept;
+bool IsVop3Float16Instruction(const Rdna2Instruction& inst) noexcept;
 std::string FormatRdna2Operand(const Rdna2Operand& op);
 std::string FormatRdna2Instruction(const Rdna2Instruction& inst);
 
@@ -471,6 +510,8 @@ public:
 
     // VOP2 (automatically emits 64-bit word when src0 is a 32-bit literal)
     void EmitVop2(Rdna2Opcode op, uint8_t vdst, const Rdna2Operand& src0, uint8_t vsrc1);
+    // VOP2 with mandatory 32-bit literal K (V_FMAMK_F16, V_FMAAK_F16, V_MADMK_F32, V_MADAK_F32)
+    void EmitVop2Literal(Rdna2Opcode op, uint8_t vdst, const Rdna2Operand& src0, uint8_t vsrc1, uint32_t literal_k);
     // VOP1 (automatically emits 64-bit word when src0 is a 32-bit literal)
     void EmitVop1(Rdna2Opcode op, uint8_t vdst, const Rdna2Operand& src0);
     // VOPC (automatically emits 64-bit word when src0 is a 32-bit literal)
@@ -482,7 +523,8 @@ public:
         const Rdna2Operand& src0,
         const Rdna2Operand& src1,
         const Rdna2Operand& src2 = Rdna2Operand::InlineInt(0),
-        bool clamp = false);
+        bool clamp = false,
+        uint8_t op_sel = 0u);
 
     // VOP3P (64-bit, or 96-bit with literal; encoding 0x33 packed 16-bit ops)
     void EmitVop3p(

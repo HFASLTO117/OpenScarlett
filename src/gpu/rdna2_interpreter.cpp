@@ -88,6 +88,22 @@ uint32_t PopCount64(uint64_t v) noexcept {
     return static_cast<uint32_t>(std::popcount(v));
 }
 
+float FlushDenormF32(float x) noexcept {
+    const uint32_t bits = FloatToBits(x);
+    if ((bits & 0x7F800000u) == 0u) {
+        return BitsToFloat(bits & 0x80000000u);
+    }
+    return x;
+}
+
+float EvalMadF32(float a, float b, float c) noexcept {
+    const float fa = FlushDenormF32(a);
+    const float fb = FlushDenormF32(b);
+    const float fc = FlushDenormF32(c);
+    const float prod = FlushDenormF32(fa * fb);
+    return FlushDenormF32(prod + fc);
+}
+
 bool IsBranchOp(Rdna2Opcode op) noexcept {
     switch (op) {
         case Rdna2Opcode::S_BRANCH:
@@ -615,6 +631,9 @@ Status ExecuteRdna2Cpu(
                                     uint64_t hi = (op.reg_index + 1u < 106u) ? wv.sgpr[op.reg_index + 1u] : 0u;
                                     return lo | (hi << 32);
                                 }
+                                if (op.kind == Rdna2OperandKind::InlineInt) {
+                                    return static_cast<uint64_t>(static_cast<int64_t>(op.int_value));
+                                }
                                 return read_op_u32(op, 0u);
                             };
 
@@ -752,6 +771,12 @@ Status ExecuteRdna2Cpu(
                                     const uint32_t r = ~read_op_u32(inst.src[0], 0);
                                     write_sgpr(inst.dst, r);
                                     wv.scc = (r != 0u);
+                                    break;
+                                }
+                                case Rdna2Opcode::S_BCNT1_I32_B32: {
+                                    const uint32_t cnt = PopCount32(read_op_u32(inst.src[0], 0));
+                                    write_sgpr(inst.dst, cnt);
+                                    wv.scc = (cnt != 0u);
                                     break;
                                 }
                                 case Rdna2Opcode::S_BCNT1_I32_B64: {
@@ -968,12 +993,49 @@ Status ExecuteRdna2Cpu(
                                             std::max(read_op_u32(inst.src[0], l), read_op_u32(inst.src[1], l));
                                     }
                                     break;
+                                case Rdna2Opcode::V_MAC_F32:
+                                    for (uint32_t l = 0; l < wv.lane_count; ++l) {
+                                        if (!lane_active(l)) continue;
+                                        const float acc = BitsToFloat(wv.vgpr[l][inst.dst.reg_index]);
+                                        wv.vgpr[l][inst.dst.reg_index] = FloatToBits(
+                                            clamp_f32(EvalMadF32(read_op_f32(inst.src[0], l), read_op_f32(inst.src[1], l), acc)));
+                                    }
+                                    break;
+                                case Rdna2Opcode::V_MADMK_F32:
+                                case Rdna2Opcode::V_MADAK_F32:
+                                    for (uint32_t l = 0; l < wv.lane_count; ++l) {
+                                        if (!lane_active(l)) continue;
+                                        wv.vgpr[l][inst.dst.reg_index] = FloatToBits(clamp_f32(
+                                            EvalMadF32(read_op_f32(inst.src[0], l), read_op_f32(inst.src[1], l), read_op_f32(inst.src[2], l))));
+                                    }
+                                    break;
                                 case Rdna2Opcode::V_FMAC_F32:
                                     for (uint32_t l = 0; l < wv.lane_count; ++l) {
                                         if (!lane_active(l)) continue;
                                         const float acc = BitsToFloat(wv.vgpr[l][inst.dst.reg_index]);
                                         wv.vgpr[l][inst.dst.reg_index] = FloatToBits(
-                                            clamp_f32(std::fma(read_op_f32(inst.src[0], l), read_op_f32(inst.src[1], l), acc)));
+                                            clamp_f32(std::fmaf(read_op_f32(inst.src[0], l), read_op_f32(inst.src[1], l), acc)));
+                                    }
+                                    break;
+                                case Rdna2Opcode::V_FMAC_F16:
+                                    for (uint32_t l = 0; l < wv.lane_count; ++l) {
+                                        if (!lane_active(l)) continue;
+                                        const float a = HalfBitsToFloat(PickHalf16(read_op_u32(inst.src[0], l), false));
+                                        const float b = HalfBitsToFloat(PickHalf16(read_op_u32(inst.src[1], l), false));
+                                        const float acc = HalfBitsToFloat(PickHalf16(wv.vgpr[l][inst.dst.reg_index], false));
+                                        wv.vgpr[l][inst.dst.reg_index] =
+                                            static_cast<uint32_t>(FloatToHalfBits(clamp_f32(std::fmaf(a, b, acc))));
+                                    }
+                                    break;
+                                case Rdna2Opcode::V_FMAMK_F16:
+                                case Rdna2Opcode::V_FMAAK_F16:
+                                    for (uint32_t l = 0; l < wv.lane_count; ++l) {
+                                        if (!lane_active(l)) continue;
+                                        const float a = HalfBitsToFloat(PickHalf16(read_op_u32(inst.src[0], l), false));
+                                        const float b = HalfBitsToFloat(PickHalf16(read_op_u32(inst.src[1], l), false));
+                                        const float c = HalfBitsToFloat(PickHalf16(read_op_u32(inst.src[2], l), false));
+                                        wv.vgpr[l][inst.dst.reg_index] =
+                                            static_cast<uint32_t>(FloatToHalfBits(clamp_f32(std::fmaf(a, b, c))));
                                     }
                                     break;
                                 case Rdna2Opcode::V_AND_B32:
@@ -1141,13 +1203,73 @@ Status ExecuteRdna2Cpu(
                                     break;
                                 }
 
-                                // ----- VOP3 (3-op / wave / bitfield) -----
+                                // ----- VOP3 (3-op / wave / bitfield / 16-bit) -----
                                 case Rdna2Opcode::V_FMA_F32:
+                                    for (uint32_t l = 0; l < wv.lane_count; ++l) {
+                                        if (!lane_active(l)) continue;
+                                        wv.vgpr[l][inst.dst.reg_index] = FloatToBits(clamp_f32(
+                                            std::fmaf(read_op_f32(inst.src[0], l), read_op_f32(inst.src[1], l), read_op_f32(inst.src[2], l))));
+                                    }
+                                    break;
                                 case Rdna2Opcode::V_MAD_F32:
                                     for (uint32_t l = 0; l < wv.lane_count; ++l) {
                                         if (!lane_active(l)) continue;
                                         wv.vgpr[l][inst.dst.reg_index] = FloatToBits(clamp_f32(
-                                            std::fma(read_op_f32(inst.src[0], l), read_op_f32(inst.src[1], l), read_op_f32(inst.src[2], l))));
+                                            EvalMadF32(read_op_f32(inst.src[0], l), read_op_f32(inst.src[1], l), read_op_f32(inst.src[2], l))));
+                                    }
+                                    break;
+                                case Rdna2Opcode::V_FMA_F16:
+                                    for (uint32_t l = 0; l < wv.lane_count; ++l) {
+                                        if (!lane_active(l)) continue;
+                                        auto read_f16 = [&](uint8_t idx) -> float {
+                                            const bool hi = ((inst.vop3_op_sel >> idx) & 1u) != 0u;
+                                            float v = HalfBitsToFloat(PickHalf16(read_op_u32(inst.src[idx], l), hi));
+                                            if (inst.src[idx].abs) v = std::fabs(v);
+                                            if (inst.src[idx].neg) v = -v;
+                                            return v;
+                                        };
+                                        const float r = clamp_f32(std::fmaf(read_f16(0u), read_f16(1u), read_f16(2u)));
+                                        wv.vgpr[l][inst.dst.reg_index] = static_cast<uint32_t>(FloatToHalfBits(r));
+                                    }
+                                    break;
+                                case Rdna2Opcode::V_ADD_NC_U16:
+                                case Rdna2Opcode::V_SUB_NC_U16:
+                                case Rdna2Opcode::V_MIN_U16:
+                                case Rdna2Opcode::V_MAX_U16:
+                                case Rdna2Opcode::V_MIN_I16:
+                                case Rdna2Opcode::V_MAX_I16:
+                                case Rdna2Opcode::V_MUL_LO_U16:
+                                case Rdna2Opcode::V_LSHLREV_B16:
+                                case Rdna2Opcode::V_LSHRREV_B16:
+                                case Rdna2Opcode::V_MAD_U16:
+                                    for (uint32_t l = 0; l < wv.lane_count; ++l) {
+                                        if (!lane_active(l)) continue;
+                                        const uint16_t a16 = PickHalf16(read_op_u32(inst.src[0], l), (inst.vop3_op_sel & 1u) != 0u);
+                                        const uint16_t b16 = PickHalf16(read_op_u32(inst.src[1], l), ((inst.vop3_op_sel >> 1) & 1u) != 0u);
+                                        uint16_t r16 = 0u;
+                                        if (inst.opcode == Rdna2Opcode::V_ADD_NC_U16) {
+                                            r16 = static_cast<uint16_t>(a16 + b16);
+                                        } else if (inst.opcode == Rdna2Opcode::V_SUB_NC_U16) {
+                                            r16 = static_cast<uint16_t>(a16 - b16);
+                                        } else if (inst.opcode == Rdna2Opcode::V_MIN_U16) {
+                                            r16 = std::min(a16, b16);
+                                        } else if (inst.opcode == Rdna2Opcode::V_MAX_U16) {
+                                            r16 = std::max(a16, b16);
+                                        } else if (inst.opcode == Rdna2Opcode::V_MIN_I16) {
+                                            r16 = static_cast<uint16_t>(std::min(static_cast<int16_t>(a16), static_cast<int16_t>(b16)));
+                                        } else if (inst.opcode == Rdna2Opcode::V_MAX_I16) {
+                                            r16 = static_cast<uint16_t>(std::max(static_cast<int16_t>(a16), static_cast<int16_t>(b16)));
+                                        } else if (inst.opcode == Rdna2Opcode::V_MUL_LO_U16) {
+                                            r16 = static_cast<uint16_t>(a16 * b16);
+                                        } else if (inst.opcode == Rdna2Opcode::V_LSHLREV_B16) {
+                                            r16 = static_cast<uint16_t>(b16 << (a16 & 15u));
+                                        } else if (inst.opcode == Rdna2Opcode::V_LSHRREV_B16) {
+                                            r16 = static_cast<uint16_t>(b16 >> (a16 & 15u));
+                                        } else {
+                                            const uint16_t c16 = PickHalf16(read_op_u32(inst.src[2], l), ((inst.vop3_op_sel >> 2) & 1u) != 0u);
+                                            r16 = static_cast<uint16_t>(static_cast<uint32_t>(a16) * static_cast<uint32_t>(b16) + c16);
+                                        }
+                                        wv.vgpr[l][inst.dst.reg_index] = static_cast<uint32_t>(r16);
                                     }
                                     break;
                                 case Rdna2Opcode::V_BFE_U32:
@@ -1400,13 +1522,32 @@ Status ExecuteRdna2Cpu(
                                     const uint8_t vaddr_b = static_cast<uint8_t>(inst.src[0].reg_index);
                                     const uint8_t vdata_b = static_cast<uint8_t>(inst.dst.reg_index);
                                     const uint8_t dmask = inst.mimg_dmask ? inst.mimg_dmask : 0xFu;
+                                    const float tex_w = (!state.tex2d_srv.mips.empty())
+                                                            ? static_cast<float>(state.tex2d_srv.mips[0].width)
+                                                            : 1.0f;
+                                    const float tex_h = (!state.tex2d_srv.mips.empty())
+                                                            ? static_cast<float>(state.tex2d_srv.mips[0].height)
+                                                            : 1.0f;
                                     for (uint32_t l = 0; l < wv.lane_count; ++l) {
                                         if (!lane_active(l)) continue;
                                         const float u = BitsToFloat(wv.vgpr[l][vaddr_b]);
                                         const float v = BitsToFloat(wv.vgpr[l][vaddr_b + 1u]);
-                                        const float lod = (inst.opcode == Rdna2Opcode::IMAGE_SAMPLE)
-                                                              ? BitsToFloat(wv.vgpr[l][vaddr_b + 2u])
-                                                              : 0.0f;
+                                        float lod = 0.0f;
+                                        if (inst.opcode == Rdna2Opcode::IMAGE_SAMPLE) {
+                                            if (container.stage == ShaderStage::Pixel && wv.lane_count >= 4u) {
+                                                // 2x2 quad helper-lane finite difference mip derivative estimation
+                                                const uint32_t lx = l ^ 1u;
+                                                const uint32_t ly = l ^ 2u;
+                                                const float dudx = (lx < wv.lane_count) ? (BitsToFloat(wv.vgpr[lx][vaddr_b]) - u) * tex_w : 0.0f;
+                                                const float dvdx = (lx < wv.lane_count) ? (BitsToFloat(wv.vgpr[lx][vaddr_b + 1u]) - v) * tex_h : 0.0f;
+                                                const float dudy = (ly < wv.lane_count) ? (BitsToFloat(wv.vgpr[ly][vaddr_b]) - u) * tex_w : 0.0f;
+                                                const float dvdy = (ly < wv.lane_count) ? (BitsToFloat(wv.vgpr[ly][vaddr_b + 1u]) - v) * tex_h : 0.0f;
+                                                const float rho2 = std::fmax(dudx * dudx + dvdx * dvdx, dudy * dudy + dvdy * dvdy);
+                                                lod = (rho2 > 1e-12f) ? (0.5f * std::log2(rho2)) : 0.0f;
+                                            } else {
+                                                lod = BitsToFloat(wv.vgpr[l][vaddr_b + 2u]);
+                                            }
+                                        }
                                         const auto px = state.tex2d_srv.SampleNearest(u, v, lod);
                                         uint8_t out_r = vdata_b;
                                         for (uint32_t ch = 0; ch < 4u; ++ch) {

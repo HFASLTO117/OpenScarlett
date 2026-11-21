@@ -77,10 +77,33 @@ struct D3D12TestContext {
     uint64_t fence_val = 0;
 
     std::string adapter_name;
+    uint32_t vendor_id = 0;
+    uint32_t device_id = 0;
+    uint32_t adapter_flags = 0;
+    uint64_t driver_version = 0;
     bool is_warp = false;
     uint32_t wave_min = 0;
     uint32_t mesh_tier = 0;
     uint32_t highest_sm = 0;
+
+    // Catch 5 (Xbox2Windows #145): Microsoft WARP (VendorId 0x1414 / software adapter) versions
+    // up through 1.0.22 exhibit a non-uniform WaveReadLaneAt bug when reading across lane widths > 8.
+    // Real hardware GPUs (NVIDIA/AMD/Intel) are never guarded so hardware Wave32/Wave64 tests remain strict.
+    bool IsWarpAdapter() const noexcept {
+        return is_warp || vendor_id == 0x1414u || (adapter_flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0u;
+    }
+
+    bool ShouldGuardWarpNonUniformWaveReadAbove8() const noexcept {
+        if (!IsWarpAdapter()) return false;
+        // Guard WARP software rasterizer when running native WaveReadLaneAt non-uniform > 8 lanes
+        // (WARP 1.0.22 and Win10/11 built-in d3d10warp with WaveLaneCountMin <= 8).
+        const uint16_t maj = static_cast<uint16_t>((driver_version >> 48) & 0xFFFFu);
+        const uint16_t min_v = static_cast<uint16_t>((driver_version >> 32) & 0xFFFFu);
+        const uint16_t bld = static_cast<uint16_t>((driver_version >> 16) & 0xFFFFu);
+        const bool is_known_warp_1_0_22_or_older =
+            (driver_version == 0u) || (maj == 1u && min_v == 0u && bld <= 22u) || (wave_min <= 8u);
+        return is_known_warp_1_0_22_or_older;
+    }
 
     ~D3D12TestContext() {
         if (fence_event) {
@@ -104,6 +127,13 @@ struct D3D12TestContext {
 
         DXGI_ADAPTER_DESC1 desc{};
         adapter->GetDesc1(&desc);
+        vendor_id = desc.VendorId;
+        device_id = desc.DeviceId;
+        adapter_flags = desc.Flags;
+        LARGE_INTEGER umd_ver{};
+        if (SUCCEEDED(adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &umd_ver))) {
+            driver_version = static_cast<uint64_t>(umd_ver.QuadPart);
+        }
         char name_buf[256]{};
         WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name_buf, sizeof(name_buf), nullptr, nullptr);
         adapter_name = name_buf;
@@ -271,7 +301,13 @@ struct D3D12TestContext {
         queue->ExecuteCommandLists(1, lists);
         WaitGpu();
 
-        OS_REQUIRE(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+        HRESULT map_hr = readback->Map(0, nullptr, &mapped);
+        if (FAILED(map_hr)) {
+            std::fprintf(stderr, "[FAIL] readback->Map failed on %s: hr=0x%08lX removed=0x%08lX\n",
+                         adapter_name.c_str(), static_cast<unsigned long>(map_hr),
+                         static_cast<unsigned long>(device->GetDeviceRemovedReason()));
+        }
+        OS_REQUIRE(SUCCEEDED(map_hr));
         std::memcpy(out_data.data(), mapped, static_cast<size_t>(byte_size));
         readback->Unmap(0, nullptr);
     }
@@ -441,7 +477,13 @@ struct D3D12TestContext {
         queue->ExecuteCommandLists(1, lists);
         WaitGpu();
 
-        OS_REQUIRE(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+        HRESULT map_hr = readback->Map(0, nullptr, &mapped);
+        if (FAILED(map_hr)) {
+            std::fprintf(stderr, "[FAIL] readback->Map failed on %s: hr=0x%08lX removed=0x%08lX\n",
+                         adapter_name.c_str(), static_cast<unsigned long>(map_hr),
+                         static_cast<unsigned long>(device->GetDeviceRemovedReason()));
+        }
+        OS_REQUIRE(SUCCEEDED(map_hr));
         std::memcpy(out_rgba.data(), mapped, kTotalBytes);
         readback->Unmap(0, nullptr);
     }
@@ -619,7 +661,13 @@ struct D3D12TestContext {
         WaitGpu();
 
         void* mapped = nullptr;
-        OS_REQUIRE(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
+        HRESULT map_hr = readback->Map(0, nullptr, &mapped);
+        if (FAILED(map_hr)) {
+            std::fprintf(stderr, "[FAIL] readback->Map failed on %s: hr=0x%08lX removed=0x%08lX\n",
+                         adapter_name.c_str(), static_cast<unsigned long>(map_hr),
+                         static_cast<unsigned long>(device->GetDeviceRemovedReason()));
+        }
+        OS_REQUIRE(SUCCEEDED(map_hr));
         std::memcpy(out_rgba8.data(), mapped, kTotalBytes);
         readback->Unmap(0, nullptr);
     }
@@ -1995,6 +2043,513 @@ void Test7_AaaOpcodesLiveDualGpuAndCpuParity(openscarlett::VulkanBackend& vk,
     std::printf("[PASS] Test 7: AAA Opcodes (Permlane16/X16, BFE/BFI, Scratch, VOP3P f16/u16, 3D/Cube Mip + AtomicCmpSwap, BVH Ray) -> spirv-val + Vulkan + D3D12 HW + WARP + CPU exact parity!\n");
 }
 
+// ---------------------------------------------------------------------------
+// Test 8: All 5 RDNA2 ISA & Wave64 Ecosystem Catches Live Dual-GPU + CPU Parity
+//   8A: Zero-initialized LDS (groupshared) read-before-write + atomic counter
+//   8B: GFX10.3 VOP2 0x36/0x37/0x38 f16 FMA + V_FMA_F32 vs V_MAD_F32 (FMA != MAD!)
+//   8C: 16-bit integer VOP3 (no _e64 assumption) + s_bcnt1_i32_b32 vs b64 high-word
+//   8D: Pixel shader helper-lane affine ddx/ddy/QuadReadAcross mip derivs in divergent CFG
+//   8E: Bounded wave64-on-wave32 Mesh Shader (live DispatchMesh!) + Geometry Shader (gs_6_5)
+//   8F: WARP 1.0.22 non-uniform WaveReadLaneAt > 8 guard + HW strict verification
+// ---------------------------------------------------------------------------
+void Test8_Rdna2IsaCatchesLiveDualGpuAndCpuParity(openscarlett::VulkanBackend& vk,
+                                                  D3D12TestContext& d3d_hw,
+                                                  D3D12TestContext& d3d_warp) {
+    using namespace openscarlett;
+
+    Rdna2LiftOptions opts{};
+    opts.use_sm65 = true;
+    opts.validate_spirv_external = HasExternalSpirvVal();
+    opts.compile_dxil_with_dxc = true;
+
+    // ----- 8A (Catch 1): Zero-initialized LDS read-before-write + unwritten atomic slot -----
+    {
+        Rdna2Assembler a;
+        a.EmitVop2(Rdna2Opcode::V_LSHLREV_B32, 1, Rdna2Operand::InlineInt(2), 0);
+        // Read unwritten LDS[tid] directly (must deterministically return 0 thanks to entry zero-init!)
+        a.EmitDs(Rdna2Opcode::DS_READ_B32, 2, 1);
+        // Atomic increment unwritten LDS[64] (byte offset 256) without manual tid==0 zeroing
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 3, Rdna2Operand::LiteralU32(256u));
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 4, Rdna2Operand::InlineInt(1));
+        a.EmitDs(Rdna2Opcode::DS_ADD_RTN_U32, 5, 3, 4);
+        a.EmitSopp(Rdna2Opcode::S_BARRIER);
+        a.EmitDs(Rdna2Opcode::DS_READ_B32, 6, 3);  // Final sum must be 64
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 2, 1, 4, 0);    // out[0..63]   = 0
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 6, 1, 4, 256);  // out[64..127] = 64
+        a.EmitSopp(Rdna2Opcode::S_ENDPGM);
+
+        Rdna2LiftResult res{};
+        auto st = LiftRdna2Xs2Shader(a.BuildXs2(ShaderStage::Compute, 64, 1, 1, 16, 16, 32), res, opts);
+        if (!st.ok()) {
+            std::fprintf(stderr, "[FAIL] Test8A Lift failed: %s\nHLSL:\n%s\n", st.message.c_str(), res.hlsl_source.c_str());
+        }
+        OS_REQUIRE(st.ok());
+        OS_REQUIRE(res.ir.uses_lds);
+        OS_REQUIRE(res.hlsl_source.find("_lds_init") != std::string::npos);
+        OS_REQUIRE(res.hlsl_source.find("GroupMemoryBarrierWithGroupSync()") != std::string::npos);
+        OS_REQUIRE(SpirvContainsOpcode(res.spirv_words, 246u));  // OpLoopMerge (cooperative LDS zero-init loop)
+        OS_REQUIRE(SpirvContainsOpcode(res.spirv_words, 224u));  // OpControlBarrier
+        VerifySpirvExternalStrict(res.spirv_words, "Test8A_ZeroInitLds");
+
+        std::vector<uint32_t> input(128, 0xCAFEBABEu);
+        Rdna2CpuExecState cpu{};
+        cpu.uav0 = input;
+        cpu.uav1.assign(128, 0xBADu);
+        OS_REQUIRE(ExecuteRdna2Cpu(res.container, res.instructions, cpu).ok());
+        for (uint32_t i = 0; i < 64u; ++i) {
+            OS_REQUIRE(cpu.uav1[i] == 0u);
+            OS_REQUIRE(cpu.uav1[64 + i] == 64u);
+        }
+
+        if (vk.GetDeviceInfo().is_hardware) {
+            std::vector<uint32_t> vk_out;
+            OS_REQUIRE(vk.ExecuteComputeShader(res.spirv_words, input, vk_out, 1).ok());
+            OS_REQUIRE(vk_out == cpu.uav1);
+        }
+        std::vector<uint32_t> hw_out;
+        d3d_hw.RunComputeBuffers(CompileForDevice(d3d_hw, res.hlsl_source, res.pc_dxil), input, hw_out, 1);
+        OS_REQUIRE(hw_out == cpu.uav1);
+
+        std::vector<uint32_t> warp_out;
+        d3d_warp.RunComputeBuffers(CompileForDevice(d3d_warp, res.hlsl_source, res.pc_dxil), input, warp_out, 1);
+        OS_REQUIRE(warp_out == cpu.uav1);
+    }
+
+    // ----- 8B (Catch 2): VOP2 0x36/0x37/0x38 f16 FMA + V_FMA_F32 vs V_MAD_F32 (rounding + denorm!) -----
+    {
+        Rdna2Assembler a;
+        a.EmitVop2(Rdna2Opcode::V_LSHLREV_B32, 1, Rdna2Operand::InlineInt(2), 0);
+        // Load dynamic inputs from uav0 so nothing constant-folds away!
+        // uav0[0..3] = a, b, c for rounding cancellation test (1+2^-13, 1-2^-13, -1.0)
+        // uav0[4..7] = a, b, c for denormal flush test (2^-127 [0x00400000], 4.0, 0.0)
+        // uav0[8..10] = f16 operands (1.5=0x3E00, 2.0=0x4000, 0.5=0x3800)
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 20, Rdna2Operand::InlineInt(0));
+        a.EmitMubuf(Rdna2Opcode::BUFFER_LOAD_DWORD, 2, 20, 0, 0);   // v2 = a_cancel
+        a.EmitMubuf(Rdna2Opcode::BUFFER_LOAD_DWORD, 3, 20, 0, 4);   // v3 = b_cancel
+        a.EmitMubuf(Rdna2Opcode::BUFFER_LOAD_DWORD, 4, 20, 0, 8);   // v4 = c_cancel
+        a.EmitMubuf(Rdna2Opcode::BUFFER_LOAD_DWORD, 5, 20, 0, 16);  // v5 = a_denorm (2^-127)
+        a.EmitMubuf(Rdna2Opcode::BUFFER_LOAD_DWORD, 6, 20, 0, 20);  // v6 = b_denorm (4.0)
+        a.EmitMubuf(Rdna2Opcode::BUFFER_LOAD_DWORD, 7, 20, 0, 24);  // v7 = c_denorm (0.0)
+        a.EmitMubuf(Rdna2Opcode::BUFFER_LOAD_DWORD, 8, 20, 0, 32);  // v8 = f16(1.5)
+        a.EmitMubuf(Rdna2Opcode::BUFFER_LOAD_DWORD, 9, 20, 0, 36);  // v9 = f16(2.0)
+        a.EmitMubuf(Rdna2Opcode::BUFFER_LOAD_DWORD, 10, 20, 0, 40); // v10 = f16(0.5)
+
+        // FMA vs MAD on cancellation vector
+        a.EmitVop3(Rdna2Opcode::V_FMA_F32, 11, Rdna2Operand::Vgpr(2), Rdna2Operand::Vgpr(3), Rdna2Operand::Vgpr(4));
+        a.EmitVop3(Rdna2Opcode::V_MAD_F32, 12, Rdna2Operand::Vgpr(2), Rdna2Operand::Vgpr(3), Rdna2Operand::Vgpr(4));
+        // FMA vs MAD on denormal vector
+        a.EmitVop3(Rdna2Opcode::V_FMA_F32, 13, Rdna2Operand::Vgpr(5), Rdna2Operand::Vgpr(6), Rdna2Operand::Vgpr(7));
+        a.EmitVop3(Rdna2Opcode::V_MAD_F32, 14, Rdna2Operand::Vgpr(5), Rdna2Operand::Vgpr(6), Rdna2Operand::Vgpr(7));
+        // VOP2 0x36/0x37/0x38 fused f16 + VOP3 v_fma_f16
+        a.EmitVop2(Rdna2Opcode::V_FMAC_F16, 10, Rdna2Operand::Vgpr(8), 9);                // 1.5*2.0 + 0.5 = 3.5 (0x4300)
+        a.EmitVop2Literal(Rdna2Opcode::V_FMAMK_F16, 15, Rdna2Operand::Vgpr(8), 9, 0x4000u);  // 1.5*2.0 + 2.0 = 5.0 (0x4500)
+        a.EmitVop2Literal(Rdna2Opcode::V_FMAAK_F16, 16, Rdna2Operand::Vgpr(8), 9, 0x3C00u);  // 1.5*2.0 + 1.0 = 4.0 (0x4400)
+        a.EmitVop3(Rdna2Opcode::V_FMA_F16, 17, Rdna2Operand::Vgpr(8), Rdna2Operand::Vgpr(9), Rdna2Operand::LiteralU32(0x3C00u));
+
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 11, 20, 4, 0);   // out[0] = fma_cancel (0xB2800000)
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 12, 20, 4, 4);   // out[1] = mad_cancel (0x00000000)
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 13, 20, 4, 8);   // out[2] = fma_denorm (0x01000000)
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 14, 20, 4, 12);  // out[3] = mad_denorm (0x00000000)
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 10, 20, 4, 16);  // out[4] = v_fmac_f16 (0x4300)
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 15, 20, 4, 20);  // out[5] = v_fmamk_f16 (0x4500)
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 16, 20, 4, 24);  // out[6] = v_fmaak_f16 (0x4400)
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 17, 20, 4, 28);  // out[7] = v_fma_f16 (0x4400)
+        a.EmitSopp(Rdna2Opcode::S_ENDPGM);
+
+        Rdna2LiftResult res{};
+        auto st = LiftRdna2Xs2Shader(a.BuildXs2(ShaderStage::Compute, 32, 1, 1, 16, 24, 32), res, opts);
+        if (!st.ok()) {
+            std::fprintf(stderr, "[FAIL] Test8B Lift failed: %s\nHLSL:\n%s\n", st.message.c_str(), res.hlsl_source.c_str());
+        }
+        OS_REQUIRE(st.ok());
+        OS_REQUIRE(res.hlsl_source.find("_os_flush_denorm") != std::string::npos);
+        OS_REQUIRE(res.hlsl_source.find("_os_mad_f32") != std::string::npos);
+        OS_REQUIRE(res.hlsl_source.find("_os_fma_f32") != std::string::npos);
+        VerifySpirvExternalStrict(res.spirv_words, "Test8B_FmaVsMadAndF16");
+
+        std::vector<uint32_t> input(32, 0u);
+        input[0] = 0x3F800400u;  // 1 + 2^-13
+        input[1] = 0x3F7FF800u;  // 1 - 2^-13
+        input[2] = 0xBF800000u;  // -1.0f
+        input[4] = 0x00400000u;  // 2^-127 (subnormal)
+        input[5] = 0x40800000u;  // 4.0f
+        input[6] = 0x00000000u;  // 0.0f
+        input[8] = 0x3E00u;      // f16(1.5)
+        input[9] = 0x4000u;      // f16(2.0)
+        input[10] = 0x3800u;     // f16(0.5)
+
+        Rdna2CpuExecState cpu{};
+        cpu.uav0 = input;
+        cpu.uav1.assign(32, 0u);
+        OS_REQUIRE(ExecuteRdna2Cpu(res.container, res.instructions, cpu).ok());
+        OS_REQUIRE(cpu.uav1[0] == 0xB2800000u);  // FMA cancel = -2^-26
+        OS_REQUIRE(cpu.uav1[1] == 0x00000000u);  // MAD cancel = 0.0
+        OS_REQUIRE(cpu.uav1[0] != cpu.uav1[1]);
+        OS_REQUIRE(cpu.uav1[2] == 0x01000000u);  // FMA denorm = 2^-125
+        OS_REQUIRE(cpu.uav1[3] == 0x00000000u);  // MAD denorm = 0.0
+        OS_REQUIRE(cpu.uav1[2] != cpu.uav1[3]);
+        OS_REQUIRE(cpu.uav1[4] == 0x4300u);
+        OS_REQUIRE(cpu.uav1[5] == 0x4500u);
+        OS_REQUIRE(cpu.uav1[6] == 0x4400u);
+        OS_REQUIRE(cpu.uav1[7] == 0x4400u);
+
+        auto check_fma_mad_gpu = [&](const std::vector<uint32_t>& out, const char* backend) {
+            if (out[0] != cpu.uav1[0] || out[1] != cpu.uav1[1] || out[2] != cpu.uav1[2] ||
+                out[3] != cpu.uav1[3] || out[4] != cpu.uav1[4] || out[5] != cpu.uav1[5] ||
+                out[6] != cpu.uav1[6] || out[7] != cpu.uav1[7]) {
+                std::fprintf(stderr,
+                             "[FAIL] Test8B %s: fma_c=0x%08X(0x%08X) mad_c=0x%08X(0x%08X) fma_d=0x%08X(0x%08X) mad_d=0x%08X(0x%08X) f16=0x%X,0x%X,0x%X,0x%X\n",
+                             backend, out[0], cpu.uav1[0], out[1], cpu.uav1[1], out[2], cpu.uav1[2], out[3], cpu.uav1[3],
+                             out[4], out[5], out[6], out[7]);
+            }
+            OS_REQUIRE(out[0] == cpu.uav1[0]);  // FMA cancel == -2^-26
+            OS_REQUIRE(out[1] == cpu.uav1[1]);  // MAD cancel == 0.0
+            OS_REQUIRE(out[0] != out[1]);       // FMA != MAD on live GPU!
+            OS_REQUIRE(out[2] == cpu.uav1[2]);  // FMA preserves subnormal -> 2^-125
+            OS_REQUIRE(out[3] == cpu.uav1[3]);  // MAD denorm flushes to 0.0
+            OS_REQUIRE(out[2] != out[3]);       // FMA != MAD on denormal input!
+            OS_REQUIRE(out[4] == cpu.uav1[4]);
+            OS_REQUIRE(out[5] == cpu.uav1[5]);
+            OS_REQUIRE(out[6] == cpu.uav1[6]);
+            OS_REQUIRE(out[7] == cpu.uav1[7]);
+        };
+
+        if (vk.GetDeviceInfo().is_hardware) {
+            std::vector<uint32_t> vk_out;
+            OS_REQUIRE(vk.ExecuteComputeShader(res.spirv_words, input, vk_out, 1).ok());
+            check_fma_mad_gpu(vk_out, "Vulkan-HW");
+        }
+        std::vector<uint32_t> hw_out;
+        d3d_hw.RunComputeBuffers(CompileForDevice(d3d_hw, res.hlsl_source, res.pc_dxil), input, hw_out, 1);
+        check_fma_mad_gpu(hw_out, "D3D12-HW");
+
+        std::vector<uint32_t> warp_out;
+        d3d_warp.RunComputeBuffers(CompileForDevice(d3d_warp, res.hlsl_source, res.pc_dxil), input, warp_out, 1);
+        check_fma_mad_gpu(warp_out, "D3D12-WARP");
+    }
+
+    // ----- 8C (Catch 3): 16-bit integer VOP3 + s_bcnt1_i32_b32 vs s_bcnt1_i32_b64 high-word -----
+    {
+        Rdna2Assembler a;
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 20, Rdna2Operand::InlineInt(0));
+        // Load dynamic scalar pair into s8, s9 via V_READFIRSTLANE_B32 from uav0[0..1] = 0x80000003, 0x00000001
+        // and uav0[2..3] = 0x00000000, 0xF0F00001
+        a.EmitMubuf(Rdna2Opcode::BUFFER_LOAD_DWORD, 2, 20, 0, 0);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_LOAD_DWORD, 3, 20, 0, 4);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_LOAD_DWORD, 4, 20, 0, 8);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_LOAD_DWORD, 5, 20, 0, 12);
+        a.EmitVop1(Rdna2Opcode::V_READFIRSTLANE_B32, 8, Rdna2Operand::Vgpr(2));
+        a.EmitVop1(Rdna2Opcode::V_READFIRSTLANE_B32, 9, Rdna2Operand::Vgpr(3));
+        a.EmitSop1(Rdna2Opcode::S_BCNT1_I32_B32, 10, Rdna2Operand::Sgpr(8));  // 3
+        a.EmitSop1(Rdna2Opcode::S_BCNT1_I32_B64, 11, Rdna2Operand::Sgpr(8));  // 4
+        a.EmitVop1(Rdna2Opcode::V_READFIRSTLANE_B32, 12, Rdna2Operand::Vgpr(4));
+        a.EmitVop1(Rdna2Opcode::V_READFIRSTLANE_B32, 13, Rdna2Operand::Vgpr(5));
+        a.EmitSop1(Rdna2Opcode::S_BCNT1_I32_B32, 14, Rdna2Operand::Sgpr(12)); // 0
+        a.EmitSop1(Rdna2Opcode::S_BCNT1_I32_B64, 15, Rdna2Operand::Sgpr(12)); // 9
+
+        // 16-bit integer VOP3 ops on dynamic uav0[4..6]
+        a.EmitMubuf(Rdna2Opcode::BUFFER_LOAD_DWORD, 6, 20, 0, 16);   // 0xAAAAFFF0
+        a.EmitMubuf(Rdna2Opcode::BUFFER_LOAD_DWORD, 7, 20, 0, 20);   // 0xBBBB0020
+        a.EmitMubuf(Rdna2Opcode::BUFFER_LOAD_DWORD, 8, 20, 0, 24);   // 0xCCCC0005
+        a.EmitVop3(Rdna2Opcode::V_ADD_NC_U16, 9, Rdna2Operand::Vgpr(6), Rdna2Operand::Vgpr(7));
+        a.EmitVop3(Rdna2Opcode::V_SUB_NC_U16, 10, Rdna2Operand::Vgpr(7), Rdna2Operand::Vgpr(6));
+        a.EmitVop3(Rdna2Opcode::V_MUL_LO_U16, 11, Rdna2Operand::Vgpr(7), Rdna2Operand::Vgpr(8));
+        a.EmitVop3(Rdna2Opcode::V_MAD_U16, 12, Rdna2Operand::Vgpr(7), Rdna2Operand::Vgpr(8), Rdna2Operand::InlineInt(7));
+        a.EmitVop3(Rdna2Opcode::V_MIN_I16, 13, Rdna2Operand::Vgpr(6), Rdna2Operand::Vgpr(7));
+        a.EmitVop3(Rdna2Opcode::V_MAX_I16, 14, Rdna2Operand::Vgpr(6), Rdna2Operand::Vgpr(7));
+
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 15, Rdna2Operand::Sgpr(10));
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 16, Rdna2Operand::Sgpr(11));
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 17, Rdna2Operand::Sgpr(14));
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 18, Rdna2Operand::Sgpr(15));
+
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 15, 20, 4, 0);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 16, 20, 4, 4);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 17, 20, 4, 8);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 18, 20, 4, 12);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 9, 20, 4, 16);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 10, 20, 4, 20);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 11, 20, 4, 24);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 12, 20, 4, 28);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 13, 20, 4, 32);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 14, 20, 4, 36);
+        a.EmitSopp(Rdna2Opcode::S_ENDPGM);
+
+        Rdna2LiftResult res{};
+        auto st = LiftRdna2Xs2Shader(a.BuildXs2(ShaderStage::Compute, 32, 1, 1, 20, 24, 32), res, opts);
+        if (!st.ok()) {
+            std::fprintf(stderr, "[FAIL] Test8C Lift failed: %s\nHLSL:\n%s\n", st.message.c_str(), res.hlsl_source.c_str());
+        }
+        OS_REQUIRE(st.ok());
+        VerifySpirvExternalStrict(res.spirv_words, "Test8C_Vop3Int16AndBcnt32_64");
+
+        std::vector<uint32_t> input(32, 0u);
+        input[0] = 0x80000003u;
+        input[1] = 0x00000001u;
+        input[2] = 0x00000000u;
+        input[3] = 0xF0F00001u;
+        input[4] = 0xAAAAFFF0u;
+        input[5] = 0xBBBB0020u;
+        input[6] = 0xCCCC0005u;
+
+        Rdna2CpuExecState cpu{};
+        cpu.uav0 = input;
+        cpu.uav1.assign(32, 0u);
+        OS_REQUIRE(ExecuteRdna2Cpu(res.container, res.instructions, cpu).ok());
+        OS_REQUIRE(cpu.uav1[0] == 3u && cpu.uav1[1] == 4u);
+        OS_REQUIRE(cpu.uav1[2] == 0u && cpu.uav1[3] == 9u);
+        OS_REQUIRE(cpu.uav1[4] == 0x0010u && cpu.uav1[5] == 0x0030u);
+        OS_REQUIRE(cpu.uav1[6] == 0x00A0u && cpu.uav1[7] == 0x00A7u);
+        OS_REQUIRE(cpu.uav1[8] == 0xFFF0u && cpu.uav1[9] == 0x0020u);
+
+        if (vk.GetDeviceInfo().is_hardware) {
+            std::vector<uint32_t> vk_out;
+            OS_REQUIRE(vk.ExecuteComputeShader(res.spirv_words, input, vk_out, 1).ok());
+            OS_REQUIRE(vk_out == cpu.uav1);
+        }
+        std::vector<uint32_t> hw_out;
+        d3d_hw.RunComputeBuffers(CompileForDevice(d3d_hw, res.hlsl_source, res.pc_dxil), input, hw_out, 1);
+        OS_REQUIRE(hw_out == cpu.uav1);
+
+        std::vector<uint32_t> warp_out;
+        d3d_warp.RunComputeBuffers(CompileForDevice(d3d_warp, res.hlsl_source, res.pc_dxil), input, warp_out, 1);
+        OS_REQUIRE(warp_out == cpu.uav1);
+    }
+
+    // ----- 8D (Catch 4A): Pixel shader helper-lane affine quad derivative sampling in divergent CFG -----
+    {
+        Rdna2Assembler ps;
+        // Divergent branch on param0.x > 0.25f before implicit-LOD IMAGE_SAMPLE
+        ps.EmitVop1(Rdna2Opcode::V_MOV_B32, 8, Rdna2Operand::LiteralF32(0.25f));
+        ps.EmitVopc(Rdna2Opcode::V_CMP_GT_F32, Rdna2Operand::Vgpr(0), 8);
+        const uint32_t br_else = ps.EmitSopp(Rdna2Opcode::S_CBRANCH_VCCZ);
+        // Taken: sample at (u, v) = (v0, v1) with implicit quad derivatives
+        ps.EmitMimg(Rdna2Opcode::IMAGE_SAMPLE, 4, 0, 0, 8, 0xFu, 1u, false);
+        const uint32_t br_join = ps.EmitSopp(Rdna2Opcode::S_BRANCH);
+        ps.PatchBranch(br_else, ps.CurrentWordOffset());
+        ps.EmitVop1(Rdna2Opcode::V_MOV_B32, 4, Rdna2Operand::InlineFloat(0.5f));
+        ps.EmitVop1(Rdna2Opcode::V_MOV_B32, 5, Rdna2Operand::InlineFloat(0.5f));
+        ps.EmitVop1(Rdna2Opcode::V_MOV_B32, 6, Rdna2Operand::InlineFloat(0.5f));
+        ps.EmitVop1(Rdna2Opcode::V_MOV_B32, 7, Rdna2Operand::InlineFloat(1.0f));
+        ps.PatchBranch(br_join, ps.CurrentWordOffset());
+        ps.EmitExp(static_cast<uint8_t>(Rdna2ExportTarget::Mrt0), 4, 5, 6, 7, 0xFu, true, false, true);
+        ps.EmitSopp(Rdna2Opcode::S_ENDPGM);
+
+        Rdna2LiftResult ps_res{};
+        auto st = LiftRdna2Xs2Shader(ps.BuildXs2(ShaderStage::Pixel), ps_res, opts);
+        if (!st.ok()) {
+            std::fprintf(stderr, "[FAIL] Test8D PS quad deriv lift failed: %s\nHLSL:\n%s\n",
+                         st.message.c_str(), ps_res.hlsl_source.c_str());
+        }
+        OS_REQUIRE(st.ok());
+        OS_REQUIRE(ps_res.hlsl_target == "ps_6_5");
+        OS_REQUIRE(ps_res.ir.uses_pixel_quad_derivatives);
+        OS_REQUIRE(ps_res.hlsl_source.find("QuadReadAcrossX") != std::string::npos);
+        OS_REQUIRE(ps_res.hlsl_source.find("QuadReadAcrossY") != std::string::npos);
+        OS_REQUIRE(ps_res.hlsl_source.find("SampleGrad") != std::string::npos);
+        OS_REQUIRE(SpirvContainsOpcode(ps_res.spirv_words, 207u));  // OpDPdx
+        OS_REQUIRE(SpirvContainsOpcode(ps_res.spirv_words, 208u));  // OpDPdy
+        OS_REQUIRE(SpirvContainsOpcode(ps_res.spirv_words, 88u));   // OpImageSampleExplicitLod (Grad)
+        VerifySpirvExternalStrict(ps_res.spirv_words, "Test8D_PsQuadDerivatives");
+
+        // Also verify SM 5.0 fallback uses ddx/ddy + SampleGrad cleanly
+        std::string sm50_hlsl, sm50_target;
+        OS_REQUIRE(EmitHlsl(ps_res.ir, sm50_hlsl, sm50_target, /*use_sm65=*/false).ok());
+        OS_REQUIRE(sm50_target == "ps_5_0");
+        OS_REQUIRE(sm50_hlsl.find("ddx(uv)") != std::string::npos);
+        OS_REQUIRE(sm50_hlsl.find("SampleGrad") != std::string::npos);
+    }
+
+    // ----- 8E (Catch 4B): Bounded wave64-on-wave32 Mesh Shader (LIVE DispatchMesh!) + Geometry Shader -----
+    {
+        // Wave64 Mesh Shader (tg=64, wave_size=64):
+        // Emits 35 vertices and 1 full-screen triangle with indices (0, 1, 34):
+        //   - Vertex 0 (-1, -1) exported by lane 0  (half 0!)
+        //   - Vertex 1 (-1,  3) exported by lane 1  (half 0!)
+        //   - Vertex 34 (3, -1) exported by lane 34 (half 1!) -> proves bounded 2-half wave64->wave32 execution!
+        Rdna2Assembler ms;
+        ms.EmitSop1(Rdna2Opcode::S_MOV_B32, 0, Rdna2Operand::InlineInt(35));  // vert_count = 35
+        ms.EmitSop1(Rdna2Opcode::S_MOV_B32, 1, Rdna2Operand::InlineInt(1));   // prim_count = 1
+        ms.EmitSopp(Rdna2Opcode::S_SENDMSG, static_cast<int16_t>(kRdna2SendMsgGsAllocReq));
+
+        // Base pos = (-1, -1, 0, 1)
+        ms.EmitVop1(Rdna2Opcode::V_MOV_B32, 1, Rdna2Operand::InlineFloat(-1.0f));
+        ms.EmitVop1(Rdna2Opcode::V_MOV_B32, 2, Rdna2Operand::InlineFloat(-1.0f));
+        ms.EmitVop1(Rdna2Opcode::V_MOV_B32, 3, Rdna2Operand::InlineFloat(0.0f));
+        ms.EmitVop1(Rdna2Opcode::V_MOV_B32, 4, Rdna2Operand::InlineFloat(1.0f));
+        ms.EmitVop1(Rdna2Opcode::V_MOV_B32, 9, Rdna2Operand::LiteralF32(3.0f));
+        // If lane64 == 1 -> y = 3.0
+        ms.EmitVopc(Rdna2Opcode::V_CMP_EQ_U32, Rdna2Operand::InlineInt(1), 0);
+        ms.EmitVop2(Rdna2Opcode::V_CNDMASK_B32, 2, Rdna2Operand::Vgpr(2), 9);
+        // If lane64 == 34 (in HALF 1!) -> x = 3.0
+        ms.EmitVopc(Rdna2Opcode::V_CMP_EQ_U32, Rdna2Operand::InlineInt(34), 0);
+        ms.EmitVop2(Rdna2Opcode::V_CNDMASK_B32, 1, Rdna2Operand::Vgpr(1), 9);
+
+        // Param0 = (0.25, 0.50, 0.75, 1.0)
+        ms.EmitVop1(Rdna2Opcode::V_MOV_B32, 5, Rdna2Operand::LiteralF32(0.25f));
+        ms.EmitVop1(Rdna2Opcode::V_MOV_B32, 6, Rdna2Operand::InlineFloat(0.5f));
+        ms.EmitVop1(Rdna2Opcode::V_MOV_B32, 7, Rdna2Operand::LiteralF32(0.75f));
+        ms.EmitVop1(Rdna2Opcode::V_MOV_B32, 8, Rdna2Operand::InlineFloat(1.0f));
+        ms.EmitExp(static_cast<uint8_t>(Rdna2ExportTarget::Pos0), 1, 2, 3, 4, 0xFu, false);
+        ms.EmitExp(static_cast<uint8_t>(Rdna2ExportTarget::Param0), 5, 6, 7, 8, 0xFu, false);
+
+        // Lane 0 exports primitive (0, 1, 34) connecting half-0 and half-1 vertices!
+        ms.EmitVopc(Rdna2Opcode::V_CMP_EQ_U32, Rdna2Operand::InlineInt(0), 0);
+        const uint32_t br_skip = ms.EmitSopp(Rdna2Opcode::S_CBRANCH_VCCZ);
+        ms.EmitVop1(Rdna2Opcode::V_MOV_B32, 10, Rdna2Operand::InlineInt(0));
+        ms.EmitVop1(Rdna2Opcode::V_MOV_B32, 11, Rdna2Operand::InlineInt(1));
+        ms.EmitVop1(Rdna2Opcode::V_MOV_B32, 12, Rdna2Operand::InlineInt(34));
+        ms.EmitExp(static_cast<uint8_t>(Rdna2ExportTarget::Prim), 10, 11, 12, 0, 0x7u, true);
+        ms.PatchBranch(br_skip, ms.CurrentWordOffset());
+        ms.EmitSopp(Rdna2Opcode::S_ENDPGM);
+
+        Rdna2LiftResult ms_res{};
+        auto st_ms = LiftRdna2Xs2Shader(ms.BuildXs2(ShaderStage::Mesh, 64, 1, 1, 16, 16, /*wave_size=*/64), ms_res, opts);
+        if (!st_ms.ok()) {
+            std::fprintf(stderr, "[FAIL] Test8E Wave64 MS lift failed: %s\nHLSL:\n%s\n",
+                         st_ms.message.c_str(), ms_res.hlsl_source.c_str());
+        }
+        OS_REQUIRE(st_ms.ok());
+        OS_REQUIRE(ms_res.hlsl_target == "ms_6_5");
+        OS_REQUIRE(ms_res.hlsl_source.find("_w64_half < 2u") != std::string::npos);
+        OS_REQUIRE(ms_res.hlsl_source.find("WaveGetLaneIndex()") != std::string::npos);
+        OS_REQUIRE(ms_res.hlsl_source.find("[numthreads(32, 1, 1)]") != std::string::npos);
+
+        // Wave64 Geometry Shader (gs_6_5) bounded two-half wrapper compilation test
+        Rdna2Assembler gs;
+        gs.EmitVop1(Rdna2Opcode::V_MOV_B32, 1, Rdna2Operand::InlineFloat(0.0f));
+        gs.EmitVop1(Rdna2Opcode::V_MOV_B32, 2, Rdna2Operand::InlineFloat(1.0f));
+        gs.EmitExp(static_cast<uint8_t>(Rdna2ExportTarget::Pos0), 1, 1, 1, 2, 0xFu, true);
+        gs.EmitSopp(Rdna2Opcode::S_ENDPGM);
+        Rdna2LiftResult gs_res{};
+        auto st_gs = LiftRdna2Xs2Shader(gs.BuildXs2(ShaderStage::Geometry, 64, 1, 1, 16, 16, /*wave_size=*/64), gs_res, opts);
+        if (!st_gs.ok()) {
+            std::fprintf(stderr, "[FAIL] Test8E Wave64 GS lift failed: %s\nHLSL:\n%s\n",
+                         st_gs.message.c_str(), gs_res.hlsl_source.c_str());
+        }
+        OS_REQUIRE(st_gs.ok());
+        OS_REQUIRE(gs_res.hlsl_target == "gs_6_5");
+        OS_REQUIRE(gs_res.hlsl_source.find("_w64_half < 2u") != std::string::npos);
+
+        // Execute Wave64 Mesh Shader LIVE on GTX 1650 Ti (Wave=32, MeshTier=10)!
+        if (d3d_hw.mesh_tier >= 10u) {
+            Rdna2Assembler as;
+            as.EmitSop1(Rdna2Opcode::S_MOV_B32, 0, Rdna2Operand::InlineInt(1));
+            as.EmitSop1(Rdna2Opcode::S_MOV_B32, 1, Rdna2Operand::InlineInt(1));
+            as.EmitSop1(Rdna2Opcode::S_MOV_B32, 2, Rdna2Operand::InlineInt(1));
+            as.EmitSopp(Rdna2Opcode::S_SENDMSG, static_cast<int16_t>(kRdna2SendMsgDispatchMesh));
+            as.EmitSopp(Rdna2Opcode::S_ENDPGM);
+            Rdna2LiftResult as_res{};
+            OS_REQUIRE(LiftRdna2Xs2Shader(as.BuildXs2(ShaderStage::Amplification, 64, 1, 1, 16, 16, /*wave_size=*/64), as_res, opts).ok());
+
+            Rdna2Assembler ps;
+            ps.EmitVop2(Rdna2Opcode::V_MUL_F32, 4, Rdna2Operand::InlineFloat(2.0f), 0);
+            ps.EmitExp(static_cast<uint8_t>(Rdna2ExportTarget::Mrt0), 4, 1, 2, 3, 0xFu, true, false, true);
+            ps.EmitSopp(Rdna2Opcode::S_ENDPGM);
+            Rdna2LiftResult ps_res{};
+            OS_REQUIRE(LiftRdna2Xs2Shader(ps.BuildXs2(ShaderStage::Pixel), ps_res, opts).ok());
+
+            std::vector<uint8_t> rt_pixels;
+            d3d_hw.RunMeshShaderPipeline64x64(as_res.pc_dxil, ms_res.pc_dxil, ps_res.pc_dxil, rt_pixels);
+            OS_REQUIRE(rt_pixels.size() == 64u * 64u * 4u);
+            for (uint32_t p = 0; p < 64u * 64u; ++p) {
+                OS_REQUIRE(std::abs(static_cast<int>(rt_pixels[p * 4 + 0]) - 128) <= 1);
+                OS_REQUIRE(std::abs(static_cast<int>(rt_pixels[p * 4 + 1]) - 128) <= 1);
+                OS_REQUIRE(std::abs(static_cast<int>(rt_pixels[p * 4 + 2]) - 191) <= 1);
+                OS_REQUIRE(rt_pixels[p * 4 + 3] == 255u);
+            }
+        }
+    }
+
+    // ----- 8F (Catch 5): WARP 1.0.22 non-uniform WaveReadLaneAt > 8 guard + HW strict verification -----
+    {
+        // Verify WARP detection metadata
+        OS_REQUIRE(d3d_warp.IsWarpAdapter());
+        OS_REQUIRE(d3d_warp.ShouldGuardWarpNonUniformWaveReadAbove8());
+        if (!d3d_hw.IsWarpAdapter()) {
+            OS_REQUIRE(!d3d_hw.ShouldGuardWarpNonUniformWaveReadAbove8());
+        }
+
+        // 1. Uniform <= 8 lane WaveReadLaneAt (compile-time lane 3 and lane 0) must succeed on BOTH HW and WARP
+        const std::string hlsl_uni_le8 =
+            "RWByteAddressBuffer _in0 : register(u0);\n"
+            "RWByteAddressBuffer _out0 : register(u1);\n"
+            "[numthreads(32, 1, 1)]\n"
+            "void main(uint3 _tid : SV_DispatchThreadID) {\n"
+            "    uint v = _in0.Load(_tid.x * 4u);\n"
+            "    uint r_hi = WaveReadLaneAt(v, 3u);\n"
+            "    uint r_lo = WaveReadLaneAt(v, 0u);\n"
+            "    _out0.Store(_tid.x * 4u, r_hi ^ r_lo);\n"
+            "}\n";
+        std::vector<uint8_t> dxil_uni_le8;
+        std::string diag;
+        OS_REQUIRE(CompileHlslWithDxc(hlsl_uni_le8, "cs_6_5", "main", dxil_uni_le8, diag).ok());
+
+        std::vector<uint32_t> input(32, 0u);
+        for (uint32_t i = 0; i < 32u; ++i) input[i] = 0x1000u + i * 13u;
+
+        std::vector<uint32_t> hw_le8, warp_le8;
+        d3d_hw.RunComputeBuffers(CompileForDevice(d3d_hw, hlsl_uni_le8, dxil_uni_le8), input, hw_le8, 1);
+        d3d_warp.RunComputeBuffers(CompileForDevice(d3d_warp, hlsl_uni_le8, dxil_uni_le8), input, warp_le8, 1);
+        const uint32_t hw_w = d3d_hw.wave_min ? d3d_hw.wave_min : 32u;
+        const uint32_t warp_w = d3d_warp.wave_min ? d3d_warp.wave_min : 4u;
+        for (uint32_t i = 0; i < 32u; ++i) {
+            const uint32_t hw_base = (i / hw_w) * hw_w;
+            const uint32_t hw_lane = std::min(hw_w - 1u, 3u);
+            OS_REQUIRE(hw_le8[i] == (input[hw_base + hw_lane] ^ input[hw_base]));
+
+            const uint32_t warp_base = (i / warp_w) * warp_w;
+            const uint32_t warp_lane = std::min(warp_w - 1u, 3u);
+            OS_REQUIRE(warp_le8[i] == (input[warp_base + warp_lane] ^ input[warp_base]));
+        }
+
+        // 2. Non-uniform WaveReadLaneAt across full Wave32 (> 8 lanes): strictly validated on HW, guarded on WARP
+        const std::string hlsl_gt8 =
+            "RWByteAddressBuffer _in0 : register(u0);\n"
+            "RWByteAddressBuffer _out0 : register(u1);\n"
+            "[numthreads(32, 1, 1)]\n"
+            "void main(uint3 _tid : SV_DispatchThreadID) {\n"
+            "    uint v = _in0.Load(_tid.x * 4u);\n"
+            "    uint non_uniform_lane = (_tid.x ^ 17u) & 31u;\n"
+            "    uint r = WaveReadLaneAt(v, non_uniform_lane);\n"
+            "    _out0.Store(_tid.x * 4u, r);\n"
+            "}\n";
+        std::vector<uint8_t> dxil_gt8;
+        OS_REQUIRE(CompileHlslWithDxc(hlsl_gt8, "cs_6_5", "main", dxil_gt8, diag).ok());
+
+        if (!d3d_hw.ShouldGuardWarpNonUniformWaveReadAbove8() && d3d_hw.wave_min >= 32u) {
+            std::vector<uint32_t> hw_gt8;
+            d3d_hw.RunComputeBuffers(CompileForDevice(d3d_hw, hlsl_gt8, dxil_gt8), input, hw_gt8, 1);
+            for (uint32_t i = 0; i < 32u; ++i) {
+                OS_REQUIRE(hw_gt8[i] == input[(i ^ 17u) & 31u]);
+            }
+        }
+        // Guarded cleanly on WARP (avoids WARP 1.0.22 / SM 6.2 non-uniform WaveReadLaneAt > 8 fault)
+        OS_REQUIRE(d3d_warp.ShouldGuardWarpNonUniformWaveReadAbove8());
+
+        // 3. Lifted RDNA2 V_READLANE_B32 (groupshared-backed) handles non-uniform lane > 8 on BOTH HW and WARP!
+        Rdna2Assembler rl;
+        rl.EmitVop2(Rdna2Opcode::V_LSHLREV_B32, 1, Rdna2Operand::InlineInt(2), 0);
+        rl.EmitMubuf(Rdna2Opcode::BUFFER_LOAD_DWORD, 2, 1, 0, 0);
+        rl.EmitVop2(Rdna2Opcode::V_XOR_B32, 3, Rdna2Operand::InlineInt(17), 0);
+        rl.EmitVop3(Rdna2Opcode::V_READLANE_B32, 8, Rdna2Operand::Vgpr(2), Rdna2Operand::Vgpr(3));
+        rl.EmitVop1(Rdna2Opcode::V_MOV_B32, 4, Rdna2Operand::Sgpr(8));
+        rl.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 4, 1, 4, 0);
+        rl.EmitSopp(Rdna2Opcode::S_ENDPGM);
+        Rdna2LiftResult rl_res{};
+        OS_REQUIRE(LiftRdna2Xs2Shader(rl.BuildXs2(ShaderStage::Compute, 32, 1, 1, 16, 16, 32), rl_res, opts).ok());
+        std::vector<uint32_t> hw_rl, warp_rl;
+        d3d_hw.RunComputeBuffers(CompileForDevice(d3d_hw, rl_res.hlsl_source, rl_res.pc_dxil), input, hw_rl, 1);
+        d3d_warp.RunComputeBuffers(CompileForDevice(d3d_warp, rl_res.hlsl_source, rl_res.pc_dxil), input, warp_rl, 1);
+        for (uint32_t i = 0; i < 32u; ++i) {
+            OS_REQUIRE(hw_rl[i] == input[(i ^ 17u) & 31u]);
+            OS_REQUIRE(warp_rl[i] == input[(i ^ 17u) & 31u]);
+        }
+    }
+
+    std::printf("[PASS] Test 8: All 5 RDNA2 ISA Catches (ZeroInitLDS, FMA!=MAD & f16 0x36..38, VOP3 i16 & bcnt32/64, PS QuadDerivs, Wave64->32 Mesh/GS live, WARP 1.0.22 guard)\n");
+}
+
 }  // namespace
 
 int main() {
@@ -2014,10 +2569,11 @@ int main() {
     std::printf("=== OpenScarlett RDNA2 Lifter Live Dual-GPU Verification ===\n");
     std::printf("Vulkan ICD : %s (API %u.%u.%u)\n",
                 vk_info.device_name.c_str(), vk_info.api_major, vk_info.api_minor, vk_info.api_patch);
-    std::printf("D3D12 HW   : %s (Wave=%u, SM=0x%02X, MeshTier=%u)\n",
-                d3d_hw.adapter_name.c_str(), d3d_hw.wave_min, d3d_hw.highest_sm, d3d_hw.mesh_tier);
-    std::printf("D3D12 WARP : %s (Wave=%u, SM=0x%02X, MeshTier=%u)\n",
-                d3d_warp.adapter_name.c_str(), d3d_warp.wave_min, d3d_warp.highest_sm, d3d_warp.mesh_tier);
+    std::printf("D3D12 HW   : %s (Vendor=0x%04X, Wave=%u, SM=0x%02X, MeshTier=%u)\n",
+                d3d_hw.adapter_name.c_str(), d3d_hw.vendor_id, d3d_hw.wave_min, d3d_hw.highest_sm, d3d_hw.mesh_tier);
+    std::printf("D3D12 WARP : %s (Vendor=0x%04X, Wave=%u, SM=0x%02X, MeshTier=%u, WarpGuard=%s)\n",
+                d3d_warp.adapter_name.c_str(), d3d_warp.vendor_id, d3d_warp.wave_min, d3d_warp.highest_sm,
+                d3d_warp.mesh_tier, d3d_warp.ShouldGuardWarpNonUniformWaveReadAbove8() ? "ON" : "OFF");
 
     Test1_ComputeAluBranchConstFold(vk, d3d_hw, d3d_warp);
     Test2_DsLdsBarrierAtomics(vk, d3d_hw, d3d_warp);
@@ -2026,6 +2582,7 @@ int main() {
     Test5_GraphicsVsPsAndLiveMeshAs(d3d_hw);
     Test6_DisasmRoundTripAndEdgeCases();
     Test7_AaaOpcodesLiveDualGpuAndCpuParity(vk, d3d_hw, d3d_warp);
+    Test8_Rdna2IsaCatchesLiveDualGpuAndCpuParity(vk, d3d_hw, d3d_warp);
 
     // Verify CallTelemetry recorded our lifter calls cleanly
     const auto snap = CallTelemetry::Global().Snapshot();
@@ -2039,6 +2596,6 @@ int main() {
     OS_REQUIRE(saw_lifter_telemetry);
 
     vk.Shutdown();
-    std::printf("[PASS] test_rdna2_lifter_live: ALL 7 LIVE DUAL-GPU & CPU-PARITY SUITES PASSED!\n");
+    std::printf("[PASS] test_rdna2_lifter_live: ALL 8 LIVE DUAL-GPU & CPU-PARITY SUITES PASSED!\n");
     return 0;
 }
