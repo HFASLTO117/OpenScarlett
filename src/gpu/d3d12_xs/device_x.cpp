@@ -1,12 +1,15 @@
 #include "device_x.h"
 
+#include <cstddef>
 #include <cstring>
+#include <deque>
 #include <new>
 #include <vector>
 
 #include "command_list_x.h"
 #include "command_queue_x.h"
 #include "openscarlett/core/telemetry.h"
+#include "openscarlett/gpu/rdna2_disasm.h"
 
 namespace openscarlett::d3d12_xs {
 
@@ -33,6 +36,85 @@ void UnwrapPageables(
     }
 }
 
+#if defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4324)  // D3D12 pipeline state stream subobjects require pointer alignment
+#endif
+template <typename T>
+struct alignas(void*) StreamSubobjLayout {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
+    T value;
+};
+#if defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+
+bool IsShaderSubobjectType(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type) noexcept {
+    switch (type) {
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS:
+            return true;
+        default:
+            return false;
+    }
+}
+
+size_t GetSubobjectStrideBytes(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type) noexcept {
+    switch (type) {
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE:
+            return sizeof(StreamSubobjLayout<ID3D12RootSignature*>);
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS:
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS:
+            return sizeof(StreamSubobjLayout<D3D12_SHADER_BYTECODE>);
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_STREAM_OUTPUT:
+            return sizeof(StreamSubobjLayout<D3D12_STREAM_OUTPUT_DESC>);
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND:
+            return sizeof(StreamSubobjLayout<D3D12_BLEND_DESC>);
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK:
+            return sizeof(StreamSubobjLayout<UINT>);
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER:
+            return sizeof(StreamSubobjLayout<D3D12_RASTERIZER_DESC>);
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL:
+            return sizeof(StreamSubobjLayout<D3D12_DEPTH_STENCIL_DESC>);
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT:
+            return sizeof(StreamSubobjLayout<D3D12_INPUT_LAYOUT_DESC>);
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE:
+            return sizeof(StreamSubobjLayout<D3D12_INDEX_BUFFER_STRIP_CUT_VALUE>);
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY:
+            return sizeof(StreamSubobjLayout<D3D12_PRIMITIVE_TOPOLOGY_TYPE>);
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS:
+            return sizeof(StreamSubobjLayout<D3D12_RT_FORMAT_ARRAY>);
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT:
+            return sizeof(StreamSubobjLayout<DXGI_FORMAT>);
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC:
+            return sizeof(StreamSubobjLayout<DXGI_SAMPLE_DESC>);
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_NODE_MASK:
+            return sizeof(StreamSubobjLayout<UINT>);
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO:
+            return sizeof(StreamSubobjLayout<D3D12_CACHED_PIPELINE_STATE>);
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS:
+            return sizeof(StreamSubobjLayout<D3D12_PIPELINE_STATE_FLAGS>);
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1:
+            return sizeof(StreamSubobjLayout<D3D12_DEPTH_STENCIL_DESC1>);
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING:
+            return sizeof(StreamSubobjLayout<D3D12_VIEW_INSTANCING_DESC>);
+        default:
+            return 0u;
+    }
+}
+
 }  // namespace
 
 DeviceX::DeviceX(
@@ -52,6 +134,7 @@ DeviceX::DeviceX(
 }
 
 DeviceX::~DeviceX() {
+    shader_cache_.WaitForPendingCompiles();
     if (host_dev6_) host_dev6_->Release();
     if (host_dev5_) host_dev5_->Release();
     if (host_dev4_) host_dev4_->Release();
@@ -202,14 +285,89 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommandAllocator(
 
 HRESULT STDMETHODCALLTYPE DeviceX::CreateGraphicsPipelineState(
     const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pDesc, REFIID riid, void** ppPipelineState) {
-    const HRESULT hr = host_dev_->CreateGraphicsPipelineState(pDesc, riid, ppPipelineState);
+    if (!pDesc) {
+        const HRESULT hr = host_dev_->CreateGraphicsPipelineState(pDesc, riid, ppPipelineState);
+        RecordDev("ID3D12DeviceX::CreateGraphicsPipelineState", 10, hr);
+        return hr;
+    }
+
+    const bool lift_vs = openscarlett::IsXboxShaderBytecode(pDesc->VS.pShaderBytecode, pDesc->VS.BytecodeLength);
+    const bool lift_ps = openscarlett::IsXboxShaderBytecode(pDesc->PS.pShaderBytecode, pDesc->PS.BytecodeLength);
+    const bool lift_ds = openscarlett::IsXboxShaderBytecode(pDesc->DS.pShaderBytecode, pDesc->DS.BytecodeLength);
+    const bool lift_hs = openscarlett::IsXboxShaderBytecode(pDesc->HS.pShaderBytecode, pDesc->HS.BytecodeLength);
+    const bool lift_gs = openscarlett::IsXboxShaderBytecode(pDesc->GS.pShaderBytecode, pDesc->GS.BytecodeLength);
+
+    if (!lift_vs && !lift_ps && !lift_ds && !lift_hs && !lift_gs) {
+        // Standard host PC DXBC/DXIL passthrough with zero overhead
+        const HRESULT hr = host_dev_->CreateGraphicsPipelineState(pDesc, riid, ppPipelineState);
+        RecordDev("ID3D12DeviceX::CreateGraphicsPipelineState", 10, hr);
+        return hr;
+    }
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC lifted_desc = *pDesc;
+    std::deque<std::vector<uint8_t>> lifted_blobs;
+
+    openscarlett::ShaderCacheLiftRequest req{};
+    req.highest_shader_model = adapter_info_.highest_shader_model ? adapter_info_.highest_shader_model : 0x60u;
+    req.mesh_has_payload = false;
+    req.prefer_dxil_standin = (req.highest_shader_model >= 0x60u);
+
+    auto lift_stage = [&](D3D12_SHADER_BYTECODE& bc, bool do_lift) -> bool {
+        if (!do_lift) return true;
+        openscarlett::CachedShaderResult res{};
+        std::string diag;
+        auto st = shader_cache_.GetOrLiftXboxShader(bc.pShaderBytecode, bc.BytecodeLength, req, res, &diag);
+        if (!st.ok()) {
+            return false;
+        }
+        lifted_blobs.push_back(std::move(res.dxil));
+        bc.pShaderBytecode = lifted_blobs.back().data();
+        bc.BytecodeLength = lifted_blobs.back().size();
+        return true;
+    };
+
+    if (!lift_stage(lifted_desc.VS, lift_vs) ||
+        !lift_stage(lifted_desc.PS, lift_ps) ||
+        !lift_stage(lifted_desc.DS, lift_ds) ||
+        !lift_stage(lifted_desc.HS, lift_hs) ||
+        !lift_stage(lifted_desc.GS, lift_gs)) {
+        RecordDev("ID3D12DeviceX::CreateGraphicsPipelineState", 10, E_INVALIDARG);
+        return E_INVALIDARG;
+    }
+
+    const HRESULT hr = host_dev_->CreateGraphicsPipelineState(&lifted_desc, riid, ppPipelineState);
     RecordDev("ID3D12DeviceX::CreateGraphicsPipelineState", 10, hr);
     return hr;
 }
 
 HRESULT STDMETHODCALLTYPE DeviceX::CreateComputePipelineState(
     const D3D12_COMPUTE_PIPELINE_STATE_DESC* pDesc, REFIID riid, void** ppPipelineState) {
-    const HRESULT hr = host_dev_->CreateComputePipelineState(pDesc, riid, ppPipelineState);
+    if (!pDesc || !openscarlett::IsXboxShaderBytecode(pDesc->CS.pShaderBytecode, pDesc->CS.BytecodeLength)) {
+        // Standard host PC DXBC/DXIL passthrough with zero overhead
+        const HRESULT hr = host_dev_->CreateComputePipelineState(pDesc, riid, ppPipelineState);
+        RecordDev("ID3D12DeviceX::CreateComputePipelineState", 11, hr);
+        return hr;
+    }
+
+    openscarlett::ShaderCacheLiftRequest req{};
+    req.highest_shader_model = adapter_info_.highest_shader_model ? adapter_info_.highest_shader_model : 0x60u;
+    req.mesh_has_payload = false;
+    req.prefer_dxil_standin = false;  // Single-stage CS can use <1ms SM 5.0 DXBC stand-in for instant async PSO
+
+    openscarlett::CachedShaderResult lifted{};
+    std::string diag;
+    auto st = shader_cache_.GetOrLiftXboxShader(
+        pDesc->CS.pShaderBytecode, pDesc->CS.BytecodeLength, req, lifted, &diag);
+    if (!st.ok()) {
+        RecordDev("ID3D12DeviceX::CreateComputePipelineState", 11, E_INVALIDARG);
+        return E_INVALIDARG;
+    }
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC lifted_desc = *pDesc;
+    lifted_desc.CS.pShaderBytecode = lifted.dxil.data();
+    lifted_desc.CS.BytecodeLength = lifted.dxil.size();
+
+    const HRESULT hr = host_dev_->CreateComputePipelineState(&lifted_desc, riid, ppPipelineState);
     RecordDev("ID3D12DeviceX::CreateComputePipelineState", 11, hr);
     return hr;
 }
@@ -576,9 +734,103 @@ HRESULT STDMETHODCALLTYPE DeviceX::SetResidencyPriority(
 // ID3D12Device2 (slot 47)
 HRESULT STDMETHODCALLTYPE DeviceX::CreatePipelineState(
     const D3D12_PIPELINE_STATE_STREAM_DESC* pDesc, REFIID riid, void** ppPipelineState) {
-    const HRESULT hr = host_dev2_
-                           ? host_dev2_->CreatePipelineState(pDesc, riid, ppPipelineState)
-                           : E_NOINTERFACE;
+    if (!host_dev2_) {
+        RecordDev("ID3D12DeviceX::CreatePipelineState", 47, E_NOINTERFACE);
+        return E_NOINTERFACE;
+    }
+    if (!pDesc || !pDesc->pPipelineStateSubobjectStream ||
+        pDesc->SizeInBytes < sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE)) {
+        const HRESULT hr = host_dev2_->CreatePipelineState(pDesc, riid, ppPipelineState);
+        RecordDev("ID3D12DeviceX::CreatePipelineState", 47, hr);
+        return hr;
+    }
+
+    // Pass 1: zero-allocation scan of subobject stream for Xbox shader bytecode & AS presence
+    const auto* raw_stream = static_cast<const uint8_t*>(pDesc->pPipelineStateSubobjectStream);
+    const size_t total_bytes = static_cast<size_t>(pDesc->SizeInBytes);
+    constexpr size_t kBytecodeOffset = offsetof(StreamSubobjLayout<D3D12_SHADER_BYTECODE>, value);
+
+    bool has_xbox_shader = false;
+    bool has_as_stage = false;
+    uint32_t shader_stage_count = 0;
+
+    size_t pos = 0;
+    while (pos + sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) <= total_bytes) {
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE sub_type{};
+        std::memcpy(&sub_type, raw_stream + pos, sizeof(sub_type));
+        const size_t stride = GetSubobjectStrideBytes(sub_type);
+        if (stride == 0u || pos + stride > total_bytes) {
+            break;
+        }
+        if (IsShaderSubobjectType(sub_type)) {
+            D3D12_SHADER_BYTECODE bc{};
+            std::memcpy(&bc, raw_stream + pos + kBytecodeOffset, sizeof(bc));
+            if (bc.pShaderBytecode && bc.BytecodeLength > 0) {
+                ++shader_stage_count;
+                if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS) {
+                    has_as_stage = true;
+                }
+                if (openscarlett::IsXboxShaderBytecode(bc.pShaderBytecode, bc.BytecodeLength)) {
+                    has_xbox_shader = true;
+                }
+            }
+        }
+        pos += stride;
+    }
+
+    if (!has_xbox_shader) {
+        // Standard host PC stream passthrough with zero overhead
+        const HRESULT hr = host_dev2_->CreatePipelineState(pDesc, riid, ppPipelineState);
+        RecordDev("ID3D12DeviceX::CreatePipelineState", 47, hr);
+        return hr;
+    }
+
+    // Pass 2: clone stream into pointer-aligned buffer and auto-lift Xbox shader subobjects
+    std::vector<uint64_t> cloned_words((total_bytes + sizeof(uint64_t) - 1u) / sizeof(uint64_t), 0ull);
+    auto* cloned_bytes = reinterpret_cast<uint8_t*>(cloned_words.data());
+    std::memcpy(cloned_bytes, raw_stream, total_bytes);
+
+    std::deque<std::vector<uint8_t>> lifted_blobs;
+    openscarlett::ShaderCacheLiftRequest req{};
+    req.highest_shader_model = adapter_info_.highest_shader_model ? adapter_info_.highest_shader_model : 0x60u;
+    req.mesh_has_payload = has_as_stage;
+    req.prefer_dxil_standin = (shader_stage_count > 1u && req.highest_shader_model >= 0x60u);
+
+    pos = 0;
+    while (pos + sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) <= total_bytes) {
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE sub_type{};
+        std::memcpy(&sub_type, cloned_bytes + pos, sizeof(sub_type));
+        const size_t stride = GetSubobjectStrideBytes(sub_type);
+        if (stride == 0u || pos + stride > total_bytes) {
+            break;
+        }
+        if (IsShaderSubobjectType(sub_type)) {
+            D3D12_SHADER_BYTECODE bc{};
+            std::memcpy(&bc, cloned_bytes + pos + kBytecodeOffset, sizeof(bc));
+            if (bc.pShaderBytecode && bc.BytecodeLength > 0 &&
+                openscarlett::IsXboxShaderBytecode(bc.pShaderBytecode, bc.BytecodeLength)) {
+                openscarlett::CachedShaderResult lifted{};
+                std::string diag;
+                auto st = shader_cache_.GetOrLiftXboxShader(
+                    bc.pShaderBytecode, bc.BytecodeLength, req, lifted, &diag);
+                if (!st.ok()) {
+                    RecordDev("ID3D12DeviceX::CreatePipelineState", 47, E_INVALIDARG);
+                    return E_INVALIDARG;
+                }
+                lifted_blobs.push_back(std::move(lifted.dxil));
+                bc.pShaderBytecode = lifted_blobs.back().data();
+                bc.BytecodeLength = lifted_blobs.back().size();
+                std::memcpy(cloned_bytes + pos + kBytecodeOffset, &bc, sizeof(bc));
+            }
+        }
+        pos += stride;
+    }
+
+    D3D12_PIPELINE_STATE_STREAM_DESC lifted_stream{};
+    lifted_stream.SizeInBytes = pDesc->SizeInBytes;
+    lifted_stream.pPipelineStateSubobjectStream = cloned_bytes;
+
+    const HRESULT hr = host_dev2_->CreatePipelineState(&lifted_stream, riid, ppPipelineState);
     RecordDev("ID3D12DeviceX::CreatePipelineState", 47, hr);
     return hr;
 }

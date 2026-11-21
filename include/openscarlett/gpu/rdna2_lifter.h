@@ -21,10 +21,15 @@ struct Rdna2LiftOptions {
     bool emit_hlsl = true;
     bool validate_spirv_external = false;
     bool compile_dxil_with_dxc = false;
+    bool mesh_has_payload = true;
+    std::string target_profile_override;  // Optional explicit DXC profile (e.g. "cs_6_2", "ps_6_2")
     std::string spirv_val_path = kDefaultSpirvValPath;
     std::string spirv_target_env = "vulkan1.2";
-    std::string dxc_path = kDefaultDxcPath;
+    std::string dxc_path;  // Empty -> portable lookup (exe dir -> OPENSCARLETT_DXC_PATH -> PATH -> WinSDK)
 };
+
+// Portable dxc.exe resolution: exe dir -> OPENSCARLETT_DXC_PATH -> requested_path -> PATH -> Windows Kits.
+std::string ResolvePortableDxcPath(const std::string& requested_path = {});
 
 struct Rdna2LiftResult {
     Xs2ShaderContainer container;
@@ -60,16 +65,16 @@ Status EmitHlsl(
     std::string& out_target,
     bool use_sm65 = true);
 
-// Compiles HLSL source to real DXIL bytecode using Microsoft dxc.exe (temp files strictly under E:\OpenScarlett\.tmp\).
+// Compiles HLSL source to real DXIL bytecode using Microsoft dxc.exe (temp files strictly under %TEMP%\openscarlett_lifter).
 Status CompileHlslWithDxc(
     const std::string& hlsl,
     const std::string& target,
     const std::string& entry_point,
     std::vector<uint8_t>& out_dxil,
     std::string& out_diagnostics,
-    const std::string& dxc_path = kDefaultDxcPath);
+    const std::string& dxc_path = {});
 
-// Full RDNA2 XS2\0 lifting pipeline: Parse -> Disasm -> SSA IR -> Optimize -> SPIR-V 1.3 + HLSL (+ optional spirv-val/DXC).
+// Full RDNA2 XS2\0 or Xbox-wrapped DXBC lifting pipeline: Parse -> Disasm -> SSA IR -> Optimize -> SPIR-V 1.3 + HLSL (+ optional spirv-val/DXC).
 Status LiftRdna2Xs2Shader(
     const std::vector<uint8_t>& xs2_bytes,
     Rdna2LiftResult& out_result,

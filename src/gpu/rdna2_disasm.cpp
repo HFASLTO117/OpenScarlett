@@ -338,10 +338,13 @@ uint16_t EncodeVopcOpcode(Rdna2Opcode op) {
 }
 
 Rdna2Opcode DecodeVop3Opcode(uint16_t raw, uint8_t& out_src_count) {
-    // Native 3-operand / wave VOP3 opcodes (GFX10.3)
+    // Native 3-operand / wave / bitfield VOP3 opcodes (GFX10.3)
     switch (raw) {
         case 0x101: out_src_count = 3; return Rdna2Opcode::V_CNDMASK_B32;
         case 0x141: out_src_count = 3; return Rdna2Opcode::V_MAD_F32;
+        case 0x148: out_src_count = 3; return Rdna2Opcode::V_BFE_U32;
+        case 0x149: out_src_count = 3; return Rdna2Opcode::V_BFE_I32;
+        case 0x14A: out_src_count = 3; return Rdna2Opcode::V_BFI_B32;
         case 0x14B: out_src_count = 3; return Rdna2Opcode::V_FMA_F32;
         case 0x169: out_src_count = 2; return Rdna2Opcode::V_MUL_LO_U32;
         case 0x305: out_src_count = 2; return Rdna2Opcode::V_MBCNT_LO_U32_B32;
@@ -349,6 +352,8 @@ Rdna2Opcode DecodeVop3Opcode(uint16_t raw, uint8_t& out_src_count) {
         case 0x360: out_src_count = 2; return Rdna2Opcode::V_READLANE_B32;
         case 0x36D: out_src_count = 3; return Rdna2Opcode::V_ADD3_U32;
         case 0x373: out_src_count = 3; return Rdna2Opcode::V_DOT2_F32_F16;
+        case 0x377: out_src_count = 3; return Rdna2Opcode::V_PERMLANE16_B32;
+        case 0x378: out_src_count = 3; return Rdna2Opcode::V_PERMLANEX16_B32;
         default: break;
     }
     // Promoted VOPC (0x000..0x0FF)
@@ -383,6 +388,9 @@ uint16_t EncodeVop3Opcode(Rdna2Opcode op) {
     switch (op) {
         case Rdna2Opcode::V_CNDMASK_B32:      return 0x101;
         case Rdna2Opcode::V_MAD_F32:          return 0x141;
+        case Rdna2Opcode::V_BFE_U32:          return 0x148;
+        case Rdna2Opcode::V_BFE_I32:          return 0x149;
+        case Rdna2Opcode::V_BFI_B32:          return 0x14A;
         case Rdna2Opcode::V_FMA_F32:          return 0x14B;
         case Rdna2Opcode::V_MUL_LO_U32:       return 0x169;
         case Rdna2Opcode::V_MBCNT_LO_U32_B32: return 0x305;
@@ -390,6 +398,8 @@ uint16_t EncodeVop3Opcode(Rdna2Opcode op) {
         case Rdna2Opcode::V_READLANE_B32:     return 0x360;
         case Rdna2Opcode::V_ADD3_U32:         return 0x36D;
         case Rdna2Opcode::V_DOT2_F32_F16:     return 0x373;
+        case Rdna2Opcode::V_PERMLANE16_B32:   return 0x377;
+        case Rdna2Opcode::V_PERMLANEX16_B32:  return 0x378;
         default: break;
     }
     uint16_t v2 = EncodeVop2Opcode(op);
@@ -399,6 +409,30 @@ uint16_t EncodeVop3Opcode(Rdna2Opcode op) {
     uint16_t vc = EncodeVopcOpcode(op);
     if (vc != 0xFFFFu) return vc;
     return 0xFFFFu;
+}
+
+Rdna2Opcode DecodeVop3pOpcode(uint16_t raw, uint8_t& out_src_count) {
+    switch (raw) {
+        case 0x04: out_src_count = 2; return Rdna2Opcode::V_PK_LSHLREV_B16;
+        case 0x05: out_src_count = 2; return Rdna2Opcode::V_PK_LSHRREV_B16;
+        case 0x0A: out_src_count = 2; return Rdna2Opcode::V_PK_ADD_U16;
+        case 0x0E: out_src_count = 3; return Rdna2Opcode::V_PK_FMA_F16;
+        case 0x0F: out_src_count = 2; return Rdna2Opcode::V_PK_ADD_F16;
+        case 0x10: out_src_count = 2; return Rdna2Opcode::V_PK_MUL_F16;
+        default:   out_src_count = 2; return Rdna2Opcode::Unknown;
+    }
+}
+
+uint16_t EncodeVop3pOpcode(Rdna2Opcode op) {
+    switch (op) {
+        case Rdna2Opcode::V_PK_LSHLREV_B16: return 0x04;
+        case Rdna2Opcode::V_PK_LSHRREV_B16: return 0x05;
+        case Rdna2Opcode::V_PK_ADD_U16:     return 0x0A;
+        case Rdna2Opcode::V_PK_FMA_F16:     return 0x0E;
+        case Rdna2Opcode::V_PK_ADD_F16:     return 0x0F;
+        case Rdna2Opcode::V_PK_MUL_F16:     return 0x10;
+        default:                            return 0xFFFF;
+    }
 }
 
 Rdna2Opcode DecodeSmemOpcode(uint16_t raw) {
@@ -441,6 +475,13 @@ Rdna2Opcode DecodeFlatOpcode(uint16_t raw, uint8_t seg) {
             default:   return Rdna2Opcode::Unknown;
         }
     }
+    if (seg == 1u) {
+        switch (raw) {
+            case 0x0C: return Rdna2Opcode::SCRATCH_LOAD_DWORD;
+            case 0x1C: return Rdna2Opcode::SCRATCH_STORE_DWORD;
+            default:   return Rdna2Opcode::Unknown;
+        }
+    }
     if (seg == 0u) {
         switch (raw) {
             case 0x0C: return Rdna2Opcode::FLAT_LOAD_DWORD;
@@ -453,31 +494,39 @@ Rdna2Opcode DecodeFlatOpcode(uint16_t raw, uint8_t seg) {
 
 uint16_t EncodeFlatOpcode(Rdna2Opcode op, uint8_t& out_seg) {
     switch (op) {
-        case Rdna2Opcode::GLOBAL_LOAD_DWORD:  out_seg = 2; return 0x0C;
-        case Rdna2Opcode::GLOBAL_STORE_DWORD: out_seg = 2; return 0x1C;
-        case Rdna2Opcode::FLAT_LOAD_DWORD:    out_seg = 0; return 0x0C;
-        case Rdna2Opcode::FLAT_STORE_DWORD:   out_seg = 0; return 0x1C;
-        default:                              out_seg = 0; return 0xFFFF;
+        case Rdna2Opcode::GLOBAL_LOAD_DWORD:   out_seg = 2; return 0x0C;
+        case Rdna2Opcode::GLOBAL_STORE_DWORD:  out_seg = 2; return 0x1C;
+        case Rdna2Opcode::SCRATCH_LOAD_DWORD:  out_seg = 1; return 0x0C;
+        case Rdna2Opcode::SCRATCH_STORE_DWORD: out_seg = 1; return 0x1C;
+        case Rdna2Opcode::FLAT_LOAD_DWORD:     out_seg = 0; return 0x0C;
+        case Rdna2Opcode::FLAT_STORE_DWORD:    out_seg = 0; return 0x1C;
+        default:                               out_seg = 0; return 0xFFFF;
     }
 }
 
 Rdna2Opcode DecodeMimgOpcode(uint16_t raw) {
     switch (raw) {
         case 0x00: return Rdna2Opcode::IMAGE_LOAD;
+        case 0x01: return Rdna2Opcode::IMAGE_LOAD_MIP;
         case 0x08: return Rdna2Opcode::IMAGE_STORE;
+        case 0x11: return Rdna2Opcode::IMAGE_ATOMIC_CMPSWAP;
         case 0x20: return Rdna2Opcode::IMAGE_SAMPLE;
         case 0x25: return Rdna2Opcode::IMAGE_SAMPLE_LZ;
+        case 0xE6: return Rdna2Opcode::IMAGE_BVH_INTERSECT_RAY;
         default:   return Rdna2Opcode::Unknown;
     }
 }
 
 uint16_t EncodeMimgOpcode(Rdna2Opcode op) {
     switch (op) {
-        case Rdna2Opcode::IMAGE_LOAD:      return 0x00;
-        case Rdna2Opcode::IMAGE_STORE:     return 0x08;
-        case Rdna2Opcode::IMAGE_SAMPLE:    return 0x20;
-        case Rdna2Opcode::IMAGE_SAMPLE_LZ: return 0x25;
-        default:                           return 0xFFFF;
+        case Rdna2Opcode::IMAGE_LOAD:              return 0x00;
+        case Rdna2Opcode::IMAGE_LOAD_MIP:          return 0x01;
+        case Rdna2Opcode::IMAGE_STORE:             return 0x08;
+        case Rdna2Opcode::IMAGE_ATOMIC_CMPSWAP:    return 0x11;
+        case Rdna2Opcode::IMAGE_SAMPLE:            return 0x20;
+        case Rdna2Opcode::IMAGE_SAMPLE_LZ:         return 0x25;
+        case Rdna2Opcode::IMAGE_BVH_INTERSECT_RAY: return 0xE6;
+        default:                                   return 0xFFFF;
     }
 }
 
@@ -629,6 +678,398 @@ std::vector<uint8_t> BuildXs2Container(const Xs2ShaderContainer& container) {
     for (uint32_t w : container.code_words) {
         AppendLe32(out, w);
     }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Xbox-Wrapped DXBC / DXIL Shader Container Parser & Builder
+// ---------------------------------------------------------------------------
+namespace {
+
+bool ParseDxbcSignatureChunk(
+    const uint8_t* data,
+    size_t size,
+    bool is_v1,
+    std::vector<XboxSignatureElement>& out_elements) {
+    out_elements.clear();
+    if (size < 8u) return false;
+    const uint32_t count = ReadLe32(data);
+    const uint32_t elem_size = is_v1 ? 32u : 24u;
+    if (count > 256u || 8u + static_cast<size_t>(count) * elem_size > size) {
+        return false;
+    }
+
+    out_elements.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint8_t* rec = data + 8u + static_cast<size_t>(i) * elem_size;
+        XboxSignatureElement el{};
+        uint32_t name_off = 0;
+        if (is_v1) {
+            el.stream = ReadLe32(rec + 0);
+            name_off = ReadLe32(rec + 4);
+            el.semantic_index = ReadLe32(rec + 8);
+            el.system_value_type = ReadLe32(rec + 12);
+            el.component_type = ReadLe32(rec + 16);
+            el.register_index = ReadLe32(rec + 20);
+            el.mask = rec[24];
+            el.rw_mask = rec[25];
+        } else {
+            el.stream = 0;
+            name_off = ReadLe32(rec + 0);
+            el.semantic_index = ReadLe32(rec + 4);
+            el.system_value_type = ReadLe32(rec + 8);
+            el.component_type = ReadLe32(rec + 12);
+            el.register_index = ReadLe32(rec + 16);
+            el.mask = rec[20];
+            el.rw_mask = rec[21];
+        }
+        if (name_off < size) {
+            size_t end = name_off;
+            while (end < size && data[end] != 0) ++end;
+            el.semantic_name.assign(reinterpret_cast<const char*>(data + name_off), end - name_off);
+        }
+        out_elements.push_back(std::move(el));
+    }
+    return true;
+}
+
+std::vector<uint8_t> BuildDxbcSignatureV1Chunk(const std::vector<XboxSignatureElement>& elements) {
+    std::vector<uint8_t> out;
+    const uint32_t count = static_cast<uint32_t>(elements.size());
+    const uint32_t header_and_table = 8u + count * 32u;
+
+    std::vector<uint8_t> string_table;
+    std::vector<uint32_t> name_offsets;
+    name_offsets.reserve(count);
+    for (const auto& el : elements) {
+        name_offsets.push_back(header_and_table + static_cast<uint32_t>(string_table.size()));
+        for (char c : el.semantic_name) {
+            string_table.push_back(static_cast<uint8_t>(c));
+        }
+        string_table.push_back(0u);
+    }
+    while ((string_table.size() & 3u) != 0u) {
+        string_table.push_back(0u);
+    }
+
+    out.reserve(header_and_table + string_table.size());
+    AppendLe32(out, count);
+    AppendLe32(out, 8u);
+    for (uint32_t i = 0; i < count; ++i) {
+        const auto& el = elements[i];
+        AppendLe32(out, el.stream);
+        AppendLe32(out, name_offsets[i]);
+        AppendLe32(out, el.semantic_index);
+        AppendLe32(out, el.system_value_type);
+        AppendLe32(out, el.component_type);
+        AppendLe32(out, el.register_index);
+        out.push_back(el.mask);
+        out.push_back(el.rw_mask);
+        out.push_back(0u);
+        out.push_back(0u);
+        AppendLe32(out, 0u);  // min_precision
+    }
+    out.insert(out.end(), string_table.begin(), string_table.end());
+    return out;
+}
+
+void ReadStaticSamplerRecord(const uint8_t* p, XboxStaticSamplerInfo& out) {
+    out.filter = ReadLe32(p + 0);
+    out.address_u = ReadLe32(p + 4);
+    out.address_v = ReadLe32(p + 8);
+    out.address_w = ReadLe32(p + 12);
+    out.mip_lod_bias = BitsToFloat(ReadLe32(p + 16));
+    out.max_anisotropy = ReadLe32(p + 20);
+    out.comparison_func = ReadLe32(p + 24);
+    out.border_color = ReadLe32(p + 28);
+    out.min_lod = BitsToFloat(ReadLe32(p + 32));
+    out.max_lod = BitsToFloat(ReadLe32(p + 36));
+    out.shader_register = ReadLe32(p + 40);
+    out.register_space = ReadLe32(p + 44);
+    out.shader_visibility = ReadLe32(p + 48);
+}
+
+void AppendStaticSamplerRecord(std::vector<uint8_t>& out, const XboxStaticSamplerInfo& s) {
+    AppendLe32(out, s.filter);
+    AppendLe32(out, s.address_u);
+    AppendLe32(out, s.address_v);
+    AppendLe32(out, s.address_w);
+    AppendLe32(out, FloatToBits(s.mip_lod_bias));
+    AppendLe32(out, s.max_anisotropy);
+    AppendLe32(out, s.comparison_func);
+    AppendLe32(out, s.border_color);
+    AppendLe32(out, FloatToBits(s.min_lod));
+    AppendLe32(out, FloatToBits(s.max_lod));
+    AppendLe32(out, s.shader_register);
+    AppendLe32(out, s.register_space);
+    AppendLe32(out, s.shader_visibility);
+}
+
+void ParseStsmChunk(const uint8_t* data, size_t size, std::vector<XboxStaticSamplerInfo>& out_samplers) {
+    if (size < 4u) return;
+    const uint32_t count = ReadLe32(data);
+    if (count > 256u || 4u + static_cast<size_t>(count) * 52u > size) return;
+    for (uint32_t i = 0; i < count; ++i) {
+        XboxStaticSamplerInfo s{};
+        ReadStaticSamplerRecord(data + 4u + static_cast<size_t>(i) * 52u, s);
+        out_samplers.push_back(s);
+    }
+}
+
+void ParseRts0Chunk(const uint8_t* data, size_t size, std::vector<XboxStaticSamplerInfo>& out_samplers) {
+    // Public D3D12 serialized root signature (RTS0) header: 24 bytes
+    // [0]: version (1 or 2), [4]: num_params, [8]: params_offset,
+    // [12]: num_static_samplers, [16]: static_samplers_offset, [20]: flags
+    if (size < 24u) return;
+    const uint32_t version = ReadLe32(data + 0);
+    if (version != 1u && version != 2u) return;
+    const uint32_t num_samplers = ReadLe32(data + 12);
+    const uint32_t samplers_off = ReadLe32(data + 16);
+    if (num_samplers == 0u || num_samplers > 256u) return;
+    if (static_cast<uint64_t>(samplers_off) + static_cast<uint64_t>(num_samplers) * 52ull > size) return;
+    for (uint32_t i = 0; i < num_samplers; ++i) {
+        XboxStaticSamplerInfo s{};
+        ReadStaticSamplerRecord(data + samplers_off + static_cast<size_t>(i) * 52u, s);
+        out_samplers.push_back(s);
+    }
+}
+
+bool TryExtractXs2FromXboxChunk(const std::vector<uint8_t>& chunk_data, Xs2ShaderContainer& out_xs2) {
+    if (chunk_data.size() >= kXs2HeaderSizeBytes && std::memcmp(chunk_data.data(), "XS2\0", 4) == 0) {
+        return ParseXs2Container(chunk_data, out_xs2).ok();
+    }
+    // Also handle wrapped Xbox shader chunks with a clean-room metadata prefix before "XS2\0"
+    for (size_t off = 4; off + kXs2HeaderSizeBytes <= chunk_data.size(); off += 4) {
+        if (std::memcmp(chunk_data.data() + off, "XS2\0", 4) == 0) {
+            std::vector<uint8_t> slice(chunk_data.begin() + static_cast<std::ptrdiff_t>(off), chunk_data.end());
+            if (ParseXs2Container(slice, out_xs2).ok()) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+bool IsXboxShaderBytecode(const void* data, size_t size) noexcept {
+    if (!data || size < 4u) return false;
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    if (std::memcmp(bytes, "XS2\0", 4) == 0) {
+        return size >= kXs2HeaderSizeBytes;
+    }
+    if (size < 32u || std::memcmp(bytes, "DXBC", 4) != 0) {
+        return false;
+    }
+    const uint32_t total_size = ReadLe32(bytes + 24);
+    const uint32_t chunk_count = ReadLe32(bytes + 28);
+    if (total_size < 32u || total_size > size || chunk_count == 0u || chunk_count > 128u) {
+        return false;
+    }
+    const uint64_t dir_end = 32ull + static_cast<uint64_t>(chunk_count) * 4ull;
+    if (dir_end > total_size) return false;
+
+    for (uint32_t i = 0; i < chunk_count; ++i) {
+        const uint32_t off = ReadLe32(bytes + 32u + static_cast<size_t>(i) * 4u);
+        if (static_cast<uint64_t>(off) + 8ull > total_size) continue;
+        if (std::memcmp(bytes + off, "XBOX", 4) == 0 || std::memcmp(bytes + off, "XS2M", 4) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+Status ParseXboxShaderContainer(const void* data, size_t size, XboxDxbcContainer& out_container) {
+    out_container = XboxDxbcContainer{};
+    if (!data || size < 4u) {
+        return Status::Error(StatusCode::ParseError, "Shader container buffer is empty or truncated");
+    }
+    const auto* bytes = static_cast<const uint8_t*>(data);
+
+    // 1. Raw XS2\0 container
+    if (std::memcmp(bytes, "XS2\0", 4) == 0) {
+        std::vector<uint8_t> raw(bytes, bytes + size);
+        if (auto st = ParseXs2Container(raw, out_container.xs2); !st.ok()) {
+            return st;
+        }
+        out_container.format = XboxShaderBlobFormat::RawXs2;
+        out_container.has_xs2 = true;
+        return Status::Ok();
+    }
+
+    // 2. DXBC container ("DXBC" magic + 16-byte hash + version + total_size + chunk_count + offsets[])
+    if (size < 32u || std::memcmp(bytes, "DXBC", 4) != 0) {
+        return Status::Error(StatusCode::UnsupportedFormat,
+                             "Unrecognized shader container magic (expected 'XS2\\0' or 'DXBC')");
+    }
+
+    const uint32_t version = ReadLe32(bytes + 20);
+    const uint32_t total_size = ReadLe32(bytes + 24);
+    const uint32_t chunk_count = ReadLe32(bytes + 28);
+    if (version == 0u || total_size < 32u || total_size > size) {
+        return Status::Error(StatusCode::ParseError, "Invalid DXBC container header size/version");
+    }
+    if (chunk_count == 0u || chunk_count > 128u) {
+        return Status::Error(StatusCode::ParseError, "Invalid DXBC chunk count");
+    }
+    const uint64_t dir_end = 32ull + static_cast<uint64_t>(chunk_count) * 4ull;
+    if (dir_end > total_size) {
+        return Status::Error(StatusCode::ParseError, "DXBC chunk offset directory extends past container end");
+    }
+
+    out_container.chunks.reserve(chunk_count);
+    for (uint32_t i = 0; i < chunk_count; ++i) {
+        const uint32_t off = ReadLe32(bytes + 32u + static_cast<size_t>(i) * 4u);
+        if (static_cast<uint64_t>(off) + 8ull > total_size) {
+            return Status::Error(StatusCode::ParseError, "DXBC chunk header extends past container end");
+        }
+        const uint32_t chunk_size = ReadLe32(bytes + off + 4u);
+        if (static_cast<uint64_t>(off) + 8ull + static_cast<uint64_t>(chunk_size) > total_size) {
+            return Status::Error(StatusCode::ParseError, "DXBC chunk payload extends past container end");
+        }
+
+        XboxDxbcChunk chunk{};
+        std::memcpy(chunk.fourcc, bytes + off, 4u);
+        chunk.fourcc[4] = '\0';
+        chunk.data.assign(bytes + off + 8u, bytes + off + 8u + chunk_size);
+
+        if (std::memcmp(chunk.fourcc, "XBOX", 4) == 0 || std::memcmp(chunk.fourcc, "XS2M", 4) == 0) {
+            if (!out_container.has_xs2 && TryExtractXs2FromXboxChunk(chunk.data, out_container.xs2)) {
+                out_container.has_xs2 = true;
+            }
+        } else if (std::memcmp(chunk.fourcc, "DXIL", 4) == 0 ||
+                   std::memcmp(chunk.fourcc, "SHEX", 4) == 0 ||
+                   std::memcmp(chunk.fourcc, "SHDR", 4) == 0) {
+            out_container.has_dxil_or_shdr = true;
+            if (out_container.host_shader_chunk_fourcc.empty()) {
+                out_container.host_shader_chunk_fourcc = chunk.fourcc;
+            }
+        } else if (std::memcmp(chunk.fourcc, "ISG1", 4) == 0) {
+            ParseDxbcSignatureChunk(chunk.data.data(), chunk.data.size(), true, out_container.input_signature);
+        } else if (std::memcmp(chunk.fourcc, "ISGN", 4) == 0 && out_container.input_signature.empty()) {
+            ParseDxbcSignatureChunk(chunk.data.data(), chunk.data.size(), false, out_container.input_signature);
+        } else if (std::memcmp(chunk.fourcc, "OSG1", 4) == 0) {
+            ParseDxbcSignatureChunk(chunk.data.data(), chunk.data.size(), true, out_container.output_signature);
+        } else if (std::memcmp(chunk.fourcc, "OSGN", 4) == 0 && out_container.output_signature.empty()) {
+            ParseDxbcSignatureChunk(chunk.data.data(), chunk.data.size(), false, out_container.output_signature);
+        } else if (std::memcmp(chunk.fourcc, "STSM", 4) == 0) {
+            ParseStsmChunk(chunk.data.data(), chunk.data.size(), out_container.static_samplers);
+        } else if (std::memcmp(chunk.fourcc, "RTS0", 4) == 0) {
+            out_container.raw_root_signature_chunk = chunk.data;
+            ParseRts0Chunk(chunk.data.data(), chunk.data.size(), out_container.static_samplers);
+        }
+
+        out_container.chunks.push_back(std::move(chunk));
+    }
+
+    out_container.format = out_container.has_xs2
+                               ? XboxShaderBlobFormat::XboxDxbc
+                               : XboxShaderBlobFormat::StandardHostDxbc;
+    return Status::Ok();
+}
+
+Status ParseXboxShaderContainer(const std::vector<uint8_t>& bytes, XboxDxbcContainer& out_container) {
+    return ParseXboxShaderContainer(bytes.data(), bytes.size(), out_container);
+}
+
+std::vector<uint8_t> BuildXboxDxbcContainer(const XboxDxbcBuildDesc& desc) {
+    std::vector<XboxDxbcChunk> chunks;
+
+    if (!desc.input_signature.empty()) {
+        XboxDxbcChunk c{};
+        std::memcpy(c.fourcc, "ISG1", 5);
+        c.data = BuildDxbcSignatureV1Chunk(desc.input_signature);
+        chunks.push_back(std::move(c));
+    }
+    if (!desc.output_signature.empty()) {
+        XboxDxbcChunk c{};
+        std::memcpy(c.fourcc, "OSG1", 5);
+        c.data = BuildDxbcSignatureV1Chunk(desc.output_signature);
+        chunks.push_back(std::move(c));
+    }
+    if (!desc.static_samplers.empty()) {
+        XboxDxbcChunk c{};
+        if (desc.emit_rts0_for_samplers) {
+            std::memcpy(c.fourcc, "RTS0", 5);
+            AppendLe32(c.data, 1u);  // D3D_ROOT_SIGNATURE_VERSION_1_0
+            AppendLe32(c.data, 0u);  // num_parameters
+            AppendLe32(c.data, 24u); // parameters_offset
+            AppendLe32(c.data, static_cast<uint32_t>(desc.static_samplers.size()));
+            AppendLe32(c.data, 24u); // static_samplers_offset
+            AppendLe32(c.data, 0u);  // flags
+            for (const auto& s : desc.static_samplers) {
+                AppendStaticSamplerRecord(c.data, s);
+            }
+        } else {
+            std::memcpy(c.fourcc, "STSM", 5);
+            AppendLe32(c.data, static_cast<uint32_t>(desc.static_samplers.size()));
+            for (const auto& s : desc.static_samplers) {
+                AppendStaticSamplerRecord(c.data, s);
+            }
+        }
+        chunks.push_back(std::move(c));
+    }
+    if (!desc.aux_dxil_or_shdr.empty()) {
+        XboxDxbcChunk c{};
+        const std::string tag = (desc.aux_shader_fourcc.size() == 4) ? desc.aux_shader_fourcc : "DXIL";
+        std::memcpy(c.fourcc, tag.data(), 4);
+        c.fourcc[4] = '\0';
+        c.data = desc.aux_dxil_or_shdr;
+        chunks.push_back(std::move(c));
+    }
+    if (!desc.xs2_blob.empty()) {
+        XboxDxbcChunk c{};
+        const std::string tag = (desc.xbox_chunk_fourcc.size() == 4) ? desc.xbox_chunk_fourcc : "XBOX";
+        std::memcpy(c.fourcc, tag.data(), 4);
+        c.fourcc[4] = '\0';
+        c.data = desc.xs2_blob;
+        chunks.push_back(std::move(c));
+    }
+
+    const uint32_t chunk_count = static_cast<uint32_t>(chunks.size());
+    uint32_t cur_offset = 32u + chunk_count * 4u;
+    std::vector<uint32_t> offsets;
+    offsets.reserve(chunk_count);
+    for (const auto& c : chunks) {
+        offsets.push_back(cur_offset);
+        cur_offset += 8u + static_cast<uint32_t>(c.data.size());
+    }
+    const uint32_t total_size = cur_offset;
+
+    std::vector<uint8_t> out;
+    out.reserve(total_size);
+    out.push_back('D');
+    out.push_back('X');
+    out.push_back('B');
+    out.push_back('C');
+    // 16-byte deterministic digest placeholder (filled below)
+    for (int i = 0; i < 16; ++i) out.push_back(0u);
+    AppendLe32(out, 1u);  // DXBC container version 1
+    AppendLe32(out, total_size);
+    AppendLe32(out, chunk_count);
+    for (uint32_t off : offsets) {
+        AppendLe32(out, off);
+    }
+    for (const auto& c : chunks) {
+        out.push_back(static_cast<uint8_t>(c.fourcc[0]));
+        out.push_back(static_cast<uint8_t>(c.fourcc[1]));
+        out.push_back(static_cast<uint8_t>(c.fourcc[2]));
+        out.push_back(static_cast<uint8_t>(c.fourcc[3]));
+        AppendLe32(out, static_cast<uint32_t>(c.data.size()));
+        out.insert(out.end(), c.data.begin(), c.data.end());
+    }
+
+    // Fill 16-byte content digest with two deterministic 64-bit FNV-1a passes over payload [20..total_size)
+    uint64_t h0 = 14695981039346656037ull;
+    uint64_t h1 = 0x9E3779B97F4A7C15ull;
+    for (size_t i = 20; i < out.size(); ++i) {
+        h0 ^= out[i];
+        h0 *= 1099511628211ull;
+        h1 ^= static_cast<uint64_t>(out[i]) + (i * 0xBF58476D1CE4E5B9ull);
+        h1 *= 0x94D049BB133111EBull;
+    }
+    std::memcpy(out.data() + 4, &h0, 8);
+    std::memcpy(out.data() + 12, &h1, 8);
     return out;
 }
 
@@ -885,6 +1326,7 @@ const char* Rdna2EncodingName(Rdna2Encoding enc) noexcept {
         case Rdna2Encoding::VOP1:  return "VOP1";
         case Rdna2Encoding::VOPC:  return "VOPC";
         case Rdna2Encoding::VOP3:  return "VOP3";
+        case Rdna2Encoding::VOP3P: return "VOP3P";
         case Rdna2Encoding::SMEM:  return "SMEM";
         case Rdna2Encoding::MUBUF: return "MUBUF";
         case Rdna2Encoding::MIMG:  return "MIMG";
@@ -992,20 +1434,34 @@ const char* Rdna2OpcodeName(Rdna2Opcode op) noexcept {
         case Rdna2Opcode::V_CMP_GE_U32:       return "v_cmp_ge_u32";
         case Rdna2Opcode::V_FMA_F32:          return "v_fma_f32";
         case Rdna2Opcode::V_MAD_F32:          return "v_mad_f32";
+        case Rdna2Opcode::V_BFE_U32:          return "v_bfe_u32";
+        case Rdna2Opcode::V_BFE_I32:          return "v_bfe_i32";
+        case Rdna2Opcode::V_BFI_B32:          return "v_bfi_b32";
         case Rdna2Opcode::V_MUL_LO_U32:       return "v_mul_lo_u32";
         case Rdna2Opcode::V_MBCNT_LO_U32_B32: return "v_mbcnt_lo_u32_b32";
         case Rdna2Opcode::V_MBCNT_HI_U32_B32: return "v_mbcnt_hi_u32_b32";
         case Rdna2Opcode::V_READLANE_B32:     return "v_readlane_b32";
         case Rdna2Opcode::V_ADD3_U32:         return "v_add3_u32";
         case Rdna2Opcode::V_DOT2_F32_F16:     return "v_dot2_f32_f16";
+        case Rdna2Opcode::V_PERMLANE16_B32:   return "v_permlane16_b32";
+        case Rdna2Opcode::V_PERMLANEX16_B32:  return "v_permlanex16_b32";
+        case Rdna2Opcode::V_PK_LSHLREV_B16:   return "v_pk_lshlrev_b16";
+        case Rdna2Opcode::V_PK_LSHRREV_B16:   return "v_pk_lshrrev_b16";
+        case Rdna2Opcode::V_PK_ADD_U16:       return "v_pk_add_u16";
+        case Rdna2Opcode::V_PK_FMA_F16:       return "v_pk_fma_f16";
+        case Rdna2Opcode::V_PK_ADD_F16:       return "v_pk_add_f16";
+        case Rdna2Opcode::V_PK_MUL_F16:       return "v_pk_mul_f16";
         case Rdna2Opcode::S_LOAD_DWORD:       return "s_load_dword";
         case Rdna2Opcode::S_BUFFER_LOAD_DWORD:return "s_buffer_load_dword";
         case Rdna2Opcode::BUFFER_LOAD_DWORD:  return "buffer_load_dword";
         case Rdna2Opcode::BUFFER_STORE_DWORD: return "buffer_store_dword";
         case Rdna2Opcode::IMAGE_LOAD:         return "image_load";
+        case Rdna2Opcode::IMAGE_LOAD_MIP:     return "image_load_mip";
         case Rdna2Opcode::IMAGE_STORE:        return "image_store";
+        case Rdna2Opcode::IMAGE_ATOMIC_CMPSWAP: return "image_atomic_cmpswap";
         case Rdna2Opcode::IMAGE_SAMPLE:       return "image_sample";
         case Rdna2Opcode::IMAGE_SAMPLE_LZ:    return "image_sample_lz";
+        case Rdna2Opcode::IMAGE_BVH_INTERSECT_RAY: return "image_bvh_intersect_ray";
         case Rdna2Opcode::DS_ADD_U32:         return "ds_add_u32";
         case Rdna2Opcode::DS_WRITE_B32:       return "ds_write_b32";
         case Rdna2Opcode::DS_ADD_RTN_U32:     return "ds_add_rtn_u32";
@@ -1015,6 +1471,8 @@ const char* Rdna2OpcodeName(Rdna2Opcode op) noexcept {
         case Rdna2Opcode::GLOBAL_STORE_DWORD: return "global_store_dword";
         case Rdna2Opcode::FLAT_LOAD_DWORD:    return "flat_load_dword";
         case Rdna2Opcode::FLAT_STORE_DWORD:   return "flat_store_dword";
+        case Rdna2Opcode::SCRATCH_LOAD_DWORD: return "scratch_load_dword";
+        case Rdna2Opcode::SCRATCH_STORE_DWORD:return "scratch_store_dword";
         case Rdna2Opcode::EXP:                return "exp";
         default:                              return "unknown";
     }
@@ -1103,7 +1561,8 @@ std::string FormatRdna2Instruction(const Rdna2Instruction& inst) {
         case Rdna2Encoding::MIMG: {
             const uint32_t base_rsrc = static_cast<uint32_t>(inst.srsrc) * 4u;
             const uint32_t base_samp = static_cast<uint32_t>(inst.ssamp) * 4u;
-            if (inst.opcode == Rdna2Opcode::IMAGE_STORE) {
+            if (inst.opcode == Rdna2Opcode::IMAGE_STORE ||
+                inst.opcode == Rdna2Opcode::IMAGE_ATOMIC_CMPSWAP) {
                 os << " " << FormatRdna2Operand(inst.src[0]) << ", " << FormatRdna2Operand(inst.src[1]);
             } else {
                 os << " " << FormatRdna2Operand(inst.dst) << ", " << FormatRdna2Operand(inst.src[0]);
@@ -1115,6 +1574,7 @@ std::string FormatRdna2Instruction(const Rdna2Instruction& inst) {
             os << " dmask:0x" << std::hex << static_cast<uint32_t>(inst.mimg_dmask) << std::dec
                << " dim:" << static_cast<uint32_t>(inst.mimg_dim);
             if (inst.mimg_unrm) os << " unrm";
+            if (inst.glc) os << " glc";
             break;
         }
         case Rdna2Encoding::DS: {
@@ -1132,13 +1592,19 @@ std::string FormatRdna2Instruction(const Rdna2Instruction& inst) {
             break;
         }
         case Rdna2Encoding::FLAT: {
-            if (inst.opcode == Rdna2Opcode::GLOBAL_STORE_DWORD || inst.opcode == Rdna2Opcode::FLAT_STORE_DWORD) {
+            if (inst.opcode == Rdna2Opcode::GLOBAL_STORE_DWORD ||
+                inst.opcode == Rdna2Opcode::FLAT_STORE_DWORD ||
+                inst.opcode == Rdna2Opcode::SCRATCH_STORE_DWORD) {
                 os << " " << FormatRdna2Operand(inst.src[0]) << ", " << FormatRdna2Operand(inst.src[1]);
             } else {
                 os << " " << FormatRdna2Operand(inst.dst) << ", " << FormatRdna2Operand(inst.src[0]);
             }
             if (inst.saddr != 0x7Fu) {
-                os << ", s[" << static_cast<uint32_t>(inst.saddr) << ":" << (static_cast<uint32_t>(inst.saddr) + 1u) << "]";
+                if (inst.flat_seg == 1u) {
+                    os << ", s" << static_cast<uint32_t>(inst.saddr);
+                } else {
+                    os << ", s[" << static_cast<uint32_t>(inst.saddr) << ":" << (static_cast<uint32_t>(inst.saddr) + 1u) << "]";
+                }
             } else {
                 os << ", off";
             }
@@ -1330,6 +1796,39 @@ Status DisassembleRdna2(
                 inst.src[2] = Rdna2Operand::VccLo();
                 inst.src_count = 3;
             }
+        } else if ((w0 >> 26) == 0x33u) {
+            // VOP3P (64-bit, or 96-bit with literal32 in GFX10.3): [31:26] == 110011
+            inst.encoding = Rdna2Encoding::VOP3P;
+            uint32_t w1 = 0;
+            if (auto st = consume_word(w1); !st.ok()) return st;
+            const uint16_t raw_op = static_cast<uint16_t>((w0 >> 16) & 0x7Fu);
+            inst.clamp = ((w0 >> 15) & 1u) != 0u;
+            const uint8_t op_sel_hi_2 = static_cast<uint8_t>((w0 >> 14) & 1u);
+            inst.vop3p_op_sel = static_cast<uint8_t>((w0 >> 11) & 0x7u);
+            inst.vop3p_neg_hi = static_cast<uint8_t>((w0 >> 8) & 0x7u);
+            const uint8_t vdst = static_cast<uint8_t>(w0 & 0xFFu);
+
+            inst.vop3p_neg_lo = static_cast<uint8_t>((w1 >> 29) & 0x7u);
+            const uint8_t op_sel_hi_10 = static_cast<uint8_t>((w1 >> 27) & 0x3u);
+            inst.vop3p_op_sel_hi = static_cast<uint8_t>(op_sel_hi_10 | (op_sel_hi_2 << 2));
+            const uint16_t src2 = static_cast<uint16_t>((w1 >> 18) & 0x1FFu);
+            const uint16_t src1 = static_cast<uint16_t>((w1 >> 9) & 0x1FFu);
+            const uint16_t src0 = static_cast<uint16_t>(w1 & 0x1FFu);
+
+            uint32_t lit = 0;
+            if (src0 == 255u || src1 == 255u || src2 == 255u) {
+                if (auto st = consume_word(lit); !st.ok()) return st;
+            }
+
+            uint8_t sc = 2;
+            inst.raw_opcode = raw_op;
+            inst.opcode = DecodeVop3pOpcode(raw_op, sc);
+            inst.src_count = sc;
+            inst.dst = Rdna2Operand::Vgpr(vdst);
+            const uint16_t raw_srcs[3] = {src0, src1, src2};
+            for (uint8_t i = 0; i < sc; ++i) {
+                inst.src[i] = DecodeRdna2SourceOperand(raw_srcs[i], lit);
+            }
         } else if ((w0 >> 26) == 0x35u) {
             // VOP3 (64-bit, or 96-bit with literal32 in GFX10.3): [31:26] == 110101
             inst.encoding = Rdna2Encoding::VOP3;
@@ -1433,6 +1932,11 @@ Status DisassembleRdna2(
                 inst.src[0] = Rdna2Operand::Vgpr(vdata);
                 inst.src[1] = Rdna2Operand::Vgpr(vaddr);
                 inst.src_count = 2;
+            } else if (inst.opcode == Rdna2Opcode::IMAGE_ATOMIC_CMPSWAP) {
+                inst.dst = Rdna2Operand::Vgpr(vdata);
+                inst.src[0] = Rdna2Operand::Vgpr(vdata);
+                inst.src[1] = Rdna2Operand::Vgpr(vaddr);
+                inst.src_count = 2;
             } else {
                 inst.dst = Rdna2Operand::Vgpr(vdata);
                 inst.src[0] = Rdna2Operand::Vgpr(vaddr);
@@ -1498,7 +2002,9 @@ Status DisassembleRdna2(
             const uint8_t vaddr = static_cast<uint8_t>(w1 & 0xFFu);
             inst.raw_opcode = raw_op;
             inst.opcode = DecodeFlatOpcode(raw_op, inst.flat_seg);
-            if (inst.opcode == Rdna2Opcode::GLOBAL_LOAD_DWORD || inst.opcode == Rdna2Opcode::FLAT_LOAD_DWORD) {
+            if (inst.opcode == Rdna2Opcode::GLOBAL_LOAD_DWORD ||
+                inst.opcode == Rdna2Opcode::FLAT_LOAD_DWORD ||
+                inst.opcode == Rdna2Opcode::SCRATCH_LOAD_DWORD) {
                 inst.dst = Rdna2Operand::Vgpr(vdst);
                 inst.src[0] = Rdna2Operand::Vgpr(vaddr);
                 inst.src_count = 1;
@@ -1696,6 +2202,48 @@ void Rdna2Assembler::EmitVop3(
     }
 }
 
+void Rdna2Assembler::EmitVop3p(
+    Rdna2Opcode op,
+    uint8_t vdst,
+    const Rdna2Operand& src0,
+    const Rdna2Operand& src1,
+    const Rdna2Operand& src2,
+    uint8_t op_sel,
+    uint8_t op_sel_hi,
+    uint8_t neg_lo,
+    uint8_t neg_hi,
+    bool clamp) {
+    const uint16_t raw_op = EncodeVop3pOpcode(op);
+    uint16_t c0 = 0, c1 = 0, c2 = 0;
+    uint32_t lit0 = 0, lit1 = 0, lit2 = 0;
+    bool need0 = false, need1 = false, need2 = false;
+    EncodeRdna2SourceOperand(src0, c0, lit0, need0);
+    EncodeRdna2SourceOperand(src1, c1, lit1, need1);
+    EncodeRdna2SourceOperand(src2, c2, lit2, need2);
+
+    const uint32_t op_sel_hi_2 = (static_cast<uint32_t>(op_sel_hi) >> 2) & 1u;
+    const uint32_t op_sel_hi_10 = static_cast<uint32_t>(op_sel_hi) & 0x3u;
+    const uint32_t w0 = (0x33u << 26) | (static_cast<uint32_t>(raw_op & 0x7Fu) << 16) |
+                        (clamp ? (1u << 15) : 0u) | (op_sel_hi_2 << 14) |
+                        (static_cast<uint32_t>(op_sel & 0x7u) << 11) |
+                        (static_cast<uint32_t>(neg_hi & 0x7u) << 8) |
+                        static_cast<uint32_t>(vdst);
+    const uint32_t w1 = (static_cast<uint32_t>(neg_lo & 0x7u) << 29) |
+                        (op_sel_hi_10 << 27) |
+                        (static_cast<uint32_t>(c2 & 0x1FFu) << 18) |
+                        (static_cast<uint32_t>(c1 & 0x1FFu) << 9) |
+                        static_cast<uint32_t>(c0 & 0x1FFu);
+    words_.push_back(w0);
+    words_.push_back(w1);
+    if (need0) {
+        words_.push_back(lit0);
+    } else if (need1) {
+        words_.push_back(lit1);
+    } else if (need2) {
+        words_.push_back(lit2);
+    }
+}
+
 void Rdna2Assembler::EmitSmem(
     Rdna2Opcode op,
     uint8_t sdata,
@@ -1740,11 +2288,13 @@ void Rdna2Assembler::EmitMimg(
     uint8_t ssamp_sgpr,
     uint8_t dmask,
     uint8_t dim,
-    bool unrm) {
+    bool unrm,
+    bool glc) {
     const uint16_t raw_op = EncodeMimgOpcode(op);
     const uint32_t srsrc = static_cast<uint32_t>(srsrc_sgpr >> 2) & 0x1Fu;
     const uint32_t ssamp = static_cast<uint32_t>(ssamp_sgpr >> 2) & 0x1Fu;
     const uint32_t w0 = (0x3Cu << 26) | (static_cast<uint32_t>(raw_op & 0x7Fu) << 18) |
+                        (glc ? (1u << 13) : 0u) |
                         (unrm ? (1u << 12) : 0u) | (static_cast<uint32_t>(dmask & 0xFu) << 8) |
                         (static_cast<uint32_t>(dim & 0x7u) << 3) |
                         static_cast<uint32_t>((raw_op >> 7) & 1u);
@@ -1781,7 +2331,9 @@ void Rdna2Assembler::EmitGlobal(
     uint8_t saddr) {
     uint8_t seg = 2;
     const uint16_t raw_op = EncodeFlatOpcode(op, seg);
-    const bool is_load = (op == Rdna2Opcode::GLOBAL_LOAD_DWORD || op == Rdna2Opcode::FLAT_LOAD_DWORD);
+    const bool is_load = (op == Rdna2Opcode::GLOBAL_LOAD_DWORD ||
+                          op == Rdna2Opcode::FLAT_LOAD_DWORD ||
+                          op == Rdna2Opcode::SCRATCH_LOAD_DWORD);
     const uint32_t w0 = (0x37u << 26) | (static_cast<uint32_t>(raw_op & 0x7Fu) << 18) |
                         (static_cast<uint32_t>(seg & 0x3u) << 14) |
                         (static_cast<uint32_t>(offset) & 0xFFFu);
@@ -1791,6 +2343,15 @@ void Rdna2Assembler::EmitGlobal(
                         static_cast<uint32_t>(vaddr);
     words_.push_back(w0);
     words_.push_back(w1);
+}
+
+void Rdna2Assembler::EmitScratch(
+    Rdna2Opcode op,
+    uint8_t vdst_or_data,
+    uint8_t vaddr,
+    int16_t offset,
+    uint8_t saddr) {
+    EmitGlobal(op, vdst_or_data, vaddr, offset, saddr);
 }
 
 void Rdna2Assembler::EmitExp(
