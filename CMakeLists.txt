@@ -1,0 +1,75 @@
+cmake_minimum_required(VERSION 3.20)
+project(OpenScarlett VERSION 0.1.0 LANGUAGES C CXX)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+enable_testing()
+
+add_library(openscarlett_core STATIC
+    src/core/status.cpp
+    src/core/telemetry.cpp
+    src/loader/pe_inspector.cpp
+    src/io/gdeflate.cpp
+    src/io/bcpack.cpp
+    src/audio/xma2_decoder.cpp
+    src/middleware/bink2_decoder.cpp
+    src/gpu/vulkan_backend.cpp
+    src/gpu/rdna2_disasm.cpp
+    src/gpu/rdna2_ir.cpp
+)
+
+target_include_directories(openscarlett_core PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+if(WIN32)
+    target_compile_definitions(openscarlett_core PUBLIC
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+        OPENSCARLETT_PLATFORM_WINDOWS=1
+    )
+    if(MSVC)
+        target_compile_options(openscarlett_core PRIVATE /W4)
+        target_link_libraries(openscarlett_core PUBLIC d3d12 dxgi d3dcompiler ole32 uuid)
+    endif()
+endif()
+
+# Shims
+add_library(winrt_xs SHARED src/shims/winrt_shim.cpp)
+set_target_properties(winrt_xs PROPERTIES PREFIX "" OUTPUT_NAME "winrt_xs")
+target_link_libraries(winrt_xs PRIVATE openscarlett_core)
+target_compile_definitions(winrt_xs PRIVATE OPENSCARLETT_BUILDING_WINRT=1)
+
+# CLI runner & hardware/binary inspector
+add_executable(openscarlett src/main.cpp)
+target_link_libraries(openscarlett PRIVATE openscarlett_core)
+add_dependencies(openscarlett winrt_xs)
+
+# Unit & Live-GPU Test Suite
+function(openscarlett_add_test name src)
+    add_executable(${name} ${src})
+    target_link_libraries(${name} PRIVATE openscarlett_core)
+    target_include_directories(${name} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests
+    )
+    target_compile_definitions(${name} PRIVATE
+        OPENSCARLETT_BINARY_DIR="${CMAKE_BINARY_DIR}"
+        OPENSCARLETT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+    )
+    add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
+openscarlett_add_test(test_pe_inspect tests/test_pe_inspect.cpp)
+add_dependencies(test_pe_inspect openscarlett)
+
+openscarlett_add_test(test_codecs tests/test_codecs.cpp)
+openscarlett_add_test(test_vulkan_live tests/test_vulkan_live.cpp)
+openscarlett_add_test(test_rdna2_core tests/test_rdna2_core.cpp)
+
+openscarlett_add_test(test_winrt_xs tests/test_winrt_xs.cpp)
+target_link_libraries(test_winrt_xs PRIVATE winrt_xs)
+
+add_test(NAME test_cli_probe_gpu COMMAND $<TARGET_FILE:openscarlett> probe-gpu)
