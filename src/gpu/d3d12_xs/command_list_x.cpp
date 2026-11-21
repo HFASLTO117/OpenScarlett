@@ -13,10 +13,16 @@ namespace {
 constexpr const char* kModule = "d3d12_xs.dll";
 
 inline void RecordList(const char* method, int32_t slot, HRESULT hr = S_OK) {
+    openscarlett::CallOutcome outcome = openscarlett::CallOutcome::Ok;
+    if (hr == E_NOTIMPL || hr == E_NOINTERFACE) {
+        outcome = openscarlett::CallOutcome::NotImplemented;
+    } else if (FAILED(hr)) {
+        outcome = openscarlett::CallOutcome::Error;
+    }
     openscarlett::CallTelemetry::Global().Record(
         kModule,
         method,
-        SUCCEEDED(hr) ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error,
+        outcome,
         static_cast<int32_t>(hr),
         slot);
 }
@@ -322,6 +328,16 @@ void STDMETHODCALLTYPE CommandListX::SetPipelineState(ID3D12PipelineState* pPipe
 
 void STDMETHODCALLTYPE CommandListX::ResourceBarrier(
     UINT NumBarriers, const D3D12_RESOURCE_BARRIER* pBarriers) {
+    if (device_x_ && pBarriers && NumBarriers > 0u && device_x_->HasRegisteredUnifiedTextures()) {
+        for (UINT i = 0; i < NumBarriers; ++i) {
+            if (pBarriers[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION &&
+                pBarriers[i].Transition.pResource != nullptr) {
+                device_x_->NotifyResourceStateTransition(
+                    pBarriers[i].Transition.pResource,
+                    pBarriers[i].Transition.StateAfter);
+            }
+        }
+    }
     host_list_->ResourceBarrier(NumBarriers, pBarriers);
     RecordList("ID3D12GraphicsCommandListX::ResourceBarrier", 26, S_OK);
 }
