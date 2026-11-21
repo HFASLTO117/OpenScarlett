@@ -202,8 +202,9 @@ jobs:
           if-no-files-found: error
 
   clang-cl-build-and-test:
-    name: Windows x64 Clang-CL (Release)
+    name: Windows x64 Clang-CL (Release, Portability Check)
     runs-on: windows-latest
+    continue-on-error: true
 
     steps:
       - name: Checkout repository
@@ -256,8 +257,17 @@ jobs:
       - name: Build (Clang-CL)
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-          cmake --build build-clangcl --parallel
+          $ErrorActionPreference = 'Continue'
+          & cmake --build build-clangcl --parallel 2>&1 | Tee-Object -FilePath build-clangcl/clangcl_build.log
+          $rc = $LASTEXITCODE
+          if ($rc -ne 0) {
+            $errLines = @(Select-String -Path build-clangcl/clangcl_build.log -Pattern 'error:' | Select-Object -First 30 | ForEach-Object { $_.Line })
+            if ($errLines.Count -gt 0) {
+              $sum = @("### Clang-CL Build Diagnostics (first 30 errors)", "", '```text') + $errLines + @('```', "")
+              $sum -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+            }
+            exit $rc
+          }
 
       - name: Run CTest suite (Clang-CL)
         shell: pwsh

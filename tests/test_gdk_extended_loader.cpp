@@ -512,7 +512,20 @@ void TestTopologicalDllOrdering() {
 
     // C) Live Multi-DLL PE import inspection + real DllMain(DLL_PROCESS_ATTACH) order verification
 #if defined(_WIN32)
-    const fs::path bin_dir(OPENSCARLETT_BINARY_DIR);
+    fs::path bin_dir;
+    {
+        wchar_t self_buf[MAX_PATH]{};
+        const DWORD self_len = ::GetModuleFileNameW(nullptr, self_buf, static_cast<DWORD>(MAX_PATH));
+        if (self_len > 0 && self_len < MAX_PATH) {
+            const fs::path exe_dir = fs::path(self_buf).parent_path();
+            if (fs::exists(exe_dir / "test_dep_base.dll")) {
+                bin_dir = exe_dir;
+            }
+        }
+        if (bin_dir.empty()) {
+            bin_dir = fs::path(OPENSCARLETT_BINARY_DIR);
+        }
+    }
     const fs::path p_base = bin_dir / "test_dep_base.dll";
     const fs::path p_mid = bin_dir / "test_dep_mid.dll";
     const fs::path p_top = bin_dir / "test_dep_top.dll";
@@ -533,8 +546,16 @@ void TestTopologicalDllOrdering() {
     OS_REQUIRE(file_order.ordered_names[1] == "test_dep_mid.dll");
     OS_REQUIRE(file_order.ordered_names[2] == "test_dep_top.dll");
 
-    // Set up temp log file strictly under OPENSCARLETT_BINARY_DIR (on E:\)
-    const fs::path log_file = bin_dir / "wave3_dep_init_order.log";
+    // Set up temp log file strictly under %TEMP% (with fallback to bin_dir)
+    fs::path log_dir = bin_dir;
+    {
+        wchar_t tmp_buf[MAX_PATH]{};
+        const DWORD tmp_len = ::GetEnvironmentVariableW(L"TEMP", tmp_buf, static_cast<DWORD>(MAX_PATH));
+        if (tmp_len > 0 && tmp_len < MAX_PATH) {
+            log_dir = fs::path(tmp_buf);
+        }
+    }
+    const fs::path log_file = log_dir / "wave3_dep_init_order.log";
     std::error_code ec;
     fs::remove(log_file, ec);
     SetEnvVarLocal("OPENSCARLETT_DEP_INIT_LOG", log_file.string().c_str());

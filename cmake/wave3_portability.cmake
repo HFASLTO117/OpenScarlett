@@ -119,6 +119,18 @@ set(_openscarlett_known_targets
     gdk_external_dstorage_async
     gdk_external_full_stack
     gdk_ms_directstorage_real
+    test_vulkan_graphics_live
+    test_hdr10_d3d12
+    test_gdk_extended_loader
+    test_dep_base
+    test_dep_mid
+    test_dep_top
+    test_gdk_simple_lighting
+    gdk_simple_lighting
+    test_gdk_hdr_cubemap
+    gdk_hdr_cubemap
+    test_vulkan_mesh_showcase
+    gdk_vulkan_mesh_showcase
 )
 
 foreach(_tgt IN LISTS _openscarlett_known_targets)
