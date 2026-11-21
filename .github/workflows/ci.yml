@@ -512,8 +512,24 @@ jobs:
           $notesFile = Join-Path $env:RUNNER_TEMP 'release_notes.md'
           [System.IO.File]::WriteAllText($notesFile, $notes, (New-Object System.Text.UTF8Encoding($false)))
 
-          gh release create $tag $zipName "$zipName.sha256" `
-            --repo "${{ github.repository }}" `
-            --title "OpenScarlett $tag (Early Portable Hardware Test Bundle)" `
-            --notes-file $notesFile `
-            --latest
+          $ErrorActionPreference = 'Continue'
+          & gh release view $tag --repo "${{ github.repository }}" *> $null
+          $releaseExists = ($LASTEXITCODE -eq 0)
+          $ErrorActionPreference = 'Stop'
+
+          if ($releaseExists) {
+            gh release upload $tag $zipName "$zipName.sha256" `
+              --repo "${{ github.repository }}" `
+              --clobber
+            gh release edit $tag `
+              --repo "${{ github.repository }}" `
+              --title "OpenScarlett $tag (Early Portable Hardware Test Bundle)" `
+              --notes-file $notesFile `
+              --latest
+          } else {
+            gh release create $tag $zipName "$zipName.sha256" `
+              --repo "${{ github.repository }}" `
+              --title "OpenScarlett $tag (Early Portable Hardware Test Bundle)" `
+              --notes-file $notesFile `
+              --latest
+          }
