@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "openscarlett/audio/xma2_decoder.h"
+#include "openscarlett/gpu/d3d12_adapter.h"
 #include "openscarlett/io/gdeflate.h"
 #include "openscarlett/loader/pe_inspector.h"
 #include "os_check.h"
@@ -196,12 +197,24 @@ void AssertNoDllsInDir(const fs::path& dir) {
 }
 
 fs::path FindDxcExe() {
+    std::error_code ec;
     const wchar_t* candidates[] = {
         LR"(C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\dxc.exe)",
         LR"(C:\Program Files (x86)\Windows Kits\10\bin\10.0.22621.0\x64\dxc.exe)",
     };
     for (const wchar_t* p : candidates) {
-        if (fs::exists(p)) return fs::path(p);
+        if (fs::exists(p, ec)) return fs::path(p);
+    }
+    const fs::path kits_bin(LR"(C:\Program Files (x86)\Windows Kits\10\bin)");
+    if (fs::exists(kits_bin, ec)) {
+        std::vector<fs::path> found;
+        for (const auto& entry : fs::directory_iterator(kits_bin, ec)) {
+            if (!entry.is_directory()) continue;
+            const auto cand = entry.path() / L"x64" / L"dxc.exe";
+            if (fs::exists(cand, ec)) found.push_back(cand);
+        }
+        std::sort(found.begin(), found.end());
+        if (!found.empty()) return found.back();
     }
     return {};
 }
@@ -391,7 +404,25 @@ int main() {
         OS_REQUIRE(has_official_gdk_samples);
     }
 
-    const fs::path stage_root = fs::path(R"(E:\OpenScarlett\.tmp\sprint3_packages)");
+    // Probe host hardware D3D12 GPU & Mesh Shader support so WARP-only CI runners still pass
+    // while real hardware hosts (e.g. NVIDIA GTX 1650 Ti, MeshTier=10) strictly verify HW paths!
+    bool has_hw_gpu = false;
+    bool has_hw_mesh = false;
+    {
+        std::vector<openscarlett::D3D12AdapterInfo> adapters;
+        if (openscarlett::EnumerateD3D12Adapters(adapters).ok()) {
+            for (const auto& a : adapters) {
+                if (!a.is_warp) {
+                    has_hw_gpu = true;
+                    if (a.mesh_shader_tier >= 10u) {
+                        has_hw_mesh = true;
+                    }
+                }
+            }
+        }
+    }
+
+    const fs::path stage_root = build_dir / ".tmp_sprint3_packages";
     std::error_code ec;
     fs::remove_all(stage_root, ec);
     fs::create_directories(stage_root, ec);
@@ -437,39 +468,42 @@ int main() {
         const auto pkg_files_before = ListDirFilenames(pkg_dir);
         AssertNoDllsInDir(pkg_dir);
 
-        // Run 1a: Hardware (NVIDIA GTX 1650 Ti)
-        const fs::path hw_t = stage_root / "run_triangle_hw_T";
-        const fs::path hw_s = stage_root / "run_triangle_hw_S";
-        const fs::path hw_tel = stage_root / "telemetry_triangle_hw.json";
-        const auto t0_hw = std::chrono::steady_clock::now();
-        OS_REQUIRE(LaunchViaOpenScarlettCli(cli_exe, staged_exe, build_dir, pkg_dir, hw_t, hw_s, hw_tel) == 0);
-        const double hw_ms = std::chrono::duration<double, std::milli>(
-                                 std::chrono::steady_clock::now() - t0_hw)
-                                 .count();
-        OS_REQUIRE(ListDirFilenames(pkg_dir) == pkg_files_before);
-        AssertNoDllsInDir(pkg_dir);
-        VerifyPpmFile(hw_t / "simple_triangle.ppm", 256, 256);
+        // Run 1a: Hardware (NVIDIA GTX 1650 Ti when present)
+        std::map<std::string, std::string> hw_metrics;
+        if (has_hw_gpu) {
+            const fs::path hw_t = stage_root / "run_triangle_hw_T";
+            const fs::path hw_s = stage_root / "run_triangle_hw_S";
+            const fs::path hw_tel = stage_root / "telemetry_triangle_hw.json";
+            const auto t0_hw = std::chrono::steady_clock::now();
+            OS_REQUIRE(LaunchViaOpenScarlettCli(cli_exe, staged_exe, build_dir, pkg_dir, hw_t, hw_s, hw_tel) == 0);
+            const double hw_ms = std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now() - t0_hw)
+                                     .count();
+            OS_REQUIRE(ListDirFilenames(pkg_dir) == pkg_files_before);
+            AssertNoDllsInDir(pkg_dir);
+            VerifyPpmFile(hw_t / "simple_triangle.ppm", 256, 256);
 
-        const auto hw_metrics = ParseKeyValueFile(hw_t / "metrics.txt");
-        const auto hw_tel_sum = ParseTelemetryJson(hw_tel);
-        OS_REQUIRE(hw_tel_sum.total_not_impl == 0);
-        OS_REQUIRE(hw_tel_sum.HasModule("d3d12_xs.dll"));
-        OS_REQUIRE(hw_tel_sum.HasModule("xgameruntime.dll"));
-        OS_REQUIRE(hw_tel_sum.HasModule("GameInput.dll"));
-        OS_REQUIRE(hw_tel_sum.HasModule("vfs"));
-        OS_REQUIRE(hw_tel_sum.HasSymbol("ID3D12GraphicsCommandListX::DrawInstanced", 12));
-        OS_REQUIRE(hw_tel_sum.HasSymbol("ID3D12CommandQueueX::PresentX", 19));
+            hw_metrics = ParseKeyValueFile(hw_t / "metrics.txt");
+            const auto hw_tel_sum = ParseTelemetryJson(hw_tel);
+            OS_REQUIRE(hw_tel_sum.total_not_impl == 0);
+            OS_REQUIRE(hw_tel_sum.HasModule("d3d12_xs.dll"));
+            OS_REQUIRE(hw_tel_sum.HasModule("xgameruntime.dll"));
+            OS_REQUIRE(hw_tel_sum.HasModule("GameInput.dll"));
+            OS_REQUIRE(hw_tel_sum.HasModule("vfs"));
+            OS_REQUIRE(hw_tel_sum.HasSymbol("ID3D12GraphicsCommandListX::DrawInstanced", 12));
+            OS_REQUIRE(hw_tel_sum.HasSymbol("ID3D12CommandQueueX::PresentX", 19));
 
-        summary_rows.push_back(SummaryRow{
-            "SimpleTriangle (HW)",
-            hw_metrics.at("adapter"),
-            hw_metrics.at("width") + "x" + hw_metrics.at("height"),
-            hw_metrics.at("fnv1a"),
-            hw_metrics.at("non_bg_pixels") + " px / " + hw_metrics.at("unique_colors") + " rgb",
-            hw_tel_sum.total_calls,
-            hw_tel_sum.rows.size(),
-            hw_ms,
-        });
+            summary_rows.push_back(SummaryRow{
+                "SimpleTriangle (HW)",
+                hw_metrics.at("adapter"),
+                hw_metrics.at("width") + "x" + hw_metrics.at("height"),
+                hw_metrics.at("fnv1a"),
+                hw_metrics.at("non_bg_pixels") + " px / " + hw_metrics.at("unique_colors") + " rgb",
+                hw_tel_sum.total_calls,
+                hw_tel_sum.rows.size(),
+                hw_ms,
+            });
+        }
 
         // Run 1b: D3D12 WARP
         const fs::path wp_t = stage_root / "run_triangle_warp_T";
@@ -489,9 +523,11 @@ int main() {
         OS_REQUIRE(wp_tel_sum.HasSymbol("ID3D12GraphicsCommandListX::DrawInstanced", 12));
         OS_REQUIRE(wp_tel_sum.HasSymbol("ID3D12CommandQueueX::PresentX", 19));
 
-        // Verify exact bit-for-bit FNV-1a hash & pixel count match between GTX 1650 Ti (SM 6.5) and WARP (SM 6.2)!
-        OS_REQUIRE(hw_metrics.at("non_bg_pixels") == wp_metrics.at("non_bg_pixels"));
-        OS_REQUIRE(hw_metrics.at("fnv1a") == wp_metrics.at("fnv1a"));
+        if (has_hw_gpu) {
+            // Verify exact bit-for-bit FNV-1a hash & pixel count match between GTX 1650 Ti (SM 6.5) and WARP (SM 6.2)!
+            OS_REQUIRE(hw_metrics.at("non_bg_pixels") == wp_metrics.at("non_bg_pixels"));
+            OS_REQUIRE(hw_metrics.at("fnv1a") == wp_metrics.at("fnv1a"));
+        }
 
         summary_rows.push_back(SummaryRow{
             "SimpleTriangle (WARP)",
@@ -508,7 +544,7 @@ int main() {
     // =========================================================================
     // SAMPLE 2: Microsoft Xbox-GDK-Samples / SimpleMeshShader (GTX 1650 Ti HW)
     // =========================================================================
-    {
+    if (has_hw_mesh) {
         const fs::path pkg_dir = stage_root / "gdk_simple_mesh_shader";
         fs::create_directories(pkg_dir, ec);
 
@@ -596,38 +632,40 @@ int main() {
         const auto pkg_files_before = ListDirFilenames(pkg_dir);
         AssertNoDllsInDir(pkg_dir);
 
-        // Run 3a: Hardware (NVIDIA GTX 1650 Ti)
-        const fs::path hw_t = stage_root / "run_compute_hw_T";
-        const fs::path hw_s = stage_root / "run_compute_hw_S";
-        const fs::path hw_tel = stage_root / "telemetry_compute_hw.json";
-        const auto t0_hw = std::chrono::steady_clock::now();
-        OS_REQUIRE(LaunchViaOpenScarlettCli(cli_exe, staged_exe, build_dir, pkg_dir, hw_t, hw_s, hw_tel) == 0);
-        const double hw_ms = std::chrono::duration<double, std::milli>(
-                                 std::chrono::steady_clock::now() - t0_hw)
-                                 .count();
-        OS_REQUIRE(ListDirFilenames(pkg_dir) == pkg_files_before);
-        AssertNoDllsInDir(pkg_dir);
-        VerifyPpmFile(hw_t / "mandelbrot.ppm", 256, 256);
+        // Run 3a: Hardware (NVIDIA GTX 1650 Ti when present)
+        if (has_hw_gpu) {
+            const fs::path hw_t = stage_root / "run_compute_hw_T";
+            const fs::path hw_s = stage_root / "run_compute_hw_S";
+            const fs::path hw_tel = stage_root / "telemetry_compute_hw.json";
+            const auto t0_hw = std::chrono::steady_clock::now();
+            OS_REQUIRE(LaunchViaOpenScarlettCli(cli_exe, staged_exe, build_dir, pkg_dir, hw_t, hw_s, hw_tel) == 0);
+            const double hw_ms = std::chrono::duration<double, std::milli>(
+                                     std::chrono::steady_clock::now() - t0_hw)
+                                     .count();
+            OS_REQUIRE(ListDirFilenames(pkg_dir) == pkg_files_before);
+            AssertNoDllsInDir(pkg_dir);
+            VerifyPpmFile(hw_t / "mandelbrot.ppm", 256, 256);
 
-        const auto hw_metrics = ParseKeyValueFile(hw_t / "metrics.txt");
-        const auto hw_tel_sum = ParseTelemetryJson(hw_tel);
-        OS_REQUIRE(hw_tel_sum.total_not_impl == 0);
-        OS_REQUIRE(hw_tel_sum.HasModule("d3d12_xs.dll"));
-        OS_REQUIRE(hw_tel_sum.HasModule("xgameruntime.dll"));
-        OS_REQUIRE(hw_tel_sum.HasModule("vfs"));
-        OS_REQUIRE(hw_tel_sum.HasSymbol("ID3D12GraphicsCommandListX::Dispatch", 14));
-        OS_REQUIRE(hw_tel_sum.HasSymbol("ID3D12CommandQueueX::PresentX", 19));
+            const auto hw_metrics = ParseKeyValueFile(hw_t / "metrics.txt");
+            const auto hw_tel_sum = ParseTelemetryJson(hw_tel);
+            OS_REQUIRE(hw_tel_sum.total_not_impl == 0);
+            OS_REQUIRE(hw_tel_sum.HasModule("d3d12_xs.dll"));
+            OS_REQUIRE(hw_tel_sum.HasModule("xgameruntime.dll"));
+            OS_REQUIRE(hw_tel_sum.HasModule("vfs"));
+            OS_REQUIRE(hw_tel_sum.HasSymbol("ID3D12GraphicsCommandListX::Dispatch", 14));
+            OS_REQUIRE(hw_tel_sum.HasSymbol("ID3D12CommandQueueX::PresentX", 19));
 
-        summary_rows.push_back(SummaryRow{
-            "SimpleCompute (HW)",
-            hw_metrics.at("adapter"),
-            hw_metrics.at("width") + "x" + hw_metrics.at("height"),
-            hw_metrics.at("fnv1a"),
-            hw_metrics.at("non_bg_pixels") + " col / " + hw_metrics.at("unique_colors") + " bands",
-            hw_tel_sum.total_calls,
-            hw_tel_sum.rows.size(),
-            hw_ms,
-        });
+            summary_rows.push_back(SummaryRow{
+                "SimpleCompute (HW)",
+                hw_metrics.at("adapter"),
+                hw_metrics.at("width") + "x" + hw_metrics.at("height"),
+                hw_metrics.at("fnv1a"),
+                hw_metrics.at("non_bg_pixels") + " col / " + hw_metrics.at("unique_colors") + " bands",
+                hw_tel_sum.total_calls,
+                hw_tel_sum.rows.size(),
+                hw_ms,
+            });
+        }
 
         // Run 3b: D3D12 WARP
         const fs::path wp_t = stage_root / "run_compute_warp_T";

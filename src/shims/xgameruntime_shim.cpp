@@ -69,6 +69,10 @@ fs::path ResolveSaveRoot() {
     if (!env_root.empty()) {
         return fs::path(env_root);
     }
+    std::string env_temp = GetEnvString("TEMP");
+    if (!env_temp.empty()) {
+        return fs::path(env_temp) / "saves";
+    }
     return fs::path("E:\\OpenScarlett\\.tmp\\saves");
 }
 

@@ -118,6 +118,7 @@ jobs:
           Copy-Item "build/openscarlett.exe" $stage
           Get-ChildItem "build" -Filter "*.dll" | Copy-Item -Destination $stage
           Get-ChildItem "build" -Filter "test_*.exe" | Copy-Item -Destination $stage
+          Get-ChildItem "build" -Filter "gdk_*.exe" | Copy-Item -Destination $stage
           Copy-Item "tools/run_hardware_test.bat" $stage
           Copy-Item "README.md", "LICENSE" $stage
 

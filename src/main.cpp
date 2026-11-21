@@ -311,7 +311,19 @@ int RunGuestExecutable(int argc, char** argv) {
     if (opts.telemetry_output_path.empty()) {
         std::string stem = std::filesystem::path(opts.exe_path).stem().string();
         if (stem.empty()) stem = "guest";
-        opts.telemetry_output_path = "E:\\OpenScarlett\\.tmp\\telemetry\\" + stem + "_telemetry.json";
+        std::filesystem::path tel_base;
+#if defined(_WIN32)
+        char temp_buf[1024]{};
+        DWORD tlen = GetEnvironmentVariableA("TEMP", temp_buf, static_cast<DWORD>(sizeof(temp_buf)));
+        if (tlen > 0 && tlen < sizeof(temp_buf)) {
+            tel_base = std::filesystem::path(temp_buf) / "telemetry";
+        } else {
+            tel_base = std::filesystem::path("E:\\OpenScarlett\\.tmp\\telemetry");
+        }
+#else
+        tel_base = std::filesystem::temp_directory_path() / "openscarlett_telemetry";
+#endif
+        opts.telemetry_output_path = (tel_base / (stem + "_telemetry.json")).string();
     }
 
     openscarlett::LaunchResult res{};

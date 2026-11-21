@@ -682,8 +682,8 @@ void TestDirectStorage() {
                    .ok());
     OS_REQUIRE(!bcpack_compressed.empty());
 
-    // Write real combined data file on E: drive!
-    const fs::path test_dir = fs::path("E:\\OpenScarlett\\.tmp\\dstorage_test");
+    // Write real combined data file inside the build directory (on E: locally, portable in CI)
+    const fs::path test_dir = fs::path(OPENSCARLETT_BINARY_DIR) / ".tmp_dstorage_test";
     std::error_code ec;
     fs::create_directories(test_dir, ec);
     const fs::path test_file = test_dir / "pack_stream.bin";

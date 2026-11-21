@@ -8,6 +8,7 @@ set "NO_PAUSE=0"
 if /I "%~1"=="--no-pause" set "NO_PAUSE=1"
 
 set "OPENSCARLETT_SAVE_ROOT=%TEMP%\openscarlett_hw_test_saves"
+set "OPENSCARLETT_AUDIO_NULL=1"
 if not exist "%OPENSCARLETT_SAVE_ROOT%" mkdir "%OPENSCARLETT_SAVE_ROOT%" >nul 2>&1
 
 pushd "%BUNDLE_DIR%" >nul
@@ -43,20 +44,22 @@ if not "!PROBE_RC!"=="0" (
 )
 
 for %%T in ("%BUNDLE_DIR%\test_*.exe") do (
-    set /a TOTAL+=1
     set "TNAME=%%~nxT"
-    echo Running !TNAME!...
-    >> "%REPORT%" echo [RUN] !TNAME!
-    "%%~fT" >> "%REPORT%" 2>&1
-    set "RC=!ERRORLEVEL!"
-    if "!RC!"=="0" (
-        set /a PASSED+=1
-        echo [PASS] !TNAME!
-        >> "%REPORT%" echo [RESULT] !TNAME!: PASS
-    ) else (
-        set /a FAILED+=1
-        echo [FAIL] !TNAME! ^(exit !RC!^)
-        >> "%REPORT%" echo [RESULT] !TNAME!: FAIL ^(exit !RC!^)
+    if /I not "!TNAME!"=="test_guest_dummy.exe" (
+        set /a TOTAL+=1
+        echo Running !TNAME!...
+        >> "%REPORT%" echo [RUN] !TNAME!
+        "%%~fT" >> "%REPORT%" 2>&1
+        set "RC=!ERRORLEVEL!"
+        if "!RC!"=="0" (
+            set /a PASSED+=1
+            echo [PASS] !TNAME!
+            >> "%REPORT%" echo [RESULT] !TNAME!: PASS
+        ) else (
+            set /a FAILED+=1
+            echo [FAIL] !TNAME! ^(exit !RC!^)
+            >> "%REPORT%" echo [RESULT] !TNAME!: FAIL ^(exit !RC!^)
+        )
     )
 )
 

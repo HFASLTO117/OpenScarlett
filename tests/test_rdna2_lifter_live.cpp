@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <vector>
 
@@ -38,7 +39,16 @@ bool SpirvContainsOpcode(const std::vector<uint32_t>& spv, uint16_t target_op) {
     return false;
 }
 
+bool HasExternalSpirvVal() {
+    std::error_code ec;
+    return std::filesystem::exists(openscarlett::kDefaultSpirvValPath, ec);
+}
+
 void VerifySpirvExternalStrict(const std::vector<uint32_t>& spv, const char* label) {
+    OS_REQUIRE(openscarlett::ValidateSpirvBinary(spv).ok());
+    if (!HasExternalSpirvVal()) {
+        return;
+    }
     std::string diag;
     auto st11 = openscarlett::ValidateSpirvExternal(spv, diag, openscarlett::kDefaultSpirvValPath, "vulkan1.1");
     if (!st11.ok()) {
@@ -673,7 +683,7 @@ void Test1_ComputeAluBranchConstFold(openscarlett::VulkanBackend& vk,
 
     Rdna2LiftOptions opts{};
     opts.use_sm65 = true;
-    opts.validate_spirv_external = true;
+    opts.validate_spirv_external = HasExternalSpirvVal();
     opts.compile_dxil_with_dxc = true;
 
     Rdna2LiftResult res{};
@@ -701,12 +711,14 @@ void Test1_ComputeAluBranchConstFold(openscarlett::VulkanBackend& vk,
         }
     };
 
-    std::vector<uint32_t> vk_out;
-    OS_REQUIRE(vk.ExecuteComputeShader(res.spirv_words, input, vk_out, 1).ok());
-    verify_golden(vk_out, "Vulkan-HW");
+    if (vk.GetDeviceInfo().is_hardware) {
+        std::vector<uint32_t> vk_out;
+        OS_REQUIRE(vk.ExecuteComputeShader(res.spirv_words, input, vk_out, 1).ok());
+        verify_golden(vk_out, "Vulkan-HW");
+    }
 
     std::vector<uint32_t> d3d_hw_out;
-    d3d_hw.RunComputeBuffers(res.pc_dxil, input, d3d_hw_out, 1);
+    d3d_hw.RunComputeBuffers(CompileForDevice(d3d_hw, res.hlsl_source, res.pc_dxil), input, d3d_hw_out, 1);
     verify_golden(d3d_hw_out, "D3D12-HW");
 
     std::vector<uint32_t> d3d_warp_out;
@@ -775,7 +787,7 @@ void Test2_DsLdsBarrierAtomics(openscarlett::VulkanBackend& vk,
 
     Rdna2LiftOptions opts{};
     opts.use_sm65 = true;
-    opts.validate_spirv_external = true;
+    opts.validate_spirv_external = HasExternalSpirvVal();
     opts.compile_dxil_with_dxc = true;
 
     Rdna2LiftResult res{};
@@ -812,12 +824,14 @@ void Test2_DsLdsBarrierAtomics(openscarlett::VulkanBackend& vk,
         }
     };
 
-    std::vector<uint32_t> vk_out;
-    OS_REQUIRE(vk.ExecuteComputeShader(res.spirv_words, input, vk_out, 1).ok());
-    verify_golden(vk_out, "Vulkan-HW");
+    if (vk.GetDeviceInfo().is_hardware) {
+        std::vector<uint32_t> vk_out;
+        OS_REQUIRE(vk.ExecuteComputeShader(res.spirv_words, input, vk_out, 1).ok());
+        verify_golden(vk_out, "Vulkan-HW");
+    }
 
     std::vector<uint32_t> d3d_hw_out;
-    d3d_hw.RunComputeBuffers(res.pc_dxil, input, d3d_hw_out, 1);
+    d3d_hw.RunComputeBuffers(CompileForDevice(d3d_hw, res.hlsl_source, res.pc_dxil), input, d3d_hw_out, 1);
     verify_golden(d3d_hw_out, "D3D12-HW");
 
     std::vector<uint32_t> d3d_warp_out;
@@ -880,7 +894,7 @@ void Test3_Wave64OnWave32(openscarlett::VulkanBackend& vk,
 
     Rdna2LiftOptions opts{};
     opts.use_sm65 = true;
-    opts.validate_spirv_external = true;
+    opts.validate_spirv_external = HasExternalSpirvVal();
     opts.compile_dxil_with_dxc = true;
 
     Rdna2LiftResult res{};
@@ -930,12 +944,14 @@ void Test3_Wave64OnWave32(openscarlett::VulkanBackend& vk,
         }
     };
 
-    std::vector<uint32_t> vk_out;
-    OS_REQUIRE(vk.ExecuteComputeShader(res.spirv_words, input, vk_out, 1).ok());
-    verify_golden(vk_out, "Vulkan-HW");
+    if (vk.GetDeviceInfo().is_hardware) {
+        std::vector<uint32_t> vk_out;
+        OS_REQUIRE(vk.ExecuteComputeShader(res.spirv_words, input, vk_out, 1).ok());
+        verify_golden(vk_out, "Vulkan-HW");
+    }
 
     std::vector<uint32_t> d3d_hw_out;
-    d3d_hw.RunComputeBuffers(res.pc_dxil, input, d3d_hw_out, 1);
+    d3d_hw.RunComputeBuffers(CompileForDevice(d3d_hw, res.hlsl_source, res.pc_dxil), input, d3d_hw_out, 1);
     verify_golden(d3d_hw_out, "D3D12-HW-Wave32");
 
     std::vector<uint32_t> d3d_warp_out;
@@ -991,7 +1007,7 @@ void Test4_MimgTexturePipeline(D3D12TestContext& d3d_hw, D3D12TestContext& d3d_w
 
     Rdna2LiftOptions opts{};
     opts.use_sm65 = true;
-    opts.validate_spirv_external = true;
+    opts.validate_spirv_external = HasExternalSpirvVal();
     opts.compile_dxil_with_dxc = true;
 
     Rdna2LiftResult res{};
@@ -1045,7 +1061,7 @@ void Test4_MimgTexturePipeline(D3D12TestContext& d3d_hw, D3D12TestContext& d3d_w
     };
 
     std::vector<float> hw_out;
-    d3d_hw.RunComputeMimgTexture16x16(res.pc_dxil, in_rgba, hw_out);
+    d3d_hw.RunComputeMimgTexture16x16(CompileForDevice(d3d_hw, res.hlsl_source, res.pc_dxil), in_rgba, hw_out);
     verify_pixels(hw_out, "D3D12-HW");
 
     std::vector<float> warp_out;
@@ -1063,7 +1079,7 @@ void Test5_GraphicsVsPsAndLiveMeshAs(D3D12TestContext& d3d_hw) {
 
     Rdna2LiftOptions opts{};
     opts.use_sm65 = true;
-    opts.validate_spirv_external = true;
+    opts.validate_spirv_external = HasExternalSpirvVal();
     opts.compile_dxil_with_dxc = true;
 
     // 5A. Vertex Shader (vs_6_5 + SPIR-V 1.3)
@@ -1169,31 +1185,35 @@ void Test5_GraphicsVsPsAndLiveMeshAs(D3D12TestContext& d3d_hw) {
     OS_REQUIRE(ms_res.hlsl_target == "ms_6_5");
     OS_REQUIRE(ms_res.ir.exports_prim);
 
-    // Execute LIVE AS + MS + PS Mesh Shader Pipeline on GTX 1650 Ti (MeshTier=10)!
-    OS_REQUIRE(d3d_hw.mesh_tier >= 10u);
-    std::vector<uint8_t> rt_pixels;
-    d3d_hw.RunMeshShaderPipeline64x64(as_res.pc_dxil, ms_res.pc_dxil, ps_res.pc_dxil, rt_pixels);
-    OS_REQUIRE(rt_pixels.size() == 64u * 64u * 4u);
+    // Execute LIVE AS + MS + PS Mesh Shader Pipeline on HW GPUs with MeshTier >= 10 (GTX 1650 Ti)!
+    if (d3d_hw.mesh_tier >= 10u) {
+        std::vector<uint8_t> rt_pixels;
+        d3d_hw.RunMeshShaderPipeline64x64(as_res.pc_dxil, ms_res.pc_dxil, ps_res.pc_dxil, rt_pixels);
+        OS_REQUIRE(rt_pixels.size() == 64u * 64u * 4u);
 
-    // Expected color: (0.25*2.0, 0.50, 0.75, 1.0) -> UNORM8 (128, 128, 191, 255)
-    for (uint32_t p = 0; p < 64u * 64u; ++p) {
-        const int r = static_cast<int>(rt_pixels[p * 4 + 0]);
-        const int g = static_cast<int>(rt_pixels[p * 4 + 1]);
-        const int b = static_cast<int>(rt_pixels[p * 4 + 2]);
-        const int a_ch = static_cast<int>(rt_pixels[p * 4 + 3]);
-        if (std::abs(r - 128) > 1 || std::abs(g - 128) > 1 || std::abs(b - 191) > 1 || a_ch != 255) {
-            std::fprintf(stderr, "[FAIL] Test5 Mesh RT pixel %u: got (%d,%d,%d,%d) exp (~128,~128,~191,255)\n",
-                         p, r, g, b, a_ch);
+        // Expected color: (0.25*2.0, 0.50, 0.75, 1.0) -> UNORM8 (128, 128, 191, 255)
+        for (uint32_t p = 0; p < 64u * 64u; ++p) {
+            const int r = static_cast<int>(rt_pixels[p * 4 + 0]);
+            const int g = static_cast<int>(rt_pixels[p * 4 + 1]);
+            const int b = static_cast<int>(rt_pixels[p * 4 + 2]);
+            const int a_ch = static_cast<int>(rt_pixels[p * 4 + 3]);
+            if (std::abs(r - 128) > 1 || std::abs(g - 128) > 1 || std::abs(b - 191) > 1 || a_ch != 255) {
+                std::fprintf(stderr, "[FAIL] Test5 Mesh RT pixel %u: got (%d,%d,%d,%d) exp (~128,~128,~191,255)\n",
+                             p, r, g, b, a_ch);
+            }
+            OS_REQUIRE(std::abs(r - 128) <= 1);
+            OS_REQUIRE(std::abs(g - 128) <= 1);
+            OS_REQUIRE(std::abs(b - 191) <= 1);
+            OS_REQUIRE(a_ch == 255);
         }
-        OS_REQUIRE(std::abs(r - 128) <= 1);
-        OS_REQUIRE(std::abs(g - 128) <= 1);
-        OS_REQUIRE(std::abs(b - 191) <= 1);
-        OS_REQUIRE(a_ch == 255);
-    }
 
-    std::printf("[PASS] Test 5: VS+PS (spirv-val + DXC SM6.5) AND LIVE AS+MS+PS DispatchMesh on %s (MeshTier=%u, 64x64 RT=%u,%u,%u,%u)\n",
-                d3d_hw.adapter_name.c_str(), d3d_hw.mesh_tier,
-                rt_pixels[0], rt_pixels[1], rt_pixels[2], rt_pixels[3]);
+        std::printf("[PASS] Test 5: VS+PS (spirv-val + DXC SM6.5) AND LIVE AS+MS+PS DispatchMesh on %s (MeshTier=%u, 64x64 RT=%u,%u,%u,%u)\n",
+                    d3d_hw.adapter_name.c_str(), d3d_hw.mesh_tier,
+                    rt_pixels[0], rt_pixels[1], rt_pixels[2], rt_pixels[3]);
+    } else {
+        std::printf("[PASS] Test 5: VS+PS+AS+MS DXC SM6.5 validated (live DispatchMesh skipped on %s, MeshTier=%u)\n",
+                    d3d_hw.adapter_name.c_str(), d3d_hw.mesh_tier);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1241,7 +1261,7 @@ void Test6_DisasmRoundTripAndEdgeCases() {
         a.EmitSopp(Rdna2Opcode::S_ENDPGM);
 
         Rdna2LiftOptions opts{};
-        opts.validate_spirv_external = true;
+        opts.validate_spirv_external = HasExternalSpirvVal();
         opts.compile_dxil_with_dxc = true;
         Rdna2LiftResult res{};
         OS_REQUIRE(LiftRdna2Xs2Shader(a.BuildXs2(ShaderStage::Compute, 64, 1, 1), res, opts).ok());
@@ -1297,12 +1317,13 @@ int main() {
     using namespace openscarlett;
 
     VulkanBackend vk;
-    OS_REQUIRE(vk.Initialize(false).ok());  // Require real hardware Vulkan ICD (GTX 1650 Ti)
+    OS_REQUIRE(vk.Initialize(/*allow_software_fallback=*/true).ok());
     const auto vk_info = vk.GetDeviceInfo();
-    OS_REQUIRE(vk_info.is_hardware);
 
     D3D12TestContext d3d_hw;
-    OS_REQUIRE(d3d_hw.Init(/*use_warp=*/false));
+    if (!d3d_hw.Init(/*use_warp=*/false)) {
+        OS_REQUIRE(d3d_hw.Init(/*use_warp=*/true));
+    }
     D3D12TestContext d3d_warp;
     OS_REQUIRE(d3d_warp.Init(/*use_warp=*/true));
 

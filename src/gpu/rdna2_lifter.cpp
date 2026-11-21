@@ -312,16 +312,55 @@ std::vector<uint32_t> ComputeImmediatePostDominators(const Rdna2IrModule& ir) {
 std::string MakeUniqueTempPath(const char* prefix, const char* ext) {
     static std::atomic<uint64_t> g_seq{1};
     std::error_code ec;
-    std::filesystem::create_directories(kLifterTempDir, ec);
+    std::filesystem::path temp_dir;
+#if defined(_WIN32)
+    char env_buf[1024]{};
+    const DWORD env_len = GetEnvironmentVariableA("TEMP", env_buf, static_cast<DWORD>(sizeof(env_buf)));
+    if (env_len > 0 && env_len < sizeof(env_buf)) {
+        temp_dir = std::filesystem::path(env_buf) / "lifter";
+    } else if (std::filesystem::exists("E:\\OpenScarlett", ec)) {
+        temp_dir = std::filesystem::path(kLifterTempDir);
+    } else {
+        temp_dir = std::filesystem::temp_directory_path(ec) / "openscarlett_lifter";
+    }
+#else
+    temp_dir = std::filesystem::temp_directory_path(ec) / "openscarlett_lifter";
+#endif
+    std::filesystem::create_directories(temp_dir, ec);
     uint32_t pid = 0;
 #if defined(_WIN32)
     pid = static_cast<uint32_t>(GetCurrentProcessId());
 #endif
     const uint64_t seq = g_seq.fetch_add(1, std::memory_order_relaxed);
     std::ostringstream oss;
-    oss << kLifterTempDir << "\\" << prefix << "_" << pid << "_" << seq << ext;
+    oss << temp_dir.string() << "\\" << prefix << "_" << pid << "_" << seq << ext;
     return oss.str();
 }
+
+#if defined(_WIN32)
+std::string ResolveDxcExecutable(const std::string& requested_path) {
+    std::error_code ec;
+    if (!requested_path.empty() && std::filesystem::exists(requested_path, ec)) {
+        return requested_path;
+    }
+    const std::filesystem::path kits_bin(R"(C:\Program Files (x86)\Windows Kits\10\bin)");
+    if (std::filesystem::exists(kits_bin, ec)) {
+        std::vector<std::filesystem::path> found;
+        for (const auto& entry : std::filesystem::directory_iterator(kits_bin, ec)) {
+            if (!entry.is_directory()) continue;
+            const auto cand = entry.path() / "x64" / "dxc.exe";
+            if (std::filesystem::exists(cand, ec)) {
+                found.push_back(cand);
+            }
+        }
+        std::sort(found.begin(), found.end());
+        if (!found.empty()) {
+            return found.back().string();
+        }
+    }
+    return requested_path;
+}
+#endif
 
 #if defined(_WIN32)
 Status RunExternalProcess(const std::string& cmdline, uint32_t& out_exit_code, std::string& out_output) {
@@ -2386,8 +2425,9 @@ Status CompileHlslWithDxc(
         return Status::Error(StatusCode::InvalidArgument, "CompileHlslWithDxc requires non-empty HLSL/target/entry");
     }
 #if defined(_WIN32)
-    if (!std::filesystem::exists(dxc_path)) {
-        out_diagnostics = "dxc.exe not found at: " + dxc_path;
+    const std::string resolved_dxc = ResolveDxcExecutable(dxc_path);
+    if (!std::filesystem::exists(resolved_dxc)) {
+        out_diagnostics = "dxc.exe not found at: " + resolved_dxc;
         CallTelemetry::Global().Record("rdna2_lifter", "CompileHlslWithDxc", CallOutcome::Error, -2);
         return Status::Error(StatusCode::NotFound, out_diagnostics);
     }
@@ -2405,7 +2445,7 @@ Status CompileHlslWithDxc(
         ofs.write(hlsl.data(), static_cast<std::streamsize>(hlsl.size()));
     }
 
-    const std::string cmd = "\"" + dxc_path + "\" -T " + target + " -E " + entry_point +
+    const std::string cmd = "\"" + resolved_dxc + "\" -T " + target + " -E " + entry_point +
                             " -Fo \"" + dxil_path + "\" \"" + hlsl_path + "\"";
     uint32_t exit_code = 1;
     Status run_st = RunExternalProcess(cmd, exit_code, out_diagnostics);

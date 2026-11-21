@@ -179,8 +179,17 @@ VfsMountConfig VfsMounts::BuildDefaultConfig(std::wstring_view default_g_root,
                                              std::wstring_view default_vfs_root) {
     VfsMountConfig cfg{};
 
-    std::wstring base_vfs = default_vfs_root.empty() ? std::wstring(kDefaultVfsRootW)
-                                                     : NormalizeRoot(default_vfs_root);
+    std::wstring base_vfs;
+    if (!default_vfs_root.empty()) {
+        base_vfs = NormalizeRoot(default_vfs_root);
+    } else {
+        std::wstring env_temp = ReadEnvVarW(L"TEMP");
+        if (!env_temp.empty()) {
+            base_vfs = NormalizeRoot(env_temp + L"\\vfs");
+        } else {
+            base_vfs = std::wstring(kDefaultVfsRootW);
+        }
+    }
 
     std::wstring env_g = ReadEnvVarW(L"OPENSCARLETT_VFS_G");
     if (!env_g.empty()) {

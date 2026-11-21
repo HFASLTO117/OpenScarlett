@@ -203,9 +203,14 @@ std::string FormatXuidHex(uint64_t xuid) {
 
 fs::path ResolveXsapiDir(const std::string& scid) {
     const std::string env_root = GetEnvString("OPENSCARLETT_SAVE_ROOT");
-    const fs::path base = !env_root.empty()
-                              ? fs::path(env_root)
-                              : fs::path("E:\\OpenScarlett\\.tmp\\saves");
+    fs::path base;
+    if (!env_root.empty()) {
+        base = fs::path(env_root);
+    } else {
+        const std::string env_temp = GetEnvString("TEMP");
+        base = !env_temp.empty() ? (fs::path(env_temp) / "saves")
+                                 : fs::path("E:\\OpenScarlett\\.tmp\\saves");
+    }
     return base / "xsapi" / SanitizePathToken(scid);
 }
 
