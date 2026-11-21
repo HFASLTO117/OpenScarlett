@@ -432,6 +432,242 @@ void TestShaderCacheAtomicsAndCorruptRecovery() {
     std::printf("[PASS] Core 4: ShaderCache 128-bit hash + atomic disk hit + corrupt-file recovery\n");
 }
 
+void TestRdna2IsaCatchesCore() {
+    using namespace openscarlett;
+
+    // 1. Catch 1: CPU reference interpreter zero-initializes LDS at dispatch start
+    {
+        Rdna2Assembler a;
+        a.EmitVop2(Rdna2Opcode::V_LSHLREV_B32, 1, Rdna2Operand::InlineInt(2), 0);
+        // Read unwritten LDS slot directly into v2, then atomic-add 1 into unwritten slot at byte 256
+        a.EmitDs(Rdna2Opcode::DS_READ_B32, 2, 1);
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 3, Rdna2Operand::LiteralU32(256u));
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 4, Rdna2Operand::InlineInt(1));
+        a.EmitDs(Rdna2Opcode::DS_ADD_RTN_U32, 5, 3, 4);
+        a.EmitSopp(Rdna2Opcode::S_BARRIER);
+        a.EmitDs(Rdna2Opcode::DS_READ_B32, 6, 3);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 2, 1, 4, 0);    // out[0..31]  = 0
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 6, 1, 4, 128);  // out[32..63] = 32
+        a.EmitSopp(Rdna2Opcode::S_ENDPGM);
+
+        Rdna2CpuExecState cpu{};
+        cpu.uav1.assign(64, 0xDEADu);
+        OS_REQUIRE(ExecuteRdna2BlobCpu(a.BuildXs2(ShaderStage::Compute, 32, 1, 1, 16, 16, 32), cpu).ok());
+        for (uint32_t i = 0; i < 32u; ++i) {
+            OS_REQUIRE(cpu.uav1[i] == 0u);
+            OS_REQUIRE(cpu.uav1[32 + i] == 32u);
+        }
+    }
+
+    // 2. Catch 2: VOP2 0x36/0x37/0x38 fused f16 + FMA vs unfused denormal-flushing MAD
+    {
+        Rdna2Assembler a;
+        // half(1.5)=0x3E00, half(2.0)=0x4000, half(0.5)=0x3800 -> fma(1.5, 2.0, 0.5) = 3.5 (0x4300)
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 1, Rdna2Operand::LiteralU32(0x3E00u));
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 2, Rdna2Operand::LiteralU32(0x4000u));
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 3, Rdna2Operand::LiteralU32(0x3800u));
+        a.EmitVop2(Rdna2Opcode::V_FMAC_F16, 3, Rdna2Operand::Vgpr(1), 2);               // 0x36: 1.5*2.0 + 0.5 = 3.5 (0x4300)
+        a.EmitVop2Literal(Rdna2Opcode::V_FMAMK_F16, 4, Rdna2Operand::Vgpr(1), 2, 0x4000u);  // 0x37: 1.5*2.0 + 2.0 = 5.0 (0x4500)
+        a.EmitVop2Literal(Rdna2Opcode::V_FMAAK_F16, 5, Rdna2Operand::Vgpr(1), 2, 0x3C00u);  // 0x38: 1.5*2.0 + 1.0 = 4.0 (0x4400)
+        a.EmitVop3(Rdna2Opcode::V_FMA_F16, 6, Rdna2Operand::Vgpr(1), Rdna2Operand::Vgpr(2), Rdna2Operand::LiteralU32(0x3C00u));
+
+        // Rounding cancellation vector where FMA != MAD:
+        // a = 1 + 2^-13 (0x3F800400), b = 1 - 2^-13 (0x3F7FF800), c = -1.0f (0xBF800000)
+        // FMA = -2^-26 (0xB2800000), MAD = 0.0f (0x00000000)
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 10, Rdna2Operand::LiteralU32(0x3F800400u));
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 11, Rdna2Operand::LiteralU32(0x3F7FF800u));
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 12, Rdna2Operand::LiteralU32(0xBF800000u));
+        a.EmitVop3(Rdna2Opcode::V_FMA_F32, 13, Rdna2Operand::Vgpr(10), Rdna2Operand::Vgpr(11), Rdna2Operand::Vgpr(12));
+        a.EmitVop3(Rdna2Opcode::V_MAD_F32, 14, Rdna2Operand::Vgpr(10), Rdna2Operand::Vgpr(11), Rdna2Operand::Vgpr(12));
+
+        // Denormal vector where FMA != MAD:
+        // a = 2^-127 (subnormal 0x00400000), b = 4.0f, c = 0.0f
+        // FMA = 2^-125 (0x01000000), MAD = 0.0f (0x00000000)
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 15, Rdna2Operand::LiteralU32(0x00400000u));
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 16, Rdna2Operand::InlineFloat(4.0f));
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 17, Rdna2Operand::InlineFloat(0.0f));
+        a.EmitVop3(Rdna2Opcode::V_FMA_F32, 18, Rdna2Operand::Vgpr(15), Rdna2Operand::Vgpr(16), Rdna2Operand::Vgpr(17));
+        a.EmitVop3(Rdna2Opcode::V_MAD_F32, 19, Rdna2Operand::Vgpr(15), Rdna2Operand::Vgpr(16), Rdna2Operand::Vgpr(17));
+        // V_MAC_F32, V_MADMK_F32, V_MADAK_F32
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 20, Rdna2Operand::LiteralU32(0xBF800000u));
+        a.EmitVop2(Rdna2Opcode::V_MAC_F32, 20, Rdna2Operand::Vgpr(10), 11);
+        a.EmitVop2Literal(Rdna2Opcode::V_MADMK_F32, 21, Rdna2Operand::Vgpr(10), 12, 0x3F7FF800u);
+        a.EmitVop2Literal(Rdna2Opcode::V_MADAK_F32, 22, Rdna2Operand::Vgpr(10), 11, 0xBF800000u);
+
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 25, Rdna2Operand::InlineInt(0));
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 3, 25, 4, 0);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 4, 25, 4, 4);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 5, 25, 4, 8);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 6, 25, 4, 12);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 13, 25, 4, 16);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 14, 25, 4, 20);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 18, 25, 4, 24);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 19, 25, 4, 28);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 20, 25, 4, 32);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 21, 25, 4, 36);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 22, 25, 4, 40);
+        a.EmitSopp(Rdna2Opcode::S_ENDPGM);
+
+        std::vector<Rdna2Instruction> insns;
+        OS_REQUIRE(DisassembleRdna2(a.Words(), insns).ok());
+        bool saw_36 = false, saw_37 = false, saw_38 = false, saw_fma16 = false;
+        for (const auto& inst : insns) {
+            if (inst.opcode == Rdna2Opcode::V_FMAC_F16) {
+                OS_REQUIRE(inst.encoding == Rdna2Encoding::VOP2 && inst.raw_opcode == 0x36u);
+                OS_REQUIRE(inst.operand_width == Rdna2OperandWidth::Bits16 && inst.data_kind == Rdna2DataKind::Float);
+                saw_36 = true;
+            } else if (inst.opcode == Rdna2Opcode::V_FMAMK_F16) {
+                OS_REQUIRE(inst.encoding == Rdna2Encoding::VOP2 && inst.raw_opcode == 0x37u && inst.word_count == 2u);
+                saw_37 = true;
+            } else if (inst.opcode == Rdna2Opcode::V_FMAAK_F16) {
+                OS_REQUIRE(inst.encoding == Rdna2Encoding::VOP2 && inst.raw_opcode == 0x38u && inst.word_count == 2u);
+                saw_38 = true;
+            } else if (inst.opcode == Rdna2Opcode::V_FMA_F16) {
+                OS_REQUIRE(IsVop3Float16Instruction(inst));
+                saw_fma16 = true;
+            }
+        }
+        OS_REQUIRE(saw_36 && saw_37 && saw_38 && saw_fma16);
+
+        // Verify IR constant folding also preserves FMA != MAD
+        Xs2ShaderContainer c{};
+        c.stage = ShaderStage::Compute;
+        c.threadgroup_x = 1;
+        c.code_words = a.Words();
+        Rdna2IrModule ir{};
+        OS_REQUIRE(BuildRdna2Ir(c, insns, ir).ok());
+        Rdna2IrOptStats opt{};
+        OS_REQUIRE(OptimizeRdna2Ir(ir, &opt).ok());
+        OS_REQUIRE(opt.folded_constants >= 8u);
+
+        Rdna2CpuExecState cpu{};
+        cpu.uav1.assign(16, 0u);
+        OS_REQUIRE(ExecuteRdna2Cpu(c, insns, cpu).ok());
+        OS_REQUIRE(cpu.uav1[0] == 0x4300u);       // v_fmac_f16: 3.5
+        OS_REQUIRE(cpu.uav1[1] == 0x4500u);       // v_fmamk_f16: 5.0
+        OS_REQUIRE(cpu.uav1[2] == 0x4400u);       // v_fmaak_f16: 4.0
+        OS_REQUIRE(cpu.uav1[3] == 0x4400u);       // v_fma_f16: 4.0
+        OS_REQUIRE(cpu.uav1[4] == 0xB2800000u);   // v_fma_f32: -2^-26
+        OS_REQUIRE(cpu.uav1[5] == 0x00000000u);   // v_mad_f32: 0.0 (unfused!)
+        OS_REQUIRE(cpu.uav1[4] != cpu.uav1[5]);   // FMA != MAD!
+        OS_REQUIRE(cpu.uav1[6] == 0x01000000u);   // v_fma_f32 denorm preserved -> 2^-125
+        OS_REQUIRE(cpu.uav1[7] == 0x00000000u);   // v_mad_f32 denorm flushed -> 0.0
+        OS_REQUIRE(cpu.uav1[6] != cpu.uav1[7]);   // FMA != MAD!
+        OS_REQUIRE(cpu.uav1[8] == 0x00000000u);   // v_mac_f32 unfused
+        OS_REQUIRE(cpu.uav1[9] == 0x00000000u);   // v_madmk_f32 unfused
+        OS_REQUIRE(cpu.uav1[10] == 0x00000000u);  // v_madak_f32 unfused
+    }
+
+    // 3. Catch 3: 16-bit integer VOP3 structural classification (no _e64 string checks) + s_bcnt1_i32_b32 vs b64
+    {
+        Rdna2Assembler a;
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 1, Rdna2Operand::LiteralU32(0x1234FFF0u));
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 2, Rdna2Operand::LiteralU32(0x56780020u));
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 3, Rdna2Operand::LiteralU32(0x00000005u));
+        a.EmitVop3(Rdna2Opcode::V_ADD_NC_U16, 4, Rdna2Operand::Vgpr(1), Rdna2Operand::Vgpr(2));      // (0xFFF0+0x0020)&0xFFFF = 0x0010
+        a.EmitVop3(Rdna2Opcode::V_SUB_NC_U16, 5, Rdna2Operand::Vgpr(2), Rdna2Operand::Vgpr(1));      // (0x0020-0xFFF0)&0xFFFF = 0x0030
+        a.EmitVop3(Rdna2Opcode::V_MUL_LO_U16, 6, Rdna2Operand::Vgpr(2), Rdna2Operand::Vgpr(3));      // 0x20 * 5 = 0x00A0
+        a.EmitVop3(Rdna2Opcode::V_MAD_U16, 7, Rdna2Operand::Vgpr(2), Rdna2Operand::Vgpr(3), Rdna2Operand::InlineInt(7));  // 0xA7
+        a.EmitVop3(Rdna2Opcode::V_MIN_I16, 8, Rdna2Operand::Vgpr(1), Rdna2Operand::Vgpr(2));         // min(-16, 32) = -16 (0xFFF0)
+        a.EmitVop3(Rdna2Opcode::V_MAX_I16, 9, Rdna2Operand::Vgpr(1), Rdna2Operand::Vgpr(2));         // max(-16, 32) = 32 (0x0020)
+        a.EmitVop3(Rdna2Opcode::V_LSHLREV_B16, 10, Rdna2Operand::InlineInt(3), Rdna2Operand::Vgpr(2)); // 0x20 << 3 = 0x0100
+        a.EmitVop3(Rdna2Opcode::V_LSHRREV_B16, 11, Rdna2Operand::InlineInt(2), Rdna2Operand::Vgpr(2)); // 0x20 >> 2 = 0x0008
+
+        // s_bcnt1_i32_b32 vs s_bcnt1_i32_b64 high-word accuracy:
+        // s[8:9] = 0x00000001_80000003 -> b32 = 3, b64 = 4
+        // s[12:13] = 0xF0F00001_00000000 -> b32 = 0, b64 = 9
+        a.EmitSop1(Rdna2Opcode::S_MOV_B32, 8, Rdna2Operand::LiteralU32(0x80000003u));
+        a.EmitSop1(Rdna2Opcode::S_MOV_B32, 9, Rdna2Operand::LiteralU32(0x00000001u));
+        a.EmitSop1(Rdna2Opcode::S_BCNT1_I32_B32, 10, Rdna2Operand::Sgpr(8));
+        a.EmitSop1(Rdna2Opcode::S_BCNT1_I32_B64, 11, Rdna2Operand::Sgpr(8));
+        a.EmitSop1(Rdna2Opcode::S_MOV_B32, 12, Rdna2Operand::LiteralU32(0x00000000u));
+        a.EmitSop1(Rdna2Opcode::S_MOV_B32, 13, Rdna2Operand::LiteralU32(0xF0F00001u));
+        a.EmitSop1(Rdna2Opcode::S_BCNT1_I32_B32, 14, Rdna2Operand::Sgpr(12));
+        a.EmitSop1(Rdna2Opcode::S_BCNT1_I32_B64, 15, Rdna2Operand::Sgpr(12));
+
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 12, Rdna2Operand::Sgpr(10));
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 13, Rdna2Operand::Sgpr(11));
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 14, Rdna2Operand::Sgpr(14));
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 15, Rdna2Operand::Sgpr(15));
+
+        a.EmitVop1(Rdna2Opcode::V_MOV_B32, 20, Rdna2Operand::InlineInt(0));
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 4, 20, 4, 0);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 5, 20, 4, 4);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 6, 20, 4, 8);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 7, 20, 4, 12);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 8, 20, 4, 16);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 9, 20, 4, 20);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 10, 20, 4, 24);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 11, 20, 4, 28);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 12, 20, 4, 32);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 13, 20, 4, 36);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 14, 20, 4, 40);
+        a.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 15, 20, 4, 44);
+        a.EmitSopp(Rdna2Opcode::S_ENDPGM);
+
+        std::vector<Rdna2Instruction> insns;
+        OS_REQUIRE(DisassembleRdna2(a.Words(), insns).ok());
+
+        uint32_t vop3_i16_count = 0;
+        bool saw_bcnt32 = false, saw_bcnt64 = false;
+        for (const auto& inst : insns) {
+            if (IsVop3Int16Instruction(inst)) {
+                OS_REQUIRE(IsVop3EncodingWord(inst.raw_words[0]));
+                OS_REQUIRE(inst.word_count >= 2u);
+                OS_REQUIRE(inst.operand_width == Rdna2OperandWidth::Bits16);
+                // Strictly classified by encoding/metadata, never by _e64 suffix
+                OS_REQUIRE(inst.mnemonic.find("_e64") == std::string::npos);
+                ++vop3_i16_count;
+            }
+            if (inst.opcode == Rdna2Opcode::S_BCNT1_I32_B32) {
+                OS_REQUIRE(inst.raw_opcode == 0x08u && inst.operand_width == Rdna2OperandWidth::Bits32);
+                saw_bcnt32 = true;
+            }
+            if (inst.opcode == Rdna2Opcode::S_BCNT1_I32_B64) {
+                OS_REQUIRE(inst.raw_opcode == 0x09u && inst.operand_width == Rdna2OperandWidth::Bits64);
+                saw_bcnt64 = true;
+            }
+        }
+        OS_REQUIRE(vop3_i16_count == 8u && saw_bcnt32 && saw_bcnt64);
+
+        Rdna2CpuExecState cpu{};
+        cpu.uav1.assign(16, 0u);
+        OS_REQUIRE(ExecuteRdna2BlobCpu(a.BuildXs2(ShaderStage::Compute, 1, 1, 1, 20, 24, 32), cpu).ok());
+        OS_REQUIRE(cpu.uav1[0] == 0x0010u);
+        OS_REQUIRE(cpu.uav1[1] == 0x0030u);
+        OS_REQUIRE(cpu.uav1[2] == 0x00A0u);
+        OS_REQUIRE(cpu.uav1[3] == 0x00A7u);
+        OS_REQUIRE(cpu.uav1[4] == 0xFFF0u);
+        OS_REQUIRE(cpu.uav1[5] == 0x0020u);
+        OS_REQUIRE(cpu.uav1[6] == 0x0100u);
+        OS_REQUIRE(cpu.uav1[7] == 0x0008u);
+        OS_REQUIRE(cpu.uav1[8] == 3u);   // s_bcnt1_i32_b32(0x80000003) == 3
+        OS_REQUIRE(cpu.uav1[9] == 4u);   // s_bcnt1_i32_b64(0x00000001_80000003) == 4
+        OS_REQUIRE(cpu.uav1[10] == 0u);  // s_bcnt1_i32_b32(0x00000000) == 0
+        OS_REQUIRE(cpu.uav1[11] == 9u);  // s_bcnt1_i32_b64(0xF0F00001_00000000) == 9
+    }
+
+    // 4. Catch 4A: Pixel shader implicit-LOD IMAGE_SAMPLE builds ImageSampleImplicit + quad derivs
+    {
+        Rdna2Assembler ps;
+        ps.EmitMimg(Rdna2Opcode::IMAGE_SAMPLE, 4, 0, 0, 8, 0xFu, 1u, false);
+        ps.EmitExp(static_cast<uint8_t>(Rdna2ExportTarget::Mrt0), 4, 5, 6, 7, 0xFu, true, false, true);
+        ps.EmitSopp(Rdna2Opcode::S_ENDPGM);
+
+        std::vector<Rdna2Instruction> insns;
+        OS_REQUIRE(DisassembleRdna2(ps.Words(), insns).ok());
+        Xs2ShaderContainer c{};
+        c.stage = ShaderStage::Pixel;
+        c.threadgroup_x = 4;
+        c.code_words = ps.Words();
+        Rdna2IrModule ir{};
+        OS_REQUIRE(BuildRdna2Ir(c, insns, ir).ok());
+        OS_REQUIRE(ir.uses_pixel_quad_derivatives);
+    }
+
+    std::printf("[PASS] Core 5: RDNA2 ISA Catches (LDS zero-init, VOP2 0x36..0x38 f16, FMA!=MAD, VOP3 i16 metadata, bcnt32/64, PS quad derivs)\n");
+}
+
 }  // namespace
 
 int main() {
@@ -439,6 +675,7 @@ int main() {
     TestAaaOpcodesEncodeDecodeIrAndCpu();
     TestXboxDxbcContainerParser();
     TestShaderCacheAtomicsAndCorruptRecovery();
-    std::printf("[PASS] test_rdna2_core: ALL 4 CORE SUITES PASSED!\n");
+    TestRdna2IsaCatchesCore();
+    std::printf("[PASS] test_rdna2_core: ALL 5 CORE SUITES PASSED!\n");
     return 0;
 }
