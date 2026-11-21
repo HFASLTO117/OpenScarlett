@@ -238,6 +238,18 @@ struct MonitorEntry {
     void* context = nullptr;
 };
 
+struct WaiterEntry {
+    uint64_t token = 0;
+    XTaskQueueHandle queue = nullptr;
+    XTaskQueuePort port = XTaskQueuePort_Work;
+    XTaskQueueCallback callback = nullptr;
+    void* context = nullptr;
+    std::atomic<bool> active{true};
+#if defined(_WIN32)
+    HANDLE reg_wait_handle = nullptr;
+#endif
+};
+
 struct PortState {
     XTaskQueueDispatchMode mode = XTaskQueueDispatchMode_ThreadPool;
     XTaskQueuePort port_id = XTaskQueuePort_Work;
@@ -253,19 +265,44 @@ struct PortState {
 
 }  // namespace
 
+struct XTaskQueuePortObject {
+    std::shared_ptr<PortState> state;
+};
+
 struct XTaskQueueObject {
     std::atomic<int32_t> ref_count{1};
-    PortState ports[2];
+    std::shared_ptr<PortState> ports[2];
+    bool owns_port[2]{true, true};
+    XTaskQueuePortObject port_handles[2];
 
     std::mutex monitor_mutex;
     uint64_t next_monitor_token = 1;
     std::vector<MonitorEntry> monitors;
+
+    std::mutex waiter_mutex;
+    uint64_t next_waiter_token = 1;
+    std::vector<std::shared_ptr<WaiterEntry>> waiters;
+    std::vector<std::shared_ptr<WaiterEntry>> retired_waiters;
 
     std::mutex terminate_mutex;
     bool terminated = false;
 };
 
 namespace {
+
+thread_local bool g_in_waiter_bridge_cb = false;
+
+#if defined(_WIN32)
+void CALLBACK WaiterBridgeCallback(PVOID param, BOOLEAN /*timed_out*/) {
+    auto* entry = static_cast<WaiterEntry*>(param);
+    if (!entry || !entry->active.load(std::memory_order_acquire)) {
+        return;
+    }
+    g_in_waiter_bridge_cb = true;
+    (void)XTaskQueueSubmitCallback(entry->queue, entry->port, entry->context, entry->callback);
+    g_in_waiter_bridge_cb = false;
+}
+#endif
 
 size_t FindEarliestItemIndexLocked(const PortState& port) {
     size_t best = 0;
@@ -292,8 +329,8 @@ void NotifyMonitors(XTaskQueueObject* queue, XTaskQueuePort port) {
     }
 }
 
-void PortWorkerLoop(XTaskQueueObject* queue, uint32_t port_idx) {
-    PortState& port = queue->ports[port_idx];
+void PortWorkerLoop(std::shared_ptr<PortState> port_sp) {
+    PortState& port = *port_sp;
     for (;;) {
         ScheduledCallback item{};
         bool canceled = false;
@@ -346,7 +383,10 @@ void PortWorkerLoop(XTaskQueueObject* queue, uint32_t port_idx) {
 }
 
 void StartPortWorkersIfNeeded(XTaskQueueObject* queue, uint32_t port_idx) {
-    PortState& port = queue->ports[port_idx];
+    if (!queue || !queue->owns_port[port_idx] || !queue->ports[port_idx]) {
+        return;
+    }
+    PortState& port = *queue->ports[port_idx];
     uint32_t worker_count = 0;
     if (port.mode == XTaskQueueDispatchMode_ThreadPool) {
         worker_count = 2;
@@ -354,17 +394,41 @@ void StartPortWorkersIfNeeded(XTaskQueueObject* queue, uint32_t port_idx) {
         worker_count = 1;
     }
     for (uint32_t i = 0; i < worker_count; ++i) {
-        port.workers.emplace_back(&PortWorkerLoop, queue, port_idx);
+        port.workers.emplace_back(&PortWorkerLoop, queue->ports[port_idx]);
+    }
+}
+
+void ShutdownQueueWaiters(XTaskQueueObject* queue) {
+    if (!queue) return;
+    std::vector<std::shared_ptr<WaiterEntry>> active_waiters;
+    {
+        std::lock_guard<std::mutex> lk(queue->waiter_mutex);
+        active_waiters.swap(queue->waiters);
+    }
+    for (auto& w : active_waiters) {
+        w->active.store(false, std::memory_order_release);
+#if defined(_WIN32)
+        if (w->reg_wait_handle) {
+            HANDLE h = w->reg_wait_handle;
+            w->reg_wait_handle = nullptr;
+            UnregisterWaitEx(h, g_in_waiter_bridge_cb ? nullptr : INVALID_HANDLE_VALUE);
+        }
+#endif
     }
 }
 
 void ShutdownQueueInternal(XTaskQueueObject* queue, bool wait_for_completion) {
     if (!queue) return;
 
-    // Drain manual/immediate pending callbacks as canceled and wake worker ports.
+    ShutdownQueueWaiters(queue);
+
+    // Drain manual/immediate pending callbacks as canceled and wake owned worker ports.
     std::vector<ScheduledCallback> manual_canceled;
     for (uint32_t p = 0; p < 2; ++p) {
-        PortState& port = queue->ports[p];
+        if (!queue->owns_port[p] || !queue->ports[p]) {
+            continue;
+        }
+        PortState& port = *queue->ports[p];
         std::lock_guard<std::mutex> lk(port.mutex);
         port.terminating = true;
         if (port.workers.empty()) {
@@ -385,7 +449,10 @@ void ShutdownQueueInternal(XTaskQueueObject* queue, bool wait_for_completion) {
 
     if (wait_for_completion) {
         for (uint32_t p = 0; p < 2; ++p) {
-            PortState& port = queue->ports[p];
+            if (!queue->owns_port[p] || !queue->ports[p]) {
+                continue;
+            }
+            PortState& port = *queue->ports[p];
             std::vector<std::thread> to_join;
             {
                 std::lock_guard<std::mutex> lk(port.mutex);
@@ -420,7 +487,9 @@ struct AsyncRecord {
 
     std::mutex mutex;
     std::condition_variable cv;
+    bool result_ready = false;
     bool completed = false;
+    std::thread::id callback_thread_id{};
     XGameResult result = XGR_E_PENDING;
     size_t required_buffer_size = 0;
 
@@ -565,6 +634,8 @@ void OPENSCARLETT_GDK_CALL AsyncCompletionTrampoline(void* context, bool /*cance
     XAsyncBlock* block = nullptr;
     {
         std::lock_guard<std::mutex> lk(rec->mutex);
+        rec->result_ready = true;
+        rec->callback_thread_id = std::this_thread::get_id();
         block = rec->async_block;
         cb = block ? block->callback : nullptr;
     }
@@ -576,6 +647,7 @@ void OPENSCARLETT_GDK_CALL AsyncCompletionTrampoline(void* context, bool /*cance
     bool should_auto_cleanup = false;
     {
         std::lock_guard<std::mutex> lk(rec->mutex);
+        rec->callback_thread_id = std::thread::id{};
         rec->completed = true;
         should_auto_cleanup = (rec->required_buffer_size == 0 || rec->result < 0);
     }
@@ -797,6 +869,321 @@ XGameResult OPENSCARLETT_GDK_CALL GameSaveInitProvider(
     }
 }
 
+// ===========================================================================
+// Async Provider Helpers for XAsyncRun, XUserGetGamerPictureAsync, XGameSave*Async
+// ===========================================================================
+const char kIdAsyncRun[] = "XAsyncRun";
+const char kIdUserGamerPicture[] = "XUserGetGamerPictureAsync";
+const char kIdGameSaveReadBlob[] = "XGameSaveReadBlobDataAsync";
+const char kIdGameSaveSubmitUpdate[] = "XGameSaveSubmitUpdateAsync";
+const char kIdGameSaveDeleteContainer[] = "XGameSaveDeleteContainerAsync";
+const char kIdGameSaveQuota[] = "XGameSaveGetRemainingQuotaAsync";
+
+struct AsyncRunCtx {
+    XAsyncWork work = nullptr;
+};
+
+XGameResult OPENSCARLETT_GDK_CALL AsyncRunProvider(
+    XAsyncOp op,
+    const XAsyncProviderData* data) {
+    auto* ctx = static_cast<AsyncRunCtx*>(data->context);
+    switch (op) {
+        case XAsyncOp_Begin:
+            return XGR_S_OK;
+        case XAsyncOp_DoWork: {
+            const XGameResult hr = (ctx && ctx->work) ? ctx->work(data->async) : XGR_E_INVALIDARG;
+            XAsyncComplete(data->async, hr, 0);
+            return XGR_E_PENDING;
+        }
+        case XAsyncOp_Cleanup:
+            delete ctx;
+            return XGR_S_OK;
+        default:
+            return XGR_S_OK;
+    }
+}
+
+uint32_t PngCrc32(const uint8_t* data, size_t len) {
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; ++i) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; ++b) {
+            crc = (crc & 1u) ? ((crc >> 1) ^ 0xEDB88320u) : (crc >> 1);
+        }
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
+void AppendBe32(std::vector<uint8_t>& out, uint32_t v) {
+    out.push_back(static_cast<uint8_t>((v >> 24) & 0xFFu));
+    out.push_back(static_cast<uint8_t>((v >> 16) & 0xFFu));
+    out.push_back(static_cast<uint8_t>((v >> 8) & 0xFFu));
+    out.push_back(static_cast<uint8_t>(v & 0xFFu));
+}
+
+void AppendPngChunk(std::vector<uint8_t>& out, const char type[4], const std::vector<uint8_t>& payload) {
+    AppendBe32(out, static_cast<uint32_t>(payload.size()));
+    const size_t type_start = out.size();
+    out.insert(out.end(), type, type + 4);
+    out.insert(out.end(), payload.begin(), payload.end());
+    const uint32_t crc = PngCrc32(out.data() + type_start, 4u + payload.size());
+    AppendBe32(out, crc);
+}
+
+std::vector<uint8_t> BuildCleanRoomGamerPicPng(uint32_t dim) {
+    // Uncompressed zlib-stored RGBA PNG (100% valid RFC 2083 + RFC 1950).
+    std::vector<uint8_t> png = {0x89u, 'P', 'N', 'G', 0x0Du, 0x0Au, 0x1Au, 0x0Au};
+    std::vector<uint8_t> ihdr;
+    AppendBe32(ihdr, dim);
+    AppendBe32(ihdr, dim);
+    ihdr.push_back(8u);  // bit depth
+    ihdr.push_back(6u);  // RGBA
+    ihdr.push_back(0u);  // compression
+    ihdr.push_back(0u);  // filter
+    ihdr.push_back(0u);  // interlace
+    AppendPngChunk(png, "IHDR", ihdr);
+
+    std::vector<uint8_t> raw;
+    raw.reserve(static_cast<size_t>(dim) * (1u + static_cast<size_t>(dim) * 4u));
+    for (uint32_t y = 0; y < dim; ++y) {
+        raw.push_back(0u);  // filter type None
+        for (uint32_t x = 0; x < dim; ++x) {
+            raw.push_back(16u);
+            raw.push_back(124u);
+            raw.push_back(16u);
+            raw.push_back(255u);
+        }
+    }
+
+    uint32_t a = 1u, b = 0u;
+    for (uint8_t byte : raw) {
+        a = (a + byte) % 65521u;
+        b = (b + a) % 65521u;
+    }
+    const uint32_t adler = (b << 16) | a;
+
+    std::vector<uint8_t> idat;
+    idat.push_back(0x78u);  // zlib CMF (deflate, 32K window)
+    idat.push_back(0x01u);  // zlib FLG (check bits)
+    const uint16_t len16 = static_cast<uint16_t>(raw.size());
+    const uint16_t nlen16 = static_cast<uint16_t>(~len16);
+    idat.push_back(0x01u);  // BFINAL=1, BTYPE=00 (stored)
+    idat.push_back(static_cast<uint8_t>(len16 & 0xFFu));
+    idat.push_back(static_cast<uint8_t>((len16 >> 8) & 0xFFu));
+    idat.push_back(static_cast<uint8_t>(nlen16 & 0xFFu));
+    idat.push_back(static_cast<uint8_t>((nlen16 >> 8) & 0xFFu));
+    idat.insert(idat.end(), raw.begin(), raw.end());
+    AppendBe32(idat, adler);
+    AppendPngChunk(png, "IDAT", idat);
+
+    AppendPngChunk(png, "IEND", {});
+    return png;
+}
+
+struct UserGamerPicAsyncCtx {
+    XUserGamerPictureSize size_enum = XUserGamerPictureSize_Medium;
+    std::vector<uint8_t> png_bytes;
+};
+
+XGameResult OPENSCARLETT_GDK_CALL UserGamerPicProvider(
+    XAsyncOp op,
+    const XAsyncProviderData* data) {
+    auto* ctx = static_cast<UserGamerPicAsyncCtx*>(data->context);
+    switch (op) {
+        case XAsyncOp_Begin:
+            return XGR_S_OK;
+        case XAsyncOp_DoWork: {
+            uint32_t dim = 8u;
+            if (ctx->size_enum == XUserGamerPictureSize_Small) dim = 4u;
+            else if (ctx->size_enum == XUserGamerPictureSize_Large) dim = 16u;
+            else if (ctx->size_enum == XUserGamerPictureSize_ExtraLarge) dim = 16u;
+            ctx->png_bytes = BuildCleanRoomGamerPicPng(dim);
+            XAsyncComplete(data->async, XGR_S_OK, ctx->png_bytes.size());
+            return XGR_E_PENDING;
+        }
+        case XAsyncOp_GetResult: {
+            if (!data->buffer || data->bufferSize < ctx->png_bytes.size()) {
+                return XGR_E_NOT_SUFFICIENT_BUFFER;
+            }
+            if (!ctx->png_bytes.empty()) {
+                std::memcpy(data->buffer, ctx->png_bytes.data(), ctx->png_bytes.size());
+            }
+            return XGR_S_OK;
+        }
+        case XAsyncOp_Cleanup:
+            delete ctx;
+            return XGR_S_OK;
+        default:
+            return XGR_S_OK;
+    }
+}
+
+struct LoadedGameSaveBlob {
+    std::string name;
+    std::vector<uint8_t> bytes;
+};
+
+struct GameSaveReadBlobAsyncCtx {
+    fs::path container_dir;
+    std::vector<std::string> requested_names;
+    std::vector<LoadedGameSaveBlob> loaded;
+    size_t required_bytes = 0;
+};
+
+XGameResult OPENSCARLETT_GDK_CALL GameSaveReadBlobProvider(
+    XAsyncOp op,
+    const XAsyncProviderData* data) {
+    auto* ctx = static_cast<GameSaveReadBlobAsyncCtx*>(data->context);
+    switch (op) {
+        case XAsyncOp_Begin:
+            return XGR_S_OK;
+        case XAsyncOp_DoWork: {
+            ContainerMeta meta{};
+            if (!LoadContainerMeta(ctx->container_dir, meta)) {
+                XAsyncComplete(data->async, XGR_E_GS_BLOB_NOT_FOUND, 0);
+                return XGR_E_PENDING;
+            }
+            std::vector<std::string> names = ctx->requested_names;
+            if (names.empty()) {
+                for (const auto& [bname, _] : meta.blobs) {
+                    names.push_back(bname);
+                }
+            }
+            ctx->loaded.clear();
+            ctx->loaded.reserve(names.size());
+            size_t req = names.size() * sizeof(XGameSaveBlob);
+            for (const auto& req_name : names) {
+                auto mit = meta.blobs.find(req_name);
+                if (mit == meta.blobs.end()) {
+                    XAsyncComplete(data->async, XGR_E_GS_BLOB_NOT_FOUND, 0);
+                    return XGR_E_PENDING;
+                }
+                LoadedGameSaveBlob lb{};
+                lb.name = req_name;
+                if (!ReadBinaryFile(ctx->container_dir / mit->second, lb.bytes)) {
+                    XAsyncComplete(data->async, XGR_E_GS_BLOB_NOT_FOUND, 0);
+                    return XGR_E_PENDING;
+                }
+                req += (lb.name.size() + 1) + lb.bytes.size();
+                ctx->loaded.push_back(std::move(lb));
+            }
+            ctx->required_bytes = req;
+            XAsyncComplete(data->async, XGR_S_OK, req);
+            return XGR_E_PENDING;
+        }
+        case XAsyncOp_GetResult: {
+            if (!data->buffer || data->bufferSize < ctx->required_bytes) {
+                return XGR_E_GS_PROVIDED_BUFFER_TOO_SMALL;
+            }
+            auto* blob_data = reinterpret_cast<XGameSaveBlob*>(data->buffer);
+            auto* base = reinterpret_cast<uint8_t*>(data->buffer);
+            size_t cursor = ctx->loaded.size() * sizeof(XGameSaveBlob);
+            for (size_t i = 0; i < ctx->loaded.size(); ++i) {
+                char* name_dst = reinterpret_cast<char*>(base + cursor);
+                std::memcpy(name_dst, ctx->loaded[i].name.c_str(), ctx->loaded[i].name.size() + 1);
+                cursor += ctx->loaded[i].name.size() + 1;
+
+                uint8_t* data_dst = base + cursor;
+                if (!ctx->loaded[i].bytes.empty()) {
+                    std::memcpy(data_dst, ctx->loaded[i].bytes.data(), ctx->loaded[i].bytes.size());
+                    cursor += ctx->loaded[i].bytes.size();
+                }
+
+                blob_data[i].info.name = name_dst;
+                blob_data[i].info.size = static_cast<uint32_t>(ctx->loaded[i].bytes.size());
+                blob_data[i].data = ctx->loaded[i].bytes.empty() ? nullptr : data_dst;
+            }
+            return XGR_S_OK;
+        }
+        case XAsyncOp_Cleanup:
+            delete ctx;
+            return XGR_S_OK;
+        default:
+            return XGR_S_OK;
+    }
+}
+
+struct GameSaveSubmitUpdateAsyncCtx {
+    XGameSaveUpdateHandle update = nullptr;
+};
+
+XGameResult OPENSCARLETT_GDK_CALL GameSaveSubmitUpdateProvider(
+    XAsyncOp op,
+    const XAsyncProviderData* data) {
+    auto* ctx = static_cast<GameSaveSubmitUpdateAsyncCtx*>(data->context);
+    switch (op) {
+        case XAsyncOp_Begin:
+            return XGR_S_OK;
+        case XAsyncOp_DoWork: {
+            const XGameResult hr = XGameSaveSubmitUpdate(ctx->update);
+            XAsyncComplete(data->async, hr, 0);
+            return XGR_E_PENDING;
+        }
+        case XAsyncOp_Cleanup:
+            delete ctx;
+            return XGR_S_OK;
+        default:
+            return XGR_S_OK;
+    }
+}
+
+struct GameSaveDeleteContainerAsyncCtx {
+    XGameSaveProviderHandle provider = nullptr;
+    std::string name;
+};
+
+XGameResult OPENSCARLETT_GDK_CALL GameSaveDeleteContainerProvider(
+    XAsyncOp op,
+    const XAsyncProviderData* data) {
+    auto* ctx = static_cast<GameSaveDeleteContainerAsyncCtx*>(data->context);
+    switch (op) {
+        case XAsyncOp_Begin:
+            return XGR_S_OK;
+        case XAsyncOp_DoWork: {
+            const XGameResult hr = XGameSaveDeleteContainer(ctx->provider, ctx->name.c_str());
+            XAsyncComplete(data->async, hr, 0);
+            return XGR_E_PENDING;
+        }
+        case XAsyncOp_Cleanup:
+            delete ctx;
+            return XGR_S_OK;
+        default:
+            return XGR_S_OK;
+    }
+}
+
+struct GameSaveQuotaAsyncCtx {
+    XGameSaveProviderHandle provider = nullptr;
+    int64_t quota = 0;
+};
+
+XGameResult OPENSCARLETT_GDK_CALL GameSaveQuotaProvider(
+    XAsyncOp op,
+    const XAsyncProviderData* data) {
+    auto* ctx = static_cast<GameSaveQuotaAsyncCtx*>(data->context);
+    switch (op) {
+        case XAsyncOp_Begin:
+            return XGR_S_OK;
+        case XAsyncOp_DoWork: {
+            const XGameResult hr = XGameSaveGetRemainingQuota(ctx->provider, &ctx->quota);
+            XAsyncComplete(data->async, hr, hr >= 0 ? sizeof(int64_t) : 0);
+            return XGR_E_PENDING;
+        }
+        case XAsyncOp_GetResult: {
+            if (!data->buffer || data->bufferSize < sizeof(int64_t)) {
+                return XGR_E_NOT_SUFFICIENT_BUFFER;
+            }
+            std::memcpy(data->buffer, &ctx->quota, sizeof(int64_t));
+            return XGR_S_OK;
+        }
+        case XAsyncOp_Cleanup:
+            delete ctx;
+            return XGR_S_OK;
+        default:
+            return XGR_S_OK;
+    }
+}
+
 }  // namespace
 
 extern "C" {
@@ -853,14 +1240,28 @@ XGameResult OPENSCARLETT_GDK_CALL XGameGetXboxTitleId(uint32_t* titleId) {
         const size_t last = env.find_last_not_of(" \t\r\n");
         const std::string trimmed = env.substr(first, last - first + 1);
         if (!trimmed.empty() && trimmed[0] != '-') {
-            int base = 10;
+            bool parsed_ok = false;
+            unsigned long long parsed = 0;
             if (trimmed.size() > 2 && trimmed[0] == '0' && (trimmed[1] == 'x' || trimmed[1] == 'X')) {
-                base = 16;
+                char* end_ptr = nullptr;
+                errno = 0;
+                parsed = std::strtoull(trimmed.c_str(), &end_ptr, 16);
+                parsed_ok = (errno == 0 && end_ptr && *end_ptr == '\0' && parsed <= 0xFFFFFFFFULL);
+            } else {
+                char* end_ptr = nullptr;
+                errno = 0;
+                parsed = std::strtoull(trimmed.c_str(), &end_ptr, 10);
+                if (errno == 0 && end_ptr && *end_ptr == '\0' && parsed <= 0xFFFFFFFFULL) {
+                    parsed_ok = true;
+                } else if (trimmed.size() <= 8) {
+                    // Unprefixed Xbox MicrosoftGame.Config hex TitleId (e.g. "5CA02002", "7e750470")
+                    end_ptr = nullptr;
+                    errno = 0;
+                    parsed = std::strtoull(trimmed.c_str(), &end_ptr, 16);
+                    parsed_ok = (errno == 0 && end_ptr && *end_ptr == '\0' && parsed <= 0xFFFFFFFFULL);
+                }
             }
-            char* end_ptr = nullptr;
-            errno = 0;
-            const unsigned long long parsed = std::strtoull(trimmed.c_str(), &end_ptr, base);
-            if (errno == 0 && end_ptr && *end_ptr == '\0' && parsed <= 0xFFFFFFFFULL) {
+            if (parsed_ok) {
                 tid = static_cast<uint32_t>(parsed);
             }
         }
@@ -882,10 +1283,16 @@ XGameResult OPENSCARLETT_GDK_CALL XTaskQueueCreate(
     *queue = nullptr;
 
     auto obj = std::make_shared<XTaskQueueObject>();
-    obj->ports[0].mode = workDispatchMode;
-    obj->ports[0].port_id = XTaskQueuePort_Work;
-    obj->ports[1].mode = completionDispatchMode;
-    obj->ports[1].port_id = XTaskQueuePort_Completion;
+    obj->ports[0] = std::make_shared<PortState>();
+    obj->ports[0]->mode = workDispatchMode;
+    obj->ports[0]->port_id = XTaskQueuePort_Work;
+    obj->ports[1] = std::make_shared<PortState>();
+    obj->ports[1]->mode = completionDispatchMode;
+    obj->ports[1]->port_id = XTaskQueuePort_Completion;
+    obj->owns_port[0] = true;
+    obj->owns_port[1] = true;
+    obj->port_handles[0].state = obj->ports[0];
+    obj->port_handles[1].state = obj->ports[1];
 
     XTaskQueueHandle raw = obj.get();
     {
@@ -1018,7 +1425,14 @@ XGameResult OPENSCARLETT_GDK_CALL XTaskQueueSubmitDelayedCallback(
         return RecordHr("XTaskQueueSubmitDelayedCallback", XGR_E_HANDLE);
     }
 
-    PortState& p = obj->ports[static_cast<uint32_t>(port)];
+    {
+        std::lock_guard<std::mutex> tlk(obj->terminate_mutex);
+        if (obj->terminated) {
+            return RecordHr("XTaskQueueSubmitDelayedCallback", XGR_E_ABORT);
+        }
+    }
+
+    PortState& p = *obj->ports[static_cast<uint32_t>(port)];
 
     if (p.mode == XTaskQueueDispatchMode_Immediate) {
         {
@@ -1075,7 +1489,7 @@ bool OPENSCARLETT_GDK_CALL XTaskQueueDispatch(
         return false;
     }
 
-    PortState& p = obj->ports[static_cast<uint32_t>(port)];
+    PortState& p = *obj->ports[static_cast<uint32_t>(port)];
     const auto deadline = SteadyClock::now() + std::chrono::milliseconds(timeoutInMs);
 
     ScheduledCallback item{};
@@ -1181,6 +1595,134 @@ void OPENSCARLETT_GDK_CALL XTaskQueueUnregisterMonitor(
         std::remove_if(m.begin(), m.end(),
                        [&](const MonitorEntry& e) { return e.token == token.token; }),
         m.end());
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XTaskQueueGetPort(
+    XTaskQueueHandle queue,
+    XTaskQueuePort port,
+    XTaskQueuePortHandle* portHandle) {
+    if (!queue || !portHandle || (port != XTaskQueuePort_Work && port != XTaskQueuePort_Completion)) {
+        return RecordHr("XTaskQueueGetPort", XGR_E_INVALIDARG);
+    }
+    *portHandle = nullptr;
+    auto obj = LookupQueue(queue);
+    if (!obj) {
+        return RecordHr("XTaskQueueGetPort", XGR_E_HANDLE);
+    }
+    *portHandle = &obj->port_handles[static_cast<uint32_t>(port)];
+    return RecordHr("XTaskQueueGetPort", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XTaskQueueCreateComposite(
+    XTaskQueuePortHandle workPort,
+    XTaskQueuePortHandle completionPort,
+    XTaskQueueHandle* queue) {
+    if (!workPort || !completionPort || !workPort->state || !completionPort->state || !queue) {
+        return RecordHr("XTaskQueueCreateComposite", XGR_E_INVALIDARG);
+    }
+    *queue = nullptr;
+
+    auto obj = std::make_shared<XTaskQueueObject>();
+    obj->ports[0] = workPort->state;
+    obj->ports[1] = completionPort->state;
+    obj->owns_port[0] = false;
+    obj->owns_port[1] = false;
+    obj->port_handles[0].state = obj->ports[0];
+    obj->port_handles[1].state = obj->ports[1];
+
+    XTaskQueueHandle raw = obj.get();
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.mutex);
+        rt.live_queues[raw] = obj;
+    }
+
+    *queue = raw;
+    return RecordHr("XTaskQueueCreateComposite", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XTaskQueueRegisterWaiter(
+    XTaskQueueHandle queue,
+    XTaskQueuePort port,
+    void* waitHandle,
+    void* callbackContext,
+    XTaskQueueCallback callback,
+    XTaskQueueRegistrationToken* token) {
+    if (!queue || !waitHandle || !callback || !token ||
+        (port != XTaskQueuePort_Work && port != XTaskQueuePort_Completion)) {
+        return RecordHr("XTaskQueueRegisterWaiter", XGR_E_INVALIDARG);
+    }
+    token->token = 0;
+    auto obj = LookupQueue(queue);
+    if (!obj) {
+        return RecordHr("XTaskQueueRegisterWaiter", XGR_E_HANDLE);
+    }
+
+    auto entry = std::make_shared<WaiterEntry>();
+    entry->queue = queue;
+    entry->port = port;
+    entry->callback = callback;
+    entry->context = callbackContext;
+
+#if defined(_WIN32)
+    HANDLE reg_h = nullptr;
+    if (!RegisterWaitForSingleObject(
+            &reg_h,
+            static_cast<HANDLE>(waitHandle),
+            &WaiterBridgeCallback,
+            entry.get(),
+            INFINITE,
+            WT_EXECUTEDEFAULT)) {
+        return RecordHr("XTaskQueueRegisterWaiter", XGR_E_FAIL);
+    }
+    entry->reg_wait_handle = reg_h;
+#endif
+
+    {
+        std::lock_guard<std::mutex> lk(obj->waiter_mutex);
+        entry->token = obj->next_waiter_token++;
+        token->token = entry->token;
+        obj->waiters.push_back(std::move(entry));
+    }
+    return RecordHr("XTaskQueueRegisterWaiter", XGR_S_OK);
+}
+
+void OPENSCARLETT_GDK_CALL XTaskQueueUnregisterWaiter(
+    XTaskQueueHandle queue,
+    XTaskQueueRegistrationToken token) {
+    RecordOk("XTaskQueueUnregisterWaiter");
+    if (!queue || token.token == 0) return;
+    auto obj = LookupQueue(queue);
+    if (!obj) return;
+
+    std::shared_ptr<WaiterEntry> removed;
+    {
+        std::lock_guard<std::mutex> lk(obj->waiter_mutex);
+        auto& w = obj->waiters;
+        for (auto it = w.begin(); it != w.end(); ++it) {
+            if ((*it)->token == token.token) {
+                removed = std::move(*it);
+                w.erase(it);
+                break;
+            }
+        }
+    }
+    if (removed) {
+        removed->active.store(false, std::memory_order_release);
+#if defined(_WIN32)
+        if (removed->reg_wait_handle) {
+            HANDLE h = removed->reg_wait_handle;
+            removed->reg_wait_handle = nullptr;
+            if (g_in_waiter_bridge_cb) {
+                UnregisterWaitEx(h, nullptr);
+                std::lock_guard<std::mutex> lk(obj->waiter_mutex);
+                obj->retired_waiters.push_back(std::move(removed));
+            } else {
+                UnregisterWaitEx(h, INVALID_HANDLE_VALUE);
+            }
+        }
+#endif
+    }
 }
 
 // ===========================================================================
@@ -1304,6 +1846,7 @@ void OPENSCARLETT_GDK_CALL XAsyncComplete(
     bool should_auto_cleanup = false;
     {
         std::lock_guard<std::mutex> lk(rec->mutex);
+        rec->result_ready = true;
         rec->completed = true;
         should_auto_cleanup = (rec->required_buffer_size == 0 || rec->result < 0);
     }
@@ -1323,6 +1866,9 @@ XGameResult OPENSCARLETT_GDK_CALL XAsyncGetStatus(
     }
 
     std::unique_lock<std::mutex> lk(rec->mutex);
+    if (rec->result_ready && rec->callback_thread_id == std::this_thread::get_id()) {
+        return RecordHr("XAsyncGetStatus", rec->result);
+    }
     if (wait) {
         rec->cv.wait(lk, [&]() { return rec->completed; });
     }
@@ -1341,7 +1887,7 @@ XGameResult OPENSCARLETT_GDK_CALL XAsyncGetResultSize(
         return RecordHr("XAsyncGetResultSize", XGR_E_INVALIDARG);
     }
     std::lock_guard<std::mutex> lk(rec->mutex);
-    if (!rec->completed) {
+    if (!rec->result_ready && !rec->completed) {
         return RecordHr("XAsyncGetResultSize", XGR_E_PENDING);
     }
     if (rec->result < 0) {
@@ -1366,7 +1912,7 @@ XGameResult OPENSCARLETT_GDK_CALL XAsyncGetResult(
     size_t req_size = 0;
     {
         std::lock_guard<std::mutex> lk(rec->mutex);
-        if (!rec->completed) {
+        if (!rec->result_ready && !rec->completed) {
             return RecordHr("XAsyncGetResult", XGR_E_PENDING);
         }
         status = rec->result;
@@ -1423,6 +1969,28 @@ void OPENSCARLETT_GDK_CALL XAsyncCancel(XAsyncBlock* asyncBlock) {
         data.context = rec->provider_context;
         rec->provider(XAsyncOp_Cancel, &data);
     }
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XAsyncRun(
+    XAsyncBlock* asyncBlock,
+    XAsyncWork work) {
+    if (!asyncBlock || !work) {
+        return RecordHr("XAsyncRun", XGR_E_INVALIDARG);
+    }
+    auto* ctx = new (std::nothrow) AsyncRunCtx{work};
+    if (!ctx) {
+        return RecordHr("XAsyncRun", XGR_E_OUTOFMEMORY);
+    }
+    XGameResult hr = XAsyncBegin(asyncBlock, ctx, kIdAsyncRun, kIdAsyncRun, &AsyncRunProvider);
+    if (hr < 0) {
+        delete ctx;
+        return RecordHr("XAsyncRun", hr);
+    }
+    hr = XAsyncSchedule(asyncBlock, 0);
+    if (hr < 0) {
+        XAsyncComplete(asyncBlock, hr, 0);
+    }
+    return RecordHr("XAsyncRun", hr);
 }
 
 // ===========================================================================
@@ -1600,6 +2168,64 @@ int32_t OPENSCARLETT_GDK_CALL XUserCompare(XUserHandle user1, XUserHandle user2)
     if (id1 < id2) return -1;
     if (id1 > id2) return 1;
     return 0;
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XUserGetGamerPictureAsync(
+    XUserHandle user,
+    XUserGamerPictureSize pictureSize,
+    XAsyncBlock* async) {
+    if (!user || !async) {
+        return RecordHr("XUserGetGamerPictureAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupUser(user)) {
+        return RecordHr("XUserGetGamerPictureAsync", XGR_E_HANDLE);
+    }
+    auto* ctx = new (std::nothrow) UserGamerPicAsyncCtx();
+    if (!ctx) {
+        return RecordHr("XUserGetGamerPictureAsync", XGR_E_OUTOFMEMORY);
+    }
+    ctx->size_enum = pictureSize;
+    XGameResult hr = XAsyncBegin(
+        async, ctx, kIdUserGamerPicture, kIdUserGamerPicture, &UserGamerPicProvider);
+    if (hr < 0) {
+        delete ctx;
+        return RecordHr("XUserGetGamerPictureAsync", hr);
+    }
+    hr = XAsyncSchedule(async, 0);
+    if (hr < 0) {
+        XAsyncComplete(async, hr, 0);
+    }
+    return RecordHr("XUserGetGamerPictureAsync", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XUserGetGamerPictureResultSize(
+    XAsyncBlock* async,
+    size_t* bufferSize) {
+    if (!async || !bufferSize) {
+        return RecordHr("XUserGetGamerPictureResultSize", XGR_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XUserGetGamerPictureResultSize", hr);
+    }
+    hr = XAsyncGetResultSize(async, bufferSize);
+    return RecordHr("XUserGetGamerPictureResultSize", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XUserGetGamerPictureResult(
+    XAsyncBlock* async,
+    size_t bufferSize,
+    uint8_t* buffer,
+    size_t* bufferUsed) {
+    if (!async || !buffer) {
+        return RecordHr("XUserGetGamerPictureResult", XGR_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XUserGetGamerPictureResult", hr);
+    }
+    hr = XAsyncGetResult(async, kIdUserGamerPicture, bufferSize, buffer, bufferUsed);
+    return RecordHr("XUserGetGamerPictureResult", hr);
 }
 
 // ===========================================================================
@@ -2107,6 +2733,242 @@ XGameResult OPENSCARLETT_GDK_CALL XGameSaveGetRemainingQuota(
     return RecordHr("XGameSaveGetRemainingQuota", XGR_S_OK);
 }
 
+XGameResult OPENSCARLETT_GDK_CALL XGameSaveEnumerateContainerInfoByName(
+    XGameSaveProviderHandle provider,
+    const char* containerNamePrefix,
+    void* context,
+    XGameSaveContainerInfoCallback callback) {
+    if (!provider || !callback) {
+        return RecordHr("XGameSaveEnumerateContainerInfoByName", XGR_E_INVALIDARG);
+    }
+    fs::path root_dir;
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.save_mutex);
+        auto it = rt.live_providers.find(provider);
+        if (it == rt.live_providers.end()) {
+            return RecordHr("XGameSaveEnumerateContainerInfoByName", XGR_E_HANDLE);
+        }
+        root_dir = it->second->root_dir;
+    }
+
+    const std::string prefix = containerNamePrefix ? containerNamePrefix : "";
+    std::error_code ec;
+    if (!fs::exists(root_dir, ec)) {
+        return RecordHr("XGameSaveEnumerateContainerInfoByName", XGR_S_OK);
+    }
+
+    for (const auto& entry : fs::directory_iterator(root_dir, ec)) {
+        if (!entry.is_directory(ec)) continue;
+        ContainerMeta meta{};
+        if (!LoadContainerMeta(entry.path(), meta)) continue;
+        if (!prefix.empty() && meta.name.rfind(prefix, 0) != 0) {
+            continue;
+        }
+
+        uint64_t total_size = 0;
+        for (const auto& [_, file_name] : meta.blobs) {
+            std::error_code fec;
+            const auto sz = fs::file_size(entry.path() / file_name, fec);
+            if (!fec) total_size += sz;
+        }
+
+        XGameSaveContainerInfo info{};
+        info.name = meta.name.c_str();
+        info.displayName = meta.display_name.c_str();
+        info.blobCount = static_cast<uint32_t>(meta.blobs.size());
+        info.totalSize = total_size;
+        info.lastModifiedTime = meta.last_modified;
+        info.needsSync = false;
+
+        if (!callback(&info, context)) {
+            break;
+        }
+    }
+    return RecordHr("XGameSaveEnumerateContainerInfoByName", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameSaveReadBlobDataAsync(
+    XGameSaveContainerHandle container,
+    const char** blobNames,
+    uint32_t countOfBlobs,
+    XAsyncBlock* async) {
+    if (!container || !async) {
+        return RecordHr("XGameSaveReadBlobDataAsync", XGR_E_INVALIDARG);
+    }
+    fs::path dir;
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.save_mutex);
+        auto it = rt.live_containers.find(container);
+        if (it == rt.live_containers.end()) {
+            return RecordHr("XGameSaveReadBlobDataAsync", XGR_E_HANDLE);
+        }
+        dir = it->second->container_dir;
+    }
+
+    auto* ctx = new (std::nothrow) GameSaveReadBlobAsyncCtx();
+    if (!ctx) {
+        return RecordHr("XGameSaveReadBlobDataAsync", XGR_E_OUTOFMEMORY);
+    }
+    ctx->container_dir = std::move(dir);
+    if (blobNames && countOfBlobs > 0) {
+        ctx->requested_names.reserve(countOfBlobs);
+        for (uint32_t i = 0; i < countOfBlobs; ++i) {
+            if (!blobNames[i] || !*blobNames[i]) {
+                delete ctx;
+                return RecordHr("XGameSaveReadBlobDataAsync", XGR_E_INVALIDARG);
+            }
+            ctx->requested_names.emplace_back(blobNames[i]);
+        }
+    }
+
+    XGameResult hr = XAsyncBegin(
+        async, ctx, kIdGameSaveReadBlob, kIdGameSaveReadBlob, &GameSaveReadBlobProvider);
+    if (hr < 0) {
+        delete ctx;
+        return RecordHr("XGameSaveReadBlobDataAsync", hr);
+    }
+    hr = XAsyncSchedule(async, 0);
+    if (hr < 0) {
+        XAsyncComplete(async, hr, 0);
+    }
+    return RecordHr("XGameSaveReadBlobDataAsync", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameSaveReadBlobDataResult(
+    XAsyncBlock* async,
+    size_t blobsSize,
+    XGameSaveBlob* blobData,
+    uint32_t* countOfBlobs) {
+    if (!async || !blobData || !countOfBlobs) {
+        return RecordHr("XGameSaveReadBlobDataResult", XGR_E_INVALIDARG);
+    }
+    *countOfBlobs = 0;
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XGameSaveReadBlobDataResult", hr);
+    }
+    auto rec = LookupAsync(async);
+    if (!rec || rec->identity != kIdGameSaveReadBlob) {
+        return RecordHr("XGameSaveReadBlobDataResult", XGR_E_INVALIDARG);
+    }
+    auto* ctx = static_cast<GameSaveReadBlobAsyncCtx*>(rec->provider_context);
+    if (!ctx) {
+        return RecordHr("XGameSaveReadBlobDataResult", XGR_E_FAIL);
+    }
+    if (blobsSize < ctx->required_bytes) {
+        return RecordHr("XGameSaveReadBlobDataResult", XGR_E_GS_PROVIDED_BUFFER_TOO_SMALL);
+    }
+    const uint32_t blob_count = static_cast<uint32_t>(ctx->loaded.size());
+    hr = XAsyncGetResult(async, kIdGameSaveReadBlob, blobsSize, blobData, nullptr);
+    if (hr >= 0) {
+        *countOfBlobs = blob_count;
+    }
+    return RecordHr("XGameSaveReadBlobDataResult", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameSaveSubmitUpdateAsync(
+    XGameSaveUpdateHandle updateContext,
+    XAsyncBlock* async) {
+    if (!updateContext || !async) {
+        return RecordHr("XGameSaveSubmitUpdateAsync", XGR_E_INVALIDARG);
+    }
+    auto* ctx = new (std::nothrow) GameSaveSubmitUpdateAsyncCtx{updateContext};
+    if (!ctx) {
+        return RecordHr("XGameSaveSubmitUpdateAsync", XGR_E_OUTOFMEMORY);
+    }
+    XGameResult hr = XAsyncBegin(
+        async, ctx, kIdGameSaveSubmitUpdate, kIdGameSaveSubmitUpdate, &GameSaveSubmitUpdateProvider);
+    if (hr < 0) {
+        delete ctx;
+        return RecordHr("XGameSaveSubmitUpdateAsync", hr);
+    }
+    hr = XAsyncSchedule(async, 0);
+    if (hr < 0) {
+        XAsyncComplete(async, hr, 0);
+    }
+    return RecordHr("XGameSaveSubmitUpdateAsync", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameSaveSubmitUpdateResult(XAsyncBlock* async) {
+    if (!async) {
+        return RecordHr("XGameSaveSubmitUpdateResult", XGR_E_INVALIDARG);
+    }
+    const XGameResult hr = XAsyncGetStatus(async, true);
+    return RecordHr("XGameSaveSubmitUpdateResult", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameSaveDeleteContainerAsync(
+    XGameSaveProviderHandle provider,
+    const char* name,
+    XAsyncBlock* async) {
+    if (!provider || !name || !*name || !async) {
+        return RecordHr("XGameSaveDeleteContainerAsync", XGR_E_INVALIDARG);
+    }
+    auto* ctx = new (std::nothrow) GameSaveDeleteContainerAsyncCtx{provider, name};
+    if (!ctx) {
+        return RecordHr("XGameSaveDeleteContainerAsync", XGR_E_OUTOFMEMORY);
+    }
+    XGameResult hr = XAsyncBegin(
+        async, ctx, kIdGameSaveDeleteContainer, kIdGameSaveDeleteContainer,
+        &GameSaveDeleteContainerProvider);
+    if (hr < 0) {
+        delete ctx;
+        return RecordHr("XGameSaveDeleteContainerAsync", hr);
+    }
+    hr = XAsyncSchedule(async, 0);
+    if (hr < 0) {
+        XAsyncComplete(async, hr, 0);
+    }
+    return RecordHr("XGameSaveDeleteContainerAsync", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameSaveDeleteContainerResult(XAsyncBlock* async) {
+    if (!async) {
+        return RecordHr("XGameSaveDeleteContainerResult", XGR_E_INVALIDARG);
+    }
+    const XGameResult hr = XAsyncGetStatus(async, true);
+    return RecordHr("XGameSaveDeleteContainerResult", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameSaveGetRemainingQuotaAsync(
+    XGameSaveProviderHandle provider,
+    XAsyncBlock* async) {
+    if (!provider || !async) {
+        return RecordHr("XGameSaveGetRemainingQuotaAsync", XGR_E_INVALIDARG);
+    }
+    auto* ctx = new (std::nothrow) GameSaveQuotaAsyncCtx{provider, 0};
+    if (!ctx) {
+        return RecordHr("XGameSaveGetRemainingQuotaAsync", XGR_E_OUTOFMEMORY);
+    }
+    XGameResult hr = XAsyncBegin(
+        async, ctx, kIdGameSaveQuota, kIdGameSaveQuota, &GameSaveQuotaProvider);
+    if (hr < 0) {
+        delete ctx;
+        return RecordHr("XGameSaveGetRemainingQuotaAsync", hr);
+    }
+    hr = XAsyncSchedule(async, 0);
+    if (hr < 0) {
+        XAsyncComplete(async, hr, 0);
+    }
+    return RecordHr("XGameSaveGetRemainingQuotaAsync", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameSaveGetRemainingQuotaResult(
+    XAsyncBlock* async,
+    int64_t* remainingQuota) {
+    if (!async || !remainingQuota) {
+        return RecordHr("XGameSaveGetRemainingQuotaResult", XGR_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XGameSaveGetRemainingQuotaResult", hr);
+    }
+    hr = XAsyncGetResult(async, kIdGameSaveQuota, sizeof(int64_t), remainingQuota, nullptr);
+    return RecordHr("XGameSaveGetRemainingQuotaResult", hr);
+}
+
 // ===========================================================================
 // XSystem
 // ===========================================================================
@@ -2234,7 +3096,10 @@ XGameResult OPENSCARLETT_GDK_CALL XMemSetAllocationHooks(
 XGameResult OPENSCARLETT_GDK_CALL XPackageGetCurrentProcessPackageIdentifier(
     size_t bufferSize,
     char* buffer) {
-    const std::string pkg_id = "OpenScarlett.Title_1.0.0.0_x64__openscarlett0";
+    std::string pkg_id = GetEnvString("OPENSCARLETT_PACKAGE_ID");
+    if (pkg_id.empty()) {
+        pkg_id = "OpenScarlett.Title_1.0.0.0_x64__openscarlett0";
+    }
     return RecordHr("XPackageGetCurrentProcessPackageIdentifier",
                     CopyStringResult(pkg_id, bufferSize, buffer, nullptr));
 }

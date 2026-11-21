@@ -283,7 +283,9 @@ public:
         if (!ppvObject) return RecordHr("IDStorageQueueX::QueryInterface", OS_DSTORAGE_E_POINTER, 0);
         *ppvObject = nullptr;
         if (!riid) return RecordHr("IDStorageQueueX::QueryInterface", OS_DSTORAGE_E_INVALIDARG, 0);
-        if (GuidEquals(riid, IID_OS_DStorage_IUnknown) || GuidEquals(riid, IID_IDStorageQueueX)) {
+        if (GuidEquals(riid, IID_OS_DStorage_IUnknown) ||
+            GuidEquals(riid, IID_IDStorageQueueX) ||
+            GuidEquals(riid, IID_IDStorageQueueX1)) {
             AddRef();
             *ppvObject = static_cast<IDStorageQueueX*>(this);
             return RecordHr("IDStorageQueueX::QueryInterface", OS_DSTORAGE_S_OK, 0);
@@ -708,7 +710,8 @@ public:
         *ppvObject = nullptr;
         if (!riid) return RecordHr("IDStorageFactoryX::QueryInterface", OS_DSTORAGE_E_INVALIDARG, 0);
         if (GuidEquals(riid, IID_OS_DStorage_IUnknown) ||
-            GuidEquals(riid, IID_IDStorageFactoryX)) {
+            GuidEquals(riid, IID_IDStorageFactoryX) ||
+            GuidEquals(riid, IID_IDStorageFactoryX1)) {
             AddRef();
             *ppvObject = static_cast<IDStorageFactoryX*>(this);
             return RecordHr("IDStorageFactoryX::QueryInterface", OS_DSTORAGE_S_OK, 0);
@@ -737,6 +740,7 @@ public:
         }
         *ppv = nullptr;
         if (riid && !GuidEquals(riid, IID_IDStorageQueueX) &&
+            !GuidEquals(riid, IID_IDStorageQueueX1) &&
             !GuidEquals(riid, IID_OS_DStorage_IUnknown)) {
             return RecordHr("IDStorageFactoryX::CreateQueue", OS_DSTORAGE_E_NOINTERFACE, 3);
         }
@@ -836,6 +840,7 @@ int32_t OPENSCARLETT_DSTORAGE_CALL DStorageGetFactory(const DStorageGuid* riid, 
     }
     *ppv = nullptr;
     if (riid && !GuidEquals(riid, IID_IDStorageFactoryX) &&
+        !GuidEquals(riid, IID_IDStorageFactoryX1) &&
         !GuidEquals(riid, IID_OS_DStorage_IUnknown)) {
         return RecordHr("DStorageGetFactory", OS_DSTORAGE_E_NOINTERFACE);
     }
