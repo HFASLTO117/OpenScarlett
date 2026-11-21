@@ -682,9 +682,13 @@ void TestDirectStorage() {
                    .ok());
     OS_REQUIRE(!bcpack_compressed.empty());
 
-    // Write real combined data file inside the build directory (on E: locally, portable in CI)
-    const fs::path test_dir = fs::path(OPENSCARLETT_BINARY_DIR) / ".tmp_dstorage_test";
+    // Write real combined data file under TEMP (on E:\.tmp locally via build.cmd, portable on tester PCs)
     std::error_code ec;
+    fs::path tmp_base = fs::temp_directory_path(ec);
+    if (ec || tmp_base.empty()) {
+        tmp_base = fs::path(OPENSCARLETT_BINARY_DIR);
+    }
+    const fs::path test_dir = tmp_base / "openscarlett_dstorage_test";
     fs::create_directories(test_dir, ec);
     const fs::path test_file = test_dir / "pack_stream.bin";
     {

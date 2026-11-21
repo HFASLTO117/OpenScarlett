@@ -503,8 +503,12 @@ float4 PsMain(VertexOut input) : SV_Target0 {
 }
 )";
 
-    const std::filesystem::path scratch_dir =
-        std::filesystem::path(OPENSCARLETT_BINARY_DIR) / "shader_scratch";
+    std::error_code scratch_ec;
+    std::filesystem::path scratch_base = std::filesystem::temp_directory_path(scratch_ec);
+    if (scratch_ec || scratch_base.empty()) {
+        scratch_base = std::filesystem::path(OPENSCARLETT_BINARY_DIR);
+    }
+    const std::filesystem::path scratch_dir = scratch_base / "openscarlett_shader_scratch";
     std::vector<uint8_t> ms_dxil;
     std::vector<uint8_t> ps_dxil;
     OS_REQUIRE(CompileHlslWithDxc(

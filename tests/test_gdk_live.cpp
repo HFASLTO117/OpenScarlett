@@ -398,13 +398,41 @@ void VerifyStandaloneXboxPeImports(const fs::path& exe_path, const std::vector<s
     }
 }
 
+fs::path ResolveRuntimeBinDir() {
+    std::error_code ec;
+    wchar_t self_buf[MAX_PATH]{};
+    const DWORD self_len = ::GetModuleFileNameW(nullptr, self_buf, static_cast<DWORD>(MAX_PATH));
+    if (self_len > 0 && self_len < MAX_PATH) {
+        const fs::path exe_dir = fs::path(self_buf).parent_path();
+        if (fs::exists(exe_dir / L"openscarlett.exe", ec) &&
+            fs::exists(exe_dir / L"openscarlett_hook.dll", ec)) {
+            return exe_dir;
+        }
+    }
+    return fs::path(OPENSCARLETT_BINARY_DIR);
+}
+
+fs::path ResolveScratchDir(const wchar_t* subdir_name) {
+    std::error_code ec;
+    wchar_t temp_buf[1024]{};
+    const DWORD tlen = ::GetEnvironmentVariableW(L"TEMP", temp_buf, static_cast<DWORD>(1024));
+    if (tlen > 0 && tlen < 1024) {
+        return fs::path(temp_buf) / subdir_name;
+    }
+    const fs::path sys_tmp = fs::temp_directory_path(ec);
+    if (!ec && !sys_tmp.empty()) {
+        return sys_tmp / subdir_name;
+    }
+    return ResolveRuntimeBinDir() / subdir_name;
+}
+
 }  // namespace
 
 int main() {
     // Ensure headless null audio mode even when test_gdk_live.exe is invoked directly
     OS_REQUIRE(::SetEnvironmentVariableW(L"OPENSCARLETT_AUDIO_NULL", L"1") != 0);
 
-    const fs::path build_dir = fs::path(OPENSCARLETT_BINARY_DIR);
+    const fs::path build_dir = ResolveRuntimeBinDir();
     const fs::path cli_exe = build_dir / "openscarlett.exe";
     const fs::path dxc_exe = FindDxcExe();
     OS_REQUIRE(fs::exists(cli_exe));
@@ -438,7 +466,7 @@ int main() {
         }
     }
 
-    const fs::path stage_root = build_dir / ".tmp_sprint3_packages";
+    const fs::path stage_root = ResolveScratchDir(L"openscarlett_sprint3_packages");
     std::error_code ec;
     fs::remove_all(stage_root, ec);
     fs::create_directories(stage_root, ec);

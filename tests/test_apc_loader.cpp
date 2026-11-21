@@ -17,6 +17,34 @@ namespace fs = std::filesystem;
 
 namespace {
 
+fs::path ResolveRuntimeBinDir() {
+    std::error_code ec;
+    wchar_t self_buf[MAX_PATH]{};
+    const DWORD self_len = ::GetModuleFileNameW(nullptr, self_buf, static_cast<DWORD>(MAX_PATH));
+    if (self_len > 0 && self_len < MAX_PATH) {
+        const fs::path exe_dir = fs::path(self_buf).parent_path();
+        if (fs::exists(exe_dir / L"openscarlett.exe", ec) &&
+            fs::exists(exe_dir / L"openscarlett_hook.dll", ec)) {
+            return exe_dir;
+        }
+    }
+    return fs::path(OPENSCARLETT_BINARY_DIR);
+}
+
+fs::path ResolveScratchRoot() {
+    std::error_code ec;
+    wchar_t temp_buf[1024]{};
+    const DWORD tlen = ::GetEnvironmentVariableW(L"TEMP", temp_buf, static_cast<DWORD>(1024));
+    if (tlen > 0 && tlen < 1024) {
+        return (fs::path(temp_buf) / L"openscarlett_apc_loader").make_preferred();
+    }
+    const fs::path sys_tmp = fs::temp_directory_path(ec);
+    if (!ec && !sys_tmp.empty()) {
+        return (sys_tmp / L"openscarlett_apc_loader").make_preferred();
+    }
+    return (ResolveRuntimeBinDir() / L".tmp_apc_loader").make_preferred();
+}
+
 std::string ReadTextFile(const fs::path& p) {
     std::ifstream ifs(p, std::ios::binary);
     OS_REQUIRE(static_cast<bool>(ifs));
@@ -68,8 +96,7 @@ void VerifyTelemetryJson(const fs::path& json_path) {
 void TestVfsMountsUnit() {
     using namespace openscarlett;
 
-    const fs::path unit_root =
-        (fs::path(OPENSCARLETT_BINARY_DIR) / ".tmp_apc_loader" / "vfs_unit").make_preferred();
+    const fs::path unit_root = (ResolveScratchRoot() / "vfs_unit").make_preferred();
     std::error_code ec;
     fs::remove_all(unit_root, ec);
 
@@ -134,7 +161,7 @@ void TestVfsMountsUnit() {
 void TestLiveApcInjectionAndCli() {
     using namespace openscarlett;
 
-    const fs::path build_dir = fs::path(OPENSCARLETT_BINARY_DIR);
+    const fs::path build_dir = ResolveRuntimeBinDir();
     const fs::path src_guest_exe = build_dir / "test_guest_dummy.exe";
     const fs::path cli_exe = build_dir / "openscarlett.exe";
     OS_REQUIRE(fs::exists(src_guest_exe));
@@ -142,8 +169,8 @@ void TestLiveApcInjectionAndCli() {
     OS_REQUIRE(fs::exists(build_dir / "openscarlett_hook.dll"));
     OS_REQUIRE(fs::exists(build_dir / "winrt_xs.dll"));
 
-    // Prepare completely isolated guest folder inside build dir (on E:\ locally, portable in CI) with ZERO shim DLLs.
-    const fs::path sandbox_root = (build_dir / ".tmp_apc_loader" / "apc_e2e").make_preferred();
+    // Prepare completely isolated guest folder under TEMP (on E:\.tmp locally, portable everywhere) with ZERO shim DLLs.
+    const fs::path sandbox_root = (ResolveScratchRoot() / "apc_e2e").make_preferred();
     std::error_code ec;
     fs::remove_all(sandbox_root, ec);
 
@@ -230,11 +257,12 @@ void TestLiveApcInjectionAndCli() {
 void TestCrossDllTelemetryForwarding() {
     using namespace openscarlett;
 
-    const fs::path build_dir = fs::path(OPENSCARLETT_BINARY_DIR);
+    const fs::path build_dir = ResolveRuntimeBinDir();
     const fs::path hook_dll = build_dir / "openscarlett_hook.dll";
     const fs::path forward_json =
-        (build_dir / ".tmp_apc_loader" / "apc_e2e" / "telemetry_forward.json").make_preferred();
+        (ResolveScratchRoot() / "apc_e2e" / "telemetry_forward.json").make_preferred();
     std::error_code ec;
+    fs::create_directories(forward_json.parent_path(), ec);
     fs::remove(forward_json, ec);
 
     OS_REQUIRE(::SetEnvironmentVariableW(L"OPENSCARLETT_TELEMETRY_PATH", forward_json.c_str()) != 0);

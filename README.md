@@ -113,7 +113,7 @@ All live measurements below were recorded on **Windows 10 x64** with **NVIDIA Ge
 | **AMD Radeon RX 6000 / 7000 / 9000 & Handheld APUs** | Windows 10 / 11 | Native `Wave64` · `Mesh` · `DXR` · `Vulkan` | 🟡 *Tester Needed!* | [Download & Test →](https://github.com/californiaAlmonds/OpenScarlett/releases/latest) |
 | **Intel Arc (A/B-Series) & Integrated GPUs** | Windows 10 / 11 | `Wave8`/`Wave16`/`Wave32` · UMA Heaps | 🟡 *Tester Needed!* | [Download & Test →](https://github.com/californiaAlmonds/OpenScarlett/releases/latest) |
 
-*\*On `v0.2.0-alpha`, all live GPU, DXR Tier 12 hardware ray tracing, RDNA2 shader lifting (`AS+MS+PS DispatchMesh`, LDS, `wave64→wave32`, `MIMG`), Vulkan 1.4.351, FSR 1.0, Win11 26H2 `VirtualAlloc2` memory aliasing, and GDK shim tests passed on RTX 2060 SUPER; the 2 failures (`test_apc_loader`, `test_gdk_live`) caught a hardcoded CI build-dir path in the test harness itself (queued for fix in the next release).*
+*\*On `v0.2.0-alpha`, all live GPU, DXR Tier 12 hardware ray tracing, RDNA2 shader lifting (`AS+MS+PS DispatchMesh`, LDS, `wave64→wave32`, `MIMG`), Vulkan 1.4.351, FSR 1.0, Win11 26H2 `VirtualAlloc2` memory aliasing, and GDK shim tests passed on RTX 2060 SUPER; the 2 failures (`test_apc_loader`, `test_gdk_live`) caught a hardcoded CI build-dir path in the test harness itself — fixed in `v0.2.1-alpha`!*
 
 ### 🙏 Thank You to Our Contributors & Testers!
 A huge thank you to everyone helping test, break, and improve OpenScarlett on real PC hardware!
