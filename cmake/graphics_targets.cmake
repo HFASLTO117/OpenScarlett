@@ -20,6 +20,9 @@ target_include_directories(d3d12_xs PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(d3d12_xs PRIVATE openscarlett_core d3d12 dxgi)
+if(MINGW)
+    target_sources(d3d12_xs PRIVATE src/shims/d3d12_xs_mingw.def)
+endif()
 if(MSVC)
     target_compile_options(d3d12_xs PRIVATE /W4)
 endif()

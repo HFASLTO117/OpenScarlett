@@ -95,11 +95,23 @@ public:
         D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptorRangeStart,
         D3D12_CPU_DESCRIPTOR_HANDLE SrcDescriptorRangeStart,
         D3D12_DESCRIPTOR_HEAP_TYPE DescriptorHeapsType) override;
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+    using ID3D12Device::GetResourceAllocationInfo;
+    D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE GetResourceAllocationInfo(
+        D3D12_RESOURCE_ALLOCATION_INFO* pRet,
+        UINT visibleMask, UINT numResourceDescs,
+        const D3D12_RESOURCE_DESC* pResourceDescs) override;
+    using ID3D12Device::GetCustomHeapProperties;
+    D3D12_HEAP_PROPERTIES* STDMETHODCALLTYPE GetCustomHeapProperties(
+        D3D12_HEAP_PROPERTIES* pRet,
+        UINT nodeMask, D3D12_HEAP_TYPE heapType) override;
+#else
     D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE GetResourceAllocationInfo(
         UINT visibleMask, UINT numResourceDescs,
         const D3D12_RESOURCE_DESC* pResourceDescs) override;
     D3D12_HEAP_PROPERTIES STDMETHODCALLTYPE GetCustomHeapProperties(
         UINT nodeMask, D3D12_HEAP_TYPE heapType) override;
+#endif
     HRESULT STDMETHODCALLTYPE CreateCommittedResource(
         const D3D12_HEAP_PROPERTIES* pHeapProperties, D3D12_HEAP_FLAGS HeapFlags,
         const D3D12_RESOURCE_DESC* pDesc, D3D12_RESOURCE_STATES InitialResourceState,
@@ -145,7 +157,12 @@ public:
         D3D12_TILE_SHAPE* pStandardTileShapeForNonPackedMips,
         UINT* pNumSubresourceTilings, UINT FirstSubresourceTilingToGet,
         D3D12_SUBRESOURCE_TILING* pSubresourceTilingsForNonPackedMips) override;
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+    using ID3D12Device::GetAdapterLuid;
+    LUID* STDMETHODCALLTYPE GetAdapterLuid(LUID* pRet) override;
+#else
     LUID STDMETHODCALLTYPE GetAdapterLuid() override;
+#endif
 
     // ID3D12Device1 (slots 44..46)
     HRESULT STDMETHODCALLTYPE CreatePipelineLibrary(
@@ -193,9 +210,17 @@ public:
         const D3D12_CLEAR_VALUE* pOptimizedClearValue,
         ID3D12ProtectedResourceSession* pProtectedSession,
         REFIID riid, void** ppvResource) override;
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+    using ID3D12Device4::GetResourceAllocationInfo1;
+    D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE GetResourceAllocationInfo1(
+        D3D12_RESOURCE_ALLOCATION_INFO* pRet,
+        UINT visibleMask, UINT numResourceDescs, const D3D12_RESOURCE_DESC* pResourceDescs,
+        D3D12_RESOURCE_ALLOCATION_INFO1* pResourceAllocationInfo1) override;
+#else
     D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE GetResourceAllocationInfo1(
         UINT visibleMask, UINT numResourceDescs, const D3D12_RESOURCE_DESC* pResourceDescs,
         D3D12_RESOURCE_ALLOCATION_INFO1* pResourceAllocationInfo1) override;
+#endif
 
     // ID3D12Device5 (slots 57..64)
     HRESULT STDMETHODCALLTYPE CreateLifetimeTracker(

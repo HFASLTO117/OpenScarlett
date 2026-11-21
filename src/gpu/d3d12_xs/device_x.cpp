@@ -497,6 +497,24 @@ void STDMETHODCALLTYPE DeviceX::CopyDescriptorsSimple(
     RecordDev("ID3D12DeviceX::CopyDescriptorsSimple", 24, S_OK);
 }
 
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE DeviceX::GetResourceAllocationInfo(
+    D3D12_RESOURCE_ALLOCATION_INFO* pRet,
+    UINT visibleMask, UINT numResourceDescs, const D3D12_RESOURCE_DESC* pResourceDescs) {
+    D3D12_RESOURCE_ALLOCATION_INFO* info =
+        host_dev_->GetResourceAllocationInfo(pRet, visibleMask, numResourceDescs, pResourceDescs);
+    RecordDev("ID3D12DeviceX::GetResourceAllocationInfo", 25, S_OK);
+    return info;
+}
+
+D3D12_HEAP_PROPERTIES* STDMETHODCALLTYPE DeviceX::GetCustomHeapProperties(
+    D3D12_HEAP_PROPERTIES* pRet,
+    UINT nodeMask, D3D12_HEAP_TYPE heapType) {
+    D3D12_HEAP_PROPERTIES* props = host_dev_->GetCustomHeapProperties(pRet, nodeMask, heapType);
+    RecordDev("ID3D12DeviceX::GetCustomHeapProperties", 26, S_OK);
+    return props;
+}
+#else
 D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE DeviceX::GetResourceAllocationInfo(
     UINT visibleMask, UINT numResourceDescs, const D3D12_RESOURCE_DESC* pResourceDescs) {
     const D3D12_RESOURCE_ALLOCATION_INFO info =
@@ -511,6 +529,7 @@ D3D12_HEAP_PROPERTIES STDMETHODCALLTYPE DeviceX::GetCustomHeapProperties(
     RecordDev("ID3D12DeviceX::GetCustomHeapProperties", 26, S_OK);
     return props;
 }
+#endif
 
 D3D12_HEAP_FLAGS SanitizeXboxHeapFlags(D3D12_HEAP_FLAGS flags) noexcept {
     // Xbox GDK titles (e.g. Microsoft Xbox-GDK-Samples DeviceResources) pass
@@ -690,11 +709,19 @@ void STDMETHODCALLTYPE DeviceX::GetResourceTiling(
     RecordDev("ID3D12DeviceX::GetResourceTiling", 42, S_OK);
 }
 
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+LUID* STDMETHODCALLTYPE DeviceX::GetAdapterLuid(LUID* pRet) {
+    LUID* luid = host_dev_->GetAdapterLuid(pRet);
+    RecordDev("ID3D12DeviceX::GetAdapterLuid", 43, S_OK);
+    return luid;
+}
+#else
 LUID STDMETHODCALLTYPE DeviceX::GetAdapterLuid() {
     const LUID luid = host_dev_->GetAdapterLuid();
     RecordDev("ID3D12DeviceX::GetAdapterLuid", 43, S_OK);
     return luid;
 }
+#endif
 
 // ID3D12Device1 (slots 44..46)
 HRESULT STDMETHODCALLTYPE DeviceX::CreatePipelineLibrary(
@@ -947,6 +974,23 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateReservedResource1(
     return hr;
 }
 
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE DeviceX::GetResourceAllocationInfo1(
+    D3D12_RESOURCE_ALLOCATION_INFO* pRet,
+    UINT visibleMask, UINT numResourceDescs, const D3D12_RESOURCE_DESC* pResourceDescs,
+    D3D12_RESOURCE_ALLOCATION_INFO1* pResourceAllocationInfo1) {
+    D3D12_RESOURCE_ALLOCATION_INFO* info = nullptr;
+    if (host_dev4_) {
+        info = host_dev4_->GetResourceAllocationInfo1(
+            pRet, visibleMask, numResourceDescs, pResourceDescs, pResourceAllocationInfo1);
+        RecordDev("ID3D12DeviceX::GetResourceAllocationInfo1", 56, S_OK);
+    } else {
+        info = host_dev_->GetResourceAllocationInfo(pRet, visibleMask, numResourceDescs, pResourceDescs);
+        RecordDev("ID3D12DeviceX::GetResourceAllocationInfo1", 56, E_NOINTERFACE);
+    }
+    return info;
+}
+#else
 D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE DeviceX::GetResourceAllocationInfo1(
     UINT visibleMask, UINT numResourceDescs, const D3D12_RESOURCE_DESC* pResourceDescs,
     D3D12_RESOURCE_ALLOCATION_INFO1* pResourceAllocationInfo1) {
@@ -961,6 +1005,7 @@ D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE DeviceX::GetResourceAllocationI
     }
     return info;
 }
+#endif
 
 // ID3D12Device5 (slots 57..64)
 HRESULT STDMETHODCALLTYPE DeviceX::CreateLifetimeTracker(

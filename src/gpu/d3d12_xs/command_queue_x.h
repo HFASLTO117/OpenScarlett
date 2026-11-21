@@ -74,7 +74,12 @@ public:
     HRESULT STDMETHODCALLTYPE GetTimestampFrequency(UINT64* pFrequency) override;
     HRESULT STDMETHODCALLTYPE GetClockCalibration(
         UINT64* pGpuTimestamp, UINT64* pCpuTimestamp) override;
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+    using ID3D12CommandQueue::GetDesc;
+    D3D12_COMMAND_QUEUE_DESC* STDMETHODCALLTYPE GetDesc(D3D12_COMMAND_QUEUE_DESC* pRet) override;
+#else
     D3D12_COMMAND_QUEUE_DESC STDMETHODCALLTYPE GetDesc() override;
+#endif
 
     // ID3D12CommandQueueX (slots 19..21)
     HRESULT STDMETHODCALLTYPE PresentX(

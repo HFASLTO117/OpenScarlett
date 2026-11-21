@@ -30,9 +30,9 @@ if(WIN32)
         NOMINMAX
         OPENSCARLETT_PLATFORM_WINDOWS=1
     )
+    target_link_libraries(openscarlett_core PUBLIC d3d12 dxgi d3dcompiler ole32 uuid)
     if(MSVC)
         target_compile_options(openscarlett_core PRIVATE /W4)
-        target_link_libraries(openscarlett_core PUBLIC d3d12 dxgi d3dcompiler ole32 uuid)
     endif()
 endif()
 

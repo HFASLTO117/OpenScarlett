@@ -130,7 +130,13 @@ inline constexpr GUID IID_IOpenScarlettPresentCapture = {
 inline constexpr GUID IID_IOpenScarlettPresentWindow = {
     0x4F534431u, 0x3258u, 0x5052u, {0x57u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x05u}};
 
-struct __declspec(uuid("4F534431-3258-4445-5600-000000000001")) ID3D12DeviceX : public ID3D12Device6 {
+#if defined(_MSC_VER)
+#define OPENSCARLETT_COM_UUID(guid_str) __declspec(uuid(guid_str))
+#else
+#define OPENSCARLETT_COM_UUID(guid_str)
+#endif
+
+struct OPENSCARLETT_COM_UUID("4F534431-3258-4445-5600-000000000001") ID3D12DeviceX : public ID3D12Device6 {
     virtual HRESULT STDMETHODCALLTYPE SetFrameIntervalX(
         IDXGIOutput* pOutput,
         uint32_t PeriodMicroseconds,
@@ -161,8 +167,11 @@ struct __declspec(uuid("4F534431-3258-4445-5600-000000000001")) ID3D12DeviceX : 
     virtual HRESULT STDMETHODCALLTYPE ResumeX() = 0;
     virtual HRESULT STDMETHODCALLTYPE GetGpuHardwareInfoX(D3D12XBOX_GPU_HARDWARE_INFO* pOutInfo) = 0;
 };
+#ifdef __CRT_UUID_DECL
+__CRT_UUID_DECL(ID3D12DeviceX, 0x4F534431, 0x3258, 0x4445, 0x56, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01)
+#endif
 
-struct __declspec(uuid("4F534431-3258-434D-5100-000000000002")) ID3D12CommandQueueX : public ID3D12CommandQueue {
+struct OPENSCARLETT_COM_UUID("4F534431-3258-434D-5100-000000000002") ID3D12CommandQueueX : public ID3D12CommandQueue {
     virtual HRESULT STDMETHODCALLTYPE PresentX(
         UINT PlaneCount,
         const D3D12XBOX_PRESENT_PLANE_PARAMETERS* pPlaneParameters,
@@ -172,13 +181,19 @@ struct __declspec(uuid("4F534431-3258-434D-5100-000000000002")) ID3D12CommandQue
     virtual HRESULT STDMETHODCALLTYPE SuspendX(uint32_t Flags) = 0;
     virtual HRESULT STDMETHODCALLTYPE ResumeX() = 0;
 };
+#ifdef __CRT_UUID_DECL
+__CRT_UUID_DECL(ID3D12CommandQueueX, 0x4F534431, 0x3258, 0x434D, 0x51, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02)
+#endif
 
-struct __declspec(uuid("4F534431-3258-434D-4C00-000000000003")) ID3D12GraphicsCommandListX : public ID3D12GraphicsCommandList6 {
+struct OPENSCARLETT_COM_UUID("4F534431-3258-434D-4C00-000000000003") ID3D12GraphicsCommandListX : public ID3D12GraphicsCommandList6 {
     virtual void STDMETHODCALLTYPE SetGpuVirtualAddressHintX(uint64_t Hint) = 0;
     virtual ID3D12GraphicsCommandList* STDMETHODCALLTYPE GetUnderlyingHostCommandList() = 0;
 };
+#ifdef __CRT_UUID_DECL
+__CRT_UUID_DECL(ID3D12GraphicsCommandListX, 0x4F534431, 0x3258, 0x434D, 0x4C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03)
+#endif
 
-struct __declspec(uuid("4F534431-3258-5052-4300-000000000004")) IOpenScarlettPresentCapture : public IUnknown {
+struct OPENSCARLETT_COM_UUID("4F534431-3258-5052-4300-000000000004") IOpenScarlettPresentCapture : public IUnknown {
     virtual HRESULT STDMETHODCALLTYPE SetOutputWindow(HWND hwnd) = 0;
     virtual HRESULT STDMETHODCALLTYPE SetReadbackCaptureEnabled(BOOL enabled) = 0;
     virtual HRESULT STDMETHODCALLTYPE GetLastPresentStats(
@@ -191,8 +206,11 @@ struct __declspec(uuid("4F534431-3258-5052-4300-000000000004")) IOpenScarlettPre
         uint32_t buffer_bytes,
         uint32_t* out_copied_bytes) = 0;
 };
+#ifdef __CRT_UUID_DECL
+__CRT_UUID_DECL(IOpenScarlettPresentCapture, 0x4F534431, 0x3258, 0x5052, 0x43, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04)
+#endif
 
-struct __declspec(uuid("4F534431-3258-5052-5700-000000000005")) IOpenScarlettPresentWindow : public IUnknown {
+struct OPENSCARLETT_COM_UUID("4F534431-3258-5052-5700-000000000005") IOpenScarlettPresentWindow : public IUnknown {
     virtual HRESULT STDMETHODCALLTYPE GetPresentWindowState(
         D3D12XBOX_PRESENT_WINDOW_STATE* out_state) = 0;
     virtual HRESULT STDMETHODCALLTYPE ToggleBorderlessFullscreen() = 0;
@@ -200,6 +218,9 @@ struct __declspec(uuid("4F534431-3258-5052-5700-000000000005")) IOpenScarlettPre
     virtual HANDLE STDMETHODCALLTYPE GetFrameLatencyWaitableObject() = 0;
     virtual HRESULT STDMETHODCALLTYPE SetWindowCloseBehavior(BOOL post_quit_on_close) = 0;
 };
+#ifdef __CRT_UUID_DECL
+__CRT_UUID_DECL(IOpenScarlettPresentWindow, 0x4F534431, 0x3258, 0x5052, 0x57, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05)
+#endif
 
 extern "C" {
 

@@ -556,11 +556,19 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::GetClockCalibration(
     return hr;
 }
 
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+D3D12_COMMAND_QUEUE_DESC* STDMETHODCALLTYPE CommandQueueX::GetDesc(D3D12_COMMAND_QUEUE_DESC* pRet) {
+    D3D12_COMMAND_QUEUE_DESC* desc = host_queue_->GetDesc(pRet);
+    RecordQueue("ID3D12CommandQueueX::GetDesc", 18, S_OK);
+    return desc;
+}
+#else
 D3D12_COMMAND_QUEUE_DESC STDMETHODCALLTYPE CommandQueueX::GetDesc() {
     const D3D12_COMMAND_QUEUE_DESC desc = host_queue_->GetDesc();
     RecordQueue("ID3D12CommandQueueX::GetDesc", 18, S_OK);
     return desc;
 }
+#endif
 
 // Window subclass management
 void CommandQueueX::AttachWindowSubclassLocked(HWND hwnd) {
