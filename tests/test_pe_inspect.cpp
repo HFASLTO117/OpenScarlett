@@ -5,7 +5,7 @@
 #include "openscarlett/loader/pe_inspector.h"
 #include "os_check.h"
 
-int main() {
+int main(int argc, char** argv) {
     using namespace openscarlett;
 
     // 1. Classify known console-only, GDK, middleware, and native Windows DLLs
@@ -18,12 +18,21 @@ int main() {
     OS_REQUIRE(ClassifyImportDll("kernel32.dll") == DllCategory::WindowsNative);
     OS_REQUIRE(ClassifyImportDll("api-ms-win-core-synch-l1-2-0.dll") == DllCategory::WindowsNative);
 
-    // 2. Inspect our own compiled openscarlett.exe PE32+ image
-    std::string exe_path = std::string(OPENSCARLETT_BINARY_DIR) + "/openscarlett.exe";
+    // 2. Inspect our own compiled openscarlett.exe PE32+ image (works in CTest and portable bundles)
+    std::filesystem::path exe_path;
+    if (argc > 0 && argv[0] != nullptr) {
+        auto beside_test = std::filesystem::path(argv[0]).parent_path() / "openscarlett.exe";
+        if (std::filesystem::exists(beside_test)) {
+            exe_path = beside_test;
+        }
+    }
+    if (exe_path.empty()) {
+        exe_path = std::filesystem::path(OPENSCARLETT_BINARY_DIR) / "openscarlett.exe";
+    }
     OS_REQUIRE(std::filesystem::exists(exe_path));
 
     PeInspectionReport rep;
-    auto st = InspectPeFile(exe_path, rep);
+    auto st = InspectPeFile(exe_path.string(), rep);
     OS_REQUIRE(st.ok());
     OS_REQUIRE(rep.is_pe64);
     OS_REQUIRE(!rep.is_dll);
@@ -47,9 +56,11 @@ int main() {
     OS_REQUIRE(snap[0].vtable_slot == 67);
     OS_REQUIRE(snap[1].ok_calls == 2);
 
-    std::string report_path = std::string(OPENSCARLETT_BINARY_DIR) + "/telemetry_test.json";
-    OS_REQUIRE(tel.WriteJsonReport(report_path).ok());
+    auto report_path = std::filesystem::temp_directory_path() / "openscarlett_telemetry_test.json";
+    OS_REQUIRE(tel.WriteJsonReport(report_path.string()).ok());
     OS_REQUIRE(std::filesystem::exists(report_path));
+    std::error_code ec;
+    std::filesystem::remove(report_path, ec);
 
     std::printf("[PASS] test_pe_inspect (%u imports parsed, telemetry verified)\n", rep.total_imports);
     return 0;
