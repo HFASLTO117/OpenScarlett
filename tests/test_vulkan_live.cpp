@@ -76,7 +76,7 @@ int main() {
 
     VulkanBackend vk;
     OS_REQUIRE(vk.Initialize(true).ok());
-    const auto& dev = vk.GetDeviceInfo();
+    const auto dev = vk.GetDeviceInfo();
 
     constexpr uint32_t kCount = 64;
     std::vector<uint32_t> input(kCount);
