@@ -85,6 +85,7 @@ foreach(_os_module_cmake
     cmake/gdk_targets.cmake
     cmake/shader_targets.cmake
     cmake/dxr_targets.cmake
+    cmake/gdk_live_targets.cmake
 )
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_os_module_cmake}")
         include("${CMAKE_CURRENT_SOURCE_DIR}/${_os_module_cmake}")
