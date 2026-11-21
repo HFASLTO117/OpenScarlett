@@ -11,6 +11,7 @@ namespace {
 
 constexpr const char* kXgModule = "xg_xs.dll";
 constexpr int32_t kHrOk = 0;
+constexpr int32_t kHrNotImpl = static_cast<int32_t>(0x80004001u);
 constexpr int32_t kHrInvalidArg = static_cast<int32_t>(0x80070057u);
 constexpr int32_t kHrPointer = static_cast<int32_t>(0x80004003u);
 constexpr int32_t kHrOutOfMemory = static_cast<int32_t>(0x8007000Eu);
@@ -61,7 +62,12 @@ public:
         uint32_t yElement,
         uint32_t zOrSlice,
         uint32_t sample) const override {
-        (void)sample;
+        if (sample > 0u) {
+            openscarlett::CallTelemetry::Global().Record(
+                kXgModule, "IXGTextureAddressComputer::GetTexelElementOffsetBytes",
+                openscarlett::CallOutcome::NotImplemented, kHrNotImpl, 3);
+            return UINT64_MAX;
+        }
         uint64_t offset = UINT64_MAX;
         if (is_3d_) {
             if (plane == 0u) {
@@ -451,6 +457,41 @@ OPENSCARLETT_XG_API int __stdcall OpenScarlettXgGetTelemetryEntry(
         }
     }
     if (out_total_calls) *out_total_calls = 0;
+    return 0;
+}
+
+// Fail-closed Xbox RDNA2 hardware DCC metadata layout API (no desktop D3D12 equivalent).
+OPENSCARLETT_XG_API int32_t __stdcall XGComputeDccMetadataLayout(
+    const XG_TEXTURE2D_DESC* pDesc,
+    void* pOutDccLayout,
+    uint64_t outDccLayoutBytes) {
+    (void)pDesc;
+    (void)pOutDccLayout;
+    (void)outDccLayoutBytes;
+    openscarlett::CallTelemetry::Global().Record(
+        kXgModule, "XGComputeDccMetadataLayout",
+        openscarlett::CallOutcome::NotImplemented, kHrNotImpl);
+    return kHrNotImpl;
+}
+
+OPENSCARLETT_XG_API int __stdcall OpenScarlettXgGetTelemetryDetail(
+    const char* symbol_name,
+    uint64_t* out_total_calls,
+    uint64_t* out_not_impl_calls,
+    int32_t* out_last_hr) {
+    if (!symbol_name) return 0;
+    const auto snap = openscarlett::CallTelemetry::Global().Snapshot();
+    for (const auto& entry : snap) {
+        if (entry.symbol_name == symbol_name) {
+            if (out_total_calls) *out_total_calls = entry.total_calls;
+            if (out_not_impl_calls) *out_not_impl_calls = entry.not_impl_calls;
+            if (out_last_hr) *out_last_hr = entry.last_hr;
+            return 1;
+        }
+    }
+    if (out_total_calls) *out_total_calls = 0;
+    if (out_not_impl_calls) *out_not_impl_calls = 0;
+    if (out_last_hr) *out_last_hr = 0;
     return 0;
 }
 

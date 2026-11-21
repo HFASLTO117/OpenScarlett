@@ -1,6 +1,7 @@
 #include "command_queue_x.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <shared_mutex>
 #include <unordered_map>
@@ -41,10 +42,16 @@ namespace {
 constexpr const char* kModule = "d3d12_xs.dll";
 
 inline void RecordQueue(const char* method, int32_t slot, HRESULT hr = S_OK) {
+    openscarlett::CallOutcome outcome = openscarlett::CallOutcome::Ok;
+    if (hr == E_NOTIMPL) {
+        outcome = openscarlett::CallOutcome::NotImplemented;
+    } else if (FAILED(hr)) {
+        outcome = openscarlett::CallOutcome::Error;
+    }
     openscarlett::CallTelemetry::Global().Record(
         kModule,
         method,
-        SUCCEEDED(hr) ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error,
+        outcome,
         static_cast<int32_t>(hr),
         slot);
 }
@@ -304,14 +311,152 @@ DXGI_FORMAT NormalizeSwapChainFormat(DXGI_FORMAT fmt) noexcept {
         case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
         case DXGI_FORMAT_B8G8R8A8_TYPELESS:
             return DXGI_FORMAT_B8G8R8A8_UNORM;
-        case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        case DXGI_FORMAT_R10G10B10A2_TYPELESS:
         case DXGI_FORMAT_R10G10B10A2_UNORM:
+            return DXGI_FORMAT_R10G10B10A2_UNORM;
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+        case DXGI_FORMAT_R16G16B16A16_FLOAT:
+            return DXGI_FORMAT_R16G16B16A16_FLOAT;
         case DXGI_FORMAT_R8G8B8A8_UNORM:
         case DXGI_FORMAT_B8G8R8A8_UNORM:
             return fmt;
         default:
             return DXGI_FORMAT_R8G8B8A8_UNORM;
     }
+}
+
+DXGI_COLOR_SPACE_TYPE ToDxgiColorSpace(
+    DXGI_FORMAT sc_format,
+    D3D12XBOX_COLOR_SPACE cs) noexcept {
+    switch (cs) {
+        case D3D12XBOX_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020:
+            return DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+        case D3D12XBOX_COLOR_SPACE_RGB_FULL_G10_NONE_P709:
+            return DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+        case D3D12XBOX_COLOR_SPACE_RGB_STUDIO_G22_NONE_P709:
+            return DXGI_COLOR_SPACE_RGB_STUDIO_G22_NONE_P709;
+        case D3D12XBOX_COLOR_SPACE_RGB_FULL_G22_NONE_P709:
+        default:
+            if (sc_format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+                return DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+            }
+            return DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    }
+}
+
+bool IsHdrSwapChainMode(DXGI_FORMAT fmt, D3D12XBOX_COLOR_SPACE cs) noexcept {
+    return (cs == D3D12XBOX_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) ||
+           (cs == D3D12XBOX_COLOR_SPACE_RGB_FULL_G10_NONE_P709) ||
+           (fmt == DXGI_FORMAT_R16G16B16A16_FLOAT) ||
+           (fmt == DXGI_FORMAT_R16G16B16A16_TYPELESS);
+}
+
+float HalfToFloat(uint16_t h) noexcept {
+    const uint32_t sign = (static_cast<uint32_t>(h) & 0x8000u) << 16;
+    const uint32_t exp = (static_cast<uint32_t>(h) >> 10) & 0x1Fu;
+    const uint32_t mant = static_cast<uint32_t>(h) & 0x03FFu;
+    uint32_t f_bits = 0u;
+    if (exp == 0u) {
+        if (mant == 0u) {
+            f_bits = sign;
+        } else {
+            // Subnormal half-float
+            uint32_t m = mant;
+            int32_t e = -14;
+            while ((m & 0x0400u) == 0u) {
+                m <<= 1;
+                --e;
+            }
+            m &= 0x03FFu;
+            f_bits = sign | (static_cast<uint32_t>(e + 127) << 23) | (m << 13);
+        }
+    } else if (exp == 31u) {
+        f_bits = sign | 0x7F800000u | (mant << 13);
+    } else {
+        f_bits = sign | ((exp + 112u) << 23) | (mant << 13);
+    }
+    float out = 0.0f;
+    std::memcpy(&out, &f_bits, sizeof(out));
+    return out;
+}
+
+void ConvertBt2020LinearToRec709Linear(
+    float r2020, float g2020, float b2020,
+    float& r709, float& g709, float& b709) noexcept {
+    r709 = std::max(0.0f, 1.6604910f * r2020 - 0.5876411f * g2020 - 0.0728499f * b2020);
+    g709 = std::max(0.0f, -0.1245505f * r2020 + 1.1328999f * g2020 - 0.0083494f * b2020);
+    b709 = std::max(0.0f, -0.0181508f * r2020 - 0.1005789f * g2020 + 1.1187297f * b2020);
+}
+
+void ConvertPackedRowToSdrRgba8(
+    DXGI_FORMAT src_format,
+    D3D12XBOX_COLOR_SPACE color_space,
+    D3D12XBOX_TONEMAP_MODE tonemap_mode,
+    float paper_white_nits,
+    const uint8_t* src_row,
+    uint8_t* dst_rgba8_row,
+    uint32_t width) noexcept {
+    const float ref_white = (paper_white_nits > 1.0f) ? paper_white_nits : 200.0f;
+
+    if (src_format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+        src_format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+        src_format == DXGI_FORMAT_B8G8R8A8_TYPELESS) {
+        for (uint32_t x = 0; x < width; ++x) {
+            dst_rgba8_row[x * 4u + 0u] = src_row[x * 4u + 2u];
+            dst_rgba8_row[x * 4u + 1u] = src_row[x * 4u + 1u];
+            dst_rgba8_row[x * 4u + 2u] = src_row[x * 4u + 0u];
+            dst_rgba8_row[x * 4u + 3u] = src_row[x * 4u + 3u];
+        }
+        return;
+    }
+
+    if (src_format == DXGI_FORMAT_R10G10B10A2_UNORM ||
+        src_format == DXGI_FORMAT_R10G10B10A2_TYPELESS) {
+        const auto* px32 = reinterpret_cast<const uint32_t*>(src_row);
+        const bool is_pq = (color_space == D3D12XBOX_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+        for (uint32_t x = 0; x < width; ++x) {
+            const uint32_t v = px32[x];
+            const float r_n = static_cast<float>(v & 0x3FFu) / 1023.0f;
+            const float g_n = static_cast<float>((v >> 10) & 0x3FFu) / 1023.0f;
+            const float b_n = static_cast<float>((v >> 20) & 0x3FFu) / 1023.0f;
+            const float a_n = static_cast<float>((v >> 30) & 0x3u) / 3.0f;
+            if (is_pq) {
+                const float r2020 = OpenScarlettD3D12PqSt2084ToLinearNits(r_n) / ref_white;
+                const float g2020 = OpenScarlettD3D12PqSt2084ToLinearNits(g_n) / ref_white;
+                const float b2020 = OpenScarlettD3D12PqSt2084ToLinearNits(b_n) / ref_white;
+                float r709 = 0.0f;
+                float g709 = 0.0f;
+                float b709 = 0.0f;
+                ConvertBt2020LinearToRec709Linear(r2020, g2020, b2020, r709, g709, b709);
+                OpenScarlettD3D12ToneMapLinearRgbToSdrRgba8(
+                    r709, g709, b709, a_n, tonemap_mode, &dst_rgba8_row[x * 4u]);
+            } else {
+                dst_rgba8_row[x * 4u + 0u] = static_cast<uint8_t>(std::lround(r_n * 255.0f));
+                dst_rgba8_row[x * 4u + 1u] = static_cast<uint8_t>(std::lround(g_n * 255.0f));
+                dst_rgba8_row[x * 4u + 2u] = static_cast<uint8_t>(std::lround(b_n * 255.0f));
+                dst_rgba8_row[x * 4u + 3u] = static_cast<uint8_t>(std::lround(a_n * 255.0f));
+            }
+        }
+        return;
+    }
+
+    if (src_format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+        src_format == DXGI_FORMAT_R16G16B16A16_TYPELESS) {
+        // scRGB linear FP16 convention: 1.0 = 80 nits; normalize to reference white nits.
+        const float scrgb_scale = 80.0f / ref_white;
+        const auto* px16 = reinterpret_cast<const uint16_t*>(src_row);
+        for (uint32_t x = 0; x < width; ++x) {
+            const float r_lin = HalfToFloat(px16[x * 4u + 0u]) * scrgb_scale;
+            const float g_lin = HalfToFloat(px16[x * 4u + 1u]) * scrgb_scale;
+            const float b_lin = HalfToFloat(px16[x * 4u + 2u]) * scrgb_scale;
+            const float a_lin = HalfToFloat(px16[x * 4u + 3u]);
+            OpenScarlettD3D12ToneMapLinearRgbToSdrRgba8(
+                r_lin, g_lin, b_lin, a_lin, tonemap_mode, &dst_rgba8_row[x * 4u]);
+        }
+        return;
+    }
+
+    std::memcpy(dst_rgba8_row, src_row, static_cast<size_t>(width) * 4u);
 }
 
 int64_t QueryQpcNow() noexcept {
@@ -372,6 +517,17 @@ ID3D12Pageable* CommandQueueX::UnwrapHostPageable(ID3D12Pageable* maybe_wrapped)
     return maybe_wrapped;
 }
 
+ID3D12CommandQueue* CommandQueueX::UnwrapHostQueue(ID3D12CommandQueue* maybe_wrapped) noexcept {
+    if (!maybe_wrapped) return nullptr;
+    auto& reg = GetQueueRegistry();
+    std::shared_lock<std::shared_mutex> lock(reg.mutex);
+    auto it = reg.map.find(static_cast<const void*>(static_cast<ID3D12Pageable*>(maybe_wrapped)));
+    if (it != reg.map.end()) {
+        return it->second;
+    }
+    return maybe_wrapped;
+}
+
 // IUnknown (slots 0..2)
 HRESULT STDMETHODCALLTYPE CommandQueueX::QueryInterface(REFIID riid, void** ppvObject) {
     if (!ppvObject) {
@@ -399,6 +555,12 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::QueryInterface(REFIID riid, void** ppvO
     }
     if (IsEqualIID(riid, IID_IOpenScarlettPresentWindow)) {
         *ppvObject = static_cast<IOpenScarlettPresentWindow*>(this);
+        AddRef();
+        RecordQueue("ID3D12CommandQueueX::QueryInterface", 0, S_OK);
+        return S_OK;
+    }
+    if (IsEqualIID(riid, IID_IOpenScarlettPresentHdr)) {
+        *ppvObject = static_cast<IOpenScarlettPresentHdr*>(this);
         AddRef();
         RecordQueue("ID3D12CommandQueueX::QueryInterface", 0, S_OK);
         return S_OK;
@@ -491,6 +653,12 @@ void STDMETHODCALLTYPE CommandQueueX::CopyTileMappings(
 void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
     UINT NumCommandLists,
     ID3D12CommandList* const* ppCommandLists) {
+    // Auto-flush any dirty title unified-memory textures before GPU work samples them.
+    if (device_x_ && device_x_->HasDirtyUnifiedTextures() &&
+        host_queue_ && host_queue_->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        device_x_->FlushDirtyUnifiedTextures(host_queue_, nullptr);
+    }
+
     // Unwrap any CommandListX* wrappers back to native host ID3D12CommandList* pointers.
     if (NumCommandLists == 0 || !ppCommandLists) {
         host_queue_->ExecuteCommandLists(NumCommandLists, ppCommandLists);
@@ -648,6 +816,10 @@ void CommandQueueX::ReleaseSwapChainLocked() {
         CloseHandle(frame_latency_waitable_object_);
         frame_latency_waitable_object_ = nullptr;
     }
+    if (swapchain4_) {
+        swapchain4_->Release();
+        swapchain4_ = nullptr;
+    }
     if (swapchain_) {
         swapchain_->Release();
         swapchain_ = nullptr;
@@ -660,6 +832,11 @@ void CommandQueueX::ReleaseSwapChainLocked() {
     swapchain_buffer_count_ = 0;
     swapchain_max_latency_ = 0;
     swapchain_occluded_ = false;
+    active_color_space_ = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    cs_support_flags_ = 0u;
+    color_space_applied_ = false;
+    hdr_metadata_applied_ = false;
+    tone_map_fallback_active_ = false;
     last_paced_qpc_ = 0;
 }
 
@@ -732,9 +909,125 @@ HRESULT CommandQueueX::EnsureReadbackBufferLocked(uint64_t required_bytes) {
     return hr;
 }
 
+HRESULT CommandQueueX::EnsureToneMapUploadBufferLocked(uint64_t required_bytes) {
+    if (tonemap_upload_buf_ && tonemap_upload_capacity_ >= required_bytes) {
+        return S_OK;
+    }
+    if (tonemap_upload_buf_) {
+        tonemap_upload_buf_->Release();
+        tonemap_upload_buf_ = nullptr;
+        tonemap_upload_capacity_ = 0;
+    }
+
+    D3D12_HEAP_PROPERTIES up_heap{};
+    up_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+
+    D3D12_RESOURCE_DESC up_desc{};
+    up_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    up_desc.Width = required_bytes;
+    up_desc.Height = 1;
+    up_desc.DepthOrArraySize = 1;
+    up_desc.MipLevels = 1;
+    up_desc.Format = DXGI_FORMAT_UNKNOWN;
+    up_desc.SampleDesc.Count = 1;
+    up_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+    HRESULT hr = device_x_->HostDevice()->CreateCommittedResource(
+        &up_heap, D3D12_HEAP_FLAG_NONE, &up_desc,
+        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&tonemap_upload_buf_));
+    if (SUCCEEDED(hr)) {
+        tonemap_upload_capacity_ = required_bytes;
+    }
+    return hr;
+}
+
+void CommandQueueX::ConfigureSwapChainHdrLocked(
+    DXGI_FORMAT src_format,
+    D3D12XBOX_COLOR_SPACE req_color_space) {
+    if (!swapchain_) return;
+
+    const bool src_is_hdr = IsHdrSwapChainMode(src_format, req_color_space);
+    const bool force_sdr = (present_config_.ForceSdrToneMapFallback != 0u);
+    const DXGI_COLOR_SPACE_TYPE target_cs =
+        force_sdr ? DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
+                  : ToDxgiColorSpace(swapchain_format_, req_color_space);
+
+    if (!swapchain4_) {
+        swapchain_->QueryInterface(IID_PPV_ARGS(&swapchain4_));
+    }
+
+    UINT support = 0u;
+    color_space_applied_ = false;
+    cs_support_flags_ = 0u;
+    if (SUCCEEDED(swapchain_->CheckColorSpaceSupport(target_cs, &support))) {
+        cs_support_flags_ = support;
+        if ((support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) != 0u) {
+            if (SUCCEEDED(swapchain_->SetColorSpace1(target_cs))) {
+                active_color_space_ = target_cs;
+                color_space_applied_ = true;
+            }
+        }
+    }
+
+    // Query output HDR capability via IDXGIOutput6 to detect SDR display tone-map fallback.
+    bool display_supports_hdr = false;
+    IDXGIOutput* out = nullptr;
+    if (SUCCEEDED(swapchain_->GetContainingOutput(&out)) && out) {
+        IDXGIOutput6* out6 = nullptr;
+        if (SUCCEEDED(out->QueryInterface(IID_PPV_ARGS(&out6))) && out6) {
+            DXGI_OUTPUT_DESC1 desc1{};
+            if (SUCCEEDED(out6->GetDesc1(&desc1))) {
+                display_supports_hdr =
+                    (desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+            }
+            out6->Release();
+        }
+        out->Release();
+    }
+
+    hdr_metadata_applied_ = false;
+    if (swapchain4_ && !force_sdr &&
+        (target_cs == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 || hdr_metadata_explicit_)) {
+        DXGI_HDR_METADATA_HDR10 dxgi_meta{};
+        dxgi_meta.RedPrimary[0] = hdr_metadata_.RedPrimary[0];
+        dxgi_meta.RedPrimary[1] = hdr_metadata_.RedPrimary[1];
+        dxgi_meta.GreenPrimary[0] = hdr_metadata_.GreenPrimary[0];
+        dxgi_meta.GreenPrimary[1] = hdr_metadata_.GreenPrimary[1];
+        dxgi_meta.BluePrimary[0] = hdr_metadata_.BluePrimary[0];
+        dxgi_meta.BluePrimary[1] = hdr_metadata_.BluePrimary[1];
+        dxgi_meta.WhitePoint[0] = hdr_metadata_.WhitePoint[0];
+        dxgi_meta.WhitePoint[1] = hdr_metadata_.WhitePoint[1];
+        dxgi_meta.MaxMasteringLuminance = hdr_metadata_.MaxMasteringLuminance;
+        dxgi_meta.MinMasteringLuminance = hdr_metadata_.MinMasteringLuminance;
+        dxgi_meta.MaxContentLightLevel = hdr_metadata_.MaxContentLightLevel;
+        dxgi_meta.MaxFrameAverageLightLevel = hdr_metadata_.MaxFrameAverageLightLevel;
+        if (SUCCEEDED(swapchain4_->SetHDRMetaData(
+                DXGI_HDR_METADATA_TYPE_HDR10, sizeof(dxgi_meta), &dxgi_meta))) {
+            hdr_metadata_applied_ = true;
+        }
+    }
+
+    const bool format_fell_back_to_sdr =
+        src_is_hdr && (swapchain_format_ == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                       swapchain_format_ == DXGI_FORMAT_B8G8R8A8_UNORM);
+    tone_map_fallback_active_ =
+        src_is_hdr && (force_sdr || !display_supports_hdr || !color_space_applied_ || format_fell_back_to_sdr);
+}
+
 HRESULT CommandQueueX::EnsureSwapChainLocked(
-    HWND hwnd, uint32_t width, uint32_t height, DXGI_FORMAT format, bool force_resize) {
-    const DXGI_FORMAT sc_fmt = NormalizeSwapChainFormat(format);
+    HWND hwnd,
+    uint32_t width,
+    uint32_t height,
+    DXGI_FORMAT format,
+    D3D12XBOX_COLOR_SPACE color_space,
+    bool force_resize) {
+    const bool force_sdr = (present_config_.ForceSdrToneMapFallback != 0u);
+    const DXGI_FORMAT requested_fmt =
+        (present_config_.PreferredFormat != DXGI_FORMAT_UNKNOWN)
+            ? present_config_.PreferredFormat
+            : format;
+    const DXGI_FORMAT sc_fmt =
+        force_sdr ? DXGI_FORMAT_R8G8B8A8_UNORM : NormalizeSwapChainFormat(requested_fmt);
     const uint32_t req_max_latency =
         device_x_ ? std::clamp(device_x_->MaxFrameLatency(), 1u, 3u) : 2u;
     const uint32_t req_buffer_count = std::clamp(req_max_latency + 1u, 2u, 3u);
@@ -754,6 +1047,13 @@ HRESULT CommandQueueX::EnsureSwapChainLocked(
                     }
                 }
             }
+            const DXGI_COLOR_SPACE_TYPE desired_cs =
+                force_sdr ? DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709
+                          : ToDxgiColorSpace(swapchain_format_, color_space);
+            if (desired_cs != active_color_space_ ||
+                (IsHdrSwapChainMode(format, color_space) && !color_space_applied_)) {
+                ConfigureSwapChainHdrLocked(format, color_space);
+            }
             return S_OK;
         }
 
@@ -767,6 +1067,7 @@ HRESULT CommandQueueX::EnsureSwapChainLocked(
             swapchain_height_ = height;
             swapchain_format_ = sc_fmt;
             swapchain_occluded_ = false;
+            ConfigureSwapChainHdrLocked(format, color_space);
             return S_OK;
         }
         // Resize failed — recreate cleanly.
@@ -808,10 +1109,12 @@ HRESULT CommandQueueX::EnsureSwapChainLocked(
     }
     flag_candidates[candidate_count++] = 0u;
 
+    DXGI_FORMAT fmt_candidates[2] = {sc_fmt, DXGI_FORMAT_R8G8B8A8_UNORM};
+    const uint32_t fmt_candidate_count = (sc_fmt != DXGI_FORMAT_R8G8B8A8_UNORM) ? 2u : 1u;
+
     DXGI_SWAP_CHAIN_DESC1 sc_desc{};
     sc_desc.Width = width;
     sc_desc.Height = height;
-    sc_desc.Format = sc_fmt;
     sc_desc.SampleDesc.Count = 1;
     sc_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sc_desc.BufferCount = req_buffer_count;
@@ -821,13 +1124,18 @@ HRESULT CommandQueueX::EnsureSwapChainLocked(
 
     IDXGISwapChain1* sc1 = nullptr;
     uint32_t chosen_flags = 0u;
+    DXGI_FORMAT chosen_fmt = sc_fmt;
     hr = E_FAIL;
-    for (uint32_t i = 0; i < candidate_count; ++i) {
-        sc_desc.Flags = flag_candidates[i];
-        hr = factory4->CreateSwapChainForHwnd(host_queue_, hwnd, &sc_desc, nullptr, nullptr, &sc1);
-        if (SUCCEEDED(hr) && sc1) {
-            chosen_flags = flag_candidates[i];
-            break;
+    for (uint32_t fi = 0; fi < fmt_candidate_count && !sc1; ++fi) {
+        sc_desc.Format = fmt_candidates[fi];
+        for (uint32_t i = 0; i < candidate_count; ++i) {
+            sc_desc.Flags = flag_candidates[i];
+            hr = factory4->CreateSwapChainForHwnd(host_queue_, hwnd, &sc_desc, nullptr, nullptr, &sc1);
+            if (SUCCEEDED(hr) && sc1) {
+                chosen_flags = flag_candidates[i];
+                chosen_fmt = fmt_candidates[fi];
+                break;
+            }
         }
     }
 
@@ -840,12 +1148,15 @@ HRESULT CommandQueueX::EnsureSwapChainLocked(
     }
 
     hr = sc1->QueryInterface(IID_PPV_ARGS(&swapchain_));
+    if (SUCCEEDED(hr) && swapchain_) {
+        sc1->QueryInterface(IID_PPV_ARGS(&swapchain4_));
+    }
     sc1->Release();
     if (SUCCEEDED(hr) && swapchain_) {
         swapchain_hwnd_ = hwnd;
         swapchain_width_ = width;
         swapchain_height_ = height;
-        swapchain_format_ = sc_fmt;
+        swapchain_format_ = chosen_fmt;
         swapchain_flags_ = chosen_flags;
         swapchain_buffer_count_ = req_buffer_count;
         swapchain_occluded_ = false;
@@ -861,6 +1172,7 @@ HRESULT CommandQueueX::EnsureSwapChainLocked(
         } else {
             swapchain_max_latency_ = req_max_latency;
         }
+        ConfigureSwapChainHdrLocked(format, color_space);
     }
     return hr;
 }
@@ -938,6 +1250,7 @@ HRESULT CommandQueueX::WaitForInternalFenceLocked() {
 void CommandQueueX::ReleasePresentObjectsLocked() {
     DetachWindowSubclassLocked();
     ReleaseSwapChainLocked();
+    if (tonemap_upload_buf_) { tonemap_upload_buf_->Release(); tonemap_upload_buf_ = nullptr; }
     if (readback_buf_) { readback_buf_->Release(); readback_buf_ = nullptr; }
     if (present_cmd_) { present_cmd_->Release(); present_cmd_ = nullptr; }
     if (present_alloc_) { present_alloc_->Release(); present_alloc_ = nullptr; }
@@ -945,6 +1258,7 @@ void CommandQueueX::ReleasePresentObjectsLocked() {
     if (present_fence_event_) { CloseHandle(present_fence_event_); present_fence_event_ = nullptr; }
     if (pacing_timer_) { CloseHandle(pacing_timer_); pacing_timer_ = nullptr; }
     readback_buf_capacity_ = 0;
+    tonemap_upload_capacity_ = 0;
 }
 
 // ID3D12CommandQueueX (slots 19..21)
@@ -990,7 +1304,7 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
         std::lock_guard<std::mutex> lock(present_mutex_);
         pump_hwnd = (pPresentParameters && pPresentParameters->OutputWindow)
                         ? pPresentParameters->OutputWindow
-                        : attached_hwnd_;
+                        : (present_config_.OutputWindow ? present_config_.OutputWindow : attached_hwnd_);
         if (pump_hwnd && IsWindow(pump_hwnd) != FALSE) {
             AttachWindowSubclassLocked(pump_hwnd);
             pump_state = window_state_;
@@ -1024,9 +1338,21 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
         return hr;
     }
 
+    D3D12XBOX_COLOR_SPACE effective_cs = pPlaneParameters[0].ColorSpace;
+    if (effective_cs == D3D12XBOX_COLOR_SPACE_RGB_FULL_G22_NONE_P709) {
+        if (present_config_.ColorSpace != D3D12XBOX_COLOR_SPACE_RGB_FULL_G22_NONE_P709) {
+            effective_cs = present_config_.ColorSpace;
+        } else if (src_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+                   src_desc.Format == DXGI_FORMAT_R16G16B16A16_TYPELESS) {
+            effective_cs = D3D12XBOX_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+        }
+    }
+    last_presented_src_format_ = src_desc.Format;
+    last_presented_color_space_ = effective_cs;
+
     HWND target_hwnd = (pPresentParameters && pPresentParameters->OutputWindow)
                            ? pPresentParameters->OutputWindow
-                           : attached_hwnd_;
+                           : (present_config_.OutputWindow ? present_config_.OutputWindow : attached_hwnd_);
     const bool use_swapchain = (target_hwnd != nullptr && IsWindow(target_hwnd) != FALSE);
 
     bool window_minimized = false;
@@ -1051,17 +1377,16 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
     }
 
     bool do_swapchain_present = use_swapchain && !window_minimized;
-    const bool need_readback = (!use_swapchain) || readback_capture_enabled_;
-
     if (do_swapchain_present) {
         const bool resize_pending =
             window_state_
                 ? window_state_->resize_pending.exchange(false, std::memory_order_acq_rel)
                 : false;
         hr = EnsureSwapChainLocked(
-            target_hwnd, target_bb_width, target_bb_height, src_desc.Format, resize_pending);
+            target_hwnd, target_bb_width, target_bb_height,
+            src_desc.Format, effective_cs, resize_pending);
         if (FAILED(hr)) {
-            if (need_readback ||
+            if ((!use_swapchain || readback_capture_enabled_) ||
                 hr == DXGI_ERROR_UNSUPPORTED ||
                 hr == DXGI_ERROR_NOT_CURRENTLY_AVAILABLE ||
                 hr == E_ACCESSDENIED) {
@@ -1080,7 +1405,20 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
                 ++latency_waits_;
             }
         }
+    } else if (IsHdrSwapChainMode(src_desc.Format, effective_cs)) {
+        // Offscreen HDR readback automatically uses SDR tone-map conversion for RGBA8 output.
+        tone_map_fallback_active_ = true;
     }
+
+    const bool direct_bb_copy_compatible =
+        do_swapchain_present && swapchain_ &&
+        (NormalizeSwapChainFormat(src_desc.Format) == swapchain_format_);
+    const bool need_tonemap_bb_upload =
+        do_swapchain_present && swapchain_ && !direct_bb_copy_compatible &&
+        (swapchain_format_ == DXGI_FORMAT_R8G8B8A8_UNORM ||
+         swapchain_format_ == DXGI_FORMAT_B8G8R8A8_UNORM);
+    const bool need_readback =
+        (!use_swapchain) || readback_capture_enabled_ || need_tonemap_bb_upload;
 
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
     UINT num_rows = 0;
@@ -1096,7 +1434,7 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
         }
     }
 
-    if (do_swapchain_present || need_readback) {
+    if (direct_bb_copy_compatible || need_readback) {
         hr = present_alloc_->Reset();
         if (FAILED(hr)) {
             RecordQueue("ID3D12CommandQueueX::PresentX", 19, hr);
@@ -1125,7 +1463,7 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
         src_loc.SubresourceIndex = 0;
 
         ID3D12Resource* backbuffer = nullptr;
-        if (do_swapchain_present && swapchain_) {
+        if (direct_bb_copy_compatible && swapchain_) {
             const UINT bb_idx = swapchain_->GetCurrentBackBufferIndex();
             hr = swapchain_->GetBuffer(bb_idx, IID_PPV_ARGS(&backbuffer));
             if (SUCCEEDED(hr) && backbuffer) {
@@ -1202,6 +1540,148 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
         host_queue_->ExecuteCommandLists(1, cmd_lists);
     }
 
+    auto process_readback = [&]() -> HRESULT {
+        if (!need_readback || !readback_buf_) return S_OK;
+        void* mapped = nullptr;
+        D3D12_RANGE read_range{0, static_cast<SIZE_T>(total_bytes)};
+        HRESULT mhr = readback_buf_->Map(0, &read_range, &mapped);
+        if (FAILED(mhr) || !mapped) {
+            return FAILED(mhr) ? mhr : E_FAIL;
+        }
+
+        const auto* rb_bytes = static_cast<const uint8_t*>(mapped);
+        const size_t packed_row_bytes = static_cast<size_t>(row_size_bytes);
+        const size_t total_packed = packed_row_bytes * height;
+        last_present_raw_pixels_.resize(total_packed);
+        last_present_raw_format_ = src_desc.Format;
+
+        const size_t rgba8_row_bytes = static_cast<size_t>(width) * 4u;
+        last_present_pixels_.resize(rgba8_row_bytes * height);
+
+        for (uint32_t y = 0; y < height; ++y) {
+            const uint8_t* src_row =
+                rb_bytes + static_cast<size_t>(y) * footprint.Footprint.RowPitch;
+            std::memcpy(
+                last_present_raw_pixels_.data() + static_cast<size_t>(y) * packed_row_bytes,
+                src_row,
+                packed_row_bytes);
+            uint8_t* dst_rgba8_row =
+                last_present_pixels_.data() + static_cast<size_t>(y) * rgba8_row_bytes;
+            ConvertPackedRowToSdrRgba8(
+                src_desc.Format,
+                effective_cs,
+                present_config_.ToneMapMode,
+                present_config_.PaperWhiteNits,
+                src_row,
+                dst_rgba8_row,
+                width);
+        }
+
+        D3D12_RANGE write_none{0, 0};
+        readback_buf_->Unmap(0, &write_none);
+
+        last_present_hash_ = openscarlett::ComputeFnv1a64(
+            last_present_pixels_.data(), last_present_pixels_.size());
+        return S_OK;
+    };
+
+    bool readback_processed = false;
+    if (need_tonemap_bb_upload && swapchain_) {
+        // Wait for HDR source readback, tone-map to SDR RGBA8, and upload to SDR backbuffer.
+        hr = WaitForInternalFenceLocked();
+        if (FAILED(hr)) {
+            RecordQueue("ID3D12CommandQueueX::PresentX", 19, hr);
+            return hr;
+        }
+        hr = process_readback();
+        if (FAILED(hr)) {
+            RecordQueue("ID3D12CommandQueueX::PresentX", 19, hr);
+            return hr;
+        }
+        readback_processed = true;
+
+        ID3D12Resource* backbuffer = nullptr;
+        const UINT bb_idx = swapchain_->GetCurrentBackBufferIndex();
+        hr = swapchain_->GetBuffer(bb_idx, IID_PPV_ARGS(&backbuffer));
+        if (SUCCEEDED(hr) && backbuffer) {
+            const D3D12_RESOURCE_DESC bb_desc = backbuffer->GetDesc();
+            const uint32_t copy_w = std::min<uint32_t>(width, static_cast<uint32_t>(bb_desc.Width));
+            const uint32_t copy_h = std::min<uint32_t>(height, bb_desc.Height);
+
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT bb_fp{};
+            UINT bb_rows = 0u;
+            UINT64 bb_row_size = 0ull;
+            UINT64 bb_total = 0ull;
+            device_x_->HostDevice()->GetCopyableFootprints(
+                &bb_desc, 0u, 1u, 0ull, &bb_fp, &bb_rows, &bb_row_size, &bb_total);
+
+            hr = EnsureToneMapUploadBufferLocked(bb_total);
+            if (SUCCEEDED(hr) && tonemap_upload_buf_) {
+                void* up_ptr = nullptr;
+                D3D12_RANGE rnone{0u, 0u};
+                if (SUCCEEDED(tonemap_upload_buf_->Map(0u, &rnone, &up_ptr)) && up_ptr) {
+                    auto* up_bytes = static_cast<uint8_t*>(up_ptr);
+                    std::memset(up_bytes, 0, static_cast<size_t>(bb_total));
+                    const bool bb_is_bgra = (bb_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM);
+                    for (uint32_t y = 0; y < copy_h; ++y) {
+                        const uint8_t* src_r =
+                            last_present_pixels_.data() + static_cast<size_t>(y) * width * 4u;
+                        uint8_t* dst_r = up_bytes + static_cast<size_t>(y) * bb_fp.Footprint.RowPitch;
+                        if (bb_is_bgra) {
+                            for (uint32_t x = 0; x < copy_w; ++x) {
+                                dst_r[x * 4u + 0u] = src_r[x * 4u + 2u];
+                                dst_r[x * 4u + 1u] = src_r[x * 4u + 1u];
+                                dst_r[x * 4u + 2u] = src_r[x * 4u + 0u];
+                                dst_r[x * 4u + 3u] = src_r[x * 4u + 3u];
+                            }
+                        } else {
+                            std::memcpy(dst_r, src_r, static_cast<size_t>(copy_w) * 4u);
+                        }
+                    }
+                    D3D12_RANGE wwritten{0u, static_cast<SIZE_T>(bb_total)};
+                    tonemap_upload_buf_->Unmap(0u, &wwritten);
+
+                    if (SUCCEEDED(present_alloc_->Reset()) &&
+                        SUCCEEDED(present_cmd_->Reset(present_alloc_, nullptr))) {
+                        D3D12_RESOURCE_BARRIER bb_to_dst{};
+                        bb_to_dst.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                        bb_to_dst.Transition.pResource = backbuffer;
+                        bb_to_dst.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                        bb_to_dst.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+                        bb_to_dst.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+                        present_cmd_->ResourceBarrier(1u, &bb_to_dst);
+
+                        D3D12_TEXTURE_COPY_LOCATION bb_dst{};
+                        bb_dst.pResource = backbuffer;
+                        bb_dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                        bb_dst.SubresourceIndex = 0u;
+
+                        D3D12_TEXTURE_COPY_LOCATION up_src{};
+                        up_src.pResource = tonemap_upload_buf_;
+                        up_src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                        up_src.PlacedFootprint = bb_fp;
+
+                        present_cmd_->CopyTextureRegion(&bb_dst, 0u, 0u, 0u, &up_src, nullptr);
+
+                        D3D12_RESOURCE_BARRIER bb_to_present{};
+                        bb_to_present.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                        bb_to_present.Transition.pResource = backbuffer;
+                        bb_to_present.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                        bb_to_present.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                        bb_to_present.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+                        present_cmd_->ResourceBarrier(1u, &bb_to_present);
+
+                        if (SUCCEEDED(present_cmd_->Close())) {
+                            ID3D12CommandList* up_lists[] = {present_cmd_};
+                            host_queue_->ExecuteCommandLists(1u, up_lists);
+                        }
+                    }
+                }
+            }
+            backbuffer->Release();
+        }
+    }
+
     const uint32_t frame_interval_us = device_x_ ? device_x_->FrameIntervalMicroseconds() : 0u;
     const bool immediate_flag =
         (pPresentParameters && (pPresentParameters->Flags & D3D12XBOX_PRESENT_FLAG_IMMEDIATE) != 0);
@@ -1246,45 +1726,12 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
         return hr;
     }
 
-    if (need_readback && readback_buf_) {
-        void* mapped = nullptr;
-        D3D12_RANGE read_range{0, static_cast<SIZE_T>(total_bytes)};
-        hr = readback_buf_->Map(0, &read_range, &mapped);
-        if (FAILED(hr) || !mapped) {
-            RecordQueue("ID3D12CommandQueueX::PresentX", 19, FAILED(hr) ? hr : E_FAIL);
-            return FAILED(hr) ? hr : E_FAIL;
+    if (!readback_processed && need_readback && readback_buf_) {
+        hr = process_readback();
+        if (FAILED(hr)) {
+            RecordQueue("ID3D12CommandQueueX::PresentX", 19, hr);
+            return hr;
         }
-
-        const auto* rb_bytes = static_cast<const uint8_t*>(mapped);
-        const size_t packed_row_bytes = static_cast<size_t>(row_size_bytes);
-        const size_t total_packed = packed_row_bytes * height;
-        last_present_pixels_.resize(total_packed);
-
-        const bool is_bgra = (src_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
-                              src_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
-
-        for (uint32_t y = 0; y < height; ++y) {
-            const uint8_t* src_row =
-                rb_bytes + static_cast<size_t>(y) * footprint.Footprint.RowPitch;
-            uint8_t* dst_row =
-                last_present_pixels_.data() + static_cast<size_t>(y) * packed_row_bytes;
-            if (is_bgra) {
-                for (uint32_t x = 0; x < width; ++x) {
-                    dst_row[x * 4u + 0u] = src_row[x * 4u + 2u];
-                    dst_row[x * 4u + 1u] = src_row[x * 4u + 1u];
-                    dst_row[x * 4u + 2u] = src_row[x * 4u + 0u];
-                    dst_row[x * 4u + 3u] = src_row[x * 4u + 3u];
-                }
-            } else {
-                std::memcpy(dst_row, src_row, packed_row_bytes);
-            }
-        }
-
-        D3D12_RANGE write_none{0, 0};
-        readback_buf_->Unmap(0, &write_none);
-
-        last_present_hash_ = openscarlett::ComputeFnv1a64(
-            last_present_pixels_.data(), last_present_pixels_.size());
     }
 
     last_present_width_ = width;
@@ -1431,6 +1878,103 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::SetWindowCloseBehavior(BOOL post_quit_o
     window_state_->post_quit_on_close.store(post_quit_on_close != FALSE, std::memory_order_release);
     window_state_->quit_posted.store(false, std::memory_order_release);
     return S_OK;
+}
+
+// IOpenScarlettPresentHdr
+HRESULT STDMETHODCALLTYPE CommandQueueX::SetPresentConfig(
+    const D3D12XBOX_PRESENTX_CONFIG* config) {
+    if (!config) return E_POINTER;
+    std::lock_guard<std::mutex> lock(present_mutex_);
+    present_config_ = *config;
+    if (present_config_.PaperWhiteNits <= 0.0f) {
+        present_config_.PaperWhiteNits = 200.0f;
+    }
+    if (present_config_.MaxDisplayNits <= 0.0f) {
+        present_config_.MaxDisplayNits = 1000.0f;
+    }
+    if (config->OutputWindow && config->OutputWindow != attached_hwnd_) {
+        if (swapchain_ && swapchain_hwnd_ != config->OutputWindow) {
+            ReleaseSwapChainLocked();
+        }
+        attached_hwnd_ = config->OutputWindow;
+        if (IsWindow(config->OutputWindow) != FALSE) {
+            AttachWindowSubclassLocked(config->OutputWindow);
+        }
+    }
+    if (swapchain_) {
+        const DXGI_FORMAT desired_fmt =
+            (present_config_.ForceSdrToneMapFallback != 0u)
+                ? DXGI_FORMAT_R8G8B8A8_UNORM
+                : ((present_config_.PreferredFormat != DXGI_FORMAT_UNKNOWN)
+                       ? NormalizeSwapChainFormat(present_config_.PreferredFormat)
+                       : swapchain_format_);
+        if (desired_fmt != swapchain_format_) {
+            ReleaseSwapChainLocked();
+        } else {
+            ConfigureSwapChainHdrLocked(
+                present_config_.PreferredFormat != DXGI_FORMAT_UNKNOWN
+                    ? present_config_.PreferredFormat
+                    : swapchain_format_,
+                present_config_.ColorSpace);
+        }
+    }
+    RecordQueue("ID3D12CommandQueueX::SetPresentConfig", -1, S_OK);
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE CommandQueueX::SetHdrMetaData(
+    const D3D12XBOX_HDR10_METADATA* metadata) {
+    if (!metadata) return E_POINTER;
+    std::lock_guard<std::mutex> lock(present_mutex_);
+    hdr_metadata_ = *metadata;
+    hdr_metadata_explicit_ = true;
+    if (swapchain_) {
+        ConfigureSwapChainHdrLocked(
+            last_presented_src_format_ != DXGI_FORMAT_UNKNOWN
+                ? last_presented_src_format_
+                : swapchain_format_,
+            last_presented_color_space_);
+    }
+    RecordQueue("ID3D12CommandQueueX::SetHdrMetaData", -1, S_OK);
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE CommandQueueX::GetHdrSwapChainState(
+    D3D12XBOX_HDR_SWAPCHAIN_STATE* out_state) {
+    if (!out_state) return E_POINTER;
+    std::memset(out_state, 0, sizeof(*out_state));
+    std::lock_guard<std::mutex> lock(present_mutex_);
+    out_state->SwapChainFormat = swapchain_format_;
+    out_state->ActiveColorSpace = active_color_space_;
+    out_state->HasSwapChain4 = swapchain4_ ? 1u : 0u;
+    out_state->ColorSpaceSupportFlags = cs_support_flags_;
+    out_state->ColorSpaceApplied = color_space_applied_ ? 1u : 0u;
+    out_state->HdrMetaDataApplied = hdr_metadata_applied_ ? 1u : 0u;
+    out_state->ToneMapFallbackActive = tone_map_fallback_active_ ? 1u : 0u;
+    out_state->ToneMapMode = present_config_.ToneMapMode;
+    out_state->LastPresentedSourceFormat = last_presented_src_format_;
+    out_state->LastPresentedColorSpace = last_presented_color_space_;
+    out_state->ActiveMetaData = hdr_metadata_;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE CommandQueueX::CopyLastPresentRawPixels(
+    uint8_t* out_raw,
+    uint32_t buffer_bytes,
+    uint32_t* out_copied_bytes,
+    DXGI_FORMAT* out_format) {
+    std::lock_guard<std::mutex> lock(present_mutex_);
+    if (out_copied_bytes) *out_copied_bytes = 0u;
+    if (out_format) *out_format = last_present_raw_format_;
+    if (last_present_raw_pixels_.empty()) return S_FALSE;
+    if (!out_raw) return E_POINTER;
+    const uint32_t to_copy = static_cast<uint32_t>(
+        std::min<size_t>(buffer_bytes, last_present_raw_pixels_.size()));
+    std::memcpy(out_raw, last_present_raw_pixels_.data(), to_copy);
+    if (out_copied_bytes) *out_copied_bytes = to_copy;
+    return (to_copy == last_present_raw_pixels_.size())
+               ? S_OK
+               : HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
 }
 
 }  // namespace openscarlett::d3d12_xs

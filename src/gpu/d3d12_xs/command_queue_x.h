@@ -16,7 +16,8 @@ struct WindowCallbackState;
 class CommandQueueX final
     : public ID3D12CommandQueueX,
       public IOpenScarlettPresentCapture,
-      public IOpenScarlettPresentWindow {
+      public IOpenScarlettPresentWindow,
+      public IOpenScarlettPresentHdr {
 public:
     CommandQueueX(DeviceX* parent_device,
                   ID3D12CommandQueue* host_queue,
@@ -29,6 +30,7 @@ public:
     ID3D12CommandQueue* HostQueue() const noexcept { return host_queue_; }
 
     static ID3D12Pageable* UnwrapHostPageable(ID3D12Pageable* maybe_wrapped) noexcept;
+    static ID3D12CommandQueue* UnwrapHostQueue(ID3D12CommandQueue* maybe_wrapped) noexcept;
 
     // IUnknown (slots 0..2)
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override;
@@ -110,11 +112,33 @@ public:
     HANDLE STDMETHODCALLTYPE GetFrameLatencyWaitableObject() override;
     HRESULT STDMETHODCALLTYPE SetWindowCloseBehavior(BOOL post_quit_on_close) override;
 
+    // IOpenScarlettPresentHdr
+    HRESULT STDMETHODCALLTYPE SetPresentConfig(
+        const D3D12XBOX_PRESENTX_CONFIG* config) override;
+    HRESULT STDMETHODCALLTYPE SetHdrMetaData(
+        const D3D12XBOX_HDR10_METADATA* metadata) override;
+    HRESULT STDMETHODCALLTYPE GetHdrSwapChainState(
+        D3D12XBOX_HDR_SWAPCHAIN_STATE* out_state) override;
+    HRESULT STDMETHODCALLTYPE CopyLastPresentRawPixels(
+        uint8_t* out_raw,
+        uint32_t buffer_bytes,
+        uint32_t* out_copied_bytes,
+        DXGI_FORMAT* out_format) override;
+
 private:
     HRESULT EnsurePresentHelperObjectsLocked();
     HRESULT EnsureSwapChainLocked(
-        HWND hwnd, uint32_t width, uint32_t height, DXGI_FORMAT format, bool force_resize);
+        HWND hwnd,
+        uint32_t width,
+        uint32_t height,
+        DXGI_FORMAT format,
+        D3D12XBOX_COLOR_SPACE color_space,
+        bool force_resize);
+    void ConfigureSwapChainHdrLocked(
+        DXGI_FORMAT src_format,
+        D3D12XBOX_COLOR_SPACE req_color_space);
     HRESULT EnsureReadbackBufferLocked(uint64_t required_bytes);
+    HRESULT EnsureToneMapUploadBufferLocked(uint64_t required_bytes);
     HRESULT WaitForInternalFenceLocked();
     void AttachWindowSubclassLocked(HWND hwnd);
     void DetachWindowSubclassLocked();
@@ -141,8 +165,11 @@ private:
 
     ID3D12Resource* readback_buf_ = nullptr;
     uint64_t readback_buf_capacity_ = 0;
+    ID3D12Resource* tonemap_upload_buf_ = nullptr;
+    uint64_t tonemap_upload_capacity_ = 0;
 
     IDXGISwapChain3* swapchain_ = nullptr;
+    IDXGISwapChain4* swapchain4_ = nullptr;
     HWND swapchain_hwnd_ = nullptr;
     uint32_t swapchain_width_ = 0;
     uint32_t swapchain_height_ = 0;
@@ -152,6 +179,18 @@ private:
     uint32_t swapchain_max_latency_ = 0;
     bool swapchain_occluded_ = false;
     HANDLE frame_latency_waitable_object_ = nullptr;
+
+    D3D12XBOX_PRESENTX_CONFIG present_config_{};
+    D3D12XBOX_HDR10_METADATA hdr_metadata_{};
+    bool hdr_metadata_explicit_ = false;
+    DXGI_COLOR_SPACE_TYPE active_color_space_ = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    UINT cs_support_flags_ = 0u;
+    bool color_space_applied_ = false;
+    bool hdr_metadata_applied_ = false;
+    bool tone_map_fallback_active_ = false;
+    DXGI_FORMAT last_presented_src_format_ = DXGI_FORMAT_UNKNOWN;
+    D3D12XBOX_COLOR_SPACE last_presented_color_space_ =
+        D3D12XBOX_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
 
     int64_t qpc_freq_ = 0;
     int64_t last_paced_qpc_ = 0;
@@ -165,6 +204,8 @@ private:
     uint32_t last_present_width_ = 0;
     uint32_t last_present_height_ = 0;
     std::vector<uint8_t> last_present_pixels_;
+    std::vector<uint8_t> last_present_raw_pixels_;
+    DXGI_FORMAT last_present_raw_format_ = DXGI_FORMAT_UNKNOWN;
 };
 
 }  // namespace openscarlett::d3d12_xs

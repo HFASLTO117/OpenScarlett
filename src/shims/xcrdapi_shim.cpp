@@ -43,11 +43,19 @@ CrdState& GetCrd() {
     return *s;
 }
 
+constexpr int32_t kCrdHrNotImpl = static_cast<int32_t>(0x80004001u);
+
 inline int32_t RecordHr(const char* sym, int32_t hr) {
+    openscarlett::CallOutcome outcome = openscarlett::CallOutcome::Ok;
+    if (hr == kCrdHrNotImpl) {
+        outcome = openscarlett::CallOutcome::NotImplemented;
+    } else if (hr < 0) {
+        outcome = openscarlett::CallOutcome::Error;
+    }
     openscarlett::CallTelemetry::Global().Record(
         kModName,
         sym,
-        hr >= 0 ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error,
+        outcome,
         hr,
         -1);
     return hr;
@@ -235,6 +243,48 @@ int32_t OS_SHIM_CALL XCrdFlushDiagnostics(const char* optionalOutputPath) {
     }
 
     return RecordHr("XCrdFlushDiagnostics", OS_SHIM_S_OK);
+}
+
+// Fail-closed Xbox hardware crash-dump / cloud upload APIs (never fake S_OK).
+OS_XCRDAPI_API int32_t OS_SHIM_CALL XCrdStartMiniDumpCapture(
+    uint32_t dumpFlags,
+    const char* outputPath) {
+    (void)dumpFlags;
+    (void)outputPath;
+    return RecordHr("XCrdStartMiniDumpCapture", kCrdHrNotImpl);
+}
+
+OS_XCRDAPI_API int32_t OS_SHIM_CALL XCrdUploadCrashDump(
+    const char* dumpPath,
+    uint32_t uploadFlags) {
+    (void)dumpPath;
+    (void)uploadFlags;
+    return RecordHr("XCrdUploadCrashDump", kCrdHrNotImpl);
+}
+
+OS_XCRDAPI_API void OS_SHIM_CALL OpenScarlettXCrdResetTelemetry(void) {
+    openscarlett::CallTelemetry::Global().Reset();
+}
+
+OS_XCRDAPI_API int OS_SHIM_CALL OpenScarlettXCrdGetTelemetryDetail(
+    const char* symbol_name,
+    uint64_t* out_total_calls,
+    uint64_t* out_not_impl_calls,
+    int32_t* out_last_hr) {
+    if (!symbol_name) return 0;
+    const auto snap = openscarlett::CallTelemetry::Global().Snapshot();
+    for (const auto& entry : snap) {
+        if (entry.symbol_name == symbol_name) {
+            if (out_total_calls) *out_total_calls = entry.total_calls;
+            if (out_not_impl_calls) *out_not_impl_calls = entry.not_impl_calls;
+            if (out_last_hr) *out_last_hr = entry.last_hr;
+            return 1;
+        }
+    }
+    if (out_total_calls) *out_total_calls = 0;
+    if (out_not_impl_calls) *out_not_impl_calls = 0;
+    if (out_last_hr) *out_last_hr = 0;
+    return 0;
 }
 
 }  // extern "C"

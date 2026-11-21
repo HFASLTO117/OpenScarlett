@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <unordered_map>
 
 #include "openscarlett/gpu/d3d12_adapter.h"
 #include "openscarlett/gpu/d3d12_xs_abi.h"
@@ -10,7 +11,27 @@
 
 namespace openscarlett::d3d12_xs {
 
-class DeviceX final : public ID3D12DeviceX {
+struct UnifiedTextureMapping {
+    ID3D12Resource* resource = nullptr;
+    uint64_t guest_va = 0ull;
+    uint64_t byte_size = 0ull;
+    uint32_t width = 0u;
+    uint32_t height = 0u;
+    uint32_t depth_or_array_size = 1u;
+    uint32_t mip_levels = 1u;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    D3D12_RESOURCE_DIMENSION dimension = D3D12_RESOURCE_DIMENSION_UNKNOWN;
+    D3D12_RESOURCE_STATES current_state = D3D12_RESOURCE_STATE_COMMON;
+    uint32_t row_pitch_bytes = 0u;
+    uint64_t page_generation = 1ull;
+    uint64_t uploaded_generation = 0ull;
+    bool dirty = false;
+    bool cpu_readable = false;
+};
+
+class DeviceX final
+    : public ID3D12DeviceX,
+      public IOpenScarlettUnifiedMemory {
 public:
     DeviceX(ID3D12Device* host_device,
             const D3D12AdapterInfo& adapter_info,
@@ -29,6 +50,14 @@ public:
     uint32_t MaxFrameLatency() const noexcept {
         return max_frame_latency_.load(std::memory_order_relaxed);
     }
+    bool HasRegisteredUnifiedTextures() const noexcept {
+        return registered_unified_count_.load(std::memory_order_acquire) > 0u;
+    }
+    bool HasDirtyUnifiedTextures() const noexcept {
+        return dirty_unified_count_.load(std::memory_order_acquire) > 0u;
+    }
+    void NotifyResourceStateTransition(
+        ID3D12Resource* resource, D3D12_RESOURCE_STATES new_state) noexcept;
 
     // IUnknown (slots 0..2)
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override;
@@ -269,7 +298,32 @@ public:
     HRESULT STDMETHODCALLTYPE ResumeX() override;
     HRESULT STDMETHODCALLTYPE GetGpuHardwareInfoX(D3D12XBOX_GPU_HARDWARE_INFO* pOutInfo) override;
 
+    // IOpenScarlettUnifiedMemory
+    HRESULT STDMETHODCALLTYPE RegisterUnifiedTexture(
+        const D3D12XBOX_UNIFIED_TEXTURE_DESC* desc) override;
+    HRESULT STDMETHODCALLTYPE UnregisterUnifiedTexture(
+        ID3D12Resource* resource) override;
+    HRESULT STDMETHODCALLTYPE NotifyVirtualRemap(
+        uint64_t guest_va_base,
+        uint64_t byte_size,
+        uint64_t new_backing_va,
+        uint32_t* out_flagged_count) override;
+    HRESULT STDMETHODCALLTYPE FlushDirtyUnifiedTextures(
+        ID3D12CommandQueue* queue,
+        uint32_t* out_flushed_count) override;
+    HRESULT STDMETHODCALLTYPE GetUnifiedTextureStats(
+        D3D12XBOX_UNIFIED_TEXTURE_STATS* out_stats) override;
+
 private:
+    HRESULT EnsureUnifiedUploadObjectsLocked();
+    HRESULT EnsureUnifiedUploadBufferLocked(uint64_t required_bytes);
+    void ReleaseUnifiedMemoryObjects();
+    void AutoRegisterUnifiedResource(
+        ID3D12Resource* resource,
+        uint64_t guest_va,
+        const D3D12_RESOURCE_DESC& desc,
+        D3D12_RESOURCE_STATES initial_state);
+
     std::atomic<ULONG> ref_count_{1};
     ID3D12Device* host_dev_ = nullptr;
     ID3D12Device1* host_dev1_ = nullptr;
@@ -285,6 +339,25 @@ private:
     std::atomic<uint64_t> next_frame_token_{1ull};
     std::atomic<bool> suspended_{false};
     openscarlett::ShaderCache shader_cache_;
+
+    // Title unified-memory texture remap tracking (ivall/xcl fd74662/bdae5a4)
+    mutable std::mutex unified_mutex_;
+    std::unordered_map<ID3D12Resource*, UnifiedTextureMapping> unified_textures_;
+    std::unordered_map<ID3D12Heap*, uint64_t> address_heaps_;
+    std::atomic<uint32_t> registered_unified_count_{0u};
+    std::atomic<uint32_t> dirty_unified_count_{0u};
+    uint64_t total_remap_notifications_{0ull};
+    uint64_t total_unified_flushes_{0ull};
+    uint64_t total_unified_bytes_uploaded_{0ull};
+
+    std::mutex unified_upload_mutex_;
+    ID3D12CommandAllocator* unified_alloc_ = nullptr;
+    ID3D12GraphicsCommandList* unified_cmd_ = nullptr;
+    ID3D12Fence* unified_fence_ = nullptr;
+    HANDLE unified_fence_event_ = nullptr;
+    uint64_t unified_fence_val_ = 0ull;
+    ID3D12Resource* unified_upload_buf_ = nullptr;
+    uint64_t unified_upload_capacity_ = 0ull;
 };
 
 }  // namespace openscarlett::d3d12_xs
