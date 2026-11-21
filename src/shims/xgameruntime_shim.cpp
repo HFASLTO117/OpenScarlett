@@ -4,8 +4,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -20,10 +22,12 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #if defined(_WIN32)
+#  include <dxgi1_6.h>
 #  include <malloc.h>
 #  include <windows.h>
 #endif
@@ -544,16 +548,33 @@ struct XGameSaveUpdate {
 };
 
 struct XDisplayTimeoutDeferral {
-    std::atomic<uint32_t> active{1};
+    std::atomic<uint32_t> ref_count{1};
+};
+
+struct XSpeechSynthesizer {
+    std::string voice_id = "openscarlett-en-us-aria";
+    bool is_male = false;
+};
+
+struct XSpeechSynthesizerStream {
+    std::vector<uint8_t> wav_bytes;
 };
 
 namespace {
+
+struct InviteListenerEntry {
+    uint64_t token = 0;
+    XTaskQueueHandle queue = nullptr;
+    void* context = nullptr;
+    XGameInviteEventCallback callback = nullptr;
+};
 
 struct RuntimeState {
     std::mutex mutex;
     std::atomic<int32_t> init_count{0};
     std::atomic<int32_t> api_impl_init_count{0};
-    std::atomic<uint32_t> vtable_refs[8]{1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u};
+    std::atomic<uint32_t> vtable_refs[12]{
+        1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u};
 
     // Task queues
     std::unordered_map<XTaskQueueObject*, std::shared_ptr<XTaskQueueObject>> live_queues;
@@ -578,6 +599,30 @@ struct RuntimeState {
     std::mutex mem_mutex;
     XMemAllocFunction alloc_hook = nullptr;
     XMemFreeFunction free_hook = nullptr;
+
+    // XDisplay timeout deferrals
+    std::mutex display_mutex;
+    std::unordered_set<XDisplayTimeoutDeferral*> live_deferrals;
+
+    // XLauncher / XGameUI
+    std::mutex ui_mutex;
+    std::string last_launched_uri;
+    XGameUINotificationPositionHint notification_pos =
+        XGameUINotificationPositionHint_BottomCenter;
+
+    // XGameInvite
+    std::mutex invite_mutex;
+    uint64_t next_invite_token = 1;
+    std::vector<InviteListenerEntry> invite_listeners;
+
+    // XAccessibility
+    std::mutex accessibility_mutex;
+    bool closed_captions_enabled = false;
+
+    // XSpeechSynthesizer
+    std::mutex speech_mutex;
+    std::unordered_map<XSpeechSynthesizer*, std::shared_ptr<XSpeechSynthesizer>> live_synths;
+    std::unordered_map<XSpeechSynthesizerStream*, std::shared_ptr<XSpeechSynthesizerStream>> live_streams;
 };
 
 RuntimeState& GetRuntime() {
@@ -3136,10 +3181,338 @@ XGameResult OPENSCARLETT_GDK_CALL XPackageEnumerateChunkAvailability(
 // ===========================================================================
 // XDisplay
 // ===========================================================================
+}  // extern "C"
+
+namespace {
+
+bool ParseEnvBoolToken(const std::string& raw, bool& out_val) {
+    if (raw.empty()) return false;
+    std::string lo = raw;
+    for (char& c : lo) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (lo == "1" || lo == "true" || lo == "yes" || lo == "on" || lo == "hdr") {
+        out_val = true;
+        return true;
+    }
+    if (lo == "0" || lo == "false" || lo == "no" || lo == "off" || lo == "sdr") {
+        out_val = false;
+        return true;
+    }
+    return false;
+}
+
+bool ProbeHostDxgiHdrDisplay(XDisplayHdrModeInfo& out_info) {
+#if defined(_WIN32)
+    IDXGIFactory1* factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory))) ||
+        !factory) {
+        return false;
+    }
+    bool hdr_enabled = false;
+    IDXGIAdapter1* adapter = nullptr;
+    for (UINT ai = 0; factory->EnumAdapters1(ai, &adapter) == S_OK && !hdr_enabled; ++ai) {
+        IDXGIOutput* output = nullptr;
+        for (UINT oi = 0; adapter->EnumOutputs(oi, &output) == S_OK && !hdr_enabled; ++oi) {
+            IDXGIOutput6* out6 = nullptr;
+            if (SUCCEEDED(output->QueryInterface(__uuidof(IDXGIOutput6),
+                                                 reinterpret_cast<void**>(&out6))) &&
+                out6) {
+                DXGI_OUTPUT_DESC1 desc1{};
+                if (SUCCEEDED(out6->GetDesc1(&desc1)) &&
+                    desc1.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020) {
+                    hdr_enabled = true;
+                    out_info.minToneMapLuminance =
+                        (desc1.MinLuminance > 0.0f) ? desc1.MinLuminance : 0.005f;
+                    out_info.maxToneMapLuminance =
+                        (desc1.MaxLuminance > 0.0f) ? desc1.MaxLuminance : 1000.0f;
+                    out_info.maxFullFrameToneMapLuminance =
+                        (desc1.MaxFullFrameLuminance > 0.0f) ? desc1.MaxFullFrameLuminance : 400.0f;
+                }
+                out6->Release();
+            }
+            output->Release();
+        }
+        adapter->Release();
+    }
+    factory->Release();
+    return hdr_enabled;
+#else
+    (void)out_info;
+    return false;
+#endif
+}
+
+// ===========================================================================
+// XGameUI Async Providers
+// ===========================================================================
+const char kIdGameUiMessageDialog[] = "XGameUIShowMessageDialogAsync";
+const char kIdGameUiTextEntry[] = "XGameUIShowTextEntryAsync";
+const char kIdGameUiPlayerPicker[] = "XGameUIShowPlayerPickerAsync";
+const char kIdGameUiErrorDialog[] = "XGameUIShowErrorDialogAsync";
+
+struct GameUiMessageDialogCtx {
+    XGameUIMessageDialogButton result_button = XGameUIMessageDialogButton_First;
+};
+
+XGameResult OPENSCARLETT_GDK_CALL GameUiMessageDialogProvider(
+    XAsyncOp op,
+    const XAsyncProviderData* data) {
+    auto* ctx = static_cast<GameUiMessageDialogCtx*>(data->context);
+    switch (op) {
+        case XAsyncOp_Begin:
+            return XGR_S_OK;
+        case XAsyncOp_DoWork:
+            XAsyncComplete(data->async, XGR_S_OK, sizeof(XGameUIMessageDialogButton));
+            return XGR_E_PENDING;
+        case XAsyncOp_GetResult:
+            if (!data->buffer || data->bufferSize < sizeof(XGameUIMessageDialogButton)) {
+                return XGR_E_NOT_SUFFICIENT_BUFFER;
+            }
+            std::memcpy(data->buffer, &ctx->result_button, sizeof(XGameUIMessageDialogButton));
+            return XGR_S_OK;
+        case XAsyncOp_Cleanup:
+            delete ctx;
+            return XGR_S_OK;
+        default:
+            return XGR_S_OK;
+    }
+}
+
+struct GameUiTextEntryCtx {
+    std::string text;
+};
+
+XGameResult OPENSCARLETT_GDK_CALL GameUiTextEntryProvider(
+    XAsyncOp op,
+    const XAsyncProviderData* data) {
+    auto* ctx = static_cast<GameUiTextEntryCtx*>(data->context);
+    switch (op) {
+        case XAsyncOp_Begin:
+            return XGR_S_OK;
+        case XAsyncOp_DoWork:
+            XAsyncComplete(data->async, XGR_S_OK, ctx->text.size() + 1u);
+            return XGR_E_PENDING;
+        case XAsyncOp_GetResult: {
+            const size_t needed = ctx->text.size() + 1u;
+            if (!data->buffer || data->bufferSize < needed) {
+                return XGR_E_NOT_SUFFICIENT_BUFFER;
+            }
+            std::memcpy(data->buffer, ctx->text.c_str(), needed);
+            return XGR_S_OK;
+        }
+        case XAsyncOp_Cleanup:
+            delete ctx;
+            return XGR_S_OK;
+        default:
+            return XGR_S_OK;
+    }
+}
+
+struct GameUiPlayerPickerCtx {
+    std::vector<uint64_t> selected_players;
+};
+
+XGameResult OPENSCARLETT_GDK_CALL GameUiPlayerPickerProvider(
+    XAsyncOp op,
+    const XAsyncProviderData* data) {
+    auto* ctx = static_cast<GameUiPlayerPickerCtx*>(data->context);
+    switch (op) {
+        case XAsyncOp_Begin:
+            return XGR_S_OK;
+        case XAsyncOp_DoWork:
+            XAsyncComplete(data->async, XGR_S_OK, ctx->selected_players.size() * sizeof(uint64_t));
+            return XGR_E_PENDING;
+        case XAsyncOp_GetResult: {
+            const size_t needed = ctx->selected_players.size() * sizeof(uint64_t);
+            if (needed > 0u) {
+                if (!data->buffer || data->bufferSize < needed) {
+                    return XGR_E_NOT_SUFFICIENT_BUFFER;
+                }
+                std::memcpy(data->buffer, ctx->selected_players.data(), needed);
+            }
+            return XGR_S_OK;
+        }
+        case XAsyncOp_Cleanup:
+            delete ctx;
+            return XGR_S_OK;
+        default:
+            return XGR_S_OK;
+    }
+}
+
+struct GameUiErrorDialogCtx {
+    XGameResult error_code = XGR_S_OK;
+};
+
+XGameResult OPENSCARLETT_GDK_CALL GameUiErrorDialogProvider(
+    XAsyncOp op,
+    const XAsyncProviderData* data) {
+    auto* ctx = static_cast<GameUiErrorDialogCtx*>(data->context);
+    switch (op) {
+        case XAsyncOp_Begin:
+            return XGR_S_OK;
+        case XAsyncOp_DoWork:
+            XAsyncComplete(data->async, XGR_S_OK, 0);
+            return XGR_E_PENDING;
+        case XAsyncOp_Cleanup:
+            delete ctx;
+            return XGR_S_OK;
+        default:
+            return XGR_S_OK;
+    }
+}
+
+// ===========================================================================
+// XGameInvite Dispatch Trampoline
+// ===========================================================================
+struct InviteDispatchCtx {
+    XGameInviteEventCallback callback = nullptr;
+    void* user_context = nullptr;
+    std::string uri;
+};
+
+void OPENSCARLETT_GDK_CALL InviteDispatchTrampoline(void* context, bool canceled) {
+    std::unique_ptr<InviteDispatchCtx> holder(static_cast<InviteDispatchCtx*>(context));
+    if (!canceled && holder && holder->callback) {
+        holder->callback(holder->user_context, holder->uri.c_str());
+    }
+}
+
+// ===========================================================================
+// XSpeechSynthesizer Deterministic PCM WAV Synthesizer
+// ===========================================================================
+struct BuiltinVoice {
+    const char* voice_id;
+    const char* display_name;
+    const char* description;
+    const char* language;
+    XSpeechSynthesizerVoiceGender gender;
+};
+
+static constexpr BuiltinVoice kBuiltinVoices[] = {
+    {"openscarlett-en-us-aria", "OpenScarlett Aria",
+     "OpenScarlett Aria - English (United States)", "en-US",
+     XSpeechSynthesizerVoiceGender_Female},
+    {"openscarlett-en-us-guy", "OpenScarlett Guy",
+     "OpenScarlett Guy - English (United States)", "en-US",
+     XSpeechSynthesizerVoiceGender_Male},
+};
+
+void AppendLe16(std::vector<uint8_t>& buf, uint16_t v) {
+    buf.push_back(static_cast<uint8_t>(v & 0xFFu));
+    buf.push_back(static_cast<uint8_t>((v >> 8) & 0xFFu));
+}
+
+void AppendLe32(std::vector<uint8_t>& buf, uint32_t v) {
+    buf.push_back(static_cast<uint8_t>(v & 0xFFu));
+    buf.push_back(static_cast<uint8_t>((v >> 8) & 0xFFu));
+    buf.push_back(static_cast<uint8_t>((v >> 16) & 0xFFu));
+    buf.push_back(static_cast<uint8_t>((v >> 24) & 0xFFu));
+}
+
+std::vector<uint8_t> SynthesizeDeterministicWav(const char* text, bool is_male) {
+    constexpr uint32_t kSampleRate = 22050u;
+    constexpr uint16_t kChannels = 1u;
+    constexpr uint16_t kBitsPerSample = 16u;
+    constexpr uint32_t kSamplesPerChar = 441u;  // 20 ms per character
+    constexpr size_t kMaxChars = 200u;          // cap at 4 seconds
+    constexpr double kTwoPi = 6.28318530717958647692;
+
+    const std::string s = text ? std::string(text) : std::string{};
+    const size_t char_count = std::min(s.size(), kMaxChars);
+    const uint32_t total_samples =
+        (char_count > 0u) ? static_cast<uint32_t>(char_count * kSamplesPerChar) : kSamplesPerChar;
+    const uint32_t data_bytes = total_samples * sizeof(int16_t);
+
+    std::vector<uint8_t> wav;
+    wav.reserve(44u + data_bytes);
+
+    // RIFF header
+    wav.insert(wav.end(), {'R', 'I', 'F', 'F'});
+    AppendLe32(wav, 36u + data_bytes);
+    wav.insert(wav.end(), {'W', 'A', 'V', 'E'});
+
+    // fmt chunk
+    wav.insert(wav.end(), {'f', 'm', 't', ' '});
+    AppendLe32(wav, 16u);                                           // PCM chunk size
+    AppendLe16(wav, 1u);                                            // WAVE_FORMAT_PCM
+    AppendLe16(wav, kChannels);
+    AppendLe32(wav, kSampleRate);
+    AppendLe32(wav, kSampleRate * kChannels * (kBitsPerSample / 8u));
+    AppendLe16(wav, static_cast<uint16_t>(kChannels * (kBitsPerSample / 8u)));
+    AppendLe16(wav, kBitsPerSample);
+
+    // data chunk
+    wav.insert(wav.end(), {'d', 'a', 't', 'a'});
+    AppendLe32(wav, data_bytes);
+
+    const double base_hz = is_male ? 135.0 : 235.0;
+    if (char_count == 0u) {
+        wav.resize(44u + data_bytes, 0u);
+        return wav;
+    }
+
+    for (size_t ci = 0; ci < char_count; ++ci) {
+        const unsigned char ch = static_cast<unsigned char>(s[ci]);
+        const bool is_pause = (std::isspace(ch) != 0);
+        const double freq1 = base_hz + static_cast<double>(ch % 37u) * 8.5;
+        const double freq2 = freq1 * 2.15;
+        for (uint32_t si = 0; si < kSamplesPerChar; ++si) {
+            int16_t pcm = 0;
+            if (!is_pause) {
+                const double t = static_cast<double>(si) / static_cast<double>(kSampleRate);
+                const double env =
+                    std::sin(3.14159265358979323846 * static_cast<double>(si) /
+                             static_cast<double>(kSamplesPerChar));
+                const double sig =
+                    0.65 * std::sin(kTwoPi * freq1 * t) + 0.35 * std::sin(kTwoPi * freq2 * t);
+                const double val = std::clamp(sig * env * 0.45, -1.0, 1.0);
+                pcm = static_cast<int16_t>(std::lround(val * 32767.0));
+            }
+            AppendLe16(wav, static_cast<uint16_t>(pcm));
+        }
+    }
+    return wav;
+}
+
+}  // namespace
+
+extern "C" {
+
 XDisplayHdrModeResult OPENSCARLETT_GDK_CALL XDisplayTryEnableHdrMode(
-    uint32_t /*preferredHdrMode*/,
+    XDisplayHdrModePreference preferredMode,
     XDisplayHdrModeInfo* displayHdrModeInfo) {
+    (void)preferredMode;
     RecordOk("XDisplayTryEnableHdrMode");
+
+    bool force_hdr = false;
+    const std::string env_hdr = GetEnvString("OPENSCARLETT_FORCE_HDR");
+    if (ParseEnvBoolToken(env_hdr, force_hdr)) {
+        if (force_hdr) {
+            if (displayHdrModeInfo) {
+                displayHdrModeInfo->minToneMapLuminance = 0.005f;
+                displayHdrModeInfo->maxToneMapLuminance = 1000.0f;
+                displayHdrModeInfo->maxFullFrameToneMapLuminance = 400.0f;
+            }
+            return XDisplayHdrModeResult_Enabled;
+        }
+        if (displayHdrModeInfo) {
+            displayHdrModeInfo->minToneMapLuminance = 0.05f;
+            displayHdrModeInfo->maxToneMapLuminance = 300.0f;
+            displayHdrModeInfo->maxFullFrameToneMapLuminance = 250.0f;
+        }
+        return XDisplayHdrModeResult_Disabled;
+    }
+
+    XDisplayHdrModeInfo probed{};
+    if (ProbeHostDxgiHdrDisplay(probed)) {
+        if (displayHdrModeInfo) {
+            *displayHdrModeInfo = probed;
+        }
+        return XDisplayHdrModeResult_Enabled;
+    }
+
     if (displayHdrModeInfo) {
         displayHdrModeInfo->minToneMapLuminance = 0.05f;
         displayHdrModeInfo->maxToneMapLuminance = 300.0f;
@@ -3148,24 +3521,699 @@ XDisplayHdrModeResult OPENSCARLETT_GDK_CALL XDisplayTryEnableHdrMode(
     return XDisplayHdrModeResult_Disabled;
 }
 
-XGameResult OPENSCARLETT_GDK_CALL XDisplayTryAcquireTimeoutDeferral(
+XGameResult OPENSCARLETT_GDK_CALL XDisplayAcquireTimeoutDeferral(
     XDisplayTimeoutDeferralHandle* handle) {
     if (!handle) {
-        return RecordHr("XDisplayTryAcquireTimeoutDeferral", XGR_E_INVALIDARG);
+        return RecordHr("XDisplayAcquireTimeoutDeferral", XGR_E_INVALIDARG);
     }
     auto* d = new (std::nothrow) XDisplayTimeoutDeferral();
     if (!d) {
         *handle = nullptr;
-        return RecordHr("XDisplayTryAcquireTimeoutDeferral", XGR_E_OUTOFMEMORY);
+        return RecordHr("XDisplayAcquireTimeoutDeferral", XGR_E_OUTOFMEMORY);
+    }
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.display_mutex);
+        rt.live_deferrals.insert(d);
     }
     *handle = d;
-    return RecordHr("XDisplayTryAcquireTimeoutDeferral", XGR_S_OK);
+    return RecordHr("XDisplayAcquireTimeoutDeferral", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XDisplayTryAcquireTimeoutDeferral(
+    XDisplayTimeoutDeferralHandle* handle) {
+    const XGameResult hr = XDisplayAcquireTimeoutDeferral(handle);
+    return RecordHr("XDisplayTryAcquireTimeoutDeferral", hr);
 }
 
 void OPENSCARLETT_GDK_CALL XDisplayCloseTimeoutDeferralHandle(
     XDisplayTimeoutDeferralHandle handle) {
     RecordOk("XDisplayCloseTimeoutDeferralHandle");
-    delete handle;
+    if (!handle) {
+        return;
+    }
+    bool found = false;
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.display_mutex);
+        auto it = rt.live_deferrals.find(handle);
+        if (it != rt.live_deferrals.end()) {
+            found = true;
+            if (handle->ref_count.fetch_sub(1u, std::memory_order_acq_rel) <= 1u) {
+                rt.live_deferrals.erase(it);
+            } else {
+                found = false;
+            }
+        }
+    }
+    if (found) {
+        delete handle;
+    }
+}
+
+// ===========================================================================
+// XLauncher & XGameUI
+// ===========================================================================
+XGameResult OPENSCARLETT_GDK_CALL XLaunchUri(
+    XUserHandle /*requestingUser*/,
+    const char* uri) {
+    if (!uri || *uri == '\0') {
+        return RecordHr("XLaunchUri", XGR_E_INVALIDARG);
+    }
+    const std::string uri_str(uri);
+    const size_t colon = uri_str.find(':');
+    if (colon == std::string::npos || colon == 0u) {
+        return RecordHr("XLaunchUri", XGR_E_INVALIDARG);
+    }
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.ui_mutex);
+        rt.last_launched_uri = uri_str;
+    }
+    return RecordHr("XLaunchUri", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUIShowMessageDialogAsync(
+    XAsyncBlock* async,
+    const char* /*titleText*/,
+    const char* /*contentText*/,
+    const char* /*firstButtonText*/,
+    const char* /*secondButtonText*/,
+    const char* /*thirdButtonText*/,
+    XGameUIMessageDialogButton defaultButton,
+    XGameUIMessageDialogButton /*cancelButton*/) {
+    if (!async) {
+        return RecordHr("XGameUIShowMessageDialogAsync", XGR_E_INVALIDARG);
+    }
+    XGameUIMessageDialogButton chosen = defaultButton;
+    const std::string env_btn = GetEnvString("OPENSCARLETT_UI_DIALOG_BUTTON");
+    if (!env_btn.empty()) {
+        if (env_btn == "0" || env_btn == "first") chosen = XGameUIMessageDialogButton_First;
+        else if (env_btn == "1" || env_btn == "second") chosen = XGameUIMessageDialogButton_Second;
+        else if (env_btn == "2" || env_btn == "third") chosen = XGameUIMessageDialogButton_Third;
+    }
+    auto* ctx = new (std::nothrow) GameUiMessageDialogCtx{chosen};
+    if (!ctx) {
+        return RecordHr("XGameUIShowMessageDialogAsync", XGR_E_OUTOFMEMORY);
+    }
+    XGameResult hr = XAsyncBegin(
+        async, ctx, kIdGameUiMessageDialog, kIdGameUiMessageDialog, &GameUiMessageDialogProvider);
+    if (hr < 0) {
+        delete ctx;
+        return RecordHr("XGameUIShowMessageDialogAsync", hr);
+    }
+    hr = XAsyncSchedule(async, 0);
+    if (hr < 0) {
+        XAsyncComplete(async, hr, 0);
+    }
+    return RecordHr("XGameUIShowMessageDialogAsync", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUIShowMessageDialogResult(
+    XAsyncBlock* async,
+    XGameUIMessageDialogButton* resultButton) {
+    if (!async || !resultButton) {
+        return RecordHr("XGameUIShowMessageDialogResult", XGR_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XGameUIShowMessageDialogResult", hr);
+    }
+    hr = XAsyncGetResult(
+        async, kIdGameUiMessageDialog, sizeof(XGameUIMessageDialogButton), resultButton, nullptr);
+    return RecordHr("XGameUIShowMessageDialogResult", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUIShowTextEntryAsync(
+    XAsyncBlock* async,
+    const char* /*titleText*/,
+    const char* /*descriptionText*/,
+    const char* defaultText,
+    XGameUITextEntryInputScope /*inputScope*/,
+    uint32_t maxTextLength) {
+    if (!async) {
+        return RecordHr("XGameUIShowTextEntryAsync", XGR_E_INVALIDARG);
+    }
+    std::string text = GetEnvString("OPENSCARLETT_UI_TEXT_ENTRY");
+    if (text.empty() && defaultText) {
+        text = defaultText;
+    }
+    if (maxTextLength > 0u && text.size() > maxTextLength) {
+        text.resize(maxTextLength);
+    }
+    auto* ctx = new (std::nothrow) GameUiTextEntryCtx{std::move(text)};
+    if (!ctx) {
+        return RecordHr("XGameUIShowTextEntryAsync", XGR_E_OUTOFMEMORY);
+    }
+    XGameResult hr = XAsyncBegin(
+        async, ctx, kIdGameUiTextEntry, kIdGameUiTextEntry, &GameUiTextEntryProvider);
+    if (hr < 0) {
+        delete ctx;
+        return RecordHr("XGameUIShowTextEntryAsync", hr);
+    }
+    hr = XAsyncSchedule(async, 0);
+    if (hr < 0) {
+        XAsyncComplete(async, hr, 0);
+    }
+    return RecordHr("XGameUIShowTextEntryAsync", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUIShowTextEntryResultSize(
+    XAsyncBlock* async,
+    uint32_t* resultTextBufferSize) {
+    if (!async || !resultTextBufferSize) {
+        return RecordHr("XGameUIShowTextEntryResultSize", XGR_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XGameUIShowTextEntryResultSize", hr);
+    }
+    size_t sz = 0;
+    hr = XAsyncGetResultSize(async, &sz);
+    if (hr >= 0) {
+        *resultTextBufferSize = static_cast<uint32_t>(sz);
+    }
+    return RecordHr("XGameUIShowTextEntryResultSize", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUIShowTextEntryResult(
+    XAsyncBlock* async,
+    uint32_t resultTextBufferSize,
+    char* resultTextBuffer,
+    uint32_t* resultTextBufferUsed) {
+    if (!async || !resultTextBuffer) {
+        return RecordHr("XGameUIShowTextEntryResult", XGR_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XGameUIShowTextEntryResult", hr);
+    }
+    size_t used = 0;
+    hr = XAsyncGetResult(async, kIdGameUiTextEntry, resultTextBufferSize, resultTextBuffer, &used);
+    if (resultTextBufferUsed) {
+        *resultTextBufferUsed = static_cast<uint32_t>(used);
+    }
+    return RecordHr("XGameUIShowTextEntryResult", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUIShowPlayerPickerAsync(
+    XAsyncBlock* async,
+    XUserHandle /*requestingUser*/,
+    const char* /*promptText*/,
+    uint32_t selectFromPlayersCount,
+    const uint64_t* selectFromPlayers,
+    uint32_t preSelectedPlayersCount,
+    const uint64_t* preSelectedPlayers,
+    uint32_t minSelectionCount,
+    uint32_t maxSelectionCount) {
+    if (!async || minSelectionCount > maxSelectionCount) {
+        return RecordHr("XGameUIShowPlayerPickerAsync", XGR_E_INVALIDARG);
+    }
+    if ((selectFromPlayersCount > 0u && !selectFromPlayers) ||
+        (preSelectedPlayersCount > 0u && !preSelectedPlayers)) {
+        return RecordHr("XGameUIShowPlayerPickerAsync", XGR_E_INVALIDARG);
+    }
+
+    auto* ctx = new (std::nothrow) GameUiPlayerPickerCtx();
+    if (!ctx) {
+        return RecordHr("XGameUIShowPlayerPickerAsync", XGR_E_OUTOFMEMORY);
+    }
+
+    auto contains = [&](uint64_t id) {
+        return std::find(ctx->selected_players.begin(), ctx->selected_players.end(), id) !=
+               ctx->selected_players.end();
+    };
+    for (uint32_t i = 0; i < preSelectedPlayersCount && ctx->selected_players.size() < maxSelectionCount; ++i) {
+        if (!contains(preSelectedPlayers[i])) {
+            ctx->selected_players.push_back(preSelectedPlayers[i]);
+        }
+    }
+    const uint32_t target_min =
+        (minSelectionCount > 0u)
+            ? minSelectionCount
+            : ((ctx->selected_players.empty() && selectFromPlayersCount > 0u && maxSelectionCount > 0u)
+                   ? 1u
+                   : 0u);
+    for (uint32_t i = 0; i < selectFromPlayersCount && ctx->selected_players.size() < target_min &&
+                         ctx->selected_players.size() < maxSelectionCount;
+         ++i) {
+        if (!contains(selectFromPlayers[i])) {
+            ctx->selected_players.push_back(selectFromPlayers[i]);
+        }
+    }
+
+    XGameResult hr = XAsyncBegin(
+        async, ctx, kIdGameUiPlayerPicker, kIdGameUiPlayerPicker, &GameUiPlayerPickerProvider);
+    if (hr < 0) {
+        delete ctx;
+        return RecordHr("XGameUIShowPlayerPickerAsync", hr);
+    }
+    hr = XAsyncSchedule(async, 0);
+    if (hr < 0) {
+        XAsyncComplete(async, hr, 0);
+    }
+    return RecordHr("XGameUIShowPlayerPickerAsync", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUIShowPlayerPickerResultCount(
+    XAsyncBlock* async,
+    uint32_t* resultPlayersCount) {
+    if (!async || !resultPlayersCount) {
+        return RecordHr("XGameUIShowPlayerPickerResultCount", XGR_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XGameUIShowPlayerPickerResultCount", hr);
+    }
+    size_t sz = 0;
+    hr = XAsyncGetResultSize(async, &sz);
+    if (hr >= 0) {
+        *resultPlayersCount = static_cast<uint32_t>(sz / sizeof(uint64_t));
+    }
+    return RecordHr("XGameUIShowPlayerPickerResultCount", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUIShowPlayerPickerResult(
+    XAsyncBlock* async,
+    uint32_t resultPlayersCount,
+    uint64_t* resultPlayers,
+    uint32_t* resultPlayersUsed) {
+    if (!async || (resultPlayersCount > 0u && !resultPlayers)) {
+        return RecordHr("XGameUIShowPlayerPickerResult", XGR_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XGameUIShowPlayerPickerResult", hr);
+    }
+    size_t used_bytes = 0;
+    hr = XAsyncGetResult(
+        async,
+        kIdGameUiPlayerPicker,
+        static_cast<size_t>(resultPlayersCount) * sizeof(uint64_t),
+        resultPlayers,
+        &used_bytes);
+    if (resultPlayersUsed) {
+        *resultPlayersUsed = static_cast<uint32_t>(used_bytes / sizeof(uint64_t));
+    }
+    return RecordHr("XGameUIShowPlayerPickerResult", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUIShowErrorDialogAsync(
+    XAsyncBlock* async,
+    XGameResult errorCode,
+    const char* /*context*/) {
+    if (!async) {
+        return RecordHr("XGameUIShowErrorDialogAsync", XGR_E_INVALIDARG);
+    }
+    auto* ctx = new (std::nothrow) GameUiErrorDialogCtx{errorCode};
+    if (!ctx) {
+        return RecordHr("XGameUIShowErrorDialogAsync", XGR_E_OUTOFMEMORY);
+    }
+    XGameResult hr = XAsyncBegin(
+        async, ctx, kIdGameUiErrorDialog, kIdGameUiErrorDialog, &GameUiErrorDialogProvider);
+    if (hr < 0) {
+        delete ctx;
+        return RecordHr("XGameUIShowErrorDialogAsync", hr);
+    }
+    hr = XAsyncSchedule(async, 0);
+    if (hr < 0) {
+        XAsyncComplete(async, hr, 0);
+    }
+    return RecordHr("XGameUIShowErrorDialogAsync", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUIShowErrorDialogResult(XAsyncBlock* async) {
+    if (!async) {
+        return RecordHr("XGameUIShowErrorDialogResult", XGR_E_INVALIDARG);
+    }
+    const XGameResult hr = XAsyncGetStatus(async, true);
+    return RecordHr("XGameUIShowErrorDialogResult", hr);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUISetNotificationPositionHint(
+    XGameUINotificationPositionHint position) {
+    if (static_cast<uint32_t>(position) >
+        static_cast<uint32_t>(XGameUINotificationPositionHint_TopRight)) {
+        return RecordHr("XGameUISetNotificationPositionHint", XGR_E_INVALIDARG);
+    }
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.ui_mutex);
+    rt.notification_pos = position;
+    return RecordHr("XGameUISetNotificationPositionHint", XGR_S_OK);
+}
+
+// ===========================================================================
+// XGameInvite
+// ===========================================================================
+XGameResult OPENSCARLETT_GDK_CALL XGameInviteRegisterForEvent(
+    XTaskQueueHandle queue,
+    void* context,
+    XGameInviteEventCallback callback,
+    XTaskQueueRegistrationToken* token) {
+    if (!callback || !token) {
+        return RecordHr("XGameInviteRegisterForEvent", XGR_E_INVALIDARG);
+    }
+    XTaskQueueHandle dup_q = nullptr;
+    if (queue) {
+        const XGameResult qhr = XTaskQueueDuplicateHandle(queue, &dup_q);
+        if (qhr < 0) {
+            return RecordHr("XGameInviteRegisterForEvent", qhr);
+        }
+    }
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.invite_mutex);
+    const uint64_t tok = rt.next_invite_token++;
+    rt.invite_listeners.push_back(InviteListenerEntry{tok, dup_q, context, callback});
+    token->token = tok;
+    return RecordHr("XGameInviteRegisterForEvent", XGR_S_OK);
+}
+
+bool OPENSCARLETT_GDK_CALL XGameInviteUnregisterForEvent(
+    XTaskQueueRegistrationToken token,
+    bool /*wait*/) {
+    RecordOk("XGameInviteUnregisterForEvent");
+    XTaskQueueHandle to_close = nullptr;
+    bool removed = false;
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.invite_mutex);
+        for (auto it = rt.invite_listeners.begin(); it != rt.invite_listeners.end(); ++it) {
+            if (it->token == token.token) {
+                to_close = it->queue;
+                rt.invite_listeners.erase(it);
+                removed = true;
+                break;
+            }
+        }
+    }
+    if (to_close) {
+        XTaskQueueCloseHandle(to_close);
+    }
+    return removed;
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameInviteDispatchTestEventForTest(const char* inviteUri) {
+    if (!inviteUri || *inviteUri == '\0') {
+        return RecordHr("XGameInviteDispatchTestEventForTest", XGR_E_INVALIDARG);
+    }
+    std::vector<InviteListenerEntry> snapshot;
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.invite_mutex);
+        snapshot = rt.invite_listeners;
+        for (auto& e : snapshot) {
+            if (e.queue) {
+                XTaskQueueHandle dup = nullptr;
+                if (XTaskQueueDuplicateHandle(e.queue, &dup) == XGR_S_OK) {
+                    e.queue = dup;
+                } else {
+                    e.queue = nullptr;
+                }
+            }
+        }
+    }
+
+    for (const auto& entry : snapshot) {
+        if (!entry.callback) {
+            if (entry.queue) XTaskQueueCloseHandle(entry.queue);
+            continue;
+        }
+        if (entry.queue) {
+            auto* dctx = new (std::nothrow) InviteDispatchCtx{entry.callback, entry.context, inviteUri};
+            if (dctx) {
+                const XGameResult shr = XTaskQueueSubmitCallback(
+                    entry.queue, XTaskQueuePort_Completion, dctx, &InviteDispatchTrampoline);
+                if (shr < 0) {
+                    delete dctx;
+                }
+            }
+            XTaskQueueCloseHandle(entry.queue);
+        } else {
+            entry.callback(entry.context, inviteUri);
+        }
+    }
+    return RecordHr("XGameInviteDispatchTestEventForTest", XGR_S_OK);
+}
+
+// ===========================================================================
+// XAccessibility (Closed Captions & High Contrast)
+// ===========================================================================
+XGameResult OPENSCARLETT_GDK_CALL XClosedCaptionGetProperties(
+    XClosedCaptionProperties* properties) {
+    if (!properties) {
+        return RecordHr("XClosedCaptionGetProperties", XGR_E_INVALIDARG);
+    }
+    bool enabled = false;
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.accessibility_mutex);
+        enabled = rt.closed_captions_enabled;
+    }
+    std::memset(properties, 0, sizeof(*properties));
+    properties->BackgroundColor.A = 0xC0u;
+    properties->BackgroundColor.R = 0x00u;
+    properties->BackgroundColor.G = 0x00u;
+    properties->BackgroundColor.B = 0x00u;
+    properties->FontColor.A = 0xFFu;
+    properties->FontColor.R = 0xFFu;
+    properties->FontColor.G = 0xFFu;
+    properties->FontColor.B = 0xFFu;
+    properties->WindowColor.A = 0x00u;
+    properties->FontEdgeAttribute = XClosedCaptionFontEdgeAttribute_DropShadowedEdges;
+    properties->FontStyle = XClosedCaptionFontStyle_ProportionalWithoutSerifs;
+    properties->FontScale = 1.0f;
+    properties->Enabled = enabled;
+    return RecordHr("XClosedCaptionGetProperties", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XClosedCaptionSetEnabled(bool enabled) {
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.accessibility_mutex);
+    rt.closed_captions_enabled = enabled;
+    return RecordHr("XClosedCaptionSetEnabled", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XHighContrastGetMode(XHighContrastMode* mode) {
+    if (!mode) {
+        return RecordHr("XHighContrastGetMode", XGR_E_INVALIDARG);
+    }
+    const std::string env_hc = GetEnvString("OPENSCARLETT_HIGH_CONTRAST");
+    if (!env_hc.empty()) {
+        std::string lo = env_hc;
+        for (char& c : lo) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        if (lo == "dark" || lo == "1") {
+            *mode = XHighContrastMode_Dark;
+            return RecordHr("XHighContrastGetMode", XGR_S_OK);
+        }
+        if (lo == "light" || lo == "2") {
+            *mode = XHighContrastMode_Light;
+            return RecordHr("XHighContrastGetMode", XGR_S_OK);
+        }
+        if (lo == "other" || lo == "3") {
+            *mode = XHighContrastMode_Other;
+            return RecordHr("XHighContrastGetMode", XGR_S_OK);
+        }
+        *mode = XHighContrastMode_Off;
+        return RecordHr("XHighContrastGetMode", XGR_S_OK);
+    }
+
+    *mode = XHighContrastMode_Off;
+#if defined(_WIN32)
+    // Probe live OS High Contrast state dynamically without hard-linking user32.dll.
+    HMODULE h_user32 = ::GetModuleHandleW(L"user32.dll");
+    if (h_user32) {
+        using PfnSpiW = BOOL(WINAPI*)(UINT, UINT, PVOID, UINT);
+        auto fn_spi = reinterpret_cast<PfnSpiW>(::GetProcAddress(h_user32, "SystemParametersInfoW"));
+        if (fn_spi) {
+            HIGHCONTRASTW hc{};
+            hc.cbSize = sizeof(hc);
+            if (fn_spi(SPI_GETHIGHCONTRAST, sizeof(hc), &hc, 0) &&
+                (hc.dwFlags & HCF_HIGHCONTRASTON) != 0u) {
+                *mode = XHighContrastMode_Dark;
+            }
+        }
+    }
+#endif
+    return RecordHr("XHighContrastGetMode", XGR_S_OK);
+}
+
+// ===========================================================================
+// XSpeechSynthesizer
+// ===========================================================================
+XGameResult OPENSCARLETT_GDK_CALL XSpeechSynthesizerCreate(
+    XSpeechSynthesizerHandle* speechSynthesizer) {
+    if (!speechSynthesizer) {
+        return RecordHr("XSpeechSynthesizerCreate", XGR_E_INVALIDARG);
+    }
+    auto sp = std::make_shared<XSpeechSynthesizer>();
+    XSpeechSynthesizerHandle raw = sp.get();
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.speech_mutex);
+        rt.live_synths[raw] = std::move(sp);
+    }
+    *speechSynthesizer = raw;
+    return RecordHr("XSpeechSynthesizerCreate", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XSpeechSynthesizerCloseHandle(
+    XSpeechSynthesizerHandle speechSynthesizer) {
+    if (!speechSynthesizer) {
+        return RecordHr("XSpeechSynthesizerCloseHandle", XGR_S_OK);
+    }
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.speech_mutex);
+    const size_t erased = rt.live_synths.erase(speechSynthesizer);
+    return RecordHr("XSpeechSynthesizerCloseHandle", erased > 0 ? XGR_S_OK : XGR_E_HANDLE);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XSpeechSynthesizerEnumerateInstalledVoices(
+    void* context,
+    XSpeechSynthesizerInstalledVoicesCallback callback) {
+    if (!callback) {
+        return RecordHr("XSpeechSynthesizerEnumerateInstalledVoices", XGR_E_INVALIDARG);
+    }
+    for (const auto& v : kBuiltinVoices) {
+        XSpeechSynthesizerVoiceInformation info{};
+        info.Description = v.description;
+        info.DisplayName = v.display_name;
+        info.Gender = v.gender;
+        info.VoiceId = v.voice_id;
+        info.Language = v.language;
+        if (!callback(&info, context)) {
+            break;
+        }
+    }
+    return RecordHr("XSpeechSynthesizerEnumerateInstalledVoices", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XSpeechSynthesizerSetDefaultVoice(
+    XSpeechSynthesizerHandle speechSynthesizer) {
+    if (!speechSynthesizer) {
+        return RecordHr("XSpeechSynthesizerSetDefaultVoice", XGR_E_INVALIDARG);
+    }
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.speech_mutex);
+    auto it = rt.live_synths.find(speechSynthesizer);
+    if (it == rt.live_synths.end()) {
+        return RecordHr("XSpeechSynthesizerSetDefaultVoice", XGR_E_HANDLE);
+    }
+    it->second->voice_id = kBuiltinVoices[0].voice_id;
+    it->second->is_male = (kBuiltinVoices[0].gender == XSpeechSynthesizerVoiceGender_Male);
+    return RecordHr("XSpeechSynthesizerSetDefaultVoice", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XSpeechSynthesizerSetCustomVoice(
+    XSpeechSynthesizerHandle speechSynthesizer,
+    const char* voiceId) {
+    if (!speechSynthesizer || !voiceId || !*voiceId) {
+        return RecordHr("XSpeechSynthesizerSetCustomVoice", XGR_E_INVALIDARG);
+    }
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.speech_mutex);
+    auto it = rt.live_synths.find(speechSynthesizer);
+    if (it == rt.live_synths.end()) {
+        return RecordHr("XSpeechSynthesizerSetCustomVoice", XGR_E_HANDLE);
+    }
+    for (const auto& v : kBuiltinVoices) {
+        if (std::strcmp(v.voice_id, voiceId) == 0) {
+            it->second->voice_id = v.voice_id;
+            it->second->is_male = (v.gender == XSpeechSynthesizerVoiceGender_Male);
+            return RecordHr("XSpeechSynthesizerSetCustomVoice", XGR_S_OK);
+        }
+    }
+    return RecordHr("XSpeechSynthesizerSetCustomVoice", XGR_E_NOT_FOUND);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XSpeechSynthesizerCreateStreamFromText(
+    XSpeechSynthesizerHandle speechSynthesizer,
+    const char* text,
+    XSpeechSynthesizerStreamHandle* speechSynthesisStream) {
+    if (!speechSynthesizer || !text || !speechSynthesisStream) {
+        return RecordHr("XSpeechSynthesizerCreateStreamFromText", XGR_E_INVALIDARG);
+    }
+    *speechSynthesisStream = nullptr;
+    bool is_male = false;
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.speech_mutex);
+        auto it = rt.live_synths.find(speechSynthesizer);
+        if (it == rt.live_synths.end()) {
+            return RecordHr("XSpeechSynthesizerCreateStreamFromText", XGR_E_HANDLE);
+        }
+        is_male = it->second->is_male;
+    }
+
+    auto stream = std::make_shared<XSpeechSynthesizerStream>();
+    stream->wav_bytes = SynthesizeDeterministicWav(text, is_male);
+    XSpeechSynthesizerStreamHandle raw = stream.get();
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.speech_mutex);
+        rt.live_streams[raw] = std::move(stream);
+    }
+    *speechSynthesisStream = raw;
+    return RecordHr("XSpeechSynthesizerCreateStreamFromText", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XSpeechSynthesizerGetStreamDataSize(
+    XSpeechSynthesizerStreamHandle speechSynthesisStream,
+    size_t* bufferSize) {
+    if (!speechSynthesisStream || !bufferSize) {
+        return RecordHr("XSpeechSynthesizerGetStreamDataSize", XGR_E_INVALIDARG);
+    }
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.speech_mutex);
+    auto it = rt.live_streams.find(speechSynthesisStream);
+    if (it == rt.live_streams.end()) {
+        return RecordHr("XSpeechSynthesizerGetStreamDataSize", XGR_E_HANDLE);
+    }
+    *bufferSize = it->second->wav_bytes.size();
+    return RecordHr("XSpeechSynthesizerGetStreamDataSize", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XSpeechSynthesizerGetStreamData(
+    XSpeechSynthesizerStreamHandle speechSynthesisStream,
+    size_t bufferSize,
+    void* buffer,
+    size_t* bufferUsed) {
+    if (!speechSynthesisStream || !buffer) {
+        return RecordHr("XSpeechSynthesizerGetStreamData", XGR_E_INVALIDARG);
+    }
+    std::shared_ptr<XSpeechSynthesizerStream> stream;
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.speech_mutex);
+        auto it = rt.live_streams.find(speechSynthesisStream);
+        if (it == rt.live_streams.end()) {
+            return RecordHr("XSpeechSynthesizerGetStreamData", XGR_E_HANDLE);
+        }
+        stream = it->second;
+    }
+    const size_t needed = stream->wav_bytes.size();
+    if (bufferUsed) {
+        *bufferUsed = needed;
+    }
+    if (bufferSize < needed) {
+        return RecordHr("XSpeechSynthesizerGetStreamData", XGR_E_NOT_SUFFICIENT_BUFFER);
+    }
+    if (needed > 0u) {
+        std::memcpy(buffer, stream->wav_bytes.data(), needed);
+    }
+    return RecordHr("XSpeechSynthesizerGetStreamData", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XSpeechSynthesizerCloseStreamHandle(
+    XSpeechSynthesizerStreamHandle speechSynthesisStream) {
+    if (!speechSynthesisStream) {
+        return RecordHr("XSpeechSynthesizerCloseStreamHandle", XGR_S_OK);
+    }
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.speech_mutex);
+    const size_t erased = rt.live_streams.erase(speechSynthesisStream);
+    return RecordHr("XSpeechSynthesizerCloseStreamHandle", erased > 0 ? XGR_S_OK : XGR_E_HANDLE);
 }
 
 }  // extern "C"
@@ -3207,7 +4255,11 @@ enum XgrApiIndex : size_t {
     kApiMem = 5,
     kApiPackage = 6,
     kApiDisplay = 7,
-    kApiCount = 8,
+    kApiGameUi = 8,
+    kApiGameInvite = 9,
+    kApiAccessibility = 10,
+    kApiSpeechSynthesizer = 11,
+    kApiCount = 12,
 };
 
 extern const IXgrTaskQueueApiVtable g_task_queue_vtable;
@@ -3218,6 +4270,10 @@ extern const IXgrSystemApiVtable g_system_vtable;
 extern const IXgrMemApiVtable g_mem_vtable;
 extern const IXgrPackageApiVtable g_package_vtable;
 extern const IXgrDisplayApiVtable g_display_vtable;
+extern const IXgrGameUiApiVtable g_game_ui_vtable;
+extern const IXgrGameInviteApiVtable g_game_invite_vtable;
+extern const IXgrAccessibilityApiVtable g_accessibility_vtable;
+extern const IXgrSpeechSynthesizerApiVtable g_speech_synth_vtable;
 
 int FindApiIndexByVtablePtr(const void* self) noexcept {
     if (self == &g_task_queue_vtable) return static_cast<int>(kApiTaskQueue);
@@ -3228,6 +4284,10 @@ int FindApiIndexByVtablePtr(const void* self) noexcept {
     if (self == &g_mem_vtable) return static_cast<int>(kApiMem);
     if (self == &g_package_vtable) return static_cast<int>(kApiPackage);
     if (self == &g_display_vtable) return static_cast<int>(kApiDisplay);
+    if (self == &g_game_ui_vtable) return static_cast<int>(kApiGameUi);
+    if (self == &g_game_invite_vtable) return static_cast<int>(kApiGameInvite);
+    if (self == &g_accessibility_vtable) return static_cast<int>(kApiAccessibility);
+    if (self == &g_speech_synth_vtable) return static_cast<int>(kApiSpeechSynthesizer);
     return -1;
 }
 
@@ -3387,6 +4447,56 @@ const IXgrDisplayApiVtable g_display_vtable = {
     &XDisplayTryEnableHdrMode,
     &XDisplayTryAcquireTimeoutDeferral,
     &XDisplayCloseTimeoutDeferralHandle,
+    &XDisplayAcquireTimeoutDeferral,
+};
+
+const IXgrGameUiApiVtable g_game_ui_vtable = {
+    &XgrVtableQueryInterface,
+    &XgrVtableAddRef,
+    &XgrVtableRelease,
+    &XLaunchUri,
+    &XGameUIShowMessageDialogAsync,
+    &XGameUIShowMessageDialogResult,
+    &XGameUIShowTextEntryAsync,
+    &XGameUIShowTextEntryResultSize,
+    &XGameUIShowTextEntryResult,
+    &XGameUIShowPlayerPickerAsync,
+    &XGameUIShowPlayerPickerResultCount,
+    &XGameUIShowPlayerPickerResult,
+    &XGameUIShowErrorDialogAsync,
+    &XGameUIShowErrorDialogResult,
+    &XGameUISetNotificationPositionHint,
+};
+
+const IXgrGameInviteApiVtable g_game_invite_vtable = {
+    &XgrVtableQueryInterface,
+    &XgrVtableAddRef,
+    &XgrVtableRelease,
+    &XGameInviteRegisterForEvent,
+    &XGameInviteUnregisterForEvent,
+};
+
+const IXgrAccessibilityApiVtable g_accessibility_vtable = {
+    &XgrVtableQueryInterface,
+    &XgrVtableAddRef,
+    &XgrVtableRelease,
+    &XClosedCaptionGetProperties,
+    &XClosedCaptionSetEnabled,
+    &XHighContrastGetMode,
+};
+
+const IXgrSpeechSynthesizerApiVtable g_speech_synth_vtable = {
+    &XgrVtableQueryInterface,
+    &XgrVtableAddRef,
+    &XgrVtableRelease,
+    &XSpeechSynthesizerCreate,
+    &XSpeechSynthesizerCloseHandle,
+    &XSpeechSynthesizerEnumerateInstalledVoices,
+    &XSpeechSynthesizerSetDefaultVoice,
+    &XSpeechSynthesizerCreateStreamFromText,
+    &XSpeechSynthesizerGetStreamDataSize,
+    &XSpeechSynthesizerGetStreamData,
+    &XSpeechSynthesizerCloseStreamHandle,
 };
 
 }  // namespace
@@ -3439,6 +4549,14 @@ XGameResult OPENSCARLETT_GDK_CALL QueryApiImpl(
         vtable = &g_package_vtable;
     } else if (XgrGuidEquals(*apiId, XGR_API_GUID_DISPLAY)) {
         vtable = &g_display_vtable;
+    } else if (XgrGuidEquals(*apiId, XGR_API_GUID_GAME_UI)) {
+        vtable = &g_game_ui_vtable;
+    } else if (XgrGuidEquals(*apiId, XGR_API_GUID_GAME_INVITE)) {
+        vtable = &g_game_invite_vtable;
+    } else if (XgrGuidEquals(*apiId, XGR_API_GUID_ACCESSIBILITY)) {
+        vtable = &g_accessibility_vtable;
+    } else if (XgrGuidEquals(*apiId, XGR_API_GUID_SPEECH_SYNTHESIZER)) {
+        vtable = &g_speech_synth_vtable;
     }
 
     if (!vtable) {

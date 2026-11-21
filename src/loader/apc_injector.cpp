@@ -4,10 +4,15 @@
 #include <cctype>
 #include <cwchar>
 #include <filesystem>
+#include <queue>
 #include <string>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include "openscarlett/core/telemetry.h"
 #include "openscarlett/loader/game_config.h"
 #include "openscarlett/loader/pe_inspector.h"
 #include "openscarlett/loader/vfs_mounts.h"
@@ -350,16 +355,52 @@ bool RedirectChildStaticXboxImports(HANDLE h_process,
         }
     }
 
-    // Stable-sort descriptors so base shims (priority 0) load before core (1) and dependent shims (2).
-    std::vector<size_t> order(descs.size());
-    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
-    std::stable_sort(order.begin(), order.end(),
-                     [&](size_t a, size_t b) { return priorities[a] < priorities[b]; });
+    // Order descriptors using deterministic Kahn's topological sort over PE imports
+    // so dependencies always initialize strictly before their importers (breaking ties by load_priority).
+    std::vector<DllDependencyNode> dep_nodes;
+    dep_nodes.reserve(descs.size());
+    for (size_t i = 0; i < descs.size(); ++i) {
+        DllDependencyNode node{};
+        std::string orig_name;
+        if (descs[i].Name != 0 && descs[i].Name < image_size) {
+            char name_buf[260]{};
+            const size_t max_read = std::min<size_t>(sizeof(name_buf) - 1, image_size - descs[i].Name);
+            if (::ReadProcessMemory(h_process,
+                                    reinterpret_cast<LPCVOID>(image_base + descs[i].Name),
+                                    name_buf, max_read, &rw) &&
+                rw > 0) {
+                name_buf[rw] = '\0';
+                orig_name = name_buf;
+            }
+        }
+        node.name = !full_paths[i].empty()
+                        ? std::filesystem::path(full_paths[i]).filename().string()
+                        : (orig_name.empty() ? ("import_" + std::to_string(i)) : orig_name);
+        node.file_path = full_paths[i];
+        node.load_priority = priorities[i];
+        if (!full_paths[i].empty()) {
+            PeInspectionReport dep_report{};
+            if (InspectPeFile(full_paths[i], dep_report).ok()) {
+                for (const auto& imp : dep_report.imports) {
+                    node.imports.push_back(imp.dll_name);
+                }
+            }
+        }
+        dep_nodes.push_back(std::move(node));
+    }
+
+    const DllInitOrderResult topo = ComputeDllInitOrder(dep_nodes);
     std::vector<IMAGE_IMPORT_DESCRIPTOR> sorted_descs;
     sorted_descs.reserve(descs.size());
-    for (size_t idx : order) {
+    for (size_t idx : topo.ordered_indices) {
         sorted_descs.push_back(descs[idx]);
     }
+    CallTelemetry::Global().Record(
+        "loader",
+        "RedirectChildStaticXboxImports:topo_sort",
+        CallOutcome::Ok,
+        static_cast<int32_t>(sorted_descs.size()),
+        -1);
 
     const size_t table_bytes = sorted_descs.size() * sizeof(IMAGE_IMPORT_DESCRIPTOR);
     DWORD old_prot = 0;
@@ -385,7 +426,276 @@ bool RedirectChildStaticXboxImports(HANDLE h_process,
 
 #endif  // _WIN32
 
+std::string NormalizeDllGraphKey(std::string_view raw) {
+    size_t pos = raw.find_last_of("\\/");
+    std::string_view base = (pos == std::string_view::npos) ? raw : raw.substr(pos + 1);
+    std::string out(base);
+    for (char& c : out) {
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
+    }
+    return out;
+}
+
 }  // namespace
+
+DllInitOrderResult ComputeDllInitOrder(const std::vector<DllDependencyNode>& nodes) {
+    DllInitOrderResult result{};
+    const size_t n = nodes.size();
+    if (n == 0) {
+        return result;
+    }
+
+    // Map normalized DLL basename -> first node index in the target set.
+    std::unordered_map<std::string, size_t> name_to_index;
+    name_to_index.reserve(n * 2);
+    for (size_t i = 0; i < n; ++i) {
+        std::string key = NormalizeDllGraphKey(nodes[i].name);
+        if (key.empty() && !nodes[i].file_path.empty()) {
+            key = NormalizeDllGraphKey(nodes[i].file_path);
+        }
+        if (!key.empty() && name_to_index.find(key) == name_to_index.end()) {
+            name_to_index.emplace(std::move(key), i);
+        }
+    }
+
+    // Directed graph: edge (dep -> importer) means `dep` must initialize before `importer`.
+    std::vector<std::vector<size_t>> dependents(n);
+    std::vector<size_t> in_degree(n, 0);
+
+    for (size_t importer = 0; importer < n; ++importer) {
+        std::unordered_set<size_t> seen_deps;
+        for (const auto& raw_imp : nodes[importer].imports) {
+            const std::string dep_key = NormalizeDllGraphKey(raw_imp);
+            auto it = name_to_index.find(dep_key);
+            if (it == name_to_index.end()) {
+                continue;
+            }
+            const size_t dep = it->second;
+            if (dep == importer) {
+                continue;  // Ignore self-imports.
+            }
+            if (seen_deps.insert(dep).second) {
+                dependents[dep].push_back(importer);
+                ++in_degree[importer];
+            }
+        }
+    }
+
+    // Deterministic min-heap ordered by (load_priority, original_index).
+    struct ReadyEntry {
+        int priority;
+        size_t index;
+        bool operator>(const ReadyEntry& other) const noexcept {
+            if (priority != other.priority) {
+                return priority > other.priority;
+            }
+            return index > other.index;
+        }
+    };
+    std::priority_queue<ReadyEntry, std::vector<ReadyEntry>, std::greater<ReadyEntry>> ready;
+    for (size_t i = 0; i < n; ++i) {
+        if (in_degree[i] == 0) {
+            ready.push(ReadyEntry{nodes[i].load_priority, i});
+        }
+    }
+
+    std::vector<uint8_t> emitted(n, 0);
+    result.ordered_indices.reserve(n);
+    result.ordered_names.reserve(n);
+
+    auto emit_node = [&](size_t u) {
+        emitted[u] = 1;
+        result.ordered_indices.push_back(u);
+        result.ordered_names.push_back(nodes[u].name);
+        for (size_t v : dependents[u]) {
+            if (emitted[v] != 0) {
+                continue;
+            }
+            if (in_degree[v] > 0) {
+                --in_degree[v];
+            }
+            if (in_degree[v] == 0) {
+                ready.push(ReadyEntry{nodes[v].load_priority, v});
+            }
+        }
+    };
+
+    while (result.ordered_indices.size() < n) {
+        if (!ready.empty()) {
+            const size_t u = ready.top().index;
+            ready.pop();
+            if (emitted[u] != 0) {
+                continue;
+            }
+            emit_node(u);
+        } else {
+            // Cycle detected: peel downstream non-cycle nodes (out-degree 0 in the remaining
+            // unemitted subgraph) so we break an actual cycle-forming node rather than a leaf
+            // that merely depends on the cycle. Then deterministically pick the candidate with
+            // lowest (in_degree, load_priority, original_index) and continue Kahn's sort.
+            result.had_cycles = true;
+            std::vector<uint8_t> in_core(n, 0);
+            std::vector<size_t> rem_out(n, 0);
+            for (size_t i = 0; i < n; ++i) {
+                if (emitted[i] == 0) {
+                    in_core[i] = 1;
+                    for (size_t v : dependents[i]) {
+                        if (emitted[v] == 0) {
+                            ++rem_out[i];
+                        }
+                    }
+                }
+            }
+            bool peeled = true;
+            while (peeled) {
+                peeled = false;
+                for (size_t i = 0; i < n; ++i) {
+                    if (in_core[i] != 0 && rem_out[i] == 0) {
+                        in_core[i] = 0;
+                        peeled = true;
+                        for (size_t p = 0; p < n; ++p) {
+                            if (in_core[p] == 0) continue;
+                            for (size_t v : dependents[p]) {
+                                if (v == i && rem_out[p] > 0) {
+                                    --rem_out[p];
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            bool any_core = false;
+            for (size_t i = 0; i < n; ++i) {
+                if (in_core[i] != 0) {
+                    any_core = true;
+                    break;
+                }
+            }
+
+            size_t best = n;
+            for (size_t i = 0; i < n; ++i) {
+                if (emitted[i] != 0) {
+                    continue;
+                }
+                if (any_core && in_core[i] == 0) {
+                    continue;
+                }
+                if (best == n ||
+                    in_degree[i] < in_degree[best] ||
+                    (in_degree[i] == in_degree[best] &&
+                     nodes[i].load_priority < nodes[best].load_priority) ||
+                    (in_degree[i] == in_degree[best] &&
+                     nodes[i].load_priority == nodes[best].load_priority &&
+                     i < best)) {
+                    best = i;
+                }
+            }
+            if (best == n) {
+                break;
+            }
+            result.cycle_broken_names.push_back(nodes[best].name);
+            emit_node(best);
+        }
+    }
+
+    return result;
+}
+
+Status ComputeDllInitOrderFromFiles(const std::vector<std::string>& dll_paths,
+                                    DllInitOrderResult& out_order) {
+    out_order = {};
+    if (dll_paths.empty()) {
+        return Status::Ok();
+    }
+
+    const DllRoutingTable routing = DllRoutingTable::CreateWithEnvOverrides();
+    std::vector<DllDependencyNode> nodes;
+    nodes.reserve(dll_paths.size());
+
+    for (const auto& path : dll_paths) {
+        PeInspectionReport report{};
+        auto st = InspectPeFile(path, report);
+        if (!st.ok()) {
+            return st;
+        }
+        DllDependencyNode node{};
+        node.name = std::filesystem::path(path).filename().string();
+        node.file_path = path;
+        if (const auto* rule = routing.FindRule(node.name)) {
+            node.load_priority = rule->load_priority;
+        }
+        for (const auto& imp : report.imports) {
+            node.imports.push_back(imp.dll_name);
+        }
+        nodes.push_back(std::move(node));
+    }
+
+    out_order = ComputeDllInitOrder(nodes);
+    CallTelemetry::Global().Record(
+        "loader",
+        "ComputeDllInitOrderFromFiles",
+        CallOutcome::Ok,
+        static_cast<int32_t>(out_order.ordered_indices.size()),
+        -1);
+    return Status::Ok();
+}
+
+Status LoadDllsInTopologicalOrder(const std::vector<std::string>& dll_paths,
+                                  std::vector<std::string>* out_loaded_order,
+                                  std::vector<void*>* out_handles) {
+    if (out_loaded_order) {
+        out_loaded_order->clear();
+    }
+    if (out_handles) {
+        out_handles->clear();
+    }
+#if !defined(_WIN32)
+    (void)dll_paths;
+    return Status::Error(StatusCode::NotImplemented, "DLL loading is Windows-only");
+#else
+    DllInitOrderResult order{};
+    auto st = ComputeDllInitOrderFromFiles(dll_paths, order);
+    if (!st.ok()) {
+        return st;
+    }
+
+    for (size_t idx : order.ordered_indices) {
+        const std::wstring wpath = ResolveAbsolutePathW(Utf8ToWide(dll_paths[idx]));
+        HMODULE mod = ::LoadLibraryExW(wpath.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+        if (!mod) {
+            mod = ::LoadLibraryW(wpath.c_str());
+        }
+        if (!mod) {
+            const DWORD err = ::GetLastError();
+            CallTelemetry::Global().Record(
+                "loader",
+                "LoadDllsInTopologicalOrder:" + std::filesystem::path(dll_paths[idx]).filename().string(),
+                CallOutcome::Error,
+                static_cast<int32_t>(err),
+                -1);
+            return Status::Error(
+                StatusCode::IoError,
+                FormatWin32Error(("LoadLibraryW(" + dll_paths[idx] + ")").c_str(), err));
+        }
+        const std::string fname = std::filesystem::path(dll_paths[idx]).filename().string();
+        CallTelemetry::Global().Record(
+            "loader",
+            "LoadDllsInTopologicalOrder:" + fname,
+            CallOutcome::Ok,
+            0,
+            -1);
+        if (out_loaded_order) {
+            out_loaded_order->push_back(fname);
+        }
+        if (out_handles) {
+            out_handles->push_back(reinterpret_cast<void*>(mod));
+        }
+    }
+    return Status::Ok();
+#endif
+}
 
 Status LaunchWithApcHook(const LaunchOptions& options, LaunchResult& out_result) {
     out_result = {};

@@ -1,11 +1,46 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "openscarlett/core/status.h"
 
 namespace openscarlett {
+
+// ---------------------------------------------------------------------------
+// Topological DLL Dependency Initialization Ordering (Kahn's Algorithm)
+// ---------------------------------------------------------------------------
+struct DllDependencyNode {
+    std::string name;                  // Display/canonical DLL name (e.g. "test_dep_top.dll")
+    std::string file_path;             // Optional resolved path on disk
+    int load_priority = 10;            // Tie-breaker priority (lower loads earlier)
+    std::vector<std::string> imports;  // DLL names imported by this node
+};
+
+struct DllInitOrderResult {
+    std::vector<std::string> ordered_names;       // Dependency-first order (dependencies before importers)
+    std::vector<size_t> ordered_indices;          // Indices into input nodes vector
+    std::vector<std::string> cycle_broken_names;  // Nodes where a cycle edge was deterministically broken
+    bool had_cycles = false;
+};
+
+// Deterministic Kahn's topological sort over a DLL import dependency graph.
+// Dependencies always precede their importers; ties are broken by (load_priority, original_index).
+// Cycles are broken deterministically without hanging while preserving all DAG constraints.
+DllInitOrderResult ComputeDllInitOrder(const std::vector<DllDependencyNode>& nodes);
+
+// Inspects PE import tables of the given DLL files on disk and computes their
+// topological dependency-first initialization order.
+Status ComputeDllInitOrderFromFiles(const std::vector<std::string>& dll_paths,
+                                    DllInitOrderResult& out_order);
+
+// Loads the given DLLs in strict topological dependency-first order (dependencies before importers),
+// recording telemetry and optionally returning the resolved order and loaded HMODULE handles.
+Status LoadDllsInTopologicalOrder(const std::vector<std::string>& dll_paths,
+                                  std::vector<std::string>* out_loaded_order = nullptr,
+                                  std::vector<void*>* out_handles = nullptr);
 
 struct LaunchOptions {
     std::string exe_path;               // Package dir, MicrosoftGame.Config/.mgc, or direct .exe

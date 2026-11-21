@@ -590,6 +590,10 @@ OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XPackageEnumerateChunkAva
 // ---------------------------------------------------------------------------
 // XDisplay
 // ---------------------------------------------------------------------------
+typedef uint32_t XDisplayHdrModePreference;
+constexpr XDisplayHdrModePreference XDisplayHdrModePreference_PreferHdr = 0u;
+constexpr XDisplayHdrModePreference XDisplayHdrModePreference_PreferRefreshRate = 1u;
+
 enum XDisplayHdrModeResult : uint32_t {
     XDisplayHdrModeResult_Unknown = 0,
     XDisplayHdrModeResult_Enabled = 1,
@@ -605,12 +609,240 @@ struct XDisplayHdrModeInfo {
 typedef struct XDisplayTimeoutDeferral* XDisplayTimeoutDeferralHandle;
 
 OPENSCARLETT_GDK_API XDisplayHdrModeResult OPENSCARLETT_GDK_CALL XDisplayTryEnableHdrMode(
-    uint32_t preferredHdrMode,
+    XDisplayHdrModePreference preferredMode,
     XDisplayHdrModeInfo* displayHdrModeInfo);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XDisplayAcquireTimeoutDeferral(
+    XDisplayTimeoutDeferralHandle* handle);
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XDisplayTryAcquireTimeoutDeferral(
     XDisplayTimeoutDeferralHandle* handle);
 OPENSCARLETT_GDK_API void OPENSCARLETT_GDK_CALL XDisplayCloseTimeoutDeferralHandle(
     XDisplayTimeoutDeferralHandle handle);
+
+// ---------------------------------------------------------------------------
+// XLauncher & XGameUI
+// ---------------------------------------------------------------------------
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XLaunchUri(
+    XUserHandle requestingUser,
+    const char* uri);
+
+enum XGameUIMessageDialogButton : uint32_t {
+    XGameUIMessageDialogButton_First = 0,
+    XGameUIMessageDialogButton_Second = 1,
+    XGameUIMessageDialogButton_Third = 2,
+};
+
+enum XGameUITextEntryInputScope : uint32_t {
+    XGameUITextEntryInputScope_Default = 0,
+    XGameUITextEntryInputScope_Url = 1,
+    XGameUITextEntryInputScope_EmailSmtpAddress = 5,
+    XGameUITextEntryInputScope_Number = 29,
+    XGameUITextEntryInputScope_Password = 31,
+    XGameUITextEntryInputScope_TelephoneNumber = 32,
+    XGameUITextEntryInputScope_Alphanumeric = 40,
+    XGameUITextEntryInputScope_Search = 50,
+};
+
+enum XGameUINotificationPositionHint : uint32_t {
+    XGameUINotificationPositionHint_BottomCenter = 0,
+    XGameUINotificationPositionHint_BottomLeft = 1,
+    XGameUINotificationPositionHint_BottomRight = 2,
+    XGameUINotificationPositionHint_TopCenter = 3,
+    XGameUINotificationPositionHint_TopLeft = 4,
+    XGameUINotificationPositionHint_TopRight = 5,
+};
+
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUIShowMessageDialogAsync(
+    XAsyncBlock* async,
+    const char* titleText,
+    const char* contentText,
+    const char* firstButtonText,
+    const char* secondButtonText,
+    const char* thirdButtonText,
+    XGameUIMessageDialogButton defaultButton,
+    XGameUIMessageDialogButton cancelButton);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUIShowMessageDialogResult(
+    XAsyncBlock* async,
+    XGameUIMessageDialogButton* resultButton);
+
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUIShowTextEntryAsync(
+    XAsyncBlock* async,
+    const char* titleText,
+    const char* descriptionText,
+    const char* defaultText,
+    XGameUITextEntryInputScope inputScope,
+    uint32_t maxTextLength);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUIShowTextEntryResultSize(
+    XAsyncBlock* async,
+    uint32_t* resultTextBufferSize);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUIShowTextEntryResult(
+    XAsyncBlock* async,
+    uint32_t resultTextBufferSize,
+    char* resultTextBuffer,
+    uint32_t* resultTextBufferUsed);
+
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUIShowPlayerPickerAsync(
+    XAsyncBlock* async,
+    XUserHandle requestingUser,
+    const char* promptText,
+    uint32_t selectFromPlayersCount,
+    const uint64_t* selectFromPlayers,
+    uint32_t preSelectedPlayersCount,
+    const uint64_t* preSelectedPlayers,
+    uint32_t minSelectionCount,
+    uint32_t maxSelectionCount);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUIShowPlayerPickerResultCount(
+    XAsyncBlock* async,
+    uint32_t* resultPlayersCount);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUIShowPlayerPickerResult(
+    XAsyncBlock* async,
+    uint32_t resultPlayersCount,
+    uint64_t* resultPlayers,
+    uint32_t* resultPlayersUsed);
+
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUIShowErrorDialogAsync(
+    XAsyncBlock* async,
+    XGameResult errorCode,
+    const char* context);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUIShowErrorDialogResult(
+    XAsyncBlock* async);
+
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUISetNotificationPositionHint(
+    XGameUINotificationPositionHint position);
+
+// ---------------------------------------------------------------------------
+// XGameInvite
+// ---------------------------------------------------------------------------
+typedef void(OPENSCARLETT_GDK_CALL* XGameInviteEventCallback)(
+    void* context,
+    const char* inviteUri);
+
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameInviteRegisterForEvent(
+    XTaskQueueHandle queue,
+    void* context,
+    XGameInviteEventCallback callback,
+    XTaskQueueRegistrationToken* token);
+OPENSCARLETT_GDK_API bool OPENSCARLETT_GDK_CALL XGameInviteUnregisterForEvent(
+    XTaskQueueRegistrationToken token,
+    bool wait);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameInviteDispatchTestEventForTest(
+    const char* inviteUri);
+
+// ---------------------------------------------------------------------------
+// XAccessibility (Closed Captions & High Contrast)
+// ---------------------------------------------------------------------------
+#if defined(_MSC_VER)
+#  pragma warning(push)
+#  pragma warning(disable : 4201)
+#endif
+struct XColor {
+    union {
+        struct {
+            uint8_t A;
+            uint8_t R;
+            uint8_t G;
+            uint8_t B;
+        };
+        uint32_t Value;
+    };
+};
+#if defined(_MSC_VER)
+#  pragma warning(pop)
+#endif
+static_assert(sizeof(XColor) == 4, "XColor must be 4 bytes");
+
+enum XClosedCaptionFontEdgeAttribute : uint32_t {
+    XClosedCaptionFontEdgeAttribute_Default = 0,
+    XClosedCaptionFontEdgeAttribute_NoEdges = 1,
+    XClosedCaptionFontEdgeAttribute_RaisedEdges = 2,
+    XClosedCaptionFontEdgeAttribute_DepressedEdges = 3,
+    XClosedCaptionFontEdgeAttribute_UniformBorderedEdges = 4,
+    XClosedCaptionFontEdgeAttribute_DropShadowedEdges = 5,
+};
+
+enum XClosedCaptionFontStyle : uint32_t {
+    XClosedCaptionFontStyle_Default = 0,
+    XClosedCaptionFontStyle_MonospacedWithSerifs = 1,
+    XClosedCaptionFontStyle_ProportionalWithSerifs = 2,
+    XClosedCaptionFontStyle_MonospacedWithoutSerifs = 3,
+    XClosedCaptionFontStyle_ProportionalWithoutSerifs = 4,
+    XClosedCaptionFontStyle_Casual = 5,
+    XClosedCaptionFontStyle_Cursive = 6,
+    XClosedCaptionFontStyle_SmallCapitals = 7,
+};
+
+struct XClosedCaptionProperties {
+    XColor BackgroundColor;
+    XColor FontColor;
+    XColor WindowColor;
+    XClosedCaptionFontEdgeAttribute FontEdgeAttribute;
+    XClosedCaptionFontStyle FontStyle;
+    float FontScale;
+    bool Enabled;
+};
+
+enum XHighContrastMode : uint32_t {
+    XHighContrastMode_Off = 0,
+    XHighContrastMode_Dark = 1,
+    XHighContrastMode_Light = 2,
+    XHighContrastMode_Other = 3,
+};
+
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XClosedCaptionGetProperties(
+    XClosedCaptionProperties* properties);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XClosedCaptionSetEnabled(
+    bool enabled);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XHighContrastGetMode(
+    XHighContrastMode* mode);
+
+// ---------------------------------------------------------------------------
+// XSpeechSynthesizer
+// ---------------------------------------------------------------------------
+typedef struct XSpeechSynthesizer* XSpeechSynthesizerHandle;
+typedef struct XSpeechSynthesizerStream* XSpeechSynthesizerStreamHandle;
+
+enum XSpeechSynthesizerVoiceGender : uint32_t {
+    XSpeechSynthesizerVoiceGender_Female = 0,
+    XSpeechSynthesizerVoiceGender_Male = 1,
+};
+
+struct XSpeechSynthesizerVoiceInformation {
+    const char* Description;
+    const char* DisplayName;
+    XSpeechSynthesizerVoiceGender Gender;
+    const char* VoiceId;
+    const char* Language;
+};
+
+typedef bool(OPENSCARLETT_GDK_CALL* XSpeechSynthesizerInstalledVoicesCallback)(
+    const XSpeechSynthesizerVoiceInformation* information,
+    void* context);
+
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XSpeechSynthesizerCreate(
+    XSpeechSynthesizerHandle* speechSynthesizer);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XSpeechSynthesizerCloseHandle(
+    XSpeechSynthesizerHandle speechSynthesizer);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XSpeechSynthesizerEnumerateInstalledVoices(
+    void* context,
+    XSpeechSynthesizerInstalledVoicesCallback callback);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XSpeechSynthesizerSetDefaultVoice(
+    XSpeechSynthesizerHandle speechSynthesizer);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XSpeechSynthesizerSetCustomVoice(
+    XSpeechSynthesizerHandle speechSynthesizer,
+    const char* voiceId);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XSpeechSynthesizerCreateStreamFromText(
+    XSpeechSynthesizerHandle speechSynthesizer,
+    const char* text,
+    XSpeechSynthesizerStreamHandle* speechSynthesisStream);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XSpeechSynthesizerGetStreamDataSize(
+    XSpeechSynthesizerStreamHandle speechSynthesisStream,
+    size_t* bufferSize);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XSpeechSynthesizerGetStreamData(
+    XSpeechSynthesizerStreamHandle speechSynthesisStream,
+    size_t bufferSize,
+    void* buffer,
+    size_t* bufferUsed);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XSpeechSynthesizerCloseStreamHandle(
+    XSpeechSynthesizerStreamHandle speechSynthesisStream);
 
 // ---------------------------------------------------------------------------
 // GDK Static Import Runtime Dispatch (InitializeApiImpl / QueryApiImpl)
@@ -642,6 +874,14 @@ constexpr XgrGuid XGR_API_GUID_PACKAGE = {
     0x4F534752u, 0x0007u, 0x4000u, {0x80, 0x07, 0x00, 0x58, 0x50, 0x4B, 0x00, 0x07}};
 constexpr XgrGuid XGR_API_GUID_DISPLAY = {
     0x4F534752u, 0x0008u, 0x4000u, {0x80, 0x08, 0x00, 0x58, 0x44, 0x50, 0x00, 0x08}};
+constexpr XgrGuid XGR_API_GUID_GAME_UI = {
+    0x4F534752u, 0x0009u, 0x4000u, {0x80, 0x09, 0x00, 0x58, 0x55, 0x49, 0x00, 0x09}};
+constexpr XgrGuid XGR_API_GUID_GAME_INVITE = {
+    0x4F534752u, 0x000Au, 0x4000u, {0x80, 0x0A, 0x00, 0x58, 0x49, 0x4E, 0x00, 0x0A}};
+constexpr XgrGuid XGR_API_GUID_ACCESSIBILITY = {
+    0x4F534752u, 0x000Bu, 0x4000u, {0x80, 0x0B, 0x00, 0x58, 0x41, 0x43, 0x00, 0x0B}};
+constexpr XgrGuid XGR_API_GUID_SPEECH_SYNTHESIZER = {
+    0x4F534752u, 0x000Cu, 0x4000u, {0x80, 0x0C, 0x00, 0x58, 0x53, 0x50, 0x00, 0x0C}};
 
 typedef XGameResult(OPENSCARLETT_GDK_CALL* XgrQueryInterfaceFn)(
     const void* self,
@@ -886,12 +1126,135 @@ struct IXgrDisplayApiVtable {
     XgrReleaseFn Release;
 
     XDisplayHdrModeResult(OPENSCARLETT_GDK_CALL* XDisplayTryEnableHdrMode)(
-        uint32_t preferredHdrMode,
+        XDisplayHdrModePreference preferredMode,
         XDisplayHdrModeInfo* displayHdrModeInfo);
     XGameResult(OPENSCARLETT_GDK_CALL* XDisplayTryAcquireTimeoutDeferral)(
         XDisplayTimeoutDeferralHandle* handle);
     void(OPENSCARLETT_GDK_CALL* XDisplayCloseTimeoutDeferralHandle)(
         XDisplayTimeoutDeferralHandle handle);
+    XGameResult(OPENSCARLETT_GDK_CALL* XDisplayAcquireTimeoutDeferral)(
+        XDisplayTimeoutDeferralHandle* handle);
+};
+
+struct IXgrGameUiApiVtable {
+    XgrQueryInterfaceFn QueryInterface;
+    XgrAddRefFn AddRef;
+    XgrReleaseFn Release;
+
+    XGameResult(OPENSCARLETT_GDK_CALL* XLaunchUri)(
+        XUserHandle requestingUser,
+        const char* uri);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameUIShowMessageDialogAsync)(
+        XAsyncBlock* async,
+        const char* titleText,
+        const char* contentText,
+        const char* firstButtonText,
+        const char* secondButtonText,
+        const char* thirdButtonText,
+        XGameUIMessageDialogButton defaultButton,
+        XGameUIMessageDialogButton cancelButton);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameUIShowMessageDialogResult)(
+        XAsyncBlock* async,
+        XGameUIMessageDialogButton* resultButton);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameUIShowTextEntryAsync)(
+        XAsyncBlock* async,
+        const char* titleText,
+        const char* descriptionText,
+        const char* defaultText,
+        XGameUITextEntryInputScope inputScope,
+        uint32_t maxTextLength);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameUIShowTextEntryResultSize)(
+        XAsyncBlock* async,
+        uint32_t* resultTextBufferSize);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameUIShowTextEntryResult)(
+        XAsyncBlock* async,
+        uint32_t resultTextBufferSize,
+        char* resultTextBuffer,
+        uint32_t* resultTextBufferUsed);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameUIShowPlayerPickerAsync)(
+        XAsyncBlock* async,
+        XUserHandle requestingUser,
+        const char* promptText,
+        uint32_t selectFromPlayersCount,
+        const uint64_t* selectFromPlayers,
+        uint32_t preSelectedPlayersCount,
+        const uint64_t* preSelectedPlayers,
+        uint32_t minSelectionCount,
+        uint32_t maxSelectionCount);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameUIShowPlayerPickerResultCount)(
+        XAsyncBlock* async,
+        uint32_t* resultPlayersCount);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameUIShowPlayerPickerResult)(
+        XAsyncBlock* async,
+        uint32_t resultPlayersCount,
+        uint64_t* resultPlayers,
+        uint32_t* resultPlayersUsed);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameUIShowErrorDialogAsync)(
+        XAsyncBlock* async,
+        XGameResult errorCode,
+        const char* context);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameUIShowErrorDialogResult)(
+        XAsyncBlock* async);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameUISetNotificationPositionHint)(
+        XGameUINotificationPositionHint position);
+};
+
+struct IXgrGameInviteApiVtable {
+    XgrQueryInterfaceFn QueryInterface;
+    XgrAddRefFn AddRef;
+    XgrReleaseFn Release;
+
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameInviteRegisterForEvent)(
+        XTaskQueueHandle queue,
+        void* context,
+        XGameInviteEventCallback callback,
+        XTaskQueueRegistrationToken* token);
+    bool(OPENSCARLETT_GDK_CALL* XGameInviteUnregisterForEvent)(
+        XTaskQueueRegistrationToken token,
+        bool wait);
+};
+
+struct IXgrAccessibilityApiVtable {
+    XgrQueryInterfaceFn QueryInterface;
+    XgrAddRefFn AddRef;
+    XgrReleaseFn Release;
+
+    XGameResult(OPENSCARLETT_GDK_CALL* XClosedCaptionGetProperties)(
+        XClosedCaptionProperties* properties);
+    XGameResult(OPENSCARLETT_GDK_CALL* XClosedCaptionSetEnabled)(
+        bool enabled);
+    XGameResult(OPENSCARLETT_GDK_CALL* XHighContrastGetMode)(
+        XHighContrastMode* mode);
+};
+
+struct IXgrSpeechSynthesizerApiVtable {
+    XgrQueryInterfaceFn QueryInterface;
+    XgrAddRefFn AddRef;
+    XgrReleaseFn Release;
+
+    XGameResult(OPENSCARLETT_GDK_CALL* XSpeechSynthesizerCreate)(
+        XSpeechSynthesizerHandle* speechSynthesizer);
+    XGameResult(OPENSCARLETT_GDK_CALL* XSpeechSynthesizerCloseHandle)(
+        XSpeechSynthesizerHandle speechSynthesizer);
+    XGameResult(OPENSCARLETT_GDK_CALL* XSpeechSynthesizerEnumerateInstalledVoices)(
+        void* context,
+        XSpeechSynthesizerInstalledVoicesCallback callback);
+    XGameResult(OPENSCARLETT_GDK_CALL* XSpeechSynthesizerSetDefaultVoice)(
+        XSpeechSynthesizerHandle speechSynthesizer);
+    XGameResult(OPENSCARLETT_GDK_CALL* XSpeechSynthesizerCreateStreamFromText)(
+        XSpeechSynthesizerHandle speechSynthesizer,
+        const char* text,
+        XSpeechSynthesizerStreamHandle* speechSynthesisStream);
+    XGameResult(OPENSCARLETT_GDK_CALL* XSpeechSynthesizerGetStreamDataSize)(
+        XSpeechSynthesizerStreamHandle speechSynthesisStream,
+        size_t* bufferSize);
+    XGameResult(OPENSCARLETT_GDK_CALL* XSpeechSynthesizerGetStreamData)(
+        XSpeechSynthesizerStreamHandle speechSynthesisStream,
+        size_t bufferSize,
+        void* buffer,
+        size_t* bufferUsed);
+    XGameResult(OPENSCARLETT_GDK_CALL* XSpeechSynthesizerCloseStreamHandle)(
+        XSpeechSynthesizerStreamHandle speechSynthesisStream);
 };
 
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL InitializeApiImpl(void);

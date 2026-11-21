@@ -1363,6 +1363,318 @@ void OPENSCARLETT_XAUDIO2_CALL SourceVoiceImpl::DestroyVoice() {
     }
 }
 
+// ===========================================================================
+// X3DAudio Clean-Room 3D Spatialization Engine
+// ===========================================================================
+constexpr uint32_t kX3dAudioMagic = 0x58334441u;  // "X3DA"
+
+struct X3dAudioInstanceState {
+    uint32_t magic;
+    uint32_t speaker_channel_mask;
+    uint32_t channel_count;
+    float speed_of_sound;
+    uint32_t reserved;
+};
+static_assert(sizeof(X3dAudioInstanceState) == OS_X3DAUDIO_HANDLE_BYTESIZE,
+              "X3dAudioInstanceState must fit exactly in 20-byte X3DAUDIO_HANDLE");
+
+uint32_t Popcount32(uint32_t v) noexcept {
+    uint32_t c = 0;
+    while (v != 0u) {
+        v &= (v - 1u);
+        ++c;
+    }
+    return c;
+}
+
+float VecDot(const X3DAUDIO_VECTOR& a, const X3DAUDIO_VECTOR& b) noexcept {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+X3DAUDIO_VECTOR VecSub(const X3DAUDIO_VECTOR& a, const X3DAUDIO_VECTOR& b) noexcept {
+    return {a.x - b.x, a.y - b.y, a.z - b.z};
+}
+
+X3DAUDIO_VECTOR VecCross(const X3DAUDIO_VECTOR& a, const X3DAUDIO_VECTOR& b) noexcept {
+    return {
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x,
+    };
+}
+
+float VecLength(const X3DAUDIO_VECTOR& v) noexcept {
+    return std::sqrt(v.x * v.x + v.y * v.y + v.z * v.z);
+}
+
+X3DAUDIO_VECTOR VecNormalizeOrDefault(const X3DAUDIO_VECTOR& v,
+                                      const X3DAUDIO_VECTOR& fallback) noexcept {
+    const float len = VecLength(v);
+    if (len <= 1e-6f || !std::isfinite(len)) {
+        return fallback;
+    }
+    const float inv = 1.0f / len;
+    return {v.x * inv, v.y * inv, v.z * inv};
+}
+
+float EvalDistanceCurve(const X3DAUDIO_DISTANCE_CURVE* curve, float norm_dist, float fallback) noexcept {
+    if (!curve || !curve->pPoints || curve->PointCount == 0u) {
+        return fallback;
+    }
+    if (norm_dist <= curve->pPoints[0].Distance) {
+        return curve->pPoints[0].DSPSetting;
+    }
+    const uint32_t last = curve->PointCount - 1u;
+    if (norm_dist >= curve->pPoints[last].Distance) {
+        return curve->pPoints[last].DSPSetting;
+    }
+    for (uint32_t i = 0; i < last; ++i) {
+        const auto& p0 = curve->pPoints[i];
+        const auto& p1 = curve->pPoints[i + 1u];
+        if (norm_dist >= p0.Distance && norm_dist <= p1.Distance) {
+            const float span = p1.Distance - p0.Distance;
+            if (span <= 1e-6f) {
+                return p1.DSPSetting;
+            }
+            const float t = (norm_dist - p0.Distance) / span;
+            return p0.DSPSetting + t * (p1.DSPSetting - p0.DSPSetting);
+        }
+    }
+    return curve->pPoints[last].DSPSetting;
+}
+
+float WrapAnglePi(float a) noexcept {
+    constexpr float kTwoPi = 2.0f * OS_X3DAUDIO_PI;
+    while (a > OS_X3DAUDIO_PI) a -= kTwoPi;
+    while (a <= -OS_X3DAUDIO_PI) a += kTwoPi;
+    return a;
+}
+
+struct SpeakerSlot {
+    uint32_t bit = 0;
+    uint32_t dst_index = 0;
+    float azimuth = 0.0f;
+    bool is_lfe = false;
+    bool is_center = false;
+};
+
+std::vector<SpeakerSlot> BuildSpeakerLayout(uint32_t mask, uint32_t dst_channels) {
+    struct KnownSpeaker {
+        uint32_t bit;
+        float azimuth;
+        bool is_lfe;
+        bool is_center;
+    };
+    static constexpr KnownSpeaker kKnown[] = {
+        {OS_SPEAKER_FRONT_LEFT, -OS_X3DAUDIO_PI * 0.25f, false, false},
+        {OS_SPEAKER_FRONT_RIGHT, OS_X3DAUDIO_PI * 0.25f, false, false},
+        {OS_SPEAKER_FRONT_CENTER, 0.0f, false, true},
+        {OS_SPEAKER_LOW_FREQUENCY, 0.0f, true, false},
+        {OS_SPEAKER_BACK_LEFT, -OS_X3DAUDIO_PI * 0.75f, false, false},
+        {OS_SPEAKER_BACK_RIGHT, OS_X3DAUDIO_PI * 0.75f, false, false},
+        {0x00000040u, -OS_X3DAUDIO_PI * 0.125f, false, false},  // FRONT_LEFT_OF_CENTER
+        {0x00000080u, OS_X3DAUDIO_PI * 0.125f, false, false},   // FRONT_RIGHT_OF_CENTER
+        {0x00000100u, OS_X3DAUDIO_PI, false, false},            // BACK_CENTER
+        {OS_SPEAKER_SIDE_LEFT, -OS_X3DAUDIO_PI * 0.5f, false, false},
+        {OS_SPEAKER_SIDE_RIGHT, OS_X3DAUDIO_PI * 0.5f, false, false},
+    };
+
+    std::vector<SpeakerSlot> out;
+    uint32_t idx = 0;
+    for (const auto& sp : kKnown) {
+        if ((mask & sp.bit) != 0u && idx < dst_channels) {
+            out.push_back(SpeakerSlot{sp.bit, idx, sp.azimuth, sp.is_lfe, sp.is_center});
+            ++idx;
+        }
+    }
+    // Fill any remaining channels generically if caller passed a custom mask/count.
+    while (idx < dst_channels) {
+        const float az = -OS_X3DAUDIO_PI + (2.0f * OS_X3DAUDIO_PI * static_cast<float>(idx)) /
+                                               static_cast<float>(std::max(1u, dst_channels));
+        out.push_back(SpeakerSlot{0u, idx, az, false, false});
+        ++idx;
+    }
+    return out;
+}
+
+// ===========================================================================
+// XAudio2FX Clean-Room COM APOs (Reverb & VolumeMeter)
+// ===========================================================================
+class ReverbApoImpl final : public OS_IXAPOParameters {
+public:
+    explicit ReverbApoImpl(uint32_t flags) : flags_(flags) {
+        // Initialize standard XAudio2FX reverb defaults.
+        params_.WetDryMix = 100.0f;
+        params_.ReflectionsDelay = 5u;
+        params_.ReverbDelay = 5u;
+        params_.RearDelay = 5u;
+        params_.SideDelay = 5u;
+        params_.PositionLeft = 6u;
+        params_.PositionRight = 6u;
+        params_.PositionMatrixLeft = 27u;
+        params_.PositionMatrixRight = 27u;
+        params_.EarlyDiffusion = 8u;
+        params_.LateDiffusion = 8u;
+        params_.LowEQGain = 8u;
+        params_.LowEQCutoff = 4u;
+        params_.HighEQGain = 8u;
+        params_.HighEQCutoff = 4u;
+        params_.RoomFilterFreq = 5000.0f;
+        params_.RoomFilterMain = 0.0f;
+        params_.RoomFilterHF = 0.0f;
+        params_.ReflectionsGain = 0.0f;
+        params_.ReverbGain = 0.0f;
+        params_.DecayTime = 1.0f;
+        params_.Density = 100.0f;
+        params_.RoomSize = 100.0f;
+        params_.DisableLateField = 0;
+    }
+
+    int32_t OPENSCARLETT_XAUDIO2_CALL QueryInterface(
+        const XAudio2Guid* riid, void** ppvObject) override {
+        if (!ppvObject) {
+            return RecordHr("XAudio2FXReverb::QueryInterface", OS_XAUDIO2_E_POINTER, 0);
+        }
+        *ppvObject = nullptr;
+        if (!riid) {
+            return RecordHr("XAudio2FXReverb::QueryInterface", OS_XAUDIO2_E_INVALIDARG, 0);
+        }
+        if (GuidEquals(riid, IID_OS_XAudio2_IUnknown) ||
+            GuidEquals(riid, IID_OS_IXAPO) ||
+            GuidEquals(riid, IID_OS_IXAPOParameters)) {
+            AddRef();
+            *ppvObject = static_cast<OS_IXAPOParameters*>(this);
+            return RecordHr("XAudio2FXReverb::QueryInterface", OS_XAUDIO2_S_OK, 0);
+        }
+        return RecordHr("XAudio2FXReverb::QueryInterface", OS_XAUDIO2_E_NOINTERFACE, 0);
+    }
+
+    uint32_t OPENSCARLETT_XAUDIO2_CALL AddRef() override {
+        RecordOk("XAudio2FXReverb::AddRef", 1);
+        return ref_count_.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    }
+
+    uint32_t OPENSCARLETT_XAUDIO2_CALL Release() override {
+        RecordOk("XAudio2FXReverb::Release", 2);
+        const uint32_t rem = ref_count_.fetch_sub(1u, std::memory_order_acq_rel) - 1u;
+        if (rem == 0u) {
+            delete this;
+        }
+        return rem;
+    }
+
+    void OPENSCARLETT_XAUDIO2_CALL SetParameters(
+        const void* pParameters, uint32_t ParameterByteSize) override {
+        RecordOk("XAudio2FXReverb::SetParameters", 3);
+        if (!pParameters || ParameterByteSize == 0u) {
+            return;
+        }
+        std::lock_guard<std::mutex> lk(mutex_);
+        const size_t copy_bytes = std::min<size_t>(sizeof(params_), ParameterByteSize);
+        std::memcpy(&params_, pParameters, copy_bytes);
+    }
+
+    void OPENSCARLETT_XAUDIO2_CALL GetParameters(
+        void* pParameters, uint32_t ParameterByteSize) override {
+        RecordOk("XAudio2FXReverb::GetParameters", 4);
+        if (!pParameters || ParameterByteSize == 0u) {
+            return;
+        }
+        std::lock_guard<std::mutex> lk(mutex_);
+        const size_t copy_bytes = std::min<size_t>(sizeof(params_), ParameterByteSize);
+        std::memcpy(pParameters, &params_, copy_bytes);
+    }
+
+private:
+    std::atomic<uint32_t> ref_count_{1u};
+    uint32_t flags_ = 0u;
+    std::mutex mutex_;
+    OS_XAUDIO2FX_REVERB_PARAMETERS params_{};
+};
+
+class VolumeMeterApoImpl final : public OS_IXAPOParameters {
+public:
+    explicit VolumeMeterApoImpl(uint32_t flags)
+        : flags_(flags), peak_levels_(8u, 0.0f), rms_levels_(8u, 0.0f) {}
+
+    int32_t OPENSCARLETT_XAUDIO2_CALL QueryInterface(
+        const XAudio2Guid* riid, void** ppvObject) override {
+        if (!ppvObject) {
+            return RecordHr("XAudio2FXVolumeMeter::QueryInterface", OS_XAUDIO2_E_POINTER, 0);
+        }
+        *ppvObject = nullptr;
+        if (!riid) {
+            return RecordHr("XAudio2FXVolumeMeter::QueryInterface", OS_XAUDIO2_E_INVALIDARG, 0);
+        }
+        if (GuidEquals(riid, IID_OS_XAudio2_IUnknown) ||
+            GuidEquals(riid, IID_OS_IXAPO) ||
+            GuidEquals(riid, IID_OS_IXAPOParameters)) {
+            AddRef();
+            *ppvObject = static_cast<OS_IXAPOParameters*>(this);
+            return RecordHr("XAudio2FXVolumeMeter::QueryInterface", OS_XAUDIO2_S_OK, 0);
+        }
+        return RecordHr("XAudio2FXVolumeMeter::QueryInterface", OS_XAUDIO2_E_NOINTERFACE, 0);
+    }
+
+    uint32_t OPENSCARLETT_XAUDIO2_CALL AddRef() override {
+        RecordOk("XAudio2FXVolumeMeter::AddRef", 1);
+        return ref_count_.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    }
+
+    uint32_t OPENSCARLETT_XAUDIO2_CALL Release() override {
+        RecordOk("XAudio2FXVolumeMeter::Release", 2);
+        const uint32_t rem = ref_count_.fetch_sub(1u, std::memory_order_acq_rel) - 1u;
+        if (rem == 0u) {
+            delete this;
+        }
+        return rem;
+    }
+
+    void OPENSCARLETT_XAUDIO2_CALL SetParameters(
+        const void* pParameters, uint32_t ParameterByteSize) override {
+        RecordOk("XAudio2FXVolumeMeter::SetParameters", 3);
+        if (!pParameters || ParameterByteSize < sizeof(OS_XAUDIO2FX_VOLUMEMETER_LEVELS)) {
+            return;
+        }
+        const auto* levels = static_cast<const OS_XAUDIO2FX_VOLUMEMETER_LEVELS*>(pParameters);
+        std::lock_guard<std::mutex> lk(mutex_);
+        const uint32_t ch = std::min<uint32_t>(levels->ChannelCount, 64u);
+        if (ch > 0u) {
+            peak_levels_.resize(ch, 0.0f);
+            rms_levels_.resize(ch, 0.0f);
+            if (levels->pPeakLevels) {
+                std::memcpy(peak_levels_.data(), levels->pPeakLevels, ch * sizeof(float));
+            }
+            if (levels->pRMSLevels) {
+                std::memcpy(rms_levels_.data(), levels->pRMSLevels, ch * sizeof(float));
+            }
+        }
+    }
+
+    void OPENSCARLETT_XAUDIO2_CALL GetParameters(
+        void* pParameters, uint32_t ParameterByteSize) override {
+        RecordOk("XAudio2FXVolumeMeter::GetParameters", 4);
+        if (!pParameters || ParameterByteSize < sizeof(OS_XAUDIO2FX_VOLUMEMETER_LEVELS)) {
+            return;
+        }
+        auto* levels = static_cast<OS_XAUDIO2FX_VOLUMEMETER_LEVELS*>(pParameters);
+        std::lock_guard<std::mutex> lk(mutex_);
+        for (uint32_t i = 0; i < levels->ChannelCount; ++i) {
+            const float peak = (i < peak_levels_.size()) ? peak_levels_[i] : 0.0f;
+            const float rms = (i < rms_levels_.size()) ? rms_levels_[i] : 0.0f;
+            if (levels->pPeakLevels) levels->pPeakLevels[i] = peak;
+            if (levels->pRMSLevels) levels->pRMSLevels[i] = rms;
+        }
+    }
+
+private:
+    std::atomic<uint32_t> ref_count_{1u};
+    uint32_t flags_ = 0u;
+    std::mutex mutex_;
+    std::vector<float> peak_levels_;
+    std::vector<float> rms_levels_;
+};
+
 }  // namespace
 
 extern "C" {
@@ -1390,6 +1702,298 @@ int32_t OPENSCARLETT_XAUDIO2_CALL XAudio2CreateWithVersionInfo(
     uint32_t /*ntddiVersion*/) {
     const int32_t hr = XAudio2Create(ppXAudio2, Flags, XAudio2Processor);
     return RecordHr("XAudio2CreateWithVersionInfo", hr);
+}
+
+int32_t OPENSCARLETT_XAUDIO2_CALL X3DAudioInitialize(
+    uint32_t SpeakerChannelMask,
+    float SpeedOfSound,
+    X3DAUDIO_HANDLE Instance) {
+    if (!Instance || SpeakerChannelMask == 0u ||
+        !(SpeedOfSound > 0.0f) || !std::isfinite(SpeedOfSound)) {
+        return RecordHr("X3DAudioInitialize", OS_XAUDIO2_E_INVALIDARG);
+    }
+    const uint32_t ch_count = Popcount32(SpeakerChannelMask);
+    if (ch_count == 0u) {
+        return RecordHr("X3DAudioInitialize", OS_XAUDIO2_E_INVALIDARG);
+    }
+    X3dAudioInstanceState state{};
+    state.magic = kX3dAudioMagic;
+    state.speaker_channel_mask = SpeakerChannelMask;
+    state.channel_count = ch_count;
+    state.speed_of_sound = SpeedOfSound;
+    state.reserved = 0u;
+    std::memcpy(Instance, &state, sizeof(state));
+    return RecordHr("X3DAudioInitialize", OS_XAUDIO2_S_OK);
+}
+
+void OPENSCARLETT_XAUDIO2_CALL X3DAudioCalculate(
+    const X3DAUDIO_HANDLE Instance,
+    const X3DAUDIO_LISTENER* pListener,
+    const X3DAUDIO_EMITTER* pEmitter,
+    uint32_t Flags,
+    X3DAUDIO_DSP_SETTINGS* pDSPSettings) {
+    RecordOk("X3DAudioCalculate");
+    if (!Instance || !pListener || !pEmitter || !pDSPSettings) {
+        return;
+    }
+
+    X3dAudioInstanceState state{};
+    std::memcpy(&state, Instance, sizeof(state));
+    if (state.magic != kX3dAudioMagic || state.speed_of_sound <= 0.0f) {
+        state.speaker_channel_mask = OS_SPEAKER_STEREO;
+        state.channel_count = 2u;
+        state.speed_of_sound = OS_X3DAUDIO_SPEED_OF_SOUND;
+    }
+
+    // Build orthonormal left-handed listener basis (DirectX convention: +X right, +Y up, +Z front).
+    const X3DAUDIO_VECTOR front = VecNormalizeOrDefault(pListener->OrientFront, {0.0f, 0.0f, 1.0f});
+    const X3DAUDIO_VECTOR up_hint = VecNormalizeOrDefault(pListener->OrientTop, {0.0f, 1.0f, 0.0f});
+    const X3DAUDIO_VECTOR right = VecNormalizeOrDefault(VecCross(up_hint, front), {1.0f, 0.0f, 0.0f});
+    const X3DAUDIO_VECTOR up = VecNormalizeOrDefault(VecCross(front, right), {0.0f, 1.0f, 0.0f});
+
+    // Vector from listener to emitter.
+    const X3DAUDIO_VECTOR l2e = VecSub(pEmitter->Position, pListener->Position);
+    const float distance = VecLength(l2e);
+    pDSPSettings->EmitterToListenerDistance = distance;
+
+    const X3DAUDIO_VECTOR dir_l2e =
+        (distance > 1e-6f) ? X3DAUDIO_VECTOR{l2e.x / distance, l2e.y / distance, l2e.z / distance}
+                           : front;
+    const X3DAUDIO_VECTOR dir_e2l = {-dir_l2e.x, -dir_l2e.y, -dir_l2e.z};
+
+    const float local_x = VecDot(dir_l2e, right);
+    const float local_y = VecDot(dir_l2e, up);
+    const float local_z = VecDot(dir_l2e, front);
+    (void)local_y;
+
+    const float curve_scaler =
+        (pEmitter->CurveDistanceScaler > 0.0f && std::isfinite(pEmitter->CurveDistanceScaler))
+            ? pEmitter->CurveDistanceScaler
+            : 1.0f;
+    const float norm_dist = distance / curve_scaler;
+
+    // Default inverse-distance attenuation falloff: 1.0 within 1 unit, 1 / norm_dist beyond.
+    const float default_vol = (norm_dist <= 1.0f) ? 1.0f : (1.0f / norm_dist);
+    float volume = std::clamp(EvalDistanceCurve(pEmitter->pVolumeCurve, norm_dist, default_vol), 0.0f, 1.0f);
+
+    // Optional emitter cone attenuation & angle.
+    const X3DAUDIO_VECTOR emitter_front = VecNormalizeOrDefault(pEmitter->OrientFront, {0.0f, 0.0f, 1.0f});
+    const float emitter_cos = std::clamp(VecDot(emitter_front, dir_e2l), -1.0f, 1.0f);
+    const float emitter_angle = std::acos(emitter_cos);
+    if ((Flags & OS_X3DAUDIO_CALCULATE_EMITTER_ANGLE) != 0u) {
+        pDSPSettings->EmitterToListenerAngle = emitter_angle;
+    }
+
+    float cone_lpf = 0.0f;
+    float cone_reverb = 1.0f;
+    if (pEmitter->pCone) {
+        const float half_inner = 0.5f * pEmitter->pCone->InnerAngle;
+        const float half_outer = 0.5f * pEmitter->pCone->OuterAngle;
+        float t = 0.0f;
+        if (emitter_angle <= half_inner) {
+            t = 0.0f;
+        } else if (emitter_angle >= half_outer || half_outer <= half_inner) {
+            t = 1.0f;
+        } else {
+            t = (emitter_angle - half_inner) / (half_outer - half_inner);
+        }
+        const float cone_vol =
+            pEmitter->pCone->InnerVolume + t * (pEmitter->pCone->OuterVolume - pEmitter->pCone->InnerVolume);
+        volume *= std::clamp(cone_vol, 0.0f, 2.0f);
+        cone_lpf = pEmitter->pCone->InnerLPF + t * (pEmitter->pCone->OuterLPF - pEmitter->pCone->InnerLPF);
+        cone_reverb =
+            pEmitter->pCone->InnerReverb + t * (pEmitter->pCone->OuterReverb - pEmitter->pCone->InnerReverb);
+    }
+
+    // 1. Speaker Panning Matrix (Mono / Stereo / Quad / 5.1 / 7.1 equal-power panning)
+    if ((Flags & OS_X3DAUDIO_CALCULATE_MATRIX) != 0u && pDSPSettings->pMatrixCoefficients != nullptr) {
+        const uint32_t src_ch = std::max(1u, pDSPSettings->SrcChannelCount);
+        const uint32_t dst_ch = std::max(1u, pDSPSettings->DstChannelCount);
+        std::fill_n(pDSPSettings->pMatrixCoefficients, static_cast<size_t>(src_ch) * dst_ch, 0.0f);
+
+        const float base_azimuth = (distance > 1e-6f) ? std::atan2(local_x, local_z) : 0.0f;
+        const float inner_blend =
+            (pEmitter->InnerRadius > 1e-6f && distance < pEmitter->InnerRadius)
+                ? (distance / pEmitter->InnerRadius)
+                : 1.0f;
+        const auto speakers = BuildSpeakerLayout(state.speaker_channel_mask, dst_ch);
+
+        // Compute LFE gain if LFE channel exists.
+        const float lfe_default = ((Flags & OS_X3DAUDIO_CALCULATE_REDIRECT_TO_LFE) != 0u) ? volume : 0.0f;
+        const float lfe_gain =
+            std::clamp(EvalDistanceCurve(pEmitter->pLFECurve, norm_dist, lfe_default), 0.0f, 1.0f);
+
+        const float src_norm = 1.0f / std::sqrt(static_cast<float>(src_ch));
+        for (uint32_t sc = 0; sc < src_ch; ++sc) {
+            float ch_az = base_azimuth;
+            float ch_pan_x = local_x * inner_blend;
+            if (src_ch > 1u && pEmitter->pChannelAzimuths != nullptr) {
+                ch_az = WrapAnglePi(base_azimuth + pEmitter->pChannelAzimuths[sc]);
+                ch_pan_x = std::sin(ch_az) * inner_blend;
+            }
+
+            if (dst_ch == 1u) {
+                pDSPSettings->pMatrixCoefficients[sc] = volume * src_norm;
+            } else if (dst_ch == 2u && state.speaker_channel_mask == OS_SPEAKER_STEREO) {
+                // Equal-power stereo panning: pan in [-1, +1] -> t in [0, 1].
+                const float pan = std::clamp(ch_pan_x, -1.0f, 1.0f);
+                const float t = 0.5f * (pan + 1.0f);
+                const float angle = t * (OS_X3DAUDIO_PI * 0.5f);
+                const float gain_l = std::cos(angle) * volume * src_norm;
+                const float gain_r = std::sin(angle) * volume * src_norm;
+                pDSPSettings->pMatrixCoefficients[0u * src_ch + sc] = gain_l;
+                pDSPSettings->pMatrixCoefficients[1u * src_ch + sc] = gain_r;
+            } else {
+                // Multi-channel equal-power circular speaker pair panning (Quad / 5.1 / 7.1).
+                std::vector<SpeakerSlot> ring;
+                ring.reserve(speakers.size());
+                for (const auto& sp : speakers) {
+                    if (sp.is_lfe) {
+                        pDSPSettings->pMatrixCoefficients[static_cast<size_t>(sp.dst_index) * src_ch + sc] =
+                            lfe_gain * src_norm;
+                        continue;
+                    }
+                    if (sp.is_center && (Flags & OS_X3DAUDIO_CALCULATE_ZEROCENTER) != 0u) {
+                        continue;
+                    }
+                    ring.push_back(sp);
+                }
+                if (!ring.empty()) {
+                    std::sort(ring.begin(), ring.end(),
+                              [](const SpeakerSlot& a, const SpeakerSlot& b) {
+                                  return a.azimuth < b.azimuth;
+                              });
+                    if (ring.size() == 1u) {
+                        pDSPSettings->pMatrixCoefficients[static_cast<size_t>(ring[0].dst_index) * src_ch + sc] =
+                            volume * src_norm;
+                    } else {
+                        // Find adjacent pair bracketing ch_az on the circle (-pi, +pi].
+                        const size_t n = ring.size();
+                        size_t idx_a = n - 1u;
+                        size_t idx_b = 0u;
+                        for (size_t i = 0; i + 1u < n; ++i) {
+                            if (ch_az >= ring[i].azimuth && ch_az <= ring[i + 1u].azimuth) {
+                                idx_a = i;
+                                idx_b = i + 1u;
+                                break;
+                            }
+                        }
+                        float az_a = ring[idx_a].azimuth;
+                        float az_b = ring[idx_b].azimuth;
+                        float az_q = ch_az;
+                        if (idx_b == 0u) {
+                            az_b += 2.0f * OS_X3DAUDIO_PI;
+                            if (az_q < az_a) {
+                                az_q += 2.0f * OS_X3DAUDIO_PI;
+                            }
+                        }
+                        const float span = std::max(1e-5f, az_b - az_a);
+                        const float u = std::clamp((az_q - az_a) / span, 0.0f, 1.0f);
+                        const float gain_a = std::cos(u * (OS_X3DAUDIO_PI * 0.5f)) * volume * src_norm;
+                        const float gain_b = std::sin(u * (OS_X3DAUDIO_PI * 0.5f)) * volume * src_norm;
+
+                        // If inside InnerRadius, blend smoothly toward omnidirectional distribution.
+                        if (inner_blend < 1.0f) {
+                            const float omni = (1.0f - inner_blend) * volume * src_norm /
+                                               std::sqrt(static_cast<float>(n));
+                            for (const auto& sp : ring) {
+                                pDSPSettings->pMatrixCoefficients[static_cast<size_t>(sp.dst_index) * src_ch + sc] +=
+                                    omni;
+                            }
+                        }
+                        pDSPSettings->pMatrixCoefficients[static_cast<size_t>(ring[idx_a].dst_index) * src_ch + sc] +=
+                            gain_a * inner_blend;
+                        pDSPSettings->pMatrixCoefficients[static_cast<size_t>(ring[idx_b].dst_index) * src_ch + sc] +=
+                            gain_b * inner_blend;
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Inter-channel Delay Times (ms)
+    if ((Flags & OS_X3DAUDIO_CALCULATE_DELAY) != 0u && pDSPSettings->pDelayTimes != nullptr) {
+        const uint32_t dst_ch = std::max(1u, pDSPSettings->DstChannelCount);
+        const auto speakers = BuildSpeakerLayout(state.speaker_channel_mask, dst_ch);
+        const float az = (distance > 1e-6f) ? std::atan2(local_x, local_z) : 0.0f;
+        for (const auto& sp : speakers) {
+            if (sp.dst_index < dst_ch) {
+                const float diff = std::fabs(WrapAnglePi(az - sp.azimuth));
+                // Up to ~1.5 ms interaural time difference across the head/speaker ring.
+                pDSPSettings->pDelayTimes[sp.dst_index] = (diff / OS_X3DAUDIO_PI) * 1.5f;
+            }
+        }
+    }
+
+    // 3. LPF Direct, LPF Reverb & Reverb Level
+    if ((Flags & OS_X3DAUDIO_CALCULATE_LPF_DIRECT) != 0u) {
+        const float default_lpf = std::clamp(1.0f - 0.05f * norm_dist, 0.25f, 1.0f);
+        const float raw_lpf = EvalDistanceCurve(pEmitter->pLPFDirectCurve, norm_dist, default_lpf);
+        pDSPSettings->LPFDirectCoefficient = std::clamp(raw_lpf - cone_lpf * 0.25f, 0.0f, 1.0f);
+    }
+    if ((Flags & OS_X3DAUDIO_CALCULATE_LPF_REVERB) != 0u) {
+        const float default_lpf_rev = std::clamp(0.75f - 0.03f * norm_dist, 0.2f, 0.75f);
+        pDSPSettings->LPFReverbCoefficient =
+            std::clamp(EvalDistanceCurve(pEmitter->pLPFReverbCurve, norm_dist, default_lpf_rev), 0.0f, 1.0f);
+    }
+    if ((Flags & OS_X3DAUDIO_CALCULATE_REVERB) != 0u) {
+        const float default_rev = std::clamp(0.25f * volume, 0.0f, 1.0f);
+        const float raw_rev = EvalDistanceCurve(pEmitter->pReverbCurve, norm_dist, default_rev);
+        pDSPSettings->ReverbLevel = std::clamp(raw_rev * cone_reverb, 0.0f, 1.0f);
+    }
+
+    // 4. Doppler Pitch Shift Factor: (c - v_listener) / (c - v_emitter)
+    //    where v_listener & v_emitter are velocity projections along emitter-to-listener axis dir_e2l.
+    if ((Flags & OS_X3DAUDIO_CALCULATE_DOPPLER) != 0u) {
+        const float v_emitter = (distance > 1e-6f) ? VecDot(pEmitter->Velocity, dir_e2l) : 0.0f;
+        const float v_listener = (distance > 1e-6f) ? VecDot(pListener->Velocity, dir_e2l) : 0.0f;
+        pDSPSettings->EmitterVelocityComponent = v_emitter;
+        pDSPSettings->ListenerVelocityComponent = v_listener;
+
+        const float dscaler =
+            (pEmitter->DopplerScaler >= 0.0f && std::isfinite(pEmitter->DopplerScaler))
+                ? pEmitter->DopplerScaler
+                : 1.0f;
+        if (dscaler == 0.0f || distance <= 1e-6f) {
+            pDSPSettings->DopplerFactor = 1.0f;
+        } else {
+            const float c = state.speed_of_sound;
+            const float min_term = c * 0.05f;
+            const float numer = std::max(min_term, c - v_listener * dscaler);
+            const float denom = std::max(min_term, c - v_emitter * dscaler);
+            pDSPSettings->DopplerFactor = std::clamp(numer / denom, 1.0f / 1024.0f, 1024.0f);
+        }
+    }
+}
+
+int32_t OPENSCARLETT_XAUDIO2_CALL XAudio2CreateReverb(
+    OS_IXAudio2Unknown** ppApo,
+    uint32_t Flags) {
+    if (!ppApo) {
+        return RecordHr("XAudio2CreateReverb", OS_XAUDIO2_E_POINTER);
+    }
+    *ppApo = nullptr;
+    auto* apo = new (std::nothrow) ReverbApoImpl(Flags);
+    if (!apo) {
+        return RecordHr("XAudio2CreateReverb", OS_XAUDIO2_E_OUTOFMEMORY);
+    }
+    *ppApo = apo;
+    return RecordHr("XAudio2CreateReverb", OS_XAUDIO2_S_OK);
+}
+
+int32_t OPENSCARLETT_XAUDIO2_CALL XAudio2CreateVolumeMeter(
+    OS_IXAudio2Unknown** ppApo,
+    uint32_t Flags) {
+    if (!ppApo) {
+        return RecordHr("XAudio2CreateVolumeMeter", OS_XAUDIO2_E_POINTER);
+    }
+    *ppApo = nullptr;
+    auto* apo = new (std::nothrow) VolumeMeterApoImpl(Flags);
+    if (!apo) {
+        return RecordHr("XAudio2CreateVolumeMeter", OS_XAUDIO2_E_OUTOFMEMORY);
+    }
+    *ppApo = apo;
+    return RecordHr("XAudio2CreateVolumeMeter", OS_XAUDIO2_S_OK);
 }
 
 int32_t OPENSCARLETT_XAUDIO2_CALL OpenScarlettXAudio2RenderMixForTest(
