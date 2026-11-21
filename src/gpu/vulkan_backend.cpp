@@ -22,8 +22,8 @@ namespace openscarlett {
 namespace {
 
 // ---------------------------------------------------------------------------
-// Clean-room minimal Vulkan 1.2/1.3 C ABI declarations (zero SDK headers).
-// Follows the public Khronos Vulkan 1.2/1.3 Specification ABI for x86-64.
+// Clean-room minimal Vulkan 1.2/1.3/1.4 C ABI declarations (zero SDK headers).
+// Follows the public Khronos Vulkan 1.2/1.3/1.4 Specification ABI for x86-64.
 // ---------------------------------------------------------------------------
 using VkFlags = uint32_t;
 using VkBool32 = uint32_t;
@@ -44,6 +44,11 @@ using VkCommandBuffer = VkCommandBuffer_T*;
 
 using VkDeviceMemory = uint64_t;
 using VkBuffer = uint64_t;
+using VkImage = uint64_t;
+using VkImageView = uint64_t;
+using VkSampler = uint64_t;
+using VkRenderPass = uint64_t;
+using VkFramebuffer = uint64_t;
 using VkShaderModule = uint64_t;
 using VkPipelineCache = uint64_t;
 using VkPipelineLayout = uint64_t;
@@ -53,12 +58,18 @@ using VkDescriptorPool = uint64_t;
 using VkDescriptorSet = uint64_t;
 using VkCommandPool = uint64_t;
 using VkFence = uint64_t;
+using VkSemaphore = uint64_t;
+using VkSurfaceKHR = uint64_t;
+using VkSwapchainKHR = uint64_t;
 
 inline constexpr uint64_t kVkNullHandle = 0;
 inline constexpr VkDeviceSize kVkWholeSize = ~0ull;
 inline constexpr uint32_t kVkQueueFamilyIgnored = ~0u;
+inline constexpr uint32_t kVkSubpassExternal = ~0u;
+inline constexpr uint64_t kVkUint64Max = ~0ull;
 
 inline constexpr VkResult kVkSuccess = 0;
+inline constexpr VkResult kVkSuboptimalKhr = 1000001003;
 
 constexpr uint32_t VkMakeApiVersion(uint32_t variant, uint32_t major, uint32_t minor, uint32_t patch) noexcept {
     return (variant << 29u) | (major << 22u) | (minor << 12u) | patch;
@@ -68,6 +79,7 @@ constexpr uint32_t VkApiMinor(uint32_t v) noexcept { return (v >> 12u) & 0x3FFu;
 constexpr uint32_t VkApiPatch(uint32_t v) noexcept { return v & 0xFFFu; }
 
 inline constexpr uint32_t kVkApiVersion1_0 = VkMakeApiVersion(0, 1, 0, 0);
+inline constexpr uint32_t kVkApiVersion1_1 = VkMakeApiVersion(0, 1, 1, 0);
 inline constexpr uint32_t kVkApiVersion1_2 = VkMakeApiVersion(0, 1, 2, 0);
 inline constexpr uint32_t kVkApiVersion1_3 = VkMakeApiVersion(0, 1, 3, 0);
 
@@ -80,38 +92,153 @@ inline constexpr int32_t kVkStypeSubmitInfo = 4;
 inline constexpr int32_t kVkStypeMemoryAllocateInfo = 5;
 inline constexpr int32_t kVkStypeMappedMemoryRange = 6;
 inline constexpr int32_t kVkStypeFenceCreateInfo = 8;
+inline constexpr int32_t kVkStypeSemaphoreCreateInfo = 9;
 inline constexpr int32_t kVkStypeBufferCreateInfo = 12;
+inline constexpr int32_t kVkStypeImageCreateInfo = 14;
+inline constexpr int32_t kVkStypeImageViewCreateInfo = 15;
 inline constexpr int32_t kVkStypeShaderModuleCreateInfo = 16;
 inline constexpr int32_t kVkStypePipelineShaderStageCreateInfo = 18;
+inline constexpr int32_t kVkStypePipelineVertexInputStateCreateInfo = 19;
+inline constexpr int32_t kVkStypePipelineInputAssemblyStateCreateInfo = 20;
+inline constexpr int32_t kVkStypePipelineViewportStateCreateInfo = 22;
+inline constexpr int32_t kVkStypePipelineRasterizationStateCreateInfo = 23;
+inline constexpr int32_t kVkStypePipelineMultisampleStateCreateInfo = 24;
+inline constexpr int32_t kVkStypePipelineDepthStencilStateCreateInfo = 25;
+inline constexpr int32_t kVkStypePipelineColorBlendStateCreateInfo = 26;
+inline constexpr int32_t kVkStypePipelineDynamicStateCreateInfo = 27;
+inline constexpr int32_t kVkStypeGraphicsPipelineCreateInfo = 28;
 inline constexpr int32_t kVkStypeComputePipelineCreateInfo = 29;
 inline constexpr int32_t kVkStypePipelineLayoutCreateInfo = 30;
+inline constexpr int32_t kVkStypeSamplerCreateInfo = 31;
 inline constexpr int32_t kVkStypeDescriptorSetLayoutCreateInfo = 32;
 inline constexpr int32_t kVkStypeDescriptorPoolCreateInfo = 33;
 inline constexpr int32_t kVkStypeDescriptorSetAllocateInfo = 34;
 inline constexpr int32_t kVkStypeWriteDescriptorSet = 35;
+inline constexpr int32_t kVkStypeFramebufferCreateInfo = 37;
+inline constexpr int32_t kVkStypeRenderPassCreateInfo = 38;
 inline constexpr int32_t kVkStypeCommandPoolCreateInfo = 39;
 inline constexpr int32_t kVkStypeCommandBufferAllocateInfo = 40;
 inline constexpr int32_t kVkStypeCommandBufferBeginInfo = 42;
+inline constexpr int32_t kVkStypeRenderPassBeginInfo = 43;
 inline constexpr int32_t kVkStypeBufferMemoryBarrier = 44;
+inline constexpr int32_t kVkStypeImageMemoryBarrier = 45;
 inline constexpr int32_t kVkStypeMemoryBarrier = 46;
+inline constexpr int32_t kVkStypeSwapchainCreateInfoKhr = 1000001000;
+inline constexpr int32_t kVkStypePresentInfoKhr = 1000001001;
+inline constexpr int32_t kVkStypeWin32SurfaceCreateInfoKhr = 1000009000;
+inline constexpr int32_t kVkStypePhysicalDeviceFeatures2 = 1000059000;
+inline constexpr int32_t kVkStypePhysicalDeviceMeshShaderFeaturesExt = 1000328000;
 
 // Flags & enums
 inline constexpr uint32_t kVkQueueGraphicsBit = 0x00000001u;
 inline constexpr uint32_t kVkQueueComputeBit = 0x00000002u;
+inline constexpr uint32_t kVkMemoryPropertyDeviceLocalBit = 0x00000001u;
 inline constexpr uint32_t kVkMemoryPropertyHostVisibleBit = 0x00000002u;
 inline constexpr uint32_t kVkMemoryPropertyHostCoherentBit = 0x00000004u;
+
+inline constexpr uint32_t kVkBufferUsageTransferSrcBit = 0x00000001u;
+inline constexpr uint32_t kVkBufferUsageTransferDstBit = 0x00000002u;
+inline constexpr uint32_t kVkBufferUsageUniformBufferBit = 0x00000010u;
 inline constexpr uint32_t kVkBufferUsageStorageBufferBit = 0x00000020u;
+inline constexpr uint32_t kVkBufferUsageIndexBufferBit = 0x00000040u;
+inline constexpr uint32_t kVkBufferUsageVertexBufferBit = 0x00000080u;
+
+inline constexpr uint32_t kVkImageUsageTransferSrcBit = 0x00000001u;
+inline constexpr uint32_t kVkImageUsageTransferDstBit = 0x00000002u;
+inline constexpr uint32_t kVkImageUsageSampledBit = 0x00000004u;
+inline constexpr uint32_t kVkImageUsageColorAttachmentBit = 0x00000010u;
+inline constexpr uint32_t kVkImageUsageDepthStencilAttachmentBit = 0x00000020u;
+
+inline constexpr uint32_t kVkImageAspectColorBit = 0x00000001u;
+inline constexpr uint32_t kVkImageAspectDepthBit = 0x00000002u;
+
+inline constexpr int32_t kVkImageType2D = 1;
+inline constexpr int32_t kVkImageType3D = 2;
+inline constexpr int32_t kVkImageViewType2D = 1;
+inline constexpr int32_t kVkImageViewType3D = 2;
+inline constexpr int32_t kVkImageTilingOptimal = 0;
+
+inline constexpr int32_t kVkImageLayoutUndefined = 0;
+inline constexpr int32_t kVkImageLayoutColorAttachmentOptimal = 2;
+inline constexpr int32_t kVkImageLayoutDepthStencilAttachmentOptimal = 3;
+inline constexpr int32_t kVkImageLayoutShaderReadOnlyOptimal = 5;
+inline constexpr int32_t kVkImageLayoutTransferSrcOptimal = 6;
+inline constexpr int32_t kVkImageLayoutTransferDstOptimal = 7;
+inline constexpr int32_t kVkImageLayoutPresentSrcKhr = 1000001002;
+
+inline constexpr int32_t kVkFormatR8G8B8A8Unorm = 37;
+inline constexpr int32_t kVkFormatB8G8R8A8Unorm = 44;
+inline constexpr int32_t kVkFormatA2B10G10R10UnormPack32 = 64;
+inline constexpr int32_t kVkFormatR16G16B16A16Sfloat = 97;
+inline constexpr int32_t kVkFormatD32Sfloat = 126;
+
+inline constexpr uint32_t kVkSampleCount1Bit = 1u;
+inline constexpr uint32_t kVkSampleCount4Bit = 4u;
+
+inline constexpr int32_t kVkAttachmentLoadOpLoad = 0;
+inline constexpr int32_t kVkAttachmentLoadOpClear = 1;
+inline constexpr int32_t kVkAttachmentLoadOpDontCare = 2;
+inline constexpr int32_t kVkAttachmentStoreOpStore = 0;
+inline constexpr int32_t kVkAttachmentStoreOpDontCare = 1;
+
 inline constexpr int32_t kVkSharingModeExclusive = 0;
+inline constexpr int32_t kVkDescriptorTypeSampler = 0;
+inline constexpr int32_t kVkDescriptorTypeCombinedImageSampler = 1;
+inline constexpr int32_t kVkDescriptorTypeSampledImage = 2;
+inline constexpr int32_t kVkDescriptorTypeUniformBuffer = 6;
 inline constexpr int32_t kVkDescriptorTypeStorageBuffer = 7;
+
+inline constexpr uint32_t kVkShaderStageVertexBit = 0x00000001u;
+inline constexpr uint32_t kVkShaderStageFragmentBit = 0x00000010u;
 inline constexpr uint32_t kVkShaderStageComputeBit = 0x00000020u;
+inline constexpr uint32_t kVkShaderStageTaskBitExt = 0x00000040u;
+inline constexpr uint32_t kVkShaderStageMeshBitExt = 0x00000080u;
+inline constexpr uint32_t kVkShaderStageAllGraphics = 0x0000001Fu;
+
+inline constexpr int32_t kVkPipelineBindPointGraphics = 0;
 inline constexpr int32_t kVkPipelineBindPointCompute = 1;
+inline constexpr int32_t kVkPrimitiveTopologyTriangleList = 3;
+inline constexpr int32_t kVkPolygonModeFill = 0;
+inline constexpr uint32_t kVkCullModeNone = 0u;
+inline constexpr int32_t kVkFrontFaceCounterClockwise = 0;
+inline constexpr int32_t kVkCompareOpLess = 1;
+inline constexpr int32_t kVkDynamicStateViewport = 0;
+inline constexpr int32_t kVkDynamicStateScissor = 1;
+inline constexpr int32_t kVkSubpassContentsInline = 0;
+inline constexpr int32_t kVkIndexTypeUint32 = 1;
+inline constexpr int32_t kVkVertexInputRateVertex = 0;
+inline constexpr int32_t kVkFilterNearest = 0;
+inline constexpr int32_t kVkFilterLinear = 1;
+inline constexpr int32_t kVkSamplerMipmapModeNearest = 0;
+inline constexpr int32_t kVkSamplerMipmapModeLinear = 1;
+inline constexpr int32_t kVkSamplerAddressModeClampToEdge = 2;
+inline constexpr int32_t kVkPresentModeFifoKhr = 2;
+inline constexpr uint32_t kVkCompositeAlphaOpaqueBitKhr = 0x00000001u;
+
 inline constexpr uint32_t kVkCommandPoolCreateResetCmdBufBit = 0x00000002u;
 inline constexpr int32_t kVkCommandBufferLevelPrimary = 0;
 inline constexpr uint32_t kVkCommandBufferUsageOneTimeSubmitBit = 0x00000001u;
+
+inline constexpr uint32_t kVkPipelineStageTopOfPipeBit = 0x00000001u;
+inline constexpr uint32_t kVkPipelineStageVertexShaderBit = 0x00000008u;
+inline constexpr uint32_t kVkPipelineStageFragmentShaderBit = 0x00000080u;
+inline constexpr uint32_t kVkPipelineStageEarlyFragmentTestsBit = 0x00000100u;
+inline constexpr uint32_t kVkPipelineStageColorAttachmentOutputBit = 0x00000400u;
 inline constexpr uint32_t kVkPipelineStageComputeShaderBit = 0x00000800u;
+inline constexpr uint32_t kVkPipelineStageTransferBit = 0x00001000u;
+inline constexpr uint32_t kVkPipelineStageBottomOfPipeBit = 0x00002000u;
 inline constexpr uint32_t kVkPipelineStageHostBit = 0x00004000u;
+inline constexpr uint32_t kVkPipelineStageAllGraphicsBit = 0x00008000u;
+inline constexpr uint32_t kVkPipelineStageAllCommandsBit = 0x00010000u;
+
+inline constexpr uint32_t kVkAccessShaderReadBit = 0x00000020u;
 inline constexpr uint32_t kVkAccessShaderWriteBit = 0x00000040u;
+inline constexpr uint32_t kVkAccessColorAttachmentWriteBit = 0x00000100u;
+inline constexpr uint32_t kVkAccessDepthStencilAttachmentWriteBit = 0x00000400u;
+inline constexpr uint32_t kVkAccessTransferReadBit = 0x00000800u;
+inline constexpr uint32_t kVkAccessTransferWriteBit = 0x00001000u;
 inline constexpr uint32_t kVkAccessHostReadBit = 0x00002000u;
+inline constexpr uint32_t kVkAccessHostWriteBit = 0x00004000u;
 
 struct VkApplicationInfo {
     int32_t sType;
@@ -134,8 +261,31 @@ struct VkInstanceCreateInfo {
     const char* const* ppEnabledExtensionNames;
 };
 
-// Generously padded after pipelineCacheUUID to cover VkPhysicalDeviceLimits (504B)
-// + VkPhysicalDeviceSparseProperties (20B) with zero risk of stack overflow.
+struct VkExtensionProperties {
+    char extensionName[256];
+    uint32_t specVersion;
+};
+
+struct VkPhysicalDeviceFeatures {
+    VkBool32 fields[55];
+};
+
+struct VkPhysicalDeviceFeatures2 {
+    int32_t sType;
+    void* pNext;
+    VkPhysicalDeviceFeatures features;
+};
+
+struct VkPhysicalDeviceMeshShaderFeaturesEXT {
+    int32_t sType;
+    void* pNext;
+    VkBool32 taskShader;
+    VkBool32 meshShader;
+    VkBool32 multiviewMeshShader;
+    VkBool32 primitiveFragmentShadingRateMeshShader;
+    VkBool32 meshShaderQueries;
+};
+
 struct alignas(8) VkPhysicalDevicePropertiesRaw {
     uint32_t apiVersion;
     uint32_t driverVersion;
@@ -151,10 +301,19 @@ static_assert(offsetof(VkPhysicalDevicePropertiesRaw, deviceName) == 20, "VkPhys
 static_assert(offsetof(VkPhysicalDevicePropertiesRaw, pipelineCacheUUID) == 276, "UUID offset");
 static_assert(offsetof(VkPhysicalDevicePropertiesRaw, limits_and_sparse_storage) == 296, "limits offset");
 
-struct VkExtent3D {
-    uint32_t width;
-    uint32_t height;
-    uint32_t depth;
+struct VkOffset2D { int32_t x; int32_t y; };
+struct VkOffset3D { int32_t x; int32_t y; int32_t z; };
+struct VkExtent2D { uint32_t width; uint32_t height; };
+struct VkExtent3D { uint32_t width; uint32_t height; uint32_t depth; };
+struct VkRect2D { VkOffset2D offset; VkExtent2D extent; };
+
+struct VkViewport {
+    float x;
+    float y;
+    float width;
+    float height;
+    float minDepth;
+    float maxDepth;
 };
 
 struct VkQueueFamilyProperties {
@@ -203,6 +362,18 @@ struct VkDeviceCreateInfo {
     const void* pEnabledFeatures;
 };
 
+struct VkFenceCreateInfo {
+    int32_t sType;
+    const void* pNext;
+    VkFlags flags;
+};
+
+struct VkSemaphoreCreateInfo {
+    int32_t sType;
+    const void* pNext;
+    VkFlags flags;
+};
+
 struct VkCommandPoolCreateInfo {
     int32_t sType;
     const void* pNext;
@@ -229,12 +400,12 @@ struct VkSubmitInfo {
     int32_t sType;
     const void* pNext;
     uint32_t waitSemaphoreCount;
-    const uint64_t* pWaitSemaphores;
+    const VkSemaphore* pWaitSemaphores;
     const VkFlags* pWaitDstStageMask;
     uint32_t commandBufferCount;
     const VkCommandBuffer* pCommandBuffers;
     uint32_t signalSemaphoreCount;
-    const uint64_t* pSignalSemaphores;
+    const VkSemaphore* pSignalSemaphores;
 };
 
 struct VkBufferCreateInfo {
@@ -246,6 +417,78 @@ struct VkBufferCreateInfo {
     int32_t sharingMode;
     uint32_t queueFamilyIndexCount;
     const uint32_t* pQueueFamilyIndices;
+};
+
+struct VkImageCreateInfo {
+    int32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    int32_t imageType;
+    int32_t format;
+    VkExtent3D extent;
+    uint32_t mipLevels;
+    uint32_t arrayLayers;
+    uint32_t samples;
+    int32_t tiling;
+    VkFlags usage;
+    int32_t sharingMode;
+    uint32_t queueFamilyIndexCount;
+    const uint32_t* pQueueFamilyIndices;
+    int32_t initialLayout;
+};
+
+struct VkComponentMapping {
+    int32_t r;
+    int32_t g;
+    int32_t b;
+    int32_t a;
+};
+
+struct VkImageSubresourceRange {
+    VkFlags aspectMask;
+    uint32_t baseMipLevel;
+    uint32_t levelCount;
+    uint32_t baseArrayLayer;
+    uint32_t layerCount;
+};
+
+struct VkImageSubresourceLayers {
+    VkFlags aspectMask;
+    uint32_t mipLevel;
+    uint32_t baseArrayLayer;
+    uint32_t layerCount;
+};
+
+struct VkImageViewCreateInfo {
+    int32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    VkImage image;
+    int32_t viewType;
+    int32_t format;
+    VkComponentMapping components;
+    VkImageSubresourceRange subresourceRange;
+};
+
+struct VkSamplerCreateInfo {
+    int32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    int32_t magFilter;
+    int32_t minFilter;
+    int32_t mipmapMode;
+    int32_t addressModeU;
+    int32_t addressModeV;
+    int32_t addressModeW;
+    float mipLodBias;
+    VkBool32 anisotropyEnable;
+    float maxAnisotropy;
+    VkBool32 compareEnable;
+    int32_t compareOp;
+    float minLod;
+    float maxLod;
+    int32_t borderColor;
+    VkBool32 unnormalizedCoordinates;
 };
 
 struct VkMemoryRequirements {
@@ -282,7 +525,7 @@ struct VkDescriptorSetLayoutBinding {
     int32_t descriptorType;
     uint32_t descriptorCount;
     VkFlags stageFlags;
-    const uint64_t* pImmutableSamplers;
+    const VkSampler* pImmutableSamplers;
 };
 
 struct VkDescriptorSetLayoutCreateInfo {
@@ -293,6 +536,12 @@ struct VkDescriptorSetLayoutCreateInfo {
     const VkDescriptorSetLayoutBinding* pBindings;
 };
 
+struct VkPushConstantRange {
+    VkFlags stageFlags;
+    uint32_t offset;
+    uint32_t size;
+};
+
 struct VkPipelineLayoutCreateInfo {
     int32_t sType;
     const void* pNext;
@@ -300,7 +549,7 @@ struct VkPipelineLayoutCreateInfo {
     uint32_t setLayoutCount;
     const VkDescriptorSetLayout* pSetLayouts;
     uint32_t pushConstantRangeCount;
-    const void* pPushConstantRanges;
+    const VkPushConstantRange* pPushConstantRanges;
 };
 
 struct VkPipelineShaderStageCreateInfo {
@@ -321,6 +570,242 @@ struct VkComputePipelineCreateInfo {
     VkPipelineLayout layout;
     VkPipeline basePipelineHandle;
     int32_t basePipelineIndex;
+};
+
+struct VkVertexInputBindingDescription {
+    uint32_t binding;
+    uint32_t stride;
+    int32_t inputRate;
+};
+
+struct VkVertexInputAttributeDescription {
+    uint32_t location;
+    uint32_t binding;
+    int32_t format;
+    uint32_t offset;
+};
+
+struct VkPipelineVertexInputStateCreateInfo {
+    int32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    uint32_t vertexBindingDescriptionCount;
+    const VkVertexInputBindingDescription* pVertexBindingDescriptions;
+    uint32_t vertexAttributeDescriptionCount;
+    const VkVertexInputAttributeDescription* pVertexAttributeDescriptions;
+};
+
+struct VkPipelineInputAssemblyStateCreateInfo {
+    int32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    int32_t topology;
+    VkBool32 primitiveRestartEnable;
+};
+
+struct VkPipelineViewportStateCreateInfo {
+    int32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    uint32_t viewportCount;
+    const VkViewport* pViewports;
+    uint32_t scissorCount;
+    const VkRect2D* pScissors;
+};
+
+struct VkPipelineRasterizationStateCreateInfo {
+    int32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    VkBool32 depthClampEnable;
+    VkBool32 rasterizerDiscardEnable;
+    int32_t polygonMode;
+    VkFlags cullMode;
+    int32_t frontFace;
+    VkBool32 depthBiasEnable;
+    float depthBiasConstantFactor;
+    float depthBiasClamp;
+    float depthBiasSlopeFactor;
+    float lineWidth;
+};
+
+struct VkPipelineMultisampleStateCreateInfo {
+    int32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    uint32_t rasterizationSamples;
+    VkBool32 sampleShadingEnable;
+    float minSampleShading;
+    const uint32_t* pSampleMask;
+    VkBool32 alphaToCoverageEnable;
+    VkBool32 alphaToOneEnable;
+};
+
+struct VkStencilOpState {
+    int32_t failOp;
+    int32_t passOp;
+    int32_t depthFailOp;
+    int32_t compareOp;
+    uint32_t compareMask;
+    uint32_t writeMask;
+    uint32_t reference;
+};
+
+struct VkPipelineDepthStencilStateCreateInfo {
+    int32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    VkBool32 depthTestEnable;
+    VkBool32 depthWriteEnable;
+    int32_t depthCompareOp;
+    VkBool32 depthBoundsTestEnable;
+    VkBool32 stencilTestEnable;
+    VkStencilOpState front;
+    VkStencilOpState back;
+    float minDepthBounds;
+    float maxDepthBounds;
+};
+
+struct VkPipelineColorBlendAttachmentState {
+    VkBool32 blendEnable;
+    int32_t srcColorBlendFactor;
+    int32_t dstColorBlendFactor;
+    int32_t colorBlendOp;
+    int32_t srcAlphaBlendFactor;
+    int32_t dstAlphaBlendFactor;
+    int32_t alphaBlendOp;
+    VkFlags colorWriteMask;
+};
+
+struct VkPipelineColorBlendStateCreateInfo {
+    int32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    VkBool32 logicOpEnable;
+    int32_t logicOp;
+    uint32_t attachmentCount;
+    const VkPipelineColorBlendAttachmentState* pAttachments;
+    float blendConstants[4];
+};
+
+struct VkPipelineDynamicStateCreateInfo {
+    int32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    uint32_t dynamicStateCount;
+    const int32_t* pDynamicStates;
+};
+
+struct VkGraphicsPipelineCreateInfo {
+    int32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    uint32_t stageCount;
+    const VkPipelineShaderStageCreateInfo* pStages;
+    const VkPipelineVertexInputStateCreateInfo* pVertexInputState;
+    const VkPipelineInputAssemblyStateCreateInfo* pInputAssemblyState;
+    const void* pTessellationState;
+    const VkPipelineViewportStateCreateInfo* pViewportState;
+    const VkPipelineRasterizationStateCreateInfo* pRasterizationState;
+    const VkPipelineMultisampleStateCreateInfo* pMultisampleState;
+    const VkPipelineDepthStencilStateCreateInfo* pDepthStencilState;
+    const VkPipelineColorBlendStateCreateInfo* pColorBlendState;
+    const VkPipelineDynamicStateCreateInfo* pDynamicState;
+    VkPipelineLayout layout;
+    VkRenderPass renderPass;
+    uint32_t subpass;
+    VkPipeline basePipelineHandle;
+    int32_t basePipelineIndex;
+};
+
+struct VkAttachmentDescription {
+    VkFlags flags;
+    int32_t format;
+    uint32_t samples;
+    int32_t loadOp;
+    int32_t storeOp;
+    int32_t stencilLoadOp;
+    int32_t stencilStoreOp;
+    int32_t initialLayout;
+    int32_t finalLayout;
+};
+
+struct VkAttachmentReference {
+    uint32_t attachment;
+    int32_t layout;
+};
+
+struct VkSubpassDescription {
+    VkFlags flags;
+    int32_t pipelineBindPoint;
+    uint32_t inputAttachmentCount;
+    const VkAttachmentReference* pInputAttachments;
+    uint32_t colorAttachmentCount;
+    const VkAttachmentReference* pColorAttachments;
+    const VkAttachmentReference* pResolveAttachments;
+    const VkAttachmentReference* pDepthStencilAttachment;
+    uint32_t preserveAttachmentCount;
+    const uint32_t* pPreserveAttachments;
+};
+
+struct VkSubpassDependency {
+    uint32_t srcSubpass;
+    uint32_t dstSubpass;
+    VkFlags srcStageMask;
+    VkFlags dstStageMask;
+    VkFlags srcAccessMask;
+    VkFlags dstAccessMask;
+    VkFlags dependencyFlags;
+};
+
+struct VkRenderPassCreateInfo {
+    int32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    uint32_t attachmentCount;
+    const VkAttachmentDescription* pAttachments;
+    uint32_t subpassCount;
+    const VkSubpassDescription* pSubpasses;
+    uint32_t dependencyCount;
+    const VkSubpassDependency* pDependencies;
+};
+
+struct VkFramebufferCreateInfo {
+    int32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    VkRenderPass renderPass;
+    uint32_t attachmentCount;
+    const VkImageView* pAttachments;
+    uint32_t width;
+    uint32_t height;
+    uint32_t layers;
+};
+
+union VkClearColorValue {
+    float float32[4];
+    int32_t int32[4];
+    uint32_t uint32[4];
+};
+
+struct VkClearDepthStencilValue {
+    float depth;
+    uint32_t stencil;
+};
+
+union VkClearValue {
+    VkClearColorValue color;
+    VkClearDepthStencilValue depthStencil;
+};
+
+struct VkRenderPassBeginInfo {
+    int32_t sType;
+    const void* pNext;
+    VkRenderPass renderPass;
+    VkFramebuffer framebuffer;
+    VkRect2D renderArea;
+    uint32_t clearValueCount;
+    const VkClearValue* pClearValues;
 };
 
 struct VkDescriptorPoolSize {
@@ -351,6 +836,12 @@ struct VkDescriptorBufferInfo {
     VkDeviceSize range;
 };
 
+struct VkDescriptorImageInfo {
+    VkSampler sampler;
+    VkImageView imageView;
+    int32_t imageLayout;
+};
+
 struct VkWriteDescriptorSet {
     int32_t sType;
     const void* pNext;
@@ -359,7 +850,7 @@ struct VkWriteDescriptorSet {
     uint32_t dstArrayElement;
     uint32_t descriptorCount;
     int32_t descriptorType;
-    const void* pImageInfo;
+    const VkDescriptorImageInfo* pImageInfo;
     const VkDescriptorBufferInfo* pBufferInfo;
     const uint64_t* pTexelBufferView;
 };
@@ -383,22 +874,119 @@ struct VkBufferMemoryBarrier {
     VkDeviceSize size;
 };
 
+struct VkImageMemoryBarrier {
+    int32_t sType;
+    const void* pNext;
+    VkFlags srcAccessMask;
+    VkFlags dstAccessMask;
+    int32_t oldLayout;
+    int32_t newLayout;
+    uint32_t srcQueueFamilyIndex;
+    uint32_t dstQueueFamilyIndex;
+    VkImage image;
+    VkImageSubresourceRange subresourceRange;
+};
+
+struct VkBufferImageCopy {
+    VkDeviceSize bufferOffset;
+    uint32_t bufferRowLength;
+    uint32_t bufferImageHeight;
+    VkImageSubresourceLayers imageSubresource;
+    VkOffset3D imageOffset;
+    VkExtent3D imageExtent;
+};
+
+struct VkImageResolve {
+    VkImageSubresourceLayers srcSubresource;
+    VkOffset3D srcOffset;
+    VkImageSubresourceLayers dstSubresource;
+    VkOffset3D dstOffset;
+    VkExtent3D extent;
+};
+
+struct VkWin32SurfaceCreateInfoKHR {
+    int32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    void* hinstance;
+    void* hwnd;
+};
+
+struct VkSurfaceCapabilitiesKHR {
+    uint32_t minImageCount;
+    uint32_t maxImageCount;
+    VkExtent2D currentExtent;
+    VkExtent2D minImageExtent;
+    VkExtent2D maxImageExtent;
+    uint32_t maxImageArrayLayers;
+    VkFlags supportedTransforms;
+    VkFlags currentTransform;
+    VkFlags supportedCompositeAlpha;
+    VkFlags supportedUsageFlags;
+};
+
+struct VkSurfaceFormatKHR {
+    int32_t format;
+    int32_t colorSpace;
+};
+
+struct VkSwapchainCreateInfoKHR {
+    int32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    VkSurfaceKHR surface;
+    uint32_t minImageCount;
+    int32_t imageFormat;
+    int32_t imageColorSpace;
+    VkExtent2D imageExtent;
+    uint32_t imageArrayLayers;
+    VkFlags imageUsage;
+    int32_t imageSharingMode;
+    uint32_t queueFamilyIndexCount;
+    const uint32_t* pQueueFamilyIndices;
+    VkFlags preTransform;
+    VkFlags compositeAlpha;
+    int32_t presentMode;
+    VkBool32 clipped;
+    VkSwapchainKHR oldSwapchain;
+};
+
+struct VkPresentInfoKHR {
+    int32_t sType;
+    const void* pNext;
+    uint32_t waitSemaphoreCount;
+    const VkSemaphore* pWaitSemaphores;
+    uint32_t swapchainCount;
+    const VkSwapchainKHR* pSwapchains;
+    const uint32_t* pImageIndices;
+    VkResult* pResults;
+};
+
+// Function pointer typedefs
 using PFN_vkVoidFunction = void(SX_VKAPI_PTR*)();
 using PFN_vkGetInstanceProcAddr = PFN_vkVoidFunction(SX_VKAPI_PTR*)(VkInstance, const char*);
 using PFN_vkGetDeviceProcAddr = PFN_vkVoidFunction(SX_VKAPI_PTR*)(VkDevice, const char*);
 using PFN_vkEnumerateInstanceVersion = VkResult(SX_VKAPI_PTR*)(uint32_t*);
+using PFN_vkEnumerateInstanceExtensionProperties = VkResult(SX_VKAPI_PTR*)(const char*, uint32_t*, VkExtensionProperties*);
 using PFN_vkCreateInstance = VkResult(SX_VKAPI_PTR*)(const VkInstanceCreateInfo*, const void*, VkInstance*);
 using PFN_vkDestroyInstance = void(SX_VKAPI_PTR*)(VkInstance, const void*);
 using PFN_vkEnumeratePhysicalDevices = VkResult(SX_VKAPI_PTR*)(VkInstance, uint32_t*, VkPhysicalDevice*);
 using PFN_vkGetPhysicalDeviceProperties = void(SX_VKAPI_PTR*)(VkPhysicalDevice, VkPhysicalDevicePropertiesRaw*);
+using PFN_vkGetPhysicalDeviceFeatures2 = void(SX_VKAPI_PTR*)(VkPhysicalDevice, VkPhysicalDeviceFeatures2*);
 using PFN_vkGetPhysicalDeviceQueueFamilyProperties = void(SX_VKAPI_PTR*)(VkPhysicalDevice, uint32_t*, VkQueueFamilyProperties*);
 using PFN_vkGetPhysicalDeviceMemoryProperties = void(SX_VKAPI_PTR*)(VkPhysicalDevice, VkPhysicalDeviceMemoryProperties*);
+using PFN_vkEnumerateDeviceExtensionProperties = VkResult(SX_VKAPI_PTR*)(VkPhysicalDevice, const char*, uint32_t*, VkExtensionProperties*);
 using PFN_vkCreateDevice = VkResult(SX_VKAPI_PTR*)(VkPhysicalDevice, const VkDeviceCreateInfo*, const void*, VkDevice*);
 using PFN_vkDestroyDevice = void(SX_VKAPI_PTR*)(VkDevice, const void*);
 using PFN_vkDeviceWaitIdle = VkResult(SX_VKAPI_PTR*)(VkDevice);
 using PFN_vkGetDeviceQueue = void(SX_VKAPI_PTR*)(VkDevice, uint32_t, uint32_t, VkQueue*);
 using PFN_vkQueueSubmit = VkResult(SX_VKAPI_PTR*)(VkQueue, uint32_t, const VkSubmitInfo*, VkFence);
 using PFN_vkQueueWaitIdle = VkResult(SX_VKAPI_PTR*)(VkQueue);
+using PFN_vkCreateFence = VkResult(SX_VKAPI_PTR*)(VkDevice, const VkFenceCreateInfo*, const void*, VkFence*);
+using PFN_vkDestroyFence = void(SX_VKAPI_PTR*)(VkDevice, VkFence, const void*);
+using PFN_vkWaitForFences = VkResult(SX_VKAPI_PTR*)(VkDevice, uint32_t, const VkFence*, VkBool32, uint64_t);
+using PFN_vkCreateSemaphore = VkResult(SX_VKAPI_PTR*)(VkDevice, const VkSemaphoreCreateInfo*, const void*, VkSemaphore*);
+using PFN_vkDestroySemaphore = void(SX_VKAPI_PTR*)(VkDevice, VkSemaphore, const void*);
 using PFN_vkCreateCommandPool = VkResult(SX_VKAPI_PTR*)(VkDevice, const VkCommandPoolCreateInfo*, const void*, VkCommandPool*);
 using PFN_vkDestroyCommandPool = void(SX_VKAPI_PTR*)(VkDevice, VkCommandPool, const void*);
 using PFN_vkAllocateCommandBuffers = VkResult(SX_VKAPI_PTR*)(VkDevice, const VkCommandBufferAllocateInfo*, VkCommandBuffer*);
@@ -408,7 +996,7 @@ using PFN_vkEndCommandBuffer = VkResult(SX_VKAPI_PTR*)(VkCommandBuffer);
 using PFN_vkCmdBindPipeline = void(SX_VKAPI_PTR*)(VkCommandBuffer, int32_t, VkPipeline);
 using PFN_vkCmdBindDescriptorSets = void(SX_VKAPI_PTR*)(VkCommandBuffer, int32_t, VkPipelineLayout, uint32_t, uint32_t, const VkDescriptorSet*, uint32_t, const uint32_t*);
 using PFN_vkCmdDispatch = void(SX_VKAPI_PTR*)(VkCommandBuffer, uint32_t, uint32_t, uint32_t);
-using PFN_vkCmdPipelineBarrier = void(SX_VKAPI_PTR*)(VkCommandBuffer, VkFlags, VkFlags, VkFlags, uint32_t, const VkMemoryBarrier*, uint32_t, const VkBufferMemoryBarrier*, uint32_t, const void*);
+using PFN_vkCmdPipelineBarrier = void(SX_VKAPI_PTR*)(VkCommandBuffer, VkFlags, VkFlags, VkFlags, uint32_t, const VkMemoryBarrier*, uint32_t, const VkBufferMemoryBarrier*, uint32_t, const VkImageMemoryBarrier*);
 using PFN_vkCreateBuffer = VkResult(SX_VKAPI_PTR*)(VkDevice, const VkBufferCreateInfo*, const void*, VkBuffer*);
 using PFN_vkDestroyBuffer = void(SX_VKAPI_PTR*)(VkDevice, VkBuffer, const void*);
 using PFN_vkGetBufferMemoryRequirements = void(SX_VKAPI_PTR*)(VkDevice, VkBuffer, VkMemoryRequirements*);
@@ -426,15 +1014,127 @@ using PFN_vkDestroyDescriptorSetLayout = void(SX_VKAPI_PTR*)(VkDevice, VkDescrip
 using PFN_vkCreatePipelineLayout = VkResult(SX_VKAPI_PTR*)(VkDevice, const VkPipelineLayoutCreateInfo*, const void*, VkPipelineLayout*);
 using PFN_vkDestroyPipelineLayout = void(SX_VKAPI_PTR*)(VkDevice, VkPipelineLayout, const void*);
 using PFN_vkCreateComputePipelines = VkResult(SX_VKAPI_PTR*)(VkDevice, VkPipelineCache, uint32_t, const VkComputePipelineCreateInfo*, const void*, VkPipeline*);
+using PFN_vkCreateGraphicsPipelines = VkResult(SX_VKAPI_PTR*)(VkDevice, VkPipelineCache, uint32_t, const VkGraphicsPipelineCreateInfo*, const void*, VkPipeline*);
 using PFN_vkDestroyPipeline = void(SX_VKAPI_PTR*)(VkDevice, VkPipeline, const void*);
 using PFN_vkCreateDescriptorPool = VkResult(SX_VKAPI_PTR*)(VkDevice, const VkDescriptorPoolCreateInfo*, const void*, VkDescriptorPool*);
 using PFN_vkDestroyDescriptorPool = void(SX_VKAPI_PTR*)(VkDevice, VkDescriptorPool, const void*);
 using PFN_vkAllocateDescriptorSets = VkResult(SX_VKAPI_PTR*)(VkDevice, const VkDescriptorSetAllocateInfo*, VkDescriptorSet*);
 using PFN_vkUpdateDescriptorSets = void(SX_VKAPI_PTR*)(VkDevice, uint32_t, const VkWriteDescriptorSet*, uint32_t, const void*);
+using PFN_vkCreateRenderPass = VkResult(SX_VKAPI_PTR*)(VkDevice, const VkRenderPassCreateInfo*, const void*, VkRenderPass*);
+using PFN_vkDestroyRenderPass = void(SX_VKAPI_PTR*)(VkDevice, VkRenderPass, const void*);
+using PFN_vkCreateImage = VkResult(SX_VKAPI_PTR*)(VkDevice, const VkImageCreateInfo*, const void*, VkImage*);
+using PFN_vkDestroyImage = void(SX_VKAPI_PTR*)(VkDevice, VkImage, const void*);
+using PFN_vkGetImageMemoryRequirements = void(SX_VKAPI_PTR*)(VkDevice, VkImage, VkMemoryRequirements*);
+using PFN_vkBindImageMemory = VkResult(SX_VKAPI_PTR*)(VkDevice, VkImage, VkDeviceMemory, VkDeviceSize);
+using PFN_vkCreateImageView = VkResult(SX_VKAPI_PTR*)(VkDevice, const VkImageViewCreateInfo*, const void*, VkImageView*);
+using PFN_vkDestroyImageView = void(SX_VKAPI_PTR*)(VkDevice, VkImageView, const void*);
+using PFN_vkCreateSampler = VkResult(SX_VKAPI_PTR*)(VkDevice, const VkSamplerCreateInfo*, const void*, VkSampler*);
+using PFN_vkDestroySampler = void(SX_VKAPI_PTR*)(VkDevice, VkSampler, const void*);
+using PFN_vkCreateFramebuffer = VkResult(SX_VKAPI_PTR*)(VkDevice, const VkFramebufferCreateInfo*, const void*, VkFramebuffer*);
+using PFN_vkDestroyFramebuffer = void(SX_VKAPI_PTR*)(VkDevice, VkFramebuffer, const void*);
+using PFN_vkCmdBeginRenderPass = void(SX_VKAPI_PTR*)(VkCommandBuffer, const VkRenderPassBeginInfo*, int32_t);
+using PFN_vkCmdEndRenderPass = void(SX_VKAPI_PTR*)(VkCommandBuffer);
+using PFN_vkCmdBindVertexBuffers = void(SX_VKAPI_PTR*)(VkCommandBuffer, uint32_t, uint32_t, const VkBuffer*, const VkDeviceSize*);
+using PFN_vkCmdBindIndexBuffer = void(SX_VKAPI_PTR*)(VkCommandBuffer, VkBuffer, VkDeviceSize, int32_t);
+using PFN_vkCmdDraw = void(SX_VKAPI_PTR*)(VkCommandBuffer, uint32_t, uint32_t, uint32_t, uint32_t);
+using PFN_vkCmdDrawIndexed = void(SX_VKAPI_PTR*)(VkCommandBuffer, uint32_t, uint32_t, uint32_t, int32_t, uint32_t);
+using PFN_vkCmdPushConstants = void(SX_VKAPI_PTR*)(VkCommandBuffer, VkPipelineLayout, VkFlags, uint32_t, uint32_t, const void*);
+using PFN_vkCmdCopyBufferToImage = void(SX_VKAPI_PTR*)(VkCommandBuffer, VkBuffer, VkImage, int32_t, uint32_t, const VkBufferImageCopy*);
+using PFN_vkCmdCopyImageToBuffer = void(SX_VKAPI_PTR*)(VkCommandBuffer, VkImage, int32_t, VkBuffer, uint32_t, const VkBufferImageCopy*);
+using PFN_vkCmdResolveImage = void(SX_VKAPI_PTR*)(VkCommandBuffer, VkImage, int32_t, VkImage, int32_t, uint32_t, const VkImageResolve*);
+using PFN_vkCmdSetViewport = void(SX_VKAPI_PTR*)(VkCommandBuffer, uint32_t, uint32_t, const VkViewport*);
+using PFN_vkCmdSetScissor = void(SX_VKAPI_PTR*)(VkCommandBuffer, uint32_t, uint32_t, const VkRect2D*);
+using PFN_vkCmdDrawMeshTasksEXT = void(SX_VKAPI_PTR*)(VkCommandBuffer, uint32_t, uint32_t, uint32_t);
+
+// WSI / Swapchain function pointers
+using PFN_vkCreateWin32SurfaceKHR = VkResult(SX_VKAPI_PTR*)(VkInstance, const VkWin32SurfaceCreateInfoKHR*, const void*, VkSurfaceKHR*);
+using PFN_vkDestroySurfaceKHR = void(SX_VKAPI_PTR*)(VkInstance, VkSurfaceKHR, const void*);
+using PFN_vkGetPhysicalDeviceWin32PresentationSupportKHR = VkBool32(SX_VKAPI_PTR*)(VkPhysicalDevice, uint32_t);
+using PFN_vkGetPhysicalDeviceSurfaceSupportKHR = VkResult(SX_VKAPI_PTR*)(VkPhysicalDevice, uint32_t, VkSurfaceKHR, VkBool32*);
+using PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR = VkResult(SX_VKAPI_PTR*)(VkPhysicalDevice, VkSurfaceKHR, VkSurfaceCapabilitiesKHR*);
+using PFN_vkGetPhysicalDeviceSurfaceFormatsKHR = VkResult(SX_VKAPI_PTR*)(VkPhysicalDevice, VkSurfaceKHR, uint32_t*, VkSurfaceFormatKHR*);
+using PFN_vkGetPhysicalDeviceSurfacePresentModesKHR = VkResult(SX_VKAPI_PTR*)(VkPhysicalDevice, VkSurfaceKHR, uint32_t*, int32_t*);
+using PFN_vkCreateSwapchainKHR = VkResult(SX_VKAPI_PTR*)(VkDevice, const VkSwapchainCreateInfoKHR*, const void*, VkSwapchainKHR*);
+using PFN_vkDestroySwapchainKHR = void(SX_VKAPI_PTR*)(VkDevice, VkSwapchainKHR, const void*);
+using PFN_vkGetSwapchainImagesKHR = VkResult(SX_VKAPI_PTR*)(VkDevice, VkSwapchainKHR, uint32_t*, VkImage*);
+using PFN_vkAcquireNextImageKHR = VkResult(SX_VKAPI_PTR*)(VkDevice, VkSwapchainKHR, uint64_t, VkSemaphore, VkFence, uint32_t*);
+using PFN_vkQueuePresentKHR = VkResult(SX_VKAPI_PTR*)(VkQueue, const VkPresentInfoKHR*);
 
 // ---------------------------------------------------------------------------
-// SPIR-V opcodes & constants (Khronos SPIR-V 1.0–1.6 Specification)
+// IEEE-754 binary16 (FP16) <-> FP32 & RGBA8 helpers
 // ---------------------------------------------------------------------------
+float HalfToFloat(uint16_t h) noexcept {
+    const uint32_t sign = (static_cast<uint32_t>(h & 0x8000u)) << 16u;
+    const uint32_t exp = (h >> 10u) & 0x1Fu;
+    const uint32_t mant = h & 0x03FFu;
+    uint32_t bits = 0;
+    if (exp == 0) {
+        if (mant == 0) {
+            bits = sign;
+        } else {
+            uint32_t m = mant;
+            int32_t e = -14;
+            while ((m & 0x0400u) == 0) {
+                m <<= 1u;
+                --e;
+            }
+            m &= 0x03FFu;
+            bits = sign | (static_cast<uint32_t>(e + 127) << 23u) | (m << 13u);
+        }
+    } else if (exp == 31) {
+        bits = sign | 0x7F800000u | (mant << 13u);
+    } else {
+        bits = sign | ((exp + 112u) << 23u) | (mant << 13u);
+    }
+    float out = 0.0f;
+    std::memcpy(&out, &bits, sizeof(out));
+    return out;
+}
+
+uint16_t FloatToHalf(float f) noexcept {
+    uint32_t bits = 0;
+    std::memcpy(&bits, &f, sizeof(bits));
+    const uint16_t sign = static_cast<uint16_t>((bits >> 16u) & 0x8000u);
+    const int32_t exp = static_cast<int32_t>((bits >> 23u) & 0xFFu) - 127;
+    const uint32_t mant = bits & 0x007FFFFFu;
+    if (exp > 15) {
+        return static_cast<uint16_t>(sign | 0x7C00u);
+    }
+    if (exp < -14) {
+        return sign;
+    }
+    const uint16_t h_exp = static_cast<uint16_t>((exp + 15) << 10);
+    const uint16_t h_mant = static_cast<uint16_t>(mant >> 13u);
+    return static_cast<uint16_t>(sign | h_exp | h_mant);
+}
+
+uint8_t FloatToUnorm8(float v) noexcept {
+    const float clamped = std::clamp(v, 0.0f, 1.0f);
+    return static_cast<uint8_t>(std::lround(clamped * 255.0f));
+}
+
+uint32_t BytesPerTexel(VulkanImageFormat fmt) noexcept {
+    switch (fmt) {
+        case VulkanImageFormat::Rgba16Sfloat: return 8u;
+        case VulkanImageFormat::D32Sfloat: return 4u;
+        case VulkanImageFormat::Bgra8Unorm:
+        case VulkanImageFormat::Rgba8Unorm:
+        default: return 4u;
+    }
+}
+
+uint32_t PackA2B10G10R10(uint8_t r, uint8_t g, uint8_t b, uint8_t a) noexcept {
+    const uint32_t r10 = (static_cast<uint32_t>(r) * 1023u + 127u) / 255u;
+    const uint32_t g10 = (static_cast<uint32_t>(g) * 1023u + 127u) / 255u;
+    const uint32_t b10 = (static_cast<uint32_t>(b) * 1023u + 127u) / 255u;
+    const uint32_t a2 = (static_cast<uint32_t>(a) * 3u + 127u) / 255u;
+    return (r10 & 0x3FFu) | ((g10 & 0x3FFu) << 10u) | ((b10 & 0x3FFu) << 20u) | ((a2 & 0x3u) << 30u);
+}
+
+// ---------------------------------------------------------------------------
+// SPIR-V opcodes & constants (Khronos SPIR-V 1.0-1.6 + SPV_EXT_mesh_shader)
+// ---------------------------------------------------------------------------
+inline constexpr uint16_t kSpvOpExtInst = 12;
 inline constexpr uint16_t kSpvOpMemoryModel = 14;
 inline constexpr uint16_t kSpvOpEntryPoint = 15;
 inline constexpr uint16_t kSpvOpExecutionMode = 16;
@@ -444,11 +1144,20 @@ inline constexpr uint16_t kSpvOpTypeBool = 20;
 inline constexpr uint16_t kSpvOpTypeInt = 21;
 inline constexpr uint16_t kSpvOpTypeFloat = 22;
 inline constexpr uint16_t kSpvOpTypeVector = 23;
+inline constexpr uint16_t kSpvOpTypeMatrix = 24;
+inline constexpr uint16_t kSpvOpTypeImage = 25;
+inline constexpr uint16_t kSpvOpTypeSampler = 26;
+inline constexpr uint16_t kSpvOpTypeSampledImage = 27;
+inline constexpr uint16_t kSpvOpTypeArray = 28;
 inline constexpr uint16_t kSpvOpTypeRuntimeArray = 29;
 inline constexpr uint16_t kSpvOpTypeStruct = 30;
 inline constexpr uint16_t kSpvOpTypePointer = 32;
 inline constexpr uint16_t kSpvOpTypeFunction = 33;
+inline constexpr uint16_t kSpvOpConstantTrue = 41;
+inline constexpr uint16_t kSpvOpConstantFalse = 42;
 inline constexpr uint16_t kSpvOpConstant = 43;
+inline constexpr uint16_t kSpvOpConstantComposite = 44;
+inline constexpr uint16_t kSpvOpConstantNull = 46;
 inline constexpr uint16_t kSpvOpFunction = 54;
 inline constexpr uint16_t kSpvOpFunctionEnd = 56;
 inline constexpr uint16_t kSpvOpVariable = 59;
@@ -456,6 +1165,20 @@ inline constexpr uint16_t kSpvOpLoad = 61;
 inline constexpr uint16_t kSpvOpStore = 62;
 inline constexpr uint16_t kSpvOpAccessChain = 65;
 inline constexpr uint16_t kSpvOpDecorate = 71;
+inline constexpr uint16_t kSpvOpMemberDecorate = 72;
+inline constexpr uint16_t kSpvOpVectorShuffle = 79;
+inline constexpr uint16_t kSpvOpCompositeConstruct = 80;
+inline constexpr uint16_t kSpvOpCompositeExtract = 81;
+inline constexpr uint16_t kSpvOpSampledImage = 86;
+inline constexpr uint16_t kSpvOpImageSampleImplicitLod = 87;
+inline constexpr uint16_t kSpvOpImageSampleExplicitLod = 88;
+inline constexpr uint16_t kSpvOpImageFetch = 95;
+inline constexpr uint16_t kSpvOpConvertFToU = 109;
+inline constexpr uint16_t kSpvOpConvertFToS = 110;
+inline constexpr uint16_t kSpvOpConvertSToF = 111;
+inline constexpr uint16_t kSpvOpConvertUToF = 112;
+inline constexpr uint16_t kSpvOpBitcast = 124;
+inline constexpr uint16_t kSpvOpFNegate = 127;
 inline constexpr uint16_t kSpvOpIAdd = 128;
 inline constexpr uint16_t kSpvOpFAdd = 129;
 inline constexpr uint16_t kSpvOpISub = 130;
@@ -466,23 +1189,64 @@ inline constexpr uint16_t kSpvOpUDiv = 134;
 inline constexpr uint16_t kSpvOpSDiv = 135;
 inline constexpr uint16_t kSpvOpFDiv = 136;
 inline constexpr uint16_t kSpvOpUMod = 137;
+inline constexpr uint16_t kSpvOpVectorTimesScalar = 142;
+inline constexpr uint16_t kSpvOpMatrixTimesVector = 145;
+inline constexpr uint16_t kSpvOpDot = 148;
+inline constexpr uint16_t kSpvOpSelect = 169;
+inline constexpr uint16_t kSpvOpIEqual = 170;
+inline constexpr uint16_t kSpvOpINotEqual = 171;
+inline constexpr uint16_t kSpvOpUGreaterThan = 172;
+inline constexpr uint16_t kSpvOpSGreaterThan = 173;
+inline constexpr uint16_t kSpvOpULessThan = 176;
+inline constexpr uint16_t kSpvOpSLessThan = 177;
+inline constexpr uint16_t kSpvOpFOrdEqual = 180;
+inline constexpr uint16_t kSpvOpFOrdLessThan = 184;
+inline constexpr uint16_t kSpvOpFOrdGreaterThan = 186;
 inline constexpr uint16_t kSpvOpShiftRightLogical = 194;
 inline constexpr uint16_t kSpvOpShiftRightArithmetic = 195;
 inline constexpr uint16_t kSpvOpShiftLeftLogical = 196;
 inline constexpr uint16_t kSpvOpBitwiseOr = 197;
 inline constexpr uint16_t kSpvOpBitwiseXor = 198;
 inline constexpr uint16_t kSpvOpBitwiseAnd = 199;
+inline constexpr uint16_t kSpvOpPhi = 245;
+inline constexpr uint16_t kSpvOpSelectionMerge = 247;
 inline constexpr uint16_t kSpvOpLabel = 248;
+inline constexpr uint16_t kSpvOpBranch = 249;
+inline constexpr uint16_t kSpvOpBranchConditional = 250;
 inline constexpr uint16_t kSpvOpReturn = 253;
+inline constexpr uint16_t kSpvOpEmitMeshTasksEXT = 5294;
+inline constexpr uint16_t kSpvOpSetMeshOutputsEXT = 5295;
 
-inline constexpr uint32_t kSpvExecModelGLCompute = 5;
-inline constexpr uint32_t kSpvExecModeLocalSize = 17;
-inline constexpr uint32_t kSpvDecBuiltIn = 11;
-inline constexpr uint32_t kSpvDecBinding = 33;
-inline constexpr uint32_t kSpvDecDescriptorSet = 34;
-inline constexpr uint32_t kSpvBuiltInGlobalInvocationId = 28;
+inline constexpr uint32_t kSpvExecModelVertex = 0u;
+inline constexpr uint32_t kSpvExecModelFragment = 4u;
+inline constexpr uint32_t kSpvExecModelGLCompute = 5u;
+inline constexpr uint32_t kSpvExecModelTaskEXT = 5364u;
+inline constexpr uint32_t kSpvExecModelMeshEXT = 5365u;
+inline constexpr uint32_t kSpvExecModeLocalSize = 17u;
 
-// Extracts a NUL-terminated UTF-8 literal string from SPIR-V words [start_word, end_word).
+inline constexpr uint32_t kSpvDecArrayStride = 6u;
+inline constexpr uint32_t kSpvDecBuiltIn = 11u;
+inline constexpr uint32_t kSpvDecLocation = 30u;
+inline constexpr uint32_t kSpvDecBinding = 33u;
+inline constexpr uint32_t kSpvDecDescriptorSet = 34u;
+inline constexpr uint32_t kSpvDecOffset = 35u;
+
+inline constexpr uint32_t kSpvBuiltInPosition = 0u;
+inline constexpr uint32_t kSpvBuiltInWorkgroupId = 26u;
+inline constexpr uint32_t kSpvBuiltInLocalInvocationId = 27u;
+inline constexpr uint32_t kSpvBuiltInGlobalInvocationId = 28u;
+inline constexpr uint32_t kSpvBuiltInLocalInvocationIndex = 29u;
+inline constexpr uint32_t kSpvBuiltInVertexIndex = 42u;
+inline constexpr uint32_t kSpvBuiltInPrimitiveTriangleIndicesEXT = 5294u;
+
+inline constexpr uint32_t kSpvStorageUniformConstant = 0u;
+inline constexpr uint32_t kSpvStorageInput = 1u;
+inline constexpr uint32_t kSpvStorageUniform = 2u;
+inline constexpr uint32_t kSpvStorageOutput = 3u;
+inline constexpr uint32_t kSpvStoragePushConstant = 9u;
+inline constexpr uint32_t kSpvStorageStorageBuffer = 12u;
+inline constexpr uint32_t kSpvStorageTaskPayloadWorkgroupEXT = 5402u;
+
 bool ReadSpirvString(const std::vector<uint32_t>& words,
                      size_t start_word,
                      size_t end_word,
@@ -503,9 +1267,7 @@ bool ReadSpirvString(const std::vector<uint32_t>& words,
     return false;
 }
 
-// Deterministic clean-room SPIR-V compute interpreter used when no Vulkan ICD is present
-// (or when InitializeSoftwareFallback() is requested). Executes real SPIR-V instructions
-// on storage buffers binding 0 (input) and binding 1 (output).
+// Deterministic clean-room SPIR-V compute interpreter (fallback when no ICD is present).
 Status ExecuteSpirvComputeSoftware(const std::vector<uint32_t>& spirv,
                                    const SpirvValidationInfo& val_info,
                                    const std::vector<uint32_t>& input_u32,
@@ -524,7 +1286,6 @@ Status ExecuteSpirvComputeSoftware(const std::vector<uint32_t>& spirv,
     std::unordered_map<uint32_t, uint32_t> var_builtin;
     uint32_t entry_func_id = 0;
 
-    // First pass: collect entry point, decorations, and constants.
     size_t pos = 5;
     size_t entry_body_start = 0;
     size_t entry_body_end = 0;
@@ -573,12 +1334,10 @@ Status ExecuteSpirvComputeSoftware(const std::vector<uint32_t>& spirv,
 
     std::vector<uint32_t> regs(bound, 0u);
     std::vector<PointerRef> ptrs(bound);
-
     for (const auto& [id, cval] : constants_u32) {
         if (id < bound) regs[id] = cval;
     }
 
-    // Bind known root variables.
     std::vector<PointerRef> root_ptrs(bound);
     for (const auto& [id, bi] : var_builtin) {
         if (id < bound && bi == kSpvBuiltInGlobalInvocationId) {
@@ -617,7 +1376,7 @@ Status ExecuteSpirvComputeSoftware(const std::vector<uint32_t>& spirv,
             switch (op) {
                 case kSpvOpLabel:
                     break;
-                case kSpvOpAccessChain: {
+                case kSpvOpAccessChain:
                     if (wc >= 5) {
                         const uint32_t res = spirv[ip + 2];
                         const uint32_t base = spirv[ip + 3];
@@ -628,7 +1387,6 @@ Status ExecuteSpirvComputeSoftware(const std::vector<uint32_t>& spirv,
                             ref.has_element = true;
                         } else if (ref.kind == PointerRef::Kind::InputBuffer ||
                                    ref.kind == PointerRef::Kind::OutputBuffer) {
-                            // Member 0 is runtime array; last index is array element index.
                             const uint32_t elem_id = spirv[ip + wc - 1];
                             ref.index = (elem_id < bound) ? regs[elem_id] : 0u;
                             ref.has_element = true;
@@ -636,8 +1394,7 @@ Status ExecuteSpirvComputeSoftware(const std::vector<uint32_t>& spirv,
                         if (res < bound) ptrs[res] = ref;
                     }
                     break;
-                }
-                case kSpvOpLoad: {
+                case kSpvOpLoad:
                     if (wc >= 4) {
                         const uint32_t res = spirv[ip + 2];
                         const uint32_t ptr_id = spirv[ip + 3];
@@ -653,8 +1410,7 @@ Status ExecuteSpirvComputeSoftware(const std::vector<uint32_t>& spirv,
                         if (res < bound) regs[res] = loaded;
                     }
                     break;
-                }
-                case kSpvOpStore: {
+                case kSpvOpStore:
                     if (wc >= 3) {
                         const uint32_t ptr_id = spirv[ip + 1];
                         const uint32_t val_id = spirv[ip + 2];
@@ -665,7 +1421,6 @@ Status ExecuteSpirvComputeSoftware(const std::vector<uint32_t>& spirv,
                         }
                     }
                     break;
-                }
                 case kSpvOpIAdd:
                     if (wc >= 5 && spirv[ip + 2] < bound)
                         regs[spirv[ip + 2]] = regs[spirv[ip + 3]] + regs[spirv[ip + 4]];
@@ -752,6 +1507,1027 @@ Status ExecuteSpirvComputeSoftware(const std::vector<uint32_t>& spirv,
     return Status::Ok();
 }
 
+// ---------------------------------------------------------------------------
+// Clean-room SPIR-V Graphics & Mesh Shader Software Fallback Evaluator
+// Executes real SPIR-V VS+PS and TaskEXT+MeshEXT+PS shaders deterministically
+// when no Vulkan ICD or VK_EXT_mesh_shader hardware is available (e.g. CI).
+// ---------------------------------------------------------------------------
+struct SwVec4 {
+    float v[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+};
+
+struct SwSpvVal {
+    uint32_t count = 1;  // 1..16 (scalar, vec2/3/4, or mat4)
+    uint32_t u[16] = {};
+
+    float f(uint32_t i) const noexcept {
+        float out = 0.0f;
+        if (i < 16) std::memcpy(&out, &u[i], sizeof(float));
+        return out;
+    }
+    void set_f(uint32_t i, float val) noexcept {
+        if (i < 16) std::memcpy(&u[i], &val, sizeof(float));
+    }
+};
+
+struct SwSpvType {
+    enum class Kind : uint8_t { Void, Bool, Int, Float, Vector, Matrix, Image, Sampler, SampledImage, Array, RuntimeArray, Struct, Pointer };
+    Kind kind = Kind::Void;
+    uint32_t elem_type = 0;
+    uint32_t count = 1;
+    uint32_t storage_class = 0;
+    uint32_t is_signed = 0;
+    std::vector<uint32_t> members;
+};
+
+struct SwSpvModule {
+    const std::vector<uint32_t>* words = nullptr;
+    uint32_t bound = 0;
+    uint32_t entry_func_id = 0;
+    uint32_t local_size[3] = {1, 1, 1};
+    size_t body_start = 0;
+    size_t body_end = 0;
+
+    std::unordered_map<uint32_t, SwSpvType> types;
+    std::unordered_map<uint32_t, SwSpvVal> constants;
+    std::unordered_map<uint32_t, uint32_t> var_type;
+    std::unordered_map<uint32_t, uint32_t> var_storage;
+    std::unordered_map<uint32_t, uint32_t> dec_location;
+    std::unordered_map<uint32_t, uint32_t> dec_binding;
+    std::unordered_map<uint32_t, uint32_t> dec_builtin;
+    std::unordered_map<uint32_t, uint32_t> dec_array_stride;
+    std::unordered_map<uint64_t, uint32_t> member_offset;
+    std::unordered_map<uint64_t, uint32_t> member_builtin;
+    std::unordered_map<uint32_t, size_t> label_ip;
+
+    bool Parse(const std::vector<uint32_t>& spv, uint32_t expected_exec_model) {
+        words = &spv;
+        if (spv.size() < 5) return false;
+        bound = spv[3];
+        size_t pos = 5;
+        uint32_t cur_fn = 0;
+        size_t cur_fn_start = 0;
+        while (pos < spv.size()) {
+            const uint16_t wc = static_cast<uint16_t>(spv[pos] >> 16);
+            const uint16_t op = static_cast<uint16_t>(spv[pos] & 0xFFFFu);
+            if (wc == 0 || pos + wc > spv.size()) return false;
+            switch (op) {
+                case kSpvOpEntryPoint:
+                    if (wc >= 4 && spv[pos + 1] == expected_exec_model) {
+                        entry_func_id = spv[pos + 2];
+                    }
+                    break;
+                case kSpvOpExecutionMode:
+                    if (wc >= 6 && spv[pos + 2] == kSpvExecModeLocalSize) {
+                        local_size[0] = std::max<uint32_t>(1, spv[pos + 3]);
+                        local_size[1] = std::max<uint32_t>(1, spv[pos + 4]);
+                        local_size[2] = std::max<uint32_t>(1, spv[pos + 5]);
+                    }
+                    break;
+                case kSpvOpDecorate:
+                    if (wc >= 4) {
+                        if (spv[pos + 2] == kSpvDecLocation) dec_location[spv[pos + 1]] = spv[pos + 3];
+                        else if (spv[pos + 2] == kSpvDecBinding) dec_binding[spv[pos + 1]] = spv[pos + 3];
+                        else if (spv[pos + 2] == kSpvDecBuiltIn) dec_builtin[spv[pos + 1]] = spv[pos + 3];
+                        else if (spv[pos + 2] == kSpvDecArrayStride) dec_array_stride[spv[pos + 1]] = spv[pos + 3];
+                    }
+                    break;
+                case kSpvOpMemberDecorate:
+                    if (wc >= 5) {
+                        const uint64_t k = (static_cast<uint64_t>(spv[pos + 1]) << 32) | spv[pos + 2];
+                        if (spv[pos + 3] == kSpvDecOffset) member_offset[k] = spv[pos + 4];
+                        else if (spv[pos + 3] == kSpvDecBuiltIn) member_builtin[k] = spv[pos + 4];
+                    }
+                    break;
+                case kSpvOpTypeVoid:
+                    types[spv[pos + 1]] = {SwSpvType::Kind::Void, 0, 0, 0, 0, {}};
+                    break;
+                case kSpvOpTypeBool:
+                    types[spv[pos + 1]] = {SwSpvType::Kind::Bool, 0, 1, 0, 0, {}};
+                    break;
+                case kSpvOpTypeInt:
+                    if (wc >= 4) types[spv[pos + 1]] = {SwSpvType::Kind::Int, 0, 1, 0, spv[pos + 3], {}};
+                    break;
+                case kSpvOpTypeFloat:
+                    types[spv[pos + 1]] = {SwSpvType::Kind::Float, 0, 1, 0, 0, {}};
+                    break;
+                case kSpvOpTypeVector:
+                    if (wc >= 4) types[spv[pos + 1]] = {SwSpvType::Kind::Vector, spv[pos + 2], spv[pos + 3], 0, 0, {}};
+                    break;
+                case kSpvOpTypeMatrix:
+                    if (wc >= 4) types[spv[pos + 1]] = {SwSpvType::Kind::Matrix, spv[pos + 2], spv[pos + 3], 0, 0, {}};
+                    break;
+                case kSpvOpTypeImage:
+                    types[spv[pos + 1]] = {SwSpvType::Kind::Image, 0, 1, 0, 0, {}};
+                    break;
+                case kSpvOpTypeSampler:
+                    types[spv[pos + 1]] = {SwSpvType::Kind::Sampler, 0, 1, 0, 0, {}};
+                    break;
+                case kSpvOpTypeSampledImage:
+                    if (wc >= 3) types[spv[pos + 1]] = {SwSpvType::Kind::SampledImage, spv[pos + 2], 1, 0, 0, {}};
+                    break;
+                case kSpvOpTypeArray:
+                    if (wc >= 4) {
+                        uint32_t len = 1;
+                        auto cit = constants.find(spv[pos + 3]);
+                        if (cit != constants.end()) len = cit->second.u[0];
+                        types[spv[pos + 1]] = {SwSpvType::Kind::Array, spv[pos + 2], len, 0, 0, {}};
+                    }
+                    break;
+                case kSpvOpTypeRuntimeArray:
+                    if (wc >= 3) types[spv[pos + 1]] = {SwSpvType::Kind::RuntimeArray, spv[pos + 2], 0, 0, 0, {}};
+                    break;
+                case kSpvOpTypeStruct: {
+                    SwSpvType st{};
+                    st.kind = SwSpvType::Kind::Struct;
+                    for (uint16_t k = 2; k < wc; ++k) st.members.push_back(spv[pos + k]);
+                    types[spv[pos + 1]] = std::move(st);
+                    break;
+                }
+                case kSpvOpTypePointer:
+                    if (wc >= 4) types[spv[pos + 1]] = {SwSpvType::Kind::Pointer, spv[pos + 3], 1, spv[pos + 2], 0, {}};
+                    break;
+                case kSpvOpConstantTrue: {
+                    SwSpvVal v{}; v.count = 1; v.u[0] = 1u;
+                    constants[spv[pos + 2]] = v;
+                    break;
+                }
+                case kSpvOpConstantFalse:
+                case kSpvOpConstantNull: {
+                    SwSpvVal v{}; v.count = 1;
+                    auto tit = types.find(spv[pos + 1]);
+                    if (tit != types.end() && tit->second.kind == SwSpvType::Kind::Vector) v.count = tit->second.count;
+                    constants[spv[pos + 2]] = v;
+                    break;
+                }
+                case kSpvOpConstant:
+                    if (wc >= 4) {
+                        SwSpvVal v{}; v.count = 1; v.u[0] = spv[pos + 3];
+                        constants[spv[pos + 2]] = v;
+                    }
+                    break;
+                case kSpvOpConstantComposite: {
+                    SwSpvVal v{};
+                    v.count = 0;
+                    for (uint16_t k = 3; k < wc && v.count < 16; ++k) {
+                        const auto& sub = constants[spv[pos + k]];
+                        for (uint32_t j = 0; j < sub.count && v.count < 16; ++j) v.u[v.count++] = sub.u[j];
+                    }
+                    constants[spv[pos + 2]] = v;
+                    break;
+                }
+                case kSpvOpVariable:
+                    if (wc >= 4) {
+                        var_type[spv[pos + 2]] = spv[pos + 1];
+                        var_storage[spv[pos + 2]] = spv[pos + 3];
+                    }
+                    break;
+                case kSpvOpFunction:
+                    if (wc >= 5) {
+                        cur_fn = spv[pos + 2];
+                        cur_fn_start = pos + wc;
+                    }
+                    break;
+                case kSpvOpLabel:
+                    if (cur_fn == entry_func_id && entry_func_id != 0 && wc >= 2) {
+                        label_ip[spv[pos + 1]] = pos;
+                    }
+                    break;
+                case kSpvOpFunctionEnd:
+                    if (cur_fn == entry_func_id && entry_func_id != 0) {
+                        body_start = cur_fn_start;
+                        body_end = pos;
+                    }
+                    cur_fn = 0;
+                    break;
+                default:
+                    break;
+            }
+            pos += wc;
+        }
+        return entry_func_id != 0 && body_start > 0 && body_start < body_end;
+    }
+
+    uint32_t TypeSizeBytes(uint32_t tid) const {
+        auto it = types.find(tid);
+        if (it == types.end()) return 4u;
+        const auto& t = it->second;
+        switch (t.kind) {
+            case SwSpvType::Kind::Vector: return t.count * 4u;
+            case SwSpvType::Kind::Matrix: return t.count * TypeSizeBytes(t.elem_type);
+            case SwSpvType::Kind::Array: {
+                auto sit = dec_array_stride.find(tid);
+                uint32_t stride = (sit != dec_array_stride.end()) ? sit->second : TypeSizeBytes(t.elem_type);
+                return t.count * stride;
+            }
+            default: return 4u;
+        }
+    }
+};
+
+struct SwShaderExecEnv {
+    uint32_t vertex_index = 0;
+    uint32_t local_index = 0;
+    uint32_t workgroup_id[3] = {0, 0, 0};
+    std::array<SwVec4, 8> stage_inputs{};
+    std::array<SwVec4, 8> stage_outputs{};
+    SwVec4 out_position = {{0.0f, 0.0f, 0.0f, 1.0f}};
+    const std::vector<uint8_t>* push_constants = nullptr;
+    const std::vector<VulkanDescriptorBinding>* descriptors = nullptr;
+
+    // Mesh & Task outputs
+    uint32_t mesh_vert_count = 0;
+    uint32_t mesh_prim_count = 0;
+    std::vector<SwVec4> mesh_positions;
+    std::vector<SwVec4> mesh_param0;
+    std::vector<std::array<uint32_t, 3>> mesh_indices;
+    uint32_t emitted_mesh_groups[3] = {0, 0, 0};
+    std::vector<uint8_t>* task_payload = nullptr;
+};
+
+SwVec4 SwSampleTexture2D(const VulkanTextureDesc& tex, float u, float v, bool linear) {
+    if (tex.mips.empty() || tex.mips[0].data.empty()) return {{0, 0, 0, 1}};
+    const auto& mip = tex.mips[0];
+    const uint32_t w = std::max<uint32_t>(1, mip.width);
+    const uint32_t h = std::max<uint32_t>(1, mip.height);
+    const float cu = std::clamp(u, 0.0f, 0.99999f);
+    const float cv = std::clamp(v, 0.0f, 0.99999f);
+
+    auto fetch = [&](uint32_t x, uint32_t y) -> SwVec4 {
+        x = std::min(x, w - 1);
+        y = std::min(y, h - 1);
+        const size_t idx = (static_cast<size_t>(y) * w + x) * BytesPerTexel(tex.format);
+        if (tex.format == VulkanImageFormat::Rgba16Sfloat && idx + 8 <= mip.data.size()) {
+            uint16_t h4[4]{};
+            std::memcpy(h4, mip.data.data() + idx, 8);
+            return {{HalfToFloat(h4[0]), HalfToFloat(h4[1]), HalfToFloat(h4[2]), HalfToFloat(h4[3])}};
+        }
+        if (idx + 4 <= mip.data.size()) {
+            return {{mip.data[idx + 0] / 255.0f, mip.data[idx + 1] / 255.0f,
+                     mip.data[idx + 2] / 255.0f, mip.data[idx + 3] / 255.0f}};
+        }
+        return {{0, 0, 0, 1}};
+    };
+
+    if (!linear) {
+        return fetch(static_cast<uint32_t>(cu * w), static_cast<uint32_t>(cv * h));
+    }
+    const float fx = cu * w - 0.5f;
+    const float fy = cv * h - 0.5f;
+    const int32_t x0 = std::clamp(static_cast<int32_t>(std::floor(fx)), 0, static_cast<int32_t>(w - 1));
+    const int32_t y0 = std::clamp(static_cast<int32_t>(std::floor(fy)), 0, static_cast<int32_t>(h - 1));
+    const int32_t x1 = std::min<int32_t>(x0 + 1, static_cast<int32_t>(w - 1));
+    const int32_t y1 = std::min<int32_t>(y0 + 1, static_cast<int32_t>(h - 1));
+    const float tx = std::clamp(fx - x0, 0.0f, 1.0f);
+    const float ty = std::clamp(fy - y0, 0.0f, 1.0f);
+    const SwVec4 c00 = fetch(static_cast<uint32_t>(x0), static_cast<uint32_t>(y0));
+    const SwVec4 c10 = fetch(static_cast<uint32_t>(x1), static_cast<uint32_t>(y0));
+    const SwVec4 c01 = fetch(static_cast<uint32_t>(x0), static_cast<uint32_t>(y1));
+    const SwVec4 c11 = fetch(static_cast<uint32_t>(x1), static_cast<uint32_t>(y1));
+    SwVec4 out{};
+    for (int i = 0; i < 4; ++i) {
+        const float top = c00.v[i] * (1.0f - tx) + c10.v[i] * tx;
+        const float bot = c01.v[i] * (1.0f - tx) + c11.v[i] * tx;
+        out.v[i] = top * (1.0f - ty) + bot * ty;
+    }
+    return out;
+}
+
+bool ExecuteSwSpvModule(const SwSpvModule& mod, SwShaderExecEnv& env) {
+    struct PtrInfo {
+        uint32_t root_var = 0;
+        uint32_t storage_class = 0;
+        uint32_t pointee_type = 0;
+        uint32_t byte_offset = 0;
+        int32_t mesh_idx = -1;
+        uint32_t builtin = ~0u;
+        uint32_t location = ~0u;
+        uint32_t binding = ~0u;
+        uint32_t vec_comp = ~0u;
+    };
+
+    const auto& spv = *mod.words;
+    std::vector<SwSpvVal> regs(mod.bound);
+    std::vector<PtrInfo> ptrs(mod.bound);
+    for (const auto& [id, cv] : mod.constants) {
+        if (id < mod.bound) regs[id] = cv;
+    }
+
+    for (const auto& [vid, ptype] : mod.var_type) {
+        if (vid >= mod.bound) continue;
+        PtrInfo p{};
+        p.root_var = vid;
+        p.storage_class = mod.var_storage.at(vid);
+        auto pit = mod.types.find(ptype);
+        if (pit != mod.types.end()) p.pointee_type = pit->second.elem_type;
+        if (auto it = mod.dec_builtin.find(vid); it != mod.dec_builtin.end()) p.builtin = it->second;
+        if (auto it = mod.dec_location.find(vid); it != mod.dec_location.end()) p.location = it->second;
+        if (auto it = mod.dec_binding.find(vid); it != mod.dec_binding.end()) p.binding = it->second;
+        ptrs[vid] = p;
+    }
+
+    auto find_desc = [&](uint32_t binding) -> const VulkanDescriptorBinding* {
+        if (!env.descriptors) return nullptr;
+        for (const auto& d : *env.descriptors) {
+            if (d.binding == binding) return &d;
+        }
+        return nullptr;
+    };
+
+    auto read_bytes = [&](const std::vector<uint8_t>* buf, uint32_t off, uint32_t type_id) -> SwSpvVal {
+        SwSpvVal out{};
+        if (!buf) return out;
+        auto tit = mod.types.find(type_id);
+        uint32_t count = 1;
+        if (tit != mod.types.end()) {
+            if (tit->second.kind == SwSpvType::Kind::Vector) count = tit->second.count;
+            else if (tit->second.kind == SwSpvType::Kind::Matrix) count = tit->second.count * 4u;
+        }
+        out.count = std::min<uint32_t>(count, 16u);
+        for (uint32_t i = 0; i < out.count; ++i) {
+            const size_t bo = static_cast<size_t>(off) + i * 4u;
+            if (bo + 4 <= buf->size()) std::memcpy(&out.u[i], buf->data() + bo, 4);
+        }
+        return out;
+    };
+
+    uint32_t prev_label = 0;
+    uint32_t cur_label = 0;
+    size_t ip = mod.body_start;
+    uint32_t steps = 0;
+    constexpr uint32_t kMaxSteps = 65536u;
+
+    while (ip < mod.body_end && ++steps < kMaxSteps) {
+        const uint16_t wc = static_cast<uint16_t>(spv[ip] >> 16);
+        const uint16_t op = static_cast<uint16_t>(spv[ip] & 0xFFFFu);
+
+        switch (op) {
+            case kSpvOpLabel:
+                prev_label = cur_label;
+                cur_label = spv[ip + 1];
+                break;
+            case kSpvOpSelectionMerge:
+                break;
+            case kSpvOpPhi:
+                if (wc >= 5 && spv[ip + 2] < mod.bound) {
+                    for (uint16_t k = 3; k + 1 < wc; k += 2) {
+                        if (spv[ip + k + 1] == prev_label) {
+                            regs[spv[ip + 2]] = regs[spv[ip + k]];
+                            break;
+                        }
+                    }
+                }
+                break;
+            case kSpvOpAccessChain:
+                if (wc >= 4 && spv[ip + 2] < mod.bound) {
+                    PtrInfo p = ptrs[spv[ip + 3]];
+                    uint32_t cur_ty = p.pointee_type;
+                    for (uint16_t k = 4; k < wc; ++k) {
+                        const uint32_t idx = regs[spv[ip + k]].u[0];
+                        auto tit = mod.types.find(cur_ty);
+                        if (tit == mod.types.end()) break;
+                        const auto& t = tit->second;
+                        if (t.kind == SwSpvType::Kind::Struct) {
+                            const uint64_t mk = (static_cast<uint64_t>(cur_ty) << 32) | idx;
+                            if (auto oit = mod.member_offset.find(mk); oit != mod.member_offset.end()) {
+                                p.byte_offset += oit->second;
+                            } else {
+                                p.byte_offset += idx * 4u;
+                            }
+                            if (auto bit = mod.member_builtin.find(mk); bit != mod.member_builtin.end()) {
+                                p.builtin = bit->second;
+                            }
+                            cur_ty = (idx < t.members.size()) ? t.members[idx] : 0u;
+                        } else if (t.kind == SwSpvType::Kind::Array || t.kind == SwSpvType::Kind::RuntimeArray) {
+                            if (p.storage_class == kSpvStorageOutput) {
+                                p.mesh_idx = static_cast<int32_t>(idx);
+                            } else {
+                                auto sit = mod.dec_array_stride.find(cur_ty);
+                                const uint32_t stride = (sit != mod.dec_array_stride.end()) ? sit->second : mod.TypeSizeBytes(t.elem_type);
+                                p.byte_offset += idx * stride;
+                            }
+                            cur_ty = t.elem_type;
+                        } else if (t.kind == SwSpvType::Kind::Vector) {
+                            p.vec_comp = idx;
+                            p.byte_offset += idx * 4u;
+                            cur_ty = t.elem_type;
+                        } else if (t.kind == SwSpvType::Kind::Matrix) {
+                            p.byte_offset += idx * mod.TypeSizeBytes(t.elem_type);
+                            cur_ty = t.elem_type;
+                        }
+                    }
+                    p.pointee_type = cur_ty;
+                    ptrs[spv[ip + 2]] = p;
+                }
+                break;
+            case kSpvOpLoad:
+                if (wc >= 4 && spv[ip + 2] < mod.bound) {
+                    const uint32_t res_ty = spv[ip + 1];
+                    const uint32_t res = spv[ip + 2];
+                    const PtrInfo& p = ptrs[spv[ip + 3]];
+                    SwSpvVal v{};
+                    if (p.storage_class == kSpvStorageUniformConstant) {
+                        v.count = 1;
+                        v.u[0] = p.binding;  // carry descriptor binding index
+                    } else if (p.storage_class == kSpvStorageInput) {
+                        if (p.builtin == kSpvBuiltInVertexIndex) {
+                            v.count = 1; v.u[0] = env.vertex_index;
+                        } else if (p.builtin == kSpvBuiltInLocalInvocationIndex) {
+                            v.count = 1; v.u[0] = env.local_index;
+                        } else if (p.builtin == kSpvBuiltInWorkgroupId || p.builtin == kSpvBuiltInGlobalInvocationId) {
+                            if (p.vec_comp < 3) {
+                                v.count = 1; v.u[0] = env.workgroup_id[p.vec_comp];
+                            } else {
+                                v.count = 3;
+                                v.u[0] = env.workgroup_id[0]; v.u[1] = env.workgroup_id[1]; v.u[2] = env.workgroup_id[2];
+                            }
+                        } else if (p.location < env.stage_inputs.size()) {
+                            const auto& in4 = env.stage_inputs[p.location];
+                            if (p.vec_comp < 4) {
+                                v.count = 1; v.set_f(0, in4.v[p.vec_comp]);
+                            } else {
+                                auto tit = mod.types.find(res_ty);
+                                v.count = (tit != mod.types.end() && tit->second.kind == SwSpvType::Kind::Vector) ? tit->second.count : 4u;
+                                for (uint32_t c = 0; c < v.count && c < 4; ++c) v.set_f(c, in4.v[c]);
+                            }
+                        }
+                    } else if (p.storage_class == kSpvStoragePushConstant) {
+                        v = read_bytes(env.push_constants, p.byte_offset, res_ty);
+                    } else if (p.storage_class == kSpvStorageUniform || p.storage_class == kSpvStorageStorageBuffer) {
+                        if (const auto* d = find_desc(p.binding)) {
+                            v = read_bytes(&d->buffer_data, p.byte_offset, res_ty);
+                        }
+                    } else if (p.storage_class == kSpvStorageTaskPayloadWorkgroupEXT) {
+                        v = read_bytes(env.task_payload, p.byte_offset, res_ty);
+                    }
+                    regs[res] = v;
+                }
+                break;
+            case kSpvOpStore:
+                if (wc >= 3) {
+                    const PtrInfo& p = ptrs[spv[ip + 1]];
+                    const SwSpvVal& val = regs[spv[ip + 2]];
+                    if (p.storage_class == kSpvStorageOutput) {
+                        if (p.mesh_idx >= 0) {
+                            const size_t idx = static_cast<size_t>(p.mesh_idx);
+                            if (p.builtin == kSpvBuiltInPosition) {
+                                if (idx >= env.mesh_positions.size()) env.mesh_positions.resize(idx + 1);
+                                for (uint32_t c = 0; c < 4; ++c) env.mesh_positions[idx].v[c] = val.f(c);
+                            } else if (p.builtin == kSpvBuiltInPrimitiveTriangleIndicesEXT) {
+                                if (idx >= env.mesh_indices.size()) env.mesh_indices.resize(idx + 1);
+                                env.mesh_indices[idx] = {val.u[0], val.u[1], val.u[2]};
+                            } else if (p.location == 0u) {
+                                if (idx >= env.mesh_param0.size()) env.mesh_param0.resize(idx + 1);
+                                for (uint32_t c = 0; c < 4; ++c) env.mesh_param0[idx].v[c] = val.f(c);
+                            }
+                        } else if (p.builtin == kSpvBuiltInPosition) {
+                            for (uint32_t c = 0; c < 4; ++c) env.out_position.v[c] = val.f(c);
+                        } else if (p.location < env.stage_outputs.size()) {
+                            for (uint32_t c = 0; c < 4 && c < val.count; ++c) env.stage_outputs[p.location].v[c] = val.f(c);
+                        }
+                    } else if (p.storage_class == kSpvStorageTaskPayloadWorkgroupEXT && env.task_payload) {
+                        const size_t need = static_cast<size_t>(p.byte_offset) + val.count * 4u;
+                        if (env.task_payload->size() < need) env.task_payload->resize(need, 0u);
+                        for (uint32_t c = 0; c < val.count; ++c) {
+                            std::memcpy(env.task_payload->data() + p.byte_offset + c * 4u, &val.u[c], 4u);
+                        }
+                    }
+                }
+                break;
+            case kSpvOpCompositeConstruct:
+                if (wc >= 4 && spv[ip + 2] < mod.bound) {
+                    SwSpvVal out{}; out.count = 0;
+                    for (uint16_t k = 3; k < wc && out.count < 16; ++k) {
+                        const auto& s = regs[spv[ip + k]];
+                        for (uint32_t j = 0; j < s.count && out.count < 16; ++j) out.u[out.count++] = s.u[j];
+                    }
+                    regs[spv[ip + 2]] = out;
+                }
+                break;
+            case kSpvOpCompositeExtract:
+                if (wc >= 5 && spv[ip + 2] < mod.bound) {
+                    const auto& s = regs[spv[ip + 3]];
+                    const uint32_t idx = spv[ip + 4];
+                    SwSpvVal out{}; out.count = 1;
+                    out.u[0] = (idx < 16) ? s.u[idx] : 0u;
+                    regs[spv[ip + 2]] = out;
+                }
+                break;
+            case kSpvOpVectorShuffle:
+                if (wc >= 6 && spv[ip + 2] < mod.bound) {
+                    const auto& a = regs[spv[ip + 3]];
+                    const auto& b = regs[spv[ip + 4]];
+                    SwSpvVal out{}; out.count = 0;
+                    for (uint16_t k = 5; k < wc && out.count < 4; ++k) {
+                        const uint32_t idx = spv[ip + k];
+                        out.u[out.count++] = (idx < a.count) ? a.u[idx] : ((idx - a.count < b.count) ? b.u[idx - a.count] : 0u);
+                    }
+                    regs[spv[ip + 2]] = out;
+                }
+                break;
+            case kSpvOpSampledImage:
+                if (wc >= 5 && spv[ip + 2] < mod.bound) {
+                    SwSpvVal out{}; out.count = 2;
+                    out.u[0] = regs[spv[ip + 3]].u[0];  // image binding
+                    out.u[1] = regs[spv[ip + 4]].u[0];  // sampler binding
+                    regs[spv[ip + 2]] = out;
+                }
+                break;
+            case kSpvOpImageSampleImplicitLod:
+            case kSpvOpImageSampleExplicitLod:
+                if (wc >= 5 && spv[ip + 2] < mod.bound) {
+                    const uint32_t img_binding = regs[spv[ip + 3]].u[0];
+                    const auto& uv = regs[spv[ip + 4]];
+                    SwVec4 c = {{0, 0, 0, 1}};
+                    if (const auto* d = find_desc(img_binding)) {
+                        c = SwSampleTexture2D(d->texture, uv.f(0), uv.f(1), d->linear_filter);
+                    }
+                    SwSpvVal out{}; out.count = 4;
+                    for (uint32_t i = 0; i < 4; ++i) out.set_f(i, c.v[i]);
+                    regs[spv[ip + 2]] = out;
+                }
+                break;
+            case kSpvOpBitcast:
+                if (wc >= 4 && spv[ip + 2] < mod.bound) regs[spv[ip + 2]] = regs[spv[ip + 3]];
+                break;
+            case kSpvOpConvertSToF:
+                if (wc >= 4 && spv[ip + 2] < mod.bound) {
+                    const auto& a = regs[spv[ip + 3]];
+                    SwSpvVal out{}; out.count = a.count;
+                    for (uint32_t i = 0; i < a.count; ++i) out.set_f(i, static_cast<float>(static_cast<int32_t>(a.u[i])));
+                    regs[spv[ip + 2]] = out;
+                }
+                break;
+            case kSpvOpConvertUToF:
+                if (wc >= 4 && spv[ip + 2] < mod.bound) {
+                    const auto& a = regs[spv[ip + 3]];
+                    SwSpvVal out{}; out.count = a.count;
+                    for (uint32_t i = 0; i < a.count; ++i) out.set_f(i, static_cast<float>(a.u[i]));
+                    regs[spv[ip + 2]] = out;
+                }
+                break;
+            case kSpvOpFNegate:
+                if (wc >= 4 && spv[ip + 2] < mod.bound) {
+                    const auto& a = regs[spv[ip + 3]];
+                    SwSpvVal out{}; out.count = a.count;
+                    for (uint32_t i = 0; i < a.count; ++i) out.set_f(i, -a.f(i));
+                    regs[spv[ip + 2]] = out;
+                }
+                break;
+            case kSpvOpFAdd:
+            case kSpvOpFSub:
+            case kSpvOpFMul:
+            case kSpvOpFDiv:
+                if (wc >= 5 && spv[ip + 2] < mod.bound) {
+                    const auto& a = regs[spv[ip + 3]];
+                    const auto& b = regs[spv[ip + 4]];
+                    SwSpvVal out{}; out.count = std::max(a.count, b.count);
+                    for (uint32_t i = 0; i < out.count; ++i) {
+                        const float fa = a.f(i < a.count ? i : 0);
+                        const float fb = b.f(i < b.count ? i : 0);
+                        float r = 0.0f;
+                        if (op == kSpvOpFAdd) r = fa + fb;
+                        else if (op == kSpvOpFSub) r = fa - fb;
+                        else if (op == kSpvOpFMul) r = fa * fb;
+                        else r = (fb != 0.0f) ? (fa / fb) : 0.0f;
+                        out.set_f(i, r);
+                    }
+                    regs[spv[ip + 2]] = out;
+                }
+                break;
+            case kSpvOpVectorTimesScalar:
+                if (wc >= 5 && spv[ip + 2] < mod.bound) {
+                    const auto& a = regs[spv[ip + 3]];
+                    const float s = regs[spv[ip + 4]].f(0);
+                    SwSpvVal out{}; out.count = a.count;
+                    for (uint32_t i = 0; i < a.count; ++i) out.set_f(i, a.f(i) * s);
+                    regs[spv[ip + 2]] = out;
+                }
+                break;
+            case kSpvOpMatrixTimesVector:
+                if (wc >= 5 && spv[ip + 2] < mod.bound) {
+                    const auto& m = regs[spv[ip + 3]];  // column-major 4x4
+                    const auto& v = regs[spv[ip + 4]];
+                    SwSpvVal out{}; out.count = 4;
+                    for (uint32_t row = 0; row < 4; ++row) {
+                        float sum = 0.0f;
+                        for (uint32_t col = 0; col < 4; ++col) {
+                            sum += m.f(col * 4 + row) * v.f(col);
+                        }
+                        out.set_f(row, sum);
+                    }
+                    regs[spv[ip + 2]] = out;
+                }
+                break;
+            case kSpvOpDot:
+                if (wc >= 5 && spv[ip + 2] < mod.bound) {
+                    const auto& a = regs[spv[ip + 3]];
+                    const auto& b = regs[spv[ip + 4]];
+                    float d = 0.0f;
+                    for (uint32_t i = 0; i < std::min(a.count, b.count); ++i) d += a.f(i) * b.f(i);
+                    SwSpvVal out{}; out.count = 1; out.set_f(0, d);
+                    regs[spv[ip + 2]] = out;
+                }
+                break;
+            case kSpvOpIAdd:
+            case kSpvOpISub:
+            case kSpvOpIMul:
+            case kSpvOpBitwiseAnd:
+            case kSpvOpBitwiseOr:
+            case kSpvOpBitwiseXor:
+            case kSpvOpShiftLeftLogical:
+            case kSpvOpShiftRightLogical:
+                if (wc >= 5 && spv[ip + 2] < mod.bound) {
+                    const uint32_t a = regs[spv[ip + 3]].u[0];
+                    const uint32_t b = regs[spv[ip + 4]].u[0];
+                    uint32_t r = 0;
+                    if (op == kSpvOpIAdd) r = a + b;
+                    else if (op == kSpvOpISub) r = a - b;
+                    else if (op == kSpvOpIMul) r = a * b;
+                    else if (op == kSpvOpBitwiseAnd) r = a & b;
+                    else if (op == kSpvOpBitwiseOr) r = a | b;
+                    else if (op == kSpvOpBitwiseXor) r = a ^ b;
+                    else if (op == kSpvOpShiftLeftLogical) r = a << (b & 31u);
+                    else r = a >> (b & 31u);
+                    SwSpvVal out{}; out.count = 1; out.u[0] = r;
+                    regs[spv[ip + 2]] = out;
+                }
+                break;
+            case kSpvOpIEqual:
+            case kSpvOpINotEqual:
+            case kSpvOpULessThan:
+            case kSpvOpSLessThan:
+            case kSpvOpUGreaterThan:
+            case kSpvOpSGreaterThan:
+            case kSpvOpFOrdEqual:
+            case kSpvOpFOrdLessThan:
+            case kSpvOpFOrdGreaterThan:
+                if (wc >= 5 && spv[ip + 2] < mod.bound) {
+                    const auto& a = regs[spv[ip + 3]];
+                    const auto& b = regs[spv[ip + 4]];
+                    bool res_b = false;
+                    if (op == kSpvOpIEqual) res_b = (a.u[0] == b.u[0]);
+                    else if (op == kSpvOpINotEqual) res_b = (a.u[0] != b.u[0]);
+                    else if (op == kSpvOpULessThan) res_b = (a.u[0] < b.u[0]);
+                    else if (op == kSpvOpSLessThan) res_b = (static_cast<int32_t>(a.u[0]) < static_cast<int32_t>(b.u[0]));
+                    else if (op == kSpvOpUGreaterThan) res_b = (a.u[0] > b.u[0]);
+                    else if (op == kSpvOpSGreaterThan) res_b = (static_cast<int32_t>(a.u[0]) > static_cast<int32_t>(b.u[0]));
+                    else if (op == kSpvOpFOrdEqual) res_b = (a.f(0) == b.f(0));
+                    else if (op == kSpvOpFOrdLessThan) res_b = (a.f(0) < b.f(0));
+                    else res_b = (a.f(0) > b.f(0));
+                    SwSpvVal out{}; out.count = 1; out.u[0] = res_b ? 1u : 0u;
+                    regs[spv[ip + 2]] = out;
+                }
+                break;
+            case kSpvOpSelect:
+                if (wc >= 6 && spv[ip + 2] < mod.bound) {
+                    const bool c = (regs[spv[ip + 3]].u[0] != 0u);
+                    regs[spv[ip + 2]] = c ? regs[spv[ip + 4]] : regs[spv[ip + 5]];
+                }
+                break;
+            case kSpvOpExtInst:
+                if (wc >= 6 && spv[ip + 2] < mod.bound) {
+                    const uint32_t ext_op = spv[ip + 4];
+                    const auto& a = regs[spv[ip + 5]];
+                    SwSpvVal out{}; out.count = a.count;
+                    for (uint32_t i = 0; i < a.count; ++i) {
+                        const float fa = a.f(i);
+                        const float fb = (wc >= 7) ? regs[spv[ip + 6]].f(i < regs[spv[ip + 6]].count ? i : 0) : 0.0f;
+                        const float fc = (wc >= 8) ? regs[spv[ip + 7]].f(i < regs[spv[ip + 7]].count ? i : 0) : 0.0f;
+                        if (ext_op == 4u) out.set_f(i, std::fabs(fa));
+                        else if (ext_op == 8u) out.set_f(i, std::floor(fa));
+                        else if (ext_op == 10u) out.set_f(i, fa - std::floor(fa));
+                        else if (ext_op == 31u) out.set_f(i, std::sqrt(std::max(0.0f, fa)));
+                        else if (ext_op == 37u) out.set_f(i, std::min(fa, fb));
+                        else if (ext_op == 40u) out.set_f(i, std::max(fa, fb));
+                        else if (ext_op == 43u) out.set_f(i, std::clamp(fa, fb, fc));
+                        else if (ext_op == 50u) out.set_f(i, fa * fb + fc);
+                        else out.set_f(i, fa);
+                    }
+                    regs[spv[ip + 2]] = out;
+                }
+                break;
+            case kSpvOpBranch:
+                if (wc >= 2) {
+                    auto it = mod.label_ip.find(spv[ip + 1]);
+                    if (it != mod.label_ip.end()) { ip = it->second; continue; }
+                }
+                return true;
+            case kSpvOpBranchConditional:
+                if (wc >= 4) {
+                    const uint32_t target = (regs[spv[ip + 1]].u[0] != 0u) ? spv[ip + 2] : spv[ip + 3];
+                    auto it = mod.label_ip.find(target);
+                    if (it != mod.label_ip.end()) { ip = it->second; continue; }
+                }
+                return true;
+            case kSpvOpSetMeshOutputsEXT:
+                if (wc >= 3) {
+                    env.mesh_vert_count = regs[spv[ip + 1]].u[0];
+                    env.mesh_prim_count = regs[spv[ip + 2]].u[0];
+                    env.mesh_positions.resize(env.mesh_vert_count);
+                    env.mesh_param0.resize(env.mesh_vert_count);
+                    env.mesh_indices.resize(env.mesh_prim_count);
+                }
+                break;
+            case kSpvOpEmitMeshTasksEXT:
+                if (wc >= 4) {
+                    env.emitted_mesh_groups[0] = regs[spv[ip + 1]].u[0];
+                    env.emitted_mesh_groups[1] = regs[spv[ip + 2]].u[0];
+                    env.emitted_mesh_groups[2] = regs[spv[ip + 3]].u[0];
+                }
+                return true;
+            case kSpvOpReturn:
+                return true;
+            default:
+                break;
+        }
+        ip += wc;
+    }
+    return true;
+}
+
+struct SwVertexOut {
+    SwVec4 pos;
+    std::array<SwVec4, 4> varyings{};
+};
+
+void RasterizeTrianglesSoftware(uint32_t width,
+                                uint32_t height,
+                                VulkanImageFormat color_format,
+                                bool enable_depth,
+                                bool enable_msaa_4x,
+                                bool depth_write,
+                                const float clear_color[4],
+                                float clear_depth,
+                                const std::vector<SwVertexOut>& verts,
+                                const std::vector<std::array<uint32_t, 3>>& tris,
+                                const SwSpvModule& ps_mod,
+                                const std::vector<uint8_t>* push_constants,
+                                const std::vector<VulkanDescriptorBinding>* descriptors,
+                                FrameBufferRgba8& out_fb,
+                                std::vector<uint16_t>& out_fp16) {
+    const uint32_t spp = enable_msaa_4x ? 4u : 1u;
+    static constexpr float kSampleOffsets4[4][2] = {
+        {0.375f, 0.125f}, {0.875f, 0.375f}, {0.125f, 0.625f}, {0.625f, 0.875f},
+    };
+    static constexpr float kSampleOffsets1[1][2] = {{0.5f, 0.5f}};
+    const float (*offsets)[2] = enable_msaa_4x ? kSampleOffsets4 : kSampleOffsets1;
+
+    const size_t total_samples = static_cast<size_t>(width) * height * spp;
+    std::vector<SwVec4> sample_color(total_samples,
+                                     {{clear_color[0], clear_color[1], clear_color[2], clear_color[3]}});
+    std::vector<float> sample_depth(total_samples, clear_depth);
+
+    auto edge_fn = [](float ax, float ay, float bx, float by, float cx, float cy) -> float {
+        return (cx - ax) * (by - ay) - (cy - ay) * (bx - ax);
+    };
+
+    for (const auto& tri : tris) {
+        if (tri[0] >= verts.size() || tri[1] >= verts.size() || tri[2] >= verts.size()) continue;
+        const auto& v0 = verts[tri[0]];
+        const auto& v1 = verts[tri[1]];
+        const auto& v2 = verts[tri[2]];
+        if (std::fabs(v0.pos.v[3]) < 1e-7f || std::fabs(v1.pos.v[3]) < 1e-7f || std::fabs(v2.pos.v[3]) < 1e-7f) {
+            continue;
+        }
+        const float inv_w0 = 1.0f / v0.pos.v[3];
+        const float inv_w1 = 1.0f / v1.pos.v[3];
+        const float inv_w2 = 1.0f / v2.pos.v[3];
+
+        const float sx0 = (v0.pos.v[0] * inv_w0 * 0.5f + 0.5f) * width;
+        const float sy0 = (v0.pos.v[1] * inv_w0 * 0.5f + 0.5f) * height;
+        const float sz0 = v0.pos.v[2] * inv_w0;
+
+        const float sx1 = (v1.pos.v[0] * inv_w1 * 0.5f + 0.5f) * width;
+        const float sy1 = (v1.pos.v[1] * inv_w1 * 0.5f + 0.5f) * height;
+        const float sz1 = v1.pos.v[2] * inv_w1;
+
+        const float sx2 = (v2.pos.v[0] * inv_w2 * 0.5f + 0.5f) * width;
+        const float sy2 = (v2.pos.v[1] * inv_w2 * 0.5f + 0.5f) * height;
+        const float sz2 = v2.pos.v[2] * inv_w2;
+
+        const float area = edge_fn(sx0, sy0, sx1, sy1, sx2, sy2);
+        if (std::fabs(area) < 1e-6f) continue;
+        const float sign = (area > 0.0f) ? 1.0f : -1.0f;
+        const float inv_area = 1.0f / area;
+
+        const int32_t min_x = std::clamp(static_cast<int32_t>(std::floor(std::min({sx0, sx1, sx2}))), 0, static_cast<int32_t>(width) - 1);
+        const int32_t max_x = std::clamp(static_cast<int32_t>(std::ceil(std::max({sx0, sx1, sx2}))), 0, static_cast<int32_t>(width) - 1);
+        const int32_t min_y = std::clamp(static_cast<int32_t>(std::floor(std::min({sy0, sy1, sy2}))), 0, static_cast<int32_t>(height) - 1);
+        const int32_t max_y = std::clamp(static_cast<int32_t>(std::ceil(std::max({sy0, sy1, sy2}))), 0, static_cast<int32_t>(height) - 1);
+
+        for (int32_t py = min_y; py <= max_y; ++py) {
+            for (int32_t px = min_x; px <= max_x; ++px) {
+                for (uint32_t s = 0; s < spp; ++s) {
+                    const float fx = static_cast<float>(px) + offsets[s][0];
+                    const float fy = static_cast<float>(py) + offsets[s][1];
+                    const float w0 = edge_fn(sx1, sy1, sx2, sy2, fx, fy);
+                    const float w1 = edge_fn(sx2, sy2, sx0, sy0, fx, fy);
+                    const float w2 = edge_fn(sx0, sy0, sx1, sy1, fx, fy);
+                    if (w0 * sign < 0.0f || w1 * sign < 0.0f || w2 * sign < 0.0f) continue;
+
+                    const float b0 = w0 * inv_area;
+                    const float b1 = w1 * inv_area;
+                    const float b2 = w2 * inv_area;
+                    const float z = b0 * sz0 + b1 * sz1 + b2 * sz2;
+                    if (z < 0.0f || z > 1.0f) continue;
+
+                    const size_t sidx = (static_cast<size_t>(py) * width + px) * spp + s;
+                    if (enable_depth && !(z < sample_depth[sidx])) continue;
+                    if (enable_depth && depth_write) sample_depth[sidx] = z;
+
+                    const float pw0 = b0 * inv_w0;
+                    const float pw1 = b1 * inv_w1;
+                    const float pw2 = b2 * inv_w2;
+                    const float inv_pw = 1.0f / std::max(1e-7f, pw0 + pw1 + pw2);
+
+                    SwShaderExecEnv ps_env{};
+                    ps_env.push_constants = push_constants;
+                    ps_env.descriptors = descriptors;
+                    for (uint32_t loc = 0; loc < 4; ++loc) {
+                        for (uint32_t c = 0; c < 4; ++c) {
+                            ps_env.stage_inputs[loc].v[c] =
+                                (pw0 * v0.varyings[loc].v[c] + pw1 * v1.varyings[loc].v[c] + pw2 * v2.varyings[loc].v[c]) * inv_pw;
+                        }
+                    }
+                    ExecuteSwSpvModule(ps_mod, ps_env);
+                    sample_color[sidx] = ps_env.stage_outputs[0];
+                }
+            }
+        }
+    }
+
+    out_fb.width = width;
+    out_fb.height = height;
+    out_fb.pixels.resize(static_cast<size_t>(width) * height * 4u);
+    out_fp16.clear();
+    if (color_format == VulkanImageFormat::Rgba16Sfloat) {
+        out_fp16.resize(static_cast<size_t>(width) * height * 4u);
+    }
+
+    for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+            float avg[4] = {0, 0, 0, 0};
+            for (uint32_t s = 0; s < spp; ++s) {
+                const auto& sc = sample_color[(static_cast<size_t>(y) * width + x) * spp + s];
+                for (int c = 0; c < 4; ++c) avg[c] += sc.v[c];
+            }
+            const float inv_spp = 1.0f / static_cast<float>(spp);
+            const size_t pidx = (static_cast<size_t>(y) * width + x) * 4u;
+            for (int c = 0; c < 4; ++c) {
+                const float v = avg[c] * inv_spp;
+                out_fb.pixels[pidx + c] = FloatToUnorm8(v);
+                if (!out_fp16.empty()) out_fp16[pidx + c] = FloatToHalf(v);
+            }
+        }
+    }
+}
+
+Status ExecuteSpirvGraphicsSoftware(const VulkanGraphicsDrawDesc& desc, VulkanGraphicsDrawResult& out_result) {
+    SwSpvModule vs_mod{};
+    SwSpvModule ps_mod{};
+    if (!vs_mod.Parse(desc.vertex_spirv, kSpvExecModelVertex)) {
+        return Status::Error(StatusCode::ShaderError, "Software fallback: invalid Vertex SPIR-V");
+    }
+    if (!ps_mod.Parse(desc.fragment_spirv, kSpvExecModelFragment)) {
+        return Status::Error(StatusCode::ShaderError, "Software fallback: invalid Fragment SPIR-V");
+    }
+
+    const bool indexed = !desc.indices.empty();
+    const uint32_t draw_count = indexed ? static_cast<uint32_t>(desc.indices.size()) : desc.vertex_count;
+    const uint32_t num_verts = indexed ? (desc.vertex_stride > 0 ? static_cast<uint32_t>(desc.vertex_bytes.size() / desc.vertex_stride) : 0u) : draw_count;
+
+    std::vector<SwVertexOut> verts(std::max<uint32_t>(num_verts, draw_count));
+    auto eval_vertex = [&](uint32_t vidx) -> SwVertexOut {
+        SwShaderExecEnv vs_env{};
+        vs_env.vertex_index = vidx;
+        vs_env.push_constants = &desc.push_constants;
+        vs_env.descriptors = &desc.descriptors;
+        if (!desc.vertex_bytes.empty() && desc.vertex_stride > 0) {
+            const size_t vbase = static_cast<size_t>(vidx) * desc.vertex_stride;
+            for (const auto& attr : desc.vertex_attributes) {
+                if (attr.location >= vs_env.stage_inputs.size()) continue;
+                const size_t abase = vbase + attr.offset;
+                uint32_t comps = 4;
+                if (attr.format == VulkanVertexFormat::R32Sfloat || attr.format == VulkanVertexFormat::R32Uint) comps = 1;
+                else if (attr.format == VulkanVertexFormat::R32G32Sfloat) comps = 2;
+                else if (attr.format == VulkanVertexFormat::R32G32B32Sfloat) comps = 3;
+                for (uint32_t c = 0; c < comps; ++c) {
+                    if (abase + (c + 1) * 4 <= desc.vertex_bytes.size()) {
+                        float fv = 0.0f;
+                        std::memcpy(&fv, desc.vertex_bytes.data() + abase + c * 4, 4);
+                        vs_env.stage_inputs[attr.location].v[c] = fv;
+                    }
+                }
+            }
+        }
+        ExecuteSwSpvModule(vs_mod, vs_env);
+        SwVertexOut vo{};
+        vo.pos = vs_env.out_position;
+        for (uint32_t i = 0; i < 4; ++i) vo.varyings[i] = vs_env.stage_outputs[i];
+        return vo;
+    };
+
+    std::vector<std::array<uint32_t, 3>> tris;
+    if (indexed) {
+        for (uint32_t i = 0; i < num_verts; ++i) verts[i] = eval_vertex(i);
+        for (size_t i = 0; i + 2 < desc.indices.size(); i += 3) {
+            tris.push_back({desc.indices[i], desc.indices[i + 1], desc.indices[i + 2]});
+        }
+    } else {
+        for (uint32_t i = 0; i < draw_count; ++i) verts[i] = eval_vertex(i);
+        for (uint32_t i = 0; i + 2 < draw_count; i += 3) {
+            tris.push_back({i, i + 1, i + 2});
+        }
+    }
+
+    RasterizeTrianglesSoftware(desc.width, desc.height, desc.color_format, desc.enable_depth,
+                               desc.enable_msaa_4x, desc.depth_write, desc.clear_color, desc.clear_depth,
+                               verts, tris, ps_mod, &desc.push_constants, &desc.descriptors,
+                               out_result.framebuffer, out_result.raw_fp16_rgba);
+    out_result.fnv1a_hash = out_result.framebuffer.ComputeFnv1aHash();
+    out_result.executed_on_vulkan_icd = false;
+    out_result.used_msaa_4x = desc.enable_msaa_4x;
+    out_result.used_depth_buffer = desc.enable_depth;
+    return Status::Ok();
+}
+
+Status ExecuteSpirvMeshSoftware(const VulkanMeshDrawDesc& desc, VulkanMeshDrawResult& out_result) {
+    SwSpvModule ms_mod{};
+    SwSpvModule ps_mod{};
+    if (!ms_mod.Parse(desc.mesh_spirv, kSpvExecModelMeshEXT)) {
+        return Status::Error(StatusCode::ShaderError, "Software fallback: invalid MeshEXT SPIR-V");
+    }
+    if (!ps_mod.Parse(desc.fragment_spirv, kSpvExecModelFragment)) {
+        return Status::Error(StatusCode::ShaderError, "Software fallback: invalid Fragment SPIR-V");
+    }
+
+    uint32_t mesh_gx = desc.group_count_x;
+    uint32_t mesh_gy = desc.group_count_y;
+    uint32_t mesh_gz = desc.group_count_z;
+    std::vector<uint8_t> payload_bytes(64, 0u);
+    const bool has_task = !desc.task_spirv.empty();
+
+    if (has_task) {
+        SwSpvModule as_mod{};
+        if (!as_mod.Parse(desc.task_spirv, kSpvExecModelTaskEXT)) {
+            return Status::Error(StatusCode::ShaderError, "Software fallback: invalid TaskEXT SPIR-V");
+        }
+        SwShaderExecEnv task_env{};
+        task_env.push_constants = &desc.push_constants;
+        task_env.descriptors = &desc.descriptors;
+        task_env.task_payload = &payload_bytes;
+        ExecuteSwSpvModule(as_mod, task_env);
+        mesh_gx = task_env.emitted_mesh_groups[0];
+        mesh_gy = task_env.emitted_mesh_groups[1];
+        mesh_gz = task_env.emitted_mesh_groups[2];
+    }
+
+    std::vector<SwVertexOut> all_verts;
+    std::vector<std::array<uint32_t, 3>> all_tris;
+
+    for (uint32_t gz = 0; gz < mesh_gz; ++gz) {
+        for (uint32_t gy = 0; gy < mesh_gy; ++gy) {
+            for (uint32_t gx = 0; gx < mesh_gx; ++gx) {
+                SwShaderExecEnv ms_env{};
+                ms_env.workgroup_id[0] = gx;
+                ms_env.workgroup_id[1] = gy;
+                ms_env.workgroup_id[2] = gz;
+                ms_env.push_constants = &desc.push_constants;
+                ms_env.descriptors = &desc.descriptors;
+                ms_env.task_payload = &payload_bytes;
+                const uint32_t wg_threads = ms_mod.local_size[0] * ms_mod.local_size[1] * ms_mod.local_size[2];
+                for (uint32_t lid = 0; lid < wg_threads; ++lid) {
+                    ms_env.local_index = lid;
+                    ExecuteSwSpvModule(ms_mod, ms_env);
+                }
+                const uint32_t base_v = static_cast<uint32_t>(all_verts.size());
+                for (uint32_t v = 0; v < ms_env.mesh_vert_count && v < ms_env.mesh_positions.size(); ++v) {
+                    SwVertexOut vo{};
+                    vo.pos = ms_env.mesh_positions[v];
+                    if (v < ms_env.mesh_param0.size()) vo.varyings[0] = ms_env.mesh_param0[v];
+                    all_verts.push_back(vo);
+                }
+                for (uint32_t p = 0; p < ms_env.mesh_prim_count && p < ms_env.mesh_indices.size(); ++p) {
+                    all_tris.push_back({base_v + ms_env.mesh_indices[p][0],
+                                        base_v + ms_env.mesh_indices[p][1],
+                                        base_v + ms_env.mesh_indices[p][2]});
+                }
+            }
+        }
+    }
+
+    RasterizeTrianglesSoftware(desc.width, desc.height, desc.color_format, desc.enable_depth,
+                               false, true, desc.clear_color, desc.clear_depth,
+                               all_verts, all_tris, ps_mod, &desc.push_constants, &desc.descriptors,
+                               out_result.framebuffer, out_result.raw_fp16_rgba);
+    out_result.fnv1a_hash = out_result.framebuffer.ComputeFnv1aHash();
+    out_result.executed_on_mesh_shader_hw = false;
+    out_result.used_task_shader = has_task;
+    out_result.used_fallback = true;
+    return Status::Ok();
+}
+
 int DeviceTypeRank(uint32_t device_type) noexcept {
     switch (device_type) {
         case 2: return 5;  // Discrete GPU
@@ -776,26 +2552,43 @@ struct VulkanBackend::Impl {
     VkPhysicalDevice physical_device = nullptr;
     VkDevice device = nullptr;
     VkQueue compute_queue = nullptr;
+    VkQueue graphics_queue = nullptr;
     VkCommandPool command_pool = kVkNullHandle;
+    VkCommandPool graphics_command_pool = kVkNullHandle;
     uint32_t compute_queue_family = 0;
+    uint32_t graphics_queue_family = 0;
+    bool has_graphics_queue = false;
+    bool mesh_shader_enabled = false;
+    bool task_shader_enabled = false;
+    bool win32_surface_enabled = false;
+    bool swapchain_enabled = false;
+    bool hdr10_colorspace_enabled = false;
     VkPhysicalDeviceMemoryProperties mem_props{};
 
     // Dynamically resolved Vulkan entry points
     PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = nullptr;
     PFN_vkGetDeviceProcAddr vkGetDeviceProcAddr = nullptr;
     PFN_vkEnumerateInstanceVersion vkEnumerateInstanceVersion = nullptr;
+    PFN_vkEnumerateInstanceExtensionProperties vkEnumerateInstanceExtensionProperties = nullptr;
     PFN_vkCreateInstance vkCreateInstance = nullptr;
     PFN_vkDestroyInstance vkDestroyInstance = nullptr;
     PFN_vkEnumeratePhysicalDevices vkEnumeratePhysicalDevices = nullptr;
     PFN_vkGetPhysicalDeviceProperties vkGetPhysicalDeviceProperties = nullptr;
+    PFN_vkGetPhysicalDeviceFeatures2 vkGetPhysicalDeviceFeatures2 = nullptr;
     PFN_vkGetPhysicalDeviceQueueFamilyProperties vkGetPhysicalDeviceQueueFamilyProperties = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties vkGetPhysicalDeviceMemoryProperties = nullptr;
+    PFN_vkEnumerateDeviceExtensionProperties vkEnumerateDeviceExtensionProperties = nullptr;
     PFN_vkCreateDevice vkCreateDevice = nullptr;
     PFN_vkDestroyDevice vkDestroyDevice = nullptr;
     PFN_vkDeviceWaitIdle vkDeviceWaitIdle = nullptr;
     PFN_vkGetDeviceQueue vkGetDeviceQueue = nullptr;
     PFN_vkQueueSubmit vkQueueSubmit = nullptr;
     PFN_vkQueueWaitIdle vkQueueWaitIdle = nullptr;
+    PFN_vkCreateFence vkCreateFence = nullptr;
+    PFN_vkDestroyFence vkDestroyFence = nullptr;
+    PFN_vkWaitForFences vkWaitForFences = nullptr;
+    PFN_vkCreateSemaphore vkCreateSemaphore = nullptr;
+    PFN_vkDestroySemaphore vkDestroySemaphore = nullptr;
     PFN_vkCreateCommandPool vkCreateCommandPool = nullptr;
     PFN_vkDestroyCommandPool vkDestroyCommandPool = nullptr;
     PFN_vkAllocateCommandBuffers vkAllocateCommandBuffers = nullptr;
@@ -823,11 +2616,68 @@ struct VulkanBackend::Impl {
     PFN_vkCreatePipelineLayout vkCreatePipelineLayout = nullptr;
     PFN_vkDestroyPipelineLayout vkDestroyPipelineLayout = nullptr;
     PFN_vkCreateComputePipelines vkCreateComputePipelines = nullptr;
+    PFN_vkCreateGraphicsPipelines vkCreateGraphicsPipelines = nullptr;
     PFN_vkDestroyPipeline vkDestroyPipeline = nullptr;
     PFN_vkCreateDescriptorPool vkCreateDescriptorPool = nullptr;
     PFN_vkDestroyDescriptorPool vkDestroyDescriptorPool = nullptr;
     PFN_vkAllocateDescriptorSets vkAllocateDescriptorSets = nullptr;
     PFN_vkUpdateDescriptorSets vkUpdateDescriptorSets = nullptr;
+
+    // Graphics procedures
+    PFN_vkCreateRenderPass vkCreateRenderPass = nullptr;
+    PFN_vkDestroyRenderPass vkDestroyRenderPass = nullptr;
+    PFN_vkCreateImage vkCreateImage = nullptr;
+    PFN_vkDestroyImage vkDestroyImage = nullptr;
+    PFN_vkGetImageMemoryRequirements vkGetImageMemoryRequirements = nullptr;
+    PFN_vkBindImageMemory vkBindImageMemory = nullptr;
+    PFN_vkCreateImageView vkCreateImageView = nullptr;
+    PFN_vkDestroyImageView vkDestroyImageView = nullptr;
+    PFN_vkCreateSampler vkCreateSampler = nullptr;
+    PFN_vkDestroySampler vkDestroySampler = nullptr;
+    PFN_vkCreateFramebuffer vkCreateFramebuffer = nullptr;
+    PFN_vkDestroyFramebuffer vkDestroyFramebuffer = nullptr;
+    PFN_vkCmdBeginRenderPass vkCmdBeginRenderPass = nullptr;
+    PFN_vkCmdEndRenderPass vkCmdEndRenderPass = nullptr;
+    PFN_vkCmdBindVertexBuffers vkCmdBindVertexBuffers = nullptr;
+    PFN_vkCmdBindIndexBuffer vkCmdBindIndexBuffer = nullptr;
+    PFN_vkCmdDraw vkCmdDraw = nullptr;
+    PFN_vkCmdDrawIndexed vkCmdDrawIndexed = nullptr;
+    PFN_vkCmdPushConstants vkCmdPushConstants = nullptr;
+    PFN_vkCmdCopyBufferToImage vkCmdCopyBufferToImage = nullptr;
+    PFN_vkCmdCopyImageToBuffer vkCmdCopyImageToBuffer = nullptr;
+    PFN_vkCmdResolveImage vkCmdResolveImage = nullptr;
+    PFN_vkCmdSetViewport vkCmdSetViewport = nullptr;
+    PFN_vkCmdSetScissor vkCmdSetScissor = nullptr;
+
+    // VK_EXT_mesh_shader
+    PFN_vkCmdDrawMeshTasksEXT vkCmdDrawMeshTasksEXT = nullptr;
+
+    // WSI / Swapchain
+    PFN_vkCreateWin32SurfaceKHR vkCreateWin32SurfaceKHR = nullptr;
+    PFN_vkDestroySurfaceKHR vkDestroySurfaceKHR = nullptr;
+    PFN_vkGetPhysicalDeviceWin32PresentationSupportKHR vkGetPhysicalDeviceWin32PresentationSupportKHR = nullptr;
+    PFN_vkGetPhysicalDeviceSurfaceSupportKHR vkGetPhysicalDeviceSurfaceSupportKHR = nullptr;
+    PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR vkGetPhysicalDeviceSurfaceCapabilitiesKHR = nullptr;
+    PFN_vkGetPhysicalDeviceSurfaceFormatsKHR vkGetPhysicalDeviceSurfaceFormatsKHR = nullptr;
+    PFN_vkGetPhysicalDeviceSurfacePresentModesKHR vkGetPhysicalDeviceSurfacePresentModesKHR = nullptr;
+    PFN_vkCreateSwapchainKHR vkCreateSwapchainKHR = nullptr;
+    PFN_vkDestroySwapchainKHR vkDestroySwapchainKHR = nullptr;
+    PFN_vkGetSwapchainImagesKHR vkGetSwapchainImagesKHR = nullptr;
+    PFN_vkAcquireNextImageKHR vkAcquireNextImageKHR = nullptr;
+    PFN_vkQueuePresentKHR vkQueuePresentKHR = nullptr;
+
+    struct SwapchainRecord {
+        VulkanSwapchainInfo info;
+        VkSurfaceKHR surface = kVkNullHandle;
+        VkSwapchainKHR swapchain = kVkNullHandle;
+        std::vector<VkImage> swapchain_images;
+        bool supports_transfer_src = false;
+        VkImage offscreen_image = kVkNullHandle;
+        VkDeviceMemory offscreen_mem = kVkNullHandle;
+        uint32_t frame_counter = 0;
+    };
+    uint64_t next_swapchain_handle = 1;
+    std::unordered_map<uint64_t, SwapchainRecord> swapchains;
 
     template <typename Fn>
     bool LoadInstProc(Fn& out, const char* name) {
@@ -842,7 +2692,6 @@ struct VulkanBackend::Impl {
     }
 
     uint32_t FindMemoryType(uint32_t type_bits, VkFlags required_flags, bool& out_is_coherent) const noexcept {
-        // First pass: prefer HOST_VISIBLE | HOST_COHERENT.
         for (uint32_t i = 0; i < mem_props.memoryTypeCount; ++i) {
             if ((type_bits & (1u << i)) != 0) {
                 const VkFlags f = mem_props.memoryTypes[i].propertyFlags;
@@ -852,11 +2701,20 @@ struct VulkanBackend::Impl {
                 }
             }
         }
-        // Fallback: HOST_VISIBLE only (caller flushes/invalidates manually).
-        for (uint32_t i = 0; i < mem_props.memoryTypeCount; ++i) {
-            if ((type_bits & (1u << i)) != 0) {
-                const VkFlags f = mem_props.memoryTypes[i].propertyFlags;
-                if ((f & kVkMemoryPropertyHostVisibleBit) != 0) {
+        if ((required_flags & kVkMemoryPropertyHostVisibleBit) != 0) {
+            for (uint32_t i = 0; i < mem_props.memoryTypeCount; ++i) {
+                if ((type_bits & (1u << i)) != 0) {
+                    const VkFlags f = mem_props.memoryTypes[i].propertyFlags;
+                    if ((f & kVkMemoryPropertyHostVisibleBit) != 0) {
+                        out_is_coherent = (f & kVkMemoryPropertyHostCoherentBit) != 0;
+                        return i;
+                    }
+                }
+            }
+        } else {
+            for (uint32_t i = 0; i < mem_props.memoryTypeCount; ++i) {
+                if ((type_bits & (1u << i)) != 0) {
+                    const VkFlags f = mem_props.memoryTypes[i].propertyFlags;
                     out_is_coherent = (f & kVkMemoryPropertyHostCoherentBit) != 0;
                     return i;
                 }
@@ -866,10 +2724,825 @@ struct VulkanBackend::Impl {
         return std::numeric_limits<uint32_t>::max();
     }
 
-    void Cleanup() {
+    Status CreateHostBuffer(VkDeviceSize size, VkFlags usage, VkBuffer& out_buf, VkDeviceMemory& out_mem,
+                            bool& out_coherent, const void* init_data = nullptr, size_t init_bytes = 0) {
+        const VkDeviceSize alloc_size = std::max<VkDeviceSize>(size, 16ull);
+        VkBufferCreateInfo bci{};
+        bci.sType = kVkStypeBufferCreateInfo;
+        bci.size = alloc_size;
+        bci.usage = usage;
+        bci.sharingMode = kVkSharingModeExclusive;
+        if (vkCreateBuffer(device, &bci, nullptr, &out_buf) != kVkSuccess) {
+            return Status::Error(StatusCode::DeviceError, "vkCreateBuffer failed");
+        }
+        VkMemoryRequirements req{};
+        vkGetBufferMemoryRequirements(device, out_buf, &req);
+        const uint32_t mem_idx = FindMemoryType(
+            req.memoryTypeBits, kVkMemoryPropertyHostVisibleBit | kVkMemoryPropertyHostCoherentBit, out_coherent);
+        if (mem_idx == std::numeric_limits<uint32_t>::max()) {
+            return Status::Error(StatusCode::OutOfMemory, "No HOST_VISIBLE Vulkan memory type available");
+        }
+        VkMemoryAllocateInfo mai{};
+        mai.sType = kVkStypeMemoryAllocateInfo;
+        mai.allocationSize = req.size;
+        mai.memoryTypeIndex = mem_idx;
+        if (vkAllocateMemory(device, &mai, nullptr, &out_mem) != kVkSuccess) {
+            return Status::Error(StatusCode::OutOfMemory, "vkAllocateMemory(buffer) failed");
+        }
+        if (vkBindBufferMemory(device, out_buf, out_mem, 0) != kVkSuccess) {
+            return Status::Error(StatusCode::DeviceError, "vkBindBufferMemory failed");
+        }
+        if (init_data && init_bytes > 0) {
+            void* mapped = nullptr;
+            if (vkMapMemory(device, out_mem, 0, alloc_size, 0, &mapped) != kVkSuccess || !mapped) {
+                return Status::Error(StatusCode::DeviceError, "vkMapMemory(upload) failed");
+            }
+            std::memset(mapped, 0, static_cast<size_t>(alloc_size));
+            std::memcpy(mapped, init_data, std::min<size_t>(init_bytes, static_cast<size_t>(alloc_size)));
+            if (!out_coherent) {
+                VkMappedMemoryRange rng{kVkStypeMappedMemoryRange, nullptr, out_mem, 0, kVkWholeSize};
+                vkFlushMappedMemoryRanges(device, 1, &rng);
+            }
+            vkUnmapMemory(device, out_mem);
+        }
+        return Status::Ok();
+    }
+
+    Status CreateDeviceImage(int32_t image_type, int32_t format, uint32_t width, uint32_t height, uint32_t depth,
+                             uint32_t mip_levels, uint32_t samples, VkFlags usage,
+                             VkImage& out_img, VkDeviceMemory& out_mem) {
+        VkImageCreateInfo ici{};
+        ici.sType = kVkStypeImageCreateInfo;
+        ici.imageType = image_type;
+        ici.format = format;
+        ici.extent = {std::max<uint32_t>(1, width), std::max<uint32_t>(1, height), std::max<uint32_t>(1, depth)};
+        ici.mipLevels = std::max<uint32_t>(1, mip_levels);
+        ici.arrayLayers = 1;
+        ici.samples = samples;
+        ici.tiling = kVkImageTilingOptimal;
+        ici.usage = usage;
+        ici.sharingMode = kVkSharingModeExclusive;
+        ici.initialLayout = kVkImageLayoutUndefined;
+        if (vkCreateImage(device, &ici, nullptr, &out_img) != kVkSuccess) {
+            return Status::Error(StatusCode::DeviceError, "vkCreateImage failed");
+        }
+        VkMemoryRequirements req{};
+        vkGetImageMemoryRequirements(device, out_img, &req);
+        bool coherent = false;
+        const uint32_t mem_idx = FindMemoryType(req.memoryTypeBits, kVkMemoryPropertyDeviceLocalBit, coherent);
+        if (mem_idx == std::numeric_limits<uint32_t>::max()) {
+            return Status::Error(StatusCode::OutOfMemory, "No compatible Vulkan memory type for image");
+        }
+        VkMemoryAllocateInfo mai{};
+        mai.sType = kVkStypeMemoryAllocateInfo;
+        mai.allocationSize = req.size;
+        mai.memoryTypeIndex = mem_idx;
+        if (vkAllocateMemory(device, &mai, nullptr, &out_mem) != kVkSuccess) {
+            return Status::Error(StatusCode::OutOfMemory, "vkAllocateMemory(image) failed");
+        }
+        if (vkBindImageMemory(device, out_img, out_mem, 0) != kVkSuccess) {
+            return Status::Error(StatusCode::DeviceError, "vkBindImageMemory failed");
+        }
+        return Status::Ok();
+    }
+
+    void CmdImageBarrier(VkCommandBuffer cmd, VkImage img, VkFlags aspect,
+                         int32_t old_layout, int32_t new_layout,
+                         VkFlags src_stage, VkFlags dst_stage,
+                         VkFlags src_access, VkFlags dst_access,
+                         uint32_t mip_levels = 1) {
+        VkImageMemoryBarrier imb{};
+        imb.sType = kVkStypeImageMemoryBarrier;
+        imb.srcAccessMask = src_access;
+        imb.dstAccessMask = dst_access;
+        imb.oldLayout = old_layout;
+        imb.newLayout = new_layout;
+        imb.srcQueueFamilyIndex = kVkQueueFamilyIgnored;
+        imb.dstQueueFamilyIndex = kVkQueueFamilyIgnored;
+        imb.image = img;
+        imb.subresourceRange = {aspect, 0u, mip_levels, 0u, 1u};
+        vkCmdPipelineBarrier(cmd, src_stage, dst_stage, 0, 0, nullptr, 0, nullptr, 1, &imb);
+    }
+
+    void DestroySwapchainRecord(SwapchainRecord& rec) {
         if (device && vkDeviceWaitIdle) {
             vkDeviceWaitIdle(device);
         }
+        if (device && rec.offscreen_image != kVkNullHandle && vkDestroyImage) {
+            vkDestroyImage(device, rec.offscreen_image, nullptr);
+            rec.offscreen_image = kVkNullHandle;
+        }
+        if (device && rec.offscreen_mem != kVkNullHandle && vkFreeMemory) {
+            vkFreeMemory(device, rec.offscreen_mem, nullptr);
+            rec.offscreen_mem = kVkNullHandle;
+        }
+        if (device && rec.swapchain != kVkNullHandle && vkDestroySwapchainKHR) {
+            vkDestroySwapchainKHR(device, rec.swapchain, nullptr);
+            rec.swapchain = kVkNullHandle;
+        }
+        if (instance && rec.surface != kVkNullHandle && vkDestroySurfaceKHR) {
+            vkDestroySurfaceKHR(instance, rec.surface, nullptr);
+            rec.surface = kVkNullHandle;
+        }
+        rec.swapchain_images.clear();
+    }
+
+    Status ExecuteGraphicsOrMeshOnIcd(
+        bool is_mesh,
+        const std::vector<uint32_t>& stage0_spirv, const std::string& stage0_entry,
+        const std::vector<uint32_t>& stage1_spirv, const std::string& stage1_entry,
+        const std::vector<uint32_t>& frag_spirv, const std::string& frag_entry,
+        uint32_t width, uint32_t height, VulkanImageFormat color_format,
+        bool enable_depth, bool enable_msaa_4x, bool depth_write,
+        const float clear_color[4], float clear_depth,
+        const std::vector<uint8_t>& vertex_bytes, uint32_t vertex_stride,
+        const std::vector<VulkanVertexAttribute>& vertex_attributes,
+        const std::vector<uint32_t>& indices, uint32_t vertex_count,
+        const uint32_t mesh_groups[3],
+        const std::vector<uint8_t>& push_constants,
+        const std::vector<VulkanDescriptorBinding>& descriptors,
+        FrameBufferRgba8& out_fb, std::vector<uint16_t>& out_fp16) {
+        if (!has_graphics_queue || !graphics_queue || graphics_command_pool == kVkNullHandle) {
+            return Status::Error(StatusCode::DeviceError, "Vulkan graphics queue not initialized");
+        }
+        const bool has_task = is_mesh && !stage0_spirv.empty();
+        const int32_t vk_color_fmt = static_cast<int32_t>(color_format);
+        const uint32_t bpp = BytesPerTexel(color_format);
+        const VkDeviceSize readback_bytes = static_cast<VkDeviceSize>(width) * height * bpp;
+        const uint32_t samples = enable_msaa_4x ? kVkSampleCount4Bit : kVkSampleCount1Bit;
+
+        struct DescGpu {
+            VkBuffer buf = kVkNullHandle;
+            VkDeviceMemory buf_mem = kVkNullHandle;
+            VkImage img = kVkNullHandle;
+            VkDeviceMemory img_mem = kVkNullHandle;
+            VkImageView img_view = kVkNullHandle;
+            VkSampler sampler = kVkNullHandle;
+            VkBuffer staging = kVkNullHandle;
+            VkDeviceMemory staging_mem = kVkNullHandle;
+            VulkanTextureDesc tex_copy;
+            bool has_upload = false;
+        };
+
+        std::vector<DescGpu> desc_gpu(descriptors.size());
+        VkImage color_img = kVkNullHandle, resolve_img = kVkNullHandle, depth_img = kVkNullHandle;
+        VkDeviceMemory color_mem = kVkNullHandle, resolve_mem = kVkNullHandle, depth_mem = kVkNullHandle;
+        VkImageView color_view = kVkNullHandle, depth_view = kVkNullHandle;
+        VkRenderPass render_pass = kVkNullHandle;
+        VkFramebuffer framebuffer = kVkNullHandle;
+        VkBuffer vb = kVkNullHandle, ib = kVkNullHandle, rb_buf = kVkNullHandle;
+        VkDeviceMemory vb_mem = kVkNullHandle, ib_mem = kVkNullHandle, rb_mem = kVkNullHandle;
+        bool rb_coherent = true;
+        VkShaderModule mod0 = kVkNullHandle, mod1 = kVkNullHandle, mod_frag = kVkNullHandle;
+        VkDescriptorSetLayout ds_layout = kVkNullHandle;
+        VkDescriptorPool desc_pool = kVkNullHandle;
+        VkPipelineLayout pipe_layout = kVkNullHandle;
+        VkPipeline pipeline = kVkNullHandle;
+        VkCommandBuffer cmd = nullptr;
+
+        auto cleanup = [&]() {
+            if (cmd) { vkFreeCommandBuffers(device, graphics_command_pool, 1, &cmd); cmd = nullptr; }
+            if (pipeline != kVkNullHandle) { vkDestroyPipeline(device, pipeline, nullptr); pipeline = kVkNullHandle; }
+            if (pipe_layout != kVkNullHandle) { vkDestroyPipelineLayout(device, pipe_layout, nullptr); pipe_layout = kVkNullHandle; }
+            if (desc_pool != kVkNullHandle) { vkDestroyDescriptorPool(device, desc_pool, nullptr); desc_pool = kVkNullHandle; }
+            if (ds_layout != kVkNullHandle) { vkDestroyDescriptorSetLayout(device, ds_layout, nullptr); ds_layout = kVkNullHandle; }
+            if (mod_frag != kVkNullHandle) { vkDestroyShaderModule(device, mod_frag, nullptr); mod_frag = kVkNullHandle; }
+            if (mod1 != kVkNullHandle) { vkDestroyShaderModule(device, mod1, nullptr); mod1 = kVkNullHandle; }
+            if (mod0 != kVkNullHandle) { vkDestroyShaderModule(device, mod0, nullptr); mod0 = kVkNullHandle; }
+            if (framebuffer != kVkNullHandle) { vkDestroyFramebuffer(device, framebuffer, nullptr); framebuffer = kVkNullHandle; }
+            if (render_pass != kVkNullHandle) { vkDestroyRenderPass(device, render_pass, nullptr); render_pass = kVkNullHandle; }
+            if (depth_view != kVkNullHandle) { vkDestroyImageView(device, depth_view, nullptr); depth_view = kVkNullHandle; }
+            if (color_view != kVkNullHandle) { vkDestroyImageView(device, color_view, nullptr); color_view = kVkNullHandle; }
+            if (depth_img != kVkNullHandle) { vkDestroyImage(device, depth_img, nullptr); depth_img = kVkNullHandle; }
+            if (resolve_img != kVkNullHandle) { vkDestroyImage(device, resolve_img, nullptr); resolve_img = kVkNullHandle; }
+            if (color_img != kVkNullHandle) { vkDestroyImage(device, color_img, nullptr); color_img = kVkNullHandle; }
+            if (depth_mem != kVkNullHandle) { vkFreeMemory(device, depth_mem, nullptr); depth_mem = kVkNullHandle; }
+            if (resolve_mem != kVkNullHandle) { vkFreeMemory(device, resolve_mem, nullptr); resolve_mem = kVkNullHandle; }
+            if (color_mem != kVkNullHandle) { vkFreeMemory(device, color_mem, nullptr); color_mem = kVkNullHandle; }
+            if (rb_buf != kVkNullHandle) { vkDestroyBuffer(device, rb_buf, nullptr); rb_buf = kVkNullHandle; }
+            if (ib != kVkNullHandle) { vkDestroyBuffer(device, ib, nullptr); ib = kVkNullHandle; }
+            if (vb != kVkNullHandle) { vkDestroyBuffer(device, vb, nullptr); vb = kVkNullHandle; }
+            if (rb_mem != kVkNullHandle) { vkFreeMemory(device, rb_mem, nullptr); rb_mem = kVkNullHandle; }
+            if (ib_mem != kVkNullHandle) { vkFreeMemory(device, ib_mem, nullptr); ib_mem = kVkNullHandle; }
+            if (vb_mem != kVkNullHandle) { vkFreeMemory(device, vb_mem, nullptr); vb_mem = kVkNullHandle; }
+            for (auto& dg : desc_gpu) {
+                if (dg.sampler != kVkNullHandle) vkDestroySampler(device, dg.sampler, nullptr);
+                if (dg.img_view != kVkNullHandle) vkDestroyImageView(device, dg.img_view, nullptr);
+                if (dg.img != kVkNullHandle) vkDestroyImage(device, dg.img, nullptr);
+                if (dg.img_mem != kVkNullHandle) vkFreeMemory(device, dg.img_mem, nullptr);
+                if (dg.staging != kVkNullHandle) vkDestroyBuffer(device, dg.staging, nullptr);
+                if (dg.staging_mem != kVkNullHandle) vkFreeMemory(device, dg.staging_mem, nullptr);
+                if (dg.buf != kVkNullHandle) vkDestroyBuffer(device, dg.buf, nullptr);
+                if (dg.buf_mem != kVkNullHandle) vkFreeMemory(device, dg.buf_mem, nullptr);
+            }
+        };
+
+        // 1. Create render targets (color, optional MSAA resolve target, optional D32_SFLOAT depth)
+        Status st = CreateDeviceImage(kVkImageType2D, vk_color_fmt, width, height, 1, 1, samples,
+                                      kVkImageUsageColorAttachmentBit | kVkImageUsageTransferSrcBit,
+                                      color_img, color_mem);
+        if (!st.ok()) { cleanup(); return st; }
+
+        if (enable_msaa_4x) {
+            st = CreateDeviceImage(kVkImageType2D, vk_color_fmt, width, height, 1, 1, kVkSampleCount1Bit,
+                                   kVkImageUsageTransferDstBit | kVkImageUsageTransferSrcBit,
+                                   resolve_img, resolve_mem);
+            if (!st.ok()) { cleanup(); return st; }
+        }
+
+        if (enable_depth) {
+            st = CreateDeviceImage(kVkImageType2D, kVkFormatD32Sfloat, width, height, 1, 1, samples,
+                                   kVkImageUsageDepthStencilAttachmentBit, depth_img, depth_mem);
+            if (!st.ok()) { cleanup(); return st; }
+        }
+
+        VkImageViewCreateInfo iv_ci{};
+        iv_ci.sType = kVkStypeImageViewCreateInfo;
+        iv_ci.image = color_img;
+        iv_ci.viewType = kVkImageViewType2D;
+        iv_ci.format = vk_color_fmt;
+        iv_ci.subresourceRange = {kVkImageAspectColorBit, 0, 1, 0, 1};
+        if (vkCreateImageView(device, &iv_ci, nullptr, &color_view) != kVkSuccess) {
+            cleanup();
+            return Status::Error(StatusCode::DeviceError, "vkCreateImageView(color) failed");
+        }
+
+        if (enable_depth) {
+            VkImageViewCreateInfo dv_ci{};
+            dv_ci.sType = kVkStypeImageViewCreateInfo;
+            dv_ci.image = depth_img;
+            dv_ci.viewType = kVkImageViewType2D;
+            dv_ci.format = kVkFormatD32Sfloat;
+            dv_ci.subresourceRange = {kVkImageAspectDepthBit, 0, 1, 0, 1};
+            if (vkCreateImageView(device, &dv_ci, nullptr, &depth_view) != kVkSuccess) {
+                cleanup();
+                return Status::Error(StatusCode::DeviceError, "vkCreateImageView(depth) failed");
+            }
+        }
+
+        // 2. RenderPass & Framebuffer
+        std::vector<VkAttachmentDescription> attachments;
+        VkAttachmentDescription color_att{};
+        color_att.format = vk_color_fmt;
+        color_att.samples = samples;
+        color_att.loadOp = kVkAttachmentLoadOpClear;
+        color_att.storeOp = kVkAttachmentStoreOpStore;
+        color_att.stencilLoadOp = kVkAttachmentLoadOpDontCare;
+        color_att.stencilStoreOp = kVkAttachmentStoreOpDontCare;
+        color_att.initialLayout = kVkImageLayoutUndefined;
+        color_att.finalLayout = kVkImageLayoutTransferSrcOptimal;
+        attachments.push_back(color_att);
+
+        VkAttachmentReference color_ref{0u, kVkImageLayoutColorAttachmentOptimal};
+        VkAttachmentReference depth_ref{1u, kVkImageLayoutDepthStencilAttachmentOptimal};
+
+        if (enable_depth) {
+            VkAttachmentDescription depth_att{};
+            depth_att.format = kVkFormatD32Sfloat;
+            depth_att.samples = samples;
+            depth_att.loadOp = kVkAttachmentLoadOpClear;
+            depth_att.storeOp = kVkAttachmentStoreOpDontCare;
+            depth_att.stencilLoadOp = kVkAttachmentLoadOpDontCare;
+            depth_att.stencilStoreOp = kVkAttachmentStoreOpDontCare;
+            depth_att.initialLayout = kVkImageLayoutUndefined;
+            depth_att.finalLayout = kVkImageLayoutDepthStencilAttachmentOptimal;
+            attachments.push_back(depth_att);
+        }
+
+        VkSubpassDescription subpass{};
+        subpass.pipelineBindPoint = kVkPipelineBindPointGraphics;
+        subpass.colorAttachmentCount = 1;
+        subpass.pColorAttachments = &color_ref;
+        subpass.pDepthStencilAttachment = enable_depth ? &depth_ref : nullptr;
+
+        VkSubpassDependency dep{};
+        dep.srcSubpass = 0u;
+        dep.dstSubpass = kVkSubpassExternal;
+        dep.srcStageMask = kVkPipelineStageColorAttachmentOutputBit;
+        dep.dstStageMask = kVkPipelineStageTransferBit;
+        dep.srcAccessMask = kVkAccessColorAttachmentWriteBit;
+        dep.dstAccessMask = kVkAccessTransferReadBit;
+
+        VkRenderPassCreateInfo rp_ci{};
+        rp_ci.sType = kVkStypeRenderPassCreateInfo;
+        rp_ci.attachmentCount = static_cast<uint32_t>(attachments.size());
+        rp_ci.pAttachments = attachments.data();
+        rp_ci.subpassCount = 1;
+        rp_ci.pSubpasses = &subpass;
+        rp_ci.dependencyCount = 1;
+        rp_ci.pDependencies = &dep;
+        if (vkCreateRenderPass(device, &rp_ci, nullptr, &render_pass) != kVkSuccess) {
+            cleanup();
+            return Status::Error(StatusCode::DeviceError, "vkCreateRenderPass failed");
+        }
+
+        std::vector<VkImageView> fb_views = {color_view};
+        if (enable_depth) fb_views.push_back(depth_view);
+        VkFramebufferCreateInfo fb_ci{};
+        fb_ci.sType = kVkStypeFramebufferCreateInfo;
+        fb_ci.renderPass = render_pass;
+        fb_ci.attachmentCount = static_cast<uint32_t>(fb_views.size());
+        fb_ci.pAttachments = fb_views.data();
+        fb_ci.width = width;
+        fb_ci.height = height;
+        fb_ci.layers = 1;
+        if (vkCreateFramebuffer(device, &fb_ci, nullptr, &framebuffer) != kVkSuccess) {
+            cleanup();
+            return Status::Error(StatusCode::DeviceError, "vkCreateFramebuffer failed");
+        }
+
+        // 3. Vertex / Index / Readback buffers
+        if (!is_mesh && !vertex_bytes.empty()) {
+            bool vb_coh = true;
+            st = CreateHostBuffer(vertex_bytes.size(), kVkBufferUsageVertexBufferBit, vb, vb_mem, vb_coh,
+                                  vertex_bytes.data(), vertex_bytes.size());
+            if (!st.ok()) { cleanup(); return st; }
+        }
+        if (!is_mesh && !indices.empty()) {
+            bool ib_coh = true;
+            st = CreateHostBuffer(indices.size() * sizeof(uint32_t), kVkBufferUsageIndexBufferBit, ib, ib_mem, ib_coh,
+                                  indices.data(), indices.size() * sizeof(uint32_t));
+            if (!st.ok()) { cleanup(); return st; }
+        }
+        st = CreateHostBuffer(readback_bytes, kVkBufferUsageTransferDstBit, rb_buf, rb_mem, rb_coherent);
+        if (!st.ok()) { cleanup(); return st; }
+
+        // 4. Descriptors (UBO, SSBO, 2D/3D textures, samplers)
+        const VkFlags active_stages =
+            is_mesh ? ((has_task ? kVkShaderStageTaskBitExt : 0u) | kVkShaderStageMeshBitExt | kVkShaderStageFragmentBit)
+                    : (kVkShaderStageVertexBit | kVkShaderStageFragmentBit);
+
+        std::vector<VkDescriptorSetLayoutBinding> dsl_bindings;
+        std::vector<VkDescriptorPoolSize> pool_sizes;
+        for (size_t i = 0; i < descriptors.size(); ++i) {
+            const auto& d = descriptors[i];
+            auto& dg = desc_gpu[i];
+
+            VkDescriptorSetLayoutBinding b{};
+            b.binding = d.binding;
+            b.descriptorType = static_cast<int32_t>(d.kind);
+            b.descriptorCount = 1;
+            b.stageFlags = active_stages;
+            dsl_bindings.push_back(b);
+            pool_sizes.push_back({b.descriptorType, 1u});
+
+            if (d.kind == VulkanDescriptorKind::UniformBuffer || d.kind == VulkanDescriptorKind::StorageBuffer) {
+                bool coh = true;
+                const VkFlags usage = (d.kind == VulkanDescriptorKind::UniformBuffer)
+                                          ? kVkBufferUsageUniformBufferBit
+                                          : kVkBufferUsageStorageBufferBit;
+                st = CreateHostBuffer(std::max<size_t>(d.buffer_data.size(), 16u), usage, dg.buf, dg.buf_mem, coh,
+                                      d.buffer_data.data(), d.buffer_data.size());
+                if (!st.ok()) { cleanup(); return st; }
+            } else if (d.kind == VulkanDescriptorKind::CombinedImageSampler ||
+                       d.kind == VulkanDescriptorKind::SampledImage) {
+                dg.tex_copy = d.texture;
+                if (dg.tex_copy.mips.empty()) {
+                    VulkanTextureMipLevel m0{};
+                    m0.width = std::max<uint32_t>(1, dg.tex_copy.width);
+                    m0.height = std::max<uint32_t>(1, dg.tex_copy.height);
+                    m0.depth = dg.tex_copy.is_3d ? std::max<uint32_t>(1, dg.tex_copy.depth) : 1u;
+                    m0.data.assign(static_cast<size_t>(m0.width) * m0.height * m0.depth * BytesPerTexel(dg.tex_copy.format), 0u);
+                    dg.tex_copy.mips.push_back(std::move(m0));
+                }
+                const uint32_t mip_cnt = static_cast<uint32_t>(dg.tex_copy.mips.size());
+                st = CreateDeviceImage(dg.tex_copy.is_3d ? kVkImageType3D : kVkImageType2D,
+                                       static_cast<int32_t>(dg.tex_copy.format),
+                                       dg.tex_copy.width, dg.tex_copy.height,
+                                       dg.tex_copy.is_3d ? dg.tex_copy.depth : 1u,
+                                       mip_cnt, kVkSampleCount1Bit,
+                                       kVkImageUsageTransferDstBit | kVkImageUsageSampledBit,
+                                       dg.img, dg.img_mem);
+                if (!st.ok()) { cleanup(); return st; }
+
+                VkImageViewCreateInfo tiv{};
+                tiv.sType = kVkStypeImageViewCreateInfo;
+                tiv.image = dg.img;
+                tiv.viewType = dg.tex_copy.is_3d ? kVkImageViewType3D : kVkImageViewType2D;
+                tiv.format = static_cast<int32_t>(dg.tex_copy.format);
+                tiv.subresourceRange = {kVkImageAspectColorBit, 0, mip_cnt, 0, 1};
+                if (vkCreateImageView(device, &tiv, nullptr, &dg.img_view) != kVkSuccess) {
+                    cleanup();
+                    return Status::Error(StatusCode::DeviceError, "vkCreateImageView(texture) failed");
+                }
+
+                // Pack all mip levels into staging upload buffer
+                std::vector<uint8_t> packed;
+                for (const auto& m : dg.tex_copy.mips) {
+                    while (packed.size() % 16 != 0) packed.push_back(0u);
+                    packed.insert(packed.end(), m.data.begin(), m.data.end());
+                }
+                bool st_coh = true;
+                st = CreateHostBuffer(packed.size(), kVkBufferUsageTransferSrcBit, dg.staging, dg.staging_mem, st_coh,
+                                      packed.data(), packed.size());
+                if (!st.ok()) { cleanup(); return st; }
+                dg.has_upload = true;
+            }
+
+            if (d.kind == VulkanDescriptorKind::CombinedImageSampler || d.kind == VulkanDescriptorKind::Sampler) {
+                VkSamplerCreateInfo sci{};
+                sci.sType = kVkStypeSamplerCreateInfo;
+                sci.magFilter = d.linear_filter ? kVkFilterLinear : kVkFilterNearest;
+                sci.minFilter = d.linear_filter ? kVkFilterLinear : kVkFilterNearest;
+                sci.mipmapMode = d.linear_filter ? kVkSamplerMipmapModeLinear : kVkSamplerMipmapModeNearest;
+                sci.addressModeU = kVkSamplerAddressModeClampToEdge;
+                sci.addressModeV = kVkSamplerAddressModeClampToEdge;
+                sci.addressModeW = kVkSamplerAddressModeClampToEdge;
+                sci.maxLod = 16.0f;
+                if (vkCreateSampler(device, &sci, nullptr, &dg.sampler) != kVkSuccess) {
+                    cleanup();
+                    return Status::Error(StatusCode::DeviceError, "vkCreateSampler failed");
+                }
+            }
+        }
+
+        VkDescriptorSet desc_set = kVkNullHandle;
+        if (!dsl_bindings.empty()) {
+            VkDescriptorSetLayoutCreateInfo dsl_ci{};
+            dsl_ci.sType = kVkStypeDescriptorSetLayoutCreateInfo;
+            dsl_ci.bindingCount = static_cast<uint32_t>(dsl_bindings.size());
+            dsl_ci.pBindings = dsl_bindings.data();
+            if (vkCreateDescriptorSetLayout(device, &dsl_ci, nullptr, &ds_layout) != kVkSuccess) {
+                cleanup();
+                return Status::Error(StatusCode::DeviceError, "vkCreateDescriptorSetLayout failed");
+            }
+            VkDescriptorPoolCreateInfo dp_ci{};
+            dp_ci.sType = kVkStypeDescriptorPoolCreateInfo;
+            dp_ci.maxSets = 1;
+            dp_ci.poolSizeCount = static_cast<uint32_t>(pool_sizes.size());
+            dp_ci.pPoolSizes = pool_sizes.data();
+            if (vkCreateDescriptorPool(device, &dp_ci, nullptr, &desc_pool) != kVkSuccess) {
+                cleanup();
+                return Status::Error(StatusCode::DeviceError, "vkCreateDescriptorPool failed");
+            }
+            VkDescriptorSetAllocateInfo dsa{};
+            dsa.sType = kVkStypeDescriptorSetAllocateInfo;
+            dsa.descriptorPool = desc_pool;
+            dsa.descriptorSetCount = 1;
+            dsa.pSetLayouts = &ds_layout;
+            if (vkAllocateDescriptorSets(device, &dsa, &desc_set) != kVkSuccess) {
+                cleanup();
+                return Status::Error(StatusCode::DeviceError, "vkAllocateDescriptorSets failed");
+            }
+
+            std::vector<VkDescriptorBufferInfo> buf_infos(descriptors.size());
+            std::vector<VkDescriptorImageInfo> img_infos(descriptors.size());
+            std::vector<VkWriteDescriptorSet> writes;
+            for (size_t i = 0; i < descriptors.size(); ++i) {
+                const auto& d = descriptors[i];
+                const auto& dg = desc_gpu[i];
+                VkWriteDescriptorSet w{};
+                w.sType = kVkStypeWriteDescriptorSet;
+                w.dstSet = desc_set;
+                w.dstBinding = d.binding;
+                w.descriptorCount = 1;
+                w.descriptorType = static_cast<int32_t>(d.kind);
+                if (d.kind == VulkanDescriptorKind::UniformBuffer || d.kind == VulkanDescriptorKind::StorageBuffer) {
+                    buf_infos[i] = {dg.buf, 0u, std::max<VkDeviceSize>(d.buffer_data.size(), 16ull)};
+                    w.pBufferInfo = &buf_infos[i];
+                } else {
+                    img_infos[i] = {dg.sampler, dg.img_view, kVkImageLayoutShaderReadOnlyOptimal};
+                    w.pImageInfo = &img_infos[i];
+                }
+                writes.push_back(w);
+            }
+            vkUpdateDescriptorSets(device, static_cast<uint32_t>(writes.size()), writes.data(), 0, nullptr);
+        }
+
+        // 5. Shader Modules, Pipeline Layout & Graphics Pipeline
+        auto make_shader = [&](const std::vector<uint32_t>& code, VkShaderModule& out_mod) -> Status {
+            VkShaderModuleCreateInfo sm_ci{};
+            sm_ci.sType = kVkStypeShaderModuleCreateInfo;
+            sm_ci.codeSize = code.size() * sizeof(uint32_t);
+            sm_ci.pCode = code.data();
+            if (vkCreateShaderModule(device, &sm_ci, nullptr, &out_mod) != kVkSuccess) {
+                return Status::Error(StatusCode::ShaderError, "vkCreateShaderModule failed");
+            }
+            return Status::Ok();
+        };
+
+        std::vector<VkPipelineShaderStageCreateInfo> stages;
+        if (has_task) {
+            st = make_shader(stage0_spirv, mod0);
+            if (!st.ok()) { cleanup(); return st; }
+            VkPipelineShaderStageCreateInfo s{};
+            s.sType = kVkStypePipelineShaderStageCreateInfo;
+            s.stage = kVkShaderStageTaskBitExt;
+            s.module = mod0;
+            s.pName = stage0_entry.c_str();
+            stages.push_back(s);
+        }
+        st = make_shader(stage1_spirv, mod1);
+        if (!st.ok()) { cleanup(); return st; }
+        {
+            VkPipelineShaderStageCreateInfo s{};
+            s.sType = kVkStypePipelineShaderStageCreateInfo;
+            s.stage = is_mesh ? kVkShaderStageMeshBitExt : kVkShaderStageVertexBit;
+            s.module = mod1;
+            s.pName = stage1_entry.c_str();
+            stages.push_back(s);
+        }
+        st = make_shader(frag_spirv, mod_frag);
+        if (!st.ok()) { cleanup(); return st; }
+        {
+            VkPipelineShaderStageCreateInfo s{};
+            s.sType = kVkStypePipelineShaderStageCreateInfo;
+            s.stage = kVkShaderStageFragmentBit;
+            s.module = mod_frag;
+            s.pName = frag_entry.c_str();
+            stages.push_back(s);
+        }
+
+        VkPushConstantRange pc_range{};
+        pc_range.stageFlags = active_stages;
+        pc_range.offset = 0;
+        pc_range.size = static_cast<uint32_t>(push_constants.size());
+
+        VkPipelineLayoutCreateInfo pl_ci{};
+        pl_ci.sType = kVkStypePipelineLayoutCreateInfo;
+        pl_ci.setLayoutCount = (ds_layout != kVkNullHandle) ? 1u : 0u;
+        pl_ci.pSetLayouts = (ds_layout != kVkNullHandle) ? &ds_layout : nullptr;
+        pl_ci.pushConstantRangeCount = !push_constants.empty() ? 1u : 0u;
+        pl_ci.pPushConstantRanges = !push_constants.empty() ? &pc_range : nullptr;
+        if (vkCreatePipelineLayout(device, &pl_ci, nullptr, &pipe_layout) != kVkSuccess) {
+            cleanup();
+            return Status::Error(StatusCode::DeviceError, "vkCreatePipelineLayout failed");
+        }
+
+        VkVertexInputBindingDescription vb_desc{};
+        std::vector<VkVertexInputAttributeDescription> vk_attrs;
+        VkPipelineVertexInputStateCreateInfo vi_ci{};
+        vi_ci.sType = kVkStypePipelineVertexInputStateCreateInfo;
+        if (!is_mesh && !vertex_attributes.empty() && vertex_stride > 0) {
+            vb_desc = {0u, vertex_stride, kVkVertexInputRateVertex};
+            for (const auto& a : vertex_attributes) {
+                vk_attrs.push_back({a.location, a.binding, static_cast<int32_t>(a.format), a.offset});
+            }
+            vi_ci.vertexBindingDescriptionCount = 1;
+            vi_ci.pVertexBindingDescriptions = &vb_desc;
+            vi_ci.vertexAttributeDescriptionCount = static_cast<uint32_t>(vk_attrs.size());
+            vi_ci.pVertexAttributeDescriptions = vk_attrs.data();
+        }
+
+        VkPipelineInputAssemblyStateCreateInfo ia_ci{};
+        ia_ci.sType = kVkStypePipelineInputAssemblyStateCreateInfo;
+        ia_ci.topology = kVkPrimitiveTopologyTriangleList;
+
+        VkPipelineViewportStateCreateInfo vp_ci{};
+        vp_ci.sType = kVkStypePipelineViewportStateCreateInfo;
+        vp_ci.viewportCount = 1;
+        vp_ci.scissorCount = 1;
+
+        VkPipelineRasterizationStateCreateInfo rs_ci{};
+        rs_ci.sType = kVkStypePipelineRasterizationStateCreateInfo;
+        rs_ci.polygonMode = kVkPolygonModeFill;
+        rs_ci.cullMode = kVkCullModeNone;
+        rs_ci.frontFace = kVkFrontFaceCounterClockwise;
+        rs_ci.lineWidth = 1.0f;
+
+        VkPipelineMultisampleStateCreateInfo ms_ci{};
+        ms_ci.sType = kVkStypePipelineMultisampleStateCreateInfo;
+        ms_ci.rasterizationSamples = samples;
+
+        VkPipelineDepthStencilStateCreateInfo ds_ci{};
+        ds_ci.sType = kVkStypePipelineDepthStencilStateCreateInfo;
+        ds_ci.depthTestEnable = enable_depth ? 1u : 0u;
+        ds_ci.depthWriteEnable = (enable_depth && depth_write) ? 1u : 0u;
+        ds_ci.depthCompareOp = kVkCompareOpLess;
+
+        VkPipelineColorBlendAttachmentState cb_att{};
+        cb_att.colorWriteMask = 0xFu;
+        VkPipelineColorBlendStateCreateInfo cb_ci{};
+        cb_ci.sType = kVkStypePipelineColorBlendStateCreateInfo;
+        cb_ci.attachmentCount = 1;
+        cb_ci.pAttachments = &cb_att;
+
+        const int32_t dyn_states[2] = {kVkDynamicStateViewport, kVkDynamicStateScissor};
+        VkPipelineDynamicStateCreateInfo dyn_ci{};
+        dyn_ci.sType = kVkStypePipelineDynamicStateCreateInfo;
+        dyn_ci.dynamicStateCount = 2;
+        dyn_ci.pDynamicStates = dyn_states;
+
+        VkGraphicsPipelineCreateInfo gp_ci{};
+        gp_ci.sType = kVkStypeGraphicsPipelineCreateInfo;
+        gp_ci.stageCount = static_cast<uint32_t>(stages.size());
+        gp_ci.pStages = stages.data();
+        gp_ci.pVertexInputState = is_mesh ? nullptr : &vi_ci;
+        gp_ci.pInputAssemblyState = is_mesh ? nullptr : &ia_ci;
+        gp_ci.pViewportState = &vp_ci;
+        gp_ci.pRasterizationState = &rs_ci;
+        gp_ci.pMultisampleState = &ms_ci;
+        gp_ci.pDepthStencilState = enable_depth ? &ds_ci : nullptr;
+        gp_ci.pColorBlendState = &cb_ci;
+        gp_ci.pDynamicState = &dyn_ci;
+        gp_ci.layout = pipe_layout;
+        gp_ci.renderPass = render_pass;
+        gp_ci.subpass = 0;
+        gp_ci.basePipelineIndex = -1;
+
+        VkResult vr = vkCreateGraphicsPipelines(device, kVkNullHandle, 1, &gp_ci, nullptr, &pipeline);
+        if (vr != kVkSuccess || pipeline == kVkNullHandle) {
+            cleanup();
+            return Status::Error(StatusCode::ShaderError,
+                                 "vkCreateGraphicsPipelines failed (VkResult=" + std::to_string(vr) + ")");
+        }
+
+        // 6. Record command buffer
+        VkCommandBufferAllocateInfo cba{};
+        cba.sType = kVkStypeCommandBufferAllocateInfo;
+        cba.commandPool = graphics_command_pool;
+        cba.level = kVkCommandBufferLevelPrimary;
+        cba.commandBufferCount = 1;
+        if (vkAllocateCommandBuffers(device, &cba, &cmd) != kVkSuccess || !cmd) {
+            cleanup();
+            return Status::Error(StatusCode::DeviceError, "vkAllocateCommandBuffers(gfx) failed");
+        }
+        VkCommandBufferBeginInfo cbi{};
+        cbi.sType = kVkStypeCommandBufferBeginInfo;
+        cbi.flags = kVkCommandBufferUsageOneTimeSubmitBit;
+        if (vkBeginCommandBuffer(cmd, &cbi) != kVkSuccess) {
+            cleanup();
+            return Status::Error(StatusCode::DeviceError, "vkBeginCommandBuffer(gfx) failed");
+        }
+
+        // Upload descriptor textures before render pass
+        for (const auto& dg : desc_gpu) {
+            if (!dg.has_upload) continue;
+            const uint32_t mip_cnt = static_cast<uint32_t>(dg.tex_copy.mips.size());
+            CmdImageBarrier(cmd, dg.img, kVkImageAspectColorBit,
+                            kVkImageLayoutUndefined, kVkImageLayoutTransferDstOptimal,
+                            kVkPipelineStageTopOfPipeBit, kVkPipelineStageTransferBit,
+                            0u, kVkAccessTransferWriteBit, mip_cnt);
+            VkDeviceSize offset = 0;
+            for (uint32_t m = 0; m < mip_cnt; ++m) {
+                while (offset % 16 != 0) ++offset;
+                const auto& mip = dg.tex_copy.mips[m];
+                VkBufferImageCopy region{};
+                region.bufferOffset = offset;
+                region.imageSubresource = {kVkImageAspectColorBit, m, 0u, 1u};
+                region.imageExtent = {std::max<uint32_t>(1, mip.width), std::max<uint32_t>(1, mip.height),
+                                      dg.tex_copy.is_3d ? std::max<uint32_t>(1, mip.depth) : 1u};
+                vkCmdCopyBufferToImage(cmd, dg.staging, dg.img, kVkImageLayoutTransferDstOptimal, 1, &region);
+                offset += mip.data.size();
+            }
+            CmdImageBarrier(cmd, dg.img, kVkImageAspectColorBit,
+                            kVkImageLayoutTransferDstOptimal, kVkImageLayoutShaderReadOnlyOptimal,
+                            kVkPipelineStageTransferBit, kVkPipelineStageFragmentShaderBit | kVkPipelineStageVertexShaderBit,
+                            kVkAccessTransferWriteBit, kVkAccessShaderReadBit, mip_cnt);
+        }
+
+        VkClearValue clear_vals[2]{};
+        clear_vals[0].color.float32[0] = clear_color[0];
+        clear_vals[0].color.float32[1] = clear_color[1];
+        clear_vals[0].color.float32[2] = clear_color[2];
+        clear_vals[0].color.float32[3] = clear_color[3];
+        clear_vals[1].depthStencil = {clear_depth, 0u};
+
+        VkRenderPassBeginInfo rpb{};
+        rpb.sType = kVkStypeRenderPassBeginInfo;
+        rpb.renderPass = render_pass;
+        rpb.framebuffer = framebuffer;
+        rpb.renderArea = {{0, 0}, {width, height}};
+        rpb.clearValueCount = enable_depth ? 2u : 1u;
+        rpb.pClearValues = clear_vals;
+        vkCmdBeginRenderPass(cmd, &rpb, kVkSubpassContentsInline);
+
+        VkViewport vp{0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height), 0.0f, 1.0f};
+        VkRect2D sc{{0, 0}, {width, height}};
+        vkCmdSetViewport(cmd, 0, 1, &vp);
+        vkCmdSetScissor(cmd, 0, 1, &sc);
+        vkCmdBindPipeline(cmd, kVkPipelineBindPointGraphics, pipeline);
+
+        if (desc_set != kVkNullHandle) {
+            vkCmdBindDescriptorSets(cmd, kVkPipelineBindPointGraphics, pipe_layout, 0, 1, &desc_set, 0, nullptr);
+        }
+        if (!push_constants.empty()) {
+            vkCmdPushConstants(cmd, pipe_layout, active_stages, 0,
+                               static_cast<uint32_t>(push_constants.size()), push_constants.data());
+        }
+
+        if (is_mesh) {
+            vkCmdDrawMeshTasksEXT(cmd, mesh_groups[0], mesh_groups[1], mesh_groups[2]);
+        } else {
+            if (vb != kVkNullHandle) {
+                const VkDeviceSize vb_off = 0;
+                vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &vb_off);
+            }
+            if (ib != kVkNullHandle) {
+                vkCmdBindIndexBuffer(cmd, ib, 0, kVkIndexTypeUint32);
+                vkCmdDrawIndexed(cmd, static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
+            } else {
+                vkCmdDraw(cmd, vertex_count, 1, 0, 0);
+            }
+        }
+        vkCmdEndRenderPass(cmd);
+
+        // Optional MSAA 4x -> 1x resolve using vkCmdResolveImage, then readback copy
+        VkImage copy_src = color_img;
+        if (enable_msaa_4x) {
+            CmdImageBarrier(cmd, resolve_img, kVkImageAspectColorBit,
+                            kVkImageLayoutUndefined, kVkImageLayoutTransferDstOptimal,
+                            kVkPipelineStageTopOfPipeBit, kVkPipelineStageTransferBit,
+                            0u, kVkAccessTransferWriteBit);
+            VkImageResolve res_reg{};
+            res_reg.srcSubresource = {kVkImageAspectColorBit, 0, 0, 1};
+            res_reg.dstSubresource = {kVkImageAspectColorBit, 0, 0, 1};
+            res_reg.extent = {width, height, 1};
+            vkCmdResolveImage(cmd, color_img, kVkImageLayoutTransferSrcOptimal,
+                              resolve_img, kVkImageLayoutTransferDstOptimal, 1, &res_reg);
+            CmdImageBarrier(cmd, resolve_img, kVkImageAspectColorBit,
+                            kVkImageLayoutTransferDstOptimal, kVkImageLayoutTransferSrcOptimal,
+                            kVkPipelineStageTransferBit, kVkPipelineStageTransferBit,
+                            kVkAccessTransferWriteBit, kVkAccessTransferReadBit);
+            copy_src = resolve_img;
+        }
+
+        VkBufferImageCopy rb_copy{};
+        rb_copy.imageSubresource = {kVkImageAspectColorBit, 0, 0, 1};
+        rb_copy.imageExtent = {width, height, 1};
+        vkCmdCopyImageToBuffer(cmd, copy_src, kVkImageLayoutTransferSrcOptimal, rb_buf, 1, &rb_copy);
+
+        VkBufferMemoryBarrier rb_bar{};
+        rb_bar.sType = kVkStypeBufferMemoryBarrier;
+        rb_bar.srcAccessMask = kVkAccessTransferWriteBit;
+        rb_bar.dstAccessMask = kVkAccessHostReadBit;
+        rb_bar.srcQueueFamilyIndex = kVkQueueFamilyIgnored;
+        rb_bar.dstQueueFamilyIndex = kVkQueueFamilyIgnored;
+        rb_bar.buffer = rb_buf;
+        rb_bar.offset = 0;
+        rb_bar.size = readback_bytes;
+        vkCmdPipelineBarrier(cmd, kVkPipelineStageTransferBit, kVkPipelineStageHostBit,
+                             0, 0, nullptr, 1, &rb_bar, 0, nullptr);
+
+        if (vkEndCommandBuffer(cmd) != kVkSuccess) {
+            cleanup();
+            return Status::Error(StatusCode::DeviceError, "vkEndCommandBuffer(gfx) failed");
+        }
+
+        VkSubmitInfo si{};
+        si.sType = kVkStypeSubmitInfo;
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &cmd;
+        if (vkQueueSubmit(graphics_queue, 1, &si, kVkNullHandle) != kVkSuccess ||
+            vkQueueWaitIdle(graphics_queue) != kVkSuccess) {
+            cleanup();
+            return Status::Error(StatusCode::DeviceError, "Vulkan graphics queue submit/wait failed");
+        }
+
+        // 7. Read back framebuffer (and raw FP16 if requested)
+        void* mapped = nullptr;
+        if (vkMapMemory(device, rb_mem, 0, readback_bytes, 0, &mapped) != kVkSuccess || !mapped) {
+            cleanup();
+            return Status::Error(StatusCode::DeviceError, "vkMapMemory(readback) failed");
+        }
+        if (!rb_coherent) {
+            VkMappedMemoryRange rng{kVkStypeMappedMemoryRange, nullptr, rb_mem, 0, kVkWholeSize};
+            vkInvalidateMappedMemoryRanges(device, 1, &rng);
+        }
+
+        out_fb.width = width;
+        out_fb.height = height;
+        out_fb.pixels.resize(static_cast<size_t>(width) * height * 4u);
+        out_fp16.clear();
+
+        if (color_format == VulkanImageFormat::Rgba16Sfloat) {
+            const size_t total_ch = static_cast<size_t>(width) * height * 4u;
+            out_fp16.resize(total_ch);
+            std::memcpy(out_fp16.data(), mapped, total_ch * sizeof(uint16_t));
+            for (size_t i = 0; i < total_ch; ++i) {
+                out_fb.pixels[i] = FloatToUnorm8(HalfToFloat(out_fp16[i]));
+            }
+        } else if (color_format == VulkanImageFormat::Bgra8Unorm) {
+            const auto* src = static_cast<const uint8_t*>(mapped);
+            const size_t px_count = static_cast<size_t>(width) * height;
+            for (size_t i = 0; i < px_count; ++i) {
+                out_fb.pixels[i * 4 + 0] = src[i * 4 + 2];
+                out_fb.pixels[i * 4 + 1] = src[i * 4 + 1];
+                out_fb.pixels[i * 4 + 2] = src[i * 4 + 0];
+                out_fb.pixels[i * 4 + 3] = src[i * 4 + 3];
+            }
+        } else {
+            std::memcpy(out_fb.pixels.data(), mapped, static_cast<size_t>(readback_bytes));
+        }
+        vkUnmapMemory(device, rb_mem);
+        cleanup();
+        return Status::Ok();
+    }
+
+    void Cleanup() {
+        for (auto& [h, rec] : swapchains) {
+            DestroySwapchainRecord(rec);
+        }
+        swapchains.clear();
+
+        if (device && vkDeviceWaitIdle) {
+            vkDeviceWaitIdle(device);
+        }
+        if (device && graphics_command_pool != kVkNullHandle && graphics_command_pool != command_pool && vkDestroyCommandPool) {
+            vkDestroyCommandPool(device, graphics_command_pool, nullptr);
+        }
+        graphics_command_pool = kVkNullHandle;
+
         if (device && command_pool != kVkNullHandle && vkDestroyCommandPool) {
             vkDestroyCommandPool(device, command_pool, nullptr);
             command_pool = kVkNullHandle;
@@ -879,6 +3552,7 @@ struct VulkanBackend::Impl {
             device = nullptr;
         }
         compute_queue = nullptr;
+        graphics_queue = nullptr;
         physical_device = nullptr;
         if (instance && vkDestroyInstance) {
             vkDestroyInstance(instance, nullptr);
@@ -892,6 +3566,12 @@ struct VulkanBackend::Impl {
 #endif
         vkGetInstanceProcAddr = nullptr;
         vkGetDeviceProcAddr = nullptr;
+        has_graphics_queue = false;
+        mesh_shader_enabled = false;
+        task_shader_enabled = false;
+        win32_surface_enabled = false;
+        swapchain_enabled = false;
+        hdr10_colorspace_enabled = false;
         initialized = false;
         fallback_mode = false;
     }
@@ -989,6 +3669,14 @@ Status VulkanBackend::ValidateSpirvBinary(const std::vector<uint32_t>& spirv,
                     info.has_compute_entry = true;
                     info.entry_point_name = name;
                     compute_entry_id = entry_id;
+                } else {
+                    if (exec_model == kSpvExecModelVertex) info.has_vertex_entry = true;
+                    else if (exec_model == kSpvExecModelFragment) info.has_fragment_entry = true;
+                    else if (exec_model == kSpvExecModelTaskEXT) info.has_task_entry = true;
+                    else if (exec_model == kSpvExecModelMeshEXT) info.has_mesh_entry = true;
+                    if (info.entry_point_name.empty()) {
+                        info.entry_point_name = name;
+                    }
                 }
                 break;
             }
@@ -1033,6 +3721,7 @@ Status VulkanBackend::ValidateSpirvBinary(const std::vector<uint32_t>& spirv,
             case kSpvOpTypeInt:
             case kSpvOpTypeFloat:
             case kSpvOpTypeVector:
+            case kSpvOpTypeMatrix:
             case kSpvOpTypeRuntimeArray:
             case kSpvOpTypeStruct:
             case kSpvOpTypePointer:
@@ -1080,16 +3769,23 @@ Status VulkanBackend::InitializeSoftwareFallback() {
     impl_->initialized = true;
     impl_->fallback_mode = true;
     device_info_ = VulkanDeviceInfo{};
-    device_info_.device_name = "OpenScarlett Software SPIR-V Compute Fallback";
+    device_info_.device_name = "OpenScarlett Software SPIR-V Fallback";
     device_info_.vendor_id = 0x5358;
     device_info_.device_id = 0x0001;
-    device_info_.api_version = kVkApiVersion1_2;
+    device_info_.api_version = kVkApiVersion1_3;
     device_info_.api_major = 1;
-    device_info_.api_minor = 2;
+    device_info_.api_minor = 3;
     device_info_.api_patch = 0;
     device_info_.device_type = VulkanDeviceType::Cpu;
+    device_info_.compute_queue_family = 0;
+    device_info_.graphics_queue_family = 0;
     device_info_.supports_compute = true;
-    device_info_.supports_graphics = false;
+    device_info_.supports_graphics = true;
+    device_info_.supports_mesh_shader = false;
+    device_info_.supports_task_shader = false;
+    device_info_.supports_win32_surface = false;
+    device_info_.supports_swapchain = false;
+    device_info_.supports_hdr10_colorspace = false;
     device_info_.is_hardware = false;
     device_info_.is_fallback = true;
     return Status::Ok();
@@ -1122,6 +3818,8 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
                 impl_->vkGetInstanceProcAddr(nullptr, "vkCreateInstance"));
             impl_->vkEnumerateInstanceVersion = reinterpret_cast<PFN_vkEnumerateInstanceVersion>(
                 impl_->vkGetInstanceProcAddr(nullptr, "vkEnumerateInstanceVersion"));
+            impl_->vkEnumerateInstanceExtensionProperties = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(
+                impl_->vkGetInstanceProcAddr(nullptr, "vkEnumerateInstanceExtensionProperties"));
             if (!impl_->vkCreateInstance) {
                 failure_reason = "vkCreateInstance not available";
                 return false;
@@ -1135,7 +3833,35 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
                 }
             }
 
-            // Target Vulkan 1.2 (or 1.3 if supported; gracefully cap to loader version).
+            // Probe instance extensions for Win32 surface & HDR10 swapchain colorspace.
+            bool has_khr_surface = false;
+            bool has_khr_win32_surface = false;
+            bool has_ext_swapchain_cs = false;
+            if (impl_->vkEnumerateInstanceExtensionProperties) {
+                uint32_t ext_count = 0;
+                if (impl_->vkEnumerateInstanceExtensionProperties(nullptr, &ext_count, nullptr) == kVkSuccess &&
+                    ext_count > 0) {
+                    std::vector<VkExtensionProperties> exts(ext_count);
+                    if (impl_->vkEnumerateInstanceExtensionProperties(nullptr, &ext_count, exts.data()) == kVkSuccess) {
+                        for (uint32_t i = 0; i < ext_count; ++i) {
+                            if (std::strcmp(exts[i].extensionName, "VK_KHR_surface") == 0) has_khr_surface = true;
+                            if (std::strcmp(exts[i].extensionName, "VK_KHR_win32_surface") == 0) has_khr_win32_surface = true;
+                            if (std::strcmp(exts[i].extensionName, "VK_EXT_swapchain_colorspace") == 0) has_ext_swapchain_cs = true;
+                        }
+                    }
+                }
+            }
+
+            std::vector<const char*> inst_exts;
+            if (has_khr_surface && has_khr_win32_surface) {
+                inst_exts.push_back("VK_KHR_surface");
+                inst_exts.push_back("VK_KHR_win32_surface");
+                if (has_ext_swapchain_cs) {
+                    inst_exts.push_back("VK_EXT_swapchain_colorspace");
+                }
+            }
+
+            // Target Vulkan 1.3 (required for SPV_EXT_mesh_shader / SPIR-V 1.4+) with graceful 1.2/1.1 fallback.
             uint32_t target_api = kVkApiVersion1_2;
             if (loader_version >= kVkApiVersion1_3) {
                 target_api = kVkApiVersion1_3;
@@ -1154,11 +3880,22 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
             VkInstanceCreateInfo inst_info{};
             inst_info.sType = kVkStypeInstanceCreateInfo;
             inst_info.pApplicationInfo = &app_info;
+            inst_info.enabledExtensionCount = static_cast<uint32_t>(inst_exts.size());
+            inst_info.ppEnabledExtensionNames = inst_exts.empty() ? nullptr : inst_exts.data();
 
             VkResult vr = impl_->vkCreateInstance(&inst_info, nullptr, &impl_->instance);
             if (vr != kVkSuccess || !impl_->instance) {
-                // Retry with Vulkan 1.2 if 1.3 was rejected by a loader shim.
                 app_info.apiVersion = kVkApiVersion1_2;
+                vr = impl_->vkCreateInstance(&inst_info, nullptr, &impl_->instance);
+            }
+            if (vr != kVkSuccess || !impl_->instance) {
+                // Retry without optional WSI extensions
+                inst_info.enabledExtensionCount = 0;
+                inst_info.ppEnabledExtensionNames = nullptr;
+                has_khr_surface = false;
+                has_khr_win32_surface = false;
+                has_ext_swapchain_cs = false;
+                app_info.apiVersion = kVkApiVersion1_1;
                 vr = impl_->vkCreateInstance(&inst_info, nullptr, &impl_->instance);
             }
             if (vr != kVkSuccess || !impl_->instance) {
@@ -1173,10 +3910,31 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
                                      "vkGetPhysicalDeviceQueueFamilyProperties") ||
                 !impl_->LoadInstProc(impl_->vkGetPhysicalDeviceMemoryProperties,
                                      "vkGetPhysicalDeviceMemoryProperties") ||
+                !impl_->LoadInstProc(impl_->vkEnumerateDeviceExtensionProperties,
+                                     "vkEnumerateDeviceExtensionProperties") ||
                 !impl_->LoadInstProc(impl_->vkCreateDevice, "vkCreateDevice") ||
                 !impl_->LoadInstProc(impl_->vkGetDeviceProcAddr, "vkGetDeviceProcAddr")) {
                 failure_reason = "Failed to resolve core Vulkan instance procedures";
                 return false;
+            }
+
+            impl_->LoadInstProc(impl_->vkGetPhysicalDeviceFeatures2, "vkGetPhysicalDeviceFeatures2");
+            if (has_khr_surface && has_khr_win32_surface) {
+                const bool wsi_inst_ok =
+                    impl_->LoadInstProc(impl_->vkCreateWin32SurfaceKHR, "vkCreateWin32SurfaceKHR") &&
+                    impl_->LoadInstProc(impl_->vkDestroySurfaceKHR, "vkDestroySurfaceKHR") &&
+                    impl_->LoadInstProc(impl_->vkGetPhysicalDeviceSurfaceSupportKHR,
+                                        "vkGetPhysicalDeviceSurfaceSupportKHR") &&
+                    impl_->LoadInstProc(impl_->vkGetPhysicalDeviceSurfaceCapabilitiesKHR,
+                                        "vkGetPhysicalDeviceSurfaceCapabilitiesKHR") &&
+                    impl_->LoadInstProc(impl_->vkGetPhysicalDeviceSurfaceFormatsKHR,
+                                        "vkGetPhysicalDeviceSurfaceFormatsKHR") &&
+                    impl_->LoadInstProc(impl_->vkGetPhysicalDeviceSurfacePresentModesKHR,
+                                        "vkGetPhysicalDeviceSurfacePresentModesKHR");
+                impl_->LoadInstProc(impl_->vkGetPhysicalDeviceWin32PresentationSupportKHR,
+                                    "vkGetPhysicalDeviceWin32PresentationSupportKHR");
+                impl_->win32_surface_enabled = wsi_inst_ok;
+                impl_->hdr10_colorspace_enabled = wsi_inst_ok && has_ext_swapchain_cs;
             }
 
             uint32_t dev_count = 0;
@@ -1196,8 +3954,8 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
 
             VkPhysicalDevice best_dev = nullptr;
             VkPhysicalDevicePropertiesRaw best_props{};
-            uint32_t best_queue_family = std::numeric_limits<uint32_t>::max();
-            bool best_has_graphics = false;
+            uint32_t best_compute_qf = std::numeric_limits<uint32_t>::max();
+            uint32_t best_graphics_qf = std::numeric_limits<uint32_t>::max();
             int best_rank = -1;
 
             for (VkPhysicalDevice candidate : phys_devs) {
@@ -1212,14 +3970,19 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
                 impl_->vkGetPhysicalDeviceQueueFamilyProperties(candidate, &qf_count, qfs.data());
 
                 uint32_t compute_qf = std::numeric_limits<uint32_t>::max();
-                bool has_graphics = false;
+                uint32_t graphics_qf = std::numeric_limits<uint32_t>::max();
                 for (uint32_t q = 0; q < qf_count; ++q) {
                     if (qfs[q].queueCount == 0) continue;
                     if ((qfs[q].queueFlags & kVkQueueGraphicsBit) != 0) {
-                        has_graphics = true;
+                        const bool win32_ok = !impl_->vkGetPhysicalDeviceWin32PresentationSupportKHR ||
+                                              impl_->vkGetPhysicalDeviceWin32PresentationSupportKHR(candidate, q) != 0;
+                        if (graphics_qf == std::numeric_limits<uint32_t>::max() || win32_ok) {
+                            if (graphics_qf == std::numeric_limits<uint32_t>::max()) {
+                                graphics_qf = q;
+                            }
+                        }
                     }
                     if ((qfs[q].queueFlags & kVkQueueComputeBit) != 0) {
-                        // Prefer dedicated compute queue if available, otherwise first compute-capable queue.
                         if (compute_qf == std::numeric_limits<uint32_t>::max() ||
                             (qfs[q].queueFlags & kVkQueueGraphicsBit) == 0) {
                             compute_qf = q;
@@ -1233,8 +3996,8 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
                     best_rank = rank;
                     best_dev = candidate;
                     best_props = props;
-                    best_queue_family = compute_qf;
-                    best_has_graphics = has_graphics;
+                    best_compute_qf = compute_qf;
+                    best_graphics_qf = graphics_qf;
                 }
             }
 
@@ -1244,33 +4007,113 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
             }
 
             impl_->physical_device = best_dev;
-            impl_->compute_queue_family = best_queue_family;
+            impl_->compute_queue_family = best_compute_qf;
+            impl_->has_graphics_queue = (best_graphics_qf != std::numeric_limits<uint32_t>::max());
+            impl_->graphics_queue_family = impl_->has_graphics_queue ? best_graphics_qf : 0u;
             impl_->vkGetPhysicalDeviceMemoryProperties(best_dev, &impl_->mem_props);
 
+            // Probe device extensions (VK_KHR_swapchain, VK_EXT_mesh_shader)
+            bool has_dev_swapchain = false;
+            bool has_dev_mesh_shader = false;
+            {
+                uint32_t dext_count = 0;
+                if (impl_->vkEnumerateDeviceExtensionProperties(best_dev, nullptr, &dext_count, nullptr) == kVkSuccess &&
+                    dext_count > 0) {
+                    std::vector<VkExtensionProperties> dexts(dext_count);
+                    if (impl_->vkEnumerateDeviceExtensionProperties(best_dev, nullptr, &dext_count, dexts.data()) == kVkSuccess) {
+                        for (uint32_t i = 0; i < dext_count; ++i) {
+                            if (std::strcmp(dexts[i].extensionName, "VK_KHR_swapchain") == 0) has_dev_swapchain = true;
+                            if (std::strcmp(dexts[i].extensionName, "VK_EXT_mesh_shader") == 0) has_dev_mesh_shader = true;
+                        }
+                    }
+                }
+            }
+
+            // Probe VK_EXT_mesh_shader features via vkGetPhysicalDeviceFeatures2
+            VkPhysicalDeviceMeshShaderFeaturesEXT queried_mesh_feats{};
+            queried_mesh_feats.sType = kVkStypePhysicalDeviceMeshShaderFeaturesExt;
+            bool enable_mesh = false;
+            bool enable_task = false;
+            if (has_dev_mesh_shader && impl_->has_graphics_queue &&
+                best_props.apiVersion >= kVkApiVersion1_2 && impl_->vkGetPhysicalDeviceFeatures2) {
+                VkPhysicalDeviceFeatures2 feats2{};
+                feats2.sType = kVkStypePhysicalDeviceFeatures2;
+                feats2.pNext = &queried_mesh_feats;
+                impl_->vkGetPhysicalDeviceFeatures2(best_dev, &feats2);
+                if (queried_mesh_feats.meshShader != 0u) {
+                    enable_mesh = true;
+                    enable_task = (queried_mesh_feats.taskShader != 0u);
+                }
+            }
+
+            std::vector<const char*> dev_exts;
+            if (has_dev_swapchain && impl_->has_graphics_queue && impl_->win32_surface_enabled) {
+                dev_exts.push_back("VK_KHR_swapchain");
+            }
+            VkPhysicalDeviceMeshShaderFeaturesEXT enable_mesh_feats{};
+            enable_mesh_feats.sType = kVkStypePhysicalDeviceMeshShaderFeaturesExt;
+            if (enable_mesh) {
+                dev_exts.push_back("VK_EXT_mesh_shader");
+                enable_mesh_feats.meshShader = 1u;
+                enable_mesh_feats.taskShader = enable_task ? 1u : 0u;
+            }
+
             const float queue_priority = 1.0f;
-            VkDeviceQueueCreateInfo queue_ci{};
-            queue_ci.sType = kVkStypeDeviceQueueCreateInfo;
-            queue_ci.queueFamilyIndex = best_queue_family;
-            queue_ci.queueCount = 1;
-            queue_ci.pQueuePriorities = &queue_priority;
+            std::vector<VkDeviceQueueCreateInfo> queue_cis;
+            {
+                VkDeviceQueueCreateInfo qci{};
+                qci.sType = kVkStypeDeviceQueueCreateInfo;
+                qci.queueFamilyIndex = best_compute_qf;
+                qci.queueCount = 1;
+                qci.pQueuePriorities = &queue_priority;
+                queue_cis.push_back(qci);
+            }
+            if (impl_->has_graphics_queue && best_graphics_qf != best_compute_qf) {
+                VkDeviceQueueCreateInfo qci{};
+                qci.sType = kVkStypeDeviceQueueCreateInfo;
+                qci.queueFamilyIndex = best_graphics_qf;
+                qci.queueCount = 1;
+                qci.pQueuePriorities = &queue_priority;
+                queue_cis.push_back(qci);
+            }
 
             VkDeviceCreateInfo dev_ci{};
             dev_ci.sType = kVkStypeDeviceCreateInfo;
-            dev_ci.queueCreateInfoCount = 1;
-            dev_ci.pQueueCreateInfos = &queue_ci;
+            dev_ci.pNext = enable_mesh ? static_cast<const void*>(&enable_mesh_feats) : nullptr;
+            dev_ci.queueCreateInfoCount = static_cast<uint32_t>(queue_cis.size());
+            dev_ci.pQueueCreateInfos = queue_cis.data();
+            dev_ci.enabledExtensionCount = static_cast<uint32_t>(dev_exts.size());
+            dev_ci.ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data();
 
             vr = impl_->vkCreateDevice(best_dev, &dev_ci, nullptr, &impl_->device);
+            if ((vr != kVkSuccess || !impl_->device) && enable_mesh) {
+                // Retry without VK_EXT_mesh_shader if driver rejected feature chain
+                enable_mesh = false;
+                enable_task = false;
+                dev_exts.erase(std::remove_if(dev_exts.begin(), dev_exts.end(), [](const char* s) {
+                    return std::strcmp(s, "VK_EXT_mesh_shader") == 0;
+                }), dev_exts.end());
+                dev_ci.pNext = nullptr;
+                dev_ci.enabledExtensionCount = static_cast<uint32_t>(dev_exts.size());
+                dev_ci.ppEnabledExtensionNames = dev_exts.empty() ? nullptr : dev_exts.data();
+                vr = impl_->vkCreateDevice(best_dev, &dev_ci, nullptr, &impl_->device);
+            }
             if (vr != kVkSuccess || !impl_->device) {
                 failure_reason = "vkCreateDevice failed (VkResult=" + std::to_string(vr) + ")";
                 return false;
             }
 
-            const bool loaded_dev =
+            const bool loaded_core =
                 impl_->LoadDevProc(impl_->vkDestroyDevice, "vkDestroyDevice") &&
                 impl_->LoadDevProc(impl_->vkDeviceWaitIdle, "vkDeviceWaitIdle") &&
                 impl_->LoadDevProc(impl_->vkGetDeviceQueue, "vkGetDeviceQueue") &&
                 impl_->LoadDevProc(impl_->vkQueueSubmit, "vkQueueSubmit") &&
                 impl_->LoadDevProc(impl_->vkQueueWaitIdle, "vkQueueWaitIdle") &&
+                impl_->LoadDevProc(impl_->vkCreateFence, "vkCreateFence") &&
+                impl_->LoadDevProc(impl_->vkDestroyFence, "vkDestroyFence") &&
+                impl_->LoadDevProc(impl_->vkWaitForFences, "vkWaitForFences") &&
+                impl_->LoadDevProc(impl_->vkCreateSemaphore, "vkCreateSemaphore") &&
+                impl_->LoadDevProc(impl_->vkDestroySemaphore, "vkDestroySemaphore") &&
                 impl_->LoadDevProc(impl_->vkCreateCommandPool, "vkCreateCommandPool") &&
                 impl_->LoadDevProc(impl_->vkDestroyCommandPool, "vkDestroyCommandPool") &&
                 impl_->LoadDevProc(impl_->vkAllocateCommandBuffers, "vkAllocateCommandBuffers") &&
@@ -1304,12 +4147,59 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
                 impl_->LoadDevProc(impl_->vkAllocateDescriptorSets, "vkAllocateDescriptorSets") &&
                 impl_->LoadDevProc(impl_->vkUpdateDescriptorSets, "vkUpdateDescriptorSets");
 
-            if (!loaded_dev) {
+            if (!loaded_core) {
                 failure_reason = "Failed to resolve core Vulkan device procedures";
                 return false;
             }
 
-            impl_->vkGetDeviceQueue(impl_->device, best_queue_family, 0, &impl_->compute_queue);
+            // Load Vulkan graphics procedures
+            const bool loaded_gfx =
+                impl_->LoadDevProc(impl_->vkCreateRenderPass, "vkCreateRenderPass") &&
+                impl_->LoadDevProc(impl_->vkDestroyRenderPass, "vkDestroyRenderPass") &&
+                impl_->LoadDevProc(impl_->vkCreateImage, "vkCreateImage") &&
+                impl_->LoadDevProc(impl_->vkDestroyImage, "vkDestroyImage") &&
+                impl_->LoadDevProc(impl_->vkGetImageMemoryRequirements, "vkGetImageMemoryRequirements") &&
+                impl_->LoadDevProc(impl_->vkBindImageMemory, "vkBindImageMemory") &&
+                impl_->LoadDevProc(impl_->vkCreateImageView, "vkCreateImageView") &&
+                impl_->LoadDevProc(impl_->vkDestroyImageView, "vkDestroyImageView") &&
+                impl_->LoadDevProc(impl_->vkCreateSampler, "vkCreateSampler") &&
+                impl_->LoadDevProc(impl_->vkDestroySampler, "vkDestroySampler") &&
+                impl_->LoadDevProc(impl_->vkCreateFramebuffer, "vkCreateFramebuffer") &&
+                impl_->LoadDevProc(impl_->vkDestroyFramebuffer, "vkDestroyFramebuffer") &&
+                impl_->LoadDevProc(impl_->vkCreateGraphicsPipelines, "vkCreateGraphicsPipelines") &&
+                impl_->LoadDevProc(impl_->vkCmdBeginRenderPass, "vkCmdBeginRenderPass") &&
+                impl_->LoadDevProc(impl_->vkCmdEndRenderPass, "vkCmdEndRenderPass") &&
+                impl_->LoadDevProc(impl_->vkCmdBindVertexBuffers, "vkCmdBindVertexBuffers") &&
+                impl_->LoadDevProc(impl_->vkCmdBindIndexBuffer, "vkCmdBindIndexBuffer") &&
+                impl_->LoadDevProc(impl_->vkCmdDraw, "vkCmdDraw") &&
+                impl_->LoadDevProc(impl_->vkCmdDrawIndexed, "vkCmdDrawIndexed") &&
+                impl_->LoadDevProc(impl_->vkCmdPushConstants, "vkCmdPushConstants") &&
+                impl_->LoadDevProc(impl_->vkCmdCopyBufferToImage, "vkCmdCopyBufferToImage") &&
+                impl_->LoadDevProc(impl_->vkCmdCopyImageToBuffer, "vkCmdCopyImageToBuffer") &&
+                impl_->LoadDevProc(impl_->vkCmdResolveImage, "vkCmdResolveImage") &&
+                impl_->LoadDevProc(impl_->vkCmdSetViewport, "vkCmdSetViewport") &&
+                impl_->LoadDevProc(impl_->vkCmdSetScissor, "vkCmdSetScissor");
+
+            if (!loaded_gfx) {
+                impl_->has_graphics_queue = false;
+            }
+
+            if (enable_mesh && impl_->has_graphics_queue &&
+                impl_->LoadDevProc(impl_->vkCmdDrawMeshTasksEXT, "vkCmdDrawMeshTasksEXT")) {
+                impl_->mesh_shader_enabled = true;
+                impl_->task_shader_enabled = enable_task;
+            }
+
+            if (has_dev_swapchain && impl_->has_graphics_queue && impl_->win32_surface_enabled) {
+                impl_->swapchain_enabled =
+                    impl_->LoadDevProc(impl_->vkCreateSwapchainKHR, "vkCreateSwapchainKHR") &&
+                    impl_->LoadDevProc(impl_->vkDestroySwapchainKHR, "vkDestroySwapchainKHR") &&
+                    impl_->LoadDevProc(impl_->vkGetSwapchainImagesKHR, "vkGetSwapchainImagesKHR") &&
+                    impl_->LoadDevProc(impl_->vkAcquireNextImageKHR, "vkAcquireNextImageKHR") &&
+                    impl_->LoadDevProc(impl_->vkQueuePresentKHR, "vkQueuePresentKHR");
+            }
+
+            impl_->vkGetDeviceQueue(impl_->device, best_compute_qf, 0, &impl_->compute_queue);
             if (!impl_->compute_queue) {
                 failure_reason = "vkGetDeviceQueue returned null compute queue";
                 return false;
@@ -1318,12 +4208,30 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
             VkCommandPoolCreateInfo pool_ci{};
             pool_ci.sType = kVkStypeCommandPoolCreateInfo;
             pool_ci.flags = kVkCommandPoolCreateResetCmdBufBit;
-            pool_ci.queueFamilyIndex = best_queue_family;
-
+            pool_ci.queueFamilyIndex = best_compute_qf;
             vr = impl_->vkCreateCommandPool(impl_->device, &pool_ci, nullptr, &impl_->command_pool);
             if (vr != kVkSuccess || impl_->command_pool == kVkNullHandle) {
                 failure_reason = "vkCreateCommandPool failed (VkResult=" + std::to_string(vr) + ")";
                 return false;
+            }
+
+            if (impl_->has_graphics_queue) {
+                if (best_graphics_qf == best_compute_qf) {
+                    impl_->graphics_queue = impl_->compute_queue;
+                    impl_->graphics_command_pool = impl_->command_pool;
+                } else {
+                    impl_->vkGetDeviceQueue(impl_->device, best_graphics_qf, 0, &impl_->graphics_queue);
+                    VkCommandPoolCreateInfo gpool_ci{};
+                    gpool_ci.sType = kVkStypeCommandPoolCreateInfo;
+                    gpool_ci.flags = kVkCommandPoolCreateResetCmdBufBit;
+                    gpool_ci.queueFamilyIndex = best_graphics_qf;
+                    if (!impl_->graphics_queue ||
+                        impl_->vkCreateCommandPool(impl_->device, &gpool_ci, nullptr, &impl_->graphics_command_pool) != kVkSuccess) {
+                        impl_->has_graphics_queue = false;
+                        impl_->graphics_queue = nullptr;
+                        impl_->graphics_command_pool = kVkNullHandle;
+                    }
+                }
             }
 
             best_props.deviceName[sizeof(best_props.deviceName) - 1] = '\0';
@@ -1337,9 +4245,15 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
             device_info_.api_patch = VkApiPatch(best_props.apiVersion);
             device_info_.driver_version = best_props.driverVersion;
             device_info_.device_type = static_cast<VulkanDeviceType>(best_props.deviceType);
-            device_info_.compute_queue_family = best_queue_family;
+            device_info_.compute_queue_family = best_compute_qf;
+            device_info_.graphics_queue_family = impl_->graphics_queue_family;
             device_info_.supports_compute = true;
-            device_info_.supports_graphics = best_has_graphics;
+            device_info_.supports_graphics = impl_->has_graphics_queue;
+            device_info_.supports_mesh_shader = impl_->mesh_shader_enabled;
+            device_info_.supports_task_shader = impl_->task_shader_enabled;
+            device_info_.supports_win32_surface = impl_->win32_surface_enabled;
+            device_info_.supports_swapchain = impl_->swapchain_enabled;
+            device_info_.supports_hdr10_colorspace = impl_->hdr10_colorspace_enabled;
             device_info_.is_hardware =
                 (device_info_.device_type == VulkanDeviceType::DiscreteGpu ||
                  device_info_.device_type == VulkanDeviceType::IntegratedGpu);
@@ -1353,7 +4267,11 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
                       << "." << device_info_.api_patch
                       << " vendor=0x" << std::hex << device_info_.vendor_id
                       << " device=0x" << device_info_.device_id << std::dec
-                      << " compute_qf=" << device_info_.compute_queue_family << "\n";
+                      << " compute_qf=" << device_info_.compute_queue_family
+                      << " gfx_qf=" << (device_info_.supports_graphics ? std::to_string(device_info_.graphics_queue_family) : "none")
+                      << " mesh=" << (device_info_.supports_mesh_shader ? (device_info_.supports_task_shader ? "task+mesh" : "mesh") : "no")
+                      << " swapchain=" << (device_info_.supports_swapchain ? "yes" : "no")
+                      << " hdr10_cs=" << (device_info_.supports_hdr10_colorspace ? "yes" : "no") << "\n";
             return true;
         };
 
@@ -1370,7 +4288,7 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
     if (!allow_software_fallback) {
         return Status::Error(StatusCode::DeviceError, failure_reason);
     }
-    std::cerr << "[OpenScarlett][vulkan] Falling back to software SPIR-V compute (" << failure_reason << ")\n";
+    std::cerr << "[OpenScarlett][vulkan] Falling back to software SPIR-V backend (" << failure_reason << ")\n";
     return InitializeSoftwareFallback();
 }
 
@@ -1415,11 +4333,8 @@ Status VulkanBackend::ExecuteComputeShader(const std::vector<uint32_t>& spirv,
     }
 
     const VkDeviceSize byte_size = static_cast<VkDeviceSize>(element_count) * sizeof(uint32_t);
-
-    VkBuffer in_buf = kVkNullHandle;
-    VkBuffer out_buf = kVkNullHandle;
-    VkDeviceMemory in_mem = kVkNullHandle;
-    VkDeviceMemory out_mem = kVkNullHandle;
+    VkBuffer in_buf = kVkNullHandle, out_buf = kVkNullHandle;
+    VkDeviceMemory in_mem = kVkNullHandle, out_mem = kVkNullHandle;
     VkShaderModule shader_mod = kVkNullHandle;
     VkDescriptorSetLayout ds_layout = kVkNullHandle;
     VkPipelineLayout pipe_layout = kVkNullHandle;
@@ -1428,114 +4343,25 @@ Status VulkanBackend::ExecuteComputeShader(const std::vector<uint32_t>& spirv,
     VkCommandBuffer cmd_buf = nullptr;
 
     auto cleanup = [&]() {
-        if (cmd_buf) {
-            impl_->vkFreeCommandBuffers(impl_->device, impl_->command_pool, 1, &cmd_buf);
-            cmd_buf = nullptr;
-        }
-        if (desc_pool != kVkNullHandle) {
-            impl_->vkDestroyDescriptorPool(impl_->device, desc_pool, nullptr);
-            desc_pool = kVkNullHandle;
-        }
-        if (pipeline != kVkNullHandle) {
-            impl_->vkDestroyPipeline(impl_->device, pipeline, nullptr);
-            pipeline = kVkNullHandle;
-        }
-        if (pipe_layout != kVkNullHandle) {
-            impl_->vkDestroyPipelineLayout(impl_->device, pipe_layout, nullptr);
-            pipe_layout = kVkNullHandle;
-        }
-        if (ds_layout != kVkNullHandle) {
-            impl_->vkDestroyDescriptorSetLayout(impl_->device, ds_layout, nullptr);
-            ds_layout = kVkNullHandle;
-        }
-        if (shader_mod != kVkNullHandle) {
-            impl_->vkDestroyShaderModule(impl_->device, shader_mod, nullptr);
-            shader_mod = kVkNullHandle;
-        }
-        if (out_buf != kVkNullHandle) {
-            impl_->vkDestroyBuffer(impl_->device, out_buf, nullptr);
-            out_buf = kVkNullHandle;
-        }
-        if (in_buf != kVkNullHandle) {
-            impl_->vkDestroyBuffer(impl_->device, in_buf, nullptr);
-            in_buf = kVkNullHandle;
-        }
-        if (out_mem != kVkNullHandle) {
-            impl_->vkFreeMemory(impl_->device, out_mem, nullptr);
-            out_mem = kVkNullHandle;
-        }
-        if (in_mem != kVkNullHandle) {
-            impl_->vkFreeMemory(impl_->device, in_mem, nullptr);
-            in_mem = kVkNullHandle;
-        }
+        if (cmd_buf) { impl_->vkFreeCommandBuffers(impl_->device, impl_->command_pool, 1, &cmd_buf); cmd_buf = nullptr; }
+        if (desc_pool != kVkNullHandle) impl_->vkDestroyDescriptorPool(impl_->device, desc_pool, nullptr);
+        if (pipeline != kVkNullHandle) impl_->vkDestroyPipeline(impl_->device, pipeline, nullptr);
+        if (pipe_layout != kVkNullHandle) impl_->vkDestroyPipelineLayout(impl_->device, pipe_layout, nullptr);
+        if (ds_layout != kVkNullHandle) impl_->vkDestroyDescriptorSetLayout(impl_->device, ds_layout, nullptr);
+        if (shader_mod != kVkNullHandle) impl_->vkDestroyShaderModule(impl_->device, shader_mod, nullptr);
+        if (out_buf != kVkNullHandle) impl_->vkDestroyBuffer(impl_->device, out_buf, nullptr);
+        if (in_buf != kVkNullHandle) impl_->vkDestroyBuffer(impl_->device, in_buf, nullptr);
+        if (out_mem != kVkNullHandle) impl_->vkFreeMemory(impl_->device, out_mem, nullptr);
+        if (in_mem != kVkNullHandle) impl_->vkFreeMemory(impl_->device, in_mem, nullptr);
     };
 
-    auto create_storage_buf = [&](VkBuffer& buf, VkDeviceMemory& mem, bool& coherent) -> Status {
-        VkBufferCreateInfo bci{};
-        bci.sType = kVkStypeBufferCreateInfo;
-        bci.size = byte_size;
-        bci.usage = kVkBufferUsageStorageBufferBit;
-        bci.sharingMode = kVkSharingModeExclusive;
-
-        if (impl_->vkCreateBuffer(impl_->device, &bci, nullptr, &buf) != kVkSuccess) {
-            return Status::Error(StatusCode::DeviceError, "vkCreateBuffer failed");
-        }
-        VkMemoryRequirements req{};
-        impl_->vkGetBufferMemoryRequirements(impl_->device, buf, &req);
-        const uint32_t mem_idx = impl_->FindMemoryType(
-            req.memoryTypeBits, kVkMemoryPropertyHostVisibleBit | kVkMemoryPropertyHostCoherentBit, coherent);
-        if (mem_idx == std::numeric_limits<uint32_t>::max()) {
-            return Status::Error(StatusCode::OutOfMemory, "No HOST_VISIBLE Vulkan memory type available");
-        }
-
-        VkMemoryAllocateInfo mai{};
-        mai.sType = kVkStypeMemoryAllocateInfo;
-        mai.allocationSize = req.size;
-        mai.memoryTypeIndex = mem_idx;
-        if (impl_->vkAllocateMemory(impl_->device, &mai, nullptr, &mem) != kVkSuccess) {
-            return Status::Error(StatusCode::OutOfMemory, "vkAllocateMemory failed");
-        }
-        if (impl_->vkBindBufferMemory(impl_->device, buf, mem, 0) != kVkSuccess) {
-            return Status::Error(StatusCode::DeviceError, "vkBindBufferMemory failed");
-        }
-        return Status::Ok();
-    };
-
-    bool in_coherent = true;
-    bool out_coherent = true;
-    Status st = create_storage_buf(in_buf, in_mem, in_coherent);
+    bool in_coherent = true, out_coherent = true;
+    Status st = impl_->CreateHostBuffer(byte_size, kVkBufferUsageStorageBufferBit, in_buf, in_mem, in_coherent,
+                                        input_u32.data(), input_u32.size() * sizeof(uint32_t));
     if (!st.ok()) { cleanup(); return st; }
-    st = create_storage_buf(out_buf, out_mem, out_coherent);
+    st = impl_->CreateHostBuffer(byte_size, kVkBufferUsageStorageBufferBit, out_buf, out_mem, out_coherent,
+                                 output_u32.data(), output_u32.size() * sizeof(uint32_t));
     if (!st.ok()) { cleanup(); return st; }
-
-    // Upload input buffer and zero-initialize output buffer.
-    {
-        void* mapped = nullptr;
-        if (impl_->vkMapMemory(impl_->device, in_mem, 0, byte_size, 0, &mapped) != kVkSuccess || !mapped) {
-            cleanup();
-            return Status::Error(StatusCode::DeviceError, "vkMapMemory(input) failed");
-        }
-        std::memset(mapped, 0, static_cast<size_t>(byte_size));
-        std::memcpy(mapped, input_u32.data(), input_u32.size() * sizeof(uint32_t));
-        if (!in_coherent) {
-            VkMappedMemoryRange rng{kVkStypeMappedMemoryRange, nullptr, in_mem, 0, kVkWholeSize};
-            impl_->vkFlushMappedMemoryRanges(impl_->device, 1, &rng);
-        }
-        impl_->vkUnmapMemory(impl_->device, in_mem);
-    }
-    {
-        void* mapped = nullptr;
-        if (impl_->vkMapMemory(impl_->device, out_mem, 0, byte_size, 0, &mapped) != kVkSuccess || !mapped) {
-            cleanup();
-            return Status::Error(StatusCode::DeviceError, "vkMapMemory(output init) failed");
-        }
-        std::memset(mapped, 0, static_cast<size_t>(byte_size));
-        if (!out_coherent) {
-            VkMappedMemoryRange rng{kVkStypeMappedMemoryRange, nullptr, out_mem, 0, kVkWholeSize};
-            impl_->vkFlushMappedMemoryRanges(impl_->device, 1, &rng);
-        }
-        impl_->vkUnmapMemory(impl_->device, out_mem);
-    }
 
     VkShaderModuleCreateInfo sm_ci{};
     sm_ci.sType = kVkStypeShaderModuleCreateInfo;
@@ -1547,14 +4373,8 @@ Status VulkanBackend::ExecuteComputeShader(const std::vector<uint32_t>& spirv,
     }
 
     VkDescriptorSetLayoutBinding bindings[2]{};
-    bindings[0].binding = 0;
-    bindings[0].descriptorType = kVkDescriptorTypeStorageBuffer;
-    bindings[0].descriptorCount = 1;
-    bindings[0].stageFlags = kVkShaderStageComputeBit;
-    bindings[1].binding = 1;
-    bindings[1].descriptorType = kVkDescriptorTypeStorageBuffer;
-    bindings[1].descriptorCount = 1;
-    bindings[1].stageFlags = kVkShaderStageComputeBit;
+    bindings[0] = {0u, kVkDescriptorTypeStorageBuffer, 1u, kVkShaderStageComputeBit, nullptr};
+    bindings[1] = {1u, kVkDescriptorTypeStorageBuffer, 1u, kVkShaderStageComputeBit, nullptr};
 
     VkDescriptorSetLayoutCreateInfo dsl_ci{};
     dsl_ci.sType = kVkStypeDescriptorSetLayoutCreateInfo;
@@ -1618,7 +4438,6 @@ Status VulkanBackend::ExecuteComputeShader(const std::vector<uint32_t>& spirv,
     writes[0].descriptorCount = 1;
     writes[0].descriptorType = kVkDescriptorTypeStorageBuffer;
     writes[0].pBufferInfo = &in_binfo;
-
     writes[1].sType = kVkStypeWriteDescriptorSet;
     writes[1].dstSet = desc_set;
     writes[1].dstBinding = 1;
@@ -1658,9 +4477,7 @@ Status VulkanBackend::ExecuteComputeShader(const std::vector<uint32_t>& spirv,
     out_barrier.buffer = out_buf;
     out_barrier.offset = 0;
     out_barrier.size = byte_size;
-    impl_->vkCmdPipelineBarrier(cmd_buf,
-                                kVkPipelineStageComputeShaderBit,
-                                kVkPipelineStageHostBit,
+    impl_->vkCmdPipelineBarrier(cmd_buf, kVkPipelineStageComputeShaderBit, kVkPipelineStageHostBit,
                                 0, 0, nullptr, 1, &out_barrier, 0, nullptr);
 
     if (impl_->vkEndCommandBuffer(cmd_buf) != kVkSuccess) {
@@ -1672,29 +4489,23 @@ Status VulkanBackend::ExecuteComputeShader(const std::vector<uint32_t>& spirv,
     submit_info.sType = kVkStypeSubmitInfo;
     submit_info.commandBufferCount = 1;
     submit_info.pCommandBuffers = &cmd_buf;
-    if (impl_->vkQueueSubmit(impl_->compute_queue, 1, &submit_info, kVkNullHandle) != kVkSuccess) {
+    if (impl_->vkQueueSubmit(impl_->compute_queue, 1, &submit_info, kVkNullHandle) != kVkSuccess ||
+        impl_->vkQueueWaitIdle(impl_->compute_queue) != kVkSuccess) {
         cleanup();
-        return Status::Error(StatusCode::DeviceError, "vkQueueSubmit failed");
-    }
-    if (impl_->vkQueueWaitIdle(impl_->compute_queue) != kVkSuccess) {
-        cleanup();
-        return Status::Error(StatusCode::DeviceError, "vkQueueWaitIdle failed");
+        return Status::Error(StatusCode::DeviceError, "vkQueueSubmit/vkQueueWaitIdle failed");
     }
 
-    // Read back GPU results.
-    {
-        void* mapped = nullptr;
-        if (impl_->vkMapMemory(impl_->device, out_mem, 0, byte_size, 0, &mapped) != kVkSuccess || !mapped) {
-            cleanup();
-            return Status::Error(StatusCode::DeviceError, "vkMapMemory(output readback) failed");
-        }
-        if (!out_coherent) {
-            VkMappedMemoryRange rng{kVkStypeMappedMemoryRange, nullptr, out_mem, 0, kVkWholeSize};
-            impl_->vkInvalidateMappedMemoryRanges(impl_->device, 1, &rng);
-        }
-        std::memcpy(output_u32.data(), mapped, static_cast<size_t>(byte_size));
-        impl_->vkUnmapMemory(impl_->device, out_mem);
+    void* mapped = nullptr;
+    if (impl_->vkMapMemory(impl_->device, out_mem, 0, byte_size, 0, &mapped) != kVkSuccess || !mapped) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkMapMemory(output readback) failed");
     }
+    if (!out_coherent) {
+        VkMappedMemoryRange rng{kVkStypeMappedMemoryRange, nullptr, out_mem, 0, kVkWholeSize};
+        impl_->vkInvalidateMappedMemoryRanges(impl_->device, 1, &rng);
+    }
+    std::memcpy(output_u32.data(), mapped, static_cast<size_t>(byte_size));
+    impl_->vkUnmapMemory(impl_->device, out_mem);
 
     cleanup();
     return Status::Ok();
@@ -1705,10 +4516,8 @@ Status VulkanBackend::RecordCommandList(const VulkanCommandListDesc& desc,
     if (!IsInitialized()) {
         return Status::Error(StatusCode::DeviceError, "VulkanBackend is not initialized");
     }
-
     out_result = VulkanCommandListResult{};
 
-    // Validate commands before recording.
     for (const auto& cmd : desc.commands) {
         if (cmd.op == VulkanCommandOp::Dispatch && (cmd.x == 0 || cmd.y == 0 || cmd.z == 0)) {
             return Status::Error(StatusCode::InvalidArgument, "Dispatch command dimensions must be > 0");
@@ -1759,13 +4568,10 @@ Status VulkanBackend::RecordCommandList(const VulkanCommandListDesc& desc,
             mb.sType = kVkStypeMemoryBarrier;
             mb.srcAccessMask = kVkAccessShaderWriteBit;
             mb.dstAccessMask = kVkAccessHostReadBit;
-            impl_->vkCmdPipelineBarrier(cmd_buf,
-                                        kVkPipelineStageComputeShaderBit,
-                                        kVkPipelineStageHostBit,
+            impl_->vkCmdPipelineBarrier(cmd_buf, kVkPipelineStageComputeShaderBit, kVkPipelineStageHostBit,
                                         0, 1, &mb, 0, nullptr, 0, nullptr);
             ++out_result.barrier_count;
         } else if (cmd.op == VulkanCommandOp::Dispatch) {
-            // Note: Dispatch without a bound pipeline is only tracked unless executed via ExecuteComputeShader.
             ++out_result.dispatch_count;
         }
     }
@@ -1789,6 +4595,701 @@ Status VulkanBackend::RecordCommandList(const VulkanCommandListDesc& desc,
 
     free_cb();
     out_result.executed_on_vulkan_icd = true;
+    return Status::Ok();
+}
+
+Status VulkanBackend::ExecuteGraphicsDraw(const VulkanGraphicsDrawDesc& desc,
+                                          VulkanGraphicsDrawResult& out_result) {
+    if (!IsInitialized()) {
+        return Status::Error(StatusCode::DeviceError, "VulkanBackend is not initialized");
+    }
+    if (desc.width == 0 || desc.height == 0) {
+        return Status::Error(StatusCode::InvalidArgument, "Render target width and height must be > 0");
+    }
+    if (desc.color_format == VulkanImageFormat::D32Sfloat) {
+        return Status::Error(StatusCode::InvalidArgument, "D32Sfloat cannot be used as color format");
+    }
+
+    SpirvValidationInfo vs_info{};
+    SpirvValidationInfo ps_info{};
+    if (auto st = ValidateSpirvBinary(desc.vertex_spirv, &vs_info); !st.ok()) return st;
+    if (auto st = ValidateSpirvBinary(desc.fragment_spirv, &ps_info); !st.ok()) return st;
+    if (!vs_info.has_vertex_entry) {
+        return Status::Error(StatusCode::ShaderError, "Vertex SPIR-V module missing Vertex entry point");
+    }
+    if (!ps_info.has_fragment_entry) {
+        return Status::Error(StatusCode::ShaderError, "Fragment SPIR-V module missing Fragment entry point");
+    }
+
+    out_result = VulkanGraphicsDrawResult{};
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+
+    if (impl_->fallback_mode || !impl_->device || !impl_->has_graphics_queue) {
+        return ExecuteSpirvGraphicsSoftware(desc, out_result);
+    }
+
+    const uint32_t unused_groups[3] = {1, 1, 1};
+    const std::vector<uint32_t> empty_task;
+    Status st = impl_->ExecuteGraphicsOrMeshOnIcd(
+        false, empty_task, "", desc.vertex_spirv, desc.vertex_entry,
+        desc.fragment_spirv, desc.fragment_entry,
+        desc.width, desc.height, desc.color_format,
+        desc.enable_depth, desc.enable_msaa_4x, desc.depth_write,
+        desc.clear_color, desc.clear_depth,
+        desc.vertex_bytes, desc.vertex_stride, desc.vertex_attributes,
+        desc.indices, desc.vertex_count, unused_groups,
+        desc.push_constants, desc.descriptors,
+        out_result.framebuffer, out_result.raw_fp16_rgba);
+    if (!st.ok()) return st;
+
+    out_result.fnv1a_hash = out_result.framebuffer.ComputeFnv1aHash();
+    out_result.executed_on_vulkan_icd = true;
+    out_result.used_msaa_4x = desc.enable_msaa_4x;
+    out_result.used_depth_buffer = desc.enable_depth;
+    return Status::Ok();
+}
+
+Status VulkanBackend::ExecuteMeshShaderDraw(const VulkanMeshDrawDesc& desc,
+                                            VulkanMeshDrawResult& out_result) {
+    if (!IsInitialized()) {
+        return Status::Error(StatusCode::DeviceError, "VulkanBackend is not initialized");
+    }
+    if (desc.width == 0 || desc.height == 0 ||
+        desc.group_count_x == 0 || desc.group_count_y == 0 || desc.group_count_z == 0) {
+        return Status::Error(StatusCode::InvalidArgument, "Invalid mesh draw dimensions or group counts");
+    }
+
+    const bool has_task = !desc.task_spirv.empty();
+    SpirvValidationInfo task_info{}, mesh_info{}, frag_info{};
+    if (has_task) {
+        if (auto st = ValidateSpirvBinary(desc.task_spirv, &task_info); !st.ok()) return st;
+        if (!task_info.has_task_entry) {
+            return Status::Error(StatusCode::ShaderError, "Task SPIR-V module missing TaskEXT entry point");
+        }
+    }
+    if (auto st = ValidateSpirvBinary(desc.mesh_spirv, &mesh_info); !st.ok()) return st;
+    if (!mesh_info.has_mesh_entry) {
+        return Status::Error(StatusCode::ShaderError, "Mesh SPIR-V module missing MeshEXT entry point");
+    }
+    if (auto st = ValidateSpirvBinary(desc.fragment_spirv, &frag_info); !st.ok()) return st;
+    if (!frag_info.has_fragment_entry) {
+        return Status::Error(StatusCode::ShaderError, "Fragment SPIR-V module missing Fragment entry point");
+    }
+
+    out_result = VulkanMeshDrawResult{};
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+
+    const bool can_run_hw = !impl_->fallback_mode && impl_->device && impl_->has_graphics_queue &&
+                            impl_->mesh_shader_enabled && impl_->vkCmdDrawMeshTasksEXT != nullptr &&
+                            (!has_task || impl_->task_shader_enabled);
+
+    if (!can_run_hw) {
+        if (!desc.allow_fallback_emulation) {
+            return Status::Error(StatusCode::UnsupportedFormat, "VK_EXT_mesh_shader not supported on this device");
+        }
+        return ExecuteSpirvMeshSoftware(desc, out_result);
+    }
+
+    const uint32_t groups[3] = {desc.group_count_x, desc.group_count_y, desc.group_count_z};
+    const std::vector<uint8_t> no_vb;
+    const std::vector<VulkanVertexAttribute> no_attrs;
+    const std::vector<uint32_t> no_ib;
+
+    Status st = impl_->ExecuteGraphicsOrMeshOnIcd(
+        true, desc.task_spirv, desc.task_entry, desc.mesh_spirv, desc.mesh_entry,
+        desc.fragment_spirv, desc.fragment_entry,
+        desc.width, desc.height, desc.color_format,
+        desc.enable_depth, false, true,
+        desc.clear_color, desc.clear_depth,
+        no_vb, 0, no_attrs, no_ib, 0, groups,
+        desc.push_constants, desc.descriptors,
+        out_result.framebuffer, out_result.raw_fp16_rgba);
+    if (!st.ok()) return st;
+
+    out_result.fnv1a_hash = out_result.framebuffer.ComputeFnv1aHash();
+    out_result.executed_on_mesh_shader_hw = true;
+    out_result.used_task_shader = has_task;
+    out_result.used_fallback = false;
+    return Status::Ok();
+}
+
+Status VulkanBackend::UploadAndReadbackTexture(const VulkanTextureDesc& desc,
+                                               VulkanTextureRoundtripResult& out_result) {
+    if (!IsInitialized()) {
+        return Status::Error(StatusCode::DeviceError, "VulkanBackend is not initialized");
+    }
+    if (desc.width == 0 || desc.height == 0 || (desc.is_3d && desc.depth == 0) || desc.mips.empty()) {
+        return Status::Error(StatusCode::InvalidArgument, "Invalid texture dimensions or empty mip list");
+    }
+
+    const uint32_t bpp = BytesPerTexel(desc.format);
+    std::vector<VkDeviceSize> mip_offsets(desc.mips.size(), 0);
+    VkDeviceSize total_bytes = 0;
+    for (size_t m = 0; m < desc.mips.size(); ++m) {
+        const auto& mip = desc.mips[m];
+        const uint32_t d = desc.is_3d ? std::max<uint32_t>(1, mip.depth) : 1u;
+        const size_t expected = static_cast<size_t>(mip.width) * mip.height * d * bpp;
+        if (mip.width == 0 || mip.height == 0 || mip.data.size() != expected) {
+            return Status::Error(StatusCode::InvalidArgument, "Texture mip data size does not match dimensions");
+        }
+        while (total_bytes % 16 != 0) ++total_bytes;
+        mip_offsets[m] = total_bytes;
+        total_bytes += expected;
+    }
+
+    out_result = VulkanTextureRoundtripResult{};
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+
+    if (impl_->fallback_mode || !impl_->device || !impl_->has_graphics_queue) {
+        out_result.readback_mips = desc.mips;
+        out_result.executed_on_vulkan_icd = false;
+        return Status::Ok();
+    }
+
+    VkImage img = kVkNullHandle;
+    VkDeviceMemory img_mem = kVkNullHandle;
+    VkBuffer up_buf = kVkNullHandle, rb_buf = kVkNullHandle;
+    VkDeviceMemory up_mem = kVkNullHandle, rb_mem = kVkNullHandle;
+    bool up_coh = true, rb_coh = true;
+    VkCommandBuffer cmd = nullptr;
+
+    auto cleanup = [&]() {
+        if (cmd) { impl_->vkFreeCommandBuffers(impl_->device, impl_->graphics_command_pool, 1, &cmd); cmd = nullptr; }
+        if (rb_buf != kVkNullHandle) impl_->vkDestroyBuffer(impl_->device, rb_buf, nullptr);
+        if (up_buf != kVkNullHandle) impl_->vkDestroyBuffer(impl_->device, up_buf, nullptr);
+        if (rb_mem != kVkNullHandle) impl_->vkFreeMemory(impl_->device, rb_mem, nullptr);
+        if (up_mem != kVkNullHandle) impl_->vkFreeMemory(impl_->device, up_mem, nullptr);
+        if (img != kVkNullHandle) impl_->vkDestroyImage(impl_->device, img, nullptr);
+        if (img_mem != kVkNullHandle) impl_->vkFreeMemory(impl_->device, img_mem, nullptr);
+    };
+
+    const uint32_t mip_cnt = static_cast<uint32_t>(desc.mips.size());
+    Status st = impl_->CreateDeviceImage(
+        desc.is_3d ? kVkImageType3D : kVkImageType2D,
+        static_cast<int32_t>(desc.format),
+        desc.width, desc.height, desc.is_3d ? desc.depth : 1u,
+        mip_cnt, kVkSampleCount1Bit,
+        kVkImageUsageTransferDstBit | kVkImageUsageTransferSrcBit | kVkImageUsageSampledBit,
+        img, img_mem);
+    if (!st.ok()) { cleanup(); return st; }
+
+    std::vector<uint8_t> staging_data(static_cast<size_t>(total_bytes), 0u);
+    for (size_t m = 0; m < desc.mips.size(); ++m) {
+        std::memcpy(staging_data.data() + mip_offsets[m], desc.mips[m].data.data(), desc.mips[m].data.size());
+    }
+
+    st = impl_->CreateHostBuffer(total_bytes, kVkBufferUsageTransferSrcBit, up_buf, up_mem, up_coh,
+                                 staging_data.data(), staging_data.size());
+    if (!st.ok()) { cleanup(); return st; }
+    st = impl_->CreateHostBuffer(total_bytes, kVkBufferUsageTransferDstBit, rb_buf, rb_mem, rb_coh);
+    if (!st.ok()) { cleanup(); return st; }
+
+    VkCommandBufferAllocateInfo cba{};
+    cba.sType = kVkStypeCommandBufferAllocateInfo;
+    cba.commandPool = impl_->graphics_command_pool;
+    cba.level = kVkCommandBufferLevelPrimary;
+    cba.commandBufferCount = 1;
+    if (impl_->vkAllocateCommandBuffers(impl_->device, &cba, &cmd) != kVkSuccess || !cmd) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkAllocateCommandBuffers(tex) failed");
+    }
+
+    VkCommandBufferBeginInfo cbi{};
+    cbi.sType = kVkStypeCommandBufferBeginInfo;
+    cbi.flags = kVkCommandBufferUsageOneTimeSubmitBit;
+    if (impl_->vkBeginCommandBuffer(cmd, &cbi) != kVkSuccess) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkBeginCommandBuffer(tex) failed");
+    }
+
+    impl_->CmdImageBarrier(cmd, img, kVkImageAspectColorBit,
+                           kVkImageLayoutUndefined, kVkImageLayoutTransferDstOptimal,
+                           kVkPipelineStageTopOfPipeBit, kVkPipelineStageTransferBit,
+                           0u, kVkAccessTransferWriteBit, mip_cnt);
+
+    for (uint32_t m = 0; m < mip_cnt; ++m) {
+        VkBufferImageCopy r{};
+        r.bufferOffset = mip_offsets[m];
+        r.imageSubresource = {kVkImageAspectColorBit, m, 0u, 1u};
+        r.imageExtent = {desc.mips[m].width, desc.mips[m].height, desc.is_3d ? desc.mips[m].depth : 1u};
+        impl_->vkCmdCopyBufferToImage(cmd, up_buf, img, kVkImageLayoutTransferDstOptimal, 1, &r);
+    }
+
+    // Exercise SHADER_READ_ONLY_OPTIMAL transition before readback copy
+    impl_->CmdImageBarrier(cmd, img, kVkImageAspectColorBit,
+                           kVkImageLayoutTransferDstOptimal, kVkImageLayoutShaderReadOnlyOptimal,
+                           kVkPipelineStageTransferBit, kVkPipelineStageFragmentShaderBit,
+                           kVkAccessTransferWriteBit, kVkAccessShaderReadBit, mip_cnt);
+    impl_->CmdImageBarrier(cmd, img, kVkImageAspectColorBit,
+                           kVkImageLayoutShaderReadOnlyOptimal, kVkImageLayoutTransferSrcOptimal,
+                           kVkPipelineStageFragmentShaderBit, kVkPipelineStageTransferBit,
+                           kVkAccessShaderReadBit, kVkAccessTransferReadBit, mip_cnt);
+
+    for (uint32_t m = 0; m < mip_cnt; ++m) {
+        VkBufferImageCopy r{};
+        r.bufferOffset = mip_offsets[m];
+        r.imageSubresource = {kVkImageAspectColorBit, m, 0u, 1u};
+        r.imageExtent = {desc.mips[m].width, desc.mips[m].height, desc.is_3d ? desc.mips[m].depth : 1u};
+        impl_->vkCmdCopyImageToBuffer(cmd, img, kVkImageLayoutTransferSrcOptimal, rb_buf, 1, &r);
+    }
+
+    VkBufferMemoryBarrier bb{};
+    bb.sType = kVkStypeBufferMemoryBarrier;
+    bb.srcAccessMask = kVkAccessTransferWriteBit;
+    bb.dstAccessMask = kVkAccessHostReadBit;
+    bb.srcQueueFamilyIndex = kVkQueueFamilyIgnored;
+    bb.dstQueueFamilyIndex = kVkQueueFamilyIgnored;
+    bb.buffer = rb_buf;
+    bb.offset = 0;
+    bb.size = total_bytes;
+    impl_->vkCmdPipelineBarrier(cmd, kVkPipelineStageTransferBit, kVkPipelineStageHostBit,
+                                0, 0, nullptr, 1, &bb, 0, nullptr);
+
+    if (impl_->vkEndCommandBuffer(cmd) != kVkSuccess) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkEndCommandBuffer(tex) failed");
+    }
+
+    VkSubmitInfo si{};
+    si.sType = kVkStypeSubmitInfo;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    if (impl_->vkQueueSubmit(impl_->graphics_queue, 1, &si, kVkNullHandle) != kVkSuccess ||
+        impl_->vkQueueWaitIdle(impl_->graphics_queue) != kVkSuccess) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "Texture roundtrip submit/wait failed");
+    }
+
+    void* mapped = nullptr;
+    if (impl_->vkMapMemory(impl_->device, rb_mem, 0, total_bytes, 0, &mapped) != kVkSuccess || !mapped) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkMapMemory(tex readback) failed");
+    }
+    if (!rb_coh) {
+        VkMappedMemoryRange rng{kVkStypeMappedMemoryRange, nullptr, rb_mem, 0, kVkWholeSize};
+        impl_->vkInvalidateMappedMemoryRanges(impl_->device, 1, &rng);
+    }
+
+    out_result.readback_mips.resize(desc.mips.size());
+    const auto* src_bytes = static_cast<const uint8_t*>(mapped);
+    for (size_t m = 0; m < desc.mips.size(); ++m) {
+        out_result.readback_mips[m].width = desc.mips[m].width;
+        out_result.readback_mips[m].height = desc.mips[m].height;
+        out_result.readback_mips[m].depth = desc.is_3d ? desc.mips[m].depth : 1u;
+        out_result.readback_mips[m].data.assign(
+            src_bytes + mip_offsets[m], src_bytes + mip_offsets[m] + desc.mips[m].data.size());
+    }
+    impl_->vkUnmapMemory(impl_->device, rb_mem);
+    cleanup();
+    out_result.executed_on_vulkan_icd = true;
+    return Status::Ok();
+}
+
+Status VulkanBackend::CreateWin32Swapchain(const VulkanSwapchainDesc& desc,
+                                           VulkanSwapchainInfo& out_info) {
+    if (!IsInitialized()) {
+        return Status::Error(StatusCode::DeviceError, "VulkanBackend is not initialized");
+    }
+    if (desc.width == 0 || desc.height == 0) {
+        return Status::Error(StatusCode::InvalidArgument, "Swapchain dimensions must be > 0");
+    }
+
+    out_info = VulkanSwapchainInfo{};
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+
+    Impl::SwapchainRecord rec{};
+    rec.info.width = desc.width;
+    rec.info.height = desc.height;
+
+    const bool try_win32 = !desc.headless_offscreen && desc.hwnd != nullptr &&
+                           !impl_->fallback_mode && impl_->device != nullptr &&
+                           impl_->has_graphics_queue && impl_->win32_surface_enabled &&
+                           impl_->swapchain_enabled;
+
+#if defined(_WIN32)
+    if (try_win32) {
+        VkWin32SurfaceCreateInfoKHR surf_ci{};
+        surf_ci.sType = kVkStypeWin32SurfaceCreateInfoKhr;
+        surf_ci.hinstance = desc.hinstance ? desc.hinstance : static_cast<void*>(GetModuleHandleA(nullptr));
+        surf_ci.hwnd = desc.hwnd;
+
+        VkSurfaceKHR surface = kVkNullHandle;
+        if (impl_->vkCreateWin32SurfaceKHR(impl_->instance, &surf_ci, nullptr, &surface) == kVkSuccess &&
+            surface != kVkNullHandle) {
+            VkBool32 supported = 0;
+            VkSurfaceCapabilitiesKHR caps{};
+            uint32_t fmt_count = 0;
+            const bool surf_ok =
+                impl_->vkGetPhysicalDeviceSurfaceSupportKHR(
+                    impl_->physical_device, impl_->graphics_queue_family, surface, &supported) == kVkSuccess &&
+                supported != 0 &&
+                impl_->vkGetPhysicalDeviceSurfaceCapabilitiesKHR(impl_->physical_device, surface, &caps) == kVkSuccess &&
+                caps.maxImageExtent.width > 0 && caps.maxImageExtent.height > 0 &&
+                impl_->vkGetPhysicalDeviceSurfaceFormatsKHR(impl_->physical_device, surface, &fmt_count, nullptr) == kVkSuccess &&
+                fmt_count > 0;
+
+            if (surf_ok) {
+                std::vector<VkSurfaceFormatKHR> fmts(fmt_count);
+                impl_->vkGetPhysicalDeviceSurfaceFormatsKHR(impl_->physical_device, surface, &fmt_count, fmts.data());
+
+                VkSurfaceFormatKHR chosen = fmts[0];
+                bool hdr10_found = false;
+                VkSurfaceFormatKHR hdr10_fmt{};
+                for (const auto& f : fmts) {
+                    const uint32_t cs = static_cast<uint32_t>(f.colorSpace);
+                    if (std::find(rec.info.supported_color_spaces.begin(),
+                                  rec.info.supported_color_spaces.end(), cs) ==
+                        rec.info.supported_color_spaces.end()) {
+                        rec.info.supported_color_spaces.push_back(cs);
+                    }
+                    if (cs == kVkColorSpaceHdr10St2084Ext) {
+                        hdr10_found = true;
+                        hdr10_fmt = f;
+                    }
+                    if ((f.format == kVkFormatB8G8R8A8Unorm || f.format == kVkFormatR8G8B8A8Unorm) &&
+                        cs == kVkColorSpaceSrgbNonlinearKhr) {
+                        chosen = f;
+                    }
+                }
+                rec.info.hdr10_advertised = hdr10_found;
+                if (desc.prefer_hdr10 && hdr10_found) {
+                    chosen = hdr10_fmt;
+                    rec.info.hdr10_active = true;
+                }
+
+                VkExtent2D extent{desc.width, desc.height};
+                if (caps.currentExtent.width != 0xFFFFFFFFu && caps.currentExtent.width > 0 &&
+                    caps.currentExtent.height > 0) {
+                    extent = caps.currentExtent;
+                } else {
+                    extent.width = std::clamp(extent.width, caps.minImageExtent.width, caps.maxImageExtent.width);
+                    extent.height = std::clamp(extent.height, caps.minImageExtent.height, caps.maxImageExtent.height);
+                }
+
+                uint32_t img_count = std::max<uint32_t>(caps.minImageCount, 2u);
+                if (caps.maxImageCount > 0 && img_count > caps.maxImageCount) {
+                    img_count = caps.maxImageCount;
+                }
+
+                VkFlags usage = kVkImageUsageColorAttachmentBit | kVkImageUsageTransferDstBit;
+                rec.supports_transfer_src = (caps.supportedUsageFlags & kVkImageUsageTransferSrcBit) != 0;
+                if (rec.supports_transfer_src) usage |= kVkImageUsageTransferSrcBit;
+
+                VkSwapchainCreateInfoKHR sc_ci{};
+                sc_ci.sType = kVkStypeSwapchainCreateInfoKhr;
+                sc_ci.surface = surface;
+                sc_ci.minImageCount = img_count;
+                sc_ci.imageFormat = chosen.format;
+                sc_ci.imageColorSpace = chosen.colorSpace;
+                sc_ci.imageExtent = extent;
+                sc_ci.imageArrayLayers = 1;
+                sc_ci.imageUsage = usage;
+                sc_ci.imageSharingMode = kVkSharingModeExclusive;
+                sc_ci.preTransform = caps.currentTransform ? caps.currentTransform : 1u;
+                sc_ci.compositeAlpha = kVkCompositeAlphaOpaqueBitKhr;
+                sc_ci.presentMode = kVkPresentModeFifoKhr;
+                sc_ci.clipped = 1u;
+
+                VkSwapchainKHR sc = kVkNullHandle;
+                if (impl_->vkCreateSwapchainKHR(impl_->device, &sc_ci, nullptr, &sc) == kVkSuccess &&
+                    sc != kVkNullHandle) {
+                    uint32_t sc_img_cnt = 0;
+                    impl_->vkGetSwapchainImagesKHR(impl_->device, sc, &sc_img_cnt, nullptr);
+                    rec.swapchain_images.resize(sc_img_cnt, kVkNullHandle);
+                    if (sc_img_cnt > 0) {
+                        impl_->vkGetSwapchainImagesKHR(impl_->device, sc, &sc_img_cnt, rec.swapchain_images.data());
+                    }
+                    rec.surface = surface;
+                    rec.swapchain = sc;
+                    rec.info.handle = impl_->next_swapchain_handle++;
+                    rec.info.width = extent.width;
+                    rec.info.height = extent.height;
+                    rec.info.image_count = sc_img_cnt;
+                    rec.info.vk_format = static_cast<uint32_t>(chosen.format);
+                    rec.info.vk_color_space = static_cast<uint32_t>(chosen.colorSpace);
+                    rec.info.is_win32_surface = true;
+                    rec.info.is_headless_offscreen = false;
+                    out_info = rec.info;
+                    impl_->swapchains[rec.info.handle] = std::move(rec);
+                    return Status::Ok();
+                }
+            }
+            impl_->vkDestroySurfaceKHR(impl_->instance, surface, nullptr);
+        }
+    }
+#else
+    (void)try_win32;
+#endif
+
+    // Headless offscreen mode (real GPU VkImage if ICD available, or software fallback)
+    if (!impl_->fallback_mode && impl_->device && impl_->has_graphics_queue) {
+        Status st = impl_->CreateDeviceImage(
+            kVkImageType2D, kVkFormatR8G8B8A8Unorm, desc.width, desc.height, 1, 1, kVkSampleCount1Bit,
+            kVkImageUsageColorAttachmentBit | kVkImageUsageTransferDstBit | kVkImageUsageTransferSrcBit,
+            rec.offscreen_image, rec.offscreen_mem);
+        if (!st.ok()) return st;
+    }
+
+    rec.info.handle = impl_->next_swapchain_handle++;
+    rec.info.width = desc.width;
+    rec.info.height = desc.height;
+    rec.info.image_count = 2;
+    rec.info.vk_format = static_cast<uint32_t>(kVkFormatR8G8B8A8Unorm);
+    rec.info.vk_color_space = kVkColorSpaceSrgbNonlinearKhr;
+    rec.info.is_win32_surface = false;
+    rec.info.is_headless_offscreen = true;
+    rec.info.hdr10_advertised = impl_->hdr10_colorspace_enabled;
+    rec.info.hdr10_active = false;
+    rec.info.supported_color_spaces.push_back(kVkColorSpaceSrgbNonlinearKhr);
+    if (impl_->hdr10_colorspace_enabled) {
+        rec.info.supported_color_spaces.push_back(kVkColorSpaceHdr10St2084Ext);
+    }
+
+    out_info = rec.info;
+    impl_->swapchains[rec.info.handle] = std::move(rec);
+    return Status::Ok();
+}
+
+Status VulkanBackend::PresentRgba8ToSwapchain(uint64_t swapchain_handle,
+                                              const FrameBufferRgba8& frame,
+                                              VulkanPresentResult& out_result,
+                                              bool readback_frame) {
+    if (!IsInitialized()) {
+        return Status::Error(StatusCode::DeviceError, "VulkanBackend is not initialized");
+    }
+    if (frame.width == 0 || frame.height == 0 ||
+        frame.pixels.size() != static_cast<size_t>(frame.width) * frame.height * 4u) {
+        return Status::Error(StatusCode::InvalidArgument, "Invalid RGBA8 framebuffer for presentation");
+    }
+
+    out_result = VulkanPresentResult{};
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+
+    auto it = impl_->swapchains.find(swapchain_handle);
+    if (it == impl_->swapchains.end()) {
+        return Status::Error(StatusCode::NotFound, "Unknown Vulkan swapchain handle");
+    }
+    auto& rec = it->second;
+
+    if (impl_->fallback_mode || !impl_->device || !impl_->has_graphics_queue) {
+        out_result.image_index = rec.frame_counter++ % std::max<uint32_t>(1, rec.info.image_count);
+        out_result.presented_to_win32_swapchain = false;
+        out_result.readback_available = true;
+        out_result.readback_framebuffer = frame;
+        out_result.fnv1a_hash = frame.ComputeFnv1aHash();
+        return Status::Ok();
+    }
+
+    const uint32_t w = std::min(frame.width, rec.info.width);
+    const uint32_t h = std::min(frame.height, rec.info.height);
+    const size_t px_count = static_cast<size_t>(w) * h;
+    std::vector<uint8_t> upload_bytes(px_count * 4u, 0u);
+
+    for (uint32_t y = 0; y < h; ++y) {
+        for (uint32_t x = 0; x < w; ++x) {
+            const size_t sidx = (static_cast<size_t>(y) * frame.width + x) * 4u;
+            const size_t didx = (static_cast<size_t>(y) * w + x) * 4u;
+            const uint8_t r = frame.pixels[sidx + 0];
+            const uint8_t g = frame.pixels[sidx + 1];
+            const uint8_t b = frame.pixels[sidx + 2];
+            const uint8_t a = frame.pixels[sidx + 3];
+            if (rec.info.vk_format == static_cast<uint32_t>(kVkFormatB8G8R8A8Unorm)) {
+                upload_bytes[didx + 0] = b;
+                upload_bytes[didx + 1] = g;
+                upload_bytes[didx + 2] = r;
+                upload_bytes[didx + 3] = a;
+            } else if (rec.info.vk_format == static_cast<uint32_t>(kVkFormatA2B10G10R10UnormPack32)) {
+                const uint32_t packed = PackA2B10G10R10(r, g, b, a);
+                std::memcpy(upload_bytes.data() + didx, &packed, 4);
+            } else {
+                upload_bytes[didx + 0] = r;
+                upload_bytes[didx + 1] = g;
+                upload_bytes[didx + 2] = b;
+                upload_bytes[didx + 3] = a;
+            }
+        }
+    }
+
+    VkBuffer up_buf = kVkNullHandle, rb_buf = kVkNullHandle;
+    VkDeviceMemory up_mem = kVkNullHandle, rb_mem = kVkNullHandle;
+    bool up_coh = true, rb_coh = true;
+    VkSemaphore img_avail = kVkNullHandle, render_done = kVkNullHandle;
+    VkCommandBuffer cmd = nullptr;
+
+    auto cleanup = [&]() {
+        if (cmd) impl_->vkFreeCommandBuffers(impl_->device, impl_->graphics_command_pool, 1, &cmd);
+        if (render_done != kVkNullHandle) impl_->vkDestroySemaphore(impl_->device, render_done, nullptr);
+        if (img_avail != kVkNullHandle) impl_->vkDestroySemaphore(impl_->device, img_avail, nullptr);
+        if (rb_buf != kVkNullHandle) impl_->vkDestroyBuffer(impl_->device, rb_buf, nullptr);
+        if (up_buf != kVkNullHandle) impl_->vkDestroyBuffer(impl_->device, up_buf, nullptr);
+        if (rb_mem != kVkNullHandle) impl_->vkFreeMemory(impl_->device, rb_mem, nullptr);
+        if (up_mem != kVkNullHandle) impl_->vkFreeMemory(impl_->device, up_mem, nullptr);
+    };
+
+    Status st = impl_->CreateHostBuffer(upload_bytes.size(), kVkBufferUsageTransferSrcBit, up_buf, up_mem, up_coh,
+                                        upload_bytes.data(), upload_bytes.size());
+    if (!st.ok()) { cleanup(); return st; }
+
+    const bool do_gpu_readback =
+        readback_frame && (rec.info.is_headless_offscreen || rec.supports_transfer_src);
+    if (do_gpu_readback) {
+        st = impl_->CreateHostBuffer(upload_bytes.size(), kVkBufferUsageTransferDstBit, rb_buf, rb_mem, rb_coh);
+        if (!st.ok()) { cleanup(); return st; }
+    }
+
+    uint32_t img_index = 0;
+    VkImage target_img = rec.offscreen_image;
+    if (rec.info.is_win32_surface && rec.swapchain != kVkNullHandle) {
+        VkSemaphoreCreateInfo sci{kVkStypeSemaphoreCreateInfo, nullptr, 0};
+        if (impl_->vkCreateSemaphore(impl_->device, &sci, nullptr, &img_avail) != kVkSuccess ||
+            impl_->vkCreateSemaphore(impl_->device, &sci, nullptr, &render_done) != kVkSuccess) {
+            cleanup();
+            return Status::Error(StatusCode::DeviceError, "vkCreateSemaphore(present) failed");
+        }
+        const VkResult acq = impl_->vkAcquireNextImageKHR(
+            impl_->device, rec.swapchain, kVkUint64Max, img_avail, kVkNullHandle, &img_index);
+        if (acq != kVkSuccess && acq != kVkSuboptimalKhr) {
+            cleanup();
+            return Status::Error(StatusCode::DeviceError,
+                                 "vkAcquireNextImageKHR failed (VkResult=" + std::to_string(acq) + ")");
+        }
+        if (img_index >= rec.swapchain_images.size()) {
+            cleanup();
+            return Status::Error(StatusCode::DeviceError, "Swapchain image index out of range");
+        }
+        target_img = rec.swapchain_images[img_index];
+    } else {
+        img_index = rec.frame_counter++ % std::max<uint32_t>(1, rec.info.image_count);
+    }
+
+    VkCommandBufferAllocateInfo cba{};
+    cba.sType = kVkStypeCommandBufferAllocateInfo;
+    cba.commandPool = impl_->graphics_command_pool;
+    cba.level = kVkCommandBufferLevelPrimary;
+    cba.commandBufferCount = 1;
+    if (impl_->vkAllocateCommandBuffers(impl_->device, &cba, &cmd) != kVkSuccess || !cmd) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkAllocateCommandBuffers(present) failed");
+    }
+
+    VkCommandBufferBeginInfo cbi{kVkStypeCommandBufferBeginInfo, nullptr, kVkCommandBufferUsageOneTimeSubmitBit, nullptr};
+    if (impl_->vkBeginCommandBuffer(cmd, &cbi) != kVkSuccess) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkBeginCommandBuffer(present) failed");
+    }
+
+    impl_->CmdImageBarrier(cmd, target_img, kVkImageAspectColorBit,
+                           kVkImageLayoutUndefined, kVkImageLayoutTransferDstOptimal,
+                           kVkPipelineStageTopOfPipeBit, kVkPipelineStageTransferBit,
+                           0u, kVkAccessTransferWriteBit);
+
+    VkBufferImageCopy cp{};
+    cp.imageSubresource = {kVkImageAspectColorBit, 0, 0, 1};
+    cp.imageExtent = {w, h, 1};
+    impl_->vkCmdCopyBufferToImage(cmd, up_buf, target_img, kVkImageLayoutTransferDstOptimal, 1, &cp);
+
+    if (do_gpu_readback) {
+        impl_->CmdImageBarrier(cmd, target_img, kVkImageAspectColorBit,
+                               kVkImageLayoutTransferDstOptimal, kVkImageLayoutTransferSrcOptimal,
+                               kVkPipelineStageTransferBit, kVkPipelineStageTransferBit,
+                               kVkAccessTransferWriteBit, kVkAccessTransferReadBit);
+        impl_->vkCmdCopyImageToBuffer(cmd, target_img, kVkImageLayoutTransferSrcOptimal, rb_buf, 1, &cp);
+    }
+
+    if (rec.info.is_win32_surface) {
+        const int32_t cur_layout = do_gpu_readback ? kVkImageLayoutTransferSrcOptimal : kVkImageLayoutTransferDstOptimal;
+        const VkFlags cur_access = do_gpu_readback ? kVkAccessTransferReadBit : kVkAccessTransferWriteBit;
+        impl_->CmdImageBarrier(cmd, target_img, kVkImageAspectColorBit,
+                               cur_layout, kVkImageLayoutPresentSrcKhr,
+                               kVkPipelineStageTransferBit, kVkPipelineStageBottomOfPipeBit,
+                               cur_access, 0u);
+    }
+
+    if (impl_->vkEndCommandBuffer(cmd) != kVkSuccess) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkEndCommandBuffer(present) failed");
+    }
+
+    const VkFlags wait_stage = kVkPipelineStageTransferBit;
+    VkSubmitInfo si{};
+    si.sType = kVkStypeSubmitInfo;
+    si.waitSemaphoreCount = (img_avail != kVkNullHandle) ? 1u : 0u;
+    si.pWaitSemaphores = (img_avail != kVkNullHandle) ? &img_avail : nullptr;
+    si.pWaitDstStageMask = (img_avail != kVkNullHandle) ? &wait_stage : nullptr;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    si.signalSemaphoreCount = (render_done != kVkNullHandle) ? 1u : 0u;
+    si.pSignalSemaphores = (render_done != kVkNullHandle) ? &render_done : nullptr;
+    if (impl_->vkQueueSubmit(impl_->graphics_queue, 1, &si, kVkNullHandle) != kVkSuccess) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkQueueSubmit(present) failed");
+    }
+
+    if (rec.info.is_win32_surface && rec.swapchain != kVkNullHandle) {
+        VkPresentInfoKHR pi{};
+        pi.sType = kVkStypePresentInfoKhr;
+        pi.waitSemaphoreCount = 1;
+        pi.pWaitSemaphores = &render_done;
+        pi.swapchainCount = 1;
+        pi.pSwapchains = &rec.swapchain;
+        pi.pImageIndices = &img_index;
+        const VkResult pr = impl_->vkQueuePresentKHR(impl_->graphics_queue, &pi);
+        if (pr != kVkSuccess && pr != kVkSuboptimalKhr) {
+            impl_->vkQueueWaitIdle(impl_->graphics_queue);
+            cleanup();
+            return Status::Error(StatusCode::DeviceError,
+                                 "vkQueuePresentKHR failed (VkResult=" + std::to_string(pr) + ")");
+        }
+        out_result.presented_to_win32_swapchain = true;
+    }
+
+    impl_->vkQueueWaitIdle(impl_->graphics_queue);
+
+    if (do_gpu_readback) {
+        void* mapped = nullptr;
+        if (impl_->vkMapMemory(impl_->device, rb_mem, 0, upload_bytes.size(), 0, &mapped) == kVkSuccess && mapped) {
+            if (!rb_coh) {
+                VkMappedMemoryRange rng{kVkStypeMappedMemoryRange, nullptr, rb_mem, 0, kVkWholeSize};
+                impl_->vkInvalidateMappedMemoryRanges(impl_->device, 1, &rng);
+            }
+            out_result.readback_framebuffer.width = w;
+            out_result.readback_framebuffer.height = h;
+            out_result.readback_framebuffer.pixels.resize(px_count * 4u);
+            const auto* src = static_cast<const uint8_t*>(mapped);
+            if (rec.info.vk_format == static_cast<uint32_t>(kVkFormatB8G8R8A8Unorm)) {
+                for (size_t i = 0; i < px_count; ++i) {
+                    out_result.readback_framebuffer.pixels[i * 4 + 0] = src[i * 4 + 2];
+                    out_result.readback_framebuffer.pixels[i * 4 + 1] = src[i * 4 + 1];
+                    out_result.readback_framebuffer.pixels[i * 4 + 2] = src[i * 4 + 0];
+                    out_result.readback_framebuffer.pixels[i * 4 + 3] = src[i * 4 + 3];
+                }
+            } else {
+                std::memcpy(out_result.readback_framebuffer.pixels.data(), src, px_count * 4u);
+            }
+            impl_->vkUnmapMemory(impl_->device, rb_mem);
+            out_result.readback_available = true;
+            out_result.fnv1a_hash = out_result.readback_framebuffer.ComputeFnv1aHash();
+        }
+    } else {
+        out_result.fnv1a_hash = frame.ComputeFnv1aHash();
+    }
+
+    out_result.image_index = img_index;
+    cleanup();
+    return Status::Ok();
+}
+
+Status VulkanBackend::DestroyWin32Swapchain(uint64_t swapchain_handle) {
+    if (!IsInitialized()) {
+        return Status::Error(StatusCode::DeviceError, "VulkanBackend is not initialized");
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    auto it = impl_->swapchains.find(swapchain_handle);
+    if (it == impl_->swapchains.end()) {
+        return Status::Error(StatusCode::NotFound, "Unknown Vulkan swapchain handle");
+    }
+    impl_->DestroySwapchainRecord(it->second);
+    impl_->swapchains.erase(it);
     return Status::Ok();
 }
 
