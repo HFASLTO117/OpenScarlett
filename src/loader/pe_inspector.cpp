@@ -128,8 +128,20 @@ bool ParsePolicyToken(std::string_view token, DllRoutePolicy& out_policy) noexce
         out_policy = DllRoutePolicy::NativeGuestDll;
         return true;
     }
-    if (lo == "windows" || lo == "win" || lo == "system" || lo == "os") {
+    if (lo == "windows" || lo == "win" || lo == "system" || lo == "os" || lo == "passthrough") {
         out_policy = DllRoutePolicy::Windows;
+        return true;
+    }
+    return false;
+}
+
+bool StripLeadingVersionDot(std::string_view& rest) noexcept {
+    size_t i = 0;
+    while (i < rest.size() && rest[i] >= '0' && rest[i] <= '9') {
+        ++i;
+    }
+    if (i > 0 && i < rest.size() && rest[i] == '.') {
+        rest.remove_prefix(i + 1);
         return true;
     }
     return false;
@@ -199,18 +211,87 @@ const char* DllRoutePolicyName(DllRoutePolicy policy) noexcept {
     return "Windows";
 }
 
+bool ResolveShimAlias(std::string_view dll_name, std::string& out_canonical_shim) {
+    out_canonical_shim.clear();
+    std::string trimmed = TrimAscii(dll_name);
+    if (trimmed.empty()) {
+        return false;
+    }
+    const size_t slash = trimmed.find_last_of("\\/");
+    if (slash != std::string::npos) {
+        trimmed = trimmed.substr(slash + 1);
+    }
+    if (trimmed.empty()) {
+        return false;
+    }
+    std::string lo = ToLower(trimmed);
+    if (lo.size() >= 4 && lo.compare(lo.size() - 4, 4, ".dll") == 0) {
+        lo.resize(lo.size() - 4);
+    }
+    if (lo.empty()) {
+        return false;
+    }
+
+    // 1. Exact short aliases
+    if (lo == "xsapi") {
+        out_canonical_shim = "Microsoft.Xbox.Services.GDK.C.dll";
+        return true;
+    }
+
+    // 2. Versioned / thunk XSAPI DLLs:
+    //    Microsoft.Xbox.Services.<ver>.GDK.C(.Thunks)?.dll -> Microsoft.Xbox.Services.GDK.C.dll
+    //    Microsoft.Xbox.Services.GDK.C.Thunks.dll          -> Microsoft.Xbox.Services.GDK.C.dll
+    constexpr std::string_view kXsapiPrefix = "microsoft.xbox.services.";
+    if (lo.size() > kXsapiPrefix.size() && lo.compare(0, kXsapiPrefix.size(), kXsapiPrefix) == 0) {
+        std::string_view rest = std::string_view(lo).substr(kXsapiPrefix.size());
+        const bool has_ver = StripLeadingVersionDot(rest);
+        if (rest == "gdk.c.thunks" || rest == "gdk.thunks" || (has_ver && rest == "gdk.c")) {
+            out_canonical_shim = "Microsoft.Xbox.Services.GDK.C.dll";
+            return true;
+        }
+        return false;
+    }
+
+    // 3. Versioned / thunk libHttpClient GDK DLLs:
+    //    libHttpClient.<ver>.GDK(.C)?(.Thunks)?.dll -> libHttpClient.GDK.dll
+    //    libHttpClient.GDK.C(.Thunks)?.dll          -> libHttpClient.GDK.dll
+    constexpr std::string_view kHttpPrefix = "libhttpclient.";
+    if (lo.size() > kHttpPrefix.size() && lo.compare(0, kHttpPrefix.size(), kHttpPrefix) == 0) {
+        std::string_view rest = std::string_view(lo).substr(kHttpPrefix.size());
+        const bool has_ver = StripLeadingVersionDot(rest);
+        if (rest == "gdk.c" || rest == "gdk.thunks" || rest == "gdk.c.thunks" ||
+            (has_ver && rest == "gdk")) {
+            out_canonical_shim = "libHttpClient.GDK.dll";
+            return true;
+        }
+        return false;
+    }
+
+    return false;
+}
+
 DllCategory ClassifyImportDll(const std::string& dll_name) {
-    const std::string lo = ToLower(dll_name);
+    std::string trimmed = TrimAscii(dll_name);
+    const size_t slash = trimmed.find_last_of("\\/");
+    if (slash != std::string::npos) {
+        trimmed = trimmed.substr(slash + 1);
+    }
+    const std::string lo = ToLower(trimmed);
     if (lo == "d3d12_xs.dll" || lo == "d3d12_x.dll" || lo == "xg_xs.dll" || lo == "xg.dll" ||
         lo == "acphal.dll" || lo == "kernelx.dll" || lo == "xmem.dll" || lo == "dstorage_xs.dll" ||
         lo == "xboxbvhbuilder.dll" || lo == "chad.dll" || lo == "xapu.dll" || lo == "xcrdapi.dll" ||
         lo == "pixevt.dll") {
         return DllCategory::ConsoleExclusive;
     }
-    if (lo == "xgameruntime.dll" || lo == "gameinput.dll" || lo == "dstorage.dll" ||
+    if (lo == "xgameruntime.dll" || lo == "xgamingruntimethunks.dll" ||
+        lo == "gameinput.dll" || lo == "dstorage.dll" ||
         lo == "xaudio2_9.dll" || lo == "libhttpclient.gdk.dll" || lo == "xcurl.dll" ||
         lo == "microsoft.xbox.services.gdk.c.dll" || lo == "xsapi.dll" || lo == "winrt_xs.dll") {
         return DllCategory::GdkRuntime;
+    }
+    std::string alias_target;
+    if (ResolveShimAlias(lo, alias_target)) {
+        return ClassifyImportDll(alias_target);
     }
     if (lo.find("bink2") != std::string::npos || lo.find("fidelityfx") != std::string::npos ||
         lo.find("fsr") != std::string::npos || lo.find("wwise") != std::string::npos ||
@@ -309,6 +390,7 @@ void DllRoutingTable::SetRule(std::string_view dll_name, DllRoutePolicy policy, 
         return;
     }
     const std::string key = ToLower(canonical);
+    aliases_.erase(key);
     auto it = rules_.find(key);
     if (it != rules_.end()) {
         it->second.rule.policy = policy;
@@ -324,6 +406,22 @@ void DllRoutingTable::SetRule(std::string_view dll_name, DllRoutePolicy policy, 
                              : ((policy == DllRoutePolicy::NativeGuestDll) ? 5 : 10);
         rules_[key] = Entry{DllRouteRule{canonical, policy, prio}, true};
     }
+}
+
+void DllRoutingTable::SetAlias(std::string_view source_dll, std::string_view target_dll) {
+    const std::string src_canon = NormalizeCanonicalName(source_dll);
+    const std::string dst_canon = NormalizeCanonicalName(target_dll);
+    if (src_canon.empty() || dst_canon.empty()) {
+        return;
+    }
+    const std::string src_key = ToLower(src_canon);
+    const std::string dst_key = ToLower(dst_canon);
+    if (src_key == dst_key) {
+        aliases_.erase(src_key);
+        return;
+    }
+    rules_.erase(src_key);
+    aliases_[src_key] = dst_canon;
 }
 
 void DllRoutingTable::ApplyOverrides(std::string_view override_spec) {
@@ -343,22 +441,49 @@ void DllRoutingTable::ApplyOverrides(std::string_view override_spec) {
         std::string_view name_part = item.substr(0, eq);
         std::string_view policy_part = item.substr(eq + 1);
         DllRoutePolicy policy = DllRoutePolicy::Windows;
-        if (!ParsePolicyToken(policy_part, policy)) {
+        if (ParsePolicyToken(policy_part, policy)) {
+            const std::string key = NormalizeDllKey(name_part);
+            auto it = rules_.find(key);
+            const int prio = (it != rules_.end() && policy == DllRoutePolicy::Shim)
+                                 ? it->second.rule.load_priority
+                                 : 1;
+            SetRule(name_part, policy, prio);
             continue;
         }
-        const std::string key = NormalizeDllKey(name_part);
-        auto it = rules_.find(key);
-        const int prio = (it != rules_.end() && policy == DllRoutePolicy::Shim)
-                             ? it->second.rule.load_priority
-                             : 1;
-        SetRule(name_part, policy, prio);
+
+        // Otherwise support "source.dll=target.dll" alias overrides.
+        const std::string target_trimmed = TrimAscii(policy_part);
+        const std::string target_lo = ToLower(target_trimmed);
+        if (target_lo.size() > 4 && target_lo.compare(target_lo.size() - 4, 4, ".dll") == 0) {
+            SetAlias(name_part, target_trimmed);
+        }
     }
 }
 
 const DllRouteRule* DllRoutingTable::FindRule(std::string_view dll_name) const {
     const std::string key = NormalizeDllKey(dll_name);
+    if (key.empty()) {
+        return nullptr;
+    }
     auto it = rules_.find(key);
-    return (it != rules_.end()) ? &it->second.rule : nullptr;
+    if (it != rules_.end()) {
+        return &it->second.rule;
+    }
+    auto alias_it = aliases_.find(key);
+    if (alias_it != aliases_.end()) {
+        auto target_it = rules_.find(ToLower(alias_it->second));
+        if (target_it != rules_.end()) {
+            return &target_it->second.rule;
+        }
+    }
+    std::string builtin_target;
+    if (ResolveShimAlias(key, builtin_target)) {
+        auto target_it = rules_.find(ToLower(builtin_target));
+        if (target_it != rules_.end()) {
+            return &target_it->second.rule;
+        }
+    }
+    return nullptr;
 }
 
 DllRouteDecision DllRoutingTable::ResolveRoute(std::string_view dll_name,
@@ -370,14 +495,14 @@ DllRouteDecision DllRoutingTable::ResolveRoute(std::string_view dll_name,
         return out;
     }
     const std::string key = ToLower(canonical_in);
+    out.requested_name = canonical_in;
     out.canonical_name = canonical_in;
 
-    auto it = rules_.find(key);
-    if (it != rules_.end()) {
-        const Entry& entry = it->second;
+    auto resolve_entry = [&](const Entry& entry, bool aliased, bool override_flag) -> DllRouteDecision {
         out.canonical_name = entry.rule.canonical_name;
         out.load_priority = entry.rule.load_priority;
-        out.from_override = entry.from_override;
+        out.from_override = override_flag || entry.from_override;
+        out.aliased = aliased;
 
         if (entry.rule.policy == DllRoutePolicy::Windows) {
             out.policy = DllRoutePolicy::Windows;
@@ -397,17 +522,65 @@ DllRouteDecision DllRoutingTable::ResolveRoute(std::string_view dll_name,
             return out;
         }
         // If shim_dir was provided and shim DLL is not present there, fall back to NativeGuestDll if present.
-        if (!shim_dir.empty() && !guest_dir.empty() &&
-            FileExistsInDirW(guest_dir, canon_w, out.resolved_path)) {
+        if (!shim_dir.empty() && !guest_dir.empty()) {
+            const std::wstring req_w = Utf8ToWide(out.requested_name);
+            if (FileExistsInDirW(guest_dir, req_w, out.resolved_path) ||
+                FileExistsInDirW(guest_dir, canon_w, out.resolved_path)) {
+                out.policy = DllRoutePolicy::NativeGuestDll;
+                out.load_priority = 5;
+                out.aliased = false;
+                return out;
+            }
+        }
+        out.policy = DllRoutePolicy::Shim;
+        return out;
+    };
+
+    // 1. Explicit rule (built-in canonical shims OR env overrides including '=passthrough')
+    auto it = rules_.find(key);
+    if (it != rules_.end()) {
+        return resolve_entry(it->second, false, it->second.from_override);
+    }
+
+    // 2. Explicit custom alias override ("source.dll=target.dll")
+    auto alias_it = aliases_.find(key);
+    if (alias_it != aliases_.end()) {
+        const std::string& target_canon = alias_it->second;
+        const std::string target_key = ToLower(target_canon);
+        auto target_it = rules_.find(target_key);
+        if (target_it != rules_.end()) {
+            return resolve_entry(target_it->second, true, true);
+        }
+        out.canonical_name = target_canon;
+        out.from_override = true;
+        out.aliased = true;
+        const std::wstring target_w = Utf8ToWide(target_canon);
+        if (FileExistsInDirW(shim_dir, target_w, out.resolved_path)) {
+            out.policy = DllRoutePolicy::Shim;
+            out.load_priority = 1;
+            return out;
+        }
+        if (FileExistsInDirW(guest_dir, target_w, out.resolved_path)) {
             out.policy = DllRoutePolicy::NativeGuestDll;
             out.load_priority = 5;
             return out;
         }
         out.policy = DllRoutePolicy::Shim;
+        out.load_priority = 1;
         return out;
     }
 
-    // No explicit rule: check if WindowsNative vs present in guest package directory.
+    // 3. Built-in versioned / thunk GDK DLL alias resolution
+    std::string builtin_target;
+    if (ResolveShimAlias(canonical_in, builtin_target)) {
+        const std::string target_key = ToLower(builtin_target);
+        auto target_it = rules_.find(target_key);
+        if (target_it != rules_.end()) {
+            return resolve_entry(target_it->second, true, target_it->second.from_override);
+        }
+    }
+
+    // 4. No explicit rule or alias: check if WindowsNative vs present in guest package directory.
     if (ClassifyImportDll(canonical_in) == DllCategory::WindowsNative) {
         out.policy = DllRoutePolicy::Windows;
         out.load_priority = 10;

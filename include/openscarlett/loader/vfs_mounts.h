@@ -43,6 +43,22 @@ std::string WideToUtf8(std::wstring_view wide);
 // Creates a directory tree iteratively using Win32 CreateDirectoryW (no C:\ fallback).
 bool EnsureDirectoryTreeW(std::wstring_view path);
 
+// Resolves the default OpenScarlett base scratch/work directory without leaking to C:\.
+// Resolution order:
+//   1. OPENSCARLETT_WORK_DIR environment variable if set and non-empty.
+//   2. Derived from anchor_dir (or the running executable's directory if empty):
+//      - Inside a build/bin directory -> "<parent>\.tmp\openscarlett_run" if writable.
+//      - Standalone folder            -> "<anchor_dir>\.openscarlett_tmp" if writable.
+//   3. Fallback to "%TEMP%\openscarlett" ONLY if the anchor location is read-only.
+std::wstring ResolveDefaultWorkDirW(std::wstring_view anchor_dir = {});
+std::string ResolveDefaultWorkDirUtf8(std::string_view anchor_dir = {});
+
+// Convenience default directories derived from ResolveDefaultWorkDirW:
+//   - VFS root:       "<work_dir>\vfs"
+//   - Telemetry dir:  "<work_dir>\telemetry"
+std::wstring ResolveDefaultVfsRootW(std::wstring_view anchor_dir = {});
+std::wstring ResolveDefaultTelemetryDirW(std::wstring_view anchor_dir = {});
+
 // Clean-room virtual drive translator for Xbox Series X|S G:\, GAME:\, T:\, and S:\ mounts,
 // with Read-Only Copy-on-Write (CoW) overlay & whiteout tracking for G:\ / GAME:\.
 class VfsMounts {
@@ -51,8 +67,8 @@ public:
     explicit VfsMounts(const VfsMountConfig& config);
 
     // Builds default mount config honoring OPENSCARLETT_VFS_G/T/S/G_OVERLAY and
-    // OPENSCARLETT_SAVE_ROOT, defaulting writable dirs under %TEMP%\vfs\ or
-    // E:\OpenScarlett\.tmp\vfs\ (never C:\).
+    // OPENSCARLETT_SAVE_ROOT, defaulting writable dirs under ResolveDefaultVfsRootW()
+    // (OPENSCARLETT_WORK_DIR -> executable-relative .tmp -> read-only fallback %TEMP%\openscarlett).
     static VfsMountConfig BuildDefaultConfig(std::wstring_view default_g_root = {},
                                              std::wstring_view default_vfs_root = {});
 

@@ -33,10 +33,12 @@ struct DllRouteRule {
 
 struct DllRouteDecision {
     DllRoutePolicy policy = DllRoutePolicy::Windows;
-    std::string canonical_name;
+    std::string requested_name;  // Normalized requested DLL basename
+    std::string canonical_name;  // Resolved target/canonical DLL basename
     std::wstring resolved_path;  // Non-empty when a backing Shim/NativeGuestDll file was located
     int load_priority = 10;
     bool from_override = false;
+    bool aliased = false;        // True when requested_name routed via versioned/thunk alias or source=target override
 };
 
 struct PeImportSymbol {
@@ -114,6 +116,11 @@ struct PeInspectionReport {
 const char* DllCategoryName(DllCategory category) noexcept;
 DllCategory ClassifyImportDll(const std::string& dll_name);
 
+// Resolves known versioned / thunk GDK DLL names (e.g. Microsoft.Xbox.Services.141.GDK.C.Thunks.dll,
+// libHttpClient.141.GDK.C.dll) to their canonical OpenScarlett shim DLL basename.
+// Returns false if dll_name is already canonical or not a built-in alias.
+bool ResolveShimAlias(std::string_view dll_name, std::string& out_canonical_shim);
+
 const char* DllRoutePolicyName(DllRoutePolicy policy) noexcept;
 
 // Data-driven per-DLL routing table shared by apc_injector and hook_dll.
@@ -127,12 +134,16 @@ public:
 
     // Applies semicolon/comma-separated override rules such as:
     //   "foo.dll=guest;dstorage_xs.dll=shim;user32.dll=windows"
+    //   "XGamingRuntimeThunks.dll=xgameruntime.dll;Microsoft.Xbox.Services.141.GDK.C.Thunks.dll=passthrough"
     void ApplyOverrides(std::string_view override_spec);
 
     // Explicitly sets or overrides a single DLL's routing rule.
     void SetRule(std::string_view dll_name, DllRoutePolicy policy, int load_priority = 1);
 
-    // Looks up an explicit rule for dll_name (case-insensitive, basename-normalized).
+    // Explicitly aliases source_dll -> target_dll (superseding prior rules on source_dll).
+    void SetAlias(std::string_view source_dll, std::string_view target_dll);
+
+    // Looks up a routing rule for dll_name (case-insensitive, basename-normalized, alias-aware).
     const DllRouteRule* FindRule(std::string_view dll_name) const;
 
     // Decides whether to route dll_name to Shim, NativeGuestDll, or Windows.
@@ -156,6 +167,7 @@ private:
         bool from_override = false;
     };
     std::unordered_map<std::string, Entry> rules_;
+    std::unordered_map<std::string, std::string> aliases_;
 };
 
 Status InspectPeFile(const std::string& file_path, PeInspectionReport& out_report);
