@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "openscarlett/core/telemetry.h"
+#include "openscarlett/loader/apc_injector.h"
 #include "openscarlett/loader/pe_inspector.h"
 #include "openscarlett/loader/vfs_mounts.h"
 
@@ -93,6 +94,7 @@ struct PatchedModuleKey {
 std::unordered_map<HMODULE, PatchedModuleKey> g_patched_modules;
 
 thread_local uint32_t tl_forwarder_depth = 0;
+thread_local bool tl_in_topo_preload = false;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -303,6 +305,153 @@ void PatchAllLoadedNonSystemModules();
 FARPROC WINAPI Hook_GetProcAddress(HMODULE hModule, LPCSTR lpProcName);
 
 // ---------------------------------------------------------------------------
+// Topological DLL Dependency Pre-Loader (Kahn's Sort over PE Import Graph)
+// ---------------------------------------------------------------------------
+bool TryLocateLocalOrRoutedDllW(const std::string& import_dll_name,
+                                const std::wstring& importer_dir_w,
+                                std::wstring& out_path_w,
+                                int& out_priority) {
+    out_path_w.clear();
+    out_priority = 10;
+    if (import_dll_name.empty()) {
+        return false;
+    }
+
+    const openscarlett::DllRouteDecision decision =
+        g_routing_table.ResolveRoute(import_dll_name, g_shim_dir_w, g_guest_dir_w);
+    out_priority = decision.load_priority;
+    if ((decision.policy == openscarlett::DllRoutePolicy::Shim ||
+         decision.policy == openscarlett::DllRoutePolicy::NativeGuestDll) &&
+        !decision.resolved_path.empty()) {
+        out_path_w = decision.resolved_path;
+        return true;
+    }
+
+    const std::wstring imp_w = openscarlett::Utf8ToWide(import_dll_name);
+    auto check_dir = [&](const std::wstring& dir) -> bool {
+        if (dir.empty()) {
+            return false;
+        }
+        const std::wstring cand = (std::filesystem::path(dir) / imp_w).wstring();
+        const DWORD attrs = ::GetFileAttributesW(cand.c_str());
+        if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0) {
+            out_path_w = cand;
+            return true;
+        }
+        return false;
+    };
+
+    if (check_dir(importer_dir_w)) return true;
+    if (check_dir(g_guest_dir_w)) return true;
+    if (check_dir(g_shim_dir_w)) return true;
+    return false;
+}
+
+void PreloadDllDependenciesTopologically(const std::wstring& root_dll_path) {
+    if (root_dll_path.empty() || tl_in_topo_preload || !g_real_LoadLibraryW || !g_real_GetModuleHandleW) {
+        return;
+    }
+
+    tl_in_topo_preload = true;
+    struct Guard {
+        ~Guard() { tl_in_topo_preload = false; }
+    } guard;
+
+    std::vector<openscarlett::DllDependencyNode> nodes;
+    std::vector<std::wstring> node_paths_w;
+    std::unordered_map<std::string, size_t> visited;
+
+    std::vector<std::pair<std::wstring, int>> queue;
+    queue.emplace_back(root_dll_path, 10);
+
+    size_t head = 0;
+    while (head < queue.size() && nodes.size() < 256u) {
+        const std::wstring cur_path_w = queue[head].first;
+        const int cur_prio = queue[head].second;
+        ++head;
+
+        const std::string cur_path_u8 = openscarlett::WideToUtf8(cur_path_w);
+        const std::string cur_fname = std::filesystem::path(cur_path_w).filename().string();
+        const std::string cur_key = ToLowerAsciiA(cur_fname);
+        if (cur_key.empty() || visited.find(cur_key) != visited.end()) {
+            continue;
+        }
+
+        openscarlett::PeInspectionReport rep{};
+        if (!openscarlett::InspectPeFile(cur_path_u8, rep).ok()) {
+            continue;
+        }
+
+        visited[cur_key] = nodes.size();
+        openscarlett::DllDependencyNode node{};
+        node.name = cur_fname;
+        node.file_path = cur_path_u8;
+        node.load_priority = cur_prio;
+
+        const std::wstring cur_dir_w = std::filesystem::path(cur_path_w).parent_path().wstring();
+        for (const auto& imp : rep.imports) {
+            node.imports.push_back(imp.dll_name);
+            const std::string imp_key = ToLowerAsciiA(imp.dll_name);
+            if (visited.find(imp_key) != visited.end()) {
+                continue;
+            }
+            std::wstring dep_path_w;
+            int dep_prio = 10;
+            if (TryLocateLocalOrRoutedDllW(imp.dll_name, cur_dir_w, dep_path_w, dep_prio)) {
+                queue.emplace_back(std::move(dep_path_w), dep_prio);
+            }
+        }
+
+        nodes.push_back(std::move(node));
+        node_paths_w.push_back(cur_path_w);
+    }
+
+    if (nodes.size() <= 1u) {
+        return;
+    }
+
+    const openscarlett::DllInitOrderResult topo = openscarlett::ComputeDllInitOrder(nodes);
+    const std::string root_key = ToLowerAsciiA(std::filesystem::path(root_dll_path).filename().string());
+
+    uint32_t preloaded_count = 0;
+    for (size_t idx : topo.ordered_indices) {
+        const std::string key = ToLowerAsciiA(nodes[idx].name);
+        if (key == root_key) {
+            continue;  // Caller loads the root DLL itself right after dependencies.
+        }
+        const std::wstring& dep_path = node_paths_w[idx];
+        HMODULE existing = g_real_GetModuleHandleW(dep_path.c_str());
+        if (!existing) {
+            existing = g_real_GetModuleHandleW(openscarlett::Utf8ToWide(nodes[idx].name).c_str());
+        }
+        if (existing) {
+            continue;
+        }
+        HMODULE dep_mod = g_real_LoadLibraryExW
+                              ? g_real_LoadLibraryExW(dep_path.c_str(), nullptr,
+                                                      LOAD_WITH_ALTERED_SEARCH_PATH)
+                              : g_real_LoadLibraryW(dep_path.c_str());
+        if (dep_mod) {
+            ++preloaded_count;
+            std::string canon_a;
+            if (MatchTrackedShimNameW(dep_path, canon_a)) {
+                RegisterXboxModule(dep_mod, canon_a);
+            }
+            PatchModuleImports(dep_mod);
+        }
+    }
+
+    if (preloaded_count > 0 && !g_shutting_down.load(std::memory_order_acquire)) {
+        openscarlett::CallTelemetry::Global().Record(
+            "loader",
+            "PreloadDllDependenciesTopologically",
+            openscarlett::CallOutcome::Ok,
+            static_cast<int32_t>(preloaded_count),
+            -1);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Hook Implementations: Library Loading & Symbol Resolution (Data-Driven)
 // ---------------------------------------------------------------------------
 HMODULE LoadRoutedDll(const openscarlett::DllRouteDecision& decision,
@@ -311,6 +460,16 @@ HMODULE LoadRoutedDll(const openscarlett::DllRouteDecision& decision,
                       HANDLE hFile,
                       DWORD dwFlags,
                       bool use_ex) {
+    constexpr DWORD kDatafilePreloadCheck =
+        LOAD_LIBRARY_AS_DATAFILE |
+        LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE |
+        LOAD_LIBRARY_AS_IMAGE_RESOURCE;
+    if (!g_shutting_down.load(std::memory_order_acquire) &&
+        (!use_ex || (dwFlags & kDatafilePreloadCheck) == 0) &&
+        !target_path.empty()) {
+        PreloadDllDependenciesTopologically(target_path);
+    }
+
     HMODULE loaded = nullptr;
     if (use_ex) {
         DWORD sanitized_flags = dwFlags;
@@ -1634,6 +1793,65 @@ __declspec(dllexport) int __cdecl OpenScarlettHook_RegisterModuleExceptionTable(
             static_cast<int32_t>(count), -1);
     }
     return ok ? 1 : 0;
+}
+
+__declspec(dllexport) int __cdecl OpenScarlettHook_LoadDllsTopologically(
+    uint32_t count,
+    const wchar_t* const* dll_paths,
+    char* out_order_csv,
+    uint32_t out_order_csv_cap,
+    HMODULE* out_handles) {
+    if (count == 0u || !dll_paths) {
+        return 0;
+    }
+
+    std::vector<std::string> paths_u8;
+    paths_u8.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        if (!dll_paths[i] || dll_paths[i][0] == L'\0') {
+            return 0;
+        }
+        paths_u8.push_back(openscarlett::WideToUtf8(dll_paths[i]));
+    }
+
+    std::vector<std::string> loaded_order;
+    std::vector<void*> handles;
+    const auto st = openscarlett::LoadDllsInTopologicalOrder(paths_u8, &loaded_order, &handles);
+    if (!st.ok()) {
+        return 0;
+    }
+
+    if (out_handles) {
+        for (uint32_t i = 0; i < count && i < handles.size(); ++i) {
+            out_handles[i] = reinterpret_cast<HMODULE>(handles[i]);
+        }
+    }
+
+    for (void* h : handles) {
+        if (h) {
+            PatchModuleImports(reinterpret_cast<HMODULE>(h));
+        }
+    }
+
+    if (out_order_csv && out_order_csv_cap > 0u) {
+        std::string csv;
+        for (size_t i = 0; i < loaded_order.size(); ++i) {
+            if (i > 0u) csv.push_back(',');
+            csv.append(loaded_order[i]);
+        }
+        const size_t copy_len = std::min<size_t>(csv.size(), static_cast<size_t>(out_order_csv_cap - 1u));
+        std::memcpy(out_order_csv, csv.data(), copy_len);
+        out_order_csv[copy_len] = '\0';
+    }
+
+    if (!g_shutting_down.load(std::memory_order_acquire)) {
+        openscarlett::CallTelemetry::Global().Record(
+            "loader", "OpenScarlettHook_LoadDllsTopologically",
+            openscarlett::CallOutcome::Ok,
+            static_cast<int32_t>(loaded_order.size()),
+            -1);
+    }
+    return 1;
 }
 
 }  // extern "C"

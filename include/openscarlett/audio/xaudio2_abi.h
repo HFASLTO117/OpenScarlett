@@ -56,6 +56,10 @@ constexpr XAudio2Guid IID_OS_XAudio2_IUnknown = {
     0x00000000u, 0x0000u, 0x0000u, {0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46}};
 constexpr XAudio2Guid IID_OS_IXAudio2 = {
     0x2B02E3CFu, 0x2E0Bu, 0x4EC3u, {0xBE, 0x45, 0x1B, 0x2A, 0x3F, 0xE7, 0x21, 0x0D}};
+constexpr XAudio2Guid IID_OS_IXAPO = {
+    0xA410B984u, 0x9839u, 0x4819u, {0xA0, 0xBE, 0x28, 0x56, 0xAE, 0x6B, 0x3A, 0xDB}};
+constexpr XAudio2Guid IID_OS_IXAPOParameters = {
+    0x26D95C66u, 0x80F2u, 0x499Au, {0xAD, 0x54, 0x5A, 0xE7, 0xF4, 0x3C, 0x6F, 0xC0}};
 
 #pragma pack(push, 1)
 struct OS_WAVEFORMATEX {
@@ -281,6 +285,174 @@ struct IXAudio2 {
         void* pReserved = nullptr) = 0;
 };
 
+// ---------------------------------------------------------------------------
+// X3DAudio (Clean-Room 3D Spatial Audio ABI matching XAudio2_9.dll)
+// ---------------------------------------------------------------------------
+constexpr float OS_X3DAUDIO_SPEED_OF_SOUND = 343.5f;
+constexpr float OS_X3DAUDIO_PI = 3.141592654f;
+
+constexpr uint32_t OS_SPEAKER_FRONT_LEFT = 0x00000001u;
+constexpr uint32_t OS_SPEAKER_FRONT_RIGHT = 0x00000002u;
+constexpr uint32_t OS_SPEAKER_FRONT_CENTER = 0x00000004u;
+constexpr uint32_t OS_SPEAKER_LOW_FREQUENCY = 0x00000008u;
+constexpr uint32_t OS_SPEAKER_BACK_LEFT = 0x00000010u;
+constexpr uint32_t OS_SPEAKER_BACK_RIGHT = 0x00000020u;
+constexpr uint32_t OS_SPEAKER_SIDE_LEFT = 0x00000200u;
+constexpr uint32_t OS_SPEAKER_SIDE_RIGHT = 0x00000400u;
+
+constexpr uint32_t OS_SPEAKER_MONO = OS_SPEAKER_FRONT_CENTER;
+constexpr uint32_t OS_SPEAKER_STEREO = OS_SPEAKER_FRONT_LEFT | OS_SPEAKER_FRONT_RIGHT;
+constexpr uint32_t OS_SPEAKER_QUAD =
+    OS_SPEAKER_FRONT_LEFT | OS_SPEAKER_FRONT_RIGHT |
+    OS_SPEAKER_BACK_LEFT | OS_SPEAKER_BACK_RIGHT;
+constexpr uint32_t OS_SPEAKER_5POINT1 =
+    OS_SPEAKER_FRONT_LEFT | OS_SPEAKER_FRONT_RIGHT | OS_SPEAKER_FRONT_CENTER |
+    OS_SPEAKER_LOW_FREQUENCY | OS_SPEAKER_BACK_LEFT | OS_SPEAKER_BACK_RIGHT;
+constexpr uint32_t OS_SPEAKER_5POINT1_SURROUND =
+    OS_SPEAKER_FRONT_LEFT | OS_SPEAKER_FRONT_RIGHT | OS_SPEAKER_FRONT_CENTER |
+    OS_SPEAKER_LOW_FREQUENCY | OS_SPEAKER_SIDE_LEFT | OS_SPEAKER_SIDE_RIGHT;
+constexpr uint32_t OS_SPEAKER_7POINT1_SURROUND =
+    OS_SPEAKER_FRONT_LEFT | OS_SPEAKER_FRONT_RIGHT | OS_SPEAKER_FRONT_CENTER |
+    OS_SPEAKER_LOW_FREQUENCY | OS_SPEAKER_BACK_LEFT | OS_SPEAKER_BACK_RIGHT |
+    OS_SPEAKER_SIDE_LEFT | OS_SPEAKER_SIDE_RIGHT;
+
+constexpr uint32_t OS_X3DAUDIO_CALCULATE_MATRIX = 0x00000001u;
+constexpr uint32_t OS_X3DAUDIO_CALCULATE_DELAY = 0x00000002u;
+constexpr uint32_t OS_X3DAUDIO_CALCULATE_LPF_DIRECT = 0x00000004u;
+constexpr uint32_t OS_X3DAUDIO_CALCULATE_LPF_REVERB = 0x00000008u;
+constexpr uint32_t OS_X3DAUDIO_CALCULATE_REVERB = 0x00000010u;
+constexpr uint32_t OS_X3DAUDIO_CALCULATE_DOPPLER = 0x00000020u;
+constexpr uint32_t OS_X3DAUDIO_CALCULATE_EMITTER_ANGLE = 0x00000040u;
+constexpr uint32_t OS_X3DAUDIO_CALCULATE_ZEROCENTER = 0x00010000u;
+constexpr uint32_t OS_X3DAUDIO_CALCULATE_REDIRECT_TO_LFE = 0x00020000u;
+
+constexpr uint32_t OS_X3DAUDIO_HANDLE_BYTESIZE = 20u;
+typedef uint8_t X3DAUDIO_HANDLE[OS_X3DAUDIO_HANDLE_BYTESIZE];
+static_assert(sizeof(X3DAUDIO_HANDLE) == 20, "X3DAUDIO_HANDLE must be 20 bytes");
+
+struct X3DAUDIO_VECTOR {
+    float x;
+    float y;
+    float z;
+};
+static_assert(sizeof(X3DAUDIO_VECTOR) == 12, "X3DAUDIO_VECTOR must be 12 bytes");
+
+struct X3DAUDIO_DISTANCE_CURVE_POINT {
+    float Distance;
+    float DSPSetting;
+};
+
+struct X3DAUDIO_DISTANCE_CURVE {
+    X3DAUDIO_DISTANCE_CURVE_POINT* pPoints;
+    uint32_t PointCount;
+};
+
+struct X3DAUDIO_CONE {
+    float InnerAngle;
+    float OuterAngle;
+    float InnerVolume;
+    float OuterVolume;
+    float InnerLPF;
+    float OuterLPF;
+    float InnerReverb;
+    float OuterReverb;
+};
+
+struct X3DAUDIO_LISTENER {
+    X3DAUDIO_VECTOR OrientFront;
+    X3DAUDIO_VECTOR OrientTop;
+    X3DAUDIO_VECTOR Position;
+    X3DAUDIO_VECTOR Velocity;
+    X3DAUDIO_CONE* pCone;
+};
+
+struct X3DAUDIO_EMITTER {
+    X3DAUDIO_CONE* pCone;
+    X3DAUDIO_VECTOR OrientFront;
+    X3DAUDIO_VECTOR OrientTop;
+    X3DAUDIO_VECTOR Position;
+    X3DAUDIO_VECTOR Velocity;
+    float InnerRadius;
+    float InnerRadiusAngle;
+    uint32_t ChannelCount;
+    float ChannelRadius;
+    float* pChannelAzimuths;
+    X3DAUDIO_DISTANCE_CURVE* pVolumeCurve;
+    X3DAUDIO_DISTANCE_CURVE* pLFECurve;
+    X3DAUDIO_DISTANCE_CURVE* pLPFDirectCurve;
+    X3DAUDIO_DISTANCE_CURVE* pLPFReverbCurve;
+    X3DAUDIO_DISTANCE_CURVE* pReverbCurve;
+    float CurveDistanceScaler;
+    float DopplerScaler;
+};
+
+struct X3DAUDIO_DSP_SETTINGS {
+    float* pMatrixCoefficients;
+    float* pDelayTimes;
+    uint32_t SrcChannelCount;
+    uint32_t DstChannelCount;
+    float LPFDirectCoefficient;
+    float LPFReverbCoefficient;
+    float ReverbLevel;
+    float DopplerFactor;
+    float EmitterToListenerAngle;
+    float EmitterToListenerDistance;
+    float EmitterVelocityComponent;
+    float ListenerVelocityComponent;
+};
+
+// ---------------------------------------------------------------------------
+// XAudio2FX (Reverb & VolumeMeter COM APOs)
+// ---------------------------------------------------------------------------
+struct OS_IXAudio2Unknown {
+    virtual int32_t OPENSCARLETT_XAUDIO2_CALL QueryInterface(
+        const XAudio2Guid* riid, void** ppvObject) = 0;
+    virtual uint32_t OPENSCARLETT_XAUDIO2_CALL AddRef() = 0;
+    virtual uint32_t OPENSCARLETT_XAUDIO2_CALL Release() = 0;
+};
+
+struct OS_IXAPOParameters : public OS_IXAudio2Unknown {
+    virtual void OPENSCARLETT_XAUDIO2_CALL SetParameters(
+        const void* pParameters, uint32_t ParameterByteSize) = 0;
+    virtual void OPENSCARLETT_XAUDIO2_CALL GetParameters(
+        void* pParameters, uint32_t ParameterByteSize) = 0;
+};
+
+#pragma pack(push, 1)
+struct OS_XAUDIO2FX_REVERB_PARAMETERS {
+    float WetDryMix;
+    uint32_t ReflectionsDelay;
+    uint8_t ReverbDelay;
+    uint8_t RearDelay;
+    uint8_t SideDelay;
+    uint8_t PositionLeft;
+    uint8_t PositionRight;
+    uint8_t PositionMatrixLeft;
+    uint8_t PositionMatrixRight;
+    uint8_t EarlyDiffusion;
+    uint8_t LateDiffusion;
+    uint8_t LowEQGain;
+    uint8_t LowEQCutoff;
+    uint8_t HighEQGain;
+    uint8_t HighEQCutoff;
+    float RoomFilterFreq;
+    float RoomFilterMain;
+    float RoomFilterHF;
+    float ReflectionsGain;
+    float ReverbGain;
+    float DecayTime;
+    float Density;
+    float RoomSize;
+    int32_t DisableLateField;
+};
+#pragma pack(pop)
+
+struct OS_XAUDIO2FX_VOLUMEMETER_LEVELS {
+    float* pPeakLevels;
+    float* pRMSLevels;
+    uint32_t ChannelCount;
+};
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -295,6 +467,26 @@ OPENSCARLETT_XAUDIO2_API int32_t OPENSCARLETT_XAUDIO2_CALL XAudio2CreateWithVers
     uint32_t Flags,
     uint32_t XAudio2Processor,
     uint32_t ntddiVersion);
+
+OPENSCARLETT_XAUDIO2_API int32_t OPENSCARLETT_XAUDIO2_CALL X3DAudioInitialize(
+    uint32_t SpeakerChannelMask,
+    float SpeedOfSound,
+    X3DAUDIO_HANDLE Instance);
+
+OPENSCARLETT_XAUDIO2_API void OPENSCARLETT_XAUDIO2_CALL X3DAudioCalculate(
+    const X3DAUDIO_HANDLE Instance,
+    const X3DAUDIO_LISTENER* pListener,
+    const X3DAUDIO_EMITTER* pEmitter,
+    uint32_t Flags,
+    X3DAUDIO_DSP_SETTINGS* pDSPSettings);
+
+OPENSCARLETT_XAUDIO2_API int32_t OPENSCARLETT_XAUDIO2_CALL XAudio2CreateReverb(
+    OS_IXAudio2Unknown** ppApo,
+    uint32_t Flags);
+
+OPENSCARLETT_XAUDIO2_API int32_t OPENSCARLETT_XAUDIO2_CALL XAudio2CreateVolumeMeter(
+    OS_IXAudio2Unknown** ppApo,
+    uint32_t Flags);
 
 // Clean-room deterministic mixer readback helper for headless / automated verification.
 // Renders `frame_count` interleaved float32 frames (frame_count * master_channels floats).
