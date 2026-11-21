@@ -1,5 +1,6 @@
 #define OPENSCARLETT_BUILDING_XAUDIO2 1
 #include "openscarlett/audio/xaudio2_abi.h"
+#include "openscarlett/audio/opus_adpcm_decoder.h"
 #include "openscarlett/audio/xma2_decoder.h"
 #include "openscarlett/core/telemetry.h"
 
@@ -7,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -48,7 +50,14 @@ bool GuidEquals(const XAudio2Guid* a, const XAudio2Guid& b) {
 }
 
 std::string GetEnvString(const char* name) {
-#if defined(_MSC_VER)
+#if defined(_WIN32)
+    char buf[256]{};
+    const DWORD len = GetEnvironmentVariableA(name, buf, static_cast<DWORD>(sizeof(buf)));
+    if (len == 0u || len >= sizeof(buf)) {
+        return {};
+    }
+    return std::string(buf, len);
+#elif defined(_MSC_VER)
     char* buf = nullptr;
     size_t len = 0;
     if (_dupenv_s(&buf, &len, name) != 0 || !buf) {
@@ -275,6 +284,11 @@ public:
     }
 
     void SetEffectiveFormatTag(uint16_t tag) { effective_format_tag_ = tag; }
+    void SetAdpcmSamplesPerBlock(uint16_t spb) { adpcm_samples_per_block_ = spb; }
+    void SetOpusPreSkip(uint16_t pre_skip) { opus_pre_skip_ = pre_skip; }
+    bool IsOpusMftActive() const {
+        return opus_mft_active_.load(std::memory_order_acquire);
+    }
 
     void OPENSCARLETT_XAUDIO2_CALL GetVoiceDetails(
         OS_XAUDIO2_VOICE_DETAILS* pVoiceDetails) override {
@@ -371,6 +385,61 @@ public:
                                     OS_XAUDIO2_E_XMA_DECODER_ERROR, 9);
                 }
             }
+        } else if (effective_format_tag_ == OS_WAVE_FORMAT_IMA_ADPCM ||
+                   effective_format_tag_ == OS_WAVE_FORMAT_XBOX_ADPCM) {
+            std::lock_guard<std::mutex> lk(decoder_mutex_);
+            if (!adpcm_decoder_) {
+                adpcm_decoder_ = std::make_unique<openscarlett::ImaAdpcmDecoder>();
+                openscarlett::ImaAdpcmConfig cfg{};
+                cfg.sample_rate = format_.nSamplesPerSec != 0 ? format_.nSamplesPerSec : 48000u;
+                cfg.channels = static_cast<uint16_t>(std::min<uint32_t>(2u, ch));
+                cfg.block_align = format_.nBlockAlign;
+                cfg.samples_per_block = adpcm_samples_per_block_;
+                cfg.xbox_adpcm = (effective_format_tag_ == OS_WAVE_FORMAT_XBOX_ADPCM);
+                if (!adpcm_decoder_->Initialize(cfg).ok()) {
+                    return RecordHr("IXAudio2SourceVoice::SubmitSourceBuffer",
+                                    OS_XAUDIO2_E_INVALIDARG, 9);
+                }
+            }
+            if (pBuffer->AudioBytes > 0) {
+                const auto st = adpcm_decoder_->DecodeBlocks(
+                    pBuffer->pAudioData, pBuffer->AudioBytes, decoded);
+                if (!st.ok()) {
+                    return RecordHr("IXAudio2SourceVoice::SubmitSourceBuffer",
+                                    OS_XAUDIO2_E_INVALIDARG, 9);
+                }
+            }
+        } else if (effective_format_tag_ == OS_WAVE_FORMAT_OPUS) {
+            std::lock_guard<std::mutex> lk(decoder_mutex_);
+            if (!opus_decoder_) {
+                opus_decoder_ = std::make_unique<openscarlett::OpusMftDecoder>();
+                openscarlett::OpusDecoderConfig cfg{};
+                cfg.sample_rate = format_.nSamplesPerSec != 0 ? format_.nSamplesPerSec : 48000u;
+                cfg.channels = static_cast<uint16_t>(std::min<uint32_t>(2u, ch));
+                cfg.pre_skip = opus_pre_skip_;
+                cfg.allow_fallback = true;
+                if (!opus_decoder_->Initialize(cfg).ok()) {
+                    return RecordHr("IXAudio2SourceVoice::SubmitSourceBuffer",
+                                    OS_XAUDIO2_E_INVALIDARG, 9);
+                }
+                opus_mft_active_.store(opus_decoder_->IsNativeMftActive(), std::memory_order_release);
+                const uint32_t out_sr = opus_decoder_->Stats().output_sample_rate;
+                if (out_sr != 0u) {
+                    sample_rate_.store(out_sr, std::memory_order_relaxed);
+                }
+            }
+            if (pBuffer->AudioBytes > 0) {
+                const auto st = opus_decoder_->DecodeStream(
+                    pBuffer->pAudioData, pBuffer->AudioBytes, decoded,
+                    openscarlett::OpusPacketFraming::Auto);
+                if (!st.ok()) {
+                    return RecordHr("IXAudio2SourceVoice::SubmitSourceBuffer",
+                                    OS_XAUDIO2_E_INVALIDARG, 9);
+                }
+                if ((pBuffer->Flags & OS_XAUDIO2_END_OF_STREAM) != 0u) {
+                    (void)opus_decoder_->Drain(decoded);
+                }
+            }
         } else if (effective_format_tag_ == OS_WAVE_FORMAT_IEEE_FLOAT) {
             if (format_.wBitsPerSample != 32) {
                 return RecordHr("IXAudio2SourceVoice::SubmitSourceBuffer",
@@ -410,9 +479,20 @@ public:
             return RecordHr("IXAudio2SourceVoice::SubmitSourceBuffer", OS_XAUDIO2_E_INVALIDARG, 9);
         }
 
-        const uint32_t eff_ch =
-            (effective_format_tag_ == OS_WAVE_FORMAT_XMA2) ? std::min<uint32_t>(2u, ch) : ch;
-        uint32_t total_frames = static_cast<uint32_t>(decoded.size() / eff_ch);
+        uint32_t eff_ch = ch;
+        if (effective_format_tag_ == OS_WAVE_FORMAT_XMA2 ||
+            effective_format_tag_ == OS_WAVE_FORMAT_IMA_ADPCM ||
+            effective_format_tag_ == OS_WAVE_FORMAT_XBOX_ADPCM) {
+            eff_ch = std::min<uint32_t>(2u, ch);
+        } else if (effective_format_tag_ == OS_WAVE_FORMAT_OPUS) {
+            std::lock_guard<std::mutex> lk(decoder_mutex_);
+            if (opus_decoder_ && opus_decoder_->Stats().output_channels > 0u) {
+                eff_ch = opus_decoder_->Stats().output_channels;
+            } else {
+                eff_ch = std::min<uint32_t>(2u, ch);
+            }
+        }
+        uint32_t total_frames = static_cast<uint32_t>(decoded.size() / std::max<uint32_t>(1u, eff_ch));
 
         // Apply optional PlayBegin / PlayLength range.
         if (pBuffer->PlayBegin > 0 || pBuffer->PlayLength > 0) {
@@ -615,6 +695,11 @@ private:
 
     std::mutex decoder_mutex_;
     std::unique_ptr<openscarlett::Xma2Decoder> xma2_decoder_;
+    std::unique_ptr<openscarlett::ImaAdpcmDecoder> adpcm_decoder_;
+    std::unique_ptr<openscarlett::OpusMftDecoder> opus_decoder_;
+    uint16_t adpcm_samples_per_block_ = 0u;
+    uint16_t opus_pre_skip_ = 0u;
+    std::atomic<bool> opus_mft_active_{false};
 
     std::mutex mutex_;
     SubmixVoiceImpl* target_submix_ = nullptr;
@@ -714,7 +799,10 @@ public:
         }
         if (effective_tag != OS_WAVE_FORMAT_PCM &&
             effective_tag != OS_WAVE_FORMAT_IEEE_FLOAT &&
-            effective_tag != OS_WAVE_FORMAT_XMA2) {
+            effective_tag != OS_WAVE_FORMAT_IMA_ADPCM &&
+            effective_tag != OS_WAVE_FORMAT_XBOX_ADPCM &&
+            effective_tag != OS_WAVE_FORMAT_XMA2 &&
+            effective_tag != OS_WAVE_FORMAT_OPUS) {
             return RecordHr("IXAudio2::CreateSourceVoice", OS_XAUDIO2_E_INVALIDARG, 5);
         }
 
@@ -722,6 +810,15 @@ public:
             this, *pSourceFormat, Flags, MaxFrequencyRatio, pCallback);
         voice->SetEffectiveFormatTag(effective_tag);
         voice->SetSourceSampleRate(pSourceFormat->nSamplesPerSec);
+        if ((effective_tag == OS_WAVE_FORMAT_IMA_ADPCM ||
+             effective_tag == OS_WAVE_FORMAT_XBOX_ADPCM) &&
+            pSourceFormat->cbSize >= 2u) {
+            const auto* ima = reinterpret_cast<const OS_IMAADPCMWAVEFORMAT*>(pSourceFormat);
+            voice->SetAdpcmSamplesPerBlock(ima->wSamplesPerBlock);
+        } else if (effective_tag == OS_WAVE_FORMAT_OPUS && pSourceFormat->cbSize >= 2u) {
+            const auto* opus = reinterpret_cast<const OS_OPUSWAVEFORMAT*>(pSourceFormat);
+            voice->SetOpusPreSkip(opus->PreSkip);
+        }
         if (pSendList) {
             voice->SetOutputVoices(pSendList);
         }
@@ -914,18 +1011,50 @@ public:
         return OS_XAUDIO2_S_OK;
     }
 
+    void GetBackendInfo(OS_XAUDIO2_BACKEND_INFO& out) {
+        std::memset(&out, 0, sizeof(out));
+        out.null_audio_forced = IsNullAudioForced() ? 1u : 0u;
+#if defined(_WIN32)
+        out.wasapi_active = wasapi_active_.load(std::memory_order_acquire) ? 1u : 0u;
+        out.wasapi_event_driven = wasapi_event_driven_.load(std::memory_order_acquire) ? 1u : 0u;
+        out.wasapi_sample_rate = wasapi_sample_rate_.load(std::memory_order_acquire);
+        out.wasapi_channels = wasapi_channels_.load(std::memory_order_acquire);
+        out.wasapi_bits_per_sample = wasapi_bits_per_sample_.load(std::memory_order_acquire);
+        out.wasapi_buffer_frames = wasapi_buffer_frames_.load(std::memory_order_acquire);
+        out.wasapi_frames_rendered = wasapi_frames_rendered_.load(std::memory_order_acquire);
+        out.wasapi_last_hresult = wasapi_last_hr_.load(std::memory_order_acquire);
+#endif
+        std::lock_guard<std::mutex> lk(mutex_);
+        uint32_t opus_mft_count = 0u;
+        for (const auto& v : source_voices_) {
+            if (v->IsOpusMftActive()) {
+                ++opus_mft_count;
+            }
+        }
+        out.opus_mft_active_voices = opus_mft_count;
+    }
+
 private:
     void StartWasapiThreadIfAllowed() {
 #if defined(_WIN32)
         if (IsNullAudioForced()) {
             return;
         }
-        std::lock_guard<std::mutex> lk(wasapi_mutex_);
+        std::unique_lock<std::mutex> lk(wasapi_mutex_);
         if (wasapi_thread_.joinable()) {
             return;
         }
         wasapi_stop_.store(false, std::memory_order_release);
+        wasapi_init_done_ = false;
+        if (!wasapi_stop_event_) {
+            wasapi_stop_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        } else {
+            ResetEvent(wasapi_stop_event_);
+        }
         wasapi_thread_ = std::thread(&XAudio2Impl::WasapiRenderLoop, this);
+        wasapi_init_cv_.wait_for(lk, std::chrono::milliseconds(500), [&]() {
+            return wasapi_init_done_;
+        });
 #endif
     }
 
@@ -935,15 +1064,33 @@ private:
         {
             std::lock_guard<std::mutex> lk(wasapi_mutex_);
             wasapi_stop_.store(true, std::memory_order_release);
+            if (wasapi_stop_event_) {
+                SetEvent(wasapi_stop_event_);
+            }
             t.swap(wasapi_thread_);
         }
         if (t.joinable()) {
             t.join();
         }
+        {
+            std::lock_guard<std::mutex> lk(wasapi_mutex_);
+            if (wasapi_stop_event_) {
+                CloseHandle(wasapi_stop_event_);
+                wasapi_stop_event_ = nullptr;
+            }
+        }
 #endif
     }
 
 #if defined(_WIN32)
+    void SignalWasapiInitDone() {
+        {
+            std::lock_guard<std::mutex> lk(wasapi_mutex_);
+            wasapi_init_done_ = true;
+        }
+        wasapi_init_cv_.notify_all();
+    }
+
     void WasapiRenderLoop() {
         const HRESULT co_hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         const bool co_init = SUCCEEDED(co_hr);
@@ -953,9 +1100,21 @@ private:
         IAudioClient* client = nullptr;
         IAudioRenderClient* render_client = nullptr;
         WAVEFORMATEX* mix_fmt = nullptr;
+        HANDLE ready_event = nullptr;
+        bool init_signaled = false;
+
+        auto signal_once = [&]() {
+            if (!init_signaled) {
+                init_signaled = true;
+                SignalWasapiInitDone();
+            }
+        };
 
         auto cleanup = [&]() {
+            wasapi_active_.store(false, std::memory_order_release);
+            signal_once();
             if (client) client->Stop();
+            if (ready_event) CloseHandle(ready_event);
             if (mix_fmt) CoTaskMemFree(mix_fmt);
             if (render_client) render_client->Release();
             if (client) client->Release();
@@ -964,45 +1123,100 @@ private:
             if (co_init) CoUninitialize();
         };
 
-        if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-                                    __uuidof(IMMDeviceEnumerator),
-                                    reinterpret_cast<void**>(&enumerator))) ||
-            !enumerator) {
+        HRESULT hr = CoCreateInstance(
+            __uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+            __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&enumerator));
+        wasapi_last_hr_.store(static_cast<int32_t>(hr), std::memory_order_release);
+        if (FAILED(hr) || !enumerator) {
             cleanup();
             return;
         }
-        if (FAILED(enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device)) || !device) {
+
+        hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+        if (FAILED(hr) || !device) {
+            hr = enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &device);
+        }
+        wasapi_last_hr_.store(static_cast<int32_t>(hr), std::memory_order_release);
+        if (FAILED(hr) || !device) {
             cleanup();
             return;
         }
-        if (FAILED(device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
-                                    reinterpret_cast<void**>(&client))) ||
-            !client) {
+
+        hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+                              reinterpret_cast<void**>(&client));
+        wasapi_last_hr_.store(static_cast<int32_t>(hr), std::memory_order_release);
+        if (FAILED(hr) || !client) {
             cleanup();
             return;
         }
-        if (FAILED(client->GetMixFormat(&mix_fmt)) || !mix_fmt) {
+
+        hr = client->GetMixFormat(&mix_fmt);
+        wasapi_last_hr_.store(static_cast<int32_t>(hr), std::memory_order_release);
+        if (FAILED(hr) || !mix_fmt) {
             cleanup();
             return;
         }
-        constexpr REFERENCE_TIME kBufferDuration = 500000;  // 50 ms
-        if (FAILED(client->Initialize(AUDCLNT_SHAREMODE_SHARED, 0, kBufferDuration, 0,
-                                      mix_fmt, nullptr))) {
-            cleanup();
-            return;
+
+        REFERENCE_TIME default_period = 200000;  // 20 ms default
+        REFERENCE_TIME min_period = 0;
+        (void)client->GetDevicePeriod(&default_period, &min_period);
+        if (default_period <= 0) default_period = 200000;
+
+        bool event_driven = false;
+        ready_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (ready_event) {
+            hr = client->Initialize(
+                AUDCLNT_SHAREMODE_SHARED,
+                AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                default_period,
+                0,
+                mix_fmt,
+                nullptr);
+            if (SUCCEEDED(hr)) {
+                hr = client->SetEventHandle(ready_event);
+                if (SUCCEEDED(hr)) {
+                    event_driven = true;
+                }
+            }
+            if (!event_driven) {
+                // Re-activate fresh IAudioClient for polling fallback (Initialize is single-use).
+                client->Release();
+                client = nullptr;
+                CloseHandle(ready_event);
+                ready_event = nullptr;
+                hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+                                      reinterpret_cast<void**>(&client));
+                if (FAILED(hr) || !client) {
+                    wasapi_last_hr_.store(static_cast<int32_t>(hr), std::memory_order_release);
+                    cleanup();
+                    return;
+                }
+            }
         }
+
+        if (!event_driven) {
+            constexpr REFERENCE_TIME kPollBufferDuration = 500000;  // 50 ms
+            hr = client->Initialize(
+                AUDCLNT_SHAREMODE_SHARED, 0, kPollBufferDuration, 0, mix_fmt, nullptr);
+            wasapi_last_hr_.store(static_cast<int32_t>(hr), std::memory_order_release);
+            if (FAILED(hr)) {
+                cleanup();
+                return;
+            }
+        }
+
         UINT32 buffer_frames = 0;
-        if (FAILED(client->GetBufferSize(&buffer_frames)) || buffer_frames == 0) {
+        hr = client->GetBufferSize(&buffer_frames);
+        wasapi_last_hr_.store(static_cast<int32_t>(hr), std::memory_order_release);
+        if (FAILED(hr) || buffer_frames == 0) {
             cleanup();
             return;
         }
-        if (FAILED(client->GetService(__uuidof(IAudioRenderClient),
-                                      reinterpret_cast<void**>(&render_client))) ||
-            !render_client) {
-            cleanup();
-            return;
-        }
-        if (FAILED(client->Start())) {
+
+        hr = client->GetService(__uuidof(IAudioRenderClient),
+                                reinterpret_cast<void**>(&render_client));
+        wasapi_last_hr_.store(static_cast<int32_t>(hr), std::memory_order_release);
+        if (FAILED(hr) || !render_client) {
             cleanup();
             return;
         }
@@ -1015,33 +1229,87 @@ private:
             is_float = (ext->SubFormat.Data1 == 0x00000003u);
         }
 
+        // Pre-fill initial buffer with silence/mix before Start() to prevent startup glitches.
         std::vector<float> mix_buf;
-        while (!wasapi_stop_.load(std::memory_order_acquire)) {
+        auto pump_available = [&]() -> bool {
             UINT32 padding = 0;
-            if (FAILED(client->GetCurrentPadding(&padding))) {
+            const HRESULT pad_hr = client->GetCurrentPadding(&padding);
+            if (FAILED(pad_hr)) {
+                wasapi_last_hr_.store(static_cast<int32_t>(pad_hr), std::memory_order_release);
+                return false;
+            }
+            const UINT32 avail = (padding < buffer_frames) ? (buffer_frames - padding) : 0u;
+            if (avail == 0u) {
+                return true;
+            }
+            BYTE* dst = nullptr;
+            const HRESULT buf_hr = render_client->GetBuffer(avail, &dst);
+            if (FAILED(buf_hr) || !dst) {
+                wasapi_last_hr_.store(static_cast<int32_t>(buf_hr), std::memory_order_release);
+                return buf_hr != AUDCLNT_E_DEVICE_INVALIDATED;
+            }
+            mix_buf.resize(static_cast<size_t>(avail) * out_ch);
+            RenderMixFrames(mix_buf.data(), avail, out_ch, out_sr);
+            if (is_float && mix_fmt->wBitsPerSample == 32u) {
+                std::memcpy(dst, mix_buf.data(), mix_buf.size() * sizeof(float));
+            } else if (mix_fmt->wBitsPerSample == 16u) {
+                auto* out16 = reinterpret_cast<int16_t*>(dst);
+                for (size_t i = 0u; i < mix_buf.size(); ++i) {
+                    const float clamped = std::clamp(mix_buf[i], -1.0f, 1.0f);
+                    out16[i] = static_cast<int16_t>(std::lround(clamped * 32767.0f));
+                }
+            } else if (mix_fmt->wBitsPerSample == 32u) {
+                auto* out32 = reinterpret_cast<int32_t*>(dst);
+                for (size_t i = 0u; i < mix_buf.size(); ++i) {
+                    const float clamped = std::clamp(mix_buf[i], -1.0f, 1.0f);
+                    out32[i] = static_cast<int32_t>(static_cast<double>(clamped) * 2147483647.0);
+                }
+            } else {
+                std::memset(dst, 0, static_cast<size_t>(avail) * mix_fmt->nBlockAlign);
+            }
+            const HRESULT rel_hr = render_client->ReleaseBuffer(avail, 0);
+            if (SUCCEEDED(rel_hr)) {
+                wasapi_frames_rendered_.fetch_add(avail, std::memory_order_relaxed);
+            } else {
+                wasapi_last_hr_.store(static_cast<int32_t>(rel_hr), std::memory_order_release);
+            }
+            return rel_hr != AUDCLNT_E_DEVICE_INVALIDATED;
+        };
+
+        (void)pump_available();
+
+        hr = client->Start();
+        wasapi_last_hr_.store(static_cast<int32_t>(hr), std::memory_order_release);
+        if (FAILED(hr)) {
+            cleanup();
+            return;
+        }
+
+        wasapi_event_driven_.store(event_driven, std::memory_order_release);
+        wasapi_sample_rate_.store(out_sr, std::memory_order_release);
+        wasapi_channels_.store(out_ch, std::memory_order_release);
+        wasapi_bits_per_sample_.store(mix_fmt->wBitsPerSample, std::memory_order_release);
+        wasapi_buffer_frames_.store(buffer_frames, std::memory_order_release);
+        wasapi_active_.store(true, std::memory_order_release);
+        signal_once();
+
+        while (!wasapi_stop_.load(std::memory_order_acquire)) {
+            if (event_driven && ready_event && wasapi_stop_event_) {
+                HANDLE wait_handles[2] = {wasapi_stop_event_, ready_event};
+                const DWORD wr = WaitForMultipleObjects(2u, wait_handles, FALSE, 50u);
+                if (wr == WAIT_OBJECT_0 || wasapi_stop_.load(std::memory_order_acquire)) {
+                    break;
+                }
+            } else if (wasapi_stop_event_) {
+                if (WaitForSingleObject(wasapi_stop_event_, 10u) == WAIT_OBJECT_0) {
+                    break;
+                }
+            } else {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            }
+            if (!pump_available()) {
                 break;
             }
-            const UINT32 avail = (padding < buffer_frames) ? (buffer_frames - padding) : 0;
-            if (avail > 0) {
-                BYTE* dst = nullptr;
-                if (SUCCEEDED(render_client->GetBuffer(avail, &dst)) && dst) {
-                    mix_buf.resize(static_cast<size_t>(avail) * out_ch);
-                    RenderMixFrames(mix_buf.data(), avail, out_ch, out_sr);
-                    if (is_float && mix_fmt->wBitsPerSample == 32) {
-                        std::memcpy(dst, mix_buf.data(), mix_buf.size() * sizeof(float));
-                    } else if (mix_fmt->wBitsPerSample == 16) {
-                        auto* out16 = reinterpret_cast<int16_t*>(dst);
-                        for (size_t i = 0; i < mix_buf.size(); ++i) {
-                            const float clamped = std::clamp(mix_buf[i], -1.0f, 1.0f);
-                            out16[i] = static_cast<int16_t>(std::lround(clamped * 32767.0f));
-                        }
-                    } else {
-                        std::memset(dst, 0, static_cast<size_t>(avail) * mix_fmt->nBlockAlign);
-                    }
-                    render_client->ReleaseBuffer(avail, 0);
-                }
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
 
         cleanup();
@@ -1058,7 +1326,18 @@ private:
 
 #if defined(_WIN32)
     std::mutex wasapi_mutex_;
+    std::condition_variable wasapi_init_cv_;
+    bool wasapi_init_done_ = false;
+    HANDLE wasapi_stop_event_ = nullptr;
     std::atomic<bool> wasapi_stop_{false};
+    std::atomic<bool> wasapi_active_{false};
+    std::atomic<bool> wasapi_event_driven_{false};
+    std::atomic<uint32_t> wasapi_sample_rate_{0u};
+    std::atomic<uint32_t> wasapi_channels_{0u};
+    std::atomic<uint32_t> wasapi_bits_per_sample_{0u};
+    std::atomic<uint32_t> wasapi_buffer_frames_{0u};
+    std::atomic<uint64_t> wasapi_frames_rendered_{0u};
+    std::atomic<int32_t> wasapi_last_hr_{0};
     std::thread wasapi_thread_;
 #endif
 };
@@ -1123,6 +1402,17 @@ int32_t OPENSCARLETT_XAUDIO2_CALL OpenScarlettXAudio2RenderMixForTest(
     auto* impl = static_cast<XAudio2Impl*>(pXAudio2);
     const int32_t hr = impl->RenderMixFrames(out_frames, frame_count);
     return RecordHr("OpenScarlettXAudio2RenderMixForTest", hr);
+}
+
+int32_t OPENSCARLETT_XAUDIO2_CALL OpenScarlettXAudio2GetBackendInfo(
+    IXAudio2* pXAudio2,
+    OS_XAUDIO2_BACKEND_INFO* out_info) {
+    if (!pXAudio2 || !out_info) {
+        return RecordHr("OpenScarlettXAudio2GetBackendInfo", OS_XAUDIO2_E_INVALIDARG);
+    }
+    auto* impl = static_cast<XAudio2Impl*>(pXAudio2);
+    impl->GetBackendInfo(*out_info);
+    return RecordHr("OpenScarlettXAudio2GetBackendInfo", OS_XAUDIO2_S_OK);
 }
 
 }  // extern "C"

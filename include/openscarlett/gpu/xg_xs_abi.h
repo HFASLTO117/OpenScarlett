@@ -16,18 +16,43 @@
 #endif
 
 // Clean-room Xbox Scarlett texture swizzle / tiling ABI (xg_xs.dll).
-// Implements RDNA2 / D3D12 Standard Swizzle micro-tile & macro-tile layouts.
+// Implements AMD GFX10 / RDNA2 2D thin (all 15 tiled modes + linear),
+// 3D thick (all 6 modes), mip chains with GFX10 mip tails, texture arrays,
+// cube maps, 3D volumes, BC1-BC7, RGB9E5, and planar depth/stencil formats.
 
 enum XG_TILE_MODE : uint32_t {
+    // Preserved ABI values (0..4)
     XG_TILE_MODE_LINEAR = 0u,
     XG_TILE_MODE_2D_THIN_4KB_S = 1u,
     XG_TILE_MODE_2D_THIN_64KB_S = 2u,
     XG_TILE_MODE_2D_THIN_64KB_D = 3u,
     XG_TILE_MODE_2D_THIN_64KB_R_X = 4u,
+
+    // Additional GFX10 2D Thin swizzle modes (total 15 tiled 2D modes)
+    XG_TILE_MODE_2D_THIN_256B_S = 5u,
+    XG_TILE_MODE_2D_THIN_256B_D = 6u,
+    XG_TILE_MODE_2D_THIN_256B_R = 7u,
+    XG_TILE_MODE_2D_THIN_4KB_Z = 8u,
+    XG_TILE_MODE_2D_THIN_4KB_D = 9u,
+    XG_TILE_MODE_2D_THIN_4KB_R = 10u,
+    XG_TILE_MODE_2D_THIN_64KB_Z = 11u,
+    XG_TILE_MODE_2D_THIN_64KB_R = 12u,
+    XG_TILE_MODE_2D_THIN_64KB_Z_X = 13u,
+    XG_TILE_MODE_2D_THIN_64KB_S_X = 14u,
+    XG_TILE_MODE_2D_THIN_64KB_D_X = 15u,
+
+    // GFX10 3D Thick swizzle modes (all 6 modes)
+    XG_TILE_MODE_3D_THICK_4KB_S = 16u,
+    XG_TILE_MODE_3D_THICK_64KB_Z = 17u,
+    XG_TILE_MODE_3D_THICK_64KB_S = 18u,
+    XG_TILE_MODE_3D_THICK_64KB_Z_X = 19u,
+    XG_TILE_MODE_3D_THICK_64KB_S_X = 20u,
+    XG_TILE_MODE_3D_THICK_64KB_R_X = 21u,
 };
 
 enum XG_RESOURCE_DIMENSION : uint32_t {
     XG_RESOURCE_DIMENSION_TEXTURE2D = 3u,
+    XG_RESOURCE_DIMENSION_TEXTURE3D = 4u,
 };
 
 enum XG_BIND_FLAGS : uint32_t {
@@ -37,6 +62,7 @@ enum XG_BIND_FLAGS : uint32_t {
     XG_BIND_DEPTH_STENCIL = 0x40u,
     XG_BIND_UNORDERED_ACCESS = 0x80u,
     XG_BIND_DISPLAYABLE = 0x100u,
+    XG_BIND_CUBE_MAP = 0x200u,
 };
 
 struct XG_FORMAT_BLOCK_INFO {
@@ -58,6 +84,16 @@ struct XG_TEXTURE2D_DESC {
     XG_TILE_MODE TileMode;
 };
 
+struct XG_TEXTURE3D_DESC {
+    uint32_t Width;
+    uint32_t Height;
+    uint32_t Depth;
+    uint32_t MipLevels;
+    uint32_t Format;          // DXGI_FORMAT
+    uint32_t BindFlags;       // XG_BIND_FLAGS
+    XG_TILE_MODE TileMode;
+};
+
 struct XG_MIPLEVEL_LAYOUT {
     uint32_t WidthElements;
     uint32_t HeightElements;
@@ -72,9 +108,23 @@ struct XG_MIPLEVEL_LAYOUT {
     uint64_t SizeBytes;
     uint64_t SlicePitchBytes;
     uint32_t RowPitchBytes;   // Meaningful for linear layouts
+
+    // Extended 3D & GFX10 mip-tail fields
+    uint32_t DepthElements;
+    uint32_t PaddedDepthElements;
+    uint32_t TileDepthElements;
+    uint32_t TilesZ;
+    uint32_t InMipTail;
+    uint32_t MipTailSubTileOffsetBytes;
+    uint32_t MipTailSubBlockBytes;
+    uint32_t MipTailPaddedWidthElements;
+    uint32_t MipTailPaddedHeightElements;
+    uint32_t MipTailPaddedDepthElements;
+    uint64_t DepthPitchBytes; // Linear 3D slice pitch per Z plane
 };
 
 constexpr uint32_t XG_MAX_MIP_LEVELS = 15u;
+constexpr uint32_t XG_MAX_PLANES = 2u;
 
 struct XG_RESOURCE_LAYOUT {
     uint64_t SizeBytes;
@@ -84,6 +134,22 @@ struct XG_RESOURCE_LAYOUT {
     XG_TILE_MODE TileMode;
     XG_FORMAT_BLOCK_INFO FormatInfo;
     XG_MIPLEVEL_LAYOUT Mips[XG_MAX_MIP_LEVELS];
+
+    // Extended 3D, mip-tail, cube-map & multi-plane depth/stencil layout fields
+    uint32_t Dimension;
+    uint32_t Depth;
+    uint32_t IsCubeMap;
+    uint32_t PlaneCount;
+    uint32_t MipTailStartLevel;
+    uint64_t MipTailOffsetBytes;
+    uint64_t MipTailSlicePitchBytes;
+    uint64_t PlaneOffsets[XG_MAX_PLANES];
+    uint64_t PlaneSizes[XG_MAX_PLANES];
+    XG_FORMAT_BLOCK_INFO PlaneFormatInfo[XG_MAX_PLANES];
+    XG_MIPLEVEL_LAYOUT Plane1Mips[XG_MAX_MIP_LEVELS];
+    uint32_t Plane1MipTailStartLevel;
+    uint64_t Plane1MipTailOffsetBytes;
+    uint64_t Plane1MipTailSlicePitchBytes;
 };
 
 struct IXGTextureAddressComputer {
@@ -116,7 +182,16 @@ struct IXGTextureAddressComputer {
 
 namespace openscarlett::xg {
 
+bool IsTileMode3D(XG_TILE_MODE mode) noexcept;
+
+uint32_t GetFormatPlaneCount(uint32_t dxgi_format) noexcept;
+
 bool GetFormatBlockInfo(uint32_t dxgi_format, XG_FORMAT_BLOCK_INFO& out_info) noexcept;
+
+bool GetFormatPlaneBlockInfo(
+    uint32_t dxgi_format,
+    uint32_t plane,
+    XG_FORMAT_BLOCK_INFO& out_info) noexcept;
 
 XG_TILE_MODE ComputeOptimalTileMode(
     uint32_t dxgi_format,
@@ -124,7 +199,17 @@ XG_TILE_MODE ComputeOptimalTileMode(
     uint32_t height,
     uint32_t bind_flags) noexcept;
 
+XG_TEXTURE2D_DESC MakeCubeMapDesc(
+    uint32_t face_size,
+    uint32_t mip_levels,
+    uint32_t num_cubes,
+    uint32_t dxgi_format,
+    XG_TILE_MODE tile_mode,
+    uint32_t bind_flags = XG_BIND_SHADER_RESOURCE) noexcept;
+
 bool ComputeTexture2DLayout(const XG_TEXTURE2D_DESC& desc, XG_RESOURCE_LAYOUT& out_layout) noexcept;
+
+bool ComputeTexture3DLayout(const XG_TEXTURE3D_DESC& desc, XG_RESOURCE_LAYOUT& out_layout) noexcept;
 
 uint64_t ComputeElementByteOffset(
     const XG_RESOURCE_LAYOUT& layout,
@@ -132,6 +217,21 @@ uint64_t ComputeElementByteOffset(
     uint32_t slice_index,
     uint32_t element_x,
     uint32_t element_y) noexcept;
+
+uint64_t ComputeElementByteOffsetPlane(
+    const XG_RESOURCE_LAYOUT& layout,
+    uint32_t plane,
+    uint32_t mip_level,
+    uint32_t slice_index,
+    uint32_t element_x,
+    uint32_t element_y) noexcept;
+
+uint64_t ComputeElementByteOffset3D(
+    const XG_RESOURCE_LAYOUT& layout,
+    uint32_t mip_level,
+    uint32_t element_x,
+    uint32_t element_y,
+    uint32_t element_z) noexcept;
 
 bool TileSurface2D(
     const XG_TEXTURE2D_DESC& desc,
@@ -151,12 +251,54 @@ bool UntileSurface2D(
     void* dst_linear,
     uint32_t dst_row_pitch_bytes) noexcept;
 
+bool TileSurface2DPlane(
+    const XG_TEXTURE2D_DESC& desc,
+    uint32_t plane,
+    uint32_t mip_level,
+    uint32_t slice_index,
+    const void* src_linear,
+    uint32_t src_row_pitch_bytes,
+    void* dst_tiled,
+    uint64_t dst_tiled_size_bytes) noexcept;
+
+bool UntileSurface2DPlane(
+    const XG_TEXTURE2D_DESC& desc,
+    uint32_t plane,
+    uint32_t mip_level,
+    uint32_t slice_index,
+    const void* src_tiled,
+    uint64_t src_tiled_size_bytes,
+    void* dst_linear,
+    uint32_t dst_row_pitch_bytes) noexcept;
+
+bool TileSurface3D(
+    const XG_TEXTURE3D_DESC& desc,
+    uint32_t mip_level,
+    const void* src_linear,
+    uint32_t src_row_pitch_bytes,
+    uint32_t src_slice_pitch_bytes,
+    void* dst_tiled,
+    uint64_t dst_tiled_size_bytes) noexcept;
+
+bool UntileSurface3D(
+    const XG_TEXTURE3D_DESC& desc,
+    uint32_t mip_level,
+    const void* src_tiled,
+    uint64_t src_tiled_size_bytes,
+    void* dst_linear,
+    uint32_t dst_row_pitch_bytes,
+    uint32_t dst_slice_pitch_bytes) noexcept;
+
 }  // namespace openscarlett::xg
 
 extern "C" {
 
 OPENSCARLETT_XG_API int32_t __stdcall XGCreateTexture2DComputer(
     const XG_TEXTURE2D_DESC* pDesc,
+    IXGTextureAddressComputer** ppComputer);
+
+OPENSCARLETT_XG_API int32_t __stdcall XGCreateTexture3DComputer(
+    const XG_TEXTURE3D_DESC* pDesc,
     IXGTextureAddressComputer** ppComputer);
 
 OPENSCARLETT_XG_API XG_TILE_MODE __stdcall XGComputeOptimalTileMode(
@@ -167,6 +309,13 @@ OPENSCARLETT_XG_API XG_TILE_MODE __stdcall XGComputeOptimalTileMode(
 
 OPENSCARLETT_XG_API int32_t __stdcall XGGetFormatBlockInfo(
     uint32_t dxgi_format,
+    XG_FORMAT_BLOCK_INFO* pOutInfo);
+
+OPENSCARLETT_XG_API uint32_t __stdcall XGGetFormatPlaneCount(uint32_t dxgi_format);
+
+OPENSCARLETT_XG_API int32_t __stdcall XGGetFormatPlaneBlockInfo(
+    uint32_t dxgi_format,
+    uint32_t plane,
     XG_FORMAT_BLOCK_INFO* pOutInfo);
 
 OPENSCARLETT_XG_API int32_t __stdcall XGTileSurface2D(
@@ -187,8 +336,50 @@ OPENSCARLETT_XG_API int32_t __stdcall XGUntileSurface2D(
     void* pDstLinear,
     uint32_t dstRowPitchBytes);
 
+OPENSCARLETT_XG_API int32_t __stdcall XGTileSurface2DPlane(
+    const XG_TEXTURE2D_DESC* pDesc,
+    uint32_t plane,
+    uint32_t mip_level,
+    uint32_t slice_index,
+    const void* pSrcLinear,
+    uint32_t srcRowPitchBytes,
+    void* pDstTiled,
+    uint64_t dstTiledSizeBytes);
+
+OPENSCARLETT_XG_API int32_t __stdcall XGUntileSurface2DPlane(
+    const XG_TEXTURE2D_DESC* pDesc,
+    uint32_t plane,
+    uint32_t mip_level,
+    uint32_t slice_index,
+    const void* pSrcTiled,
+    uint64_t srcTiledSizeBytes,
+    void* pDstLinear,
+    uint32_t dstRowPitchBytes);
+
+OPENSCARLETT_XG_API int32_t __stdcall XGTileSurface3D(
+    const XG_TEXTURE3D_DESC* pDesc,
+    uint32_t mip_level,
+    const void* pSrcLinear,
+    uint32_t srcRowPitchBytes,
+    uint32_t srcSlicePitchBytes,
+    void* pDstTiled,
+    uint64_t dstTiledSizeBytes);
+
+OPENSCARLETT_XG_API int32_t __stdcall XGUntileSurface3D(
+    const XG_TEXTURE3D_DESC* pDesc,
+    uint32_t mip_level,
+    const void* pSrcTiled,
+    uint64_t srcTiledSizeBytes,
+    void* pDstLinear,
+    uint32_t dstRowPitchBytes,
+    uint32_t dstSlicePitchBytes);
+
 OPENSCARLETT_XG_API int32_t __stdcall XGComputeMipLayout(
     const XG_TEXTURE2D_DESC* pDesc,
+    XG_RESOURCE_LAYOUT* pOutLayout);
+
+OPENSCARLETT_XG_API int32_t __stdcall XGComputeMipLayout3D(
+    const XG_TEXTURE3D_DESC* pDesc,
     XG_RESOURCE_LAYOUT* pOutLayout);
 
 OPENSCARLETT_XG_API void __stdcall OpenScarlettXgResetTelemetry();

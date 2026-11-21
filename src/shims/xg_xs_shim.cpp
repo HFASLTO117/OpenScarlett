@@ -18,7 +18,10 @@ constexpr int32_t kHrOutOfMemory = static_cast<int32_t>(0x8007000Eu);
 class XGTextureAddressComputerImpl final : public IXGTextureAddressComputer {
 public:
     XGTextureAddressComputerImpl(const XG_TEXTURE2D_DESC& desc, const XG_RESOURCE_LAYOUT& layout)
-        : desc_(desc), layout_(layout) {}
+        : is_3d_(false), desc2d_(desc), layout_(layout) {}
+
+    XGTextureAddressComputerImpl(const XG_TEXTURE3D_DESC& desc, const XG_RESOURCE_LAYOUT& layout)
+        : is_3d_(true), desc3d_(desc), layout_(layout) {}
 
     uint32_t __stdcall AddRef() override {
         const uint32_t ref = ref_count_.fetch_add(1u, std::memory_order_relaxed) + 1u;
@@ -58,10 +61,17 @@ public:
         uint32_t yElement,
         uint32_t zOrSlice,
         uint32_t sample) const override {
-        (void)plane;
         (void)sample;
-        const uint64_t offset = openscarlett::xg::ComputeElementByteOffset(
-            layout_, mipLevel, zOrSlice, xElement, yElement);
+        uint64_t offset = UINT64_MAX;
+        if (is_3d_) {
+            if (plane == 0u) {
+                offset = openscarlett::xg::ComputeElementByteOffset3D(
+                    layout_, mipLevel, xElement, yElement, zOrSlice);
+            }
+        } else {
+            offset = openscarlett::xg::ComputeElementByteOffsetPlane(
+                layout_, plane, mipLevel, zOrSlice, xElement, yElement);
+        }
         openscarlett::CallTelemetry::Global().Record(
             kXgModule, "IXGTextureAddressComputer::GetTexelElementOffsetBytes",
             offset == UINT64_MAX ? openscarlett::CallOutcome::Error : openscarlett::CallOutcome::Ok,
@@ -76,12 +86,21 @@ public:
         const void* pSrcLinearData,
         uint32_t srcRowPitchBytes,
         uint32_t srcSlicePitchBytes) const override {
-        (void)plane;
-        (void)srcSlicePitchBytes;
-        const uint32_t mip = subresource % layout_.MipLevels;
-        const uint32_t slice = subresource / layout_.MipLevels;
-        const bool ok = openscarlett::xg::TileSurface2D(
-            desc_, mip, slice, pSrcLinearData, srcRowPitchBytes, pDstTiledResource, layout_.SizeBytes);
+        bool ok = false;
+        if (is_3d_) {
+            if (plane == 0u && subresource < layout_.MipLevels) {
+                ok = openscarlett::xg::TileSurface3D(
+                    desc3d_, subresource, pSrcLinearData,
+                    srcRowPitchBytes, srcSlicePitchBytes,
+                    pDstTiledResource, layout_.SizeBytes);
+            }
+        } else if (layout_.MipLevels > 0u) {
+            const uint32_t mip = subresource % layout_.MipLevels;
+            const uint32_t slice = subresource / layout_.MipLevels;
+            ok = openscarlett::xg::TileSurface2DPlane(
+                desc2d_, plane, mip, slice, pSrcLinearData, srcRowPitchBytes,
+                pDstTiledResource, layout_.SizeBytes);
+        }
         const int32_t hr = ok ? kHrOk : kHrInvalidArg;
         openscarlett::CallTelemetry::Global().Record(
             kXgModule, "IXGTextureAddressComputer::CopyIntoSubresource",
@@ -96,12 +115,20 @@ public:
         const void* pSrcTiledResource,
         uint32_t dstRowPitchBytes,
         uint32_t dstSlicePitchBytes) const override {
-        (void)plane;
-        (void)dstSlicePitchBytes;
-        const uint32_t mip = subresource % layout_.MipLevels;
-        const uint32_t slice = subresource / layout_.MipLevels;
-        const bool ok = openscarlett::xg::UntileSurface2D(
-            desc_, mip, slice, pSrcTiledResource, layout_.SizeBytes, pDstLinearData, dstRowPitchBytes);
+        bool ok = false;
+        if (is_3d_) {
+            if (plane == 0u && subresource < layout_.MipLevels) {
+                ok = openscarlett::xg::UntileSurface3D(
+                    desc3d_, subresource, pSrcTiledResource, layout_.SizeBytes,
+                    pDstLinearData, dstRowPitchBytes, dstSlicePitchBytes);
+            }
+        } else if (layout_.MipLevels > 0u) {
+            const uint32_t mip = subresource % layout_.MipLevels;
+            const uint32_t slice = subresource / layout_.MipLevels;
+            ok = openscarlett::xg::UntileSurface2DPlane(
+                desc2d_, plane, mip, slice, pSrcTiledResource, layout_.SizeBytes,
+                pDstLinearData, dstRowPitchBytes);
+        }
         const int32_t hr = ok ? kHrOk : kHrInvalidArg;
         openscarlett::CallTelemetry::Global().Record(
             kXgModule, "IXGTextureAddressComputer::CopyFromSubresource",
@@ -111,7 +138,9 @@ public:
 
 private:
     std::atomic<uint32_t> ref_count_{1u};
-    XG_TEXTURE2D_DESC desc_{};
+    bool is_3d_ = false;
+    XG_TEXTURE2D_DESC desc2d_{};
+    XG_TEXTURE3D_DESC desc3d_{};
     XG_RESOURCE_LAYOUT layout_{};
 };
 
@@ -154,6 +183,41 @@ OPENSCARLETT_XG_API int32_t __stdcall XGCreateTexture2DComputer(
     return kHrOk;
 }
 
+OPENSCARLETT_XG_API int32_t __stdcall XGCreateTexture3DComputer(
+    const XG_TEXTURE3D_DESC* pDesc,
+    IXGTextureAddressComputer** ppComputer) {
+    if (!ppComputer) {
+        openscarlett::CallTelemetry::Global().Record(
+            kXgModule, "XGCreateTexture3DComputer", openscarlett::CallOutcome::Error, kHrPointer);
+        return kHrPointer;
+    }
+    *ppComputer = nullptr;
+    if (!pDesc) {
+        openscarlett::CallTelemetry::Global().Record(
+            kXgModule, "XGCreateTexture3DComputer", openscarlett::CallOutcome::Error, kHrInvalidArg);
+        return kHrInvalidArg;
+    }
+
+    XG_RESOURCE_LAYOUT layout{};
+    if (!openscarlett::xg::ComputeTexture3DLayout(*pDesc, layout)) {
+        openscarlett::CallTelemetry::Global().Record(
+            kXgModule, "XGCreateTexture3DComputer", openscarlett::CallOutcome::Error, kHrInvalidArg);
+        return kHrInvalidArg;
+    }
+
+    auto* comp = new (std::nothrow) XGTextureAddressComputerImpl(*pDesc, layout);
+    if (!comp) {
+        openscarlett::CallTelemetry::Global().Record(
+            kXgModule, "XGCreateTexture3DComputer", openscarlett::CallOutcome::Error, kHrOutOfMemory);
+        return kHrOutOfMemory;
+    }
+
+    *ppComputer = comp;
+    openscarlett::CallTelemetry::Global().Record(
+        kXgModule, "XGCreateTexture3DComputer", openscarlett::CallOutcome::Ok, kHrOk);
+    return kHrOk;
+}
+
 OPENSCARLETT_XG_API XG_TILE_MODE __stdcall XGComputeOptimalTileMode(
     uint32_t dxgi_format,
     uint32_t width,
@@ -178,6 +242,29 @@ OPENSCARLETT_XG_API int32_t __stdcall XGGetFormatBlockInfo(
     const int32_t hr = ok ? kHrOk : kHrInvalidArg;
     openscarlett::CallTelemetry::Global().Record(
         kXgModule, "XGGetFormatBlockInfo",
+        ok ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error, hr);
+    return hr;
+}
+
+OPENSCARLETT_XG_API uint32_t __stdcall XGGetFormatPlaneCount(uint32_t dxgi_format) {
+    openscarlett::CallTelemetry::Global().Record(
+        kXgModule, "XGGetFormatPlaneCount", openscarlett::CallOutcome::Ok, kHrOk);
+    return openscarlett::xg::GetFormatPlaneCount(dxgi_format);
+}
+
+OPENSCARLETT_XG_API int32_t __stdcall XGGetFormatPlaneBlockInfo(
+    uint32_t dxgi_format,
+    uint32_t plane,
+    XG_FORMAT_BLOCK_INFO* pOutInfo) {
+    if (!pOutInfo) {
+        openscarlett::CallTelemetry::Global().Record(
+            kXgModule, "XGGetFormatPlaneBlockInfo", openscarlett::CallOutcome::Error, kHrPointer);
+        return kHrPointer;
+    }
+    const bool ok = openscarlett::xg::GetFormatPlaneBlockInfo(dxgi_format, plane, *pOutInfo);
+    const int32_t hr = ok ? kHrOk : kHrInvalidArg;
+    openscarlett::CallTelemetry::Global().Record(
+        kXgModule, "XGGetFormatPlaneBlockInfo",
         ok ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error, hr);
     return hr;
 }
@@ -226,6 +313,96 @@ OPENSCARLETT_XG_API int32_t __stdcall XGUntileSurface2D(
     return hr;
 }
 
+OPENSCARLETT_XG_API int32_t __stdcall XGTileSurface2DPlane(
+    const XG_TEXTURE2D_DESC* pDesc,
+    uint32_t plane,
+    uint32_t mip_level,
+    uint32_t slice_index,
+    const void* pSrcLinear,
+    uint32_t srcRowPitchBytes,
+    void* pDstTiled,
+    uint64_t dstTiledSizeBytes) {
+    if (!pDesc || !pSrcLinear || !pDstTiled) {
+        openscarlett::CallTelemetry::Global().Record(
+            kXgModule, "XGTileSurface2DPlane", openscarlett::CallOutcome::Error, kHrInvalidArg);
+        return kHrInvalidArg;
+    }
+    const bool ok = openscarlett::xg::TileSurface2DPlane(
+        *pDesc, plane, mip_level, slice_index, pSrcLinear, srcRowPitchBytes, pDstTiled, dstTiledSizeBytes);
+    const int32_t hr = ok ? kHrOk : kHrInvalidArg;
+    openscarlett::CallTelemetry::Global().Record(
+        kXgModule, "XGTileSurface2DPlane",
+        ok ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error, hr);
+    return hr;
+}
+
+OPENSCARLETT_XG_API int32_t __stdcall XGUntileSurface2DPlane(
+    const XG_TEXTURE2D_DESC* pDesc,
+    uint32_t plane,
+    uint32_t mip_level,
+    uint32_t slice_index,
+    const void* pSrcTiled,
+    uint64_t srcTiledSizeBytes,
+    void* pDstLinear,
+    uint32_t dstRowPitchBytes) {
+    if (!pDesc || !pSrcTiled || !pDstLinear) {
+        openscarlett::CallTelemetry::Global().Record(
+            kXgModule, "XGUntileSurface2DPlane", openscarlett::CallOutcome::Error, kHrInvalidArg);
+        return kHrInvalidArg;
+    }
+    const bool ok = openscarlett::xg::UntileSurface2DPlane(
+        *pDesc, plane, mip_level, slice_index, pSrcTiled, srcTiledSizeBytes, pDstLinear, dstRowPitchBytes);
+    const int32_t hr = ok ? kHrOk : kHrInvalidArg;
+    openscarlett::CallTelemetry::Global().Record(
+        kXgModule, "XGUntileSurface2DPlane",
+        ok ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error, hr);
+    return hr;
+}
+
+OPENSCARLETT_XG_API int32_t __stdcall XGTileSurface3D(
+    const XG_TEXTURE3D_DESC* pDesc,
+    uint32_t mip_level,
+    const void* pSrcLinear,
+    uint32_t srcRowPitchBytes,
+    uint32_t srcSlicePitchBytes,
+    void* pDstTiled,
+    uint64_t dstTiledSizeBytes) {
+    if (!pDesc || !pSrcLinear || !pDstTiled) {
+        openscarlett::CallTelemetry::Global().Record(
+            kXgModule, "XGTileSurface3D", openscarlett::CallOutcome::Error, kHrInvalidArg);
+        return kHrInvalidArg;
+    }
+    const bool ok = openscarlett::xg::TileSurface3D(
+        *pDesc, mip_level, pSrcLinear, srcRowPitchBytes, srcSlicePitchBytes, pDstTiled, dstTiledSizeBytes);
+    const int32_t hr = ok ? kHrOk : kHrInvalidArg;
+    openscarlett::CallTelemetry::Global().Record(
+        kXgModule, "XGTileSurface3D",
+        ok ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error, hr);
+    return hr;
+}
+
+OPENSCARLETT_XG_API int32_t __stdcall XGUntileSurface3D(
+    const XG_TEXTURE3D_DESC* pDesc,
+    uint32_t mip_level,
+    const void* pSrcTiled,
+    uint64_t srcTiledSizeBytes,
+    void* pDstLinear,
+    uint32_t dstRowPitchBytes,
+    uint32_t dstSlicePitchBytes) {
+    if (!pDesc || !pSrcTiled || !pDstLinear) {
+        openscarlett::CallTelemetry::Global().Record(
+            kXgModule, "XGUntileSurface3D", openscarlett::CallOutcome::Error, kHrInvalidArg);
+        return kHrInvalidArg;
+    }
+    const bool ok = openscarlett::xg::UntileSurface3D(
+        *pDesc, mip_level, pSrcTiled, srcTiledSizeBytes, pDstLinear, dstRowPitchBytes, dstSlicePitchBytes);
+    const int32_t hr = ok ? kHrOk : kHrInvalidArg;
+    openscarlett::CallTelemetry::Global().Record(
+        kXgModule, "XGUntileSurface3D",
+        ok ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error, hr);
+    return hr;
+}
+
 OPENSCARLETT_XG_API int32_t __stdcall XGComputeMipLayout(
     const XG_TEXTURE2D_DESC* pDesc,
     XG_RESOURCE_LAYOUT* pOutLayout) {
@@ -238,6 +415,22 @@ OPENSCARLETT_XG_API int32_t __stdcall XGComputeMipLayout(
     const int32_t hr = ok ? kHrOk : kHrInvalidArg;
     openscarlett::CallTelemetry::Global().Record(
         kXgModule, "XGComputeMipLayout",
+        ok ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error, hr);
+    return hr;
+}
+
+OPENSCARLETT_XG_API int32_t __stdcall XGComputeMipLayout3D(
+    const XG_TEXTURE3D_DESC* pDesc,
+    XG_RESOURCE_LAYOUT* pOutLayout) {
+    if (!pDesc || !pOutLayout) {
+        openscarlett::CallTelemetry::Global().Record(
+            kXgModule, "XGComputeMipLayout3D", openscarlett::CallOutcome::Error, kHrInvalidArg);
+        return kHrInvalidArg;
+    }
+    const bool ok = openscarlett::xg::ComputeTexture3DLayout(*pDesc, *pOutLayout);
+    const int32_t hr = ok ? kHrOk : kHrInvalidArg;
+    openscarlett::CallTelemetry::Global().Record(
+        kXgModule, "XGComputeMipLayout3D",
         ok ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error, hr);
     return hr;
 }
