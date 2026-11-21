@@ -1,12 +1,61 @@
 #include "openscarlett/core/telemetry.h"
 
 #include <algorithm>
+#include <atomic>
 #include <fstream>
 #include <sstream>
+
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 namespace openscarlett {
 
 namespace {
+
+#if defined(_WIN32)
+using PfnHookRecordCall = void(__cdecl*)(const char* module_name,
+                                         const char* symbol_name,
+                                         uint8_t outcome,
+                                         int32_t hr,
+                                         int32_t vtable_slot);
+
+void ForwardToHookDllIfPresent(const std::string& module_name,
+                               const std::string& symbol_name,
+                               CallOutcome outcome,
+                               int32_t hr,
+                               int32_t vtable_slot) {
+    static std::atomic<int> init_state{0};  // 0 = unchecked, 1 = forward, 2 = self/disabled
+    static std::atomic<PfnHookRecordCall> cached_fn{nullptr};
+
+    int state = init_state.load(std::memory_order_acquire);
+    if (state == 2) return;
+
+    PfnHookRecordCall fn = cached_fn.load(std::memory_order_acquire);
+    if (!fn) {
+        HMODULE hook_mod = GetModuleHandleA("openscarlett_hook.dll");
+        if (!hook_mod) return;
+        HMODULE self_mod = nullptr;
+        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCSTR>(&ForwardToHookDllIfPresent),
+                           &self_mod);
+        if (self_mod == hook_mod) {
+            init_state.store(2, std::memory_order_release);
+            return;
+        }
+        fn = reinterpret_cast<PfnHookRecordCall>(
+            GetProcAddress(hook_mod, "OpenScarlettHook_RecordCall"));
+        if (fn) {
+            cached_fn.store(fn, std::memory_order_release);
+            init_state.store(1, std::memory_order_release);
+        }
+    }
+    if (fn) {
+        fn(module_name.c_str(), symbol_name.c_str(), static_cast<uint8_t>(outcome), hr, vtable_slot);
+    }
+}
+#endif
 
 std::string EscapeJson(const std::string& s) {
     std::string out;
@@ -57,6 +106,9 @@ void CallTelemetry::Record(const std::string& module_name,
         case CallOutcome::NotImplemented: ++e.not_impl_calls; break;
         case CallOutcome::Error: ++e.error_calls; break;
     }
+#if defined(_WIN32)
+    ForwardToHookDllIfPresent(module_name, symbol_name, outcome, hr, vtable_slot);
+#endif
 }
 
 std::vector<CallTraceEntry> CallTelemetry::Snapshot() const {

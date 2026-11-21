@@ -55,6 +55,9 @@ function(openscarlett_add_test name src)
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
     )
+    if(MSVC)
+        target_compile_options(${name} PRIVATE /W4)
+    endif()
     target_compile_definitions(${name} PRIVATE
         OPENSCARLETT_BINARY_DIR="${CMAKE_BINARY_DIR}"
         OPENSCARLETT_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
@@ -73,3 +76,16 @@ openscarlett_add_test(test_winrt_xs tests/test_winrt_xs.cpp)
 target_link_libraries(test_winrt_xs PRIVATE winrt_xs)
 
 add_test(NAME test_cli_probe_gpu COMMAND $<TARGET_FILE:openscarlett> probe-gpu)
+
+# Modular subsystem build files (keeps parallel worktrees conflict-free)
+foreach(_os_module_cmake
+    cmake/loader_targets.cmake
+    cmake/kernel_targets.cmake
+    cmake/graphics_targets.cmake
+    cmake/gdk_targets.cmake
+    cmake/shader_targets.cmake
+)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_os_module_cmake}")
+        include("${CMAKE_CURRENT_SOURCE_DIR}/${_os_module_cmake}")
+    endif()
+endforeach()
