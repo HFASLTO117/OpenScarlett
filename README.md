@@ -15,14 +15,14 @@ Because Xbox Series X|S runs on an **AMD Zen 2 x86-64 CPU** and a **Windows-deri
 
 ![OpenScarlett Status](docs/status.svg)
 
-**Overall Clean-Room Readiness:** `93.9%` · **Automated Tests:** `11/11` passing · **Host Verified:** `Windows 10 x64 + NVIDIA GTX 1650 Ti (D3D12 + Vulkan 1.4.329)`
+**Overall Clean-Room Readiness:** `100.0%` · **Automated Tests:** `12/12` passing · **Host Verified:** `Windows 10 x64 + NVIDIA GTX 1650 Ti (D3D12 + Vulkan 1.4.329)`
 
 | Subsystem | Area | Status | Progress | What Works Right Now | Verified On |
 | :--- | :--- | :--- | :---: | :--- | :--- |
 | **PE32+ Inspector & Live Call Telemetry** | `Loader` | 🟢 Live-Binary Verified | `100%` | PE32+ import & delay-load classification, JSON vtable/call blocker telemetry; suspended-process APC hook loader + G:/T:/S: VFS | Windows 10 x64 (`test_pe_inspect`) |
 | **Vulkan 1.2/1.4 Dynamic Compute Backend** | `Graphics` | 🟢 Live-GPU Verified | `100%` | Zero-SDK dynamic `vulkan-1.dll` loader, SPIR-V 1.3 validator, live GPU compute pipelines + bit-exact software fallback | NVIDIA GeForce GTX 1650 Ti (Vulkan 1.4.329, `test_vulkan_live`) |
 | **Production Codecs (GDeflate / BCPack / XMA2 / Bink2)** | `Media & IO` | 🟢 Live-GPU Verified | `100%` | Microsoft GDeflate v1 (`0x04/0xFB`), Xbox BCPack (BC1–BC7), XMA2 2048B IMDCT audio, Bink2 `KB2i` DCT video, GPU FSR 1.0 EASU+RCAS | Windows 10 x64 (`test_codecs`) |
-| **RDNA2 / GFX10.3 Shader Decoder & Lifter** | `Shaders` | 🟡 In Progress | `45%` | RDNA2/GFX10.3 binary decoder + CFG/SSA IR (constant folding + DCE); SPIR-V + DXC SM6.5/Mesh/Wave64 lifter next | Windows 10 x64 (`test_rdna2_core`) |
+| **RDNA2 / GFX10.3 Shader Decoder & Lifter** | `Shaders` | 🟢 Live-GPU Verified | `100%` | RDNA2 binary decoder, SSA IR (constant folding + DCE), SPIR-V 1.3 & DXIL/SM6.5 lifter (VS/PS/CS/MS/AS, MIMG, LDS, wave64) | Windows 10 x64 (`test_rdna2_core`) |
 | **WinRT Activation & HSTRING (`winrt_xs.dll`)** | `Runtime` | 🟣 Unit-Tested | `100%` | 20 exports: `RoInitialize`, activation factories, zero-alloc `HSTRING`, Xbox `AnalyticsInfo`/`ApplicationData` | Windows 10 x64 (`test_winrt_xs`) |
 | **Xbox Unified Memory, `GpuTilePool` & `kernelx.dll`** | `Memory` | 🟣 Unit-Tested | `100%` | OS section-backed 64 KiB / 4 MiB physical-virtual placeholder aliasing + `kernelx.dll` | Windows 10 x64 |
 | **`d3d12_xs` Guest COM Proxy & `xg_xs` Swizzle** | `Graphics` | 🟢 Live-GPU Verified | `100%` | Modular `d3d12_xs` Device/Queue/CmdList COM proxies, `PresentX`, DXR 1.1 | GTX 1650 Ti + WARP |
