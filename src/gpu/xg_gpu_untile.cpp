@@ -3177,19 +3177,23 @@ bool ComputePlacedTiledSubresourceLayout2D(
     constexpr uint64_t kPoolTile64KB = 65536ull;
     const uint64_t heap_sub_off = placed_heap_offset_bytes + sub_off;
 
+    const uint32_t sample_count = (desc.SampleCount == 0u) ? 1u : desc.SampleCount;
+    const uint64_t base_row_bytes =
+        static_cast<uint64_t>(ml.WidthElements) * static_cast<uint64_t>(bpe) * static_cast<uint64_t>(sample_count);
+
     out_sub.subresource_index = subresource_index;
     out_sub.mip_level = mip;
     out_sub.array_slice = slice;
     out_sub.width_elements = ml.WidthElements;
     out_sub.height_elements = ml.HeightElements;
-    out_sub.depth_elements = 1u;
+    out_sub.depth_elements = sample_count;
     out_sub.tiles_x = std::max<uint32_t>(1u, ml.TilesX);
     out_sub.tiles_y = std::max<uint32_t>(1u, ml.TilesY);
     out_sub.tiles_z = 1u;
     out_sub.tile_size_bytes = ml.TileSizeBytes;
     out_sub.bytes_per_element = bpe;
     // D3D12 placed texture subresource row pitch is 256-byte aligned.
-    out_sub.linear_row_pitch_bytes = AlignUpU32(ml.WidthElements * bpe, 256u);
+    out_sub.linear_row_pitch_bytes = AlignUpU32(static_cast<uint32_t>(base_row_bytes), 256u);
     out_sub.subresource_offset_bytes = sub_off;
     out_sub.heap_subresource_offset_bytes = heap_sub_off;
     out_sub.subresource_size_bytes = sub_size;

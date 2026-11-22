@@ -47,10 +47,14 @@ constexpr DStorageGuid IID_IDStorageFactoryX = {
     0x6924EA0Cu, 0xC3CDu, 0x4826u, {0xB1, 0x0A, 0xF6, 0x4F, 0x4E, 0xD9, 0x27, 0xC1}};
 constexpr DStorageGuid IID_IDStorageFactoryX1 = {
     0x6924EA0Cu, 0xC3CDu, 0x4826u, {0xB1, 0x0A, 0xF6, 0x4F, 0x4E, 0xD9, 0x27, 0xC2}};
+constexpr DStorageGuid IID_IDStorageFactoryX2 = {
+    0x6924EA0Cu, 0xC3CDu, 0x4826u, {0xB1, 0x0A, 0xF6, 0x4F, 0x4E, 0xD9, 0x27, 0xC3}};
 constexpr DStorageGuid IID_IDStorageQueueX = {
     0xCFDBD83Fu, 0x9E06u, 0x4FDAu, {0x8E, 0xA5, 0x69, 0x04, 0x21, 0x37, 0xF4, 0x9B}};
 constexpr DStorageGuid IID_IDStorageQueueX1 = {
     0xCFDBD83Fu, 0x9E06u, 0x4FDAu, {0x8E, 0xA5, 0x69, 0x04, 0x21, 0x37, 0xF4, 0x9C}};
+constexpr DStorageGuid IID_IDStorageQueueX2 = {
+    0xCFDBD83Fu, 0x9E06u, 0x4FDAu, {0x8E, 0xA5, 0x69, 0x04, 0x21, 0x37, 0xF4, 0x9D}};
 constexpr DStorageGuid IID_IDStorageFileX = {
     0x5DE95E7Bu, 0x955Au, 0x4868u, {0xA7, 0x3C, 0x24, 0x3B, 0x29, 0xF4, 0xB8, 0xDA}};
 constexpr DStorageGuid IID_IDStorageStatusArrayX = {
@@ -134,7 +138,11 @@ constexpr uint32_t DSTORAGE_MAX_STAGING_BUFFER_SIZE = 256u * 1024u * 1024u;  // 
 struct IDStorageFileX;
 struct IDStorageStatusArrayX;
 struct IDStorageQueueX;
+struct IDStorageQueueX1;
+struct IDStorageQueueX2;
 struct IDStorageFactoryX;
+struct IDStorageFactoryX1;
+struct IDStorageFactoryX2;
 
 struct DSTORAGE_CONFIGURATION {
     uint32_t NumSubmitThreads;
@@ -375,6 +383,41 @@ struct DSTORAGE_QUEUE_STATS {
     uint32_t LastIntermediateSize;
 };
 
+// DirectStorage X1/X2 queue options & extended descriptors (public GDK dstorage_xs.h).
+enum DSTORAGE_QUEUE_OPTIONS : uint32_t {
+    DSTORAGE_QUEUE_OPTIONS_NONE = 0x0u,
+    DSTORAGE_QUEUE_OPTIONS_DISABLE_AUTO_SUBMIT = 0x1u,
+};
+
+struct DSTORAGE_QUEUE_DESC1 {
+    DSTORAGE_REQUEST_SOURCE_TYPE SourceType;  // +0x00 (UINT64)
+    uint16_t Capacity;                        // +0x08
+    DSTORAGE_PRIORITY Priority;               // +0x0A (INT8)
+    uint32_t Options;                         // +0x0C (DSTORAGE_QUEUE_OPTIONS)
+    const char* Name;                         // +0x10
+};
+
+struct DSTORAGE_QUEUE_INFO1 {
+    DSTORAGE_QUEUE_DESC1 Desc;
+    uint16_t EmptySlotCount;
+    uint16_t RequestCountUntilAutoSubmit;
+    uint32_t AutoSubmitDisabled;
+    uint32_t InFlightRequestCount;
+    uint64_t CompletedRequestCount;
+};
+
+struct DSTORAGE_STATS {
+    uint64_t TotalRequestsCompleted;
+    uint64_t TotalBytesRead;
+    uint64_t TotalIocpAsyncReads;
+    uint64_t TotalOver64GiBReads;
+    uint64_t MaxConcurrentIocpReads;
+    uint64_t TotalZlibDecompressions;
+    uint64_t TotalBcpackDecompressions;
+    uint64_t TotalSwizzleTransforms;
+    uint64_t TotalPhysicalPageTransfers;
+};
+
 struct IDStorageFileX {
     virtual int32_t OPENSCARLETT_DSTORAGE_CALL QueryInterface(
         const DStorageGuid* riid, void** ppvObject) = 0;
@@ -413,6 +456,16 @@ struct IDStorageQueueX {
     virtual void OPENSCARLETT_DSTORAGE_CALL Query(DSTORAGE_QUEUE_INFO* info) = 0;
 };
 
+struct IDStorageQueueX1 : public IDStorageQueueX {
+    virtual void OPENSCARLETT_DSTORAGE_CALL EnqueueSignal(void* fence, uint64_t value) = 0;
+};
+
+struct IDStorageQueueX2 : public IDStorageQueueX1 {
+    virtual void OPENSCARLETT_DSTORAGE_CALL Query1(DSTORAGE_QUEUE_INFO1* info) = 0;
+    virtual int32_t OPENSCARLETT_DSTORAGE_CALL SetAutoSubmitDisabled(bool disabled) = 0;
+    virtual bool OPENSCARLETT_DSTORAGE_CALL GetAutoSubmitDisabled() = 0;
+};
+
 struct IDStorageFactoryX {
     virtual int32_t OPENSCARLETT_DSTORAGE_CALL QueryInterface(
         const DStorageGuid* riid, void** ppvObject) = 0;
@@ -426,6 +479,16 @@ struct IDStorageFactoryX {
         uint32_t capacity, const char* name, const DStorageGuid* riid, void** ppv) = 0;
     virtual void OPENSCARLETT_DSTORAGE_CALL SetDebugFlags(uint32_t flags) = 0;
     virtual int32_t OPENSCARLETT_DSTORAGE_CALL SetStagingBufferSize(uint32_t size) = 0;
+};
+
+struct IDStorageFactoryX1 : public IDStorageFactoryX {
+    virtual int32_t OPENSCARLETT_DSTORAGE_CALL GetStats(DSTORAGE_STATS* stats) = 0;
+    virtual int32_t OPENSCARLETT_DSTORAGE_CALL SetCpuAffinity(uint64_t affinity) = 0;
+};
+
+struct IDStorageFactoryX2 : public IDStorageFactoryX1 {
+    virtual int32_t OPENSCARLETT_DSTORAGE_CALL CreateQueue1(
+        const DSTORAGE_QUEUE_DESC1* desc, const DStorageGuid* riid, void** ppv) = 0;
 };
 
 #ifdef __cplusplus
@@ -447,6 +510,11 @@ OPENSCARLETT_DSTORAGE_API int32_t OPENSCARLETT_DSTORAGE_CALL OpenScarlettDStorag
 // device field, so the shim cannot take it from the title's queue description.
 OPENSCARLETT_DSTORAGE_API int32_t OPENSCARLETT_DSTORAGE_CALL OpenScarlettDStorageSetQueueDevice(
     IDStorageQueueX* queue, void* d3d12_device);
+
+// Attaches an optional openscarlett::TitleVAMirror* for Options.DestinationIsPhysicalPages
+// and Options.SourceIsPhysicalPages resolution alongside kernelx.dll physical pages.
+OPENSCARLETT_DSTORAGE_API int32_t OPENSCARLETT_DSTORAGE_CALL OpenScarlettDStorageSetQueueTitleVaMirror(
+    IDStorageQueueX* queue, void* title_va_mirror);
 
 OPENSCARLETT_DSTORAGE_API int32_t OPENSCARLETT_DSTORAGE_CALL OpenScarlettDStorageGetQueueStats(
     IDStorageQueueX* queue, DSTORAGE_QUEUE_STATS* outStats);

@@ -220,4 +220,31 @@ Status BcGenerateSyntheticSurface(
     uint32_t seed,
     std::vector<uint8_t>& out_blocks);
 
+// ---------------------------------------------------------------------------
+// Public Xbox Hardware BCPack Raw Bitstream Codec (BC1..BC7)
+// Used by DirectStorage Xbox DSTORAGE_REQUEST::Options.BcpackMode.
+// Implements bit-level entropy coding with explicit flush bit, per-format
+// BC1-BC7 block predictors, spatial delta coding, and endpoint/selector palettes.
+// ---------------------------------------------------------------------------
+Status BcPackHwEncodeBitstream(
+    BcFormat format,
+    const uint8_t* src_blocks,
+    size_t src_size,
+    std::vector<uint8_t>& out_bitstream,
+    uint32_t tile_width_blocks = 0u);
+
+Status BcPackHwDecodeBitstream(
+    BcFormat format,
+    const uint8_t* src_bitstream,
+    size_t src_size,
+    uint8_t* dst_blocks,
+    size_t dst_size,
+    size_t* out_written = nullptr);
+
+bool BcPackHwIsValidBitstreamHeader(
+    BcFormat expected_format,
+    const uint8_t* src_bitstream,
+    size_t src_size,
+    uint32_t* out_block_count = nullptr) noexcept;
+
 }  // namespace openscarlett
