@@ -117,6 +117,7 @@ $TestDescriptions = @{
     'test_rdna2_lockstep_isa.exe'      = 'Single-wave lockstep LDS barriers, 5 RDNA2 no-ops & CPU-vs-GPU differential ISA checks'
     'test_s7_pe_gdk_runtime.exe'       = 'PE/KnownDLL/.xdata hardening, XMemVirtualQuery, Minecraft-GDK surface, 6 stubs, RawInput & DCC fuzz'
     'test_gdk_3d_scene_dual_api.exe'   = '3D shadowed/skinned/BC1+BC3 GDK scene launched via openscarlett run on D3D12 & Vulkan 1.4'
+    'test_launcher_updater.exe'        = 'Native Win32/D2D OpenScarlettLauncher GUI smoke, privacy sanitizer & BCrypt SHA-256 updater'
 }
 
 Write-Host ''

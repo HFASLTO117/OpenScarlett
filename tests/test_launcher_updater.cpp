@@ -275,10 +275,12 @@ void TestSemVer() {
     OS_REQUIRE(!IsNewerVersion("v0.4.0", "v0.4.0-alpha"));
     OS_REQUIRE(!IsNewerVersion("v1.0.0", "v0.9.9"));
 
-    // Invalid version rejection
+    // Short major.minor normalization (e.g. "v1.2" -> 1.2.0) & invalid version rejection
+    const SemVer v12 = ParseSemVer("v1.2");
+    OS_REQUIRE(v12.valid && v12.major == 1 && v12.minor == 2 && v12.patch == 0);
     OS_REQUIRE(!ParseSemVer("").valid);
     OS_REQUIRE(!ParseSemVer("not-a-version").valid);
-    OS_REQUIRE(!ParseSemVer("v1.2").valid);
+    OS_REQUIRE(!ParseSemVer("v1").valid);
     OS_REQUIRE(!ParseSemVer("v1.2.x").valid);
     OS_REQUIRE(!ParseSemVer("v-1.0.0").valid);
     OS_REQUIRE(!IsNewerVersion("v0.4.0-alpha", "garbage"));

@@ -19,27 +19,27 @@
 
 ## Where Do We Stand Right Now?
 
-OpenScarlett is in **early alpha** (`v0.3.1-alpha`, **`41/41` automated tests passing**). Simple Xbox-ABI games, official Microsoft Xbox GDK 3D/Mesh/HDR/Ray-Tracing samples, and a shadowed 3D dual-API (DirectX 12 + Vulkan 1.4) workload run live on real NVIDIA and AMD PCs today. Larger commercial Xbox Series games are **not playable yet** — we are building toward them step by step.
+OpenScarlett is in **early alpha** (`v0.4.0-alpha`, **`42/42` automated tests passing**). Simple Xbox-ABI games, official Microsoft Xbox GDK 3D/Mesh/HDR/Ray-Tracing samples, a shadowed 3D dual-API (DirectX 12 + Vulkan 1.4) workload, and our all-in-one native Windows GUI launcher (`OpenScarlettLauncher.exe`) run live on real NVIDIA and AMD PCs today. Larger commercial Xbox Series games are **not playable yet** — we are building toward them step by step.
 
 ```mermaid
 flowchart LR
     S1["1. Core Engine ✓\nLoader · 30 DLLs · Shaders"] --> S2["2. Xbox Samples ✓\n3D · Mesh · HDR10 · DXR"]
     S2 --> S3["3. Playable Demos ✓\nFreedoom 60 FPS & Arena"]
-    S3 --> S4["4. Larger 3D Indie ◐\nVulkan Routing + Launcher"]
-    S4 --> S5["5. Complex 3D Titles ○\nLong-Term Target"]
+    S3 --> S4["4. Vulkan Routing + GUI ✓\n3D Scene · Launcher · Updater"]
+    S4 --> S5["5. Complex 3D Titles ◐\nCommercial Bring-Up Target"]
 
     style S1 fill:#e11d48,stroke:#fb7185,color:#ffffff
     style S2 fill:#e11d48,stroke:#fb7185,color:#ffffff
     style S3 fill:#e11d48,stroke:#fb7185,color:#ffffff
-    style S4 fill:#d29922,stroke:#f0b72f,color:#ffffff
-    style S5 fill:#21262d,stroke:#30363d,color:#8b949e
+    style S4 fill:#e11d48,stroke:#fb7185,color:#ffffff
+    style S5 fill:#d29922,stroke:#f0b72f,color:#ffffff
 ```
 
 | Working Today | Building Next |
 | :--- | :--- |
-| Plays **Freedoom** & **ScarlettArena** at 60 FPS with live controller, audio & saves | All-in-one Windows Launcher GUI with built-in 60s Hardware Tester & SHA-256 updater |
-| Runs official Microsoft Xbox GDK 3D, Mesh Shader, HDR10 & Ray-Tracing samples | Larger open-source 3D & commercial GDK title bring-up |
-| Direct Xbox DirectX 12 → **Vulkan 1.4** command-list routing + shadowed 3D scene | Broader RDNA2 shader corpus validation across more engines |
+| All-in-one native Windows GUI (**`OpenScarlettLauncher.exe`**) with built-in 60s Hardware Tester, PE Inspector & opt-in BCrypt SHA-256 updater | Larger open-source 3D & commercial GDK title bring-up |
+| Plays **Freedoom**, **ScarlettArena** & a shadowed/skinned 3D GDK scene (`gdk_3d_scene`) with live controller, audio & saves | Broader RDNA2 shader corpus validation across more engines |
+| Direct Xbox DirectX 12 → **Vulkan 1.4** command-list routing (`0.0000` MAE vs D3D12) + official Microsoft Xbox GDK 3D/Mesh/HDR10/DXR samples | Multi-vendor Vulkan tuning & performance profiling |
 | Matches **292/292** shipping GDK runtime functions across **30** shimmed DLLs on **6 real PCs** | Hardware testing on Intel Arc, RTX 40/50, RX 6000 & handheld APUs |
 
 ---
@@ -67,9 +67,9 @@ flowchart LR
 
 Every new GPU and Windows build helps us catch real driver, wave-size, and memory-aliasing quirks we cannot reproduce locally.
 
-1. **[Download the latest `OpenScarlett-*-win64.zip`](https://github.com/californiaAlmonds/OpenScarlett/releases/latest)** and extract anywhere *(everything — including open-source `dxc.exe` — is bundled; no Visual Studio or SDK required)*.
-2. **Run `run_hardware_test.ps1`** *(right-click → **Run with PowerShell**, or `powershell -ExecutionPolicy Bypass -File .\run_hardware_test.ps1`)* — probes your GPU, runs all tests, and automatically strips usernames & local folder paths.
-3. **Press `Enter`** when prompted to open a pre-filled GitHub Hardware Report and click **Create**.
+1. **[Download the latest `OpenScarlett-*-win64.zip`](https://github.com/californiaAlmonds/OpenScarlett/releases/latest)** and extract anywhere *(everything — including `OpenScarlettLauncher.exe` and open-source `dxc.exe` — is bundled; no Visual Studio or SDK required)*.
+2. **Double-click `OpenScarlettLauncher.exe`** → open the **60s Hardware Self-Test** tab → click **Run 60s Hardware Test** *(or double-click `run_hardware_test.bat` / run `powershell -ExecutionPolicy Bypass -File .\run_hardware_test.ps1` for CLI)* — probes your GPU, runs all tests with live progress, and automatically strips usernames & local folder paths.
+3. **Click `Open Pre-Filled GitHub Hardware Report`** *(or press `Enter` in CLI)* to open a pre-filled GitHub Hardware Report and click **Create**.
 
 | Hardware Tier | Tested Status |
 | :--- | :--- |
@@ -88,7 +88,7 @@ Every new GPU and Windows build helps us catch real driver, wave-size, and memor
 <br/>
 
 <!-- OPENSCARLETT_STATUS_START -->
-**Automated Tests:** `41/41` passing · **Shimmed DLLs:** `30` · **Shipping GDK Thunks:** `292/292` · **Verified Hardware:** `6 PCs` (`NVIDIA` + `AMD`)
+**Automated Tests:** `42/42` passing · **Shimmed DLLs:** `30` · **Shipping GDK Thunks:** `292/292` · **Verified Hardware:** `6 PCs` (`NVIDIA` + `AMD`)
 
 | Subsystem | Area | Status | Progress | Technical Coverage | Verified On |
 | :--- | :--- | :--- | :---: | :--- | :--- |
@@ -99,7 +99,7 @@ Every new GPU and Windows build helps us catch real driver, wave-size, and memor
 | **BCPack BC1–BC7, RDNA2 BVH4, Opus/XMA2/WASAPI, `X3DAudio` & GPU FSR 1.0** | `Media` | 🟢 Live-GPU Verified | `100%` | GDeflate v1, BCPack BC1–BC7 (ring-window/selector-table/NPOT/multi-mip), RDNA2 BVH4 decoder + SAH BVH2→BVH4, XMA2 IMDCT, `MSOpusDecoder` Opus (`0x704F`), IMA-ADPCM, WASAPI (all MMDevice formats), `X3DAudio`/`XAudio2FX`, Bink2, live GPU FSR 1.0 | 6 PCs (GTX 1650 Ti, RTX 2060 SUPER/3080 Ti, AMD RX 7600/7900 XTX/9070 XT) + WARP (`test_codecs`, `test_bcpack_bvh4`, `test_audio_opus_wasapi`, `test_d3d12_xs_live`) |
 | **GDK & Console Shims (30 DLLs, 292/292 Thunks, WinRT 20 Exports & Raw Input)** | `GDK Shims` | 🟢 Live-Binary Verified | `100%` | 30 shimmed DLLs: `xgameruntime` (**292/292** shipping `XGamingRuntimeThunks.dll` parity, 24 COM `QueryApiImpl` interfaces, `XGameStreaming`/`XSystem`/headless `XStore`), `XCurl` (16/16), `XSAPI` (178), `GameInput` (XInput + Raw Input mouse), `winrt_xs` (20 exports), `mfplat_xs`, `advapi32legacy`, `KernelTraceControl`, `hix_xs`, `xbtp`, `mflnmhelp`, `mfhevcdec`, `gamecoreclient`, `minuserx`, `xtfpix`, `xtfdebugmonitor` | Live commercial `Alexandria IV DEMO` shipping thunks (`0 E_NOINTERFACE`), Win10 & Win11 26H2 (`test_real_gdk_thunks_live`, `test_s7_pe_gdk_runtime`, `test_xgr_conformance_parity`, `test_winrt_xs`) |
 | **Playable Demos, Dual-API 3D GDK Scene & Hardware DXR Tier 1.1** | `Workloads` | 🟢 Live-GPU Verified | `100%` | Live 60 FPS **Freedoom: Phase 1** & `ScarlettArena`, 3D shadowed/skinned BC1+BC3 GDK scene over BOTH D3D12 & Vulkan 1.4 (`test_gdk_3d_scene_dual_api`), `ID3D12Device5` DXR 1.1, `SimplePBR`, `MeshletCull`, `SimpleLighting`, `HDRCubeMap`, `VulkanMeshShowcase` (`not_impl=0`) | GTX 1650 Ti (HW + WARP, D3D12 + Vulkan 1.4), RTX 2060 SUPER/3080 Ti (`DXR=12`), AMD RX 7600/7900 XTX/9070 XT (`DXR=11`) (`test_scarlett_game_live`, `test_gdk_3d_scene_dual_api`, `test_dxr_live`, `test_vulkan_mesh_showcase`) |
-| **Native Win32/Direct2D `OpenScarlettLauncher.exe` + Opt-In SHA-256 Updater** | `UX & Tools` | 🟡 In Progress | `40%` | Wave 2 in progress: native Win32/Direct2D GUI shell, integrated 60s Hardware Self-Test runner, PE32+ inspector, and opt-in WinHTTP + BCrypt SHA-256 verified updater (CLI & `run_hardware_test.ps1` live today) | Wave 2 active (`run_hardware_test.ps1` verified on 6 PCs) |
+| **Native Win32/Direct2D `OpenScarlettLauncher.exe` + Opt-In SHA-256 Updater** | `UX & Tools` | 🟢 Live-Binary Verified | `100%` | Native Win32/Direct2D launcher with GPU telemetry strip, Play & Launch tab, integrated 60s Hardware Self-Test, PE32+ Binary Inspector, and opt-in WinHTTP + BCrypt SHA-256 verified GitHub updater | Win10 & Win11 x64 (`test_launcher_updater`) |
 
 _Auto-generated from live CTest results via `python tools/generate_status.py --build-dir build`._
 <!-- OPENSCARLETT_STATUS_END -->
@@ -151,6 +151,16 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
+### Native Windows GUI (`OpenScarlettLauncher.exe`)
+```powershell
+# Launch the dark native Win32/Direct2D all-in-one GUI (Play & Launch, 60s Hardware Self-Test,
+# PE32+ Binary Inspector, Live GPU Telemetry Strip, and Opt-In BCrypt SHA-256 Updater)
+.\build\OpenScarlettLauncher.exe
+
+# Headless / CI self-check (verifies Direct2D/DWrite, GPU probe, sanitizer & updater offline)
+.\build\OpenScarlettLauncher.exe --headless-check
+```
+
 ### CLI Usage
 ```powershell
 # Inspect your PC's D3D12, DXR, Mesh Shader, Wave lane, Vulkan, and DXC support
@@ -172,7 +182,7 @@ ctest --test-dir build --output-on-failure
 - [x] **Sprint 4 — Shader Cache/Auto-Lift, 19-DLL Stack & Multi-Pass GDK Bring-Up**: RDNA2 AAA opcodes, CPU wave32/64 interpreter, disk shader cache + `d3d12_xs` auto-lift, Opus MFT + WASAPI, full GFX10 `xg_xs`, `MicrosoftGame.Config` + CoW VFS, interactive `PresentX`, `SimplePBR`, `MeshletCull`, `DXRTriangle`, untouched MIT `SimpleDirectStorageCombo` (`23/23` CTest).
 - [x] **Sprint 5 (`v0.3.0-alpha`) — Full Vulkan 1.4 Graphics, Mesh Shaders & HDR10**: Zero-SDK Vulkan 1.4 rasterization + `VK_EXT_mesh_shader` + 3D textures + Win32 swapchain, HDR10 ST.2084/scRGB `PresentX`, `XDisplay`/`XGameUI`/`X3DAudio`/`XAudio2FX`, Kahn topo DLL init, Clang-CL & MinGW-w64 CI, `SimpleLighting`, `HDRCubeMap`, `VulkanMeshShowcase` (`29/29` CTest).
 - [x] **Sprint 6 (`v0.3.1-alpha`) — 292/292 GDK Thunks, RDNA2 Corpus Parity, Child-Hook Propagation & First Playable Game**: Clamped shifts, `v_cmpx`, `MTBUF d16`, `PSV0` wave bounds, DXIL MD5 re-signing, NVIDIA `R9G9B9E5`→`RGBA16F` UAV fallback, Vulkan sparse/`GetResourceTiling`, `xg_xs` HTILE/DCC/CMASK, 292/292 `XGamingRuntimeThunks.dll` parity (`0 E_NOINTERFACE`), `CreateProcess` child-hook propagation, BCPack BC1–BC7 + RDNA2 BVH4, and live 60 FPS **Freedoom: Phase 1** & `ScarlettArena` (`37/37` CTest).
-- [ ] **Sprint 7 (`v0.4.0-alpha`, In Progress)**: Wave 1 complete (`41/41` CTest) — direct `d3d12_xs`→Vulkan 1.4 routing, Wave32-on-64 Vulkan compute, staged BC copies, lockstep 1-wave LDS barriers, differential ISA, `KnownDLL`/`XMemVirtualQuery`/`XGEncodeDCC` fuzz/Raw Input + 6 new DLLs (30 total), and 3D shadowed/skinned dual-API GDK scene. Wave 2 active — native Win32/Direct2D Launcher GUI with built-in 60s Hardware Tester & opt-in SHA-256 updater.
+- [x] **Sprint 7 (`v0.4.0-alpha`) — Direct `d3d12_xs`→Vulkan 1.4 Routing, Overnight Ecosystem Parity, 3D Dual-API GDK Title & Native Windows GUI (`OpenScarlettLauncher.exe`)**: Direct `d3d12_xs`→Vulkan 1.4 command-list routing (`--backend=vulkan`, `0.0000` MAE vs D3D12), Wave32-on-64 Vulkan compute, staged BC1–BC7 copies, push-constant budget guard, `OPENSCARLETT_VK_DEVICE` selection, mixed-heap slot isolation, decoupled `PresentX` fence vs DXGI timings; single-wave lockstep LDS barriers (PSV0 `NumThreads`), 5 RDNA2 no-op opcodes & CPU-vs-GPU differential ISA (`s_bfe`, `v_cvt_(pk)norm`, `image_load`); `System32`-first KnownDLLs, reloc RVA-0, bounded export names, fault-free section protections, `.xdata` `UWOP_ALLOC_LARGE` + v2/v3 chained unwind, `XMemVirtualQuery` + ERA attributes, Minecraft-GDK (`XGameStreaming`/`XTaskQueue` monitors/`XSystem`), 6 fixed-return stub DLLs (30 routed DLLs), lossless Win32 Raw Input mouse deltas, v1.1→v1.0 root-sig round-trip, 1,000-case `XGEncodeDCC` fuzz; shadowed/skinned/BC1+BC3 `gdk_3d_scene.exe` over D3D12 + Vulkan 1.4; and zero-dependency native Win32/Direct2D `OpenScarlettLauncher.exe` with integrated 60s Hardware Tester, PE Inspector, and opt-in WinHTTP + BCrypt SHA-256 verified updater (`42/42` CTest).
 
 </details>
 
@@ -182,7 +192,7 @@ ctest --test-dir build --output-on-failure
 
 | GPU | Windows Build | Probed Capabilities | Result | Reported By |
 | :--- | :--- | :--- | :---: | :--- |
-| **NVIDIA GeForce GTX 1650 Ti** (`4 GB`) | Win10 22H2 (`19045.3086`) | `SM 6.5` · `Wave32` · `Mesh` · `Vulkan 1.4.329` | 🟢 **41/41 Pass** | Maintainer |
+| **NVIDIA GeForce GTX 1650 Ti** (`4 GB`) | Win10 22H2 (`19045.3086`) | `SM 6.5` · `Wave32` · `Mesh` · `Vulkan 1.4.329` | 🟢 **42/42 Pass** | Maintainer |
 | **NVIDIA GeForce RTX 2060 SUPER** (`8 GB`) | Win11 26H2 (`26300.9974`) | `SM 6.6` · `Wave32` · `Mesh` · `DXR=12` · `Vulkan 1.4.351` | 🟢 **13/13 Pass** | [@rpatty-dev](https://github.com/rpatty-dev) ([#1](https://github.com/californiaAlmonds/OpenScarlett/issues/1), [#8](https://github.com/californiaAlmonds/OpenScarlett/issues/8)) |
 | **NVIDIA GeForce RTX 3080 Ti** (`12 GB`) | Win11 25H2 (`26200.9974`) | `SM 6.6` · `Wave32` · `Mesh` · `DXR=12` · `Vulkan 1.4.357` | 🟢 **13/13 Pass** | [@sackboysplayer](https://github.com/sackboysplayer) ([#13](https://github.com/californiaAlmonds/OpenScarlett/issues/13)) |
 | **AMD Radeon RX 7600** (`8 GB`) | Win11 26H2 (`26300.9711`) | `SM 6.6` · `Wave=32..64` · `Mesh` · `DXR=11` · `Vulkan 1.4.359` | 🟢 **13/13 Pass** | [@AntoninMichelq](https://github.com/AntoninMichelq) ([#12](https://github.com/californiaAlmonds/OpenScarlett/issues/12)) |

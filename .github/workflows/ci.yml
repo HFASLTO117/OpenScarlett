@@ -118,11 +118,18 @@ jobs:
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
           Copy-Item "build/openscarlett.exe" $stage
+          if (Test-Path "build/OpenScarlettLauncher.exe") {
+            Copy-Item "build/OpenScarlettLauncher.exe" $stage
+          }
           Get-ChildItem "build" -Filter "*.dll" | Copy-Item -Destination $stage
           Get-ChildItem "build" -Filter "test_*.exe" | Copy-Item -Destination $stage
           Get-ChildItem "build" -Filter "gdk_*.exe" | Copy-Item -Destination $stage
           Get-ChildItem "build" -Filter "Scarlett*.exe" | Copy-Item -Destination $stage
+          if (Test-Path "build/gdk_3d_scene_MicrosoftGame.Config") {
+            Copy-Item "build/gdk_3d_scene_MicrosoftGame.Config" $stage
+          }
           Copy-Item "tools/run_hardware_test.ps1" $stage
+          Copy-Item "tools/run_hardware_test.bat" $stage
           Copy-Item "README.md", "LICENSE" $stage
 
           # Bundle open-source DirectXShaderCompiler (dxc.exe + dxcompiler.dll + dxil.dll)
@@ -177,6 +184,13 @@ jobs:
           Write-Host "Running portable bundle smoke test (hiding build/ so hardcoded build paths fail CI)..."
           Rename-Item -Path "build" -NewName "build_hidden_for_smoke"
           try {
+            $env:OPENSCARLETT_NO_UPDATE_CHECK = '1'
+            if (Test-Path "$stage\OpenScarlettLauncher.exe") {
+              $lp = Start-Process -FilePath "$stage\OpenScarlettLauncher.exe" -ArgumentList '--headless-check' -Wait -NoNewWindow -PassThru
+              if ($lp.ExitCode -ne 0) {
+                throw "Portable OpenScarlettLauncher --headless-check failed with exit code $($lp.ExitCode)"
+              }
+            }
             & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$stage\run_hardware_test.ps1" -NoPause
             if ($LASTEXITCODE -ne 0) {
               throw "Portable bundle smoke test failed with exit code $LASTEXITCODE"
@@ -381,6 +395,12 @@ jobs:
             KernelTraceControl
             hix_xs
             xbtp
+            mflnmhelp
+            mfhevcdec
+            gamecoreclient
+            minuserx
+            xtfpix
+            xtfdebugmonitor
             test_codecs
             test_bcpack_bvh4
             test_rdna2_core
@@ -499,20 +519,20 @@ jobs:
           $tag = "${{ github.ref_name }}"
           $zipName = "OpenScarlett-$tag-win64.zip"
           $notes = @"
-          ## OpenScarlett $tag — Portable Windows x64 Hardware Test Bundle
+          ## OpenScarlett $tag — All-in-One Native GUI + Portable Windows x64 Hardware Test Bundle
 
-          **Zero coding or Visual Studio required!** Help us test OpenScarlett across real PC GPUs (NVIDIA RTX, AMD RDNA2/3/4, Intel Arc/iGPU) and Windows 10/11 builds:
+          **Zero coding or Visual Studio required!** Launch unpacked Xbox GDK packages, inspect PE32+ binaries, or run the 60-second hardware compatibility suite right from our brand-new native Windows GUI:
 
           1. Download **`$zipName`** below and extract it anywhere.
-          2. Right-click **`run_hardware_test.ps1`** → **Run with PowerShell** (or run ``powershell -ExecutionPolicy Bypass -File .\run_hardware_test.ps1``) — it probes your GPU(s) and runs the full automated suite (zero-SDK Vulkan 1.4 graphics & ``VK_EXT_mesh_shader``, HDR10 ST.2084 & scRGB ``PresentX``, D3D12 COM proxies, Mesh Shaders, FSR 1.0, ``VirtualAlloc2`` aliasing, RDNA2 shader lifting & ISA catches, DXR 1.1, ``XDisplay``/``X3DAudio``/``XAudio2FX``, and live Xbox GDK workloads including ``SimpleLighting``, ``HDRCubeMap``, and ``VulkanMeshShowcase``).
-          3. Press **Enter** when prompted to open a **pre-filled GitHub Hardware Report** (with personal paths/usernames automatically stripped) and click **Create**!
+          2. Double-click **`OpenScarlettLauncher.exe`** (dark native Win32/Direct2D GUI with live GPU telemetry strip, Play & Launch tab, integrated 60-second Hardware Self-Test tab, PE32+ Binary Inspector tab, and opt-in SHA-256 verified GitHub updater) — **OR** run **`run_hardware_test.bat`** / **`run_hardware_test.ps1`** for CLI/headless testing.
+          3. Click **Run 60s Hardware Test** → **Open Pre-Filled GitHub Hardware Report** (usernames & local paths are automatically stripped before saving or sharing) and click **Create**!
 
-          ### What's New in $tag
-          - **100% Real-GDK Thunk Parity (292/292 ``xgameruntime`` + 16/16 ``XCurl``, Zero ``E_NOINTERFACE``)**: Added all final 31 ``XAppBroadcast*``/``XAppCapture*``/``XSpeech*`` exports and all 24 real shipping 3-arg COM ``QueryApiImpl`` interfaces (288 vtable slots), verified live against commercial ``XGamingRuntimeThunks.dll`` + ``Microsoft.Xbox.Services.141.GDK.C.Thunks.dll``, plus headless ``XStore``/PLS & ``XTaskQueue``/``XAsync`` stress tests.
-          - **First Playable Scarlett Game Stack (Live 60 FPS via ``openscarlett run``)**: Full zero-DLL Xbox Series X|S game bring-up running **Freedoom: Phase 1** (``ScarlettDoom``) & 100% MIT ``ScarlettArena`` across ``d3d12_xs`` + ``PresentX`` + ``kernelx`` + ``xgameruntime`` + ``GameInput`` + ``XAudio2_9`` + ``S:\`` saves + read-only ``G:\`` CoW VFS (``not_impl = 0`` on both HW GPU & WARP).
-          - **RDNA2 / GFX10.3 Corpus Parity & DXIL Re-Signing**: Clamped bit-shift UB guards, ``v_cmpx``, split ``f16`` compares, MTBUF ``d16``, NaN quieting & denorm ``floor``/``ceil``, active-mask IR pruning, ``PSV0`` wave lane bounds, Wave32-on-64 isolation, ``merged_wave_info``/``GS_ALLOC_REQ``/``NumThreads``, ``CullPrimitiveEXT`` Block+bool, FSSM/vertex-fetch contracts, and clean-room DXIL MD5 container re-signing.
-          - **``d3d12_xs``, Vulkan Sparse/Reserved & ``xg_xs`` Metadata Parity**: ``R9G9B9E5``→``RGBA16F`` UAV fallback (unblocks FidelityFX on NVIDIA), ``CommandQueueX``/``CommandListX`` Xbox methods (``KickoffX``, ``Wait32/64BitValueX``, ``RSSetDepthBiasX``), xmem desktop GPU VA binding, MSVC x64 ``sret`` COM ABI tests, Vulkan sparse/reserved resources + ``GetResourceTiling`` + ``S#``/``T#`` mip parity, and ``xg_xs`` ``HTILE``/``DCC``/``CMASK`` metadata planes & Scarlett pipe config.
-          - **24-DLL Routing, Multi-Process Child-Hook Propagation, ``dstorage_xs`` & BCPack/BVH4**: 5 new clean-room DLLs (``mfplat_xs``, ``advapi32legacy``, ``KernelTraceControl``, ``hix_xs``, ``xbtp``), ``dstorage_xs`` request cancellation + physical-page decompression, deterministic XMem/XThread & all Windows MMDevice WASAPI endpoint formats, ``CreateProcessW/A`` child-process APC hook propagation with per-PID telemetry, hardened BCPack BC1–BC7 entropy codecs, and clean-room RDNA2 BVH4 header/node-pointer decoder paired with ``XboxBvhBuilder`` SAH BVH (``37/37`` tests).
+          ### What's New in $tag (Sprint 7)
+          - **All-in-One Native Windows GUI (`OpenScarlettLauncher.exe`)**: Zero external dependencies (native Win32 + Direct2D + DirectWrite + WinHTTP + Windows BCrypt). Includes live GPU telemetry strip, Play & Launch tab (Auto / Direct3D 12 / Vulkan 1.4 backend + adapter selector + live CallTelemetry + 1-click demo launch), integrated 60-second Hardware Self-Test with privacy sanitization & 1-click GitHub reporting, drag-and-drop PE32+ Binary Inspector (showing shim routing & missing exports), and an opt-in BCrypt SHA-256 verified updater (never silent, preserves `S:\` saves & user config).
+          - **Direct `d3d12_xs` → Vulkan 1.4 Command-List Routing & Cross-Vendor Edge Cases**: Routes `DeviceX`/`CommandQueueX`/`CommandListX` draws, compute dispatches, mesh dispatches, resource uploads/copies, barriers, and `PresentX` directly through our zero-SDK Vulkan 1.4 backend on `--backend=vulkan` / `OPENSCARLETT_BACKEND=vulkan` (`0.0000` MAE vs native D3D12 on GTX 1650 Ti & WARP). Adds Wave32-on-Wave64 compute execution, staged BC1–BC7 block-compressed texture copies, device push-constant byte-budget guards, `OPENSCARLETT_VK_DEVICE` substring GPU selection, mixed-heap colliding buffer/image descriptor slot separation, and decoupled `PresentX` fence signaling vs DXGI presentation timings.
+          - **RDNA2 Single-Wave Lockstep LDS Barriers, Explicit No-Op Opcodes & Differential ISA Verification**: Detects 1-wave console compute shaders (`<=64` threads, honoring PSV0 threadgroup dimensions) relying on implicit Wave64 lockstep LDS visibility and emits explicit `GroupMemoryBarrierWithGroupSync` / `OpControlBarrier` for bit-exact results on 32-lane NVIDIA/Intel GPUs; adds clean no-op lowering for `s_icache_inv`, `s_ttracedata`, `s_ttracedata_imm`, `s_code_end`, and `s_version`; adds CPU-vs-live-GPU differential tests for `s_bfe`, `v_cvt_(pk)norm`, and `image_load` edge cases.
+          - **PE / Loader Hardening & Overnight Ecosystem Parity (30 Routed DLLs)**: System32-first KnownDLL resolution, PE base relocation RVA 0 handling, section-bounded raw export name reading, fault-free section protection transitions, `.xdata` `UWOP_ALLOC_LARGE` + v2/v3 chained unwind validation, `XMemVirtualQuery` + ERA allocation attribute decoding, Minecraft-GDK surface (`XGameStreaming`, `XTaskQueue` monitors/process queue, `XSystem`), 6 new fixed-return stub DLLs (`mflnmhelp`, `mfhevcdec`, `gamecoreclient`, `minuserx`, `xtfpix`, `xtfdebugmonitor`), lossless Win32 Raw Input mouse deltas in `GameInput`, versioned→legacy D3D12 root-signature round-trip, and 1,000-case deterministic `XGEncodeDCC` fuzzing.
+          - **Larger 3D Multi-Mesh Shadowed/Skinned GDK Title (`gdk_3d_scene.exe`)**: Clean-room MIT 3D DirectXTK12-style Xbox-ABI title with `D32_FLOAT` depth buffer, 1024² PCF directional shadow pass, 3-bone GPU vertex skinning, procedural BC1/BC3 textures, `XAudio2_9` synth cues, `GameInput`, and `S:\` checkpoints — verified from an isolated zero-DLL package via `openscarlett run` on BOTH D3D12 and `--backend=vulkan` (`not_impl = 0`, `42/42` CTest).
 
           > **Clean-Room Policy:** 100% MIT open-source code. Contains bundled open-source Microsoft ``dxc.exe``/``dxcompiler.dll``/``dxil.dll`` so no Windows SDK is required. Never decrypts retail ``.xvc``/``.xvd`` packages.
           "@

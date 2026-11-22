@@ -112,6 +112,7 @@ foreach(_os_module_cmake
     cmake/worker_playable_game.cmake
     cmake/wave3_portability.cmake
     cmake/sprint7_wave1.cmake
+    cmake/sprint7_launcher.cmake
 )
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_os_module_cmake}")
         include("${CMAKE_CURRENT_SOURCE_DIR}/${_os_module_cmake}")

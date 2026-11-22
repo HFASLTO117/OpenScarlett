@@ -887,6 +887,67 @@ std::string SanitizeReportText(const std::string& text,
     }
 #endif
 
+    // Also scrub any generic "<Drive>:\Users\<ProfileName>" or "<Drive>:/Users/<ProfileName>"
+    // path segment (excluding system accounts like Public/Default) so profile directory names
+    // that differ from %USERNAME% (e.g. Microsoft Accounts) are never leaked.
+    {
+        auto to_lower_ascii = [](std::string_view sv) {
+            std::string r(sv);
+            for (char& c : r) {
+                if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+            }
+            return r;
+        };
+        std::string scrubbed;
+        scrubbed.reserve(out.size());
+        size_t i = 0;
+        while (i < out.size()) {
+            const char ch = out[i];
+            const bool is_drive = ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')) &&
+                                  (i + 2 < out.size()) && out[i + 1] == ':' &&
+                                  (out[i + 2] == '\\' || out[i + 2] == '/');
+            if (is_drive) {
+                size_t j = i + 2;
+                while (j < out.size() && (out[j] == '\\' || out[j] == '/')) {
+                    ++j;
+                }
+                if (j + 5 < out.size() &&
+                    to_lower_ascii(std::string_view(out).substr(j, 5)) == "users" &&
+                    (out[j + 5] == '\\' || out[j + 5] == '/')) {
+                    size_t name_start = j + 5;
+                    while (name_start < out.size() &&
+                           (out[name_start] == '\\' || out[name_start] == '/')) {
+                        ++name_start;
+                    }
+                    size_t name_end = name_start;
+                    while (name_end < out.size() &&
+                           out[name_end] != '\\' && out[name_end] != '/' &&
+                           out[name_end] != '\r' && out[name_end] != '\n' &&
+                           out[name_end] != ' ' && out[name_end] != '\t' &&
+                           out[name_end] != '"' && out[name_end] != '\'' &&
+                           out[name_end] != ')' && out[name_end] != ']' &&
+                           out[name_end] != ';') {
+                        ++name_end;
+                    }
+                    if (name_end > name_start) {
+                        const std::string seg_lower =
+                            to_lower_ascii(std::string_view(out).substr(name_start, name_end - name_start));
+                        if (seg_lower != "<user>" && seg_lower != "public" &&
+                            seg_lower != "default" && seg_lower != "all") {
+                            scrubbed.append(out, i, name_start - i);
+                            scrubbed.append("<USER>");
+                            i = name_end;
+                            continue;
+                        }
+                    }
+                }
+            }
+            scrubbed.push_back(ch);
+            ++i;
+        }
+        out = std::move(scrubbed);
+    }
+
     return out;
 }
 

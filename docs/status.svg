@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="900" height="542" viewBox="0 0 900 542" role="img" aria-label="OpenScarlett Core Subsystems (41/41 tests passing)">
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="542" viewBox="0 0 900 542" role="img" aria-label="OpenScarlett Core Subsystems (42/42 tests passing)">
   <defs>
     <linearGradient id="accentBar" x1="0%" y1="0%" x2="100%" y2="0%">
       <stop offset="0%" stop-color="#e11d48"/>
@@ -19,7 +19,7 @@
     <rect width="900" height="542" fill="#0d1117"/>
     <rect x="0" y="0" width="900" height="3" fill="url(#accentBar)"/>
     <text class="h1" x="28" y="40">OpenScarlett — Core Subsystems</text>
-    <text class="sub" x="28" y="62">Windows 10/11 x64 · MIT · 41/41 tests passing · 30 shimmed Xbox DLLs · 6 real PCs verified</text>
+    <text class="sub" x="28" y="62">Windows 10/11 x64 · MIT · 42/42 tests passing · 30 shimmed Xbox DLLs · 6 real PCs verified</text>
     <line x1="28" y1="82" x2="872" y2="82" stroke="#21262d" stroke-width="1"/>
     <text class="name" x="28" y="118">Game Loader &amp; Virtual Drives</text>
     <text class="desc" x="28" y="135">Launches unpacked packages, isolates saves, tracks multi-process games</text>
@@ -79,11 +79,11 @@
     <line x1="28" y1="460" x2="872" y2="460" stroke="#161b22" stroke-width="1"/>
     <text class="name" x="28" y="482">Windows Launcher GUI &amp; Updater</text>
     <text class="desc" x="28" y="499">All-in-one app launcher, built-in 60s hardware tester &amp; SHA-256 updater</text>
-    <rect x="488" y="476" width="138" height="22" rx="11" fill="#d29922"/>
-    <text class="pill" x="557" y="491" text-anchor="middle">In Progress</text>
+    <rect x="488" y="476" width="138" height="22" rx="11" fill="#2ea043"/>
+    <text class="pill" x="557" y="491" text-anchor="middle">Live Verified</text>
     <rect x="648" y="482" width="176" height="10" rx="5" fill="#21262d"/>
-    <rect x="648" y="482" width="70" height="10" rx="5" fill="#d29922"/>
-    <text class="pct" x="872" y="491" text-anchor="end">40%</text>
+    <rect x="648" y="482" width="176" height="10" rx="5" fill="#2ea043"/>
+    <text class="pct" x="872" y="491" text-anchor="end">100%</text>
   </g>
   <rect x="0.5" y="0.5" width="899" height="541" rx="12" fill="none" stroke="#30363d" stroke-width="1"/>
 </svg>
