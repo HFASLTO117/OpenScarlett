@@ -1,5 +1,5 @@
 @echo off
-setlocal EnableDelayedExpansion
+setlocal
 set "ROOT_DIR=%~dp0"
 if "%ROOT_DIR:~-1%"=="\" set "ROOT_DIR=%ROOT_DIR:~0,-1%"
 set "TEMP=%ROOT_DIR%\.tmp"
@@ -8,10 +8,10 @@ set "OPENSCARLETT_SAVE_ROOT=%ROOT_DIR%\.tmp\saves"
 if not exist "%TEMP%" mkdir "%TEMP%"
 if not exist "%OPENSCARLETT_SAVE_ROOT%" mkdir "%OPENSCARLETT_SAVE_ROOT%"
 
-rem MSVC: keep an already initialised developer prompt, otherwise ask vswhere
+rem MSVC: keep an already initialised x64 developer prompt, otherwise ask vswhere
 rem for the newest install with the x64 C++ tools (Community, Professional,
 rem Enterprise or Build Tools, any version).
-where cl.exe >nul 2>&1 && goto :have_msvc
+if /i "%VSCMD_ARG_TGT_ARCH%"=="x64" where cl.exe >nul 2>&1 && goto :have_msvc
 set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
 set "VS_DIR="
 if exist "%VSWHERE%" (

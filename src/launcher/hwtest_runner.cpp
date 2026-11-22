@@ -811,6 +811,56 @@ ProcessRunOutput RunProcessCapture(
     return res;
 }
 
+std::filesystem::path ResolveWorkRootDirForSanitize(
+    const std::filesystem::path& bundle_dir,
+    std::string_view user_profile_utf8) {
+    if (bundle_dir.empty()) {
+        return {};
+    }
+    auto lower_ascii = [](std::string s) {
+        for (char& c : s) {
+            if (c >= 'A' && c <= 'Z') {
+                c = static_cast<char>(c - 'A' + 'a');
+            }
+        }
+        return s;
+    };
+    std::filesystem::path dir = bundle_dir.lexically_normal();
+    while (!dir.empty() && dir.filename().empty() && dir != dir.root_path()) {
+        dir = dir.parent_path();
+    }
+    std::string leaf = lower_ascii(PathToUtf8(dir.filename()));
+    if (leaf == "debug" || leaf == "release" ||
+        leaf == "relwithdebinfo" || leaf == "minsizerel") {
+        const std::filesystem::path parent = dir.parent_path();
+        const std::string parent_leaf = lower_ascii(PathToUtf8(parent.filename()));
+        if (!parent.empty() && (parent_leaf == "build" || parent_leaf == "bin")) {
+            dir = parent;
+            leaf = parent_leaf;
+        }
+    }
+    if (leaf != "build" && leaf != "bin") {
+        return {};
+    }
+    const std::filesystem::path root = dir.parent_path();
+    const std::string root_clean = StripTrailingSeparators(PathToUtf8(root));
+    if (root_clean.size() <= 2) {
+        return {};
+    }
+    if (!user_profile_utf8.empty()) {
+        std::string up = StripTrailingSeparators(std::string(user_profile_utf8));
+        std::string rt = root_clean;
+        std::replace(up.begin(), up.end(), '/', '\\');
+        std::replace(rt.begin(), rt.end(), '/', '\\');
+        if (!up.empty()) up.push_back('\\');
+        if (!rt.empty()) rt.push_back('\\');
+        if (StartsWithIgnoreCaseAscii(up, rt)) {
+            return {};
+        }
+    }
+    return root;
+}
+
 #endif  // defined(_WIN32)
 
 }  // namespace
@@ -845,6 +895,7 @@ std::string SanitizeReportText(const std::string& text,
     };
 
 #if defined(_WIN32)
+    const std::string user_profile = GetEnvVarUtf8(L"USERPROFILE");
     if (!bundle_dir.empty()) {
         add_path_rule(PathToUtf8(bundle_dir), "<BUNDLE_DIR>");
         std::error_code ec;
@@ -856,8 +907,20 @@ std::string SanitizeReportText(const std::string& text,
         if (!ec && !canonical.empty()) {
             add_path_rule(PathToUtf8(canonical), "<BUNDLE_DIR>");
         }
+        const auto work_root = ResolveWorkRootDirForSanitize(bundle_dir, user_profile);
+        if (!work_root.empty()) {
+            add_path_rule(PathToUtf8(work_root), "<REPO_DIR>");
+            const auto work_norm = work_root.lexically_normal();
+            if (work_norm != work_root) {
+                add_path_rule(PathToUtf8(work_norm), "<REPO_DIR>");
+            }
+            const auto work_canon = std::filesystem::weakly_canonical(work_root, ec);
+            if (!ec && !work_canon.empty()) {
+                add_path_rule(PathToUtf8(work_canon), "<REPO_DIR>");
+            }
+        }
     }
-    add_path_rule(GetEnvVarUtf8(L"USERPROFILE"), "<USER_HOME>");
+    add_path_rule(user_profile, "<USER_HOME>");
     add_path_rule(GetEnvVarUtf8(L"TEMP"), "<TEMP>");
     add_path_rule(GetEnvVarUtf8(L"LOCALAPPDATA"), "<LOCALAPPDATA>");
     add_path_rule(GetEnvVarUtf8(L"APPDATA"), "<APPDATA>");

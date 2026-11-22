@@ -588,6 +588,23 @@ void TestPrivacySanitization(const fs::path& bin_dir) {
         OS_REQUIRE(clean.find("Users\\" + username) == std::string::npos);
     }
 
+    // Synthetic source-build & multi-config paths must mask <REPO_DIR> without leaking parent path
+    {
+        const std::string src_dirty =
+            "Exe=D:\\src\\OpenScarlett\\build\\openscarlett.exe\n"
+            "Vfs=D:\\src\\OpenScarlett\\.tmp\\openscarlett_run\\vfs\\G_overlay\n";
+        const std::string src_clean = SanitizeReportText(src_dirty, fs::path("D:\\src\\OpenScarlett\\build"));
+        OS_REQUIRE(src_clean.find("D:\\src\\OpenScarlett") == std::string::npos);
+        OS_REQUIRE(src_clean.find("<BUNDLE_DIR>\\openscarlett.exe") != std::string::npos);
+        OS_REQUIRE(src_clean.find("<REPO_DIR>\\.tmp\\openscarlett_run\\vfs\\G_overlay") != std::string::npos);
+
+        const std::string rel_clean = SanitizeReportText(
+            "Vfs=D:/src/OpenScarlett/.tmp/openscarlett_run/vfs/G_overlay\n",
+            fs::path("D:\\src\\OpenScarlett\\build\\Release"));
+        OS_REQUIRE(rel_clean.find("OpenScarlett") == std::string::npos);
+        OS_REQUIRE(rel_clean.find("<REPO_DIR>/.tmp/openscarlett_run/vfs/G_overlay") != std::string::npos);
+    }
+
     std::printf("[PASS] Test 4: Privacy sanitization (bundle, env paths, / and \\, case-insensitive, Users\\<name>)\n");
 }
 
