@@ -128,6 +128,7 @@ foreach(_os_module_cmake
     cmake/sprint13_live_xbox_shader.cmake
     cmake/sprint13_vk_xg_tiled.cmake
     cmake/sprint13_shader_cfg.cmake
+    cmake/sprint13_gdk_offline.cmake
 )
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_os_module_cmake}")
         include("${CMAKE_CURRENT_SOURCE_DIR}/${_os_module_cmake}")
