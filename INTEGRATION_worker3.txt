@@ -1,0 +1,40 @@
+OpenScarlett Sprint 8 — Worker 3 Integration Guide
+Branch: swarm/s8-rdna2-corpus-bench
+Files added:
+  - src/gpu/rdna2_coverage_tool.h
+  - src/gpu/rdna2_coverage_tool.cpp
+  - tools/rdna2_corpus_bench.py
+  - tests/test_rdna2_corpus_bench.cpp
+
+1. Wire `src/gpu/rdna2_coverage_tool.cpp` into `openscarlett_core` and register `test_rdna2_corpus_bench` in CTest
+   (e.g. in `cmake/shader_targets.cmake` or a new modular `cmake/sprint8_rdna2_coverage.cmake`):
+
+   target_sources(openscarlett_core PRIVATE
+       src/gpu/rdna2_coverage_tool.cpp
+   )
+
+   openscarlett_add_test(test_rdna2_corpus_bench tests/test_rdna2_corpus_bench.cpp)
+
+   Note: `src/gpu/rdna2_coverage_tool.cpp` automatically detects Worker 1 (`rdna2_isa_scalar_vector.h`)
+   and Worker 2 (`rdna2_isa_mem_img.h`) via `#if defined(__has_include)` (checking both local
+   `src/gpu/` and `openscarlett/gpu/` include paths) and aggregates all deduplicated GFX10.3 opcodes
+   into the 779-opcode reference catalog without needing manual `#define` toggles.
+
+2. Wire `rdna2-bench` subcommand into `src/main.cpp`:
+   - Add include near top of `src/main.cpp`:
+       #include "gpu/rdna2_coverage_tool.h"
+   - Add usage line in `PrintUsage()`:
+       "  openscarlett rdna2-bench [--full|--fast] [--json <path>] [--corpus-count N] [--no-gpu] [--no-external]\n"
+   - Add command dispatch in `main(int argc, char** argv)`:
+       if (cmd == "rdna2-bench") return openscarlett::RunRdna2BenchCli(argc, argv);
+
+3. Generate `docs/rdna2_coverage.json` and update status badges after merging Workers 1, 2, and 3:
+   - Run full 3,120-shader GFX10.3 corpus benchmark & schema validation:
+       python tools/rdna2_corpus_bench.py --exe build/openscarlett.exe --full --json docs/rdna2_coverage.json
+   - Regenerate README status table, SVG, and dashboard (automatically reads `opcodes_decoded`,
+     `opcodes_total`, `corpus_shaders_total`, `corpus_shaders_passed` from `docs/rdna2_coverage.json`):
+       python tools/generate_status.py --build-dir build
+
+4. Portability Notes:
+   - Zero WRL dependency (uses clean-room `ComRef<T>` RAII wrapper under `#if defined(_WIN32)`).
+   - Compiled and verified at `/W4 /WX` (0 warnings) with MSVC C++20 and designed for Clang-CL & MinGW-w64.
