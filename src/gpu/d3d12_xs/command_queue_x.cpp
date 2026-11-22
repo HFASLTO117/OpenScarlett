@@ -61,6 +61,7 @@ inline void RecordQueue(const char* method, int32_t slot, HRESULT hr = S_OK) {
 struct QueueRegistry {
     std::shared_mutex mutex;
     std::unordered_map<const void*, ID3D12CommandQueue*> map;
+    std::vector<CommandQueueX*> active_queues;
 };
 
 QueueRegistry& GetQueueRegistry() {
@@ -266,15 +267,28 @@ LRESULT CALLBACK SubclassWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             }
             case WM_CLOSE: {
                 state->close_requested.store(true, std::memory_order_release);
-                if (state->post_quit_on_close.load(std::memory_order_acquire)) {
+                const bool post_quit = state->post_quit_on_close.load(std::memory_order_acquire);
+                if (post_quit) {
                     if (!state->quit_posted.exchange(true, std::memory_order_acq_rel)) {
                         PostQuitMessage(0);
                     }
+                }
+                char term_buf[16]{};
+                const DWORD tlen = GetEnvironmentVariableA(
+                    "OPENSCARLETT_TERMINATE_ON_WINDOW_CLOSE", term_buf, static_cast<DWORD>(sizeof(term_buf)));
+                if (tlen > 0u && tlen < sizeof(term_buf) &&
+                    (term_buf[0] == '1' || term_buf[0] == 't' || term_buf[0] == 'T')) {
+                    ExitProcess(0u);
                 }
                 break;
             }
             case WM_DESTROY: {
                 state->close_requested.store(true, std::memory_order_release);
+                if (state->post_quit_on_close.load(std::memory_order_acquire)) {
+                    if (!state->quit_posted.exchange(true, std::memory_order_acq_rel)) {
+                        PostQuitMessage(0);
+                    }
+                }
                 break;
             }
             case WM_NCDESTROY: {
@@ -660,6 +674,345 @@ HWND DiscoverProcessMainWindow() noexcept {
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// Sprint 14: FenceWaitDispatcher — dispatches callbacks strictly OUTSIDE mutex
+// and wakes all blocked waits immediately on device removal (Leonida #1933).
+// ---------------------------------------------------------------------------
+FenceWaitDispatcher::FenceWaitDispatcher(DeviceX* parent_device)
+    : device_x_(parent_device) {
+    stop_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    wakeup_event_ = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    device_removed_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+}
+
+FenceWaitDispatcher::~FenceWaitDispatcher() {
+    std::vector<PendingEntry> remaining;
+    std::thread to_join;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        stopping_ = true;
+        if (stop_event_) SetEvent(stop_event_);
+        if (wakeup_event_) SetEvent(wakeup_event_);
+        if (device_removed_event_) SetEvent(device_removed_event_);
+        if (worker_started_ && worker_thread_.joinable()) {
+            to_join = std::move(worker_thread_);
+            worker_started_ = false;
+        }
+    }
+    cv_.notify_all();
+    if (to_join.joinable()) {
+        to_join.join();
+    }
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        remaining.swap(pending_);
+    }
+    for (auto& e : remaining) {
+        if (e.event_handle) CloseHandle(e.event_handle);
+        if (e.host_fence) e.host_fence->Release();
+        if (e.user_fence) e.user_fence->Release();
+    }
+    if (device_removed_event_) CloseHandle(device_removed_event_);
+    if (wakeup_event_) CloseHandle(wakeup_event_);
+    if (stop_event_) CloseHandle(stop_event_);
+}
+
+void FenceWaitDispatcher::EnsureWorkerStartedLocked() {
+    if (worker_started_ || stopping_) return;
+    worker_started_ = true;
+    worker_thread_ = std::thread([this]() { WorkerLoop(); });
+}
+
+void FenceWaitDispatcher::DispatchOutsideLock(std::vector<PendingEntry>& ready) {
+    for (auto& e : ready) {
+        if (e.callback) {
+            e.callback(e.user_fence, e.target_value, e.status, e.user_ctx);
+        }
+        if (e.event_handle) {
+            CloseHandle(e.event_handle);
+            e.event_handle = nullptr;
+        }
+        if (e.host_fence) {
+            e.host_fence->Release();
+            e.host_fence = nullptr;
+        }
+        if (e.user_fence) {
+            e.user_fence->Release();
+            e.user_fence = nullptr;
+        }
+    }
+    ready.clear();
+}
+
+HRESULT FenceWaitDispatcher::RegisterCallback(
+    ID3D12Fence* fence,
+    UINT64 target_value,
+    FenceCompletionCallbackFn callback,
+    void* user_ctx,
+    uint64_t* out_registration_id) {
+    if (!fence || !callback) return E_INVALIDARG;
+    ID3D12Fence* host_fence = UnwrapFence(fence);
+    if (!host_fence) return E_INVALIDARG;
+
+    const uint64_t reg_id = next_id_.fetch_add(1ull, std::memory_order_relaxed);
+    if (out_registration_id) *out_registration_id = reg_id;
+
+    // Check immediate device removal or already-completed fence.
+    HRESULT immediate_status = S_OK;
+    bool fire_immediately = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (device_removed_.load(std::memory_order_acquire)) {
+            immediate_status = removed_reason_.load(std::memory_order_acquire);
+            if (SUCCEEDED(immediate_status)) immediate_status = DXGI_ERROR_DEVICE_REMOVED;
+            fire_immediately = true;
+        } else if (device_x_) {
+            const HRESULT dev_hr = device_x_->GetDeviceRemovedReason();
+            if (FAILED(dev_hr)) {
+                device_removed_.store(true, std::memory_order_release);
+                removed_reason_.store(dev_hr, std::memory_order_release);
+                if (device_removed_event_) SetEvent(device_removed_event_);
+                immediate_status = dev_hr;
+                fire_immediately = true;
+            }
+        }
+        if (!fire_immediately) {
+            const UINT64 cur_val = host_fence->GetCompletedValue();
+            if (cur_val == UINT64_MAX) {
+                HRESULT dev_hr = device_x_ ? device_x_->GetDeviceRemovedReason() : DXGI_ERROR_DEVICE_REMOVED;
+                if (SUCCEEDED(dev_hr)) dev_hr = DXGI_ERROR_DEVICE_REMOVED;
+                device_removed_.store(true, std::memory_order_release);
+                removed_reason_.store(dev_hr, std::memory_order_release);
+                if (device_removed_event_) SetEvent(device_removed_event_);
+                immediate_status = dev_hr;
+                fire_immediately = true;
+            } else if (cur_val >= target_value) {
+                immediate_status = S_OK;
+                fire_immediately = true;
+            }
+        }
+        if (!fire_immediately) {
+            HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            if (!ev) return E_OUTOFMEMORY;
+            const HRESULT set_hr = host_fence->SetEventOnCompletion(target_value, ev);
+            if (FAILED(set_hr)) {
+                CloseHandle(ev);
+                return set_hr;
+            }
+            PendingEntry entry{};
+            entry.id = reg_id;
+            entry.user_fence = fence;
+            entry.host_fence = host_fence;
+            entry.user_fence->AddRef();
+            entry.host_fence->AddRef();
+            entry.target_value = target_value;
+            entry.callback = callback;
+            entry.user_ctx = user_ctx;
+            entry.event_handle = ev;
+            entry.status = S_OK;
+            pending_.push_back(entry);
+            EnsureWorkerStartedLocked();
+            if (wakeup_event_) SetEvent(wakeup_event_);
+        }
+    }
+
+    if (fire_immediately) {
+        // Dispatched strictly OUTSIDE mutex_ so re-entrant callbacks never deadlock!
+        callback(fence, target_value, immediate_status, user_ctx);
+    }
+    return S_OK;
+}
+
+HRESULT FenceWaitDispatcher::WaitForFenceValue(
+    ID3D12Fence* fence,
+    UINT64 target_value,
+    UINT timeout_ms) {
+    if (!fence) return E_INVALIDARG;
+    ID3D12Fence* host_fence = UnwrapFence(fence);
+    if (!host_fence) return E_INVALIDARG;
+
+    auto check_removed = [&]() noexcept -> HRESULT {
+        if (device_removed_.load(std::memory_order_acquire)) {
+            HRESULT r = removed_reason_.load(std::memory_order_acquire);
+            return FAILED(r) ? r : DXGI_ERROR_DEVICE_REMOVED;
+        }
+        if (device_x_) {
+            const HRESULT r = device_x_->GetDeviceRemovedReason();
+            if (FAILED(r)) {
+                NotifyDeviceRemoved(r);
+                return r;
+            }
+        }
+        return S_OK;
+    };
+
+    const HRESULT initial_rm = check_removed();
+    if (FAILED(initial_rm)) return initial_rm;
+
+    const UINT64 cur_val = host_fence->GetCompletedValue();
+    if (cur_val == UINT64_MAX) {
+        HRESULT r = check_removed();
+        if (SUCCEEDED(r)) {
+            r = DXGI_ERROR_DEVICE_REMOVED;
+            NotifyDeviceRemoved(r);
+        }
+        return r;
+    }
+    if (cur_val >= target_value) {
+        return S_OK;
+    }
+
+    HANDLE ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!ev) return E_OUTOFMEMORY;
+
+    const HRESULT set_hr = host_fence->SetEventOnCompletion(target_value, ev);
+    if (FAILED(set_hr)) {
+        CloseHandle(ev);
+        const HRESULT rm = check_removed();
+        return FAILED(rm) ? rm : set_hr;
+    }
+
+    HANDLE handles[2] = {device_removed_event_, ev};
+    const DWORD handle_count = device_removed_event_ ? 2u : 1u;
+    const DWORD wr = WaitForMultipleObjects(
+        handle_count,
+        device_removed_event_ ? handles : &ev,
+        FALSE,
+        timeout_ms);
+    CloseHandle(ev);
+
+    if (device_removed_event_ && wr == WAIT_OBJECT_0) {
+        HRESULT r = removed_reason_.load(std::memory_order_acquire);
+        return FAILED(r) ? r : DXGI_ERROR_DEVICE_REMOVED;
+    }
+    if (wr == WAIT_TIMEOUT) {
+        const HRESULT rm = check_removed();
+        return FAILED(rm) ? rm : HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+    }
+    if (wr == WAIT_FAILED) {
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+    const HRESULT post_rm = check_removed();
+    if (FAILED(post_rm)) return post_rm;
+    if (host_fence->GetCompletedValue() == UINT64_MAX) {
+        return DXGI_ERROR_DEVICE_REMOVED;
+    }
+    return S_OK;
+}
+
+uint32_t FenceWaitDispatcher::PumpReadyCallbacks() {
+    std::vector<PendingEntry> ready;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        bool removed = device_removed_.load(std::memory_order_acquire);
+        HRESULT rm_hr = removed_reason_.load(std::memory_order_acquire);
+        if (!removed && device_x_) {
+            const HRESULT dev_hr = device_x_->GetDeviceRemovedReason();
+            if (FAILED(dev_hr)) {
+                removed = true;
+                rm_hr = dev_hr;
+                device_removed_.store(true, std::memory_order_release);
+                removed_reason_.store(dev_hr, std::memory_order_release);
+                if (device_removed_event_) SetEvent(device_removed_event_);
+            }
+        }
+        if (removed && SUCCEEDED(rm_hr)) {
+            rm_hr = DXGI_ERROR_DEVICE_REMOVED;
+        }
+
+        auto it = pending_.begin();
+        while (it != pending_.end()) {
+            bool done = false;
+            HRESULT st = S_OK;
+            if (removed) {
+                done = true;
+                st = rm_hr;
+            } else if (it->host_fence) {
+                const UINT64 cv = it->host_fence->GetCompletedValue();
+                if (cv == UINT64_MAX) {
+                    done = true;
+                    st = DXGI_ERROR_DEVICE_REMOVED;
+                } else if (cv >= it->target_value) {
+                    done = true;
+                    st = S_OK;
+                }
+            } else {
+                done = true;
+                st = E_FAIL;
+            }
+            if (done) {
+                it->status = st;
+                ready.push_back(*it);
+                it = pending_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    const uint32_t count = static_cast<uint32_t>(ready.size());
+    // Dispatched strictly OUTSIDE mutex_!
+    DispatchOutsideLock(ready);
+    return count;
+}
+
+void FenceWaitDispatcher::NotifyDeviceRemoved(HRESULT removed_reason) {
+    if (SUCCEEDED(removed_reason)) {
+        removed_reason = DXGI_ERROR_DEVICE_REMOVED;
+    }
+    std::vector<PendingEntry> ready;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        device_removed_.store(true, std::memory_order_release);
+        removed_reason_.store(removed_reason, std::memory_order_release);
+        if (device_removed_event_) SetEvent(device_removed_event_);
+        if (wakeup_event_) SetEvent(wakeup_event_);
+        ready.swap(pending_);
+        for (auto& e : ready) {
+            e.status = removed_reason;
+        }
+    }
+    cv_.notify_all();
+    // Dispatch all cancelled/aborted callbacks strictly OUTSIDE mutex_!
+    DispatchOutsideLock(ready);
+}
+
+void FenceWaitDispatcher::WorkerLoop() {
+    for (;;) {
+        HANDLE wait_handles[MAXIMUM_WAIT_OBJECTS]{};
+        DWORD handle_count = 0u;
+        bool has_overflow = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stopping_) break;
+            if (stop_event_) wait_handles[handle_count++] = stop_event_;
+            if (wakeup_event_) wait_handles[handle_count++] = wakeup_event_;
+            if (device_removed_event_) wait_handles[handle_count++] = device_removed_event_;
+            for (const auto& e : pending_) {
+                if (!e.event_handle) continue;
+                if (handle_count < MAXIMUM_WAIT_OBJECTS) {
+                    wait_handles[handle_count++] = e.event_handle;
+                } else {
+                    has_overflow = true;
+                    break;
+                }
+            }
+        }
+
+        const DWORD timeout = has_overflow ? 2u : 50u;
+        if (handle_count > 0u) {
+            WaitForMultipleObjects(handle_count, wait_handles, FALSE, timeout);
+        } else {
+            Sleep(10u);
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stopping_) break;
+        }
+        (void)PumpReadyCallbacks();
+    }
+}
+
 CommandQueueX::CommandQueueX(
     DeviceX* parent_device,
     ID3D12CommandQueue* host_queue,
@@ -667,7 +1020,8 @@ CommandQueueX::CommandQueueX(
     : device_x_(parent_device),
       host_queue_(host_queue),
       attached_hwnd_(initial_hwnd),
-      window_state_(std::make_shared<WindowCallbackState>()) {
+      window_state_(std::make_shared<WindowCallbackState>()),
+      fence_dispatcher_(std::make_unique<FenceWaitDispatcher>(parent_device)) {
     LARGE_INTEGER freq{};
     QueryPerformanceFrequency(&freq);
     qpc_freq_ = freq.QuadPart;
@@ -681,6 +1035,7 @@ CommandQueueX::CommandQueueX(
         auto& reg = GetQueueRegistry();
         std::unique_lock<std::shared_mutex> lock(reg.mutex);
         reg.map[static_cast<const ID3D12Pageable*>(this)] = host_queue_;
+        reg.active_queues.push_back(this);
     }
     if (initial_hwnd && IsWindow(initial_hwnd) != FALSE) {
         std::lock_guard<std::mutex> lock(present_mutex_);
@@ -781,13 +1136,37 @@ CommandQueueX::~CommandQueueX() {
         auto& reg = GetQueueRegistry();
         std::unique_lock<std::shared_mutex> lock(reg.mutex);
         reg.map.erase(static_cast<const ID3D12Pageable*>(this));
+        auto it = std::find(reg.active_queues.begin(), reg.active_queues.end(), this);
+        if (it != reg.active_queues.end()) {
+            reg.active_queues.erase(it);
+        }
     }
+    fence_dispatcher_.reset();
     {
         std::lock_guard<std::mutex> lock(present_mutex_);
         ReleasePresentObjectsLocked();
     }
     if (host_queue_) host_queue_->Release();
     if (device_x_) device_x_->Release();
+}
+
+void CommandQueueX::NotifyDeviceRemovedForDevice(DeviceX* dev, HRESULT removed_reason) noexcept {
+    if (!dev) return;
+    std::vector<CommandQueueX*> targets;
+    {
+        auto& reg = GetQueueRegistry();
+        std::shared_lock<std::shared_mutex> lock(reg.mutex);
+        for (CommandQueueX* q : reg.active_queues) {
+            if (q && q->device_x_ == dev) {
+                q->AddRef();
+                targets.push_back(q);
+            }
+        }
+    }
+    for (CommandQueueX* q : targets) {
+        (void)q->NotifyDeviceRemoved(removed_reason);
+        q->Release();
+    }
 }
 
 ID3D12Pageable* CommandQueueX::UnwrapHostPageable(ID3D12Pageable* maybe_wrapped) noexcept {
@@ -857,6 +1236,12 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::QueryInterface(REFIID riid, void** ppvO
     }
     if (IsEqualIID(riid, IID_IOpenScarlettPresentPacing)) {
         *ppvObject = static_cast<IOpenScarlettPresentPacing*>(this);
+        AddRef();
+        RecordQueue("ID3D12CommandQueueX::QueryInterface", 0, S_OK);
+        return S_OK;
+    }
+    if (IsEqualIID(riid, IID_IOpenScarlettFenceWaitDispatcher)) {
+        *ppvObject = static_cast<IOpenScarlettFenceWaitDispatcher*>(this);
         AddRef();
         RecordQueue("ID3D12CommandQueueX::QueryInterface", 0, S_OK);
         return S_OK;
@@ -2019,6 +2404,10 @@ HRESULT CommandQueueX::WaitForInternalFenceWithTimingLocked(
     int64_t* out_signal_qpc,
     double* out_wait_us,
     uint64_t* out_completed_value) {
+    if (fence_dispatcher_ && fence_dispatcher_->IsDeviceRemoved()) {
+        HRESULT r = fence_dispatcher_->RemovedReason();
+        return FAILED(r) ? r : DXGI_ERROR_DEVICE_REMOVED;
+    }
     if (!present_fence_ || !present_fence_event_) {
         if (out_signal_qpc) *out_signal_qpc = QueryQpcNow();
         if (out_wait_us) *out_wait_us = 0.0;
@@ -2029,11 +2418,30 @@ HRESULT CommandQueueX::WaitForInternalFenceWithTimingLocked(
     const int64_t sig_qpc = QueryQpcNow();
     HRESULT hr = host_queue_->Signal(present_fence_, target);
     if (FAILED(hr)) return hr;
-    if (present_fence_->GetCompletedValue() < target) {
+    const uint64_t cur_completed = present_fence_->GetCompletedValue();
+    if (cur_completed == UINT64_MAX) {
+        HRESULT r = device_x_ ? device_x_->GetDeviceRemovedReason() : DXGI_ERROR_DEVICE_REMOVED;
+        if (SUCCEEDED(r)) r = DXGI_ERROR_DEVICE_REMOVED;
+        if (fence_dispatcher_) fence_dispatcher_->NotifyDeviceRemoved(r);
+        return r;
+    }
+    if (cur_completed < target) {
         hr = present_fence_->SetEventOnCompletion(target, present_fence_event_);
         if (FAILED(hr)) return hr;
-        const DWORD wr = WaitForSingleObject(present_fence_event_, 15000);
-        if (wr != WAIT_OBJECT_0) return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+        HANDLE rm_ev = fence_dispatcher_ ? fence_dispatcher_->DeviceRemovedEventHandle() : nullptr;
+        DWORD wr = WAIT_FAILED;
+        if (rm_ev) {
+            HANDLE waits[2] = {rm_ev, present_fence_event_};
+            wr = WaitForMultipleObjects(2u, waits, FALSE, 15000u);
+            if (wr == WAIT_OBJECT_0) {
+                HRESULT r = fence_dispatcher_->RemovedReason();
+                return FAILED(r) ? r : DXGI_ERROR_DEVICE_REMOVED;
+            }
+            if (wr != (WAIT_OBJECT_0 + 1u)) return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+        } else {
+            wr = WaitForSingleObject(present_fence_event_, 15000u);
+            if (wr != WAIT_OBJECT_0) return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+        }
     }
     const int64_t done_qpc = QueryQpcNow();
     if (out_signal_qpc) *out_signal_qpc = sig_qpc;
@@ -3250,6 +3658,40 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::GetPresentPacingState(
             window_state_->is_fullscreen.load(std::memory_order_acquire) ? 1u : 0u;
     }
     out_state->last_frame_ms = last_frame_ms_;
+    return S_OK;
+}
+
+// IOpenScarlettFenceWaitDispatcher
+HRESULT STDMETHODCALLTYPE CommandQueueX::RegisterFenceCallback(
+    ID3D12Fence* fence,
+    UINT64 target_value,
+    FenceCompletionCallbackFn callback,
+    void* user_ctx,
+    uint64_t* out_registration_id) {
+    if (!fence_dispatcher_) return E_FAIL;
+    return fence_dispatcher_->RegisterCallback(
+        fence, target_value, callback, user_ctx, out_registration_id);
+}
+
+HRESULT STDMETHODCALLTYPE CommandQueueX::WaitForFenceValue(
+    ID3D12Fence* fence,
+    UINT64 target_value,
+    UINT timeout_ms) {
+    if (!fence_dispatcher_) return E_FAIL;
+    return fence_dispatcher_->WaitForFenceValue(fence, target_value, timeout_ms);
+}
+
+HRESULT STDMETHODCALLTYPE CommandQueueX::PumpFenceCallbacks(
+    uint32_t* out_dispatched_count) {
+    if (!fence_dispatcher_) return E_FAIL;
+    const uint32_t count = fence_dispatcher_->PumpReadyCallbacks();
+    if (out_dispatched_count) *out_dispatched_count = count;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE CommandQueueX::NotifyDeviceRemoved(HRESULT removed_reason) {
+    if (!fence_dispatcher_) return E_FAIL;
+    fence_dispatcher_->NotifyDeviceRemoved(removed_reason);
     return S_OK;
 }
 

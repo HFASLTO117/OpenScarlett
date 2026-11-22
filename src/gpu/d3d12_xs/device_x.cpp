@@ -488,9 +488,200 @@ size_t GetSubobjectStrideBytes(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type) noexcep
             return sizeof(StreamSubobjLayout<D3D12_DEPTH_STENCIL_DESC1>);
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING:
             return sizeof(StreamSubobjLayout<D3D12_VIEW_INSTANCING_DESC>);
+#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2:
+            return sizeof(StreamSubobjLayout<D3D12_DEPTH_STENCIL_DESC2>);
+#endif
+#ifdef __ID3D12Device11_INTERFACE_DEFINED__
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1:
+            return sizeof(StreamSubobjLayout<D3D12_RASTERIZER_DESC1>);
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2:
+            return sizeof(StreamSubobjLayout<D3D12_RASTERIZER_DESC2>);
+#endif
         default:
             return 0u;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 14: DXBC/DXIL PSV0 Mesh Topology & Stage Inspector (xbox-emulator #168, #176)
+// Public Microsoft DXIL Pipeline State Validation (PSV0) container spec:
+//   ShaderStage: 0=PS, 1=VS, 2=GS, 3=HS, 4=DS, 5=CS, 13=MS, 14=AS
+//   PSVRuntimeInfo0::MS.OutputTopology: 1=Point, 2=Line, 3=Triangle
+// ---------------------------------------------------------------------------
+bool ExtractDxbcPsv0Info(
+    const void* data,
+    size_t size,
+    uint8_t& out_stage,
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE& out_mesh_topo) noexcept {
+    out_stage = 0xFFu;
+    out_mesh_topo = D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED;
+    if (!data || size < 36u) return false;
+    const auto* b = static_cast<const uint8_t*>(data);
+    if (b[0] != 'D' || b[1] != 'X' || b[2] != 'B' || b[3] != 'C') return false;
+
+    uint32_t chunk_count = 0u;
+    std::memcpy(&chunk_count, b + 28u, sizeof(chunk_count));
+    if (chunk_count == 0u || chunk_count > 128u) return false;
+    if (32u + static_cast<size_t>(chunk_count) * 4u > size) return false;
+
+    for (uint32_t i = 0u; i < chunk_count; ++i) {
+        uint32_t off = 0u;
+        std::memcpy(&off, b + 32u + static_cast<size_t>(i) * 4u, sizeof(off));
+        if (off + 8u > size) continue;
+        if (b[off + 0u] == 'P' && b[off + 1u] == 'S' && b[off + 2u] == 'V' && b[off + 3u] == '0') {
+            uint32_t chunk_sz = 0u;
+            std::memcpy(&chunk_sz, b + off + 4u, sizeof(chunk_sz));
+            if (off + 8u + chunk_sz > size || chunk_sz < 4u) continue;
+            const uint8_t* psv = b + off + 8u;
+            uint32_t info_size = 0u;
+            std::memcpy(&info_size, psv, sizeof(info_size));
+            // PSVRuntimeInfo0 is 24 bytes (starts at psv + 4); PSVRuntimeInfo1 adds 12 bytes (ShaderStage at +24).
+            if (info_size >= 28u && chunk_sz >= 4u + 28u) {
+                const uint8_t* ri = psv + 4u;
+                out_stage = ri[24u];
+                if (out_stage == 13u) {
+                    // PSVRuntimeInfo0::MS layout (public DXIL spec):
+                    // [0..3]: GroupSharedBytesUsed, [4..7]: GroupSharedBytesDependentOnViewID,
+                    // [8..11]: PayloadSizeInBytes, [12..13]: MaxOutputVertices,
+                    // [14..15]: MaxOutputPrimitives, [16]: OutputTopology (or in byte 12..16 depending on version).
+                    // Check standard PSVRuntimeInfo0 MS struct:
+                    //   uint32 GroupSharedBytesUsed (0..3)
+                    //   uint32 GroupSharedBytesDependentOnViewID (4..7)
+                    //   uint32 PayloadSizeInBytes (8..11)
+                    //   uint16 MaxOutputVertices (12..13)
+                    //   uint16 MaxOutputPrimitives (14..15)
+                    //   Followed by PSVRuntimeInfo1 at offset 24:
+                    //   uint8 ShaderStage (24), uint8 UsesViewID (25),
+                    //   uint16 MaxVertexCount / SigInputVectors (26..27) ...
+                    //   Note: in DXIL PSVRuntimeInfo1, OutputTopology is stored in byte 26 (union with MaxVertexCount)
+                    //   for MS: 0=Undefined, 1=Point, 2=Line, 3=Triangle (or D3D_PRIMITIVE_TOPOLOGY: 1=Point, 2=Line, 3=Triangle).
+                    const uint8_t ms_topo = ri[26u] & 0x0Fu;
+                    if (ms_topo == 1u) {
+                        out_mesh_topo = D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT;
+                    } else if (ms_topo == 2u) {
+                        out_mesh_topo = D3D12_PRIMITIVE_TOPOLOGY_TYPE_LINE;
+                    } else if (ms_topo == 3u) {
+                        out_mesh_topo = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+                    } else {
+                        out_mesh_topo = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+                    }
+                }
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Reconcile fp16 / min16 half-precision varyings between VS output and PS input signatures (Leonida 81ec7f7).
+uint32_t LinkFp16HalfStageSignatures(
+    openscarlett::XboxParsedShaderContainer& vs_parsed,
+    openscarlett::XboxParsedShaderContainer& ps_parsed) noexcept {
+    uint32_t linked = 0u;
+    auto is_16bit_prec = [](uint32_t min_prec) noexcept -> bool {
+        // D3D_MIN_PRECISION: 1=FLOAT_16, 2=FLOAT_2_8, 4=SINT_16, 5=UINT_16, 0xF0=ANY_16
+        return min_prec == 1u || min_prec == 2u || min_prec == 4u || min_prec == 5u || min_prec == 0xF0u;
+    };
+    auto ps_attr_has_fp16_cntl = [&](uint32_t reg_idx) noexcept -> bool {
+        for (const auto& c : ps_parsed.reg_setup.ps_input_cntls) {
+            if (c.attr_index == reg_idx && c.fp16_interp) return true;
+        }
+        return false;
+    };
+
+    for (auto& vs_out : vs_parsed.output_signature) {
+        if (vs_out.system_value_type != 0u) continue;
+        for (auto& ps_in : ps_parsed.input_signature) {
+            if (ps_in.system_value_type != 0u) continue;
+            const bool sem_match =
+                EqualsAsciiCaseInsensitive(vs_out.semantic_name.c_str(), ps_in.semantic_name.c_str()) &&
+                vs_out.semantic_index == ps_in.semantic_index;
+            if (!sem_match) continue;
+
+            const bool vs_f16 = is_16bit_prec(vs_out.min_precision);
+            const bool ps_f16 = is_16bit_prec(ps_in.min_precision) || ps_attr_has_fp16_cntl(ps_in.register_index);
+            if (vs_f16 || ps_f16) {
+                // Harmonize precision & half-register masks across VS output and PS input so
+                // packed f16 halves link cleanly without Desktop D3D12 PSO signature mismatch.
+                const uint32_t target_prec = vs_f16 ? vs_out.min_precision : (ps_in.min_precision ? ps_in.min_precision : 1u);
+                bool changed = false;
+                if (vs_out.min_precision != target_prec) {
+                    vs_out.min_precision = target_prec;
+                    changed = true;
+                }
+                if (ps_in.min_precision != target_prec) {
+                    ps_in.min_precision = target_prec;
+                    changed = true;
+                }
+                if (vs_out.component_type != ps_in.component_type) {
+                    ps_in.component_type = vs_out.component_type;
+                    changed = true;
+                }
+                // Merge split low/high f16 half masks (e.g. .xy + .zw packed into one register)
+                const uint8_t combined_mask = static_cast<uint8_t>((vs_out.mask | ps_in.mask) & 0x0Fu);
+                if (combined_mask != 0u && (vs_out.mask != combined_mask || ps_in.mask != combined_mask)) {
+                    vs_out.mask = combined_mask;
+                    ps_in.mask = combined_mask;
+                    changed = true;
+                }
+                if (changed || (vs_f16 && ps_f16)) {
+                    ++linked;
+                }
+            }
+        }
+    }
+    return linked;
+}
+
+// Portable SEH-guarded guest CPU memory helpers (xbox-emulator #153).
+bool SafeCopyGuestMemory(void* dst, const void* src, size_t byte_count) noexcept {
+    if (!dst || !src || byte_count == 0u) return false;
+#if defined(_MSC_VER)
+    __try {
+        std::memcpy(dst, src, byte_count);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+#else
+    if (!IsReadableGuestVaRange(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(src)), byte_count)) {
+        return false;
+    }
+    std::memcpy(dst, src, byte_count);
+    return true;
+#endif
+}
+
+bool SafeHashGuestMemoryFnv1a64(const void* src, size_t byte_count, uint64_t& out_hash) noexcept {
+    out_hash = 14695981039346656037ull;
+    if (!src || byte_count == 0u) return false;
+#if defined(_MSC_VER)
+    __try {
+        const auto* p = static_cast<const uint8_t*>(src);
+        uint64_t h = 14695981039346656037ull;
+        for (size_t i = 0u; i < byte_count; ++i) {
+            h ^= static_cast<uint64_t>(p[i]);
+            h *= 1099511628211ull;
+        }
+        out_hash = h;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+#else
+    if (!IsReadableGuestVaRange(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(src)), byte_count)) {
+        return false;
+    }
+    const auto* p = static_cast<const uint8_t*>(src);
+    uint64_t h = 14695981039346656037ull;
+    for (size_t i = 0u; i < byte_count; ++i) {
+        h ^= static_cast<uint64_t>(p[i]);
+        h *= 1099511628211ull;
+    }
+    out_hash = h;
+    return true;
+#endif
 }
 
 D3D12_HEAP_FLAGS SanitizeXboxHeapFlags(D3D12_HEAP_FLAGS flags) noexcept {
@@ -1326,6 +1517,13 @@ DeviceX::DeviceX(
         (void)sampler_feedback_mgr_.Initialize(host_dev_);
         (void)query_accumulator_.Initialize(host_dev_);
         (void)openscarlett::FrameCaptureRecorder::Global().InitializeFromEnv();
+
+        // Sprint 14: Initialize live VRAM Residency Manager profile, DXGI Adapter3 memory info,
+        // and Sparse VRAM Window-0 isolator (Descriptor Heaps Window 0 vs Title Buffers Window 1+).
+        sparse_window_iso_ = openscarlett::CreateSparseVramWindowIsolator();
+        console_profile_ = openscarlett::SelectXboxConsoleMemoryProfileFromHostVram(
+            adapter_info_.dedicated_video_memory_bytes, nullptr);
+        (void)openscarlett::QueryHostAdapterVideoMemoryInfo(host_dev_, dxgi_mem_info_);
     }
 
     const uint32_t resolved_mode = ResolveEffectiveBackendMode();
@@ -1404,6 +1602,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::GetVulkanRoutingStats(
 
 void DeviceX::NotifyResourceDestroyed(ID3D12Resource* host_resource) noexcept {
     if (!host_resource) return;
+    UntrackLiveResidencyObject(static_cast<ID3D12Pageable*>(host_resource));
     sampler_feedback_mgr_.NotifyResourceDestroyed(host_resource);
     {
         std::lock_guard<std::mutex> lock(buffer_va_mutex_);
@@ -1442,8 +1641,19 @@ void DeviceX::NotifyResourceDestroyed(ID3D12Resource* host_resource) noexcept {
 
 void DeviceX::NotifyHeapDestroyed(ID3D12Heap* host_heap) noexcept {
     if (!host_heap) return;
+    UntrackLiveResidencyObject(static_cast<ID3D12Pageable*>(host_heap));
     std::lock_guard<std::mutex> lock(unified_mutex_);
     address_heaps_.erase(host_heap);
+}
+
+void DeviceX::NotifyDescriptorHeapDestroyed(ID3D12DescriptorHeap* host_heap) noexcept {
+    if (!host_heap) return;
+    std::lock_guard<std::mutex> lock(residency_mutex_);
+    auto it = desc_heap_window0_vas_.find(host_heap);
+    if (it != desc_heap_window0_vas_.end()) {
+        openscarlett::SparseVramFree(sparse_window_iso_, it->second);
+        desc_heap_window0_vas_.erase(it);
+    }
 }
 
 void DeviceX::NotifyPipelineDestroyed(ID3D12PipelineState* pso_key) noexcept {
@@ -1756,6 +1966,14 @@ DeviceX::~DeviceX() {
     }
     ReleaseAaaRuntimeObjects();
     ReleaseUnifiedMemoryObjects();
+    {
+        std::lock_guard<std::mutex> lock(residency_mutex_);
+        residency_entries_.clear();
+        residency_lru_.clear();
+        desc_heap_window0_vas_.clear();
+        openscarlett::DestroySparseVramWindowIsolator(sparse_window_iso_);
+        sparse_window_iso_ = nullptr;
+    }
 #ifdef __ID3D12Device9_INTERFACE_DEFINED__
     delete ext_proxy_;
     ext_proxy_ = nullptr;
@@ -1868,6 +2086,12 @@ HRESULT STDMETHODCALLTYPE DeviceX::QueryInterface(REFIID riid, void** ppvObject)
     }
     if (IsEqualIID(riid, IID_IOpenScarlettAaaRuntime)) {
         *ppvObject = static_cast<IOpenScarlettAaaRuntime*>(this);
+        AddRef();
+        RecordDev("ID3D12DeviceX::QueryInterface", 0, S_OK);
+        return S_OK;
+    }
+    if (IsEqualIID(riid, IID_IOpenScarlettVramResidencyControl)) {
+        *ppvObject = static_cast<IOpenScarlettVramResidencyControl*>(this);
         AddRef();
         RecordDev("ID3D12DeviceX::QueryInterface", 0, S_OK);
         return S_OK;
@@ -2262,6 +2486,8 @@ bool DeviceX::LiftXboxStageToHostBytecode(
         RecordDev("ID3D12DeviceX::MeshInferredRootBindings", 47, S_OK);
     }
 
+    const uint64_t stage_blob_hash = HashBytesFnv1a64(data, size);
+    std::mutex& lift_stripe = shader_lift_stripes_[stage_blob_hash & (kShaderLiftLockStripes - 1u)];
     const uint32_t highest_sm = adapter_info_.highest_shader_model ? adapter_info_.highest_shader_model : 0x60u;
 
     // 1. LIVE RayQuery bridge routing whenever image_bvh_intersect_ray / image_bvh64_intersect_ray is present.
@@ -2279,11 +2505,23 @@ bool DeviceX::LiftXboxStageToHostBytecode(
         const bool use_dxr11 = (backend == openscarlett::Rdna2RayQueryBackend::HardwareDxr11);
 
         const uint64_t cache_key =
-            HashBytesFnv1a64(data, size) ^
+            stage_blob_hash ^
             (static_cast<uint64_t>(highest_sm) << 33) ^
             (use_dxr11 ? 0xA5A50001ull : 0x5A5A0002ull);
         {
-            std::lock_guard<std::mutex> lock(shader_lift_mutex_);
+            std::shared_lock<std::shared_mutex> rlock(xbox_container_cache_mutex_);
+            auto it = xbox_container_dxil_cache_.find(cache_key);
+            if (it != xbox_container_dxil_cache_.end()) {
+                out_bytecode = it->second;
+                if (out_parsed) *out_parsed = std::move(parsed);
+                RecordDev("ID3D12DeviceX::RayQueryBridgeLift", 11, S_OK);
+                return true;
+            }
+        }
+
+        std::lock_guard<std::mutex> stripe_lock(lift_stripe);
+        {
+            std::shared_lock<std::shared_mutex> rlock(xbox_container_cache_mutex_);
             auto it = xbox_container_dxil_cache_.find(cache_key);
             if (it != xbox_container_dxil_cache_.end()) {
                 out_bytecode = it->second;
@@ -2310,9 +2548,6 @@ bool DeviceX::LiftXboxStageToHostBytecode(
             return false;
         }
         const std::string& src_hlsl = use_dxr11 ? rq_res.dxr11_hlsl : rq_res.compute_bvh4_hlsl;
-        // Hardware DXR 1.1 requires cs_6_5; Compute BVH4 fallback uses cs_6_5 DXIL on SM 6.5+
-        // hardware GPUs and cs_5_0 DXBC on WARP / pre-SM 6.5 adapters (matching
-        // Rdna2RayQueryExecutor and avoiding Windows 10 WARP DXIL nested-stack JIT hangs).
         const std::string target = use_dxr11
                                        ? std::string("cs_6_5")
                                        : ((highest_sm >= 0x65u && !adapter_info_.is_warp)
@@ -2322,7 +2557,7 @@ bool DeviceX::LiftXboxStageToHostBytecode(
             return false;
         }
         {
-            std::lock_guard<std::mutex> lock(shader_lift_mutex_);
+            std::unique_lock<std::shared_mutex> wlock(xbox_container_cache_mutex_);
             xbox_container_dxil_cache_[cache_key] = out_bytecode;
         }
         rayquery_bridge_lifts_.fetch_add(1ull, std::memory_order_relaxed);
@@ -2342,12 +2577,24 @@ bool DeviceX::LiftXboxStageToHostBytecode(
 
     if (needs_vs_iid_prologue || needs_paired_interp) {
         const uint64_t cache_key =
-            HashBytesFnv1a64(data, size) ^
+            stage_blob_hash ^
             (static_cast<uint64_t>(highest_sm) << 33) ^
             (mesh_has_payload ? 0x10101010ull : 0x20202020ull) ^
             (needs_paired_interp ? 0x33333333ull : 0ull);
         {
-            std::lock_guard<std::mutex> lock(shader_lift_mutex_);
+            std::shared_lock<std::shared_mutex> rlock(xbox_container_cache_mutex_);
+            auto it = xbox_container_dxil_cache_.find(cache_key);
+            if (it != xbox_container_dxil_cache_.end()) {
+                out_bytecode = it->second;
+                if (out_parsed) *out_parsed = std::move(parsed);
+                RecordDev("ID3D12DeviceX::XboxContainerLift", 10, S_OK);
+                return true;
+            }
+        }
+
+        std::lock_guard<std::mutex> stripe_lock(lift_stripe);
+        {
+            std::shared_lock<std::shared_mutex> rlock(xbox_container_cache_mutex_);
             auto it = xbox_container_dxil_cache_.find(cache_key);
             if (it != xbox_container_dxil_cache_.end()) {
                 out_bytecode = it->second;
@@ -2374,17 +2621,14 @@ bool DeviceX::LiftXboxStageToHostBytecode(
         xopts.lift_options.target_profile_override = target;
 
         openscarlett::XboxContainerLiftResult lift_res{};
-        {
-            std::lock_guard<std::mutex> lock(shader_lift_mutex_);
-            if (!openscarlett::LiftXboxShaderContainer(data, size, lift_res, xopts).ok()) {
-                return false;
-            }
+        if (!openscarlett::LiftXboxShaderContainer(data, size, lift_res, xopts).ok()) {
+            return false;
         }
         if (!CompileHlslWithSm50Fallback(lift_res.lift.hlsl_source, target, out_bytecode)) {
             return false;
         }
         {
-            std::lock_guard<std::mutex> lock(shader_lift_mutex_);
+            std::unique_lock<std::shared_mutex> wlock(xbox_container_cache_mutex_);
             xbox_container_dxil_cache_[cache_key] = out_bytecode;
         }
         xbox_container_lifts_.fetch_add(1ull, std::memory_order_relaxed);
@@ -2393,7 +2637,7 @@ bool DeviceX::LiftXboxStageToHostBytecode(
         return true;
     }
 
-    // 3. Standard ShaderCache path (preserves MemoryHit/DiskHit/AsyncCompile telemetry & disk cache).
+    // 3. Standard ShaderCache path using per-hash lock striping for parallel PSO compilation!
     openscarlett::ShaderCacheLiftRequest req{};
     req.highest_shader_model = highest_sm;
     req.mesh_has_payload = mesh_has_payload;
@@ -2403,7 +2647,7 @@ bool DeviceX::LiftXboxStageToHostBytecode(
     std::string diag;
     openscarlett::Status st;
     {
-        std::lock_guard<std::mutex> lift_lock(shader_lift_mutex_);
+        std::lock_guard<std::mutex> stripe_lock(lift_stripe);
         st = shader_cache_.GetOrLiftXboxShader(data, size, req, res, &diag);
     }
     if (!st.ok()) {
@@ -2467,7 +2711,8 @@ bool DeviceX::LiftXboxStageToSpirv(
 
     openscarlett::XboxContainerLiftResult lift_res{};
     {
-        std::lock_guard<std::mutex> lock(shader_lift_mutex_);
+        const uint64_t spv_hash = HashBytesFnv1a64(data, size);
+        std::lock_guard<std::mutex> stripe_lock(shader_lift_stripes_[spv_hash & (kShaderLiftLockStripes - 1u)]);
         if (!openscarlett::LiftXboxShaderContainer(data, size, lift_res, xopts).ok() ||
             lift_res.lift.spirv_words.empty()) {
             return false;
@@ -2566,6 +2811,21 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateGraphicsPipelineState(
             openscarlett::ParseFullXboxShaderContainer(pDesc->VS.pShaderBytecode, pDesc->VS.BytecodeLength, vs_parsed).ok();
         const bool has_ps_parsed = lift_ps &&
             openscarlett::ParseFullXboxShaderContainer(pDesc->PS.pShaderBytecode, pDesc->PS.BytecodeLength, ps_parsed).ok();
+
+        if (has_vs_parsed && has_ps_parsed) {
+            const uint32_t f16_links = LinkFp16HalfStageSignatures(vs_parsed, ps_parsed);
+            if (f16_links > 0u) {
+                pso_f16_links_reconciled_.fetch_add(f16_links, std::memory_order_relaxed);
+            }
+            openscarlett::XboxPsoInterpLinkageReport interp_report{};
+            (void)openscarlett::ValidateAndMatchStageInterpolation(vs_parsed, ps_parsed, interp_report);
+            pso_interp_validations_.fetch_add(1ull, std::memory_order_relaxed);
+            for (const auto& entry : interp_report.entries) {
+                if (entry.matched) {
+                    pso_interp_matches_.fetch_add(1ull, std::memory_order_relaxed);
+                }
+            }
+        }
 
         openscarlett::XboxRootSignatureDesc fallback_rs_desc{};
         bool has_fallback_rs = false;
@@ -2814,6 +3074,15 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateDescriptorHeap(
     if (FAILED(hr) || !host_heap) {
         RecordDev("ID3D12DeviceX::CreateDescriptorHeap", 14, hr);
         return hr;
+    }
+    if (pDescriptorHeapDesc && sparse_window_iso_) {
+        const uint64_t heap_bytes = std::max<uint64_t>(
+            65536ull, static_cast<uint64_t>(pDescriptorHeapDesc->NumDescriptors) * 64ull);
+        const uint64_t w0_va = openscarlett::SparseVramAllocateWindow0(sparse_window_iso_, heap_bytes);
+        if (w0_va != 0ull) {
+            std::lock_guard<std::mutex> lock(residency_mutex_);
+            desc_heap_window0_vas_[host_heap] = w0_va;
+        }
     }
     auto* proxy = new (std::nothrow) DescriptorHeapXProxy(this, host_heap);
     host_heap->Release();
@@ -3206,14 +3475,57 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommittedResource(
         return hr;
     }
     *ppvResource = nullptr;
+
+    // Sprint 14: Live VramResidencyManager budget enforcement + LRU eviction + L0 system-RAM spill fallback.
+    const uint64_t est_bytes = desc_ptr ? EstimateResourceVramBytes(*desc_ptr) : 0ull;
+    const bool allow_l0_spill =
+        (pHeapProperties != nullptr) &&
+        (pHeapProperties->Type == D3D12_HEAP_TYPE_DEFAULT) &&
+        (desc_ptr != nullptr) &&
+        ((desc_ptr->Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) == 0);
+    bool should_spill_l0 = false;
+    if (est_bytes > 0ull && pHeapProperties && pHeapProperties->Type == D3D12_HEAP_TYPE_DEFAULT) {
+        PrepareResidencyBudgetForAllocation(est_bytes, allow_l0_spill, should_spill_l0);
+    }
+
+    D3D12_HEAP_PROPERTIES eff_heap_props{};
+    const D3D12_HEAP_PROPERTIES* eff_heap_ptr = pHeapProperties;
+    bool did_l0_spill = false;
+    if (should_spill_l0 && pHeapProperties) {
+        eff_heap_props = *pHeapProperties;
+        eff_heap_props.Type = D3D12_HEAP_TYPE_CUSTOM;
+        eff_heap_props.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
+        eff_heap_props.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+        eff_heap_ptr = &eff_heap_props;
+    }
+
     ID3D12Resource* host_res = nullptr;
     HRESULT hr = host_dev_->CreateCommittedResource(
-        pHeapProperties, clean_heap_flags, desc_ptr, InitialResourceState,
+        eff_heap_ptr, clean_heap_flags, desc_ptr, InitialResourceState,
         clear_ptr, OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
+    if (should_spill_l0 && SUCCEEDED(hr) && host_res) {
+        did_l0_spill = true;
+    } else if (should_spill_l0 && (FAILED(hr) || !host_res)) {
+        // Adapter rejected L0 custom pool for this resource; fall back cleanly to original heap props.
+        hr = host_dev_->CreateCommittedResource(
+            pHeapProperties, clean_heap_flags, desc_ptr, InitialResourceState,
+            clear_ptr, OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
+    }
     if (FAILED(hr) || !host_res) {
         RecordDev("ID3D12DeviceX::CreateCommittedResource", 27, hr);
         return hr;
     }
+    const uint64_t sparse_va =
+        (sparse_window_iso_ && est_bytes > 0ull)
+            ? openscarlett::SparseVramAllocateTitleWindow(sparse_window_iso_, est_bytes)
+            : 0ull;
+    TrackLiveResidencyObject(
+        static_cast<ID3D12Pageable*>(host_res),
+        est_bytes,
+        pHeapProperties ? pHeapProperties->Type : D3D12_HEAP_TYPE_DEFAULT,
+        /*is_placed_suballocation=*/false,
+        did_l0_spill,
+        sparse_va);
     TrackFallbackResource(host_res, did_r9g9b9e5_fallback);
     if (desc_ptr) {
         TrackBufferVaResource(host_res, *desc_ptr, 0ull);
@@ -3258,14 +3570,50 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateHeap(
         return hr;
     }
     *ppvHeap = nullptr;
+    const uint64_t req_heap_bytes = heap_ptr ? heap_ptr->SizeInBytes : 0ull;
+    const bool allow_l0_spill =
+        (heap_ptr != nullptr) && (heap_ptr->Properties.Type == D3D12_HEAP_TYPE_DEFAULT);
+    bool should_spill_l0 = false;
+    if (req_heap_bytes > 0ull && allow_l0_spill) {
+        PrepareResidencyBudgetForAllocation(req_heap_bytes, true, should_spill_l0);
+    }
+
+    D3D12_HEAP_DESC eff_heap{};
+    const D3D12_HEAP_DESC* eff_heap_ptr = heap_ptr;
+    bool did_l0_spill = false;
+    if (should_spill_l0 && heap_ptr) {
+        eff_heap = *heap_ptr;
+        eff_heap.Properties.Type = D3D12_HEAP_TYPE_CUSTOM;
+        eff_heap.Properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
+        eff_heap.Properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+        eff_heap_ptr = &eff_heap;
+    }
+
     ID3D12Heap* host_heap = nullptr;
     HRESULT hr = host_dev_->CreateHeap(
-        heap_ptr, OS_D3D12_IID(ID3D12Heap), reinterpret_cast<void**>(&host_heap));
+        eff_heap_ptr, OS_D3D12_IID(ID3D12Heap), reinterpret_cast<void**>(&host_heap));
+    if (should_spill_l0 && SUCCEEDED(hr) && host_heap) {
+        did_l0_spill = true;
+    } else if (should_spill_l0 && (FAILED(hr) || !host_heap)) {
+        hr = host_dev_->CreateHeap(
+            heap_ptr, OS_D3D12_IID(ID3D12Heap), reinterpret_cast<void**>(&host_heap));
+    }
     if (FAILED(hr) || !host_heap) {
         RecordDev("ID3D12DeviceX::CreateHeap", 28, hr);
         return hr;
     }
-    auto* proxy = new (std::nothrow) HeapXProxy(this, host_heap, 0ull);
+    const uint64_t sparse_va =
+        (sparse_window_iso_ && req_heap_bytes > 0ull)
+            ? openscarlett::SparseVramAllocateTitleWindow(sparse_window_iso_, req_heap_bytes)
+            : 0ull;
+    TrackLiveResidencyObject(
+        static_cast<ID3D12Pageable*>(host_heap),
+        req_heap_bytes,
+        heap_ptr ? heap_ptr->Properties.Type : D3D12_HEAP_TYPE_DEFAULT,
+        /*is_placed_suballocation=*/false,
+        did_l0_spill,
+        sparse_va);
+    auto* proxy = new (std::nothrow) HeapXProxy(this, host_heap, sparse_va);
     host_heap->Release();
     if (!proxy) {
         RecordDev("ID3D12DeviceX::CreateHeap", 28, E_OUTOFMEMORY);
@@ -3336,6 +3684,20 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResource(
     if (FAILED(hr) || !host_res) {
         RecordDev("ID3D12DeviceX::CreatePlacedResource", 29, hr);
         return hr;
+    }
+    if (desc_ptr) {
+        const uint64_t est_bytes = EstimateResourceVramBytes(*desc_ptr);
+        const uint64_t sparse_va =
+            (sparse_window_iso_ && est_bytes > 0ull)
+                ? openscarlett::SparseVramAllocateTitleWindow(sparse_window_iso_, est_bytes)
+                : 0ull;
+        TrackLiveResidencyObject(
+            static_cast<ID3D12Pageable*>(host_res),
+            est_bytes,
+            D3D12_HEAP_TYPE_DEFAULT,
+            /*is_placed_suballocation=*/!placed_used_shadow_fallback,
+            /*spilled_to_l0=*/false,
+            sparse_va);
     }
     TrackFallbackResource(host_res, did_r9g9b9e5_fallback);
     if (did_r9g9b9e5_fallback) {
@@ -3472,18 +3834,114 @@ HRESULT STDMETHODCALLTYPE DeviceX::OpenSharedHandleByName(
 
 HRESULT STDMETHODCALLTYPE DeviceX::MakeResident(
     UINT NumObjects, ID3D12Pageable* const* ppObjects) {
+    if (NumObjects == 0u) {
+        RecordDev("ID3D12DeviceX::MakeResident", 34, S_OK);
+        return S_OK;
+    }
+    if (!ppObjects) {
+        RecordDev("ID3D12DeviceX::MakeResident", 34, E_INVALIDARG);
+        return E_INVALIDARG;
+    }
     std::vector<ID3D12Pageable*> unwrapped;
     UnwrapPageables(NumObjects, ppObjects, unwrapped);
+    for (ID3D12Pageable* obj : unwrapped) {
+        if (!obj) {
+            RecordDev("ID3D12DeviceX::MakeResident", 34, E_INVALIDARG);
+            return E_INVALIDARG;
+        }
+    }
+
+    // Proactively enforce budget before making evicted pageables resident.
+    {
+        std::lock_guard<std::mutex> lock(residency_mutex_);
+        uint64_t bytes_to_page_in = 0ull;
+        for (ID3D12Pageable* obj : unwrapped) {
+            auto it = residency_entries_.find(obj);
+            if (it != residency_entries_.end() && !it->second.is_resident && !it->second.is_placed_suballocation) {
+                bytes_to_page_in += it->second.size_bytes;
+            }
+        }
+        const uint64_t budget = EffectiveResidencyBudgetBytesLocked();
+        if (bytes_to_page_in > 0ull && budget > 0ull && tracked_resident_bytes_ + bytes_to_page_in > budget) {
+            const uint64_t over = (tracked_resident_bytes_ + bytes_to_page_in) - budget;
+            (void)EvictLruVictimsLocked(over, unwrapped[0]);
+        }
+    }
+
     const HRESULT hr = host_dev_->MakeResident(NumObjects, unwrapped.data());
+    if (SUCCEEDED(hr)) {
+        std::lock_guard<std::mutex> lock(residency_mutex_);
+        ++make_resident_calls_;
+        for (ID3D12Pageable* obj : unwrapped) {
+            auto it = residency_entries_.find(obj);
+            if (it != residency_entries_.end()) {
+                auto& e = it->second;
+                ++e.residency_ref_count;
+                if (!e.is_resident) {
+                    e.is_resident = true;
+                    if (!e.is_placed_suballocation) {
+                        if (tracked_evicted_bytes_ >= e.size_bytes) tracked_evicted_bytes_ -= e.size_bytes;
+                        else tracked_evicted_bytes_ = 0ull;
+                        tracked_resident_bytes_ += e.size_bytes;
+                    }
+                }
+                if (e.in_lru) {
+                    residency_lru_.erase(e.lru_it);
+                }
+                residency_lru_.push_front(obj);
+                e.lru_it = residency_lru_.begin();
+                e.in_lru = true;
+            }
+        }
+    }
     RecordDev("ID3D12DeviceX::MakeResident", 34, hr);
     return hr;
 }
 
 HRESULT STDMETHODCALLTYPE DeviceX::Evict(
     UINT NumObjects, ID3D12Pageable* const* ppObjects) {
+    if (NumObjects == 0u) {
+        RecordDev("ID3D12DeviceX::Evict", 35, S_OK);
+        return S_OK;
+    }
+    if (!ppObjects) {
+        RecordDev("ID3D12DeviceX::Evict", 35, E_INVALIDARG);
+        return E_INVALIDARG;
+    }
     std::vector<ID3D12Pageable*> unwrapped;
     UnwrapPageables(NumObjects, ppObjects, unwrapped);
+    for (ID3D12Pageable* obj : unwrapped) {
+        if (!obj) {
+            RecordDev("ID3D12DeviceX::Evict", 35, E_INVALIDARG);
+            return E_INVALIDARG;
+        }
+    }
     const HRESULT hr = host_dev_->Evict(NumObjects, unwrapped.data());
+    if (SUCCEEDED(hr)) {
+        std::lock_guard<std::mutex> lock(residency_mutex_);
+        ++evict_calls_;
+        for (ID3D12Pageable* obj : unwrapped) {
+            auto it = residency_entries_.find(obj);
+            if (it != residency_entries_.end()) {
+                auto& e = it->second;
+                if (e.residency_ref_count > 0u) {
+                    --e.residency_ref_count;
+                }
+                if (e.residency_ref_count == 0u && e.is_resident) {
+                    e.is_resident = false;
+                    if (e.in_lru) {
+                        residency_lru_.erase(e.lru_it);
+                        e.in_lru = false;
+                    }
+                    if (!e.is_placed_suballocation) {
+                        if (tracked_resident_bytes_ >= e.size_bytes) tracked_resident_bytes_ -= e.size_bytes;
+                        else tracked_resident_bytes_ = 0ull;
+                        tracked_evicted_bytes_ += e.size_bytes;
+                    }
+                }
+            }
+        }
+    }
     RecordDev("ID3D12DeviceX::Evict", 35, hr);
     return hr;
 }
@@ -3518,7 +3976,10 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateFence(
 HRESULT STDMETHODCALLTYPE DeviceX::GetDeviceRemovedReason() {
     const HRESULT host_hr = host_dev_ ? host_dev_->GetDeviceRemovedReason() : S_OK;
     if (FAILED(host_hr)) {
-        device_removed_reason_.store(host_hr, std::memory_order_release);
+        const HRESULT prev = device_removed_reason_.exchange(host_hr, std::memory_order_acq_rel);
+        if (SUCCEEDED(prev)) {
+            CommandQueueX::NotifyDeviceRemovedForDevice(this, host_hr);
+        }
         RecordDev("ID3D12DeviceX::GetDeviceRemovedReason", 37, host_hr);
         return host_hr;
     }
@@ -3705,12 +4166,47 @@ HRESULT STDMETHODCALLTYPE DeviceX::SetEventOnMultipleFenceCompletion(
 HRESULT STDMETHODCALLTYPE DeviceX::SetResidencyPriority(
     UINT NumObjects, ID3D12Pageable* const* ppObjects,
     const D3D12_RESIDENCY_PRIORITY* pPriorities) {
+    if (NumObjects == 0u) {
+        RecordDev("ID3D12DeviceX::SetResidencyPriority", 46, S_OK);
+        return S_OK;
+    }
+    if (!ppObjects || !pPriorities) {
+        RecordDev("ID3D12DeviceX::SetResidencyPriority", 46, E_INVALIDARG);
+        return E_INVALIDARG;
+    }
     std::vector<ID3D12Pageable*> unwrapped;
     UnwrapPageables(NumObjects, ppObjects, unwrapped);
-    const HRESULT hr = host_dev1_
-                           ? host_dev1_->SetResidencyPriority(
-                                 NumObjects, unwrapped.data(), pPriorities)
-                           : E_NOINTERFACE;
+    for (ID3D12Pageable* obj : unwrapped) {
+        if (!obj) {
+            RecordDev("ID3D12DeviceX::SetResidencyPriority", 46, E_INVALIDARG);
+            return E_INVALIDARG;
+        }
+    }
+    HRESULT hr = host_dev1_
+                     ? host_dev1_->SetResidencyPriority(
+                           NumObjects, unwrapped.data(), pPriorities)
+                     : E_NOINTERFACE;
+    // Some WDDM/WARP drivers return E_ACCESSDENIED for D3D12_RESIDENCY_PRIORITY_MAXIMUM when non-elevated;
+    // retry with HIGH so Xbox titles don't abort on standard Windows user accounts (Leonida #2864).
+    if (hr == E_ACCESSDENIED && host_dev1_) {
+        std::vector<D3D12_RESIDENCY_PRIORITY> clamped(pPriorities, pPriorities + NumObjects);
+        for (auto& pr : clamped) {
+            if (pr == D3D12_RESIDENCY_PRIORITY_MAXIMUM) {
+                pr = D3D12_RESIDENCY_PRIORITY_HIGH;
+            }
+        }
+        hr = host_dev1_->SetResidencyPriority(NumObjects, unwrapped.data(), clamped.data());
+    }
+    if (SUCCEEDED(hr)) {
+        std::lock_guard<std::mutex> lock(residency_mutex_);
+        ++set_priority_calls_;
+        for (UINT i = 0u; i < NumObjects; ++i) {
+            auto it = residency_entries_.find(unwrapped[i]);
+            if (it != residency_entries_.end()) {
+                it->second.priority = pPriorities[i];
+            }
+        }
+    }
     RecordDev("ID3D12DeviceX::SetResidencyPriority", 46, hr);
     return hr;
 }
@@ -3729,96 +4225,287 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePipelineState(
         return hr;
     }
 
-    // Pass 1: zero-allocation scan of subobject stream for Xbox shaders, SPIR-V, and wrapped root signatures.
+    // Pass 1: Scan stream, decode Xbox Series subobject tags (AS=23, MS=24, ext 25..30 -> Desktop tags),
+    // detect mesh pipelines, Xbox shaders, SPIR-V, wrapped root sigs, and VS/PS containers.
     const auto* raw_stream = static_cast<const uint8_t*>(pDesc->pPipelineStateSubobjectStream);
     const size_t total_bytes = static_cast<size_t>(pDesc->SizeInBytes);
     constexpr size_t kBytecodeOffset = offsetof(StreamSubobjLayout<D3D12_SHADER_BYTECODE>, value);
     constexpr size_t kRootSigOffset = offsetof(StreamSubobjLayout<ID3D12RootSignature*>, value);
 
+    struct DecodedStreamEntry {
+        size_t src_offset = 0u;
+        size_t src_stride = 0u;
+        uint32_t raw_tag = 0u;
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE desktop_type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE;
+        bool drop_subobject = false;
+        bool remapped_from_xbox = false;
+        bool convert_ds2_to_ds1 = false;
+        bool convert_rast_ext_to_rast0 = false;
+    };
+
+    auto looks_like_mesh_shader_blob = [](const D3D12_SHADER_BYTECODE& bc) noexcept -> bool {
+        if (!bc.pShaderBytecode || bc.BytecodeLength < 16u) return false;
+        if (openscarlett::IsXboxShaderContainerBlob(bc.pShaderBytecode, bc.BytecodeLength)) {
+            openscarlett::XboxParsedShaderContainer tmp{};
+            if (openscarlett::ParseFullXboxShaderContainer(bc.pShaderBytecode, bc.BytecodeLength, tmp).ok() &&
+                tmp.has_xs2 && tmp.xs2.stage == openscarlett::ShaderStage::Mesh) {
+                return true;
+            }
+        }
+        uint8_t psv_stage = 0xFFu;
+        D3D12_PRIMITIVE_TOPOLOGY_TYPE topo = D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED;
+        if (ExtractDxbcPsv0Info(bc.pShaderBytecode, bc.BytecodeLength, psv_stage, topo) &&
+            psv_stage == 13u) {
+            return true;
+        }
+        return false;
+    };
+
+    bool stream_uses_xbox_tags = false;
+    bool needs_stream_rebuild = false;
     bool has_xbox_shader = false;
     bool has_spirv_shader = false;
     bool has_wrapped_root_sig = false;
     bool has_root_sig_subobj = false;
     bool root_sig_is_null = false;
-    size_t root_sig_subobj_pos = 0u;
     bool has_as_stage = false;
-    uint32_t shader_stage_count = 0;
+    bool has_ms_stage = false;
+    bool has_prim_topo_subobj = false;
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE stream_prim_topo = D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED;
+    D3D12_PRIMITIVE_TOPOLOGY_TYPE psv0_mesh_topo = D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED;
+    uint32_t shader_stage_count = 0u;
     VulkanPipelineInfo spirv_stream_pi{};
     openscarlett::XboxParsedShaderContainer stream_vs_parsed{}, stream_ps_parsed{};
     bool has_stream_vs_parsed = false;
     bool has_stream_ps_parsed = false;
 
-    size_t pos = 0;
-    while (pos + sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) <= total_bytes) {
-        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE sub_type{};
-        std::memcpy(&sub_type, raw_stream + pos, sizeof(sub_type));
-        const size_t stride = GetSubobjectStrideBytes(sub_type);
-        if (stride == 0u || pos + stride > total_bytes) {
+    std::vector<DecodedStreamEntry> entries;
+    entries.reserve(16u);
+
+    size_t pos = 0u;
+    while (pos + sizeof(uint32_t) <= total_bytes) {
+        uint32_t raw_tag = 0u;
+        std::memcpy(&raw_tag, raw_stream + pos, sizeof(raw_tag));
+
+        DecodedStreamEntry ent{};
+        ent.src_offset = pos;
+        ent.raw_tag = raw_tag;
+
+        if (raw_tag == 23u) {
+            // Xbox Series AS subobject tag (23) -> Desktop D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS (24).
+            stream_uses_xbox_tags = true;
+            ent.desktop_type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS;
+            ent.src_stride = sizeof(StreamSubobjLayout<D3D12_SHADER_BYTECODE>);
+            ent.remapped_from_xbox = true;
+            needs_stream_rebuild = true;
+            pso_remapped_as_tags_.fetch_add(1ull, std::memory_order_relaxed);
+        } else if (raw_tag == 24u) {
+            ent.src_stride = sizeof(StreamSubobjLayout<D3D12_SHADER_BYTECODE>);
+            bool is_xbox_ms = stream_uses_xbox_tags;
+            if (!is_xbox_ms && pos + ent.src_stride <= total_bytes) {
+                D3D12_SHADER_BYTECODE bc{};
+                std::memcpy(&bc, raw_stream + pos + kBytecodeOffset, sizeof(bc));
+                if (looks_like_mesh_shader_blob(bc)) {
+                    is_xbox_ms = true;
+                    stream_uses_xbox_tags = true;
+                }
+            }
+            if (is_xbox_ms) {
+                ent.desktop_type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS;
+                ent.remapped_from_xbox = true;
+                needs_stream_rebuild = true;
+                pso_remapped_ms_tags_.fetch_add(1ull, std::memory_order_relaxed);
+            } else {
+                ent.desktop_type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS;
+            }
+        } else if (raw_tag >= 25u && raw_tag <= 30u && stream_uses_xbox_tags) {
+            // Xbox Series extension subobjects 25..30 (xbox-emulator #168):
+            //  25 = Xbox DEPTH_STENCIL2 -> remap to Desktop DEPTH_STENCIL1 (safe on Win10 & Win11)
+            //  26 = Xbox RASTERIZER1 / 27 = Xbox RASTERIZER2 -> remap/down-convert to Desktop RASTERIZER
+            //  28..30 = Xbox-only extension flags (UINT payload) -> strip cleanly on Desktop D3D12.
+            ent.remapped_from_xbox = true;
+            needs_stream_rebuild = true;
+            pso_remapped_ext_tags_.fetch_add(1ull, std::memory_order_relaxed);
+            if (raw_tag == 25u) {
+#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+                const size_t ds2_stride = sizeof(StreamSubobjLayout<D3D12_DEPTH_STENCIL_DESC2>);
+                if (pos + ds2_stride <= total_bytes) {
+                    ent.desktop_type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1;
+                    ent.src_stride = ds2_stride;
+                    ent.convert_ds2_to_ds1 = true;
+                } else
+#endif
+                {
+                    ent.src_stride = sizeof(StreamSubobjLayout<UINT>);
+                    ent.drop_subobject = true;
+                }
+            } else if (raw_tag == 26u || raw_tag == 27u) {
+#ifdef __ID3D12Device11_INTERFACE_DEFINED__
+                const size_t r_stride = (raw_tag == 26u)
+                                            ? sizeof(StreamSubobjLayout<D3D12_RASTERIZER_DESC1>)
+                                            : sizeof(StreamSubobjLayout<D3D12_RASTERIZER_DESC2>);
+                if (pos + r_stride <= total_bytes) {
+                    ent.desktop_type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER;
+                    ent.src_stride = r_stride;
+                    ent.convert_rast_ext_to_rast0 = true;
+                } else
+#endif
+                {
+                    ent.src_stride = sizeof(StreamSubobjLayout<UINT>);
+                    ent.drop_subobject = true;
+                }
+            } else {
+                // Xbox-only extension subobjects 28..30 (e.g. Xbox pipeline flags/modes): drop safely.
+                ent.src_stride = sizeof(StreamSubobjLayout<UINT>);
+                ent.drop_subobject = true;
+            }
+        } else if (raw_tag > 28u && raw_tag <= 30u) {
+            // Standalone Xbox extension subobjects 29..30 even without AS/MS tags.
+            ent.remapped_from_xbox = true;
+            ent.drop_subobject = true;
+            ent.src_stride = sizeof(StreamSubobjLayout<UINT>);
+            needs_stream_rebuild = true;
+            pso_remapped_ext_tags_.fetch_add(1ull, std::memory_order_relaxed);
+        } else {
+            ent.desktop_type = static_cast<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE>(raw_tag);
+            ent.src_stride = GetSubobjectStrideBytes(ent.desktop_type);
+        }
+
+        if (ent.src_stride == 0u || pos + ent.src_stride > total_bytes) {
             break;
         }
-        if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE) {
-            has_root_sig_subobj = true;
-            root_sig_subobj_pos = pos;
-            ID3D12RootSignature* rs = nullptr;
-            std::memcpy(&rs, raw_stream + pos + kRootSigOffset, sizeof(rs));
-            if (!rs) {
-                root_sig_is_null = true;
-            } else if (UnwrapRootSignature(rs) != rs) {
-                has_wrapped_root_sig = true;
-            }
-        } else if (IsShaderSubobjectType(sub_type)) {
-            D3D12_SHADER_BYTECODE bc{};
-            std::memcpy(&bc, raw_stream + pos + kBytecodeOffset, sizeof(bc));
-            if (bc.pShaderBytecode && bc.BytecodeLength > 0) {
-                ++shader_stage_count;
-                if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS) {
-                    has_as_stage = true;
+
+        const D3D12_PIPELINE_STATE_SUBOBJECT_TYPE sub_type = ent.desktop_type;
+        if (!ent.drop_subobject) {
+            if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE) {
+                has_root_sig_subobj = true;
+                ID3D12RootSignature* rs = nullptr;
+                std::memcpy(&rs, raw_stream + pos + kRootSigOffset, sizeof(rs));
+                if (!rs) {
+                    root_sig_is_null = true;
+                } else if (UnwrapRootSignature(rs) != rs) {
+                    has_wrapped_root_sig = true;
                 }
-                if (openscarlett::IsXboxShaderContainerBlob(bc.pShaderBytecode, bc.BytecodeLength)) {
-                    has_xbox_shader = true;
-                    if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS) {
-                        has_stream_vs_parsed = openscarlett::ParseFullXboxShaderContainer(
-                            bc.pShaderBytecode, bc.BytecodeLength, stream_vs_parsed).ok();
-                    } else if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS) {
-                        has_stream_ps_parsed = openscarlett::ParseFullXboxShaderContainer(
-                            bc.pShaderBytecode, bc.BytecodeLength, stream_ps_parsed).ok();
+            } else if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY) {
+                has_prim_topo_subobj = true;
+                std::memcpy(&stream_prim_topo,
+                            raw_stream + pos + offsetof(StreamSubobjLayout<D3D12_PRIMITIVE_TOPOLOGY_TYPE>, value),
+                            sizeof(stream_prim_topo));
+            } else if (IsShaderSubobjectType(sub_type)) {
+                D3D12_SHADER_BYTECODE bc{};
+                std::memcpy(&bc, raw_stream + pos + kBytecodeOffset, sizeof(bc));
+                if (bc.pShaderBytecode && bc.BytecodeLength > 0u) {
+                    ++shader_stage_count;
+                    if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS) {
+                        has_as_stage = true;
+                    } else if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS) {
+                        has_ms_stage = true;
+                        uint8_t psv_st = 0xFFu;
+                        D3D12_PRIMITIVE_TOPOLOGY_TYPE topo = D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED;
+                        if (ExtractDxbcPsv0Info(bc.pShaderBytecode, bc.BytecodeLength, psv_st, topo) &&
+                            topo != D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED) {
+                            psv0_mesh_topo = topo;
+                        }
                     }
-                }
-                if (vulkan_routing_active_ && IsRawSpirvBytecode(bc.pShaderBytecode, bc.BytecodeLength)) {
-                    has_spirv_shader = true;
-                    auto words = CopySpirvWords(bc.pShaderBytecode, bc.BytecodeLength);
-                    openscarlett::SpirvValidationInfo val{};
-                    if (openscarlett::VulkanBackend::ValidateSpirvBinary(words, &val).ok()) {
-                        if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS) {
-                            spirv_stream_pi.as_spirv = std::move(words);
-                            if (!val.entry_point_name.empty()) spirv_stream_pi.as_entry = val.entry_point_name;
-                        } else if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS) {
-                            spirv_stream_pi.is_mesh = true;
-                            spirv_stream_pi.ms_spirv = std::move(words);
-                            if (!val.entry_point_name.empty()) spirv_stream_pi.ms_entry = val.entry_point_name;
-                        } else if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS) {
-                            spirv_stream_pi.vs_spirv = std::move(words);
-                            if (!val.entry_point_name.empty()) spirv_stream_pi.vs_entry = val.entry_point_name;
+                    if (openscarlett::IsXboxShaderContainerBlob(bc.pShaderBytecode, bc.BytecodeLength)) {
+                        has_xbox_shader = true;
+                        if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS) {
+                            has_stream_vs_parsed = openscarlett::ParseFullXboxShaderContainer(
+                                bc.pShaderBytecode, bc.BytecodeLength, stream_vs_parsed).ok();
                         } else if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS) {
-                            spirv_stream_pi.ps_spirv = std::move(words);
-                            if (!val.entry_point_name.empty()) spirv_stream_pi.ps_entry = val.entry_point_name;
-                        } else if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS) {
-                            spirv_stream_pi.is_compute = true;
-                            spirv_stream_pi.cs_spirv = std::move(words);
-                            if (!val.entry_point_name.empty()) spirv_stream_pi.cs_entry = val.entry_point_name;
+                            has_stream_ps_parsed = openscarlett::ParseFullXboxShaderContainer(
+                                bc.pShaderBytecode, bc.BytecodeLength, stream_ps_parsed).ok();
+                        }
+                    }
+                    if (vulkan_routing_active_ && IsRawSpirvBytecode(bc.pShaderBytecode, bc.BytecodeLength)) {
+                        has_spirv_shader = true;
+                        auto words = CopySpirvWords(bc.pShaderBytecode, bc.BytecodeLength);
+                        openscarlett::SpirvValidationInfo val{};
+                        if (openscarlett::VulkanBackend::ValidateSpirvBinary(words, &val).ok()) {
+                            if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS) {
+                                spirv_stream_pi.as_spirv = std::move(words);
+                                if (!val.entry_point_name.empty()) spirv_stream_pi.as_entry = val.entry_point_name;
+                            } else if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS) {
+                                spirv_stream_pi.is_mesh = true;
+                                spirv_stream_pi.ms_spirv = std::move(words);
+                                if (!val.entry_point_name.empty()) spirv_stream_pi.ms_entry = val.entry_point_name;
+                            } else if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS) {
+                                spirv_stream_pi.vs_spirv = std::move(words);
+                                if (!val.entry_point_name.empty()) spirv_stream_pi.vs_entry = val.entry_point_name;
+                            } else if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS) {
+                                spirv_stream_pi.ps_spirv = std::move(words);
+                                if (!val.entry_point_name.empty()) spirv_stream_pi.ps_entry = val.entry_point_name;
+                            } else if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS) {
+                                spirv_stream_pi.is_compute = true;
+                                spirv_stream_pi.cs_spirv = std::move(words);
+                                if (!val.entry_point_name.empty()) spirv_stream_pi.cs_entry = val.entry_point_name;
+                            }
                         }
                     }
                 }
-            }
-        } else if (vulkan_routing_active_ &&
-                   sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS) {
-            D3D12_RT_FORMAT_ARRAY rts{};
-            std::memcpy(&rts, raw_stream + pos + offsetof(StreamSubobjLayout<D3D12_RT_FORMAT_ARRAY>, value), sizeof(rts));
-            if (rts.NumRenderTargets > 0u) {
-                spirv_stream_pi.color_format = DxgiToVulkanColorFormat(rts.RTFormats[0]);
+            } else if (vulkan_routing_active_ &&
+                       sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS) {
+                D3D12_RT_FORMAT_ARRAY rts{};
+                std::memcpy(&rts, raw_stream + pos + offsetof(StreamSubobjLayout<D3D12_RT_FORMAT_ARRAY>, value), sizeof(rts));
+                if (rts.NumRenderTargets > 0u) {
+                    spirv_stream_pi.color_format = DxgiToVulkanColorFormat(rts.RTFormats[0]);
+                }
             }
         }
-        pos += stride;
+
+        entries.push_back(ent);
+        pos += ent.src_stride;
+    }
+
+    // Mesh shader PSO hardening (xbox-emulator #176): drop empty legacy VS/HS/DS/GS stages
+    // (and empty INPUT_LAYOUT / IB_STRIP_CUT_VALUE) that Desktop D3D12 rejects on Mesh PSOs.
+    if (has_ms_stage) {
+        for (auto& ent : entries) {
+            if (ent.drop_subobject) continue;
+            if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS ||
+                ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS ||
+                ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS ||
+                ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS) {
+                D3D12_SHADER_BYTECODE bc{};
+                std::memcpy(&bc, raw_stream + ent.src_offset + kBytecodeOffset, sizeof(bc));
+                if (!bc.pShaderBytecode || bc.BytecodeLength == 0u) {
+                    ent.drop_subobject = true;
+                    needs_stream_rebuild = true;
+                    pso_dropped_legacy_stages_.fetch_add(1ull, std::memory_order_relaxed);
+                }
+            } else if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT) {
+                D3D12_INPUT_LAYOUT_DESC il{};
+                std::memcpy(&il, raw_stream + ent.src_offset + offsetof(StreamSubobjLayout<D3D12_INPUT_LAYOUT_DESC>, value), sizeof(il));
+                if (il.NumElements == 0u || !il.pInputElementDescs) {
+                    ent.drop_subobject = true;
+                    needs_stream_rebuild = true;
+                    pso_dropped_legacy_stages_.fetch_add(1ull, std::memory_order_relaxed);
+                }
+            } else if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_IB_STRIP_CUT_VALUE) {
+                ent.drop_subobject = true;
+                needs_stream_rebuild = true;
+                pso_dropped_legacy_stages_.fetch_add(1ull, std::memory_order_relaxed);
+            }
+        }
+        if (!has_prim_topo_subobj || stream_prim_topo == D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED) {
+            needs_stream_rebuild = true;
+        }
+    }
+
+    // Wire f16 half linkage + ValidateAndMatchStageInterpolation into CreatePipelineState!
+    if (has_stream_vs_parsed && has_stream_ps_parsed) {
+        const uint32_t f16_links = LinkFp16HalfStageSignatures(stream_vs_parsed, stream_ps_parsed);
+        if (f16_links > 0u) {
+            pso_f16_links_reconciled_.fetch_add(f16_links, std::memory_order_relaxed);
+        }
+        openscarlett::XboxPsoInterpLinkageReport interp_report{};
+        (void)openscarlett::ValidateAndMatchStageInterpolation(stream_vs_parsed, stream_ps_parsed, interp_report);
+        pso_interp_validations_.fetch_add(1ull, std::memory_order_relaxed);
+        for (const auto& ie : interp_report.entries) {
+            if (ie.matched) {
+                pso_interp_matches_.fetch_add(1ull, std::memory_order_relaxed);
+            }
+        }
     }
 
     if (vulkan_routing_active_ && has_spirv_shader) {
@@ -3845,46 +4532,128 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePipelineState(
 
     const D3D12_PIPELINE_STATE_STREAM_DESC* final_stream_desc = pDesc;
     D3D12_PIPELINE_STATE_STREAM_DESC lifted_stream{};
-    std::vector<uint64_t> cloned_words;
+    std::vector<uint64_t> rebuilt_words;
     std::deque<std::vector<uint8_t>> lifted_blobs;
 
-    if (has_xbox_shader || has_wrapped_root_sig) {
-        // Pass 2: clone stream into pointer-aligned buffer, unwrap root sigs & lift Xbox shaders.
-        const size_t base_words = (total_bytes + sizeof(uint64_t) - 1u) / sizeof(uint64_t);
-        cloned_words.assign(base_words, 0ull);
-        auto* cloned_bytes = reinterpret_cast<uint8_t*>(cloned_words.data());
-        std::memcpy(cloned_bytes, raw_stream, total_bytes);
+    if (has_xbox_shader || has_wrapped_root_sig || needs_stream_rebuild) {
+        // Pass 2: Rebuild a clean pointer-aligned Desktop D3D12 subobject stream.
+        std::vector<uint8_t> rebuilt_bytes;
+        rebuilt_bytes.reserve(total_bytes + 128u);
+
+        auto append_aligned = [&](const void* src, size_t len) -> size_t {
+            const size_t aligned = (rebuilt_bytes.size() + sizeof(void*) - 1u) & ~(sizeof(void*) - 1u);
+            if (aligned > rebuilt_bytes.size()) {
+                rebuilt_bytes.resize(aligned, 0u);
+            }
+            const size_t start = rebuilt_bytes.size();
+            rebuilt_bytes.resize(start + len, 0u);
+            if (src && len > 0u) {
+                std::memcpy(rebuilt_bytes.data() + start, src, len);
+            }
+            return start;
+        };
 
         const uint32_t highest_sm = adapter_info_.highest_shader_model ? adapter_info_.highest_shader_model : 0x60u;
         const bool prefer_dxil_standin = (shader_stage_count > 1u && highest_sm >= 0x60u);
 
         openscarlett::XboxRootSignatureDesc fallback_rs_desc{};
         bool has_fallback_rs = false;
+        size_t rebuilt_rs_pos = SIZE_MAX;
+        size_t rebuilt_topo_pos = SIZE_MAX;
 
-        pos = 0;
-        while (pos + sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) <= total_bytes) {
-            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE sub_type{};
-            std::memcpy(&sub_type, cloned_bytes + pos, sizeof(sub_type));
-            const size_t stride = GetSubobjectStrideBytes(sub_type);
-            if (stride == 0u || pos + stride > total_bytes) {
-                break;
+        for (const auto& ent : entries) {
+            if (ent.drop_subobject) continue;
+
+            if (ent.convert_ds2_to_ds1) {
+#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+                StreamSubobjLayout<D3D12_DEPTH_STENCIL_DESC2> ds2{};
+                std::memcpy(&ds2, raw_stream + ent.src_offset, sizeof(ds2));
+                StreamSubobjLayout<D3D12_DEPTH_STENCIL_DESC1> ds1{};
+                ds1.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1;
+                ds1.value.DepthEnable = ds2.value.DepthEnable;
+                ds1.value.DepthWriteMask = ds2.value.DepthWriteMask;
+                ds1.value.DepthFunc = ds2.value.DepthFunc;
+                ds1.value.StencilEnable = ds2.value.StencilEnable;
+                ds1.value.StencilReadMask = ds2.value.FrontFace.StencilReadMask;
+                ds1.value.StencilWriteMask = ds2.value.FrontFace.StencilWriteMask;
+                ds1.value.FrontFace.StencilFailOp = ds2.value.FrontFace.StencilFailOp;
+                ds1.value.FrontFace.StencilDepthFailOp = ds2.value.FrontFace.StencilDepthFailOp;
+                ds1.value.FrontFace.StencilPassOp = ds2.value.FrontFace.StencilPassOp;
+                ds1.value.FrontFace.StencilFunc = ds2.value.FrontFace.StencilFunc;
+                ds1.value.BackFace.StencilFailOp = ds2.value.BackFace.StencilFailOp;
+                ds1.value.BackFace.StencilDepthFailOp = ds2.value.BackFace.StencilDepthFailOp;
+                ds1.value.BackFace.StencilPassOp = ds2.value.BackFace.StencilPassOp;
+                ds1.value.BackFace.StencilFunc = ds2.value.BackFace.StencilFunc;
+                ds1.value.DepthBoundsTestEnable = ds2.value.DepthBoundsTestEnable;
+                (void)append_aligned(&ds1, sizeof(ds1));
+#endif
+                continue;
             }
-            if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE) {
+            if (ent.convert_rast_ext_to_rast0) {
+#ifdef __ID3D12Device11_INTERFACE_DEFINED__
+                StreamSubobjLayout<D3D12_RASTERIZER_DESC> r0{};
+                r0.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER;
+                if (ent.raw_tag == 26u) {
+                    StreamSubobjLayout<D3D12_RASTERIZER_DESC1> r1{};
+                    std::memcpy(&r1, raw_stream + ent.src_offset, sizeof(r1));
+                    r0.value.FillMode = r1.value.FillMode;
+                    r0.value.CullMode = r1.value.CullMode;
+                    r0.value.FrontCounterClockwise = r1.value.FrontCounterClockwise;
+                    r0.value.DepthBias = static_cast<INT>(r1.value.DepthBias);
+                    r0.value.DepthBiasClamp = r1.value.DepthBiasClamp;
+                    r0.value.SlopeScaledDepthBias = r1.value.SlopeScaledDepthBias;
+                    r0.value.DepthClipEnable = r1.value.DepthClipEnable;
+                    r0.value.MultisampleEnable = r1.value.MultisampleEnable;
+                    r0.value.AntialiasedLineEnable = r1.value.AntialiasedLineEnable;
+                    r0.value.ForcedSampleCount = r1.value.ForcedSampleCount;
+                    r0.value.ConservativeRaster = r1.value.ConservativeRaster;
+                } else {
+                    StreamSubobjLayout<D3D12_RASTERIZER_DESC2> r2{};
+                    std::memcpy(&r2, raw_stream + ent.src_offset, sizeof(r2));
+                    r0.value.FillMode = r2.value.FillMode;
+                    r0.value.CullMode = r2.value.CullMode;
+                    r0.value.FrontCounterClockwise = r2.value.FrontCounterClockwise;
+                    r0.value.DepthBias = static_cast<INT>(r2.value.DepthBias);
+                    r0.value.DepthBiasClamp = r2.value.DepthBiasClamp;
+                    r0.value.SlopeScaledDepthBias = r2.value.SlopeScaledDepthBias;
+                    r0.value.DepthClipEnable = r2.value.DepthClipEnable;
+                    r0.value.MultisampleEnable = (r2.value.LineRasterizationMode == D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_WIDE ||
+                                                  r2.value.LineRasterizationMode == D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_NARROW)
+                                                     ? TRUE
+                                                     : FALSE;
+                    r0.value.AntialiasedLineEnable =
+                        (r2.value.LineRasterizationMode == D3D12_LINE_RASTERIZATION_MODE_ALPHA_ANTIALIASED) ? TRUE : FALSE;
+                    r0.value.ForcedSampleCount = r2.value.ForcedSampleCount;
+                    r0.value.ConservativeRaster = r2.value.ConservativeRaster;
+                }
+                (void)append_aligned(&r0, sizeof(r0));
+#endif
+                continue;
+            }
+
+            const size_t dst_pos = append_aligned(raw_stream + ent.src_offset, ent.src_stride);
+            // Patch desktop subobject type tag (e.g. Xbox AS=23->24, MS=24->25).
+            std::memcpy(rebuilt_bytes.data() + dst_pos, &ent.desktop_type, sizeof(ent.desktop_type));
+
+            if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE) {
+                rebuilt_rs_pos = dst_pos;
                 ID3D12RootSignature* rs = nullptr;
-                std::memcpy(&rs, cloned_bytes + pos + kRootSigOffset, sizeof(rs));
+                std::memcpy(&rs, rebuilt_bytes.data() + dst_pos + kRootSigOffset, sizeof(rs));
                 ID3D12RootSignature* unwrapped_rs = UnwrapRootSignature(rs);
                 if (unwrapped_rs != rs) {
-                    std::memcpy(cloned_bytes + pos + kRootSigOffset, &unwrapped_rs, sizeof(unwrapped_rs));
+                    std::memcpy(rebuilt_bytes.data() + dst_pos + kRootSigOffset, &unwrapped_rs, sizeof(unwrapped_rs));
                 }
-            } else if (has_xbox_shader && IsShaderSubobjectType(sub_type)) {
+            } else if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY) {
+                rebuilt_topo_pos = dst_pos;
+            } else if (has_xbox_shader && IsShaderSubobjectType(ent.desktop_type)) {
                 D3D12_SHADER_BYTECODE bc{};
-                std::memcpy(&bc, cloned_bytes + pos + kBytecodeOffset, sizeof(bc));
-                if (bc.pShaderBytecode && bc.BytecodeLength > 0 &&
+                std::memcpy(&bc, rebuilt_bytes.data() + dst_pos + kBytecodeOffset, sizeof(bc));
+                if (bc.pShaderBytecode && bc.BytecodeLength > 0u &&
                     openscarlett::IsXboxShaderContainerBlob(bc.pShaderBytecode, bc.BytecodeLength)) {
                     const openscarlett::XboxParsedShaderContainer* paired = nullptr;
-                    if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS && has_stream_ps_parsed) {
+                    if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS && has_stream_ps_parsed) {
                         paired = &stream_ps_parsed;
-                    } else if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS && has_stream_vs_parsed) {
+                    } else if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS && has_stream_vs_parsed) {
                         paired = &stream_vs_parsed;
                     }
                     std::vector<uint8_t> host_bc;
@@ -3895,10 +4664,18 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePipelineState(
                         RecordDev("ID3D12DeviceX::CreatePipelineState", 47, E_INVALIDARG);
                         return E_INVALIDARG;
                     }
-                    // Prefer MS/AS/CS inferred or embedded root signature when stream omitted ROOT_SIGNATURE
+                    if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS &&
+                        psv0_mesh_topo == D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED) {
+                        uint8_t lifted_stage = 0xFFu;
+                        D3D12_PRIMITIVE_TOPOLOGY_TYPE lifted_topo = D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED;
+                        if (ExtractDxbcPsv0Info(host_bc.data(), host_bc.size(), lifted_stage, lifted_topo) &&
+                            lifted_topo != D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED) {
+                            psv0_mesh_topo = lifted_topo;
+                        }
+                    }
                     if (!has_fallback_rs ||
-                        sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS ||
-                        sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS) {
+                        ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS ||
+                        ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS) {
                         if (stage_parsed.root_signature.present) {
                             fallback_rs_desc = stage_parsed.root_signature;
                             has_fallback_rs = true;
@@ -3910,37 +4687,56 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePipelineState(
                     lifted_blobs.push_back(std::move(host_bc));
                     bc.pShaderBytecode = lifted_blobs.back().data();
                     bc.BytecodeLength = lifted_blobs.back().size();
-                    std::memcpy(cloned_bytes + pos + kBytecodeOffset, &bc, sizeof(bc));
+                    std::memcpy(rebuilt_bytes.data() + dst_pos + kBytecodeOffset, &bc, sizeof(bc));
                 }
             }
-            pos += stride;
         }
 
-        // If stream omitted ROOT_SIGNATURE (or passed nullptr) alongside an Xbox Mesh/Compute/Graphics
-        // container without RTS0, synthesize & inject a host root signature from inferred bindings!
-        size_t final_size_bytes = total_bytes;
+        // Match mesh PSO primitive topology from PSV0 metadata when missing/unspecified (xbox-emulator #176).
+        if (has_ms_stage &&
+            (!has_prim_topo_subobj || stream_prim_topo == D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED)) {
+            const D3D12_PRIMITIVE_TOPOLOGY_TYPE resolved_topo =
+                (psv0_mesh_topo != D3D12_PRIMITIVE_TOPOLOGY_TYPE_UNDEFINED)
+                    ? psv0_mesh_topo
+                    : D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            if (rebuilt_topo_pos != SIZE_MAX) {
+                std::memcpy(
+                    rebuilt_bytes.data() + rebuilt_topo_pos +
+                        offsetof(StreamSubobjLayout<D3D12_PRIMITIVE_TOPOLOGY_TYPE>, value),
+                    &resolved_topo,
+                    sizeof(resolved_topo));
+            } else {
+                StreamSubobjLayout<D3D12_PRIMITIVE_TOPOLOGY_TYPE> topo_sub{};
+                topo_sub.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY;
+                topo_sub.value = resolved_topo;
+                (void)append_aligned(&topo_sub, sizeof(topo_sub));
+            }
+            pso_inferred_mesh_topologies_.fetch_add(1ull, std::memory_order_relaxed);
+        }
+
+        // If stream omitted ROOT_SIGNATURE (or passed nullptr) alongside an Xbox container
+        // without RTS0, synthesize & inject a host root signature from inferred bindings!
         if ((!has_root_sig_subobj || root_sig_is_null) && has_fallback_rs) {
             ID3D12RootSignature* synth_rs = SynthesizeHostRootSignatureFromXboxDesc(fallback_rs_desc);
             if (synth_rs) {
-                if (has_root_sig_subobj && root_sig_is_null) {
-                    std::memcpy(cloned_bytes + root_sig_subobj_pos + kRootSigOffset, &synth_rs, sizeof(synth_rs));
+                if (rebuilt_rs_pos != SIZE_MAX && root_sig_is_null) {
+                    std::memcpy(rebuilt_bytes.data() + rebuilt_rs_pos + kRootSigOffset, &synth_rs, sizeof(synth_rs));
                 } else {
                     StreamSubobjLayout<ID3D12RootSignature*> rs_sub{};
                     rs_sub.type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE;
                     rs_sub.value = synth_rs;
-                    const size_t aligned_end =
-                        (final_size_bytes + sizeof(void*) - 1u) & ~(sizeof(void*) - 1u);
-                    const size_t new_total = aligned_end + sizeof(rs_sub);
-                    cloned_words.resize((new_total + sizeof(uint64_t) - 1u) / sizeof(uint64_t), 0ull);
-                    cloned_bytes = reinterpret_cast<uint8_t*>(cloned_words.data());
-                    std::memcpy(cloned_bytes + aligned_end, &rs_sub, sizeof(rs_sub));
-                    final_size_bytes = new_total;
+                    (void)append_aligned(&rs_sub, sizeof(rs_sub));
                 }
             }
         }
 
-        lifted_stream.SizeInBytes = final_size_bytes;
-        lifted_stream.pPipelineStateSubobjectStream = cloned_bytes;
+        const size_t word_count = (rebuilt_bytes.size() + sizeof(uint64_t) - 1u) / sizeof(uint64_t);
+        rebuilt_words.assign(word_count, 0ull);
+        if (!rebuilt_bytes.empty()) {
+            std::memcpy(rebuilt_words.data(), rebuilt_bytes.data(), rebuilt_bytes.size());
+        }
+        lifted_stream.SizeInBytes = rebuilt_bytes.size();
+        lifted_stream.pPipelineStateSubobjectStream = rebuilt_words.data();
         final_stream_desc = &lifted_stream;
     }
 
@@ -3967,38 +4763,31 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePipelineState(
         VulkanPipelineInfo vk_pi = std::move(spirv_stream_pi);
         vk_pi.is_spirv_direct = false;
         bool has_any = false;
-        size_t sp_pos = 0u;
-        while (sp_pos + sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) <= total_bytes) {
-            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE sub_type{};
-            std::memcpy(&sub_type, raw_stream + sp_pos, sizeof(sub_type));
-            const size_t stride = GetSubobjectStrideBytes(sub_type);
-            if (stride == 0u || sp_pos + stride > total_bytes) break;
-            if (IsShaderSubobjectType(sub_type)) {
-                D3D12_SHADER_BYTECODE bc{};
-                std::memcpy(&bc, raw_stream + sp_pos + kBytecodeOffset, sizeof(bc));
-                if (bc.pShaderBytecode && bc.BytecodeLength > 0u &&
-                    openscarlett::IsXboxShaderContainerBlob(bc.pShaderBytecode, bc.BytecodeLength)) {
-                    std::vector<uint32_t> spv;
-                    if (LiftXboxStageToSpirv(bc.pShaderBytecode, bc.BytecodeLength,
-                                             has_as_stage, nullptr, spv)) {
-                        has_any = true;
-                        if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS) {
-                            vk_pi.as_spirv = std::move(spv);
-                        } else if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS) {
-                            vk_pi.is_mesh = true;
-                            vk_pi.ms_spirv = std::move(spv);
-                        } else if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS) {
-                            vk_pi.vs_spirv = std::move(spv);
-                        } else if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS) {
-                            vk_pi.ps_spirv = std::move(spv);
-                        } else if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS) {
-                            vk_pi.is_compute = true;
-                            vk_pi.cs_spirv = std::move(spv);
-                        }
+        for (const auto& ent : entries) {
+            if (ent.drop_subobject || !IsShaderSubobjectType(ent.desktop_type)) continue;
+            D3D12_SHADER_BYTECODE bc{};
+            std::memcpy(&bc, raw_stream + ent.src_offset + kBytecodeOffset, sizeof(bc));
+            if (bc.pShaderBytecode && bc.BytecodeLength > 0u &&
+                openscarlett::IsXboxShaderContainerBlob(bc.pShaderBytecode, bc.BytecodeLength)) {
+                std::vector<uint32_t> spv;
+                if (LiftXboxStageToSpirv(bc.pShaderBytecode, bc.BytecodeLength,
+                                         has_as_stage, nullptr, spv)) {
+                    has_any = true;
+                    if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS) {
+                        vk_pi.as_spirv = std::move(spv);
+                    } else if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS) {
+                        vk_pi.is_mesh = true;
+                        vk_pi.ms_spirv = std::move(spv);
+                    } else if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS) {
+                        vk_pi.vs_spirv = std::move(spv);
+                    } else if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS) {
+                        vk_pi.ps_spirv = std::move(spv);
+                    } else if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS) {
+                        vk_pi.is_compute = true;
+                        vk_pi.cs_spirv = std::move(spv);
                     }
                 }
             }
-            sp_pos += stride;
         }
         if (has_any) {
             std::lock_guard<std::mutex> lock(vk_state_mutex_);
@@ -4082,13 +4871,76 @@ HRESULT STDMETHODCALLTYPE DeviceX::OpenExistingHeapFromFileMapping(
 HRESULT STDMETHODCALLTYPE DeviceX::EnqueueMakeResident(
     D3D12_RESIDENCY_FLAGS Flags, UINT NumObjects, ID3D12Pageable* const* ppObjects,
     ID3D12Fence* pFenceToSignal, UINT64 FenceValueToSignal) {
+    if (!pFenceToSignal) {
+        RecordDev("ID3D12DeviceX::EnqueueMakeResident", 50, E_INVALIDARG);
+        return E_INVALIDARG;
+    }
+    if (NumObjects == 0u) {
+        ID3D12Fence* host_fence = UnwrapFence(pFenceToSignal);
+        const HRESULT hr = host_fence ? host_fence->Signal(FenceValueToSignal) : E_INVALIDARG;
+        RecordDev("ID3D12DeviceX::EnqueueMakeResident", 50, hr);
+        return hr;
+    }
+    if (!ppObjects) {
+        RecordDev("ID3D12DeviceX::EnqueueMakeResident", 50, E_INVALIDARG);
+        return E_INVALIDARG;
+    }
     std::vector<ID3D12Pageable*> unwrapped;
     UnwrapPageables(NumObjects, ppObjects, unwrapped);
+    for (ID3D12Pageable* obj : unwrapped) {
+        if (!obj) {
+            RecordDev("ID3D12DeviceX::EnqueueMakeResident", 50, E_INVALIDARG);
+            return E_INVALIDARG;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(residency_mutex_);
+        uint64_t bytes_needed = 0ull;
+        for (ID3D12Pageable* obj : unwrapped) {
+            auto it = residency_entries_.find(obj);
+            if (it != residency_entries_.end() && !it->second.is_resident && !it->second.is_placed_suballocation) {
+                bytes_needed += it->second.size_bytes;
+            }
+        }
+        const uint64_t budget = EffectiveResidencyBudgetBytesLocked();
+        if (bytes_needed > 0ull && budget > 0ull && tracked_resident_bytes_ + bytes_needed > budget) {
+            if ((Flags & D3D12_RESIDENCY_FLAG_DENY_OVERBUDGET) != 0) {
+                RecordDev("ID3D12DeviceX::EnqueueMakeResident", 50, E_OUTOFMEMORY);
+                return E_OUTOFMEMORY;
+            }
+            (void)EvictLruVictimsLocked((tracked_resident_bytes_ + bytes_needed) - budget, unwrapped[0]);
+        }
+    }
     const HRESULT hr = host_dev3_
                            ? host_dev3_->EnqueueMakeResident(
                                  Flags, NumObjects, unwrapped.data(),
                                  UnwrapFence(pFenceToSignal), FenceValueToSignal)
                            : E_NOINTERFACE;
+    if (SUCCEEDED(hr)) {
+        std::lock_guard<std::mutex> lock(residency_mutex_);
+        ++enqueue_make_resident_calls_;
+        for (ID3D12Pageable* obj : unwrapped) {
+            auto it = residency_entries_.find(obj);
+            if (it != residency_entries_.end()) {
+                auto& e = it->second;
+                ++e.residency_ref_count;
+                if (!e.is_resident) {
+                    e.is_resident = true;
+                    if (!e.is_placed_suballocation) {
+                        if (tracked_evicted_bytes_ >= e.size_bytes) tracked_evicted_bytes_ -= e.size_bytes;
+                        else tracked_evicted_bytes_ = 0ull;
+                        tracked_resident_bytes_ += e.size_bytes;
+                    }
+                }
+                if (e.in_lru) {
+                    residency_lru_.erase(e.lru_it);
+                }
+                residency_lru_.push_front(obj);
+                e.lru_it = residency_lru_.begin();
+                e.in_lru = true;
+            }
+        }
+    }
     RecordDev("ID3D12DeviceX::EnqueueMakeResident", 50, hr);
     return hr;
 }
@@ -4180,6 +5032,20 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommittedResource1(
         RecordDev("ID3D12DeviceX::CreateCommittedResource1", 53, hr);
         return hr;
     }
+    if (desc_ptr) {
+        const uint64_t est_bytes = EstimateResourceVramBytes(*desc_ptr);
+        const uint64_t sparse_va =
+            (sparse_window_iso_ && est_bytes > 0ull)
+                ? openscarlett::SparseVramAllocateTitleWindow(sparse_window_iso_, est_bytes)
+                : 0ull;
+        TrackLiveResidencyObject(
+            static_cast<ID3D12Pageable*>(host_res),
+            est_bytes,
+            pHeapProperties ? pHeapProperties->Type : D3D12_HEAP_TYPE_DEFAULT,
+            /*is_placed_suballocation=*/false,
+            /*spilled_to_l0=*/false,
+            sparse_va);
+    }
     TrackFallbackResource(host_res, did_r9g9b9e5_fallback);
     if (vulkan_routing_active_ && pHeapProperties && desc_ptr) {
         TrackVulkanResource(host_res, pHeapProperties->Type, *desc_ptr);
@@ -4228,7 +5094,19 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateHeap1(
         RecordDev("ID3D12DeviceX::CreateHeap1", 54, hr);
         return hr;
     }
-    auto* proxy = new (std::nothrow) HeapXProxy(this, host_heap, 0ull);
+    const uint64_t req_heap_bytes = heap_ptr ? heap_ptr->SizeInBytes : 0ull;
+    const uint64_t sparse_va =
+        (sparse_window_iso_ && req_heap_bytes > 0ull)
+            ? openscarlett::SparseVramAllocateTitleWindow(sparse_window_iso_, req_heap_bytes)
+            : 0ull;
+    TrackLiveResidencyObject(
+        static_cast<ID3D12Pageable*>(host_heap),
+        req_heap_bytes,
+        heap_ptr ? heap_ptr->Properties.Type : D3D12_HEAP_TYPE_DEFAULT,
+        /*is_placed_suballocation=*/false,
+        /*spilled_to_l0=*/false,
+        sparse_va);
+    auto* proxy = new (std::nothrow) HeapXProxy(this, host_heap, sparse_va);
     host_heap->Release();
     if (!proxy) {
         RecordDev("ID3D12DeviceX::CreateHeap1", 54, E_OUTOFMEMORY);
@@ -4380,16 +5258,20 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateLifetimeTracker(
 }
 
 void STDMETHODCALLTYPE DeviceX::RemoveDevice() {
-    device_removed_reason_.store(DXGI_ERROR_DEVICE_REMOVED, std::memory_order_release);
+    HRESULT final_reason = DXGI_ERROR_DEVICE_REMOVED;
+    device_removed_reason_.store(final_reason, std::memory_order_release);
     if (host_dev5_) {
         host_dev5_->RemoveDevice();
     }
     if (host_dev_) {
         const HRESULT host_hr = host_dev_->GetDeviceRemovedReason();
         if (FAILED(host_hr)) {
-            device_removed_reason_.store(host_hr, std::memory_order_release);
+            final_reason = host_hr;
+            device_removed_reason_.store(final_reason, std::memory_order_release);
         }
     }
+    // Wake all blocked FenceWaitDispatcher waits and pending fence callbacks immediately (Leonida #1933).
+    CommandQueueX::NotifyDeviceRemovedForDevice(this, final_reason);
     RecordDev("ID3D12DeviceX::RemoveDevice", 58, S_OK);
 }
 
@@ -4806,6 +5688,18 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommittedResource2(
     if (SUCCEEDED(hr) && host_res && ppvResource) {
         const D3D12_RESOURCE_DESC d0 = desc1_ptr ? Desc1ToDesc0(*desc1_ptr) : D3D12_RESOURCE_DESC{};
         if (desc1_ptr) {
+            const uint64_t est_bytes = EstimateResourceVramBytes(d0);
+            const uint64_t sparse_va =
+                (sparse_window_iso_ && est_bytes > 0ull)
+                    ? openscarlett::SparseVramAllocateTitleWindow(sparse_window_iso_, est_bytes)
+                    : 0ull;
+            TrackLiveResidencyObject(
+                static_cast<ID3D12Pageable*>(host_res),
+                est_bytes,
+                pHeapProperties ? pHeapProperties->Type : D3D12_HEAP_TYPE_DEFAULT,
+                /*is_placed_suballocation=*/false,
+                /*spilled_to_l0=*/false,
+                sparse_va);
             TrackBufferVaResource(host_res, d0, 0ull);
         }
         if (pDesc) {
@@ -4862,6 +5756,18 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResource1(
     if (SUCCEEDED(hr) && host_res && ppvResource) {
         const D3D12_RESOURCE_DESC d0 = desc1_ptr ? Desc1ToDesc0(*desc1_ptr) : D3D12_RESOURCE_DESC{};
         if (desc1_ptr) {
+            const uint64_t est_bytes = EstimateResourceVramBytes(d0);
+            const uint64_t sparse_va =
+                (sparse_window_iso_ && est_bytes > 0ull)
+                    ? openscarlett::SparseVramAllocateTitleWindow(sparse_window_iso_, est_bytes)
+                    : 0ull;
+            TrackLiveResidencyObject(
+                static_cast<ID3D12Pageable*>(host_res),
+                est_bytes,
+                D3D12_HEAP_TYPE_DEFAULT,
+                /*is_placed_suballocation=*/true,
+                /*spilled_to_l0=*/false,
+                sparse_va);
             TrackBufferVaResource(host_res, d0, 0ull);
         }
         if (pDesc) {
@@ -5068,6 +5974,20 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResourceX(
         return hr;
     }
 
+    {
+        const uint64_t est_bytes = EstimateResourceVramBytes(clean_desc);
+        const uint64_t sparse_va =
+            (sparse_window_iso_ && est_bytes > 0ull)
+                ? openscarlett::SparseVramAllocateTitleWindow(sparse_window_iso_, est_bytes)
+                : 0ull;
+        TrackLiveResidencyObject(
+            static_cast<ID3D12Pageable*>(host_res),
+            est_bytes,
+            D3D12_HEAP_TYPE_DEFAULT,
+            /*is_placed_suballocation=*/false,
+            /*spilled_to_l0=*/false,
+            sparse_va);
+    }
     TrackFallbackResource(host_res, did_r9g9b9e5_fallback);
     TrackBufferVaResource(host_res, clean_desc, VirtualAddress);
     {
@@ -5385,10 +6305,12 @@ bool DeviceX::RefreshDirtyUnifiedResources() noexcept {
             }
         } else if (m.byte_size <= (64ull * 1024ull * 1024ull) &&
                    IsReadableGuestVaRange(m.guest_va, m.byte_size)) {
-            const uint64_t cur_hash = HashBytesFnv1a64(
-                reinterpret_cast<const void*>(static_cast<uintptr_t>(m.guest_va)),
-                static_cast<size_t>(m.byte_size));
-            if (!m.has_uploaded_once || cur_hash != m.last_uploaded_hash) {
+            uint64_t cur_hash = 0ull;
+            if (SafeHashGuestMemoryFnv1a64(
+                    reinterpret_cast<const void*>(static_cast<uintptr_t>(m.guest_va)),
+                    static_cast<size_t>(m.byte_size),
+                    cur_hash) &&
+                (!m.has_uploaded_once || cur_hash != m.last_uploaded_hash)) {
                 modified = true;
             }
         }
@@ -5756,7 +6678,11 @@ HRESULT STDMETHODCALLTYPE DeviceX::FlushDirtyUnifiedTextures(
         const auto* src_base =
             reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(item.mapping.guest_va));
         if (item.mapping.byte_size <= (64ull * 1024ull * 1024ull)) {
-            item.snapshot_hash = HashBytesFnv1a64(src_base, static_cast<size_t>(item.mapping.byte_size));
+            uint64_t snap_h = 0ull;
+            if (!SafeHashGuestMemoryFnv1a64(src_base, static_cast<size_t>(item.mapping.byte_size), snap_h)) {
+                continue;
+            }
+            item.snapshot_hash = snap_h;
         }
 
         if (item.skip_gpu_copy_native_cpu_heap) {
@@ -5764,8 +6690,10 @@ HRESULT STDMETHODCALLTYPE DeviceX::FlushDirtyUnifiedTextures(
             continue;
         }
         if (item.res_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-            std::memcpy(dst_base + item.buffer_upload_offset, src_base,
-                        static_cast<size_t>(item.copy_bytes));
+            if (!SafeCopyGuestMemory(dst_base + item.buffer_upload_offset, src_base,
+                                     static_cast<size_t>(item.copy_bytes))) {
+                continue;
+            }
             uploaded_indices.push_back(idx);
             gpu_copy_indices.push_back(idx);
         } else if (item.res_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
@@ -5773,7 +6701,8 @@ HRESULT STDMETHODCALLTYPE DeviceX::FlushDirtyUnifiedTextures(
                    item.res_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
             const size_t slices = item.footprints.size();
             uint64_t src_slice_offset = 0ull;
-            for (size_t s = 0; s < slices; ++s) {
+            bool copy_ok = true;
+            for (size_t s = 0; s < slices && copy_ok; ++s) {
                 const uint64_t row_bytes = item.row_sizes[s];
                 const uint64_t src_row_pitch =
                     (item.mapping.row_pitch_bytes >= row_bytes)
@@ -5786,22 +6715,27 @@ HRESULT STDMETHODCALLTYPE DeviceX::FlushDirtyUnifiedTextures(
                      item.footprints[s].Footprint.Depth > 0u)
                         ? item.footprints[s].Footprint.Depth
                         : 1u;
-                for (UINT z = 0u; z < depth; ++z) {
+                for (UINT z = 0u; z < depth && copy_ok; ++z) {
                     for (UINT y = 0u; y < item.num_rows[s]; ++y) {
                         const uint64_t row_idx = static_cast<uint64_t>(z) * item.num_rows[s] + y;
                         const uint64_t src_off = src_slice_offset + row_idx * src_row_pitch;
                         if (src_off + row_bytes <= item.mapping.byte_size) {
-                            std::memcpy(
-                                dst_slice + static_cast<size_t>(row_idx) * static_cast<size_t>(dst_row_pitch),
-                                src_base + src_off,
-                                static_cast<size_t>(row_bytes));
+                            if (!SafeCopyGuestMemory(
+                                    dst_slice + static_cast<size_t>(row_idx) * static_cast<size_t>(dst_row_pitch),
+                                    src_base + src_off,
+                                    static_cast<size_t>(row_bytes))) {
+                                copy_ok = false;
+                                break;
+                            }
                         }
                     }
                 }
                 src_slice_offset += src_row_pitch * static_cast<uint64_t>(item.num_rows[s]) * depth;
             }
-            uploaded_indices.push_back(idx);
-            gpu_copy_indices.push_back(idx);
+            if (copy_ok) {
+                uploaded_indices.push_back(idx);
+                gpu_copy_indices.push_back(idx);
+            }
         }
     }
 
@@ -7052,6 +7986,295 @@ HRESULT STDMETHODCALLTYPE DeviceX::BindBridgeHeaps(ID3D12GraphicsCommandList* cm
     if (!cmd_list) return E_INVALIDARG;
     descriptor_bridge_.BindHeapsToCommandList(CommandListX::UnwrapHostGraphicsList(cmd_list));
     RecordBridgeHeapBind();
+    return S_OK;
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 14: Live VRAM Residency Controller & IOpenScarlettVramResidencyControl
+// ---------------------------------------------------------------------------
+uint64_t DeviceX::EstimateResourceVramBytes(const D3D12_RESOURCE_DESC& desc) const noexcept {
+    if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        return AlignUp64(std::max<uint64_t>(desc.Width, 65536ull), 65536ull);
+    }
+    if (host_dev_) {
+        const D3D12_RESOURCE_ALLOCATION_INFO info = host_dev_->GetResourceAllocationInfo(0u, 1u, &desc);
+        if (info.SizeInBytes > 0ull && info.SizeInBytes != UINT64_MAX) {
+            return info.SizeInBytes;
+        }
+    }
+    const FormatFootprintSpec spec = DescribeFormatForFootprint(desc.Format);
+    const uint64_t w = std::max<uint64_t>(1ull, desc.Width);
+    const uint64_t h = std::max<uint64_t>(1ull, desc.Height);
+    const uint64_t d = std::max<uint64_t>(1ull, desc.DepthOrArraySize);
+    const uint64_t blocks_x = (w + spec.block_width - 1ull) / spec.block_width;
+    const uint64_t blocks_y = (h + spec.block_height - 1ull) / spec.block_height;
+    return AlignUp64(std::max<uint64_t>(blocks_x * blocks_y * d * spec.bytes_per_block, 65536ull), 65536ull);
+}
+
+void DeviceX::RefreshDxgiVideoMemoryInfoLocked() noexcept {
+    if (host_dev_) {
+        (void)openscarlett::QueryHostAdapterVideoMemoryInfo(host_dev_, dxgi_mem_info_);
+    }
+}
+
+uint64_t DeviceX::EffectiveResidencyBudgetBytesLocked() const noexcept {
+    if (residency_budget_override_bytes_ > 0ull) {
+        return residency_budget_override_bytes_;
+    }
+    if (dxgi_mem_info_.queried_dxgi_adapter3 && dxgi_mem_info_.local_budget_bytes > 0ull) {
+        return std::min<uint64_t>(dxgi_mem_info_.local_budget_bytes, console_profile_.target_console_vram_bytes);
+    }
+    if (adapter_info_.dedicated_video_memory_bytes > 0ull) {
+        const uint64_t safe_host = (adapter_info_.dedicated_video_memory_bytes * 85ull) / 100ull;
+        return std::min<uint64_t>(safe_host, console_profile_.target_console_vram_bytes);
+    }
+    return console_profile_.target_console_vram_bytes;
+}
+
+uint64_t DeviceX::EvictLruVictimsLocked(uint64_t bytes_needed, ID3D12Pageable* protect_obj) noexcept {
+    if (!host_dev_ || bytes_needed == 0ull || residency_lru_.empty()) return 0ull;
+    uint64_t freed = 0ull;
+
+    // Two-pass priority-aware LRU eviction:
+    // Pass 0 evicts MINIMUM/LOW/NORMAL priority victims first; Pass 1 evicts HIGH if still over budget.
+    // MAXIMUM priority objects are never auto-evicted.
+    for (int pass = 0; pass < 2 && freed < bytes_needed; ++pass) {
+        std::vector<ID3D12Pageable*> victims;
+        for (auto it = residency_lru_.rbegin(); it != residency_lru_.rend() && freed < bytes_needed; ++it) {
+            ID3D12Pageable* cand = *it;
+            if (!cand || cand == protect_obj) continue;
+            auto eit = residency_entries_.find(cand);
+            if (eit == residency_entries_.end()) continue;
+            const auto& e = eit->second;
+            if (!e.is_resident || e.is_placed_suballocation || e.spilled_to_l0) continue;
+            if (e.priority == D3D12_RESIDENCY_PRIORITY_MAXIMUM) continue;
+            if (pass == 0 && e.priority == D3D12_RESIDENCY_PRIORITY_HIGH) continue;
+            victims.push_back(cand);
+            freed += e.size_bytes;
+        }
+        for (ID3D12Pageable* v : victims) {
+            auto eit = residency_entries_.find(v);
+            if (eit == residency_entries_.end() || !eit->second.is_resident) continue;
+            auto& e = eit->second;
+            const HRESULT ev_hr = host_dev_->Evict(1u, &v);
+            if (SUCCEEDED(ev_hr)) {
+                e.is_resident = false;
+                e.residency_ref_count = 0u;
+                if (e.in_lru) {
+                    residency_lru_.erase(e.lru_it);
+                    e.in_lru = false;
+                }
+                if (tracked_resident_bytes_ >= e.size_bytes) tracked_resident_bytes_ -= e.size_bytes;
+                else tracked_resident_bytes_ = 0ull;
+                tracked_evicted_bytes_ += e.size_bytes;
+                ++auto_lru_evict_count_;
+                ++evict_calls_;
+            }
+        }
+    }
+    return freed;
+}
+
+void DeviceX::PrepareResidencyBudgetForAllocation(
+    uint64_t requested_bytes,
+    bool allow_l0_spill,
+    bool& out_should_spill_l0) {
+    out_should_spill_l0 = false;
+    if (requested_bytes == 0ull) return;
+
+    std::lock_guard<std::mutex> lock(residency_mutex_);
+    const uint64_t budget = EffectiveResidencyBudgetBytesLocked();
+    if (budget == 0ull) return;
+
+    if (tracked_resident_bytes_ + requested_bytes > budget) {
+        const uint64_t over = (tracked_resident_bytes_ + requested_bytes) - budget;
+        (void)EvictLruVictimsLocked(over, nullptr);
+    }
+    // If still over budget after evicting eligible LRU victims, spill this cold allocation to L0 system RAM!
+    if (allow_l0_spill && (tracked_resident_bytes_ + requested_bytes > budget)) {
+        out_should_spill_l0 = true;
+    }
+}
+
+void DeviceX::TrackLiveResidencyObject(
+    ID3D12Pageable* host_obj,
+    uint64_t size_bytes,
+    D3D12_HEAP_TYPE heap_type,
+    bool is_placed_suballocation,
+    bool spilled_to_l0,
+    uint64_t sparse_window_va) {
+    if (!host_obj) return;
+    std::lock_guard<std::mutex> lock(residency_mutex_);
+    auto it = residency_entries_.find(host_obj);
+    if (it != residency_entries_.end()) {
+        if (it->second.in_lru) {
+            residency_lru_.erase(it->second.lru_it);
+        }
+        if (it->second.sparse_window_va != 0ull && sparse_window_iso_) {
+            openscarlett::SparseVramFree(sparse_window_iso_, it->second.sparse_window_va);
+        }
+        residency_entries_.erase(it);
+    }
+
+    LiveResidencyEntry e{};
+    e.host_obj = host_obj;
+    e.size_bytes = size_bytes;
+    e.sparse_window_va = sparse_window_va;
+    e.heap_type = heap_type;
+    e.priority = D3D12_RESIDENCY_PRIORITY_NORMAL;
+    e.residency_ref_count = 1u;
+    e.is_resident = true;
+    e.is_placed_suballocation = is_placed_suballocation;
+    e.spilled_to_l0 = spilled_to_l0;
+    if (!is_placed_suballocation) {
+        if (spilled_to_l0) {
+            l0_spilled_bytes_ += size_bytes;
+            ++l0_spill_count_;
+        } else {
+            tracked_resident_bytes_ += size_bytes;
+            residency_lru_.push_front(host_obj);
+            e.lru_it = residency_lru_.begin();
+            e.in_lru = true;
+        }
+    }
+    residency_entries_.emplace(host_obj, e);
+}
+
+void DeviceX::UntrackLiveResidencyObject(ID3D12Pageable* host_obj) noexcept {
+    if (!host_obj) return;
+    std::lock_guard<std::mutex> lock(residency_mutex_);
+    auto it = residency_entries_.find(host_obj);
+    if (it == residency_entries_.end()) return;
+    const auto& e = it->second;
+    if (e.in_lru) {
+        residency_lru_.erase(e.lru_it);
+    }
+    if (e.sparse_window_va != 0ull && sparse_window_iso_) {
+        openscarlett::SparseVramFree(sparse_window_iso_, e.sparse_window_va);
+    }
+    if (!e.is_placed_suballocation) {
+        if (e.spilled_to_l0) {
+            if (l0_spilled_bytes_ >= e.size_bytes) l0_spilled_bytes_ -= e.size_bytes;
+            else l0_spilled_bytes_ = 0ull;
+        } else if (e.is_resident) {
+            if (tracked_resident_bytes_ >= e.size_bytes) tracked_resident_bytes_ -= e.size_bytes;
+            else tracked_resident_bytes_ = 0ull;
+        } else {
+            if (tracked_evicted_bytes_ >= e.size_bytes) tracked_evicted_bytes_ -= e.size_bytes;
+            else tracked_evicted_bytes_ = 0ull;
+        }
+    }
+    residency_entries_.erase(it);
+}
+
+HRESULT STDMETHODCALLTYPE DeviceX::GetVramResidencyStats(
+    D3D12XBOX_VRAM_RESIDENCY_STATS* out_stats) {
+    if (!out_stats) return E_POINTER;
+    std::memset(out_stats, 0, sizeof(*out_stats));
+    std::lock_guard<std::mutex> lock(residency_mutex_);
+    RefreshDxgiVideoMemoryInfoLocked();
+    out_stats->console_profile = console_profile_.profile_id;
+    out_stats->queried_dxgi_adapter3 = dxgi_mem_info_.queried_dxgi_adapter3 ? 1u : 0u;
+    out_stats->target_console_vram_bytes = console_profile_.target_console_vram_bytes;
+    out_stats->host_dedicated_vram_bytes = adapter_info_.dedicated_video_memory_bytes;
+    out_stats->dxgi_local_budget_bytes = dxgi_mem_info_.local_budget_bytes;
+    out_stats->dxgi_local_current_usage_bytes = dxgi_mem_info_.local_current_usage_bytes;
+    out_stats->dxgi_non_local_budget_bytes = dxgi_mem_info_.non_local_budget_bytes;
+    out_stats->effective_budget_bytes = EffectiveResidencyBudgetBytesLocked();
+    out_stats->tracked_resident_bytes = tracked_resident_bytes_;
+    out_stats->tracked_evicted_bytes = tracked_evicted_bytes_;
+    out_stats->l0_spilled_bytes = l0_spilled_bytes_;
+    out_stats->tracked_object_count = static_cast<uint64_t>(residency_entries_.size());
+    uint64_t res_cnt = 0ull;
+    uint64_t ev_cnt = 0ull;
+    for (const auto& [ptr, e] : residency_entries_) {
+        (void)ptr;
+        if (e.is_resident) ++res_cnt;
+        else ++ev_cnt;
+    }
+    out_stats->resident_object_count = res_cnt;
+    out_stats->evicted_object_count = ev_cnt;
+    out_stats->l0_spill_count = l0_spill_count_;
+    out_stats->auto_lru_eviction_count = auto_lru_evict_count_;
+    out_stats->make_resident_calls = make_resident_calls_;
+    out_stats->evict_calls = evict_calls_;
+    out_stats->set_priority_calls = set_priority_calls_;
+    out_stats->enqueue_make_resident_calls = enqueue_make_resident_calls_;
+    openscarlett::SparseVramGetStats(
+        sparse_window_iso_,
+        out_stats->window0_descriptor_allocs,
+        out_stats->window0_descriptor_bytes,
+        out_stats->window1_title_buffer_allocs,
+        out_stats->window1_title_buffer_bytes);
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE DeviceX::SetResidencyBudgetOverride(
+    uint64_t budget_bytes_or_zero_for_auto) {
+    std::lock_guard<std::mutex> lock(residency_mutex_);
+    residency_budget_override_bytes_ = budget_bytes_or_zero_for_auto;
+    if (residency_budget_override_bytes_ > 0ull &&
+        tracked_resident_bytes_ > residency_budget_override_bytes_) {
+        (void)EvictLruVictimsLocked(tracked_resident_bytes_ - residency_budget_override_bytes_, nullptr);
+    }
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE DeviceX::SetConsoleProfileOverride(
+    int32_t profile_or_neg1_for_auto) {
+    std::lock_guard<std::mutex> lock(residency_mutex_);
+    if (profile_or_neg1_for_auto == 0) {
+        console_profile_ = openscarlett::SelectXboxConsoleMemoryProfileFromHostVram(
+            adapter_info_.dedicated_video_memory_bytes, "series_s");
+    } else if (profile_or_neg1_for_auto == 1) {
+        console_profile_ = openscarlett::SelectXboxConsoleMemoryProfileFromHostVram(
+            adapter_info_.dedicated_video_memory_bytes, "series_x");
+    } else {
+        console_profile_ = openscarlett::SelectXboxConsoleMemoryProfileFromHostVram(
+            adapter_info_.dedicated_video_memory_bytes, nullptr);
+    }
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE DeviceX::GetAgilitySdkInfo(
+    D3D12XBOX_AGILITY_SDK_INFO* out_info) {
+    if (!out_info) return E_POINTER;
+    QueryAgilitySdkRuntimeSnapshot(out_info);
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE DeviceX::GetPsoStreamDiagStats(
+    D3D12XBOX_PSO_STREAM_DIAG_STATS* out_stats) {
+    if (!out_stats) return E_POINTER;
+    out_stats->remapped_as_tags = pso_remapped_as_tags_.load(std::memory_order_relaxed);
+    out_stats->remapped_ms_tags = pso_remapped_ms_tags_.load(std::memory_order_relaxed);
+    out_stats->remapped_ext_tags = pso_remapped_ext_tags_.load(std::memory_order_relaxed);
+    out_stats->dropped_legacy_stages = pso_dropped_legacy_stages_.load(std::memory_order_relaxed);
+    out_stats->inferred_mesh_topologies = pso_inferred_mesh_topologies_.load(std::memory_order_relaxed);
+    out_stats->f16_stage_links_reconciled = pso_f16_links_reconciled_.load(std::memory_order_relaxed);
+    out_stats->interp_validations_run = pso_interp_validations_.load(std::memory_order_relaxed);
+    out_stats->interp_attributes_matched = pso_interp_matches_.load(std::memory_order_relaxed);
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE DeviceX::AllocateSparseWindowVa(
+    uint32_t is_descriptor_window0,
+    uint64_t size_bytes,
+    uint64_t* out_va) {
+    if (!out_va) return E_POINTER;
+    *out_va = 0ull;
+    if (!sparse_window_iso_ || size_bytes == 0ull) return E_INVALIDARG;
+    const uint64_t va = is_descriptor_window0
+                            ? openscarlett::SparseVramAllocateWindow0(sparse_window_iso_, size_bytes)
+                            : openscarlett::SparseVramAllocateTitleWindow(sparse_window_iso_, size_bytes);
+    if (va == 0ull) return E_OUTOFMEMORY;
+    *out_va = va;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE DeviceX::FreeSparseWindowVa(uint64_t va) {
+    if (va == 0ull) return E_INVALIDARG;
+    openscarlett::SparseVramFree(sparse_window_iso_, va);
     return S_OK;
 }
 

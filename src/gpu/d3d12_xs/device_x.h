@@ -1,9 +1,12 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
+#include <list>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -23,7 +26,129 @@
 #include "openscarlett/gpu/xg_gpu_untile.h"
 #include "openscarlett/kernel/title_va_mirror.h"
 
+namespace openscarlett {
+
+// Sprint 14 residency/profile/window helpers implemented in src/kernel/vram_residency_manager.cpp.
+struct XboxConsoleProfileSelection {
+    uint32_t profile_id = 0u;  // 0 = Series S (Lockhart 8 GiB), 1 = Series X (Anaconda 13.5 GiB)
+    uint64_t target_console_vram_bytes = 8ull * 1024ull * 1024ull * 1024ull;
+    uint64_t host_dedicated_vram_bytes = 0ull;
+    bool overridden_by_env = false;
+};
+
+XboxConsoleProfileSelection SelectXboxConsoleMemoryProfileFromHostVram(
+    uint64_t host_dedicated_vram_bytes,
+    const char* explicit_override_or_null = nullptr) noexcept;
+
+#if defined(_WIN32)
+struct HostAdapterVideoMemoryInfo {
+    bool queried_dxgi_adapter3 = false;
+    uint64_t local_budget_bytes = 0ull;
+    uint64_t local_current_usage_bytes = 0ull;
+    uint64_t local_available_reservation_bytes = 0ull;
+    uint64_t non_local_budget_bytes = 0ull;
+    uint64_t non_local_current_usage_bytes = 0ull;
+};
+
+bool QueryHostAdapterVideoMemoryInfo(
+    ID3D12Device* host_device,
+    HostAdapterVideoMemoryInfo& out_info) noexcept;
+#endif
+
+class SparseVramWindowIsolator;
+SparseVramWindowIsolator* CreateSparseVramWindowIsolator();
+void DestroySparseVramWindowIsolator(SparseVramWindowIsolator* iso) noexcept;
+uint64_t SparseVramAllocateWindow0(SparseVramWindowIsolator* iso, uint64_t size_bytes) noexcept;
+uint64_t SparseVramAllocateTitleWindow(SparseVramWindowIsolator* iso, uint64_t size_bytes) noexcept;
+void SparseVramFree(SparseVramWindowIsolator* iso, uint64_t va) noexcept;
+void SparseVramGetStats(
+    const SparseVramWindowIsolator* iso,
+    uint64_t& out_w0_allocs,
+    uint64_t& out_w0_bytes,
+    uint64_t& out_w1_allocs,
+    uint64_t& out_w1_bytes) noexcept;
+
+}  // namespace openscarlett
+
 namespace openscarlett::d3d12_xs {
+
+// Sprint 14 COM interface for Live VRAM Residency, Agility SDK status, Sparse Window-0 isolation,
+// and Xbox Series PSO Stream normalization diagnostics.
+// {4F534431-3258-5652-4D00-000000000033}
+inline constexpr GUID IID_IOpenScarlettVramResidencyControl = {
+    0x4F534431u, 0x3258u, 0x5652u,
+    {0x4Du, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x33u}
+};
+
+struct D3D12XBOX_VRAM_RESIDENCY_STATS {
+    uint32_t console_profile = 0u;  // 0 = Series S (8 GiB), 1 = Series X (13.5 GiB)
+    uint32_t queried_dxgi_adapter3 = 0u;
+    uint64_t target_console_vram_bytes = 0ull;
+    uint64_t host_dedicated_vram_bytes = 0ull;
+    uint64_t dxgi_local_budget_bytes = 0ull;
+    uint64_t dxgi_local_current_usage_bytes = 0ull;
+    uint64_t dxgi_non_local_budget_bytes = 0ull;
+    uint64_t effective_budget_bytes = 0ull;
+    uint64_t tracked_resident_bytes = 0ull;
+    uint64_t tracked_evicted_bytes = 0ull;
+    uint64_t l0_spilled_bytes = 0ull;
+    uint64_t tracked_object_count = 0ull;
+    uint64_t resident_object_count = 0ull;
+    uint64_t evicted_object_count = 0ull;
+    uint64_t l0_spill_count = 0ull;
+    uint64_t auto_lru_eviction_count = 0ull;
+    uint64_t make_resident_calls = 0ull;
+    uint64_t evict_calls = 0ull;
+    uint64_t set_priority_calls = 0ull;
+    uint64_t enqueue_make_resident_calls = 0ull;
+    uint64_t window0_descriptor_allocs = 0ull;
+    uint64_t window0_descriptor_bytes = 0ull;
+    uint64_t window1_title_buffer_allocs = 0ull;
+    uint64_t window1_title_buffer_bytes = 0ull;
+};
+
+struct D3D12XBOX_AGILITY_SDK_INFO {
+    uint32_t exported_sdk_version = 0u;
+    uint32_t configured_sdk_version = 0u;
+    uint32_t core_dll_found = 0u;
+    uint32_t agility_active = 0u;
+    uint32_t using_inbox_fallback = 1u;
+    HRESULT last_config_hr = S_FALSE;
+    char exported_sdk_path[64]{};
+    char discovered_core_dir[260]{};
+};
+
+struct D3D12XBOX_PSO_STREAM_DIAG_STATS {
+    uint64_t remapped_as_tags = 0ull;
+    uint64_t remapped_ms_tags = 0ull;
+    uint64_t remapped_ext_tags = 0ull;
+    uint64_t dropped_legacy_stages = 0ull;
+    uint64_t inferred_mesh_topologies = 0ull;
+    uint64_t f16_stage_links_reconciled = 0ull;
+    uint64_t interp_validations_run = 0ull;
+    uint64_t interp_attributes_matched = 0ull;
+};
+
+struct IOpenScarlettVramResidencyControl : public IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE GetVramResidencyStats(
+        D3D12XBOX_VRAM_RESIDENCY_STATS* out_stats) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetResidencyBudgetOverride(
+        uint64_t budget_bytes_or_zero_for_auto) = 0;
+    virtual HRESULT STDMETHODCALLTYPE SetConsoleProfileOverride(
+        int32_t profile_or_neg1_for_auto) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetAgilitySdkInfo(
+        D3D12XBOX_AGILITY_SDK_INFO* out_info) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetPsoStreamDiagStats(
+        D3D12XBOX_PSO_STREAM_DIAG_STATS* out_stats) = 0;
+    virtual HRESULT STDMETHODCALLTYPE AllocateSparseWindowVa(
+        uint32_t is_descriptor_window0,
+        uint64_t size_bytes,
+        uint64_t* out_va) = 0;
+    virtual HRESULT STDMETHODCALLTYPE FreeSparseWindowVa(
+        uint64_t va) = 0;
+};
+
+void QueryAgilitySdkRuntimeSnapshot(D3D12XBOX_AGILITY_SDK_INFO* out_info) noexcept;
 
 class DeviceExtendedProxy;
 class DxgiDeviceProxy;
@@ -92,7 +217,8 @@ class DeviceX final
     : public ID3D12DeviceX,
       public IOpenScarlettUnifiedMemory,
       public IOpenScarlettVulkanRouting,
-      public IOpenScarlettAaaRuntime {
+      public IOpenScarlettAaaRuntime,
+      public IOpenScarlettVramResidencyControl {
 public:
     DeviceX(ID3D12Device* host_device,
             const D3D12AdapterInfo& adapter_info,
@@ -638,6 +764,26 @@ public:
     HRESULT STDMETHODCALLTYPE BindBridgeHeaps(
         ID3D12GraphicsCommandList* cmd_list) override;
 
+    // IOpenScarlettVramResidencyControl
+    HRESULT STDMETHODCALLTYPE GetVramResidencyStats(
+        D3D12XBOX_VRAM_RESIDENCY_STATS* out_stats) override;
+    HRESULT STDMETHODCALLTYPE SetResidencyBudgetOverride(
+        uint64_t budget_bytes_or_zero_for_auto) override;
+    HRESULT STDMETHODCALLTYPE SetConsoleProfileOverride(
+        int32_t profile_or_neg1_for_auto) override;
+    HRESULT STDMETHODCALLTYPE GetAgilitySdkInfo(
+        D3D12XBOX_AGILITY_SDK_INFO* out_info) override;
+    HRESULT STDMETHODCALLTYPE GetPsoStreamDiagStats(
+        D3D12XBOX_PSO_STREAM_DIAG_STATS* out_stats) override;
+    HRESULT STDMETHODCALLTYPE AllocateSparseWindowVa(
+        uint32_t is_descriptor_window0,
+        uint64_t size_bytes,
+        uint64_t* out_va) override;
+    HRESULT STDMETHODCALLTYPE FreeSparseWindowVa(
+        uint64_t va) override;
+
+    void NotifyDescriptorHeapDestroyed(ID3D12DescriptorHeap* host_heap) noexcept;
+
 private:
     struct TrackedBufferVa {
         uint64_t gpu_va = 0ull;
@@ -723,8 +869,10 @@ private:
     std::atomic<uint32_t> max_frame_latency_{2u};
     std::atomic<uint64_t> next_frame_token_{1ull};
     std::atomic<bool> suspended_{false};
-    std::mutex shader_lift_mutex_;
+    static constexpr size_t kShaderLiftLockStripes = 64u;
+    std::array<std::mutex, kShaderLiftLockStripes> shader_lift_stripes_;
     openscarlett::ShaderCache shader_cache_;
+    mutable std::shared_mutex xbox_container_cache_mutex_;
     std::unordered_map<uint64_t, std::vector<uint8_t>> xbox_container_dxil_cache_;
     std::mutex synth_rs_mutex_;
     std::vector<ID3D12RootSignature*> synthesized_root_sigs_;
@@ -835,6 +983,66 @@ private:
     std::atomic<uint64_t> vk_spirv_direct_draws_{0ull};
     std::atomic<uint64_t> vk_spirv_direct_dispatches_{0ull};
     std::atomic<uint64_t> vk_spirv_direct_mesh_dispatches_{0ull};
+
+    // Sprint 14: Live VRAM Residency Manager + Sparse VRAM Window-0 Isolation + PSO Diagnostics
+    struct LiveResidencyEntry {
+        ID3D12Pageable* host_obj = nullptr;
+        uint64_t size_bytes = 0ull;
+        uint64_t sparse_window_va = 0ull;
+        D3D12_HEAP_TYPE heap_type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESIDENCY_PRIORITY priority = D3D12_RESIDENCY_PRIORITY_NORMAL;
+        uint32_t residency_ref_count = 1u;
+        bool is_resident = true;
+        bool is_placed_suballocation = false;
+        bool spilled_to_l0 = false;
+        bool in_lru = false;
+        std::list<ID3D12Pageable*>::iterator lru_it;
+    };
+
+    uint64_t EstimateResourceVramBytes(const D3D12_RESOURCE_DESC& desc) const noexcept;
+    void PrepareResidencyBudgetForAllocation(
+        uint64_t requested_bytes,
+        bool allow_l0_spill,
+        bool& out_should_spill_l0);
+    void TrackLiveResidencyObject(
+        ID3D12Pageable* host_obj,
+        uint64_t size_bytes,
+        D3D12_HEAP_TYPE heap_type,
+        bool is_placed_suballocation,
+        bool spilled_to_l0,
+        uint64_t sparse_window_va = 0ull);
+    void UntrackLiveResidencyObject(ID3D12Pageable* host_obj) noexcept;
+    void RefreshDxgiVideoMemoryInfoLocked() noexcept;
+    uint64_t EffectiveResidencyBudgetBytesLocked() const noexcept;
+    uint64_t EvictLruVictimsLocked(uint64_t bytes_needed, ID3D12Pageable* protect_obj) noexcept;
+
+    mutable std::mutex residency_mutex_;
+    openscarlett::XboxConsoleProfileSelection console_profile_{};
+    openscarlett::HostAdapterVideoMemoryInfo dxgi_mem_info_{};
+    openscarlett::SparseVramWindowIsolator* sparse_window_iso_ = nullptr;
+    std::unordered_map<ID3D12Pageable*, LiveResidencyEntry> residency_entries_;
+    std::list<ID3D12Pageable*> residency_lru_;  // Front = MRU, Back = LRU
+    std::unordered_map<ID3D12DescriptorHeap*, uint64_t> desc_heap_window0_vas_;
+    uint64_t residency_budget_override_bytes_ = 0ull;
+    uint64_t tracked_resident_bytes_ = 0ull;
+    uint64_t tracked_evicted_bytes_ = 0ull;
+    uint64_t l0_spilled_bytes_ = 0ull;
+    uint64_t l0_spill_count_ = 0ull;
+    uint64_t auto_lru_evict_count_ = 0ull;
+    uint64_t make_resident_calls_ = 0ull;
+    uint64_t evict_calls_ = 0ull;
+    uint64_t set_priority_calls_ = 0ull;
+    uint64_t enqueue_make_resident_calls_ = 0ull;
+
+    // Sprint 14: Xbox Series PSO Stream & Linkage diagnostic counters
+    std::atomic<uint64_t> pso_remapped_as_tags_{0ull};
+    std::atomic<uint64_t> pso_remapped_ms_tags_{0ull};
+    std::atomic<uint64_t> pso_remapped_ext_tags_{0ull};
+    std::atomic<uint64_t> pso_dropped_legacy_stages_{0ull};
+    std::atomic<uint64_t> pso_inferred_mesh_topologies_{0ull};
+    std::atomic<uint64_t> pso_f16_links_reconciled_{0ull};
+    std::atomic<uint64_t> pso_interp_validations_{0ull};
+    std::atomic<uint64_t> pso_interp_matches_{0ull};
 };
 
 }  // namespace openscarlett::d3d12_xs

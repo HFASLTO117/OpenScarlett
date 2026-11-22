@@ -1,9 +1,11 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #include "openscarlett/gpu/d3d12_xs_abi.h"
@@ -15,13 +17,105 @@ class DeviceX;
 struct WindowCallbackState;
 struct VulkanRecordedBatch;
 
+// Sprint 14: Lock-safe FenceWaitDispatcher COM interface (Leonida #1933).
+// Dispatches fence completion callbacks strictly OUTSIDE the dispatcher mutex
+// (preventing re-entrant deadlocks) and wakes all blocked waits cleanly on device removal.
+// {4F534431-3258-4657-4400-000000000031}
+inline constexpr GUID IID_IOpenScarlettFenceWaitDispatcher = {
+    0x4F534431u, 0x3258u, 0x4657u,
+    {0x44u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x31u}
+};
+
+using FenceCompletionCallbackFn = void (*)(
+    ID3D12Fence* fence,
+    UINT64 target_value,
+    HRESULT completion_status,
+    void* user_ctx);
+
+struct IOpenScarlettFenceWaitDispatcher : public IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE RegisterFenceCallback(
+        ID3D12Fence* fence,
+        UINT64 target_value,
+        FenceCompletionCallbackFn callback,
+        void* user_ctx,
+        uint64_t* out_registration_id) = 0;
+    virtual HRESULT STDMETHODCALLTYPE WaitForFenceValue(
+        ID3D12Fence* fence,
+        UINT64 target_value,
+        UINT timeout_ms) = 0;
+    virtual HRESULT STDMETHODCALLTYPE PumpFenceCallbacks(
+        uint32_t* out_dispatched_count) = 0;
+    virtual HRESULT STDMETHODCALLTYPE NotifyDeviceRemoved(
+        HRESULT removed_reason) = 0;
+};
+
+class FenceWaitDispatcher final {
+public:
+    explicit FenceWaitDispatcher(DeviceX* parent_device);
+    ~FenceWaitDispatcher();
+
+    FenceWaitDispatcher(const FenceWaitDispatcher&) = delete;
+    FenceWaitDispatcher& operator=(const FenceWaitDispatcher&) = delete;
+
+    HRESULT RegisterCallback(
+        ID3D12Fence* fence,
+        UINT64 target_value,
+        FenceCompletionCallbackFn callback,
+        void* user_ctx,
+        uint64_t* out_registration_id);
+    HRESULT WaitForFenceValue(
+        ID3D12Fence* fence,
+        UINT64 target_value,
+        UINT timeout_ms);
+    uint32_t PumpReadyCallbacks();
+    void NotifyDeviceRemoved(HRESULT removed_reason);
+    bool IsDeviceRemoved() const noexcept {
+        return device_removed_.load(std::memory_order_acquire);
+    }
+    HRESULT RemovedReason() const noexcept {
+        return removed_reason_.load(std::memory_order_acquire);
+    }
+    HANDLE DeviceRemovedEventHandle() const noexcept { return device_removed_event_; }
+
+private:
+    struct PendingEntry {
+        uint64_t id = 0ull;
+        ID3D12Fence* user_fence = nullptr;
+        ID3D12Fence* host_fence = nullptr;
+        UINT64 target_value = 0ull;
+        FenceCompletionCallbackFn callback = nullptr;
+        void* user_ctx = nullptr;
+        HANDLE event_handle = nullptr;
+        HRESULT status = S_OK;
+    };
+
+    void EnsureWorkerStartedLocked();
+    void WorkerLoop();
+    void DispatchOutsideLock(std::vector<PendingEntry>& ready);
+
+    DeviceX* device_x_ = nullptr;
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    std::atomic<uint64_t> next_id_{1ull};
+    std::atomic<bool> device_removed_{false};
+    std::atomic<HRESULT> removed_reason_{S_OK};
+    bool stopping_ = false;
+    bool worker_started_ = false;
+    HANDLE stop_event_ = nullptr;
+    HANDLE wakeup_event_ = nullptr;
+    HANDLE device_removed_event_ = nullptr;
+    std::thread worker_thread_;
+    std::vector<PendingEntry> pending_;
+};
+
 class CommandQueueX final
     : public ID3D12CommandQueueX,
       public IOpenScarlettPresentCapture,
       public IOpenScarlettPresentWindow,
       public IOpenScarlettPresentHdr,
       public IOpenScarlettPresentTiming,
-      public IOpenScarlettPresentPacing {
+      public IOpenScarlettPresentPacing,
+      public IOpenScarlettFenceWaitDispatcher {
 public:
     CommandQueueX(DeviceX* parent_device,
                   ID3D12CommandQueue* host_queue,
@@ -48,6 +142,7 @@ public:
 
     static ID3D12Pageable* UnwrapHostPageable(ID3D12Pageable* maybe_wrapped) noexcept;
     static ID3D12CommandQueue* UnwrapHostQueue(ID3D12CommandQueue* maybe_wrapped) noexcept;
+    static void NotifyDeviceRemovedForDevice(DeviceX* dev, HRESULT removed_reason) noexcept;
 
     // IUnknown (slots 0..2)
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override;
@@ -166,6 +261,22 @@ public:
         BOOL override_active) override;
     HRESULT STDMETHODCALLTYPE GetPresentPacingState(
         D3D12XBOX_PRESENT_PACING_STATE* out_state) override;
+
+    // IOpenScarlettFenceWaitDispatcher
+    HRESULT STDMETHODCALLTYPE RegisterFenceCallback(
+        ID3D12Fence* fence,
+        UINT64 target_value,
+        FenceCompletionCallbackFn callback,
+        void* user_ctx,
+        uint64_t* out_registration_id) override;
+    HRESULT STDMETHODCALLTYPE WaitForFenceValue(
+        ID3D12Fence* fence,
+        UINT64 target_value,
+        UINT timeout_ms) override;
+    HRESULT STDMETHODCALLTYPE PumpFenceCallbacks(
+        uint32_t* out_dispatched_count) override;
+    HRESULT STDMETHODCALLTYPE NotifyDeviceRemoved(
+        HRESULT removed_reason) override;
 
 private:
     uint32_t ResolveEffectiveFrameIntervalUsLocked(
@@ -287,6 +398,8 @@ private:
     uint32_t vk_swapchain_width_ = 0u;
     uint32_t vk_swapchain_height_ = 0u;
     bool vk_swapchain_headless_ = false;
+
+    std::unique_ptr<FenceWaitDispatcher> fence_dispatcher_;
 };
 
 }  // namespace openscarlett::d3d12_xs

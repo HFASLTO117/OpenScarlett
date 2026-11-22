@@ -180,10 +180,35 @@ struct DeferredCpuWait {
     bool is_64bit = false;
 };
 
+// {4F534431-3258-4241-5200-000000000032}
+inline constexpr GUID IID_IOpenScarlettEnhancedBarrierStats = {
+    0x4F534431u, 0x3258u, 0x4241u,
+    {0x52u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x32u}
+};
+
+struct D3D12XBOX_ENHANCED_BARRIER_STATS {
+    uint64_t barrier_calls = 0ull;
+    uint64_t native_barrier_calls = 0ull;
+    uint64_t legacy_fallback_calls = 0ull;
+    uint64_t buffer_barriers_processed = 0ull;
+    uint64_t texture_barriers_processed = 0ull;
+    uint64_t global_barriers_processed = 0ull;
+    uint64_t proxy_resources_unwrapped = 0ull;
+    uint64_t va_mirror_notifications = 0ull;
+    uint64_t unified_texture_notifications = 0ull;
+    uint32_t host_has_cmdlist7 = 0u;
+};
+
+struct IOpenScarlettEnhancedBarrierStats : public IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE GetEnhancedBarrierStats(
+        D3D12XBOX_ENHANCED_BARRIER_STATS* out_stats) const noexcept = 0;
+};
+
 class CommandListX final
     : public ID3D12GraphicsCommandListX,
       public IOpenScarlettCommandListExtState,
-      public IOpenScarlettTiledPlacedManager {
+      public IOpenScarlettTiledPlacedManager,
+      public IOpenScarlettEnhancedBarrierStats {
 public:
     CommandListX(DeviceX* parent_device, ID3D12GraphicsCommandList* host_list);
     ~CommandListX();
@@ -475,8 +500,17 @@ public:
         uint32_t tile_z,
         D3D12XBOX_TILED_PLACED_TILE_MAPPING* out_mapping) override;
 
+    // IOpenScarlettEnhancedBarrierStats
+    HRESULT STDMETHODCALLTYPE GetEnhancedBarrierStats(
+        D3D12XBOX_ENHANCED_BARRIER_STATS* out_stats) const noexcept override;
+
 private:
     friend class CommandListExtendedProxy;
+#ifdef __ID3D12GraphicsCommandList7_INTERFACE_DEFINED__
+    void ExecuteEnhancedBarriers(
+        UINT32 num_barrier_groups,
+        const D3D12_BARRIER_GROUP* barrier_groups);
+#endif
 
     std::atomic<ULONG> ref_count_{1};
     DeviceX* device_x_ = nullptr;
@@ -577,6 +611,17 @@ private:
         UINT num_barriers,
         const D3D12_RESOURCE_BARRIER* unwrapped_barriers,
         std::vector<D3D12_RESOURCE_BARRIER>& extra_coherency_barriers);
+
+    // Sprint 14 Enhanced Barriers telemetry & diagnostics
+    std::atomic<uint64_t> eb_barrier_calls_{0ull};
+    std::atomic<uint64_t> eb_native_calls_{0ull};
+    std::atomic<uint64_t> eb_legacy_fallbacks_{0ull};
+    std::atomic<uint64_t> eb_buffer_barriers_{0ull};
+    std::atomic<uint64_t> eb_texture_barriers_{0ull};
+    std::atomic<uint64_t> eb_global_barriers_{0ull};
+    std::atomic<uint64_t> eb_resources_unwrapped_{0ull};
+    std::atomic<uint64_t> eb_va_mirror_notifs_{0ull};
+    std::atomic<uint64_t> eb_unified_tex_notifs_{0ull};
 };
 
 }  // namespace openscarlett::d3d12_xs
