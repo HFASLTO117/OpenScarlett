@@ -49,6 +49,17 @@ struct VulkanDeviceInfo {
     bool supports_sparse_binding = false;
     bool supports_sparse_residency_image_2d = false;
     bool supports_sparse_residency_image_3d = false;
+
+    // Cross-vendor limits, subgroup & BC compression capabilities
+    uint32_t max_push_constants_size = 128;
+    uint32_t subgroup_size = 32;
+    uint32_t supported_subgroup_stages = 0;
+    uint32_t supported_subgroup_operations = 0;
+    bool supports_bc_texture_compression = false;
+
+    // OPENSCARLETT_VK_DEVICE adapter substring selection diagnostics
+    std::string selected_device_filter;
+    bool matched_device_filter = false;
 };
 
 struct SpirvValidationInfo {
@@ -103,6 +114,13 @@ enum class VulkanImageFormat : uint32_t {
     Bgra8Unorm = 44,    // VK_FORMAT_B8G8R8A8_UNORM
     Rgba16Sfloat = 97,  // VK_FORMAT_R16G16B16A16_SFLOAT
     D32Sfloat = 126,    // VK_FORMAT_D32_SFLOAT
+    Bc1RgbaUnorm = 133, // VK_FORMAT_BC1_RGBA_UNORM_BLOCK
+    Bc2Unorm = 135,     // VK_FORMAT_BC2_UNORM_BLOCK
+    Bc3Unorm = 137,     // VK_FORMAT_BC3_UNORM_BLOCK
+    Bc4Unorm = 139,     // VK_FORMAT_BC4_UNORM_BLOCK
+    Bc5Unorm = 141,     // VK_FORMAT_BC5_UNORM_BLOCK
+    Bc6hUfloat = 143,   // VK_FORMAT_BC6H_UFLOAT_BLOCK
+    Bc7Unorm = 145,     // VK_FORMAT_BC7_UNORM_BLOCK
 };
 
 // Supported vertex attribute formats (values match Khronos VkFormat constants).
@@ -154,6 +172,53 @@ struct VulkanTextureRoundtripResult {
     bool executed_on_vulkan_icd = false;
 };
 
+// Staged block-compressed (BC1-BC7) mip copy descriptor (supports custom / non-aligned row pitch).
+struct VulkanCompressedMipCopy {
+    uint32_t width = 4;
+    uint32_t height = 4;
+    uint32_t depth = 1;
+    uint32_t src_row_pitch_bytes = 0;  // 0 = tightly packed; may be D3D12 256B-aligned or custom pitch
+    std::vector<uint8_t> src_data;
+};
+
+struct VulkanCompressedTextureCopyDesc {
+    uint32_t width = 4;
+    uint32_t height = 4;
+    uint32_t depth = 1;
+    VulkanImageFormat format = VulkanImageFormat::Bc7Unorm;
+    std::vector<VulkanCompressedMipCopy> mips;
+};
+
+struct VulkanCompressedTextureCopyResult {
+    std::vector<VulkanTextureMipLevel> readback_mips;
+    uint32_t staged_mip_count = 0;
+    uint64_t total_staged_bytes = 0;
+    bool executed_on_vulkan_icd = false;
+    bool used_software_fallback = false;
+};
+
+// Wave32-on-Wave64 compute dispatch controls & diagnostics.
+struct VulkanComputeDispatchOptions {
+    uint32_t requested_wave_size = 32;            // 32 (Scarlett native Wave32) or 64
+    bool wave32_on_wave64_safe = true;            // Pad buffers & guard lane budget on Wave64 devices
+    uint32_t simulated_device_subgroup_size = 0;  // 0 = use active/queried device subgroup_size
+};
+
+struct VulkanComputeDispatchResult {
+    bool executed_on_vulkan_icd = false;
+    uint32_t device_subgroup_size = 32;
+    uint32_t effective_wave_size = 32;
+    bool wave32_on_wave64_adapted = false;
+    uint32_t padded_buffer_elements = 0;
+};
+
+// Records automatic mixed-heap buffer/image descriptor slot separation remappings.
+struct VulkanDescriptorSlotRemap {
+    uint32_t original_binding = 0;
+    uint32_t remapped_binding = 0;
+    VulkanDescriptorKind kind = VulkanDescriptorKind::UniformBuffer;
+};
+
 // Binding in descriptor set 0 for graphics or mesh pipelines.
 struct VulkanDescriptorBinding {
     uint32_t binding = 0;
@@ -199,6 +264,8 @@ struct VulkanGraphicsDrawDesc {
 
     // Optional push constants (bound to VERTEX | FRAGMENT).
     std::vector<uint8_t> push_constants;
+    // Optional push-constant byte-budget override (0 = use device maxPushConstantsSize).
+    uint32_t push_constant_budget_override = 0;
 
     // Optional descriptor set 0 bindings.
     std::vector<VulkanDescriptorBinding> descriptors;
@@ -211,6 +278,11 @@ struct VulkanGraphicsDrawResult {
     bool executed_on_vulkan_icd = false;
     bool used_msaa_4x = false;
     bool used_depth_buffer = false;
+    bool push_constants_exceeded_budget = false;
+    uint32_t effective_push_constant_bytes = 0;
+    uint32_t device_push_constant_limit = 128;
+    uint32_t descriptor_collisions_resolved = 0;
+    std::vector<VulkanDescriptorSlotRemap> descriptor_slot_remaps;
 };
 
 // VK_EXT_mesh_shader draw configuration (optional Task/AS + Mesh/MS + Fragment/PS).
@@ -234,6 +306,7 @@ struct VulkanMeshDrawDesc {
     float clear_depth = 1.0f;
 
     std::vector<uint8_t> push_constants;
+    uint32_t push_constant_budget_override = 0;
     std::vector<VulkanDescriptorBinding> descriptors;
 
     // If true, transparently falls back to deterministic clean-room SPIR-V mesh emulation
@@ -248,6 +321,11 @@ struct VulkanMeshDrawResult {
     bool executed_on_mesh_shader_hw = false;
     bool used_task_shader = false;
     bool used_fallback = false;
+    bool push_constants_exceeded_budget = false;
+    uint32_t effective_push_constant_bytes = 0;
+    uint32_t device_push_constant_limit = 128;
+    uint32_t descriptor_collisions_resolved = 0;
+    std::vector<VulkanDescriptorSlotRemap> descriptor_slot_remaps;
 };
 
 // Win32 surface / swapchain / headless offscreen presentation descriptor.
@@ -380,6 +458,25 @@ public:
                                 const std::vector<uint32_t>& input_u32,
                                 std::vector<uint32_t>& output_u32,
                                 uint32_t group_x);
+
+    // Extended compute dispatch with Wave32-on-Wave64 subgroup safety and detailed diagnostics.
+    Status ExecuteComputeShaderEx(const std::vector<uint32_t>& spirv,
+                                  const std::vector<uint32_t>& input_u32,
+                                  std::vector<uint32_t>& output_u32,
+                                  uint32_t group_x,
+                                  const VulkanComputeDispatchOptions& options,
+                                  VulkanComputeDispatchResult& out_result);
+
+    // Staged block-compressed (BC1-BC7) texture copy handling 4x4 block-rounded extents
+    // and non-aligned / D3D12 256B-padded row pitches via intermediate staging buffers.
+    Status CopyCompressedTextureStaged(const VulkanCompressedTextureCopyDesc& desc,
+                                       VulkanCompressedTextureCopyResult& out_result);
+
+    // Test/diagnostic overrides for cross-vendor push-constant and subgroup-size verification.
+    void SetPushConstantBudgetOverrideForTest(uint32_t max_bytes) noexcept;
+    uint32_t GetEffectivePushConstantBudget() const noexcept;
+    void SetSimulatedSubgroupSizeForTest(uint32_t subgroup_size) noexcept;
+    uint32_t GetEffectiveSubgroupSize() const noexcept;
 
     // Records a command list (real VkCommandBuffer begin/barrier/end/submit on Vulkan ICD,
     // or validated recording in software fallback mode).

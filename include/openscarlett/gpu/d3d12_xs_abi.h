@@ -181,6 +181,52 @@ struct D3D12XBOX_PRESENT_WINDOW_STATE {
     double last_frame_ms;
 };
 
+// Separated PresentX GPU fence-signal vs DXGI/Vulkan presentation timing telemetry.
+struct D3D12XBOX_PRESENT_TIMING_STATS {
+    int64_t fence_signal_qpc = 0;
+    double fence_wait_us = 0.0;
+    uint64_t fence_completed_value = 0ull;
+    int64_t present_submit_qpc = 0;
+    int64_t present_complete_qpc = 0;
+    double dxgi_present_us = 0.0;
+    double total_presentx_us = 0.0;
+    uint64_t present_count = 0ull;
+};
+
+// d3d12_xs execution backend mode (OPENSCARLETT_BACKEND / OPENSCARLETT_GPU_BACKEND).
+enum D3D12XBOX_BACKEND_MODE : uint32_t {
+    D3D12XBOX_BACKEND_AUTO = 0u,
+    D3D12XBOX_BACKEND_D3D12 = 1u,
+    D3D12XBOX_BACKEND_VULKAN = 2u,
+};
+
+// Detailed live d3d12_xs -> Vulkan 1.4 command-list routing telemetry.
+struct D3D12XBOX_VULKAN_ROUTING_STATS {
+    uint32_t vulkan_routing_active = 0u;
+    uint32_t executed_on_vulkan_icd = 0u;
+    uint32_t vulkan_software_fallback = 0u;
+    uint32_t vulkan_api_major = 0u;
+    uint32_t vulkan_api_minor = 0u;
+    uint32_t vulkan_api_patch = 0u;
+    uint32_t subgroup_size = 0u;
+    uint32_t max_push_constants_size = 0u;
+    uint64_t routed_command_lists = 0ull;
+    uint64_t routed_draws = 0ull;
+    uint64_t routed_indexed_draws = 0ull;
+    uint64_t routed_dispatches = 0ull;
+    uint64_t routed_mesh_dispatches = 0ull;
+    uint64_t routed_copies = 0ull;
+    uint64_t routed_barriers = 0ull;
+    uint64_t routed_rtv_clears = 0ull;
+    uint64_t routed_dsv_clears = 0ull;
+    uint64_t routed_presents = 0ull;
+    uint64_t vulkan_icd_executions = 0ull;
+    uint64_t spirv_direct_draws = 0ull;
+    uint64_t spirv_direct_dispatches = 0ull;
+    uint64_t spirv_direct_mesh_dispatches = 0ull;
+    char vulkan_device_name[128] = {};
+};
+
 // Clean-room OpenScarlett COM interface IIDs for Xbox D3D12X proxy interfaces.
 // {4F534431-3258-4445-5600-000000000001}
 inline constexpr GUID IID_ID3D12DeviceX = {
@@ -209,6 +255,14 @@ inline constexpr GUID IID_IOpenScarlettPresentHdr = {
 // {4F534431-3258-554D-4500-000000000007}
 inline constexpr GUID IID_IOpenScarlettUnifiedMemory = {
     0x4F534431u, 0x3258u, 0x554Du, {0x45u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x07u}};
+
+// {4F534431-3258-5052-5400-000000000008}
+inline constexpr GUID IID_IOpenScarlettPresentTiming = {
+    0x4F534431u, 0x3258u, 0x5052u, {0x54u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x08u}};
+
+// {4F534431-3258-564B-5200-000000000009}
+inline constexpr GUID IID_IOpenScarlettVulkanRouting = {
+    0x4F534431u, 0x3258u, 0x564Bu, {0x52u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x09u}};
 
 #if defined(_MSC_VER)
 #define OPENSCARLETT_COM_UUID(guid_str) __declspec(uuid(guid_str))
@@ -374,6 +428,23 @@ struct OPENSCARLETT_COM_UUID("4F534431-3258-554D-4500-000000000007") IOpenScarle
 };
 #ifdef __CRT_UUID_DECL
 __CRT_UUID_DECL(IOpenScarlettUnifiedMemory, 0x4F534431, 0x3258, 0x554D, 0x45, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07)
+#endif
+
+struct OPENSCARLETT_COM_UUID("4F534431-3258-5052-5400-000000000008") IOpenScarlettPresentTiming : public IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE GetPresentTimingStats(
+        D3D12XBOX_PRESENT_TIMING_STATS* out_stats) = 0;
+};
+#ifdef __CRT_UUID_DECL
+__CRT_UUID_DECL(IOpenScarlettPresentTiming, 0x4F534431, 0x3258, 0x5052, 0x54, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08)
+#endif
+
+struct OPENSCARLETT_COM_UUID("4F534431-3258-564B-5200-000000000009") IOpenScarlettVulkanRouting : public IUnknown {
+    virtual uint32_t STDMETHODCALLTYPE GetActiveBackendMode() = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetVulkanRoutingStats(
+        D3D12XBOX_VULKAN_ROUTING_STATS* out_stats) = 0;
+};
+#ifdef __CRT_UUID_DECL
+__CRT_UUID_DECL(IOpenScarlettVulkanRouting, 0x4F534431, 0x3258, 0x564B, 0x52, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09)
 #endif
 
 extern "C" {
@@ -560,6 +631,22 @@ OPENSCARLETT_D3D12_API void WINAPI OpenScarlettD3D12SetForceR9G9B9E5UavFallback(
 OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12GetR9G9B9E5UavFallbackActive(
     ID3D12Device* device,
     int* out_active);
+
+// Separated PresentX fence signaling vs DXGI/Vulkan presentation timing stats.
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12GetPresentTimingStats(
+    ID3D12CommandQueue* queue,
+    D3D12XBOX_PRESENT_TIMING_STATS* out_stats);
+
+// Direct d3d12_xs -> Vulkan 1.4 backend mode & routing telemetry helpers.
+OPENSCARLETT_D3D12_API void WINAPI OpenScarlettD3D12SetBackendMode(
+    uint32_t backend_mode);
+
+OPENSCARLETT_D3D12_API uint32_t WINAPI OpenScarlettD3D12GetActiveBackend(
+    ID3D12Device* device);
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12GetVulkanRoutingStats(
+    ID3D12Device* device,
+    D3D12XBOX_VULKAN_ROUTING_STATS* out_stats);
 
 }  // extern "C"
 

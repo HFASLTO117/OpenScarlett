@@ -1,0 +1,52 @@
+OpenScarlett Sprint 7 (v0.4.0-alpha) — Worker 1 Integration Notes
+Branch: swarm/s7-d3d12-vk-routing
+Worktree: E:\OpenScarlett\.worktrees\s7-d3d12-vk-routing
+
+1. Modified / New Files
+- include/openscarlett/gpu/vulkan_backend.h
+- src/gpu/vulkan_backend.cpp
+- include/openscarlett/gpu/d3d12_xs_abi.h
+- src/gpu/d3d12_xs/device_x.h
+- src/gpu/d3d12_xs/device_x.cpp
+- src/gpu/d3d12_xs/command_list_x.h
+- src/gpu/d3d12_xs/command_list_x.cpp
+- src/gpu/d3d12_xs/command_queue_x.h
+- src/gpu/d3d12_xs/command_queue_x.cpp
+- src/shims/d3d12_xs_shim.cpp
+- src/shims/d3d12_xs_mingw.def
+- tests/test_d3d12_vk_routing.cpp
+- INTEGRATION_worker1.txt
+
+2. New CTest Target to Register in CMake
+Target name: test_d3d12_vk_routing
+Source file: tests/test_d3d12_vk_routing.cpp
+Link libraries:
+  openscarlett_add_test(test_d3d12_vk_routing tests/test_d3d12_vk_routing.cpp)
+  target_link_libraries(test_d3d12_vk_routing PRIVATE d3d12_xs d3d12 dxgi d3dcompiler ole32 uuid user32)
+
+3. New Public C Exports (d3d12_xs.dll + src/shims/d3d12_xs_mingw.def)
+- OpenScarlettD3D12GetPresentTimingStats
+- OpenScarlettD3D12SetBackendMode
+- OpenScarlettD3D12GetActiveBackend
+- OpenScarlettD3D12GetVulkanRoutingStats
+
+4. New COM Interfaces (include/openscarlett/gpu/d3d12_xs_abi.h)
+- IOpenScarlettPresentTiming (IID_IOpenScarlettPresentTiming) on CommandQueueX
+- IOpenScarlettVulkanRouting (IID_IOpenScarlettVulkanRouting) on DeviceX
+
+5. Verification Summary
+- Compiler warnings: 0 warnings at /W4 (/W4 /WX verified on test_d3d12_vk_routing.cpp)
+- Existing CTest suite: 37/37 passed (100%)
+- test_d3d12_vk_routing.exe (Hardware NVIDIA GeForce GTX 1650 Ti, Vulkan 1.4.329):
+  - Standard GDK Triangle D3D12 vs Vulkan-Routed: hash=0x1B885BBB5BCBC359 vs 0x1B885BBB5BCBC359, MAE=0.0000 (ICD=1)
+  - Direct SPIR-V via d3d12_xs: gfx_draws=1, cs_dispatches=1, mesh_dispatches=1, icd_execs=7
+  - PresentX timing separation: monotonic fence_completed_value (1->2->3), independent fence_wait_us vs dxgi_present_us vs total_presentx_us
+  - Staged BC1-BC7 copies (all 7 formats, 10x10->5x5->2x2->1x1 mips, 256B + odd custom row pitch): bit-exact on Vulkan 1.4 ICD and SW fallback
+  - Mixed-heap colliding slot 0 (UBO + CombinedImageSampler): remapped 0->1, HW-vs-SW MAE=0.0010
+  - Push-constant byte-budget guard: queried maxPushConstantsSize=256B; 16B ok, 32B/16B & 320B/256B guarded cleanly
+  - OPENSCARLETT_VK_DEVICE substring selection: matched "nvidia" -> "NVIDIA GeForce GTX 1650 Ti"; non-matching handled cleanly (strict error + software fallback)
+  - Wave32-on-Wave64 compute: queried native subgroup_size=32 (stages=0xFF); simulated Wave64 mode padded=64 elems, bit-exact
+  - WARP + Vulkan software fallback: passed (hash=0x713C68B1E7C3C849)
+- test_d3d12_vk_routing.exe (OPENSCARLETT_PREFER_WARP=1):
+  - Standard GDK Triangle D3D12 WARP vs Vulkan-Routed: hash=0x713C68B1E7C3C849 vs 0x713C68B1E7C3C849, MAE=0.0000
+  - All 7 tests passed (100%)

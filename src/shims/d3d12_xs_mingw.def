@@ -44,3 +44,7 @@ EXPORTS
     OpenScarlettD3D12ResolveXMemGpuVa
     OpenScarlettD3D12SetForceR9G9B9E5UavFallback
     OpenScarlettD3D12GetR9G9B9E5UavFallbackActive
+    OpenScarlettD3D12GetPresentTimingStats
+    OpenScarlettD3D12SetBackendMode
+    OpenScarlettD3D12GetActiveBackend
+    OpenScarlettD3D12GetVulkanRoutingStats

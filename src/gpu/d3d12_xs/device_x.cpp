@@ -18,6 +18,136 @@ namespace {
 
 constexpr const char* kModule = "d3d12_xs.dll";
 std::atomic<bool> g_force_r9g9b9e5_uav_fallback{false};
+std::atomic<uint32_t> g_backend_mode{D3D12XBOX_BACKEND_AUTO};
+
+bool EqualsAsciiCaseInsensitive(const char* a, const char* b) noexcept {
+    if (!a || !b) return false;
+    while (*a && *b) {
+        char ca = *a++;
+        char cb = *b++;
+        if (ca >= 'A' && ca <= 'Z') ca = static_cast<char>(ca + ('a' - 'A'));
+        if (cb >= 'A' && cb <= 'Z') cb = static_cast<char>(cb + ('a' - 'A'));
+        if (ca != cb) return false;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+bool EnvVarEqualsIgnoreCase(const char* env_name, const char* expected) noexcept {
+    char buf[128]{};
+    const DWORD len = GetEnvironmentVariableA(env_name, buf, static_cast<DWORD>(sizeof(buf)));
+    if (len == 0u || len >= sizeof(buf)) return false;
+    // Trim leading/trailing ASCII whitespace.
+    size_t start = 0u;
+    size_t end = len;
+    while (start < end && (buf[start] == ' ' || buf[start] == '\t')) ++start;
+    while (end > start && (buf[end - 1u] == ' ' || buf[end - 1u] == '\t' || buf[end - 1u] == '\r' || buf[end - 1u] == '\n')) --end;
+    buf[end] = '\0';
+    return EqualsAsciiCaseInsensitive(buf + start, expected);
+}
+
+bool IsRawSpirvBytecode(const void* data, size_t size) noexcept {
+    if (!data || size < 20u || (size % 4u) != 0u) return false;
+    uint32_t magic = 0u;
+    std::memcpy(&magic, data, sizeof(magic));
+    return magic == openscarlett::kSpirvMagicNumber;
+}
+
+std::vector<uint32_t> CopySpirvWords(const void* data, size_t size) {
+    std::vector<uint32_t> out(size / 4u, 0u);
+    if (!out.empty() && data) {
+        std::memcpy(out.data(), data, out.size() * sizeof(uint32_t));
+    }
+    return out;
+}
+
+openscarlett::VulkanVertexFormat DxgiToVulkanVertexFormat(DXGI_FORMAT fmt) noexcept {
+    switch (fmt) {
+        case DXGI_FORMAT_R32_UINT: return openscarlett::VulkanVertexFormat::R32Uint;
+        case DXGI_FORMAT_R32_FLOAT: return openscarlett::VulkanVertexFormat::R32Sfloat;
+        case DXGI_FORMAT_R32G32_FLOAT: return openscarlett::VulkanVertexFormat::R32G32Sfloat;
+        case DXGI_FORMAT_R32G32B32_FLOAT: return openscarlett::VulkanVertexFormat::R32G32B32Sfloat;
+        case DXGI_FORMAT_R32G32B32A32_UINT: return openscarlett::VulkanVertexFormat::R32G32B32A32Uint;
+        case DXGI_FORMAT_R32G32B32A32_FLOAT:
+        default:
+            return openscarlett::VulkanVertexFormat::R32G32B32A32Sfloat;
+    }
+}
+
+uint32_t DxgiVertexFormatBytes(DXGI_FORMAT fmt) noexcept {
+    switch (fmt) {
+        case DXGI_FORMAT_R32_UINT:
+        case DXGI_FORMAT_R32_FLOAT: return 4u;
+        case DXGI_FORMAT_R32G32_FLOAT: return 8u;
+        case DXGI_FORMAT_R32G32B32_FLOAT: return 12u;
+        case DXGI_FORMAT_R32G32B32A32_UINT:
+        case DXGI_FORMAT_R32G32B32A32_FLOAT:
+        default:
+            return 16u;
+    }
+}
+
+openscarlett::VulkanImageFormat DxgiToVulkanColorFormat(DXGI_FORMAT fmt) noexcept {
+    switch (fmt) {
+        case DXGI_FORMAT_B8G8R8A8_UNORM:
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+            return openscarlett::VulkanImageFormat::Bgra8Unorm;
+        case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        case DXGI_FORMAT_R16G16B16A16_TYPELESS:
+            return openscarlett::VulkanImageFormat::Rgba16Sfloat;
+        default:
+            return openscarlett::VulkanImageFormat::Rgba8Unorm;
+    }
+}
+
+// Lightweight clean-room ID3D12PipelineState returned for raw SPIR-V PSOs when Vulkan routing is active.
+class VulkanPipelineStateX final : public ID3D12PipelineState {
+public:
+    explicit VulkanPipelineStateX(DeviceX* parent) : parent_(parent) {
+        if (parent_) parent_->AddRef();
+    }
+    ~VulkanPipelineStateX() {
+        if (parent_) parent_->Release();
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override {
+        if (!ppvObject) return E_POINTER;
+        *ppvObject = nullptr;
+        if (IsEqualIID(riid, __uuidof(IUnknown)) ||
+            IsEqualIID(riid, __uuidof(ID3D12Object)) ||
+            IsEqualIID(riid, __uuidof(ID3D12DeviceChild)) ||
+            IsEqualIID(riid, __uuidof(ID3D12Pageable)) ||
+            IsEqualIID(riid, __uuidof(ID3D12PipelineState))) {
+            *ppvObject = static_cast<ID3D12PipelineState*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return ref_count_.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG rem = ref_count_.fetch_sub(1u, std::memory_order_acq_rel) - 1u;
+        if (rem == 0u) delete this;
+        return rem;
+    }
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, UINT*, void*) override { return DXGI_ERROR_NOT_FOUND; }
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, UINT, const void*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID, const IUnknown*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE SetName(LPCWSTR) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void** ppvDevice) override {
+        return parent_ ? parent_->QueryInterface(riid, ppvDevice) : E_FAIL;
+    }
+    HRESULT STDMETHODCALLTYPE GetCachedBlob(ID3DBlob** ppBlob) override {
+        if (ppBlob) *ppBlob = nullptr;
+        return E_NOTIMPL;
+    }
+
+private:
+    std::atomic<ULONG> ref_count_{1u};
+    DeviceX* parent_ = nullptr;
+};
 
 inline void RecordDev(const char* method, int32_t slot, HRESULT hr = S_OK) {
     openscarlett::CallOutcome outcome = openscarlett::CallOutcome::Ok;
@@ -232,6 +362,259 @@ DeviceX::DeviceX(
         }
         adapter_info_.supports_r9g9b9e5_uav = supports_r9g9b9e5_uav_;
     }
+
+    const uint32_t resolved_mode = ResolveEffectiveBackendMode();
+    vulkan_routing_active_ = (resolved_mode == D3D12XBOX_BACKEND_VULKAN);
+    if (vulkan_routing_active_) {
+        vulkan_backend_ = std::make_unique<openscarlett::VulkanBackend>();
+        const bool force_sw =
+            EnvVarEqualsIgnoreCase("OPENSCARLETT_VK_FORCE_SOFTWARE", "1") ||
+            EnvVarEqualsIgnoreCase("OPENSCARLETT_VK_FORCE_SOFTWARE", "true");
+        if (force_sw) {
+            vulkan_backend_->InitializeSoftwareFallback();
+        } else {
+            vulkan_backend_->Initialize(/*allow_software_fallback=*/true);
+        }
+    }
+}
+
+void DeviceX::SetGlobalBackendMode(uint32_t backend_mode) noexcept {
+    if (backend_mode > D3D12XBOX_BACKEND_VULKAN) {
+        backend_mode = D3D12XBOX_BACKEND_AUTO;
+    }
+    g_backend_mode.store(backend_mode, std::memory_order_release);
+}
+
+uint32_t DeviceX::ResolveEffectiveBackendMode() noexcept {
+    const uint32_t explicit_mode = g_backend_mode.load(std::memory_order_acquire);
+    if (explicit_mode == D3D12XBOX_BACKEND_VULKAN) return D3D12XBOX_BACKEND_VULKAN;
+    if (explicit_mode == D3D12XBOX_BACKEND_D3D12) return D3D12XBOX_BACKEND_D3D12;
+    if (EnvVarEqualsIgnoreCase("OPENSCARLETT_BACKEND", "vulkan") ||
+        EnvVarEqualsIgnoreCase("OPENSCARLETT_BACKEND", "vk") ||
+        EnvVarEqualsIgnoreCase("OPENSCARLETT_GPU_BACKEND", "vulkan") ||
+        EnvVarEqualsIgnoreCase("OPENSCARLETT_GPU_BACKEND", "vk")) {
+        return D3D12XBOX_BACKEND_VULKAN;
+    }
+    return D3D12XBOX_BACKEND_D3D12;
+}
+
+uint32_t STDMETHODCALLTYPE DeviceX::GetActiveBackendMode() {
+    return vulkan_routing_active_ ? D3D12XBOX_BACKEND_VULKAN : D3D12XBOX_BACKEND_D3D12;
+}
+
+HRESULT STDMETHODCALLTYPE DeviceX::GetVulkanRoutingStats(
+    D3D12XBOX_VULKAN_ROUTING_STATS* out_stats) {
+    if (!out_stats) return E_POINTER;
+    std::memset(out_stats, 0, sizeof(*out_stats));
+    out_stats->vulkan_routing_active = vulkan_routing_active_ ? 1u : 0u;
+    if (vulkan_backend_ && vulkan_backend_->IsInitialized()) {
+        const auto& info = vulkan_backend_->GetDeviceInfo();
+        out_stats->executed_on_vulkan_icd = vulkan_backend_->is_fallback_mode() ? 0u : 1u;
+        out_stats->vulkan_software_fallback = vulkan_backend_->is_fallback_mode() ? 1u : 0u;
+        out_stats->vulkan_api_major = info.api_major;
+        out_stats->vulkan_api_minor = info.api_minor;
+        out_stats->vulkan_api_patch = info.api_patch;
+        out_stats->subgroup_size = info.subgroup_size;
+        out_stats->max_push_constants_size = info.max_push_constants_size;
+        const size_t n = std::min(info.device_name.size(), sizeof(out_stats->vulkan_device_name) - 1u);
+        std::memcpy(out_stats->vulkan_device_name, info.device_name.data(), n);
+        out_stats->vulkan_device_name[n] = '\0';
+    }
+    out_stats->routed_command_lists = vk_routed_cmd_lists_.load(std::memory_order_relaxed);
+    out_stats->routed_draws = vk_routed_draws_.load(std::memory_order_relaxed);
+    out_stats->routed_indexed_draws = vk_routed_indexed_draws_.load(std::memory_order_relaxed);
+    out_stats->routed_dispatches = vk_routed_dispatches_.load(std::memory_order_relaxed);
+    out_stats->routed_mesh_dispatches = vk_routed_mesh_dispatches_.load(std::memory_order_relaxed);
+    out_stats->routed_copies = vk_routed_copies_.load(std::memory_order_relaxed);
+    out_stats->routed_barriers = vk_routed_barriers_.load(std::memory_order_relaxed);
+    out_stats->routed_rtv_clears = vk_routed_rtv_clears_.load(std::memory_order_relaxed);
+    out_stats->routed_dsv_clears = vk_routed_dsv_clears_.load(std::memory_order_relaxed);
+    out_stats->routed_presents = vk_routed_presents_.load(std::memory_order_relaxed);
+    out_stats->vulkan_icd_executions = vk_icd_executions_.load(std::memory_order_relaxed);
+    out_stats->spirv_direct_draws = vk_spirv_direct_draws_.load(std::memory_order_relaxed);
+    out_stats->spirv_direct_dispatches = vk_spirv_direct_dispatches_.load(std::memory_order_relaxed);
+    out_stats->spirv_direct_mesh_dispatches = vk_spirv_direct_mesh_dispatches_.load(std::memory_order_relaxed);
+    return S_OK;
+}
+
+void DeviceX::TrackVulkanResource(
+    IUnknown* obj, D3D12_HEAP_TYPE heap_type, const D3D12_RESOURCE_DESC& desc) {
+    if (!vulkan_routing_active_ || !obj) return;
+    ID3D12Resource* res = nullptr;
+    if (SUCCEEDED(obj->QueryInterface(IID_PPV_ARGS(&res))) && res) {
+        VulkanTrackedResource tr{};
+        tr.resource = res;
+        tr.heap_type = heap_type;
+        tr.desc = desc;
+        if (desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            tr.gpu_va = res->GetGPUVirtualAddress();
+        }
+        {
+            std::lock_guard<std::mutex> lock(vk_state_mutex_);
+            vk_resources_[res] = std::move(tr);
+        }
+        res->Release();
+    }
+}
+
+bool DeviceX::LookupVulkanPipeline(ID3D12PipelineState* pso, VulkanPipelineInfo& out_info) const {
+    if (!vulkan_routing_active_ || !pso) return false;
+    std::lock_guard<std::mutex> lock(vk_state_mutex_);
+    auto it = vk_pipelines_.find(pso);
+    if (it == vk_pipelines_.end()) return false;
+    out_info = it->second;
+    return true;
+}
+
+bool DeviceX::IsSpirvDirectPipeline(ID3D12PipelineState* pso) const {
+    if (!vulkan_routing_active_ || !pso) return false;
+    std::lock_guard<std::mutex> lock(vk_state_mutex_);
+    auto it = vk_pipelines_.find(pso);
+    return (it != vk_pipelines_.end()) && it->second.is_spirv_direct;
+}
+
+ID3D12Resource* DeviceX::ResolveVulkanRtvResource(D3D12_CPU_DESCRIPTOR_HANDLE rtv) const {
+    if (!vulkan_routing_active_ || rtv.ptr == 0u) return nullptr;
+    std::lock_guard<std::mutex> lock(vk_state_mutex_);
+    auto it = vk_rtv_map_.find(rtv.ptr);
+    return (it != vk_rtv_map_.end()) ? it->second : nullptr;
+}
+
+ID3D12Resource* DeviceX::ResolveVulkanDsvResource(D3D12_CPU_DESCRIPTOR_HANDLE dsv) const {
+    if (!vulkan_routing_active_ || dsv.ptr == 0u) return nullptr;
+    std::lock_guard<std::mutex> lock(vk_state_mutex_);
+    auto it = vk_dsv_map_.find(dsv.ptr);
+    return (it != vk_dsv_map_.end()) ? it->second : nullptr;
+}
+
+ID3D12Resource* DeviceX::ResolveVulkanBufferByGpuVa(
+    D3D12_GPU_VIRTUAL_ADDRESS va, uint64_t* out_offset_bytes) const {
+    if (!vulkan_routing_active_ || va == 0ull) return nullptr;
+    std::lock_guard<std::mutex> lock(vk_state_mutex_);
+    for (const auto& [res, tr] : vk_resources_) {
+        if (tr.gpu_va != 0ull && tr.desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            if (va >= tr.gpu_va && va < tr.gpu_va + tr.desc.Width) {
+                if (out_offset_bytes) *out_offset_bytes = va - tr.gpu_va;
+                return res;
+            }
+        }
+    }
+    return nullptr;
+}
+
+bool DeviceX::ReadVulkanBufferData(
+    ID3D12Resource* res, uint64_t offset, uint64_t size, std::vector<uint8_t>& out_bytes) {
+    out_bytes.clear();
+    if (!res) return false;
+    D3D12_HEAP_TYPE heap_type = D3D12_HEAP_TYPE_DEFAULT;
+    uint64_t res_width = res->GetDesc().Width;
+    {
+        std::lock_guard<std::mutex> lock(vk_state_mutex_);
+        auto it = vk_resources_.find(res);
+        if (it != vk_resources_.end()) {
+            heap_type = it->second.heap_type;
+            if (!it->second.shadow_bytes.empty()) {
+                const uint64_t avail = (offset < it->second.shadow_bytes.size())
+                                           ? (it->second.shadow_bytes.size() - offset)
+                                           : 0ull;
+                const uint64_t to_copy = (size == 0ull) ? avail : std::min<uint64_t>(size, avail);
+                out_bytes.assign(it->second.shadow_bytes.begin() + static_cast<ptrdiff_t>(offset),
+                                 it->second.shadow_bytes.begin() + static_cast<ptrdiff_t>(offset + to_copy));
+                return !out_bytes.empty();
+            }
+        }
+    }
+    if (offset >= res_width) return false;
+    const uint64_t avail = res_width - offset;
+    const uint64_t to_copy = (size == 0ull) ? avail : std::min<uint64_t>(size, avail);
+    if (heap_type == D3D12_HEAP_TYPE_UPLOAD || heap_type == D3D12_HEAP_TYPE_READBACK) {
+        void* mapped = nullptr;
+        D3D12_RANGE range{static_cast<SIZE_T>(offset), static_cast<SIZE_T>(offset + to_copy)};
+        if (SUCCEEDED(res->Map(0u, &range, &mapped)) && mapped) {
+            out_bytes.resize(static_cast<size_t>(to_copy));
+            std::memcpy(out_bytes.data(), static_cast<const uint8_t*>(mapped) + offset, static_cast<size_t>(to_copy));
+            D3D12_RANGE write_none{0u, 0u};
+            res->Unmap(0u, &write_none);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool DeviceX::WriteVulkanBufferData(
+    ID3D12Resource* res, uint64_t offset, const void* data, size_t size) {
+    if (!res || !data || size == 0u) return false;
+    D3D12_HEAP_TYPE heap_type = D3D12_HEAP_TYPE_DEFAULT;
+    uint64_t res_width = res->GetDesc().Width;
+    {
+        std::lock_guard<std::mutex> lock(vk_state_mutex_);
+        auto& tr = vk_resources_[res];
+        tr.resource = res;
+        heap_type = tr.heap_type;
+        if (tr.shadow_bytes.size() < offset + size) {
+            tr.shadow_bytes.resize(static_cast<size_t>(offset + size), 0u);
+        }
+        std::memcpy(tr.shadow_bytes.data() + offset, data, size);
+    }
+    if (offset + size <= res_width &&
+        (heap_type == D3D12_HEAP_TYPE_UPLOAD || heap_type == D3D12_HEAP_TYPE_READBACK)) {
+        void* mapped = nullptr;
+        D3D12_RANGE read_none{0u, 0u};
+        if (SUCCEEDED(res->Map(0u, &read_none, &mapped)) && mapped) {
+            std::memcpy(static_cast<uint8_t*>(mapped) + offset, data, size);
+            D3D12_RANGE written{static_cast<SIZE_T>(offset), static_cast<SIZE_T>(offset + size)};
+            res->Unmap(0u, &written);
+        }
+    }
+    return true;
+}
+
+void DeviceX::StoreVulkanRenderTargetFramebuffer(
+    ID3D12Resource* rt_res, const openscarlett::FrameBufferRgba8& fb) {
+    if (!vulkan_routing_active_ || !rt_res) return;
+    std::lock_guard<std::mutex> lock(vk_state_mutex_);
+    vk_rt_framebuffers_[rt_res] = fb;
+}
+
+bool DeviceX::TryGetVulkanRenderTargetFramebuffer(
+    ID3D12Resource* rt_res, openscarlett::FrameBufferRgba8& out_fb) const {
+    if (!vulkan_routing_active_ || !rt_res) return false;
+    std::lock_guard<std::mutex> lock(vk_state_mutex_);
+    auto it = vk_rt_framebuffers_.find(rt_res);
+    if (it == vk_rt_framebuffers_.end() || it->second.pixels.empty()) return false;
+    out_fb = it->second;
+    return true;
+}
+
+void DeviceX::RecordVulkanRoutingCounters(
+    uint64_t cmd_lists,
+    uint64_t draws,
+    uint64_t indexed_draws,
+    uint64_t dispatches,
+    uint64_t mesh_dispatches,
+    uint64_t copies,
+    uint64_t barriers,
+    uint64_t rtv_clears,
+    uint64_t dsv_clears,
+    uint64_t presents,
+    uint64_t icd_execs,
+    uint64_t spirv_draws,
+    uint64_t spirv_dispatches,
+    uint64_t spirv_mesh_dispatches) noexcept {
+    if (cmd_lists) vk_routed_cmd_lists_.fetch_add(cmd_lists, std::memory_order_relaxed);
+    if (draws) vk_routed_draws_.fetch_add(draws, std::memory_order_relaxed);
+    if (indexed_draws) vk_routed_indexed_draws_.fetch_add(indexed_draws, std::memory_order_relaxed);
+    if (dispatches) vk_routed_dispatches_.fetch_add(dispatches, std::memory_order_relaxed);
+    if (mesh_dispatches) vk_routed_mesh_dispatches_.fetch_add(mesh_dispatches, std::memory_order_relaxed);
+    if (copies) vk_routed_copies_.fetch_add(copies, std::memory_order_relaxed);
+    if (barriers) vk_routed_barriers_.fetch_add(barriers, std::memory_order_relaxed);
+    if (rtv_clears) vk_routed_rtv_clears_.fetch_add(rtv_clears, std::memory_order_relaxed);
+    if (dsv_clears) vk_routed_dsv_clears_.fetch_add(dsv_clears, std::memory_order_relaxed);
+    if (presents) vk_routed_presents_.fetch_add(presents, std::memory_order_relaxed);
+    if (icd_execs) vk_icd_executions_.fetch_add(icd_execs, std::memory_order_relaxed);
+    if (spirv_draws) vk_spirv_direct_draws_.fetch_add(spirv_draws, std::memory_order_relaxed);
+    if (spirv_dispatches) vk_spirv_direct_dispatches_.fetch_add(spirv_dispatches, std::memory_order_relaxed);
+    if (spirv_mesh_dispatches) vk_spirv_direct_mesh_dispatches_.fetch_add(spirv_mesh_dispatches, std::memory_order_relaxed);
 }
 
 bool DeviceX::IsR9G9B9E5UavFallbackActive() const noexcept {
@@ -316,6 +699,12 @@ HRESULT STDMETHODCALLTYPE DeviceX::QueryInterface(REFIID riid, void** ppvObject)
     }
     if (IsEqualIID(riid, IID_IOpenScarlettUnifiedMemory)) {
         *ppvObject = static_cast<IOpenScarlettUnifiedMemory*>(this);
+        AddRef();
+        RecordDev("ID3D12DeviceX::QueryInterface", 0, S_OK);
+        return S_OK;
+    }
+    if (IsEqualIID(riid, IID_IOpenScarlettVulkanRouting)) {
+        *ppvObject = static_cast<IOpenScarlettVulkanRouting*>(this);
         AddRef();
         RecordDev("ID3D12DeviceX::QueryInterface", 0, S_OK);
         return S_OK;
@@ -450,6 +839,65 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateGraphicsPipelineState(
         return hr;
     }
 
+    // Direct SPIR-V graphics PSO path when Vulkan routing is active.
+    if (vulkan_routing_active_ &&
+        IsRawSpirvBytecode(pDesc->VS.pShaderBytecode, pDesc->VS.BytecodeLength) &&
+        IsRawSpirvBytecode(pDesc->PS.pShaderBytecode, pDesc->PS.BytecodeLength)) {
+        if (!ppPipelineState) {
+            RecordDev("ID3D12DeviceX::CreateGraphicsPipelineState", 10, E_POINTER);
+            return E_POINTER;
+        }
+        *ppPipelineState = nullptr;
+        VulkanPipelineInfo pi{};
+        pi.is_spirv_direct = true;
+        pi.is_compute = false;
+        pi.is_mesh = false;
+        pi.vs_spirv = CopySpirvWords(pDesc->VS.pShaderBytecode, pDesc->VS.BytecodeLength);
+        pi.ps_spirv = CopySpirvWords(pDesc->PS.pShaderBytecode, pDesc->PS.BytecodeLength);
+        openscarlett::SpirvValidationInfo vs_val{}, ps_val{};
+        if (!openscarlett::VulkanBackend::ValidateSpirvBinary(pi.vs_spirv, &vs_val).ok() ||
+            !openscarlett::VulkanBackend::ValidateSpirvBinary(pi.ps_spirv, &ps_val).ok()) {
+            RecordDev("ID3D12DeviceX::CreateGraphicsPipelineState", 10, E_INVALIDARG);
+            return E_INVALIDARG;
+        }
+        if (!vs_val.entry_point_name.empty()) pi.vs_entry = vs_val.entry_point_name;
+        if (!ps_val.entry_point_name.empty()) pi.ps_entry = ps_val.entry_point_name;
+        pi.enable_depth = (pDesc->DepthStencilState.DepthEnable != FALSE);
+        pi.depth_write = (pDesc->DepthStencilState.DepthWriteMask != D3D12_DEPTH_WRITE_MASK_ZERO);
+        if (pDesc->NumRenderTargets > 0u) {
+            pi.color_format = DxgiToVulkanColorFormat(pDesc->RTVFormats[0]);
+        }
+        uint32_t running_off = 0u;
+        for (UINT i = 0; i < pDesc->InputLayout.NumElements; ++i) {
+            const auto& el = pDesc->InputLayout.pInputElementDescs[i];
+            const uint32_t off = (el.AlignedByteOffset == D3D12_APPEND_ALIGNED_ELEMENT)
+                                     ? running_off
+                                     : el.AlignedByteOffset;
+            openscarlett::VulkanVertexAttribute attr{};
+            attr.location = i;
+            attr.binding = el.InputSlot;
+            attr.format = DxgiToVulkanVertexFormat(el.Format);
+            attr.offset = off;
+            pi.vertex_attrs.push_back(attr);
+            running_off = off + DxgiVertexFormatBytes(el.Format);
+        }
+        pi.vertex_stride_hint = running_off;
+
+        auto* vk_pso = new (std::nothrow) VulkanPipelineStateX(this);
+        if (!vk_pso) {
+            RecordDev("ID3D12DeviceX::CreateGraphicsPipelineState", 10, E_OUTOFMEMORY);
+            return E_OUTOFMEMORY;
+        }
+        {
+            std::lock_guard<std::mutex> lock(vk_state_mutex_);
+            vk_pipelines_[static_cast<ID3D12PipelineState*>(vk_pso)] = std::move(pi);
+        }
+        const HRESULT hr = vk_pso->QueryInterface(riid, ppPipelineState);
+        vk_pso->Release();
+        RecordDev("ID3D12DeviceX::CreateGraphicsPipelineState", 10, hr);
+        return hr;
+    }
+
     const bool lift_vs = openscarlett::IsXboxShaderBytecode(pDesc->VS.pShaderBytecode, pDesc->VS.BytecodeLength);
     const bool lift_ps = openscarlett::IsXboxShaderBytecode(pDesc->PS.pShaderBytecode, pDesc->PS.BytecodeLength);
     const bool lift_ds = openscarlett::IsXboxShaderBytecode(pDesc->DS.pShaderBytecode, pDesc->DS.BytecodeLength);
@@ -501,6 +949,40 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateGraphicsPipelineState(
 
 HRESULT STDMETHODCALLTYPE DeviceX::CreateComputePipelineState(
     const D3D12_COMPUTE_PIPELINE_STATE_DESC* pDesc, REFIID riid, void** ppPipelineState) {
+    if (vulkan_routing_active_ && pDesc &&
+        IsRawSpirvBytecode(pDesc->CS.pShaderBytecode, pDesc->CS.BytecodeLength)) {
+        if (!ppPipelineState) {
+            RecordDev("ID3D12DeviceX::CreateComputePipelineState", 11, E_POINTER);
+            return E_POINTER;
+        }
+        *ppPipelineState = nullptr;
+        VulkanPipelineInfo pi{};
+        pi.is_spirv_direct = true;
+        pi.is_compute = true;
+        pi.cs_spirv = CopySpirvWords(pDesc->CS.pShaderBytecode, pDesc->CS.BytecodeLength);
+        openscarlett::SpirvValidationInfo cs_val{};
+        if (!openscarlett::VulkanBackend::ValidateSpirvBinary(pi.cs_spirv, &cs_val).ok() ||
+            !cs_val.has_compute_entry) {
+            RecordDev("ID3D12DeviceX::CreateComputePipelineState", 11, E_INVALIDARG);
+            return E_INVALIDARG;
+        }
+        if (!cs_val.entry_point_name.empty()) pi.cs_entry = cs_val.entry_point_name;
+
+        auto* vk_pso = new (std::nothrow) VulkanPipelineStateX(this);
+        if (!vk_pso) {
+            RecordDev("ID3D12DeviceX::CreateComputePipelineState", 11, E_OUTOFMEMORY);
+            return E_OUTOFMEMORY;
+        }
+        {
+            std::lock_guard<std::mutex> lock(vk_state_mutex_);
+            vk_pipelines_[static_cast<ID3D12PipelineState*>(vk_pso)] = std::move(pi);
+        }
+        const HRESULT hr = vk_pso->QueryInterface(riid, ppPipelineState);
+        vk_pso->Release();
+        RecordDev("ID3D12DeviceX::CreateComputePipelineState", 11, hr);
+        return hr;
+    }
+
     if (!pDesc || !openscarlett::IsXboxShaderBytecode(pDesc->CS.pShaderBytecode, pDesc->CS.BytecodeLength)) {
         // Standard host PC DXBC/DXIL passthrough with zero overhead
         const HRESULT hr = host_dev_->CreateComputePipelineState(pDesc, riid, ppPipelineState);
@@ -539,9 +1021,15 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommandList(
         return E_POINTER;
     }
     *ppCommandList = nullptr;
+    ID3D12PipelineState* host_initial = pInitialState;
+    const bool initial_is_spirv =
+        vulkan_routing_active_ && IsSpirvDirectPipeline(pInitialState);
+    if (initial_is_spirv) {
+        host_initial = nullptr;
+    }
     ID3D12GraphicsCommandList* host_cl = nullptr;
     HRESULT hr = host_dev_->CreateCommandList(
-        nodeMask, type, pCommandAllocator, pInitialState, IID_PPV_ARGS(&host_cl));
+        nodeMask, type, pCommandAllocator, host_initial, IID_PPV_ARGS(&host_cl));
     if (FAILED(hr) || !host_cl) {
         RecordDev("ID3D12DeviceX::CreateCommandList", 12, hr);
         return hr;
@@ -551,6 +1039,9 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommandList(
     if (!wrapper) {
         RecordDev("ID3D12DeviceX::CreateCommandList", 12, E_OUTOFMEMORY);
         return E_OUTOFMEMORY;
+    }
+    if (initial_is_spirv) {
+        wrapper->SetPipelineState(pInitialState);
     }
     hr = wrapper->QueryInterface(riid, ppCommandList);
     wrapper->Release();
@@ -707,6 +1198,10 @@ void STDMETHODCALLTYPE DeviceX::CreateRenderTargetView(
         desc_ptr = &rw_desc;
     }
     host_dev_->CreateRenderTargetView(pResource, desc_ptr, DestDescriptor);
+    if (vulkan_routing_active_ && pResource) {
+        std::lock_guard<std::mutex> lock(vk_state_mutex_);
+        vk_rtv_map_[DestDescriptor.ptr] = pResource;
+    }
     RecordDev("ID3D12DeviceX::CreateRenderTargetView", 20, S_OK);
 }
 
@@ -714,6 +1209,10 @@ void STDMETHODCALLTYPE DeviceX::CreateDepthStencilView(
     ID3D12Resource* pResource, const D3D12_DEPTH_STENCIL_VIEW_DESC* pDesc,
     D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
     host_dev_->CreateDepthStencilView(pResource, pDesc, DestDescriptor);
+    if (vulkan_routing_active_ && pResource) {
+        std::lock_guard<std::mutex> lock(vk_state_mutex_);
+        vk_dsv_map_[DestDescriptor.ptr] = pResource;
+    }
     RecordDev("ID3D12DeviceX::CreateDepthStencilView", 21, S_OK);
 }
 
@@ -864,6 +1363,9 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommittedResource(
         clear_ptr, riidResource, ppvResource);
     if (SUCCEEDED(hr) && ppvResource && *ppvResource) {
         TrackFallbackResource(static_cast<IUnknown*>(*ppvResource), did_r9g9b9e5_fallback);
+        if (vulkan_routing_active_ && pHeapProperties && desc_ptr) {
+            TrackVulkanResource(static_cast<IUnknown*>(*ppvResource), pHeapProperties->Type, *desc_ptr);
+        }
         if (did_r9g9b9e5_fallback) {
             RecordDev("ID3D12DeviceX::R9G9B9E5UavFallback", 27, S_OK);
         }
@@ -1146,8 +1648,10 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePipelineState(
     constexpr size_t kBytecodeOffset = offsetof(StreamSubobjLayout<D3D12_SHADER_BYTECODE>, value);
 
     bool has_xbox_shader = false;
+    bool has_spirv_shader = false;
     bool has_as_stage = false;
     uint32_t shader_stage_count = 0;
+    VulkanPipelineInfo spirv_stream_pi{};
 
     size_t pos = 0;
     while (pos + sizeof(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE) <= total_bytes) {
@@ -1168,9 +1672,63 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePipelineState(
                 if (openscarlett::IsXboxShaderBytecode(bc.pShaderBytecode, bc.BytecodeLength)) {
                     has_xbox_shader = true;
                 }
+                if (vulkan_routing_active_ && IsRawSpirvBytecode(bc.pShaderBytecode, bc.BytecodeLength)) {
+                    has_spirv_shader = true;
+                    auto words = CopySpirvWords(bc.pShaderBytecode, bc.BytecodeLength);
+                    openscarlett::SpirvValidationInfo val{};
+                    if (openscarlett::VulkanBackend::ValidateSpirvBinary(words, &val).ok()) {
+                        if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS) {
+                            spirv_stream_pi.as_spirv = std::move(words);
+                            if (!val.entry_point_name.empty()) spirv_stream_pi.as_entry = val.entry_point_name;
+                        } else if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS) {
+                            spirv_stream_pi.is_mesh = true;
+                            spirv_stream_pi.ms_spirv = std::move(words);
+                            if (!val.entry_point_name.empty()) spirv_stream_pi.ms_entry = val.entry_point_name;
+                        } else if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS) {
+                            spirv_stream_pi.vs_spirv = std::move(words);
+                            if (!val.entry_point_name.empty()) spirv_stream_pi.vs_entry = val.entry_point_name;
+                        } else if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS) {
+                            spirv_stream_pi.ps_spirv = std::move(words);
+                            if (!val.entry_point_name.empty()) spirv_stream_pi.ps_entry = val.entry_point_name;
+                        } else if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS) {
+                            spirv_stream_pi.is_compute = true;
+                            spirv_stream_pi.cs_spirv = std::move(words);
+                            if (!val.entry_point_name.empty()) spirv_stream_pi.cs_entry = val.entry_point_name;
+                        }
+                    }
+                }
+            }
+        } else if (vulkan_routing_active_ &&
+                   sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS) {
+            D3D12_RT_FORMAT_ARRAY rts{};
+            std::memcpy(&rts, raw_stream + pos + offsetof(StreamSubobjLayout<D3D12_RT_FORMAT_ARRAY>, value), sizeof(rts));
+            if (rts.NumRenderTargets > 0u) {
+                spirv_stream_pi.color_format = DxgiToVulkanColorFormat(rts.RTFormats[0]);
             }
         }
         pos += stride;
+    }
+
+    if (vulkan_routing_active_ && has_spirv_shader) {
+        if (!ppPipelineState) {
+            RecordDev("ID3D12DeviceX::CreatePipelineState", 47, E_POINTER);
+            return E_POINTER;
+        }
+        *ppPipelineState = nullptr;
+        spirv_stream_pi.is_spirv_direct = true;
+        auto* vk_pso = new (std::nothrow) VulkanPipelineStateX(this);
+        if (!vk_pso) {
+            RecordDev("ID3D12DeviceX::CreatePipelineState", 47, E_OUTOFMEMORY);
+            return E_OUTOFMEMORY;
+        }
+        {
+            std::lock_guard<std::mutex> lock(vk_state_mutex_);
+            vk_pipelines_[static_cast<ID3D12PipelineState*>(vk_pso)] = std::move(spirv_stream_pi);
+        }
+        const HRESULT hr = vk_pso->QueryInterface(riid, ppPipelineState);
+        vk_pso->Release();
+        RecordDev("ID3D12DeviceX::CreatePipelineState", 47, hr);
+        return hr;
     }
 
     if (!has_xbox_shader) {
