@@ -228,9 +228,31 @@ public:
     void STDMETHODCALLTYPE DispatchMesh(
         UINT ThreadGroupCountX, UINT ThreadGroupCountY, UINT ThreadGroupCountZ) override;
 
-    // ID3D12GraphicsCommandListX (slots 80..81)
+    // ID3D12GraphicsCommandListX (slots 80..85)
     void STDMETHODCALLTYPE SetGpuVirtualAddressHintX(uint64_t Hint) override;
     ID3D12GraphicsCommandList* STDMETHODCALLTYPE GetUnderlyingHostCommandList() override;
+    void STDMETHODCALLTYPE KickoffX() override;
+    void STDMETHODCALLTYPE Wait32BitValueX(
+        D3D12_GPU_VIRTUAL_ADDRESS Address,
+        uint32_t Value,
+        uint32_t Mask,
+        D3D12XBOX_WAIT_VALUE_OP Operation) override;
+    void STDMETHODCALLTYPE Wait64BitValueX(
+        D3D12_GPU_VIRTUAL_ADDRESS Address,
+        uint64_t Value,
+        uint64_t Mask,
+        D3D12XBOX_WAIT_VALUE_OP Operation) override;
+    void STDMETHODCALLTYPE RSSetDepthBiasX(
+        FLOAT DepthBias,
+        FLOAT DepthBiasClamp,
+        FLOAT SlopeScaledDepthBias) override;
+
+    // Inspection helper for tests/runtime diagnostics.
+    void GetDepthBiasXState(
+        float* out_depth_bias,
+        float* out_depth_bias_clamp,
+        float* out_slope_scaled_depth_bias) const noexcept;
+    uint64_t KickoffCount() const noexcept { return kickoff_count_.load(std::memory_order_relaxed); }
 
 private:
     std::atomic<ULONG> ref_count_{1};
@@ -243,6 +265,10 @@ private:
     ID3D12GraphicsCommandList5* host_list5_ = nullptr;
     ID3D12GraphicsCommandList6* host_list6_ = nullptr;
     std::atomic<uint64_t> gpu_va_hint_{0};
+    std::atomic<uint64_t> kickoff_count_{0};
+    std::atomic<float> depth_bias_{0.0f};
+    std::atomic<float> depth_bias_clamp_{0.0f};
+    std::atomic<float> slope_scaled_depth_bias_{0.0f};
 };
 
 }  // namespace openscarlett::d3d12_xs

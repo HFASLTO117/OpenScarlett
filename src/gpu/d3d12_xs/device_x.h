@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
+#include <vector>
 
 #include "openscarlett/gpu/d3d12_adapter.h"
 #include "openscarlett/gpu/d3d12_xs_abi.h"
@@ -29,6 +31,15 @@ struct UnifiedTextureMapping {
     bool cpu_readable = false;
 };
 
+struct XMemAllocationRecord {
+    uint64_t guest_va = 0ull;
+    uint64_t byte_size = 0ull;
+    uint64_t aligned_size = 0ull;
+    ID3D12Heap* heap = nullptr;
+    ID3D12Resource* anchor_buffer = nullptr;
+    D3D12_GPU_VIRTUAL_ADDRESS desktop_gpu_va = 0ull;
+};
+
 class DeviceX final
     : public ID3D12DeviceX,
       public IOpenScarlettUnifiedMemory {
@@ -44,6 +55,9 @@ public:
     ID3D12Device* HostDevice() const noexcept { return host_dev_; }
     const D3D12AdapterInfo& AdapterInfo() const noexcept { return adapter_info_; }
     HWND DefaultWindow() const noexcept { return default_hwnd_; }
+    bool IsR9G9B9E5UavFallbackActive() const noexcept;
+    static void SetForceR9G9B9E5UavFallback(bool force) noexcept;
+    D3D12_GPU_VIRTUAL_ADDRESS TranslateGuestGpuVa(D3D12_GPU_VIRTUAL_ADDRESS address) const noexcept;
     uint32_t FrameIntervalMicroseconds() const noexcept {
         return frame_interval_us_.load(std::memory_order_relaxed);
     }
@@ -313,8 +327,22 @@ public:
         uint32_t* out_flushed_count) override;
     HRESULT STDMETHODCALLTYPE GetUnifiedTextureStats(
         D3D12XBOX_UNIFIED_TEXTURE_STATS* out_stats) override;
+    HRESULT STDMETHODCALLTYPE AttachXMemAllocation(
+        uint64_t guest_va,
+        uint64_t byte_size,
+        uint64_t* out_desktop_gpu_va) override;
+    HRESULT STDMETHODCALLTYPE DetachXMemAllocation(
+        uint64_t guest_va) override;
+    HRESULT STDMETHODCALLTYPE ResolveXMemGpuVa(
+        uint64_t guest_va,
+        uint64_t* out_desktop_gpu_va) override;
+    HRESULT STDMETHODCALLTYPE GetR9G9B9E5UavFallbackActive(
+        int* out_active) override;
 
 private:
+    bool ShouldRewriteR9G9B9E5Uav(const D3D12_RESOURCE_DESC& desc) const noexcept;
+    void TrackFallbackResource(IUnknown* obj, bool is_fallback);
+    bool IsTrackedFallbackResource(ID3D12Resource* resource) const noexcept;
     HRESULT EnsureUnifiedUploadObjectsLocked();
     HRESULT EnsureUnifiedUploadBufferLocked(uint64_t required_bytes);
     void ReleaseUnifiedMemoryObjects();
@@ -334,16 +362,22 @@ private:
     ID3D12Device6* host_dev6_ = nullptr;
     D3D12AdapterInfo adapter_info_{};
     HWND default_hwnd_ = nullptr;
+    bool supports_r9g9b9e5_uav_ = false;
     std::atomic<uint32_t> frame_interval_us_{16667u};
     std::atomic<uint32_t> max_frame_latency_{2u};
     std::atomic<uint64_t> next_frame_token_{1ull};
     std::atomic<bool> suspended_{false};
     openscarlett::ShaderCache shader_cache_;
 
+    mutable std::mutex fallback_mutex_;
+    std::unordered_set<ID3D12Resource*> r9g9b9e5_fallback_resources_;
+
     // Title unified-memory texture remap tracking (ivall/xcl fd74662/bdae5a4)
     mutable std::mutex unified_mutex_;
     std::unordered_map<ID3D12Resource*, UnifiedTextureMapping> unified_textures_;
     std::unordered_map<ID3D12Heap*, uint64_t> address_heaps_;
+    std::vector<XMemAllocationRecord> xmem_allocations_;
+    std::atomic<uint32_t> xmem_allocation_count_{0u};
     std::atomic<uint32_t> registered_unified_count_{0u};
     std::atomic<uint32_t> dirty_unified_count_{0u};
     uint64_t total_remap_notifications_{0ull};

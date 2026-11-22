@@ -17,6 +17,7 @@ namespace openscarlett::d3d12_xs {
 namespace {
 
 constexpr const char* kModule = "d3d12_xs.dll";
+std::atomic<bool> g_force_r9g9b9e5_uav_fallback{false};
 
 inline void RecordDev(const char* method, int32_t slot, HRESULT hr = S_OK) {
     openscarlett::CallOutcome outcome = openscarlett::CallOutcome::Ok;
@@ -220,7 +221,68 @@ DeviceX::DeviceX(
         host_dev_->QueryInterface(IID_PPV_ARGS(&host_dev4_));
         host_dev_->QueryInterface(IID_PPV_ARGS(&host_dev5_));
         host_dev_->QueryInterface(IID_PPV_ARGS(&host_dev6_));
+
+        D3D12_FEATURE_DATA_FORMAT_SUPPORT fmt_sup{};
+        fmt_sup.Format = DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
+        if (SUCCEEDED(host_dev_->CheckFeatureSupport(
+                D3D12_FEATURE_FORMAT_SUPPORT, &fmt_sup, sizeof(fmt_sup)))) {
+            supports_r9g9b9e5_uav_ =
+                ((fmt_sup.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) != 0) &&
+                ((fmt_sup.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) != 0);
+        }
+        adapter_info_.supports_r9g9b9e5_uav = supports_r9g9b9e5_uav_;
     }
+}
+
+bool DeviceX::IsR9G9B9E5UavFallbackActive() const noexcept {
+    return !supports_r9g9b9e5_uav_ ||
+           g_force_r9g9b9e5_uav_fallback.load(std::memory_order_acquire);
+}
+
+void DeviceX::SetForceR9G9B9E5UavFallback(bool force) noexcept {
+    g_force_r9g9b9e5_uav_fallback.store(force, std::memory_order_release);
+}
+
+bool DeviceX::ShouldRewriteR9G9B9E5Uav(const D3D12_RESOURCE_DESC& desc) const noexcept {
+    return IsR9G9B9E5UavFallbackActive() &&
+           desc.Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP &&
+           (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0;
+}
+
+void DeviceX::TrackFallbackResource(IUnknown* obj, bool is_fallback) {
+    if (!obj) return;
+    ID3D12Resource* res = nullptr;
+    if (SUCCEEDED(obj->QueryInterface(IID_PPV_ARGS(&res))) && res) {
+        {
+            std::lock_guard<std::mutex> lock(fallback_mutex_);
+            if (is_fallback) {
+                r9g9b9e5_fallback_resources_.insert(res);
+            } else {
+                r9g9b9e5_fallback_resources_.erase(res);
+            }
+        }
+        res->Release();
+    }
+}
+
+bool DeviceX::IsTrackedFallbackResource(ID3D12Resource* resource) const noexcept {
+    if (!resource) return false;
+    std::lock_guard<std::mutex> lock(fallback_mutex_);
+    return r9g9b9e5_fallback_resources_.find(resource) != r9g9b9e5_fallback_resources_.end();
+}
+
+D3D12_GPU_VIRTUAL_ADDRESS DeviceX::TranslateGuestGpuVa(
+    D3D12_GPU_VIRTUAL_ADDRESS address) const noexcept {
+    if (address == 0ull || xmem_allocation_count_.load(std::memory_order_acquire) == 0u) {
+        return address;
+    }
+    std::lock_guard<std::mutex> lock(unified_mutex_);
+    for (const auto& rec : xmem_allocations_) {
+        if (address >= rec.guest_va && address < rec.guest_va + rec.aligned_size) {
+            return rec.desktop_gpu_va + (address - rec.guest_va);
+        }
+    }
+    return address;
 }
 
 DeviceX::~DeviceX() {
@@ -530,13 +592,36 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateRootSignature(
 void STDMETHODCALLTYPE DeviceX::CreateConstantBufferView(
     const D3D12_CONSTANT_BUFFER_VIEW_DESC* pDesc,
     D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
-    host_dev_->CreateConstantBufferView(pDesc, DestDescriptor);
+    D3D12_CONSTANT_BUFFER_VIEW_DESC translated{};
+    const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc_ptr = pDesc;
+    if (pDesc && pDesc->BufferLocation != 0ull) {
+        const D3D12_GPU_VIRTUAL_ADDRESS mapped_va = TranslateGuestGpuVa(pDesc->BufferLocation);
+        if (mapped_va != pDesc->BufferLocation) {
+            translated = *pDesc;
+            translated.BufferLocation = mapped_va;
+            desc_ptr = &translated;
+        }
+    }
+    host_dev_->CreateConstantBufferView(desc_ptr, DestDescriptor);
     RecordDev("ID3D12DeviceX::CreateConstantBufferView", 17, S_OK);
 }
 
 void STDMETHODCALLTYPE DeviceX::CreateShaderResourceView(
     ID3D12Resource* pResource, const D3D12_SHADER_RESOURCE_VIEW_DESC* pDesc,
     D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
+    // R9G9B9E5_SHAREDEXP UAV fallback: rewrite explicit R9G9B9E5 SRV views to R16G16B16A16_FLOAT
+    // when the backing resource was promoted to RGBA16F.
+    if (pDesc != nullptr && pDesc->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP &&
+        pResource != nullptr &&
+        (IsTrackedFallbackResource(pResource) ||
+         pResource->GetDesc().Format == DXGI_FORMAT_R16G16B16A16_FLOAT)) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC rw_desc = *pDesc;
+        rw_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        host_dev_->CreateShaderResourceView(pResource, &rw_desc, DestDescriptor);
+        RecordDev("ID3D12DeviceX::CreateShaderResourceView[R9G9B9E5Fallback]", 18, S_OK);
+        RecordDev("ID3D12DeviceX::CreateShaderResourceView", 18, S_OK);
+        return;
+    }
     // ScarlettX #46: Preserve array slices on default (nullptr desc) texture SRVs.
     // Some host drivers / translation paths collapse nullptr SRV descriptors on Texture2D arrays
     // into a single-slice Texture2D view; build an explicit array SRV descriptor instead.
@@ -592,14 +677,36 @@ void STDMETHODCALLTYPE DeviceX::CreateUnorderedAccessView(
     ID3D12Resource* pResource, ID3D12Resource* pCounterResource,
     const D3D12_UNORDERED_ACCESS_VIEW_DESC* pDesc,
     D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
-    host_dev_->CreateUnorderedAccessView(pResource, pCounterResource, pDesc, DestDescriptor);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC rw_desc{};
+    const D3D12_UNORDERED_ACCESS_VIEW_DESC* desc_ptr = pDesc;
+    if (pDesc != nullptr && pDesc->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP &&
+        (IsR9G9B9E5UavFallbackActive() ||
+         (pResource != nullptr &&
+          (IsTrackedFallbackResource(pResource) ||
+           pResource->GetDesc().Format == DXGI_FORMAT_R16G16B16A16_FLOAT)))) {
+        rw_desc = *pDesc;
+        rw_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        desc_ptr = &rw_desc;
+        RecordDev("ID3D12DeviceX::CreateUnorderedAccessView[R9G9B9E5Fallback]", 19, S_OK);
+    }
+    host_dev_->CreateUnorderedAccessView(pResource, pCounterResource, desc_ptr, DestDescriptor);
     RecordDev("ID3D12DeviceX::CreateUnorderedAccessView", 19, S_OK);
 }
 
 void STDMETHODCALLTYPE DeviceX::CreateRenderTargetView(
     ID3D12Resource* pResource, const D3D12_RENDER_TARGET_VIEW_DESC* pDesc,
     D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
-    host_dev_->CreateRenderTargetView(pResource, pDesc, DestDescriptor);
+    D3D12_RENDER_TARGET_VIEW_DESC rw_desc{};
+    const D3D12_RENDER_TARGET_VIEW_DESC* desc_ptr = pDesc;
+    if (pDesc != nullptr && pDesc->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP &&
+        pResource != nullptr &&
+        (IsTrackedFallbackResource(pResource) ||
+         pResource->GetDesc().Format == DXGI_FORMAT_R16G16B16A16_FLOAT)) {
+        rw_desc = *pDesc;
+        rw_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        desc_ptr = &rw_desc;
+    }
+    host_dev_->CreateRenderTargetView(pResource, desc_ptr, DestDescriptor);
     RecordDev("ID3D12DeviceX::CreateRenderTargetView", 20, S_OK);
 }
 
@@ -645,8 +752,26 @@ void STDMETHODCALLTYPE DeviceX::CopyDescriptorsSimple(
 D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE DeviceX::GetResourceAllocationInfo(
     D3D12_RESOURCE_ALLOCATION_INFO* pRet,
     UINT visibleMask, UINT numResourceDescs, const D3D12_RESOURCE_DESC* pResourceDescs) {
+    std::vector<D3D12_RESOURCE_DESC> rw_descs;
+    const D3D12_RESOURCE_DESC* descs_ptr = pResourceDescs;
+    if (pResourceDescs && numResourceDescs > 0u && IsR9G9B9E5UavFallbackActive()) {
+        bool need_rw = false;
+        for (UINT i = 0; i < numResourceDescs; ++i) {
+            if (ShouldRewriteR9G9B9E5Uav(pResourceDescs[i])) {
+                need_rw = true;
+                break;
+            }
+        }
+        if (need_rw) {
+            rw_descs.assign(pResourceDescs, pResourceDescs + numResourceDescs);
+            for (auto& d : rw_descs) {
+                if (ShouldRewriteR9G9B9E5Uav(d)) d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            }
+            descs_ptr = rw_descs.data();
+        }
+    }
     D3D12_RESOURCE_ALLOCATION_INFO* info =
-        host_dev_->GetResourceAllocationInfo(pRet, visibleMask, numResourceDescs, pResourceDescs);
+        host_dev_->GetResourceAllocationInfo(pRet, visibleMask, numResourceDescs, descs_ptr);
     RecordDev("ID3D12DeviceX::GetResourceAllocationInfo", 25, S_OK);
     return info;
 }
@@ -661,8 +786,26 @@ D3D12_HEAP_PROPERTIES* STDMETHODCALLTYPE DeviceX::GetCustomHeapProperties(
 #else
 D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE DeviceX::GetResourceAllocationInfo(
     UINT visibleMask, UINT numResourceDescs, const D3D12_RESOURCE_DESC* pResourceDescs) {
+    std::vector<D3D12_RESOURCE_DESC> rw_descs;
+    const D3D12_RESOURCE_DESC* descs_ptr = pResourceDescs;
+    if (pResourceDescs && numResourceDescs > 0u && IsR9G9B9E5UavFallbackActive()) {
+        bool need_rw = false;
+        for (UINT i = 0; i < numResourceDescs; ++i) {
+            if (ShouldRewriteR9G9B9E5Uav(pResourceDescs[i])) {
+                need_rw = true;
+                break;
+            }
+        }
+        if (need_rw) {
+            rw_descs.assign(pResourceDescs, pResourceDescs + numResourceDescs);
+            for (auto& d : rw_descs) {
+                if (ShouldRewriteR9G9B9E5Uav(d)) d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            }
+            descs_ptr = rw_descs.data();
+        }
+    }
     const D3D12_RESOURCE_ALLOCATION_INFO info =
-        host_dev_->GetResourceAllocationInfo(visibleMask, numResourceDescs, pResourceDescs);
+        host_dev_->GetResourceAllocationInfo(visibleMask, numResourceDescs, descs_ptr);
     RecordDev("ID3D12DeviceX::GetResourceAllocationInfo", 25, S_OK);
     return info;
 }
@@ -699,13 +842,32 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommittedResource(
     const D3D12_CLEAR_VALUE* pOptimizedClearValue, REFIID riidResource, void** ppvResource) {
     D3D12_RESOURCE_DESC clean_desc{};
     const D3D12_RESOURCE_DESC* desc_ptr = pDesc;
+    D3D12_CLEAR_VALUE clean_clear{};
+    const D3D12_CLEAR_VALUE* clear_ptr = pOptimizedClearValue;
+    bool did_r9g9b9e5_fallback = false;
     if (pDesc) {
         clean_desc = SanitizeXboxResourceDesc(*pDesc);
+        if (ShouldRewriteR9G9B9E5Uav(clean_desc)) {
+            clean_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            did_r9g9b9e5_fallback = true;
+            if (pOptimizedClearValue &&
+                pOptimizedClearValue->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) {
+                clean_clear = *pOptimizedClearValue;
+                clean_clear.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+                clear_ptr = &clean_clear;
+            }
+        }
         desc_ptr = &clean_desc;
     }
     const HRESULT hr = host_dev_->CreateCommittedResource(
         pHeapProperties, SanitizeXboxHeapFlags(HeapFlags), desc_ptr, InitialResourceState,
-        pOptimizedClearValue, riidResource, ppvResource);
+        clear_ptr, riidResource, ppvResource);
+    if (SUCCEEDED(hr) && ppvResource && *ppvResource) {
+        TrackFallbackResource(static_cast<IUnknown*>(*ppvResource), did_r9g9b9e5_fallback);
+        if (did_r9g9b9e5_fallback) {
+            RecordDev("ID3D12DeviceX::R9G9B9E5UavFallback", 27, S_OK);
+        }
+    }
     RecordDev("ID3D12DeviceX::CreateCommittedResource", 27, hr);
     return hr;
 }
@@ -730,12 +892,31 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResource(
     REFIID riid, void** ppvResource) {
     D3D12_RESOURCE_DESC clean_desc{};
     const D3D12_RESOURCE_DESC* desc_ptr = pDesc;
+    D3D12_CLEAR_VALUE clean_clear{};
+    const D3D12_CLEAR_VALUE* clear_ptr = pOptimizedClearValue;
+    bool did_r9g9b9e5_fallback = false;
     if (pDesc) {
         clean_desc = SanitizeXboxResourceDesc(*pDesc);
+        if (ShouldRewriteR9G9B9E5Uav(clean_desc)) {
+            clean_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            did_r9g9b9e5_fallback = true;
+            if (pOptimizedClearValue &&
+                pOptimizedClearValue->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) {
+                clean_clear = *pOptimizedClearValue;
+                clean_clear.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+                clear_ptr = &clean_clear;
+            }
+        }
         desc_ptr = &clean_desc;
     }
     const HRESULT hr = host_dev_->CreatePlacedResource(
-        pHeap, HeapOffset, desc_ptr, InitialState, pOptimizedClearValue, riid, ppvResource);
+        pHeap, HeapOffset, desc_ptr, InitialState, clear_ptr, riid, ppvResource);
+    if (SUCCEEDED(hr) && ppvResource && *ppvResource) {
+        TrackFallbackResource(static_cast<IUnknown*>(*ppvResource), did_r9g9b9e5_fallback);
+        if (did_r9g9b9e5_fallback) {
+            RecordDev("ID3D12DeviceX::R9G9B9E5UavFallback", 29, S_OK);
+        }
+    }
     if (SUCCEEDED(hr) && pHeap && desc_ptr && ppvResource && *ppvResource) {
         uint64_t heap_base_va = 0ull;
         {
@@ -762,12 +943,31 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateReservedResource(
     const D3D12_CLEAR_VALUE* pOptimizedClearValue, REFIID riid, void** ppvResource) {
     D3D12_RESOURCE_DESC clean_desc{};
     const D3D12_RESOURCE_DESC* desc_ptr = pDesc;
+    D3D12_CLEAR_VALUE clean_clear{};
+    const D3D12_CLEAR_VALUE* clear_ptr = pOptimizedClearValue;
+    bool did_r9g9b9e5_fallback = false;
     if (pDesc) {
         clean_desc = SanitizeXboxResourceDesc(*pDesc);
+        if (ShouldRewriteR9G9B9E5Uav(clean_desc)) {
+            clean_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            did_r9g9b9e5_fallback = true;
+            if (pOptimizedClearValue &&
+                pOptimizedClearValue->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) {
+                clean_clear = *pOptimizedClearValue;
+                clean_clear.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+                clear_ptr = &clean_clear;
+            }
+        }
         desc_ptr = &clean_desc;
     }
     const HRESULT hr = host_dev_->CreateReservedResource(
-        desc_ptr, InitialState, pOptimizedClearValue, riid, ppvResource);
+        desc_ptr, InitialState, clear_ptr, riid, ppvResource);
+    if (SUCCEEDED(hr) && ppvResource && *ppvResource) {
+        TrackFallbackResource(static_cast<IUnknown*>(*ppvResource), did_r9g9b9e5_fallback);
+        if (did_r9g9b9e5_fallback) {
+            RecordDev("ID3D12DeviceX::R9G9B9E5UavFallback", 30, S_OK);
+        }
+    }
     RecordDev("ID3D12DeviceX::CreateReservedResource", 30, hr);
     return hr;
 }
@@ -829,8 +1029,15 @@ void STDMETHODCALLTYPE DeviceX::GetCopyableFootprints(
     const D3D12_RESOURCE_DESC* pResourceDesc, UINT FirstSubresource, UINT NumSubresources,
     UINT64 BaseOffset, D3D12_PLACED_SUBRESOURCE_FOOTPRINT* pLayouts, UINT* pNumRows,
     UINT64* pRowSizeInBytes, UINT64* pTotalBytes) {
+    D3D12_RESOURCE_DESC rw_desc{};
+    const D3D12_RESOURCE_DESC* desc_ptr = pResourceDesc;
+    if (pResourceDesc && ShouldRewriteR9G9B9E5Uav(*pResourceDesc)) {
+        rw_desc = *pResourceDesc;
+        rw_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        desc_ptr = &rw_desc;
+    }
     host_dev_->GetCopyableFootprints(
-        pResourceDesc, FirstSubresource, NumSubresources, BaseOffset,
+        desc_ptr, FirstSubresource, NumSubresources, BaseOffset,
         pLayouts, pNumRows, pRowSizeInBytes, pTotalBytes);
     RecordDev("ID3D12DeviceX::GetCopyableFootprints", 38, S_OK);
 }
@@ -1112,16 +1319,35 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommittedResource1(
     REFIID riidResource, void** ppvResource) {
     D3D12_RESOURCE_DESC clean_desc{};
     const D3D12_RESOURCE_DESC* desc_ptr = pDesc;
+    D3D12_CLEAR_VALUE clean_clear{};
+    const D3D12_CLEAR_VALUE* clear_ptr = pOptimizedClearValue;
+    bool did_r9g9b9e5_fallback = false;
     if (pDesc) {
         clean_desc = SanitizeXboxResourceDesc(*pDesc);
+        if (ShouldRewriteR9G9B9E5Uav(clean_desc)) {
+            clean_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            did_r9g9b9e5_fallback = true;
+            if (pOptimizedClearValue &&
+                pOptimizedClearValue->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) {
+                clean_clear = *pOptimizedClearValue;
+                clean_clear.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+                clear_ptr = &clean_clear;
+            }
+        }
         desc_ptr = &clean_desc;
     }
     const HRESULT hr = host_dev4_
                            ? host_dev4_->CreateCommittedResource1(
                                  pHeapProperties, SanitizeXboxHeapFlags(HeapFlags), desc_ptr,
-                                 InitialResourceState, pOptimizedClearValue,
+                                 InitialResourceState, clear_ptr,
                                  pProtectedSession, riidResource, ppvResource)
                            : E_NOINTERFACE;
+    if (SUCCEEDED(hr) && ppvResource && *ppvResource) {
+        TrackFallbackResource(static_cast<IUnknown*>(*ppvResource), did_r9g9b9e5_fallback);
+        if (did_r9g9b9e5_fallback) {
+            RecordDev("ID3D12DeviceX::R9G9B9E5UavFallback", 53, S_OK);
+        }
+    }
     RecordDev("ID3D12DeviceX::CreateCommittedResource1", 53, hr);
     return hr;
 }
@@ -1150,15 +1376,34 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateReservedResource1(
     REFIID riid, void** ppvResource) {
     D3D12_RESOURCE_DESC clean_desc{};
     const D3D12_RESOURCE_DESC* desc_ptr = pDesc;
+    D3D12_CLEAR_VALUE clean_clear{};
+    const D3D12_CLEAR_VALUE* clear_ptr = pOptimizedClearValue;
+    bool did_r9g9b9e5_fallback = false;
     if (pDesc) {
         clean_desc = SanitizeXboxResourceDesc(*pDesc);
+        if (ShouldRewriteR9G9B9E5Uav(clean_desc)) {
+            clean_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            did_r9g9b9e5_fallback = true;
+            if (pOptimizedClearValue &&
+                pOptimizedClearValue->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) {
+                clean_clear = *pOptimizedClearValue;
+                clean_clear.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+                clear_ptr = &clean_clear;
+            }
+        }
         desc_ptr = &clean_desc;
     }
     const HRESULT hr = host_dev4_
                            ? host_dev4_->CreateReservedResource1(
-                                 desc_ptr, InitialState, pOptimizedClearValue,
+                                 desc_ptr, InitialState, clear_ptr,
                                  pProtectedSession, riid, ppvResource)
                            : E_NOINTERFACE;
+    if (SUCCEEDED(hr) && ppvResource && *ppvResource) {
+        TrackFallbackResource(static_cast<IUnknown*>(*ppvResource), did_r9g9b9e5_fallback);
+        if (did_r9g9b9e5_fallback) {
+            RecordDev("ID3D12DeviceX::R9G9B9E5UavFallback", 55, S_OK);
+        }
+    }
     RecordDev("ID3D12DeviceX::CreateReservedResource1", 55, hr);
     return hr;
 }
@@ -1168,13 +1413,31 @@ D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE DeviceX::GetResourceAllocation
     D3D12_RESOURCE_ALLOCATION_INFO* pRet,
     UINT visibleMask, UINT numResourceDescs, const D3D12_RESOURCE_DESC* pResourceDescs,
     D3D12_RESOURCE_ALLOCATION_INFO1* pResourceAllocationInfo1) {
+    std::vector<D3D12_RESOURCE_DESC> rw_descs;
+    const D3D12_RESOURCE_DESC* descs_ptr = pResourceDescs;
+    if (pResourceDescs && numResourceDescs > 0u && IsR9G9B9E5UavFallbackActive()) {
+        bool need_rw = false;
+        for (UINT i = 0; i < numResourceDescs; ++i) {
+            if (ShouldRewriteR9G9B9E5Uav(pResourceDescs[i])) {
+                need_rw = true;
+                break;
+            }
+        }
+        if (need_rw) {
+            rw_descs.assign(pResourceDescs, pResourceDescs + numResourceDescs);
+            for (auto& d : rw_descs) {
+                if (ShouldRewriteR9G9B9E5Uav(d)) d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            }
+            descs_ptr = rw_descs.data();
+        }
+    }
     D3D12_RESOURCE_ALLOCATION_INFO* info = nullptr;
     if (host_dev4_) {
         info = host_dev4_->GetResourceAllocationInfo1(
-            pRet, visibleMask, numResourceDescs, pResourceDescs, pResourceAllocationInfo1);
+            pRet, visibleMask, numResourceDescs, descs_ptr, pResourceAllocationInfo1);
         RecordDev("ID3D12DeviceX::GetResourceAllocationInfo1", 56, S_OK);
     } else {
-        info = host_dev_->GetResourceAllocationInfo(pRet, visibleMask, numResourceDescs, pResourceDescs);
+        info = host_dev_->GetResourceAllocationInfo(pRet, visibleMask, numResourceDescs, descs_ptr);
         RecordDev("ID3D12DeviceX::GetResourceAllocationInfo1", 56, E_NOINTERFACE);
     }
     return info;
@@ -1183,13 +1446,31 @@ D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE DeviceX::GetResourceAllocation
 D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE DeviceX::GetResourceAllocationInfo1(
     UINT visibleMask, UINT numResourceDescs, const D3D12_RESOURCE_DESC* pResourceDescs,
     D3D12_RESOURCE_ALLOCATION_INFO1* pResourceAllocationInfo1) {
+    std::vector<D3D12_RESOURCE_DESC> rw_descs;
+    const D3D12_RESOURCE_DESC* descs_ptr = pResourceDescs;
+    if (pResourceDescs && numResourceDescs > 0u && IsR9G9B9E5UavFallbackActive()) {
+        bool need_rw = false;
+        for (UINT i = 0; i < numResourceDescs; ++i) {
+            if (ShouldRewriteR9G9B9E5Uav(pResourceDescs[i])) {
+                need_rw = true;
+                break;
+            }
+        }
+        if (need_rw) {
+            rw_descs.assign(pResourceDescs, pResourceDescs + numResourceDescs);
+            for (auto& d : rw_descs) {
+                if (ShouldRewriteR9G9B9E5Uav(d)) d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            }
+            descs_ptr = rw_descs.data();
+        }
+    }
     D3D12_RESOURCE_ALLOCATION_INFO info{};
     if (host_dev4_) {
         info = host_dev4_->GetResourceAllocationInfo1(
-            visibleMask, numResourceDescs, pResourceDescs, pResourceAllocationInfo1);
+            visibleMask, numResourceDescs, descs_ptr, pResourceAllocationInfo1);
         RecordDev("ID3D12DeviceX::GetResourceAllocationInfo1", 56, S_OK);
     } else {
-        info = host_dev_->GetResourceAllocationInfo(visibleMask, numResourceDescs, pResourceDescs);
+        info = host_dev_->GetResourceAllocationInfo(visibleMask, numResourceDescs, descs_ptr);
         RecordDev("ID3D12DeviceX::GetResourceAllocationInfo1", 56, E_NOINTERFACE);
     }
     return info;
@@ -1338,17 +1619,78 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResourceX(
         RecordDev("ID3D12DeviceX::CreatePlacedResourceX", 69, E_INVALIDARG);
         return E_INVALIDARG;
     }
-    const D3D12_RESOURCE_DESC clean_desc = SanitizeXboxResourceDesc(*pDesc);
-    D3D12_HEAP_PROPERTIES heap_props{};
-    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
-    const HRESULT hr = host_dev_->CreateCommittedResource(
-        &heap_props, D3D12_HEAP_FLAG_NONE, &clean_desc, InitialState,
-        pOptimizedClearValue, riid, ppvResource);
-    if (SUCCEEDED(hr) && VirtualAddress != 0ull && *ppvResource) {
-        ID3D12Resource* res = nullptr;
-        if (SUCCEEDED(static_cast<IUnknown*>(*ppvResource)->QueryInterface(IID_PPV_ARGS(&res))) && res) {
-            AutoRegisterUnifiedResource(res, VirtualAddress, clean_desc, InitialState);
-            res->Release();
+    *ppvResource = nullptr;
+    D3D12_RESOURCE_DESC clean_desc = SanitizeXboxResourceDesc(*pDesc);
+    D3D12_CLEAR_VALUE clean_clear{};
+    const D3D12_CLEAR_VALUE* clear_ptr = pOptimizedClearValue;
+    bool did_r9g9b9e5_fallback = false;
+    if (ShouldRewriteR9G9B9E5Uav(clean_desc)) {
+        clean_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        did_r9g9b9e5_fallback = true;
+        if (pOptimizedClearValue &&
+            pOptimizedClearValue->Format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP) {
+            clean_clear = *pOptimizedClearValue;
+            clean_clear.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            clear_ptr = &clean_clear;
+        }
+    }
+
+    // If VirtualAddress falls inside an attached XMem graphics allocation, place directly
+    // into its backing desktop ID3D12Heap so GPU virtual addresses bind cleanly on desktop!
+    HRESULT hr = E_FAIL;
+    if (VirtualAddress != 0ull && xmem_allocation_count_.load(std::memory_order_acquire) > 0u) {
+        ID3D12Heap* backing_heap = nullptr;
+        uint64_t heap_offset = 0ull;
+        uint64_t heap_size = 0ull;
+        {
+            std::lock_guard<std::mutex> lock(unified_mutex_);
+            for (const auto& rec : xmem_allocations_) {
+                if (rec.heap && VirtualAddress >= rec.guest_va &&
+                    VirtualAddress < rec.guest_va + rec.aligned_size) {
+                    backing_heap = rec.heap;
+                    backing_heap->AddRef();
+                    heap_offset = VirtualAddress - rec.guest_va;
+                    heap_size = rec.aligned_size;
+                    break;
+                }
+            }
+        }
+        if (backing_heap) {
+            const D3D12_RESOURCE_ALLOCATION_INFO alloc_info =
+                host_dev_->GetResourceAllocationInfo(0u, 1u, &clean_desc);
+            const uint64_t req_align = std::max<uint64_t>(
+                alloc_info.Alignment ? alloc_info.Alignment : 65536ull, 65536ull);
+            if (alloc_info.SizeInBytes > 0ull &&
+                (heap_offset % req_align) == 0ull &&
+                heap_offset + alloc_info.SizeInBytes <= heap_size) {
+                hr = host_dev_->CreatePlacedResource(
+                    backing_heap, heap_offset, &clean_desc, InitialState,
+                    clear_ptr, riid, ppvResource);
+            }
+            backing_heap->Release();
+        }
+    }
+
+    // Fallback to committed default-heap resource if not attached or heap placement incompatible.
+    if (FAILED(hr) || !*ppvResource) {
+        D3D12_HEAP_PROPERTIES heap_props{};
+        heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+        hr = host_dev_->CreateCommittedResource(
+            &heap_props, D3D12_HEAP_FLAG_NONE, &clean_desc, InitialState,
+            clear_ptr, riid, ppvResource);
+    }
+
+    if (SUCCEEDED(hr) && *ppvResource) {
+        TrackFallbackResource(static_cast<IUnknown*>(*ppvResource), did_r9g9b9e5_fallback);
+        if (did_r9g9b9e5_fallback) {
+            RecordDev("ID3D12DeviceX::R9G9B9E5UavFallback", 69, S_OK);
+        }
+        if (VirtualAddress != 0ull) {
+            ID3D12Resource* res = nullptr;
+            if (SUCCEEDED(static_cast<IUnknown*>(*ppvResource)->QueryInterface(IID_PPV_ARGS(&res))) && res) {
+                AutoRegisterUnifiedResource(res, VirtualAddress, clean_desc, InitialState);
+                res->Release();
+            }
         }
     }
     RecordDev("ID3D12DeviceX::CreatePlacedResourceX", 69, hr);
@@ -1515,8 +1857,18 @@ void DeviceX::ReleaseUnifiedMemoryObjects() {
         }
         unified_textures_.clear();
         address_heaps_.clear();
+        for (auto& xmem : xmem_allocations_) {
+            if (xmem.anchor_buffer) xmem.anchor_buffer->Release();
+            if (xmem.heap) xmem.heap->Release();
+        }
+        xmem_allocations_.clear();
+        xmem_allocation_count_.store(0u, std::memory_order_release);
         registered_unified_count_.store(0u, std::memory_order_release);
         dirty_unified_count_.store(0u, std::memory_order_release);
+    }
+    {
+        std::lock_guard<std::mutex> lock(fallback_mutex_);
+        r9g9b9e5_fallback_resources_.clear();
     }
     {
         std::lock_guard<std::mutex> lock(unified_upload_mutex_);
@@ -1947,6 +2299,172 @@ HRESULT STDMETHODCALLTYPE DeviceX::GetUnifiedTextureStats(
     out_stats->TotalFlushes = total_unified_flushes_;
     out_stats->TotalBytesUploaded = total_unified_bytes_uploaded_;
     RecordDev("ID3D12DeviceX::GetUnifiedTextureStats", -1, S_OK);
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE DeviceX::AttachXMemAllocation(
+    uint64_t guest_va,
+    uint64_t byte_size,
+    uint64_t* out_desktop_gpu_va) {
+    if (out_desktop_gpu_va) *out_desktop_gpu_va = 0ull;
+    if (guest_va == 0ull || byte_size == 0ull || !host_dev_) {
+        RecordDev("ID3D12DeviceX::AttachXMemAllocation", -1, E_INVALIDARG);
+        return E_INVALIDARG;
+    }
+
+    const uint64_t aligned_size = AlignUp64(byte_size, 65536ull);
+
+    // Check if this guest_va is already attached with sufficient size.
+    {
+        std::lock_guard<std::mutex> lock(unified_mutex_);
+        for (const auto& rec : xmem_allocations_) {
+            if (rec.guest_va == guest_va && rec.aligned_size >= aligned_size) {
+                if (out_desktop_gpu_va) *out_desktop_gpu_va = rec.desktop_gpu_va;
+                RecordDev("ID3D12DeviceX::AttachXMemAllocation", -1, S_OK);
+                return S_OK;
+            }
+        }
+    }
+
+    // Create a desktop D3D12 default heap and anchor buffer so every attached xmem graphics
+    // allocation binds immediately to a real, non-zero desktop GPU virtual address.
+    D3D12_HEAP_DESC heap_desc{};
+    heap_desc.SizeInBytes = aligned_size;
+    heap_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    heap_desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    heap_desc.Flags = D3D12_HEAP_FLAG_NONE;
+
+    ID3D12Heap* heap = nullptr;
+    HRESULT hr = host_dev_->CreateHeap(&heap_desc, IID_PPV_ARGS(&heap));
+    if (FAILED(hr) || !heap) {
+        // Fallback for ResourceHeapTier 1 devices where D3D12_HEAP_FLAG_NONE is disallowed.
+        heap_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+        hr = host_dev_->CreateHeap(&heap_desc, IID_PPV_ARGS(&heap));
+        if (FAILED(hr) || !heap) {
+            RecordDev("ID3D12DeviceX::AttachXMemAllocation", -1, hr);
+            return hr;
+        }
+    }
+
+    D3D12_RESOURCE_DESC anchor_desc{};
+    anchor_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    anchor_desc.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+    anchor_desc.Width = aligned_size;
+    anchor_desc.Height = 1u;
+    anchor_desc.DepthOrArraySize = 1u;
+    anchor_desc.MipLevels = 1u;
+    anchor_desc.Format = DXGI_FORMAT_UNKNOWN;
+    anchor_desc.SampleDesc.Count = 1u;
+    anchor_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    anchor_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+    ID3D12Resource* anchor_buf = nullptr;
+    hr = host_dev_->CreatePlacedResource(
+        heap, 0ull, &anchor_desc, D3D12_RESOURCE_STATE_COMMON,
+        nullptr, IID_PPV_ARGS(&anchor_buf));
+    if (FAILED(hr) || !anchor_buf) {
+        heap->Release();
+        RecordDev("ID3D12DeviceX::AttachXMemAllocation", -1, hr);
+        return hr;
+    }
+
+    const D3D12_GPU_VIRTUAL_ADDRESS desktop_va = anchor_buf->GetGPUVirtualAddress();
+    if (desktop_va == 0ull) {
+        anchor_buf->Release();
+        heap->Release();
+        RecordDev("ID3D12DeviceX::AttachXMemAllocation", -1, E_FAIL);
+        return E_FAIL;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(unified_mutex_);
+        // Replace any previous record at the exact same guest_va.
+        for (auto it = xmem_allocations_.begin(); it != xmem_allocations_.end(); ) {
+            if (it->guest_va == guest_va) {
+                if (it->anchor_buffer) it->anchor_buffer->Release();
+                if (it->heap) it->heap->Release();
+                it = xmem_allocations_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        XMemAllocationRecord rec{};
+        rec.guest_va = guest_va;
+        rec.byte_size = byte_size;
+        rec.aligned_size = aligned_size;
+        rec.heap = heap;
+        rec.anchor_buffer = anchor_buf;
+        rec.desktop_gpu_va = desktop_va;
+        xmem_allocations_.push_back(rec);
+        xmem_allocation_count_.store(
+            static_cast<uint32_t>(xmem_allocations_.size()), std::memory_order_release);
+    }
+
+    if (out_desktop_gpu_va) *out_desktop_gpu_va = desktop_va;
+    RecordDev("ID3D12DeviceX::AttachXMemAllocation", -1, S_OK);
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE DeviceX::DetachXMemAllocation(uint64_t guest_va) {
+    if (guest_va == 0ull) {
+        RecordDev("ID3D12DeviceX::DetachXMemAllocation", -1, E_INVALIDARG);
+        return E_INVALIDARG;
+    }
+    ID3D12Heap* old_heap = nullptr;
+    ID3D12Resource* old_anchor = nullptr;
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lock(unified_mutex_);
+        for (auto it = xmem_allocations_.begin(); it != xmem_allocations_.end(); ++it) {
+            if (it->guest_va == guest_va) {
+                old_heap = it->heap;
+                old_anchor = it->anchor_buffer;
+                xmem_allocations_.erase(it);
+                xmem_allocation_count_.store(
+                    static_cast<uint32_t>(xmem_allocations_.size()), std::memory_order_release);
+                found = true;
+                break;
+            }
+        }
+    }
+    if (old_anchor) old_anchor->Release();
+    if (old_heap) old_heap->Release();
+    const HRESULT hr = found ? S_OK : S_FALSE;
+    RecordDev("ID3D12DeviceX::DetachXMemAllocation", -1, hr);
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE DeviceX::ResolveXMemGpuVa(
+    uint64_t guest_va,
+    uint64_t* out_desktop_gpu_va) {
+    if (!out_desktop_gpu_va) {
+        RecordDev("ID3D12DeviceX::ResolveXMemGpuVa", -1, E_POINTER);
+        return E_POINTER;
+    }
+    *out_desktop_gpu_va = 0ull;
+    if (guest_va == 0ull) {
+        RecordDev("ID3D12DeviceX::ResolveXMemGpuVa", -1, E_INVALIDARG);
+        return E_INVALIDARG;
+    }
+    std::lock_guard<std::mutex> lock(unified_mutex_);
+    for (const auto& rec : xmem_allocations_) {
+        if (guest_va >= rec.guest_va && guest_va < rec.guest_va + rec.aligned_size) {
+            *out_desktop_gpu_va = rec.desktop_gpu_va + (guest_va - rec.guest_va);
+            RecordDev("ID3D12DeviceX::ResolveXMemGpuVa", -1, S_OK);
+            return S_OK;
+        }
+    }
+    RecordDev("ID3D12DeviceX::ResolveXMemGpuVa", -1, HRESULT_FROM_WIN32(ERROR_NOT_FOUND));
+    return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
+}
+
+HRESULT STDMETHODCALLTYPE DeviceX::GetR9G9B9E5UavFallbackActive(int* out_active) {
+    if (!out_active) {
+        RecordDev("ID3D12DeviceX::GetR9G9B9E5UavFallbackActive", -1, E_POINTER);
+        return E_POINTER;
+    }
+    *out_active = IsR9G9B9E5UavFallbackActive() ? 1 : 0;
+    RecordDev("ID3D12DeviceX::GetR9G9B9E5UavFallbackActive", -1, S_OK);
     return S_OK;
 }
 

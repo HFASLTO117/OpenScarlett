@@ -465,6 +465,41 @@ int64_t QueryQpcNow() noexcept {
     return li.QuadPart;
 }
 
+bool IsReadableCpuVa(uint64_t va, size_t byte_size) noexcept {
+    if (va == 0ull || byte_size == 0u || va > UINT64_MAX - byte_size) return false;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(va)), &mbi, sizeof(mbi)) == 0) {
+        return false;
+    }
+    if (mbi.State != MEM_COMMIT) return false;
+    constexpr DWORD kReadable =
+        PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+        PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if ((mbi.Protect & kReadable) == 0u || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0u) {
+        return false;
+    }
+    const uint64_t region_end =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(mbi.BaseAddress)) +
+        static_cast<uint64_t>(mbi.RegionSize);
+    return (va + byte_size) <= region_end;
+}
+
+template <typename T>
+bool EvaluateWaitOp(T current, T reference, T mask, D3D12XBOX_WAIT_VALUE_OP op) noexcept {
+    const T lhs = current & mask;
+    const T rhs = reference & mask;
+    switch (op) {
+        case D3D12XBOX_WAIT_VALUE_OP_ALWAYS:        return true;
+        case D3D12XBOX_WAIT_VALUE_OP_LESS:          return lhs < rhs;
+        case D3D12XBOX_WAIT_VALUE_OP_LESS_EQUAL:    return lhs <= rhs;
+        case D3D12XBOX_WAIT_VALUE_OP_EQUAL:         return lhs == rhs;
+        case D3D12XBOX_WAIT_VALUE_OP_NOT_EQUAL:     return lhs != rhs;
+        case D3D12XBOX_WAIT_VALUE_OP_GREATER_EQUAL: return lhs >= rhs;
+        case D3D12XBOX_WAIT_VALUE_OP_GREATER:       return lhs > rhs;
+        default:                                    return false;
+    }
+}
+
 }  // namespace
 
 CommandQueueX::CommandQueueX(
@@ -1753,6 +1788,103 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::ResumeX() {
     suspended_.store(false, std::memory_order_release);
     RecordQueue("ID3D12CommandQueueX::ResumeX", 21, S_OK);
     return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE CommandQueueX::KickoffX() {
+    if (device_x_ && device_x_->HasDirtyUnifiedTextures() &&
+        host_queue_ && host_queue_->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        device_x_->FlushDirtyUnifiedTextures(host_queue_, nullptr);
+    }
+    {
+        std::lock_guard<std::mutex> lock(present_mutex_);
+        if (present_fence_ && host_queue_) {
+            const uint64_t target = ++present_fence_val_;
+            host_queue_->Signal(present_fence_, target);
+        }
+    }
+    kickoff_count_.fetch_add(1ull, std::memory_order_relaxed);
+    RecordQueue("ID3D12CommandQueueX::KickoffX", 22, S_OK);
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE CommandQueueX::Wait32BitValueX(
+    D3D12_GPU_VIRTUAL_ADDRESS Address,
+    uint32_t Value,
+    uint32_t Mask,
+    D3D12XBOX_WAIT_VALUE_OP Operation) {
+    if (Address == 0ull) {
+        RecordQueue("ID3D12CommandQueueX::Wait32BitValueX", 23, E_INVALIDARG);
+        return E_INVALIDARG;
+    }
+    if (IsReadableCpuVa(Address, sizeof(uint32_t))) {
+        const auto* ptr = reinterpret_cast<const volatile uint32_t*>(static_cast<uintptr_t>(Address));
+        const int64_t start_qpc = QueryQpcNow();
+        const int64_t timeout_ticks = (qpc_freq_ > 0) ? (qpc_freq_ * 2LL) : 0LL;  // 2s bounded wait
+        for (;;) {
+            const uint32_t cur = *ptr;
+            if (EvaluateWaitOp<uint32_t>(cur, Value, Mask, Operation)) {
+                RecordQueue("ID3D12CommandQueueX::Wait32BitValueX", 23, S_OK);
+                return S_OK;
+            }
+            if (timeout_ticks > 0 && (QueryQpcNow() - start_qpc) >= timeout_ticks) {
+                const HRESULT hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+                RecordQueue("ID3D12CommandQueueX::Wait32BitValueX", 23, hr);
+                return hr;
+            }
+            SwitchToThread();
+        }
+    }
+    // GPU-only virtual address: synchronize submitted queue work cleanly via internal fence.
+    HRESULT hr = S_OK;
+    {
+        std::lock_guard<std::mutex> lock(present_mutex_);
+        hr = EnsurePresentHelperObjectsLocked();
+        if (SUCCEEDED(hr)) {
+            hr = WaitForInternalFenceLocked();
+        }
+    }
+    RecordQueue("ID3D12CommandQueueX::Wait32BitValueX", 23, hr);
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE CommandQueueX::Wait64BitValueX(
+    D3D12_GPU_VIRTUAL_ADDRESS Address,
+    uint64_t Value,
+    uint64_t Mask,
+    D3D12XBOX_WAIT_VALUE_OP Operation) {
+    if (Address == 0ull) {
+        RecordQueue("ID3D12CommandQueueX::Wait64BitValueX", 24, E_INVALIDARG);
+        return E_INVALIDARG;
+    }
+    if (IsReadableCpuVa(Address, sizeof(uint64_t))) {
+        const auto* ptr = reinterpret_cast<const volatile uint64_t*>(static_cast<uintptr_t>(Address));
+        const int64_t start_qpc = QueryQpcNow();
+        const int64_t timeout_ticks = (qpc_freq_ > 0) ? (qpc_freq_ * 2LL) : 0LL;  // 2s bounded wait
+        for (;;) {
+            const uint64_t cur = *ptr;
+            if (EvaluateWaitOp<uint64_t>(cur, Value, Mask, Operation)) {
+                RecordQueue("ID3D12CommandQueueX::Wait64BitValueX", 24, S_OK);
+                return S_OK;
+            }
+            if (timeout_ticks > 0 && (QueryQpcNow() - start_qpc) >= timeout_ticks) {
+                const HRESULT hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+                RecordQueue("ID3D12CommandQueueX::Wait64BitValueX", 24, hr);
+                return hr;
+            }
+            SwitchToThread();
+        }
+    }
+    // GPU-only virtual address: synchronize submitted queue work cleanly via internal fence.
+    HRESULT hr = S_OK;
+    {
+        std::lock_guard<std::mutex> lock(present_mutex_);
+        hr = EnsurePresentHelperObjectsLocked();
+        if (SUCCEEDED(hr)) {
+            hr = WaitForInternalFenceLocked();
+        }
+    }
+    RecordQueue("ID3D12CommandQueueX::Wait64BitValueX", 24, hr);
+    return hr;
 }
 
 // IOpenScarlettPresentCapture

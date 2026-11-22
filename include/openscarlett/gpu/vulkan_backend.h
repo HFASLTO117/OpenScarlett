@@ -43,6 +43,12 @@ struct VulkanDeviceInfo {
     bool supports_win32_surface = false;
     bool supports_swapchain = false;
     bool supports_hdr10_colorspace = false;
+
+    // Sparse / reserved resource capabilities (VK_IMAGE_CREATE_SPARSE_*)
+    uint32_t sparse_queue_family = 0;
+    bool supports_sparse_binding = false;
+    bool supports_sparse_residency_image_2d = false;
+    bool supports_sparse_residency_image_3d = false;
 };
 
 struct SpirvValidationInfo {
@@ -155,6 +161,15 @@ struct VulkanDescriptorBinding {
     std::vector<uint8_t> buffer_data;  // UniformBuffer / StorageBuffer payload
     VulkanTextureDesc texture;         // CombinedImageSampler / SampledImage payload
     bool linear_filter = false;        // false = nearest, true = linear
+
+    // Optional T# view-range mip selection (VkImageViewCreateInfo::subresourceRange)
+    uint32_t view_base_mip_level = 0;
+    uint32_t view_mip_level_count = 0;  // 0 = all remaining mips from view_base_mip_level
+
+    // Optional S# sampler LOD controls (VkSamplerCreateInfo)
+    float sampler_min_lod = 0.0f;
+    float sampler_max_lod = 16.0f;
+    float sampler_mip_lod_bias = 0.0f;
 };
 
 // Full VS+PS graphics draw configuration (VB, IB, UBO/SSBO/2D/3D textures, push constants, depth, MSAA 4x).
@@ -270,6 +285,62 @@ struct VulkanPresentResult {
     uint64_t fnv1a_hash = 0;
 };
 
+// Sparse / reserved image resource structs (D3D12 CreateReservedResource + GetResourceTiling parity).
+struct VulkanReservedResourceDesc {
+    uint32_t width = 256;
+    uint32_t height = 256;
+    uint32_t depth = 1;
+    uint32_t mip_levels = 1;
+    uint32_t array_layers = 1;
+    bool is_3d = false;
+    VulkanImageFormat format = VulkanImageFormat::Rgba8Unorm;
+};
+
+struct VulkanSubresourceTiling {
+    uint32_t width_in_tiles = 0;
+    uint32_t height_in_tiles = 0;
+    uint32_t depth_in_tiles = 0;
+    uint32_t start_tile_index_in_overall_resource = 0;
+};
+
+struct VulkanResourceTilingInfo {
+    uint32_t num_tiles_for_entire_resource = 0;
+    uint32_t num_standard_mips = 0;
+    uint32_t num_packed_mips = 0;
+    uint32_t num_tiles_for_packed_mips = 0;
+    uint32_t start_tile_index_in_overall_resource = 0;
+    uint32_t tile_width_in_texels = 0;
+    uint32_t tile_height_in_texels = 0;
+    uint32_t tile_depth_in_texels = 1;
+    uint64_t tile_size_bytes = 65536;
+    uint64_t mip_tail_offset_bytes = 0;
+    uint64_t mip_tail_size_bytes = 0;
+    uint64_t mip_tail_stride_bytes = 0;
+    uint32_t sparse_format_flags = 0;
+    std::vector<VulkanSubresourceTiling> subresource_tilings;
+    bool executed_on_vulkan_icd = false;
+};
+
+struct VulkanSparseTileMapping {
+    uint32_t mip_level = 0;
+    uint32_t array_layer = 0;
+    uint32_t tile_x = 0;
+    uint32_t tile_y = 0;
+    uint32_t tile_z = 0;
+    uint32_t tile_count_x = 1;
+    uint32_t tile_count_y = 1;
+    uint32_t tile_count_z = 1;
+    uint32_t heap_tile_offset = 0;
+    bool map_null = false;
+    bool bind_mip_tail = false;
+};
+
+struct VulkanReservedResourceHandle {
+    uint64_t handle = 0;
+    VulkanResourceTilingInfo tiling;
+    bool executed_on_vulkan_icd = false;
+};
+
 // Clean-room Dynamic Vulkan 1.2/1.3/1.4 backend with zero Vulkan SDK header dependencies.
 // Dynamically loads vulkan-1.dll at runtime via LoadLibraryA + vkGetInstanceProcAddr,
 // executes real hardware/ICD compute, graphics rasterization, VK_EXT_mesh_shader,
@@ -343,6 +414,31 @@ public:
 
     // Destroys a previously created swapchain/surface handle.
     Status DestroyWin32Swapchain(uint64_t swapchain_handle);
+
+    // Creates a sparse/reserved Vulkan image (VK_IMAGE_CREATE_SPARSE_BINDING_BIT |
+    // VK_IMAGE_CREATE_SPARSE_RESIDENCY_BIT) and queries vkGetImageSparseMemoryRequirements
+    // to populate D3D12 GetResourceTiling-compatible tiling metadata.
+    Status CreateReservedImage(const VulkanReservedResourceDesc& desc,
+                               VulkanReservedResourceHandle& out_handle);
+
+    // Queries GetResourceTiling-compatible tiling layout for an existing reserved image.
+    Status GetReservedImageTiling(uint64_t reserved_handle,
+                                  VulkanResourceTilingInfo& out_tiling) const;
+
+    // Binds or unbinds sparse tiles (and optional opaque mip tail) via vkQueueBindSparse.
+    Status BindReservedImageTiles(uint64_t reserved_handle,
+                                  const std::vector<VulkanSparseTileMapping>& mappings);
+
+    // Uploads texel data to a bound tile of a reserved image and reads it back from the GPU.
+    Status UploadAndReadbackReservedImageTile(uint64_t reserved_handle,
+                                              uint32_t mip_level,
+                                              uint32_t tile_x,
+                                              uint32_t tile_y,
+                                              const std::vector<uint8_t>& tile_pixels,
+                                              std::vector<uint8_t>& out_readback_pixels);
+
+    // Destroys a previously created reserved/sparse image and releases its backing memory.
+    Status DestroyReservedImage(uint64_t reserved_handle);
 
 private:
     struct Impl;

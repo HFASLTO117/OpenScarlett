@@ -33,6 +33,7 @@ struct D3D12AdapterInfo {
     uint32_t wave_lane_min = 0;
     uint32_t wave_lane_max = 0;
     uint32_t feature_level = 0;         // D3D_FEATURE_LEVEL
+    bool supports_r9g9b9e5_uav = false; // Typed UAV store support for DXGI_FORMAT_R9G9B9E5_SHAREDEXP
 };
 
 struct D3D12AdapterSelectionOptions {

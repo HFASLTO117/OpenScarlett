@@ -83,7 +83,7 @@ public:
     D3D12_COMMAND_QUEUE_DESC STDMETHODCALLTYPE GetDesc() override;
 #endif
 
-    // ID3D12CommandQueueX (slots 19..21)
+    // ID3D12CommandQueueX (slots 19..24)
     HRESULT STDMETHODCALLTYPE PresentX(
         UINT PlaneCount,
         const D3D12XBOX_PRESENT_PLANE_PARAMETERS* pPlaneParameters,
@@ -91,6 +91,17 @@ public:
         void* pPresentToken) override;
     HRESULT STDMETHODCALLTYPE SuspendX(uint32_t Flags) override;
     HRESULT STDMETHODCALLTYPE ResumeX() override;
+    HRESULT STDMETHODCALLTYPE KickoffX() override;
+    HRESULT STDMETHODCALLTYPE Wait32BitValueX(
+        D3D12_GPU_VIRTUAL_ADDRESS Address,
+        uint32_t Value,
+        uint32_t Mask,
+        D3D12XBOX_WAIT_VALUE_OP Operation) override;
+    HRESULT STDMETHODCALLTYPE Wait64BitValueX(
+        D3D12_GPU_VIRTUAL_ADDRESS Address,
+        uint64_t Value,
+        uint64_t Mask,
+        D3D12XBOX_WAIT_VALUE_OP Operation) override;
 
     // IOpenScarlettPresentCapture
     HRESULT STDMETHODCALLTYPE SetOutputWindow(HWND hwnd) override;
@@ -150,6 +161,7 @@ private:
     DeviceX* device_x_ = nullptr;
     ID3D12CommandQueue* host_queue_ = nullptr;
     std::atomic<bool> suspended_{false};
+    std::atomic<uint64_t> kickoff_count_{0ull};
 
     std::mutex present_mutex_;
     HWND attached_hwnd_ = nullptr;

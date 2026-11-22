@@ -223,6 +223,15 @@ Status QueryD3D12DeviceAdapterInfo(
         out_info.mesh_shader_tier = static_cast<uint32_t>(opt7.MeshShaderTier);
     }
 
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT r9g9b9e5_sup{};
+    r9g9b9e5_sup.Format = DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
+    if (SUCCEEDED(device->CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT, &r9g9b9e5_sup, sizeof(r9g9b9e5_sup)))) {
+        out_info.supports_r9g9b9e5_uav =
+            ((r9g9b9e5_sup.Support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW) != 0) &&
+            ((r9g9b9e5_sup.Support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE) != 0);
+    }
+
     out_info.highest_shader_model = ProbeHighestShaderModel(device);
     out_info.feature_level = ProbeMaxFeatureLevel(device);
     return Status::Ok();
