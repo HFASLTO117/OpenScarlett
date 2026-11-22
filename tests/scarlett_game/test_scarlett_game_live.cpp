@@ -38,6 +38,7 @@
 
 #include "openscarlett/gpu/d3d12_adapter.h"
 #include "openscarlett/loader/pe_inspector.h"
+#include "openscarlett/loader/vfs_mounts.h"
 #include "os_check.h"
 
 namespace fs = std::filesystem;
@@ -116,16 +117,27 @@ fs::path ResolveRuntimeBinDir() {
 
 fs::path ResolveScratchDir(const wchar_t* subdir) {
     std::error_code ec;
+    const fs::path bin_dir = ResolveRuntimeBinDir();
+    const bool bin_off_sys = !openscarlett::IsPathOnSystemDriveW(bin_dir.wstring());
     wchar_t temp_buf[1024]{};
     const DWORD len = ::GetEnvironmentVariableW(L"TEMP", temp_buf, 1024u);
     if (len > 0 && len < 1024u) {
-        return fs::path(temp_buf) / subdir;
+        const fs::path tmp_path(temp_buf);
+        if (!bin_off_sys || !openscarlett::IsPathOnSystemDriveW(tmp_path.wstring())) {
+            return tmp_path / subdir;
+        }
+    }
+    if (bin_off_sys) {
+        const std::wstring work_dir = openscarlett::ResolveDefaultWorkDirW(bin_dir.wstring());
+        if (!work_dir.empty()) {
+            return fs::path(work_dir) / subdir;
+        }
     }
     const fs::path sys_tmp = fs::temp_directory_path(ec);
     if (!ec && !sys_tmp.empty()) {
         return sys_tmp / subdir;
     }
-    return ResolveRuntimeBinDir() / subdir;
+    return bin_dir / subdir;
 }
 
 std::string ReadTextFile(const fs::path& p) {

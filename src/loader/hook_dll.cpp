@@ -1551,6 +1551,8 @@ void PropagateHookToCreatedChild(const PROCESS_INFORMATION& pi,
             -1);
     }
 
+    FlushTelemetryInternal(false);
+
     if (!caller_suspended) {
         ::ResumeThread(pi.hThread);
     }
@@ -2321,6 +2323,7 @@ bool InitializeHookRuntime(HMODULE self_mod) {
 
     PatchAllLoadedNonSystemModules();
     g_initialized.store(true, std::memory_order_release);
+    FlushTelemetryInternal(false);
     return true;
 }
 

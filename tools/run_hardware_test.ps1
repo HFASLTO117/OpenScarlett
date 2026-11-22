@@ -1,4 +1,4 @@
-# OpenScarlett — 1-Click Portable Hardware & Self-Test Runner
+﻿# OpenScarlett — 1-Click Portable Hardware & Self-Test Runner
 # Runs host GPU/OS probes + all OpenScarlett live tests, shows clear live results,
 # saves a privacy-sanitized Markdown report, and optionally opens a pre-filled GitHub Issue.
 
@@ -103,8 +103,16 @@ $TestDescriptions = @{
     'test_hdr10_d3d12.exe'          = 'HDR10 ST.2084 & scRGB PresentX, SDR tone-map, default Texture2DArray SRV & VA remap'
     'test_gdk_extended_loader.exe'  = 'XDisplay HDR, XGameUI/Invite/Speech, X3DAudio/XAudio2FX & topological DLL init order'
     'test_gdk_simple_lighting.exe'  = 'DirectXTK12-style 3D Blinn-Phong SimpleLighting (D3D12 HW/WARP & Vulkan 1.4 parity)'
-    'test_gdk_hdr_cubemap.exe'      = 'HDRCubeMap (FP16 TextureCube + default Array SRV + HDR10 ST.2084 + SDR tone-map)'
-    'test_vulkan_mesh_showcase.exe' = 'VulkanMeshShowcase (RDNA2 XS2 AS+MS+PS + 3D LUT: Vulkan 1.4 vs D3D12 MeshTier=10)'
+    'test_gdk_hdr_cubemap.exe'         = 'HDRCubeMap (FP16 TextureCube + default Array SRV + HDR10 ST.2084 + SDR tone-map)'
+    'test_vulkan_mesh_showcase.exe'    = 'VulkanMeshShowcase (RDNA2 XS2 AS+MS+PS + 3D LUT: Vulkan 1.4 vs D3D12 MeshTier=10)'
+    'test_rdna2_corpus_parity.exe'     = 'RDNA2/GFX10.3 corpus parity (v_cmpx, f16/d16, NaN/denorm, PSV0 wave, mesh, DXIL MD5 re-sign)'
+    'test_gpu_d3d12x_vk_parity.exe'    = 'd3d12_xs R9G9B9E5 UAV fallback, CommandListX/QueueX, sret ABI, Vulkan sparse/mip & xg_xs metadata'
+    'test_xgr_conformance_parity.exe'  = 'xgameruntime 292/292 parity, 3-arg COM QueryApiImpl, headless XStore/PLS & XTaskQueue/XAsync stress'
+    'test_dstorage_audio_diag_parity.exe' = 'dstorage_xs cancel/phys-page, mfplat_xs & 4 console diag DLLs, XMem/XThread & WASAPI MMDevice'
+    'test_loader_child_hook_parity.exe' = '24-DLL routing, hardened nested CoW G: VFS & Win32 parent->child APC hook propagation'
+    'test_bcpack_bvh4.exe'             = 'Hardened BCPack BC1-BC7 entropy codecs & RDNA2 BVH4 header/node-pointer decoder + SAH equivalence'
+    'test_real_gdk_thunks_live.exe'    = 'Live 292/292 xgameruntime + 16/16 XCurl + shipping commercial GDK thunks (zero E_NOINTERFACE)'
+    'test_scarlett_game_live.exe'      = 'Full playable Scarlett game stack via openscarlett run (d3d12_xs+PresentX+GameInput+XAudio2+S:)'
 }
 
 Write-Host ''

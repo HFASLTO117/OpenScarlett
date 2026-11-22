@@ -143,6 +143,22 @@ set(_openscarlett_known_targets
     gdk_hdr_cubemap
     test_vulkan_mesh_showcase
     gdk_vulkan_mesh_showcase
+    test_rdna2_corpus_parity
+    test_gpu_d3d12x_vk_parity
+    test_xgr_conformance_parity
+    mfplat_xs
+    advapi32legacy
+    KernelTraceControl
+    hix_xs
+    xbtp
+    test_dstorage_audio_diag_parity
+    test_loader_child_hook_parity
+    test_bcpack_bvh4
+    test_real_gdk_thunks_live
+    scarlett_platform_host
+    ScarlettArena
+    ScarlettDoom
+    test_scarlett_game_live
 )
 
 foreach(_tgt IN LISTS _openscarlett_known_targets)

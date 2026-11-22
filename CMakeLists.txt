@@ -100,10 +100,17 @@ foreach(_os_module_cmake
     cmake/wave3_vulkan_graphics.cmake
     cmake/wave3_hdr10_d3d12.cmake
     cmake/wave3_gdk_extended_loader.cmake
-    cmake/wave3_portability.cmake
     cmake/wave4_simple_lighting.cmake
     cmake/wave4_hdr_cubemap.cmake
     cmake/wave4_vulkan_mesh_showcase.cmake
+    cmake/worker_rdna2_corpus.cmake
+    cmake/worker_gpu_d3d12x_vk.cmake
+    cmake/worker_xgr_conformance.cmake
+    cmake/worker_dstorage_audio_diag.cmake
+    cmake/worker_loader_child_hook.cmake
+    cmake/worker_bcpack_bvh4.cmake
+    cmake/worker_playable_game.cmake
+    cmake/wave3_portability.cmake
 )
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_os_module_cmake}")
         include("${CMAKE_CURRENT_SOURCE_DIR}/${_os_module_cmake}")

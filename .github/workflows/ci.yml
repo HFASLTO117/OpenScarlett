@@ -121,6 +121,7 @@ jobs:
           Get-ChildItem "build" -Filter "*.dll" | Copy-Item -Destination $stage
           Get-ChildItem "build" -Filter "test_*.exe" | Copy-Item -Destination $stage
           Get-ChildItem "build" -Filter "gdk_*.exe" | Copy-Item -Destination $stage
+          Get-ChildItem "build" -Filter "Scarlett*.exe" | Copy-Item -Destination $stage
           Copy-Item "tools/run_hardware_test.ps1" $stage
           Copy-Item "README.md", "LICENSE" $stage
 
@@ -375,7 +376,13 @@ jobs:
             amd_fidelityfx_upscaler_xbox
             amd_fidelityfx_loader_xbox
             XboxBvhBuilder
+            mfplat_xs
+            advapi32legacy
+            KernelTraceControl
+            hix_xs
+            xbtp
             test_codecs
+            test_bcpack_bvh4
             test_rdna2_core
             test_winrt_xs
             test_kernelx

@@ -65,59 +65,60 @@ def collect_components() -> list[Component]:
     has_hdr10 = has("tests/test_hdr10_d3d12.cpp")
     has_gdk_ext = has("tests/test_gdk_extended_loader.cpp")
     has_sprint5 = has("tests/test_gdk_simple_lighting.cpp") and has("tests/test_gdk_hdr_cubemap.cpp") and has("tests/test_vulkan_mesh_showcase.cpp")
+    has_sprint6 = has("tests/test_real_gdk_thunks_live.cpp") and has("tests/scarlett_game/test_scarlett_game_live.cpp") and has("src/gpu/bvh4_decoder.cpp")
 
     return [
         Component(
-            name="PE32+ Loader, `MicrosoftGame.Config`, CoW VFS & Topo Init",
+            name="PE32+ Loader, CoW VFS, 24-DLL Routing & Child-Hook Propagation",
             area="Loader",
             stage="Live-Binary Verified" if has_hook else "Unit-Tested",
             pct=100 if has_hook else 50,
             what_works=(
-                "`MicrosoftGame.Config` XML loader, portable CoW overlay VFS (`G:/GAME:/T:/S:`), PE forwarders/TLS/`.pdata` SEH, Kahn topological DLL init, 19-DLL + versioned/thunk alias routing (`OPENSCARLETT_DLL_ROUTING`), `--backend=vulkan`, Store-bootstrap diagnostics + unified telemetry"
-                if (has_game_config and has_gdk_ext)
-                else "`MicrosoftGame.Config` XML loader, read-only CoW overlay VFS (`G:/GAME:/T:/S:`), PE export-forwarder/TLS/`.pdata` SEH (`RtlAddFunctionTable`), 19-DLL data-driven routing, APC hook + unified JSON telemetry"
+                "`MicrosoftGame.Config` XML loader, hardened nested `G:` CoW overlay VFS (NTFS junction containment, zero base/`C:` writes), PE forwarders/TLS/`.pdata` SEH, Kahn topo DLL init, 24-DLL + `XGamingRuntimeThunks` alias routing, `CreateProcessW/A` child-process APC hook propagation with per-PID telemetry"
+                if has_sprint6
+                else "`MicrosoftGame.Config` XML loader, portable CoW overlay VFS (`G:/GAME:/T:/S:`), PE forwarders/TLS/`.pdata` SEH, Kahn topological DLL init, 19-DLL + versioned/thunk alias routing (`OPENSCARLETT_DLL_ROUTING`), `--backend=vulkan`, Store-bootstrap diagnostics + unified telemetry"
             ),
-            verified_on="Win10 & Win11 26H2 (`test_pe_inspect`, `test_apc_loader`, `test_loader_vfs_config`, `test_gdk_extended_loader`, `test_gdk_live`)" if has_gdk_ext else "Win10 & Win11 26H2 (`test_pe_inspect`, `test_apc_loader`, `test_loader_vfs_config`, `test_gdk_live`)",
+            verified_on="Win10 & Win11 26H2 (`test_loader_child_hook_parity`, `test_loader_vfs_config`, `Pizza House Simulator` + `House Flipper 2` multi-process)" if has_sprint6 else "Win10 & Win11 26H2 (`test_pe_inspect`, `test_apc_loader`, `test_loader_vfs_config`, `test_gdk_extended_loader`, `test_gdk_live`)",
         ),
         Component(
-            name="Vulkan 1.2/1.4 Dynamic Graphics, `VK_EXT_mesh_shader` & Swapchain",
+            name="Vulkan 1.2/1.4 Graphics, Sparse/Reserved, `VK_EXT_mesh_shader` & Swapchain",
             area="Graphics",
             stage="Live-GPU Verified",
             pct=100,
             what_works=(
-                "Zero-SDK `vulkan-1.dll` rasterization (`RGBA8`/`FP16`/`D32F`/4× MSAA resolve), native `VK_EXT_mesh_shader` (`Task+Mesh+PS`), mipmapped 2D/3D volume textures, Win32 swapchain + HDR10 probe, SPIR-V 1.3/1.4 + SW fallback"
-                if has_vk_gfx
-                else "Zero-SDK dynamic `vulkan-1.dll` loader, SPIR-V 1.3 validator, live GPU compute/LDS/wave64 pipelines + software fallback"
+                "Zero-SDK `vulkan-1.dll` rasterization (`RGBA8`/`FP16`/`D32F`/4× MSAA), sparse/reserved images (`vkQueueBindSparse` + `GetResourceTiling`), `S#`/`T#` sampler/view mip LOD, native `VK_EXT_mesh_shader` (`Task+Mesh+PS`), 2D/3D textures, Win32 swapchain + HDR10 probe"
+                if has_sprint6
+                else "Zero-SDK `vulkan-1.dll` rasterization (`RGBA8`/`FP16`/`D32F`/4× MSAA resolve), native `VK_EXT_mesh_shader` (`Task+Mesh+PS`), mipmapped 2D/3D volume textures, Win32 swapchain + HDR10 probe, SPIR-V 1.3/1.4 + SW fallback"
             ),
             verified_on=(
-                "NVIDIA GTX 1650 Ti (Vk 1.4.329, `VK_EXT_mesh_shader=task+mesh`, `0.0000` MAE vs D3D12), RTX 2060 SUPER/3080 Ti, AMD RX 7600/7900 XTX/9070 XT (`test_vulkan_live`, `test_vulkan_graphics_live`, `test_vulkan_mesh_showcase`)"
-                if has_sprint5
-                else "NVIDIA GTX 1650 Ti, RTX 2060 SUPER & RTX 3080 Ti (Vk 1.4.329–357); AMD RX 7600, RX 7900 XTX & RX 9070 XT (Vk 1.4.315–359)"
+                "NVIDIA GTX 1650 Ti (Vk 1.4.329, sparse + `VK_EXT_mesh_shader`, `0.0000` MAE vs D3D12), RTX 2060 SUPER/3080 Ti, AMD RX 7600/7900 XTX/9070 XT (`test_vulkan_live`, `test_vulkan_graphics_live`, `test_gpu_d3d12x_vk_parity`, `test_vulkan_mesh_showcase`)"
+                if has_sprint6
+                else "NVIDIA GTX 1650 Ti (Vk 1.4.329, `VK_EXT_mesh_shader=task+mesh`, `0.0000` MAE vs D3D12), RTX 2060 SUPER/3080 Ti, AMD RX 7600/7900 XTX/9070 XT (`test_vulkan_live`, `test_vulkan_graphics_live`, `test_vulkan_mesh_showcase`)"
             ),
         ),
         Component(
-            name="Codecs, Opus/WASAPI, `X3DAudio`/`XAudio2FX` & GPU FSR 1.0",
+            name="Codecs (BCPack BC1–BC7), RDNA2 BVH4, Opus/WASAPI & GPU FSR 1.0",
             area="Media & IO",
             stage="Live-GPU Verified" if has_fsr else "Unit-Tested",
             pct=100 if has_fsr else 80,
             what_works=(
-                "GDeflate v1, BCPack (BC1–BC7), XMA2 IMDCT, `MSOpusDecoder.dll` Opus (`0x704F`), IMA-ADPCM, live WASAPI, `X3DAudio` (panning/Doppler) & `XAudio2FX` (Reverb/VolumeMeter), Bink2 `KB2i`, live GPU FSR 1.0"
-                if (has_opus and has_gdk_ext)
-                else "GDeflate v1, BCPack (BC1–BC7), XMA2 IMDCT, `MSOpusDecoder.dll` MFT Opus (`0x704F`), IMA-ADPCM, live event-driven WASAPI, Bink2 `KB2i` DCT, live D3D12 GPU FSR 1.0 EASU+RCAS"
+                "GDeflate v1, hardened BCPack BC1–BC7 (ring-window/selector-table/NPOT/multi-mip), RDNA2 BVH4 header/node-pointer decoder + SAH BVH2→BVH4 collapse, XMA2 IMDCT, `MSOpusDecoder` Opus (`0x704F`), IMA-ADPCM, WASAPI (all MMDevice endpoint formats), `X3DAudio`/`XAudio2FX`, Bink2, live GPU FSR 1.0"
+                if has_sprint6
+                else "GDeflate v1, BCPack (BC1–BC7), XMA2 IMDCT, `MSOpusDecoder.dll` Opus (`0x704F`), IMA-ADPCM, live WASAPI, `X3DAudio` (panning/Doppler) & `XAudio2FX` (Reverb/VolumeMeter), Bink2 `KB2i`, live GPU FSR 1.0"
             ),
-            verified_on="6 PCs (GTX 1650 Ti, RTX 2060 SUPER/3080 Ti, AMD RX 7600/7900 XTX/9070 XT) + WARP (`test_codecs`, `test_audio_opus_wasapi`, `test_gdk_extended_loader`, `test_d3d12_xs_live`)" if has_gdk_ext else "6 PCs (GTX 1650 Ti, RTX 2060 SUPER/3080 Ti, AMD RX 7600/7900 XTX/9070 XT) + WARP (`test_codecs`, `test_audio_opus_wasapi`, `test_d3d12_xs_live`)",
+            verified_on="6 PCs (GTX 1650 Ti, RTX 2060 SUPER/3080 Ti, AMD RX 7600/7900 XTX/9070 XT) + WARP (`test_codecs`, `test_bcpack_bvh4`, `test_audio_opus_wasapi`, `test_dstorage_audio_diag_parity`, `test_d3d12_xs_live`)" if has_sprint6 else "6 PCs (GTX 1650 Ti, RTX 2060 SUPER/3080 Ti, AMD RX 7600/7900 XTX/9070 XT) + WARP (`test_codecs`, `test_audio_opus_wasapi`, `test_gdk_extended_loader`, `test_d3d12_xs_live`)",
         ),
         Component(
-            name="RDNA2 AAA Shader Lifter, ISA Hardening & Disk Cache",
+            name="RDNA2 Corpus Lifter, PSV0 Wave Bounds, Mesh Contracts & DXIL Re-Signing",
             area="Shaders",
             stage="Live-GPU Verified" if has_lifter else "In Progress",
             pct=100 if has_lifter else 45,
             what_works=(
-                "RDNA2 AAA disasm/IR/lifter (zero-init LDS, exact `f16` FMA vs denorm-flushing MAD, encoding-size 16-bit `VOP3`, `s_bcnt1` b32/b64, quad `ddx`/`ddy`, bounded `wave64`→`wave32` mesh, `SCRATCH`, `BVH_INTERSECT_RAY`), CPU wave32/64 interpreter, disk cache + `d3d12_xs` auto-lift"
-                if has_shader_cache
-                else "RDNA2 disassembler + SSA IR (const-fold/DCE) + SPIR-V 1.3 & DXIL SM 6.5 lifter (`MIMG`, `DS`/LDS + `S_BARRIER`, `wave64`→`wave32`, `VS`/`PS`/`CS`/`MS`/`AS`)"
+                "RDNA2/GFX10.3 disasm/IR/lifter (clamped shifts, `v_cmpx`, split `f16`, MTBUF `d16`, NaN quiet/denorm, mask-IR pruning, `PSV0` wave bounds, Wave32-on-64 isolation, `merged_wave_info`/`GS_ALLOC_REQ`/`NumThreads`, `CullPrimitiveEXT` Block+bool, FSSM/vfetch, DXIL MD5 re-signing), CPU interpreter, disk cache + auto-lift"
+                if has_sprint6
+                else "RDNA2 AAA disasm/IR/lifter (zero-init LDS, exact `f16` FMA vs denorm-flushing MAD, encoding-size 16-bit `VOP3`, `s_bcnt1` b32/b64, quad `ddx`/`ddy`, bounded `wave64`→`wave32` mesh, `SCRATCH`, `BVH_INTERSECT_RAY`), CPU wave32/64 interpreter, disk cache + `d3d12_xs` auto-lift"
             ),
-            verified_on="`spirv-val` + `dxc` SM 6.5 + 6 GPUs (NVIDIA Turing/Ampere + AMD RDNA3/RDNA4 `MeshTier=10`) + WARP `1.0.22` guard (`test_rdna2_core`, `test_rdna2_lifter_live`, `test_d3d12_xs_autolift`)" if has_shader_cache else "`spirv-val` + `dxc` SM 6.5 + 6 GPUs (NVIDIA + AMD `MeshTier=10`) + WARP",
+            verified_on="`spirv-val` + `dxc` SM 6.5 + 6 GPUs (NVIDIA Turing/Ampere + AMD RDNA3/RDNA4 `MeshTier=10`) + WARP (`test_rdna2_core`, `test_rdna2_lifter_live`, `test_rdna2_corpus_parity`, `test_d3d12_xs_autolift`)" if has_sprint6 else "`spirv-val` + `dxc` SM 6.5 + 6 GPUs (NVIDIA Turing/Ampere + AMD RDNA3/RDNA4 `MeshTier=10`) + WARP `1.0.22` guard (`test_rdna2_core`, `test_rdna2_lifter_live`, `test_d3d12_xs_autolift`)",
         ),
         Component(
             name="WinRT Activation & HSTRING (`winrt_xs.dll`)",
@@ -132,51 +133,51 @@ def collect_components() -> list[Component]:
             area="Memory",
             stage="Live-Binary Verified" if (has_kernelx and has_gdk_runner) else ("Unit-Tested" if has_kernelx else "Planned"),
             pct=100 if has_kernelx else 0,
-            what_works="Win10/11 `VirtualAlloc2`/`MapViewOfFile3` 64 KiB & 4 MiB physical-virtual aliasing, `GpuTilePool`, placed unified-memory texture remap tracking, 41 `kernelx.dll` exports (`xmem.dll` forwarding)" if has_hdr10 else "Win10/11 `VirtualAlloc2`/`MapViewOfFile3` 64 KiB & 4 MiB physical-virtual aliasing, `GpuTilePool`, 41 `kernelx.dll` exports (`xmem.dll` forwarding)",
-            verified_on="Win10 & Win11 26H2 (`test_kernelx`, `test_hdr10_d3d12`, `test_secondary_shims`, `test_gdk_live`)" if has_hdr10 else "Win10 & Win11 26H2 (`test_kernelx`, `test_secondary_shims`, `test_gdk_live`)",
+            what_works="Win10/11 `VirtualAlloc2`/`MapViewOfFile3` 64 KiB & 4 MiB physical-virtual aliasing, `GpuTilePool`, placed desktop GPU VA attachment, deterministic XMem/XThread edge-case handling, direct `dstorage_xs` physical-page decompression, `kernelx.dll` / `xmem.dll`" if has_sprint6 else "Win10/11 `VirtualAlloc2`/`MapViewOfFile3` 64 KiB & 4 MiB physical-virtual aliasing, `GpuTilePool`, placed unified-memory texture remap tracking, 41 `kernelx.dll` exports (`xmem.dll` forwarding)",
+            verified_on="Win10 & Win11 26H2 (`test_kernelx`, `test_hdr10_d3d12`, `test_gpu_d3d12x_vk_parity`, `test_dstorage_audio_diag_parity`, `test_gdk_live`)" if has_sprint6 else "Win10 & Win11 26H2 (`test_kernelx`, `test_hdr10_d3d12`, `test_secondary_shims`, `test_gdk_live`)",
         ),
         Component(
-            name="`d3d12_xs.dll` Proxy, HDR10 `PresentX` & Full `xg_xs`",
+            name="`d3d12_xs.dll` Proxy, HDR10 `PresentX` & Full `xg_xs` Metadata",
             area="Graphics",
             stage="Live-GPU Verified" if has_d3d_proxy else "Planned",
             pct=100 if has_d3d_proxy else 0,
             what_works=(
-                "`DeviceX` auto-lift + default `Texture2DArray` SRV slice preservation + fail-closed `E_NOTIMPL`, HDR10 (`R10G10B10A2` ST.2084) & scRGB (`FP16`) `PresentX` with ACES/Reinhard SDR tone-map fallback + 60/120 Hz pacing, full GFX10 `xg_xs` (15 2D + 6 3D + mip tails)"
-                if has_hdr10
-                else "`DeviceX` auto-lift/`CommandQueueX`/`CommandListX` proxies, interactive Win32 `PresentX` (60/120 Hz pacing, waitable latency, Alt+Enter borderless, resize/close), full GFX10 `xg_xs` (15 2D + 6 3D thick + mip tails + BC1–BC7/RGB9E5/depth)"
+                "`DeviceX` auto-lift, `R9G9B9E5`→`RGBA16F` UAV fallback (FidelityFX on NVIDIA), `CommandListX`/`QueueX` (`KickoffX`, `Wait32/64BitValueX`, `RSSetDepthBiasX`), MSVC x64 `sret` COM ABI verified, HDR10/scRGB `PresentX`, full GFX10 `xg_xs` + `HTILE`/`DCC`/`CMASK` metadata & Scarlett pipe config"
+                if has_sprint6
+                else "`DeviceX` auto-lift + default `Texture2DArray` SRV slice preservation + fail-closed `E_NOTIMPL`, HDR10 (`R10G10B10A2` ST.2084) & scRGB (`FP16`) `PresentX` with ACES/Reinhard SDR tone-map fallback + 60/120 Hz pacing, full GFX10 `xg_xs` (15 2D + 6 3D + mip tails)"
             ),
-            verified_on="6 GPUs (GTX 1650 Ti, RTX 2060 SUPER/3080 Ti, AMD RX 7600/7900 XTX/9070 XT `MeshTier=10`) + WARP (`test_d3d12_xs_live`, `test_presentx_windowing`, `test_hdr10_d3d12`, `test_xg_dstorage`)" if has_hdr10 else "6 GPUs (GTX 1650 Ti, RTX 2060 SUPER/3080 Ti, AMD RX 7600/7900 XTX/9070 XT `MeshTier=10`) + WARP (`test_d3d12_xs_live`, `test_presentx_windowing`, `test_xg_dstorage`)",
+            verified_on="6 GPUs (GTX 1650 Ti, RTX 2060 SUPER/3080 Ti, AMD RX 7600/7900 XTX/9070 XT `MeshTier=10`) + WARP (`test_d3d12_xs_live`, `test_gpu_d3d12x_vk_parity`, `test_presentx_windowing`, `test_hdr10_d3d12`, `test_xg_dstorage`)" if has_sprint6 else "6 GPUs (GTX 1650 Ti, RTX 2060 SUPER/3080 Ti, AMD RX 7600/7900 XTX/9070 XT `MeshTier=10`) + WARP (`test_d3d12_xs_live`, `test_presentx_windowing`, `test_hdr10_d3d12`, `test_xg_dstorage`)",
         ),
         Component(
-            name="GDK & Console Shims (19 DLLs + `XDisplay`/`XGameUI`/`QueryApiImpl`)",
+            name="GDK & Console Shims (24 DLLs, 292/292 Thunks Parity & Zero `E_NOINTERFACE`)",
             area="GDK Shims",
             stage="Live-Binary Verified" if has_gdk_runner else ("Unit-Tested" if has_xgr else "Planned"),
             pct=100 if has_xgr else 0,
             what_works=(
-                "19 console/GDK DLLs: `xgameruntime` (286 exports, 15-table + 3-arg real-thunk `QueryApiImpl`, `XUser`/`XStore`/`XGameUi`/`XNetworking`/`XPackage`/`XDisplay`/`XSpeechSynthesizer`), `GameInput`, `XAudio2_9`/`X3DAudio`/`AcpHal`, `dstorage_xs`, `XSAPI` (178 exports), `XCurl` (46 exports, 16/16 real thunk imports), `pixevt`, `xmem`, `xcrdapi`, `libHttpClient.GDK`, `Bink2Scarlett`, FidelityFX, `XboxBvhBuilder`"
-                if has_gdk_ext
-                else "16 console/GDK DLLs (`xgameruntime` 8-table `QueryApiImpl`, `GameInput`, `XAudio2_9`, `AcpHal`, hardened `dstorage_xs`, `XSAPI`, `pixevt`, `xmem`, `xcrdapi`, `libHttpClient.GDK`, `XCurl`, `Bink2Scarlett`, FidelityFX loader/upscaler, `XboxBvhBuilder`)"
+                "24 console/GDK DLLs: `xgameruntime` (**292/292** shipping `XGamingRuntimeThunks.dll` parity, 321 exports, 24 real 3-arg COM `QueryApiImpl` interfaces / 288 slots, headless `XStore`/PLS, `XAppBroadcast`/`XAppCapture`/`XSpeech*`), `XCurl` (16/16), `XSAPI` (178), `dstorage_xs` (cancel + phys-page), `GameInput`, `XAudio2_9`, `mfplat_xs`, `advapi32legacy`, `KernelTraceControl`, `hix_xs`, `xbtp`, FidelityFX, `XboxBvhBuilder`"
+                if has_sprint6
+                else "19 console/GDK DLLs: `xgameruntime` (286 exports, 15-table + 3-arg real-thunk `QueryApiImpl`, `XUser`/`XStore`/`XGameUi`/`XNetworking`/`XPackage`/`XDisplay`/`XSpeechSynthesizer`), `GameInput`, `XAudio2_9`/`X3DAudio`/`AcpHal`, `dstorage_xs`, `XSAPI` (178 exports), `XCurl` (46 exports, 16/16 real thunk imports), `pixevt`, `xmem`, `xcrdapi`, `libHttpClient.GDK`, `Bink2Scarlett`, FidelityFX, `XboxBvhBuilder`"
             ),
             verified_on=(
-                "Win10 & Win11 26H2 (`test_gdk_shims`, `test_gdk_extended_loader`, `test_secondary_shims`, `test_xg_dstorage`, `Xbox-GDK-Samples`, 19-DLL `test_external_gdk_bringup`)"
-                if has_gdk_ext
-                else "Win10 & Win11 26H2 (`test_gdk_shims`, `test_secondary_shims`, `test_xg_dstorage`, `Xbox-GDK-Samples`, 19-DLL `test_external_gdk_bringup`)"
+                "Live commercial `Alexandria IV DEMO` shipping thunks (`S_OK`, **0 `E_NOINTERFACE`**, `TitleId=0x6BFFDF10`), Win10 & Win11 26H2 (`test_real_gdk_thunks_live`, `test_xgr_conformance_parity`, `test_dstorage_audio_diag_parity`, `test_gdk_shims`, `test_external_gdk_bringup`)"
+                if has_sprint6
+                else "Win10 & Win11 26H2 (`test_gdk_shims`, `test_gdk_extended_loader`, `test_secondary_shims`, `test_xg_dstorage`, `Xbox-GDK-Samples`, 19-DLL `test_external_gdk_bringup`)"
             ),
         ),
         Component(
-            name="DXR Tier 1.1, HDR10 & Cross-API Real-Binary GDK Workloads",
+            name="Playable Scarlett Games, DXR Tier 1.1 & Cross-API Real-Binary Workloads",
             area="Graphics",
             stage="Live-GPU Verified" if has_dxr else "Planned",
             pct=100 if has_dxr else 0,
             what_works=(
-                "`ID3D12Device5` BLAS/TLAS/SBT + `lib_6_3` `DispatchRays`, `SimplePBR`, `MeshletCull`, `SimpleLighting` (D3D12+Vk `0.0000` MAE), `HDRCubeMap` (FP16+ST.2084+Array SRV), `VulkanMeshShowcase` (`XS2\\0` `AS`+`MS`+`PS`+3D LUT `0.0000` MAE)"
-                if has_sprint5
-                else "`ID3D12Device5` BLAS/TLAS/SBT + `lib_6_3` `DispatchRays` (HW RT cores + `XboxBvhBuilder.dll` SAH BVH), `SimplePBR` (4× MSAA/depth/CB/SRV), `MeshletCull` (`AS`+`MS`+`PS` frustum/cone culling)"
+                "Live 60 FPS playable **Freedoom: Phase 1** (`ScarlettDoom`) & MIT `ScarlettArena` via `openscarlett run` (`d3d12_xs`+`PresentX`+`kernelx`+`xgameruntime`+`GameInput`+`XAudio2_9`+`S:` saves+`G:` CoW VFS, `not_impl=0`), `ID3D12Device5` DXR 1.1, `SimplePBR`, `MeshletCull`, `SimpleLighting`, `HDRCubeMap`, `VulkanMeshShowcase`"
+                if has_sprint6
+                else "`ID3D12Device5` BLAS/TLAS/SBT + `lib_6_3` `DispatchRays`, `SimplePBR`, `MeshletCull`, `SimpleLighting` (D3D12+Vk `0.0000` MAE), `HDRCubeMap` (FP16+ST.2084+Array SRV), `VulkanMeshShowcase` (`XS2\\0` `AS`+`MS`+`PS`+3D LUT `0.0000` MAE)"
             ),
             verified_on=(
-                "RTX 2060 SUPER & RTX 3080 Ti (`DXR=12`), AMD RX 7600/7900 XTX/9070 XT (`DXR=11`), GTX 1650 Ti (`MeshTier=10`, Vk 1.4.329 `VK_EXT_mesh_shader`) + WARP (`test_dxr_live`, `test_gdk_simple_pbr`, `test_gdk_meshlet_cull`, `test_gdk_dxr_triangle`, `test_gdk_simple_lighting`, `test_gdk_hdr_cubemap`, `test_vulkan_mesh_showcase`)"
-                if has_sprint5
-                else "RTX 2060 SUPER & RTX 3080 Ti (`DXR=12`), AMD RX 7600/7900 XTX/9070 XT (`DXR=11` HW), GTX 1650 Ti (`MeshTier=10`, SW) + WARP (`test_dxr_live`, `test_gdk_simple_pbr`, `test_gdk_meshlet_cull`, `test_gdk_dxr_triangle`)"
+                "GTX 1650 Ti (HW + WARP, Freedoom1 131f/129 hashes, `not_impl=0`), RTX 2060 SUPER/3080 Ti (`DXR=12`), AMD RX 7600/7900 XTX/9070 XT (`DXR=11`) (`test_scarlett_game_live`, `test_dxr_live`, `test_gdk_simple_pbr`, `test_gdk_meshlet_cull`, `test_gdk_simple_lighting`, `test_gdk_hdr_cubemap`, `test_vulkan_mesh_showcase`)"
+                if has_sprint6
+                else "RTX 2060 SUPER & RTX 3080 Ti (`DXR=12`), AMD RX 7600/7900 XTX/9070 XT (`DXR=11`), GTX 1650 Ti (`MeshTier=10`, Vk 1.4.329 `VK_EXT_mesh_shader`) + WARP (`test_dxr_live`, `test_gdk_simple_pbr`, `test_gdk_meshlet_cull`, `test_gdk_dxr_triangle`, `test_gdk_simple_lighting`, `test_gdk_hdr_cubemap`, `test_vulkan_mesh_showcase`)"
             ),
         ),
         Component(

@@ -1545,19 +1545,31 @@ void TestXGameRuntimeThunksParity() {
         OS_REQUIRE(core_vt->XClosedCaptionSetEnabled(false) == XGR_S_OK);
     }
 
-    // --- 7. 3-arg real XGamingRuntimeThunks QueryApiImpl(clsid, iid, ppv) safety ---
+    // --- 7. 3-arg real XGamingRuntimeThunks QueryApiImpl(clsid, iid, ppv) COM ABI ---
     {
         static const XgrGuid kRealClsid = {
             0x073B7DCBu, 0x1FCFu, 0x4030u, {0x94, 0xBE, 0xE3, 0xC9, 0xEB, 0x62, 0x34, 0x28}};
         static const XgrGuid kRealIid = {
             0x073B7DCBu, 0x1FCFu, 0x4030u, {0x94, 0xBE, 0xE3, 0xC9, 0xEB, 0x62, 0x34, 0x28}};
-        void* out_iface = reinterpret_cast<void*>(static_cast<uintptr_t>(0x1234u));
+        void* out_iface = nullptr;
         const XGameResult hr3 = QueryApiImpl(
             &kRealClsid,
             reinterpret_cast<void**>(const_cast<XgrGuid*>(&kRealIid)),
             &out_iface);
-        OS_REQUIRE(hr3 == XGR_E_NOINTERFACE);
-        OS_REQUIRE(out_iface == nullptr);
+        OS_REQUIRE(hr3 == XGR_S_OK);
+        OS_REQUIRE(out_iface != nullptr);
+
+        static const XgrGuid kUnknownClsid = {
+            0xDEADBEEFu, 0x1234u, 0x5678u, {0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x01, 0x02}};
+        static const XgrGuid kUnknownIid = {
+            0xCAFEBABEu, 0x4321u, 0x8765u, {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88}};
+        void* out_unknown = reinterpret_cast<void*>(static_cast<uintptr_t>(0x1234u));
+        const XGameResult hr_unk = QueryApiImpl(
+            &kUnknownClsid,
+            reinterpret_cast<void**>(const_cast<XgrGuid*>(&kUnknownIid)),
+            &out_unknown);
+        OS_REQUIRE(hr_unk == XGR_E_NOINTERFACE);
+        OS_REQUIRE(out_unknown == nullptr);
     }
 
     XUserCloseHandle(user);
