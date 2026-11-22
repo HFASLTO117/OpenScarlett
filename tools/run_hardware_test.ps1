@@ -33,12 +33,37 @@ New-Item -ItemType Directory -Force -Path $SaveRoot | Out-Null
 $env:OPENSCARLETT_SAVE_ROOT = $SaveRoot
 $env:OPENSCARLETT_AUDIO_NULL = '1'
 
+# When the tests run from a build\ or bin\ folder (optionally build\Release etc.),
+# the loader puts its work dir under <parent>\.tmp\openscarlett_run
+# (ResolveDefaultWorkDirW in src/loader/vfs_mounts.cpp), so that parent folder
+# shows up in test output too.
+function Get-WorkRootDir {
+    $dir = $BundleDir
+    $leaf = (Split-Path $dir -Leaf).ToLowerInvariant()
+    if (@('debug', 'release', 'relwithdebinfo', 'minsizerel') -contains $leaf) {
+        $parent = Split-Path $dir -Parent
+        if ($parent -and @('build', 'bin') -contains (Split-Path $parent -Leaf).ToLowerInvariant()) {
+            $dir = $parent
+            $leaf = (Split-Path $dir -Leaf).ToLowerInvariant()
+        }
+    }
+    if (@('build', 'bin') -notcontains $leaf) { return '' }
+    $root = Split-Path $dir -Parent
+    if (-not $root -or $root.TrimEnd('\').Length -le 2) { return '' }
+    # Never mask a folder that contains the user profile; the user-home and
+    # username rules below handle those paths.
+    if ($env:USERPROFILE -and ($env:USERPROFILE.TrimEnd('\') + '\').StartsWith($root.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) { return '' }
+    return $root.TrimEnd('\')
+}
+$WorkRootDir = Get-WorkRootDir
+
 function Sanitize-Text {
     param([string]$Text)
     if ([string]::IsNullOrEmpty($Text)) { return '' }
     $out = $Text
     $replacements = @(
         @{ Key = $BundleDir;         Val = '<BUNDLE_DIR>' },
+        @{ Key = $WorkRootDir;       Val = '<REPO_DIR>' },
         @{ Key = $env:USERPROFILE;   Val = '<USER_HOME>' },
         @{ Key = $env:TEMP;          Val = '<TEMP>' },
         @{ Key = $env:LOCALAPPDATA;  Val = '<LOCALAPPDATA>' },
