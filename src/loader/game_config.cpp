@@ -3,10 +3,15 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <utility>
+
+#if defined(_WIN32)
+#  include <windows.h>
+#endif
 
 namespace openscarlett {
 
@@ -458,6 +463,45 @@ bool ParseXmlBool(std::string_view s) noexcept {
     return EqualsIgnoreCase(s, "true") || s == "1";
 }
 
+bool ParseXmlUint64(std::string_view raw, uint64_t& out_value) noexcept {
+    const std::string trimmed = TrimAscii(raw);
+    if (trimmed.empty()) {
+        return false;
+    }
+    uint64_t acc = 0;
+    for (char c : trimmed) {
+        if (c < '0' || c > '9') {
+            return false;
+        }
+        const uint64_t digit = static_cast<uint64_t>(c - '0');
+        if (acc > (UINT64_MAX - digit) / 10ull) {
+            return false;
+        }
+        acc = acc * 10ull + digit;
+    }
+    out_value = acc;
+    return true;
+}
+
+std::string ReadEnvStringA(const char* name) {
+#if defined(_WIN32)
+    DWORD needed = ::GetEnvironmentVariableA(name, nullptr, 0);
+    if (needed == 0) {
+        return {};
+    }
+    std::string buf(needed, '\0');
+    DWORD written = ::GetEnvironmentVariableA(name, buf.data(), needed);
+    if (written == 0 || written >= needed) {
+        return {};
+    }
+    buf.resize(written);
+    return buf;
+#else
+    const char* v = std::getenv(name);
+    return v ? std::string(v) : std::string{};
+#endif
+}
+
 bool FindConfigInDirectory(const std::filesystem::path& dir, std::filesystem::path& out_config) {
     std::error_code ec;
     if (!std::filesystem::is_directory(dir, ec)) {
@@ -569,9 +613,92 @@ Status ParseGameConfigXml(std::string_view xml_text,
         out_config.msa_app_id = TrimAscii(msa_node->text);
     }
 
+    if (const auto* store_node = root.FindChild("StoreId")) {
+        out_config.store_id = TrimAscii(store_node->text);
+    }
+
     if (const auto* visuals = root.FindChild("ShellVisuals")) {
         if (const auto* v = visuals->FindAttr("DefaultDisplayName")) {
             out_config.display_name = *v;
+        }
+    }
+
+    if (const auto* pls_node = root.FindChild("PersistentLocalStorage")) {
+        out_config.persistent_local_storage.has_config = true;
+        if (const auto* sz_child = pls_node->FindChild("SizeMB")) {
+            uint64_t val = 0;
+            if (ParseXmlUint64(sz_child->text, val)) {
+                out_config.persistent_local_storage.size_mb = val;
+            }
+        } else if (const auto* sz_attr = pls_node->FindAttr("SizeMB")) {
+            uint64_t val = 0;
+            if (ParseXmlUint64(*sz_attr, val)) {
+                out_config.persistent_local_storage.size_mb = val;
+            }
+        }
+        if (const auto* grow_child = pls_node->FindChild("GrowableToMB")) {
+            uint64_t val = 0;
+            if (ParseXmlUint64(grow_child->text, val)) {
+                out_config.persistent_local_storage.growable_to_mb = val;
+                out_config.persistent_local_storage.has_growable_to_mb = true;
+            }
+        } else if (const auto* grow_attr = pls_node->FindAttr("GrowableToMB")) {
+            uint64_t val = 0;
+            if (ParseXmlUint64(*grow_attr, val)) {
+                out_config.persistent_local_storage.growable_to_mb = val;
+                out_config.persistent_local_storage.has_growable_to_mb = true;
+            }
+        }
+    }
+
+    if (const auto* vm_node = root.FindChild("VirtualMachine")) {
+        out_config.virtual_machine.has_config = true;
+        if (const auto* v = vm_node->FindAttr("SMTEnabled")) {
+            out_config.virtual_machine.smt_enabled = ParseXmlBool(TrimAscii(*v));
+            out_config.virtual_machine.has_smt_enabled = true;
+        } else if (const auto* c = vm_node->FindChild("SMTEnabled")) {
+            out_config.virtual_machine.smt_enabled = ParseXmlBool(TrimAscii(c->text));
+            out_config.virtual_machine.has_smt_enabled = true;
+        }
+        if (const auto* v = vm_node->FindAttr("XboxLockhartTitleMemory")) {
+            uint64_t val = 0;
+            if (ParseXmlUint64(*v, val)) {
+                out_config.virtual_machine.xbox_lockhart_title_memory = val;
+                out_config.virtual_machine.has_lockhart_title_memory = true;
+            }
+        } else if (const auto* c = vm_node->FindChild("XboxLockhartTitleMemory")) {
+            uint64_t val = 0;
+            if (ParseXmlUint64(c->text, val)) {
+                out_config.virtual_machine.xbox_lockhart_title_memory = val;
+                out_config.virtual_machine.has_lockhart_title_memory = true;
+            }
+        }
+        if (const auto* v = vm_node->FindAttr("XboxAnacondaTitleMemory")) {
+            uint64_t val = 0;
+            if (ParseXmlUint64(*v, val)) {
+                out_config.virtual_machine.xbox_anaconda_title_memory = val;
+                out_config.virtual_machine.has_anaconda_title_memory = true;
+            }
+        } else if (const auto* c = vm_node->FindChild("XboxAnacondaTitleMemory")) {
+            uint64_t val = 0;
+            if (ParseXmlUint64(c->text, val)) {
+                out_config.virtual_machine.xbox_anaconda_title_memory = val;
+                out_config.virtual_machine.has_anaconda_title_memory = true;
+            }
+        }
+    }
+
+    if (const auto* res_node = root.FindChild("Resources")) {
+        for (const auto& child : res_node->children) {
+            if (!EqualsIgnoreCase(child.tag, "Resource")) {
+                continue;
+            }
+            if (const auto* lang = child.FindAttr("Language")) {
+                const std::string trimmed = TrimAscii(*lang);
+                if (!trimmed.empty()) {
+                    out_config.resources.push_back(trimmed);
+                }
+            }
         }
     }
 
@@ -714,6 +841,17 @@ std::string FormatTitleIdFolderName(const GameConfig& config) {
         return sanitize(config.identity.name);
     }
     return {};
+}
+
+std::string ResolvePreferredUserLocale(const GameConfig* config) {
+    const std::string env_locale = TrimAscii(ReadEnvStringA("OPENSCARLETT_LOCALE"));
+    if (!env_locale.empty()) {
+        return env_locale;
+    }
+    if (config && !config->resources.empty() && !config->resources.front().empty()) {
+        return config->resources.front();
+    }
+    return "en-US";
 }
 
 }  // namespace openscarlett

@@ -1,0 +1,23 @@
+LIBRARY XAudio2_9.dll
+EXPORTS
+    XAudio2Create @1
+    CreateAudioVolumeMeter @2
+    CreateAudioReverb @3
+    XAudio2CreateWithVersionInfo @4
+    X3DAudioInitialize @5
+    X3DAudioCalculate @6
+    XAudio2CreateReverb @10
+    XAudio2CreateVolumeMeter @11
+    OpenScarlettXAudio2RenderMixForTest @12
+    OpenScarlettXAudio2GetBackendInfo @13
+    OpenScarlettXAudio2ValidateEndpointIdW @14
+    OpenScarlettXAudio2ValidateEndpointIdA @15
+    OpenScarlettXAudio2ProbeWasapiEndpointW @16
+    OpenScarlettXAudio2SetEffectChain @17
+    OpenScarlettXAudio2EnableEffect @18
+    OpenScarlettXAudio2GetEffectState @19
+    OpenScarlettXAudio2SetEffectParameters @20
+    OpenScarlettXAudio2GetEffectParameters @21
+    OpenScarlettXAudio2AdvanceClock @22
+    OpenScarlettXAudio2GetLockFreeMixerStats @23
+    OpenScarlettCreateSpatialAudioClient @24

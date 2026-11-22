@@ -1,5 +1,14 @@
 #define OPENSCARLETT_BUILDING_XGAMERUNTIME 1
+// Rename void-returning XError* declarations from xgameruntime_abi.h so our exported
+// XErrorReport / XErrorSetCallback / XErrorSetOptions return XGameResult (S_OK) matching
+// Microsoft GDK runtime ABI (AnyXboxX #89), while keeping void adapters for legacy vtables.
+#define XErrorReport _os_abi_void_XErrorReport
+#define XErrorSetCallback _os_abi_void_XErrorSetCallback
+#define XErrorSetOptions _os_abi_void_XErrorSetOptions
 #include "openscarlett/gdk/xgameruntime_abi.h"
+#undef XErrorReport
+#undef XErrorSetCallback
+#undef XErrorSetOptions
 #include "openscarlett/core/telemetry.h"
 #include "openscarlett/kernel/console_lsa_policy.h"
 #include "openscarlett/kernel/plm_notifications.h"
@@ -1751,9 +1760,11 @@ struct GameConfigMetadata {
     bool found = false;
     bool has_title_id = false;
     uint32_t title_id = 0;
+    uint64_t pls_size_mb = 0;
     std::string store_id;
     std::string identity_name;
     std::string display_name;
+    std::string default_locale;
 };
 
 std::string TrimAscii(const std::string& s) {
@@ -1933,6 +1944,25 @@ GameConfigMetadata LoadGameConfigMetadata() {
     meta.store_id = ExtractXmlElementText(stripped, "StoreId");
     meta.identity_name = ExtractXmlAttribute(stripped, "Identity", "Name");
     meta.display_name = ExtractXmlAttribute(stripped, "ShellVisuals", "DefaultDisplayName");
+    const std::string pls_block = ExtractXmlElementText(stripped, "PersistentLocalStorage");
+    std::string pls_mb_str = !pls_block.empty()
+                                 ? ExtractXmlElementText(pls_block, "SizeMB")
+                                 : ExtractXmlElementText(stripped, "SizeMB");
+    if (pls_mb_str.empty()) {
+        pls_mb_str = ExtractXmlAttribute(stripped, "PersistentLocalStorage", "SizeMB");
+    }
+    if (!pls_mb_str.empty() && pls_mb_str[0] != '-') {
+        char* end_ptr = nullptr;
+        errno = 0;
+        const unsigned long long mb = std::strtoull(pls_mb_str.c_str(), &end_ptr, 10);
+        if (errno == 0 && end_ptr && *end_ptr == '\0') {
+            meta.pls_size_mb = static_cast<uint64_t>(mb);
+        }
+    }
+    const std::string res_block = ExtractXmlElementText(stripped, "Resources");
+    if (!res_block.empty()) {
+        meta.default_locale = ExtractXmlAttribute(res_block, "Resource", "Language");
+    }
     return meta;
 }
 
@@ -4491,6 +4521,173 @@ void OPENSCARLETT_GDK_CALL XGameSaveCloseProvider(XGameSaveProviderHandle provid
     rt.live_providers.erase(provider);
 }
 
+// ===========================================================================
+// XGameSaveFiles (Direct File-System Save Folder Backed Onto XGameSave Root)
+// ===========================================================================
+extern "C++" {
+namespace {
+
+const char kIdGameSaveFilesFolder[] = "XGameSaveFilesGetFolderWithUiAsync";
+
+struct GameSaveFilesFolderAsyncCtx {
+    std::string folder_path;
+};
+
+XGameResult OPENSCARLETT_GDK_CALL GameSaveFilesFolderProvider(
+    XAsyncOp op,
+    const XAsyncProviderData* data) {
+    auto* ctx = static_cast<GameSaveFilesFolderAsyncCtx*>(data->context);
+    switch (op) {
+        case XAsyncOp_Begin:
+            return XGR_S_OK;
+        case XAsyncOp_DoWork: {
+            if (!ctx || ctx->folder_path.empty()) {
+                XAsyncComplete(data->async, XGR_E_FAIL, 0);
+                return XGR_E_PENDING;
+            }
+            std::error_code ec;
+            fs::create_directories(fs::path(ctx->folder_path), ec);
+            if (ec) {
+                XAsyncComplete(data->async, XGR_E_FAIL, 0);
+                return XGR_E_PENDING;
+            }
+            XAsyncComplete(data->async, XGR_S_OK, ctx->folder_path.size() + 1u);
+            return XGR_E_PENDING;
+        }
+        case XAsyncOp_GetResult: {
+            if (!ctx || !data->buffer) {
+                return XGR_E_INVALIDARG;
+            }
+            const size_t needed = ctx->folder_path.size() + 1u;
+            if (data->bufferSize < needed) {
+                return XGR_E_NOT_SUFFICIENT_BUFFER;
+            }
+            std::memcpy(data->buffer, ctx->folder_path.c_str(), needed);
+            return XGR_S_OK;
+        }
+        case XAsyncOp_Cleanup:
+            delete ctx;
+            return XGR_S_OK;
+        default:
+            return XGR_S_OK;
+    }
+}
+
+uint64_t ComputeDirectoryTreeBytes(const fs::path& dir) {
+    uint64_t total = 0ull;
+    std::error_code ec;
+    if (!fs::exists(dir, ec) || !fs::is_directory(dir, ec)) {
+        return 0ull;
+    }
+    for (const auto& entry : fs::recursive_directory_iterator(
+             dir, fs::directory_options::skip_permission_denied, ec)) {
+        if (ec) break;
+        std::error_code fec;
+        if (entry.is_regular_file(fec) && !fec) {
+            const auto sz = entry.file_size(fec);
+            if (!fec) {
+                total += static_cast<uint64_t>(sz);
+            }
+        }
+    }
+    return total;
+}
+
+}  // namespace
+}  // extern "C++"
+
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameSaveFilesGetFolderWithUiAsync(
+    XUserHandle requestingUser,
+    const char* configurationId,
+    XAsyncBlock* async) {
+    if (!async || !configurationId || !*configurationId) {
+        return RecordHr("XGameSaveFilesGetFolderWithUiAsync", XGR_E_INVALIDARG);
+    }
+
+    uint64_t xuid = DefaultUserXuid();
+    if (requestingUser) {
+        auto u = LookupUser(requestingUser);
+        if (!u) {
+            return RecordHr("XGameSaveFilesGetFolderWithUiAsync", XGR_E_HANDLE);
+        }
+        xuid = u->xuid;
+    }
+
+    const fs::path folder =
+        ResolveSaveRoot() / "xgamesave" / EncodePathToken(configurationId) / FormatXuidHex(xuid);
+    auto* ctx = new (std::nothrow) GameSaveFilesFolderAsyncCtx{folder.string()};
+    if (!ctx) {
+        return RecordHr("XGameSaveFilesGetFolderWithUiAsync", XGR_E_OUTOFMEMORY);
+    }
+
+    XGameResult hr = XAsyncBegin(
+        async, ctx, kIdGameSaveFilesFolder, kIdGameSaveFilesFolder, &GameSaveFilesFolderProvider);
+    if (hr < 0) {
+        delete ctx;
+        return RecordHr("XGameSaveFilesGetFolderWithUiAsync", hr);
+    }
+    hr = XAsyncSchedule(async, 0u);
+    if (hr < 0) {
+        XAsyncComplete(async, hr, 0);
+    }
+    return RecordHr("XGameSaveFilesGetFolderWithUiAsync", hr);
+}
+
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameSaveFilesGetFolderWithUiResultSize(
+    XAsyncBlock* async,
+    size_t* folderSize) {
+    if (!async || !folderSize) {
+        return RecordHr("XGameSaveFilesGetFolderWithUiResultSize", XGR_E_INVALIDARG);
+    }
+    *folderSize = 0u;
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XGameSaveFilesGetFolderWithUiResultSize", hr);
+    }
+    hr = XAsyncGetResultSize(async, folderSize);
+    return RecordHr("XGameSaveFilesGetFolderWithUiResultSize", hr);
+}
+
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameSaveFilesGetFolderWithUiResult(
+    XAsyncBlock* async,
+    size_t folderSize,
+    char* folderResult) {
+    if (!async || !folderResult || folderSize == 0u) {
+        return RecordHr("XGameSaveFilesGetFolderWithUiResult", XGR_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) {
+        return RecordHr("XGameSaveFilesGetFolderWithUiResult", hr);
+    }
+    hr = XAsyncGetResult(async, kIdGameSaveFilesFolder, folderSize, folderResult, nullptr);
+    return RecordHr("XGameSaveFilesGetFolderWithUiResult", hr);
+}
+
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameSaveFilesGetRemainingQuota(
+    XUserHandle requestingUser,
+    const char* configurationId,
+    int64_t* remainingQuota) {
+    if (!remainingQuota || !configurationId || !*configurationId) {
+        return RecordHr("XGameSaveFilesGetRemainingQuota", XGR_E_INVALIDARG);
+    }
+    uint64_t xuid = DefaultUserXuid();
+    if (requestingUser) {
+        auto u = LookupUser(requestingUser);
+        if (!u) {
+            return RecordHr("XGameSaveFilesGetRemainingQuota", XGR_E_HANDLE);
+        }
+        xuid = u->xuid;
+    }
+    constexpr uint64_t kDefaultSaveFilesQuotaBytes = 256ull * 1024ull * 1024ull;
+    const fs::path folder =
+        ResolveSaveRoot() / "xgamesave" / EncodePathToken(configurationId) / FormatXuidHex(xuid);
+    const uint64_t used = ComputeDirectoryTreeBytes(folder);
+    *remainingQuota = (used < kDefaultSaveFilesQuotaBytes)
+                          ? static_cast<int64_t>(kDefaultSaveFilesQuotaBytes - used)
+                          : 0LL;
+    return RecordHr("XGameSaveFilesGetRemainingQuota", XGR_S_OK);
+}
+
 XGameResult OPENSCARLETT_GDK_CALL XGameSaveCreateContainer(
     XGameSaveProviderHandle provider,
     const char* name,
@@ -5641,7 +5838,13 @@ XGameResult OPENSCARLETT_GDK_CALL XPackageGetMountPath(
 }
 
 XGameResult OPENSCARLETT_GDK_CALL XPackageGetUserLocale(size_t localeSize, char* locale) {
-    std::string loc = GetEnvString("OPENSCARLETT_LOCALE");
+    std::string loc = TrimAscii(GetEnvString("OPENSCARLETT_LOCALE"));
+    if (loc.empty()) {
+        const GameConfigMetadata meta = LoadGameConfigMetadata();
+        if (!meta.default_locale.empty()) {
+            loc = meta.default_locale;
+        }
+    }
     if (loc.empty()) loc = "en-US";
     return RecordHr("XPackageGetUserLocale", CopyStringResult(loc, localeSize, locale, nullptr));
 }
@@ -9225,14 +9428,53 @@ XGameResult OPENSCARLETT_GDK_CALL XNetworkingVerifyServerCertificate(
 // ===========================================================================
 // Core Runtime Extensions (PLS, XThread, XError, XGameEvent, XGameInvite, XLaunch, XAccessibility)
 // ===========================================================================
+extern "C++" {
+namespace {
+
+fs::path ResolvePlsBackingDir() {
+    const std::string env_pls = TrimAscii(GetEnvString("OPENSCARLETT_PLS_PATH"));
+    if (!env_pls.empty()) {
+        return fs::path(env_pls);
+    }
+    return ResolveSaveRoot() / "pls";
+}
+
+std::string ResolvePlsReportedPath() {
+    const std::string use_p = TrimAscii(GetEnvString("OPENSCARLETT_PLS_DRIVE_P"));
+    if (use_p == "1" || use_p == "true" || use_p == "TRUE") {
+        return "P:\\";
+    }
+    const fs::path pls_dir = ResolvePlsBackingDir();
+    std::error_code ec;
+    fs::create_directories(pls_dir, ec);
+    return pls_dir.string();
+}
+
+uint64_t ResolvePlsQuotaBytes() {
+    const std::string env_mb = TrimAscii(GetEnvString("OPENSCARLETT_PLS_SIZE_MB"));
+    if (!env_mb.empty() && env_mb[0] != '-') {
+        char* end_ptr = nullptr;
+        errno = 0;
+        const unsigned long long mb = std::strtoull(env_mb.c_str(), &end_ptr, 10);
+        if (errno == 0 && end_ptr && *end_ptr == '\0' && mb > 0ull) {
+            return static_cast<uint64_t>(mb) * 1024ull * 1024ull;
+        }
+    }
+    const GameConfigMetadata meta = LoadGameConfigMetadata();
+    if (meta.pls_size_mb > 0ull) {
+        return meta.pls_size_mb * 1024ull * 1024ull;
+    }
+    return 0ull;
+}
+
+}  // namespace
+}  // extern "C++"
+
 XGameResult OPENSCARLETT_GDK_CALL XPersistentLocalStorageGetPathSize(size_t* pathSize) {
     if (!pathSize) {
         return RecordHr("XPersistentLocalStorageGetPathSize", XGR_E_INVALIDARG);
     }
-    const fs::path pls_dir = ResolveSaveRoot() / "pls";
-    std::error_code ec;
-    fs::create_directories(pls_dir, ec);
-    const std::string pls_str = pls_dir.string();
+    const std::string pls_str = ResolvePlsReportedPath();
     *pathSize = pls_str.size() + 1;
     return RecordHr("XPersistentLocalStorageGetPathSize", XGR_S_OK);
 }
@@ -9241,10 +9483,7 @@ XGameResult OPENSCARLETT_GDK_CALL XPersistentLocalStorageGetPath(
     size_t pathSize,
     char* path,
     size_t* pathUsed) {
-    const fs::path pls_dir = ResolveSaveRoot() / "pls";
-    std::error_code ec;
-    fs::create_directories(pls_dir, ec);
-    const std::string pls_str = pls_dir.string();
+    const std::string pls_str = ResolvePlsReportedPath();
     return RecordHr(
         "XPersistentLocalStorageGetPath",
         CopyStringResult(pls_str, pathSize, path, pathUsed));
@@ -9255,11 +9494,22 @@ XGameResult OPENSCARLETT_GDK_CALL XPersistentLocalStorageGetSpaceInfo(
     if (!spaceInfo) {
         return RecordHr("XPersistentLocalStorageGetSpaceInfo", XGR_E_INVALIDARG);
     }
-    const fs::path pls_dir = ResolveSaveRoot() / "pls";
+    const fs::path pls_dir = ResolvePlsBackingDir();
     std::error_code ec;
     fs::create_directories(pls_dir, ec);
     const auto sp = fs::space(pls_dir, ec);
-    if (!ec && sp.capacity > 0u) {
+    const uint64_t host_avail = (!ec && sp.capacity > 0u) ? static_cast<uint64_t>(sp.available) : 0ull;
+    const uint64_t quota_bytes = ResolvePlsQuotaBytes();
+
+    if (quota_bytes > 0ull) {
+        const uint64_t used = ComputeDirectoryTreeBytes(pls_dir);
+        const uint64_t free_in_quota = (quota_bytes > used) ? (quota_bytes - used) : 0ull;
+        spaceInfo->totalBytes = quota_bytes;
+        spaceInfo->usedBytes = used;
+        spaceInfo->totalFreeBytes = free_in_quota;
+        spaceInfo->availableFreeBytes =
+            (host_avail > 0ull) ? std::min<uint64_t>(host_avail, free_in_quota) : free_in_quota;
+    } else if (!ec && sp.capacity > 0u) {
         spaceInfo->availableFreeBytes = static_cast<uint64_t>(sp.available);
         spaceInfo->totalFreeBytes = static_cast<uint64_t>(sp.free);
         spaceInfo->totalBytes = static_cast<uint64_t>(sp.capacity);
@@ -9318,8 +9568,9 @@ bool OPENSCARLETT_GDK_CALL XThreadVerifyNotTimeSensitive(void) {
     return !g_thread_time_sensitive;
 }
 
-void OPENSCARLETT_GDK_CALL XErrorReport(XGameResult hr, const char* msg) {
-    RecordOk("XErrorReport");
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XErrorReport(
+    XGameResult hr,
+    const char* msg) {
     XErrorCallback cb = nullptr;
     void* ctx = nullptr;
     XErrorOptions opts_dbg = XErrorOptions_None;
@@ -9362,14 +9613,17 @@ void OPENSCARLETT_GDK_CALL XErrorReport(XGameResult hr, const char* msg) {
         (void)opts_nodbg;
 #endif
     }
+    return RecordHr("XErrorReport", XGR_S_OK);
 }
 
-void OPENSCARLETT_GDK_CALL XErrorSetCallback(XErrorCallback callback, void* context) {
-    RecordOk("XErrorSetCallback");
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XErrorSetCallback(
+    XErrorCallback callback,
+    void* context) {
     auto& rt = GetRuntime();
     std::lock_guard<std::mutex> lk(rt.error_mutex);
     rt.error_callback = callback;
     rt.error_callback_ctx = context;
+    return RecordHr("XErrorSetCallback", XGR_S_OK);
 }
 
 // Validates and stores GDK XErrorOptions bitmasks:
@@ -9378,7 +9632,7 @@ void OPENSCARLETT_GDK_CALL XErrorSetCallback(XErrorCallback callback, void* cont
 //   - Bit 2 (0x04): XErrorOptions_FailFastOnError
 // Unknown/reserved bits (~0x07u) are stripped before storage and logged as XGR_E_INVALIDARG
 // in CallTelemetry so buggy callers cannot corrupt runtime error-handling state.
-void OPENSCARLETT_GDK_CALL XErrorSetOptions(
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XErrorSetOptions(
     XErrorOptions optionsDebuggerPresent,
     XErrorOptions optionsDebuggerNotPresent) {
     const uint32_t raw_dbg = static_cast<uint32_t>(optionsDebuggerPresent);
@@ -9397,6 +9651,7 @@ void OPENSCARLETT_GDK_CALL XErrorSetOptions(
     std::lock_guard<std::mutex> lk(rt.error_mutex);
     rt.error_opts_debugger = clean_dbg;
     rt.error_opts_no_debugger = clean_nodbg;
+    return XGR_S_OK;
 }
 
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XErrorGetOptions(
@@ -9915,6 +10170,20 @@ const IXgrNetworkingApiVtable g_networking_vtable = {
     &XNetworkingVerifyServerCertificate,
 };
 
+void OPENSCARLETT_GDK_CALL XErrorReport_LegacyVoid(XGameResult hr, const char* msg) {
+    (void)XErrorReport(hr, msg);
+}
+
+void OPENSCARLETT_GDK_CALL XErrorSetCallback_LegacyVoid(XErrorCallback callback, void* context) {
+    (void)XErrorSetCallback(callback, context);
+}
+
+void OPENSCARLETT_GDK_CALL XErrorSetOptions_LegacyVoid(
+    XErrorOptions optionsDebuggerPresent,
+    XErrorOptions optionsDebuggerNotPresent) {
+    (void)XErrorSetOptions(optionsDebuggerPresent, optionsDebuggerNotPresent);
+}
+
 const IXgrCoreRuntimeApiVtable g_core_runtime_vtable = {
     &XgrVtableQueryInterface,
     &XgrVtableAddRef,
@@ -9926,9 +10195,9 @@ const IXgrCoreRuntimeApiVtable g_core_runtime_vtable = {
     &XThreadSetTimeSensitive,
     &XThreadAssertNotTimeSensitive,
     &XThreadVerifyNotTimeSensitive,
-    &XErrorReport,
-    &XErrorSetCallback,
-    &XErrorSetOptions,
+    &XErrorReport_LegacyVoid,
+    &XErrorSetCallback_LegacyVoid,
+    &XErrorSetOptions_LegacyVoid,
     &XGameEventWrite,
     &XGameInviteRegisterForEvent,
     &XGameInviteUnregisterForEvent,

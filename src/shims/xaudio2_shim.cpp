@@ -3634,6 +3634,19 @@ int32_t OPENSCARLETT_XAUDIO2_CALL XAudio2CreateVolumeMeter(
     return RecordHr("XAudio2CreateVolumeMeter", OS_XAUDIO2_S_OK);
 }
 
+// Standard Microsoft XAudio2_9.dll ordinal @2 and @3 exports.
+OPENSCARLETT_XAUDIO2_API int32_t OPENSCARLETT_XAUDIO2_CALL CreateAudioVolumeMeter(
+    OS_IXAudio2Unknown** ppApo) {
+    const int32_t hr = XAudio2CreateVolumeMeter(ppApo, 0u);
+    return RecordHr("CreateAudioVolumeMeter", hr);
+}
+
+OPENSCARLETT_XAUDIO2_API int32_t OPENSCARLETT_XAUDIO2_CALL CreateAudioReverb(
+    OS_IXAudio2Unknown** ppApo) {
+    const int32_t hr = XAudio2CreateReverb(ppApo, 0u);
+    return RecordHr("CreateAudioReverb", hr);
+}
+
 int32_t OPENSCARLETT_XAUDIO2_CALL OpenScarlettXAudio2RenderMixForTest(
     IXAudio2* pXAudio2,
     float* out_frames,

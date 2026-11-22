@@ -53,6 +53,7 @@ struct SectionRange {
     uint32_t vsize = 0;
     uint32_t raw_ptr = 0;
     uint32_t raw_size = 0;
+    uint32_t characteristics = 0;
 };
 
 bool RvaToFileOffset(const std::vector<SectionRange>& sections, uint32_t rva, size_t file_size, size_t& out_off) {
@@ -586,6 +587,20 @@ DllRoutingTable::DllRoutingTable() {
 
 DllRoutingTable DllRoutingTable::CreateWithEnvOverrides() {
     DllRoutingTable table;
+    const std::string net_routing = ToLower(TrimAscii(ReadEnvVarA("OPENSCARLETT_NET_ROUTING")));
+    if (!net_routing.empty()) {
+        DllRoutePolicy net_policy = DllRoutePolicy::Shim;
+        if (net_routing == "guest" || net_routing == "native" || net_routing == "nativeguest" ||
+            net_routing == "nativeguestdll") {
+            net_policy = DllRoutePolicy::NativeGuestDll;
+            table.SetRule("XCurl.dll", net_policy, 5);
+            table.SetRule("libHttpClient.GDK.dll", net_policy, 5);
+        } else if (net_routing == "shim") {
+            net_policy = DllRoutePolicy::Shim;
+            table.SetRule("XCurl.dll", net_policy, 1);
+            table.SetRule("libHttpClient.GDK.dll", net_policy, 1);
+        }
+    }
     const std::string env_spec = ReadEnvVarA("OPENSCARLETT_DLL_ROUTING");
     if (!env_spec.empty()) {
         table.ApplyOverrides(env_spec);
@@ -726,9 +741,25 @@ DllRouteDecision DllRoutingTable::ResolveRoute(std::string_view dll_name,
         }
         if (entry.rule.policy == DllRoutePolicy::NativeGuestDll) {
             out.policy = DllRoutePolicy::NativeGuestDll;
+            const std::wstring req_w = Utf8ToWide(out.requested_name);
             const std::wstring canon_w = Utf8ToWide(out.canonical_name);
-            FileExistsInDirW(guest_dir, canon_w, out.resolved_path);
+            if (!FileExistsInDirW(guest_dir, req_w, out.resolved_path)) {
+                FileExistsInDirW(guest_dir, canon_w, out.resolved_path);
+            }
             return out;
+        }
+
+        // Smart middleware routing: when no explicit override was set and the guest ships
+        // its own Bink2Scarlett.dll in guest_dir, prefer the native guest Bink2 DLL while
+        // keeping OpenScarlett's Bink2Scarlett.dll shim as automatic fallback when absent.
+        if (key == "bink2scarlett.dll" && !out.from_override && !guest_dir.empty()) {
+            const std::wstring canon_w = Utf8ToWide(out.canonical_name);
+            if (FileExistsInDirW(guest_dir, canon_w, out.resolved_path)) {
+                out.policy = DllRoutePolicy::NativeGuestDll;
+                out.load_priority = 5;
+                out.aliased = false;
+                return out;
+            }
         }
 
         // entry.rule.policy == DllRoutePolicy::Shim
@@ -985,8 +1016,18 @@ Status InspectPeBytes(const std::vector<uint8_t>& bytes,
         if (!ReadPod(bytes, base + 8, sr.vsize) ||
             !ReadPod(bytes, base + 12, sr.vaddr) ||
             !ReadPod(bytes, base + 16, sr.raw_size) ||
-            !ReadPod(bytes, base + 20, sr.raw_ptr)) {
+            !ReadPod(bytes, base + 20, sr.raw_ptr) ||
+            !ReadPod(bytes, base + 36, sr.characteristics)) {
             return Status::Error(StatusCode::ParseError, "Truncated section table");
+        }
+        // Validate section raw file range against EOF to prevent OOB reads on truncated PEs.
+        if (sr.raw_size > 0u) {
+            const uint64_t raw_end =
+                static_cast<uint64_t>(sr.raw_ptr) + static_cast<uint64_t>(sr.raw_size);
+            if (raw_end > static_cast<uint64_t>(bytes.size())) {
+                return Status::Error(StatusCode::ParseError,
+                                     "PE section raw data exceeds file size (EOF)");
+            }
         }
         sections.push_back(sr);
     }
@@ -1160,23 +1201,57 @@ Status InspectPeBytes(const std::vector<uint8_t>& bytes,
         out_report.tls_dir_size = tls_sz;
 
         size_t tls_off = 0;
-        uint64_t addr_of_callbacks_va = 0;
-        if (RvaToFileOffset(sections, tls_rva, bytes.size(), tls_off) &&
-            ReadPod(bytes, tls_off + 24, addr_of_callbacks_va) &&
-            addr_of_callbacks_va >= out_report.image_base) {
-            const uint64_t cb_rva_64 = addr_of_callbacks_va - out_report.image_base;
-            if (cb_rva_64 < out_report.image_size) {
-                size_t cb_off = 0;
-                if (RvaToFileOffset(sections, static_cast<uint32_t>(cb_rva_64), bytes.size(), cb_off)) {
-                    for (size_t i = 0; i < 256; ++i) {
-                        uint64_t fn_va = 0;
-                        if (!ReadPod(bytes, cb_off + i * 8, fn_va) || fn_va == 0) {
-                            break;
+        if (RvaToFileOffset(sections, tls_rva, bytes.size(), tls_off)) {
+            // Validate TLS AddressOfIndex (offset 16 in IMAGE_TLS_DIRECTORY64):
+            // The OS loader writes the allocated TLS index DWORD to *AddressOfIndex, so it
+            // must point inside a writable (IMAGE_SCN_MEM_WRITE) mapped section.
+            uint64_t addr_of_index_va = 0;
+            if (ReadPod(bytes, tls_off + 16, addr_of_index_va) && addr_of_index_va != 0) {
+                constexpr uint32_t kImageScnMemWrite = 0x80000000u;
+                if (addr_of_index_va < out_report.image_base) {
+                    return Status::Error(StatusCode::ParseError,
+                                         "PE TLS AddressOfIndex is below ImageBase");
+                }
+                const uint64_t idx_rva_64 = addr_of_index_va - out_report.image_base;
+                if (idx_rva_64 + 4ull > static_cast<uint64_t>(out_report.image_size)) {
+                    return Status::Error(StatusCode::ParseError,
+                                         "PE TLS AddressOfIndex is outside image bounds");
+                }
+                const uint32_t idx_rva = static_cast<uint32_t>(idx_rva_64);
+                bool in_writable_section = false;
+                for (const auto& s : sections) {
+                    const uint32_t span = std::max(s.vsize, s.raw_size);
+                    if (idx_rva >= s.vaddr && (idx_rva - s.vaddr) < span &&
+                        (span - (idx_rva - s.vaddr)) >= 4u) {
+                        if ((s.characteristics & kImageScnMemWrite) != 0u) {
+                            in_writable_section = true;
                         }
-                        if (fn_va >= out_report.image_base &&
-                            fn_va - out_report.image_base < out_report.image_size) {
-                            out_report.tls_callback_rvas.push_back(
-                                static_cast<uint32_t>(fn_va - out_report.image_base));
+                        break;
+                    }
+                }
+                if (!in_writable_section) {
+                    return Status::Error(StatusCode::ParseError,
+                                         "PE TLS AddressOfIndex points to unwritable or unmapped section");
+                }
+            }
+
+            uint64_t addr_of_callbacks_va = 0;
+            if (ReadPod(bytes, tls_off + 24, addr_of_callbacks_va) &&
+                addr_of_callbacks_va >= out_report.image_base) {
+                const uint64_t cb_rva_64 = addr_of_callbacks_va - out_report.image_base;
+                if (cb_rva_64 < out_report.image_size) {
+                    size_t cb_off = 0;
+                    if (RvaToFileOffset(sections, static_cast<uint32_t>(cb_rva_64), bytes.size(), cb_off)) {
+                        for (size_t i = 0; i < 256; ++i) {
+                            uint64_t fn_va = 0;
+                            if (!ReadPod(bytes, cb_off + i * 8, fn_va) || fn_va == 0) {
+                                break;
+                            }
+                            if (fn_va >= out_report.image_base &&
+                                fn_va - out_report.image_base < out_report.image_size) {
+                                out_report.tls_callback_rvas.push_back(
+                                    static_cast<uint32_t>(fn_va - out_report.image_base));
+                            }
                         }
                     }
                 }

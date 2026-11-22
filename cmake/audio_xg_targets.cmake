@@ -6,6 +6,11 @@ target_sources(openscarlett_core PRIVATE
     src/audio/opus_adpcm_decoder.cpp
 )
 
+# Pin standard Microsoft XAudio2_9.dll ordinals (@1..@4) across MSVC, Clang-CL, and MinGW-w64.
+if(TARGET XAudio2_9 AND WIN32)
+    target_sources(XAudio2_9 PRIVATE src/shims/xaudio2_9.def)
+endif()
+
 # 1. Opus MFT + IMA-ADPCM + Deterministic & Live Host WASAPI Test
 # Note: Intentionally does NOT force OPENSCARLETT_AUDIO_NULL=1 so the live
 # WASAPI sub-test exercises host WASAPI (while still handling headless CI safely).

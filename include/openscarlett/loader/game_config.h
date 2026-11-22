@@ -23,6 +23,23 @@ struct GameExecutableEntry {
     bool is_dev_only = false;
 };
 
+struct GamePersistentLocalStorage {
+    uint64_t size_mb = 0;          // From <PersistentLocalStorage><SizeMB>
+    uint64_t growable_to_mb = 0;   // Optional <GrowableToMB>
+    bool has_growable_to_mb = false;
+    bool has_config = false;
+};
+
+struct GameVirtualMachineConfig {
+    bool smt_enabled = true;                   // SMTEnabled
+    bool has_smt_enabled = false;
+    uint64_t xbox_lockhart_title_memory = 0;   // XboxLockhartTitleMemory
+    bool has_lockhart_title_memory = false;
+    uint64_t xbox_anaconda_title_memory = 0;   // XboxAnacondaTitleMemory
+    bool has_anaconda_title_memory = false;
+    bool has_config = false;
+};
+
 struct GameConfig {
     std::string source_path;
     std::string config_version;
@@ -31,8 +48,12 @@ struct GameConfig {
     uint32_t title_id_value = 0;   // Parsed 32-bit hex value (supports optional 0x prefix)
     bool has_title_id = false;
     std::string msa_app_id;
+    std::string store_id;          // From <StoreId>
     std::string display_name;      // From <ShellVisuals DefaultDisplayName="...">
     std::vector<GameExecutableEntry> executables;
+    GamePersistentLocalStorage persistent_local_storage;
+    GameVirtualMachineConfig virtual_machine;
+    std::vector<std::string> resources;  // From <Resources><Resource Language="..."/>
 
     // Selects the primary executable, preferring Scarlett -> Xbox -> first non-dev-only -> first entry.
     const GameExecutableEntry* SelectPrimaryExecutable() const noexcept;
@@ -64,5 +85,11 @@ Status ResolvePackageLaunchTarget(const std::string& input_path,
 // Formats a safe per-title directory name (uppercase 8-digit hex TitleId when available,
 // falling back to sanitized Identity.Name).
 std::string FormatTitleIdFolderName(const GameConfig& config);
+
+// Resolves active user locale honoring:
+//   1. OPENSCARLETT_LOCALE environment variable override (when non-empty)
+//   2. First declared <Resources><Resource Language="..."/> in config (when provided)
+//   3. Fallback "en-US"
+std::string ResolvePreferredUserLocale(const GameConfig* config = nullptr);
 
 }  // namespace openscarlett

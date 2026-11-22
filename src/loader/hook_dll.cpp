@@ -2664,8 +2664,58 @@ uint32_t RebindShimIatTable(uint8_t* base,
     return patched;
 }
 
+// RAII pin guard preventing concurrent module unload races during import sweeps.
+class ScopedModulePin {
+public:
+    explicit ScopedModulePin(HMODULE candidate) noexcept {
+        if (!candidate) {
+            return;
+        }
+        HMODULE pinned = nullptr;
+        const BOOL ok = g_real_GetModuleHandleExW
+            ? g_real_GetModuleHandleExW(
+                  GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                  reinterpret_cast<LPCWSTR>(candidate),
+                  &pinned)
+            : ::GetModuleHandleExW(
+                  GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                  reinterpret_cast<LPCWSTR>(candidate),
+                  &pinned);
+        if (ok && pinned == candidate) {
+            mod_ = pinned;
+        } else if (ok && pinned != nullptr) {
+            ::FreeLibrary(pinned);
+        }
+    }
+
+    ~ScopedModulePin() {
+        if (mod_ != nullptr) {
+            ::FreeLibrary(mod_);
+        }
+    }
+
+    ScopedModulePin(const ScopedModulePin&) = delete;
+    ScopedModulePin& operator=(const ScopedModulePin&) = delete;
+
+    explicit operator bool() const noexcept { return mod_ != nullptr; }
+    HMODULE Get() const noexcept { return mod_; }
+
+private:
+    HMODULE mod_ = nullptr;
+};
+
 void PatchModuleImports(HMODULE mod) {
-    if (!mod || IsWindowsSystemModule(mod)) {
+    if (!mod || mod == g_self_module) {
+        return;
+    }
+
+    // Pin the module across the entire PE header / IAT / delay-load walk so concurrent
+    // FreeLibrary calls on another thread cannot unmap the image mid-sweep.
+    ScopedModulePin pin(mod);
+    if (!pin) {
+        return;
+    }
+    if (IsWindowsSystemModule(mod)) {
         return;
     }
 
@@ -2854,6 +2904,10 @@ void PatchAllLoadedNonSystemModules() {
 
     for (HMODULE mod : mods) {
         if (!mod || mod == g_self_module) {
+            continue;
+        }
+        ScopedModulePin pin(mod);
+        if (!pin) {
             continue;
         }
         std::wstring path = GetModulePathW(mod);
