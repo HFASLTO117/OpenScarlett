@@ -100,6 +100,11 @@ struct D3D12ComputeRunner {
         char buf[256]{};
         WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, buf, sizeof(buf), nullptr, nullptr);
         adapter_name = buf;
+        if (!use_warp &&
+            (((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0u) ||
+             (desc.VendorId == 0x1414u && (desc.DeviceId == 0x008Cu || desc.DedicatedVideoMemory == 0)))) {
+            return false;
+        }
 
         if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device)))) return false;
         D3D12_FEATURE_DATA_SHADER_MODEL sm{D3D_SHADER_MODEL_6_6};

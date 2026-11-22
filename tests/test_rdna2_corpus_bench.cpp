@@ -17,8 +17,12 @@ namespace {
 using namespace openscarlett;
 
 std::string ResolveTempJsonPath(const char* filename) {
-    const std::filesystem::path dir("E:\\OpenScarlett\\.tmp\\s8-rdna2-corpus-bench");
     std::error_code ec;
+    std::filesystem::path base = std::filesystem::temp_directory_path(ec);
+    if (ec || base.empty()) {
+        base = std::filesystem::current_path(ec);
+    }
+    const std::filesystem::path dir = base / "openscarlett_s8_corpus_bench";
     std::filesystem::create_directories(dir, ec);
     return (dir / filename).string();
 }
