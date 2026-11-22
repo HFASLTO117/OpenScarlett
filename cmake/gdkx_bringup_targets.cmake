@@ -93,7 +93,7 @@ if(WIN32 AND MSVC)
             # Microsoft's untouched sample .cpp files (never editing Microsoft's code).
             if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
                 set_source_files_properties(${_sample_abs_srcs} PROPERTIES
-                    COMPILE_OPTIONS "-Wno-everything"
+                    COMPILE_OPTIONS "-Wno-everything;/arch:AVX2"
                 )
             else()
                 set_source_files_properties(${_sample_abs_srcs} PROPERTIES
