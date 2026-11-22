@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Generate OpenScarlett's status chart (docs/status.svg), interactive dashboard (docs/index.html),
-and auto-updated technical table block inside README.md."""
+"""Generate OpenScarlett's honest status charts (docs/status.svg, docs/matrix.svg),
+interactive dashboard (docs/index.html), and auto-updated technical table inside README.md."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import struct
 from dataclasses import dataclass
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
+DISCORD_URL = "https://discord.gg/sShMY2fjR"
 
 
 @dataclass
@@ -21,11 +22,26 @@ class Component:
     plain_summary: str
     tech_name: str
     area: str
-    stage: str  # "Live-GPU Verified" | "Live-Binary Verified" | "Unit-Tested" | "In Progress" | "Planned"
+    stage: str  # "Live Verified" | "Partial" | "In Progress" | "Early Alpha" | "Planned"
     pill_label: str
     pct: int
     what_works: str
     verified_on: str
+
+
+@dataclass
+class DllInfo:
+    name: str
+    tier: str  # "high" | "partial" | "stub"
+    exports: int
+    note: str
+
+
+@dataclass
+class TranslationItem:
+    name: str
+    status: str  # "live" | "partial" | "pending"
+    detail: str
 
 
 def read_ctest(build_dir: pathlib.Path) -> tuple[int, int] | None:
@@ -80,307 +96,381 @@ def count_pe_exports(dll_path: pathlib.Path) -> int:
     return 0
 
 
-def measure_codebase_metrics(build_dir: pathlib.Path) -> dict[str, int | str]:
-    # Count unique RDNA2/GFX10.3 mnemonics decoded in src/gpu/rdna2_disasm.cpp
-    opcodes_decoded = 0
-    disasm_path = ROOT / "src/gpu/rdna2_disasm.cpp"
-    if disasm_path.exists():
-        dis = disasm_path.read_text(encoding="utf-8", errors="ignore")
-        opcodes_decoded = len(
-            set(re.findall(r'"((?:s|v|ds|buffer|tbuffer|image|flat|global|scratch)_[a-z0-9_]+|exp)"', dis))
-        )
+def measure_rdna2_families() -> tuple[list[dict[str, int | str]], int, int, int, int]:
+    # Scan all RDNA2 decoder/ISA files so Sprint 8 additions auto-register immediately.
+    mnems: set[str] = set()
+    gpu_dir = ROOT / "src/gpu"
+    if gpu_dir.exists():
+        for p in sorted(gpu_dir.glob("rdna2_*.cpp")):
+            txt = p.read_text(encoding="utf-8", errors="ignore")
+            mnems.update(
+                re.findall(r'"((?:s|v|ds|buffer|tbuffer|image|flat|global|scratch)_[a-z0-9_]+|exp)"', txt)
+            )
 
-    # Optional Sprint 8 corpus report (docs/rdna2_coverage.json)
-    corpus_shaders = 0
-    corpus_passed = 0
+    def _cnt(pred) -> int:
+        return sum(1 for m in mnems if pred(m))
+
+    smem_kw = ("load", "store", "buffer", "atomic", "dcache", "atc", "memtime", "memrealtime")
+    families: list[dict[str, int | str]] = [
+        {"name": "VOP (Vector ALU / VOP3P)", "done": _cnt(lambda m: m.startswith("v_")), "total": 330},
+        {"name": "SOP (Scalar ALU / Ctrl)", "done": _cnt(lambda m: m.startswith("s_") and not any(k in m for k in smem_kw)), "total": 130},
+        {"name": "MIMG (Images / Samplers / BVH)", "done": _cnt(lambda m: m.startswith("image_")), "total": 85},
+        {"name": "FLAT / GLOBAL / SCRATCH", "done": _cnt(lambda m: m.startswith(("flat_", "global_", "scratch_"))), "total": 70},
+        {"name": "DS (LDS Shared Memory)", "done": _cnt(lambda m: m.startswith("ds_")), "total": 70},
+        {"name": "MUBUF / MTBUF (Buffers)", "done": _cnt(lambda m: m.startswith(("buffer_", "tbuffer_"))), "total": 65},
+        {"name": "SMEM (Scalar Memory)", "done": _cnt(lambda m: m.startswith("s_") and any(k in m for k in smem_kw)), "total": 28},
+        {"name": "EXP (Shader Exports)", "done": _cnt(lambda m: m == "exp"), "total": 1},
+    ]
+
+    opcodes_decoded = len(mnems)
     opcodes_total = 779
+    corpus_passed = 0
+    corpus_total = 0
+
     cov_path = ROOT / "docs/rdna2_coverage.json"
     if cov_path.exists():
         try:
             cov = json.loads(cov_path.read_text(encoding="utf-8"))
             opcodes_decoded = int(cov.get("opcodes_decoded", opcodes_decoded))
             opcodes_total = int(cov.get("opcodes_total", opcodes_total))
-            corpus_shaders = int(cov.get("corpus_shaders_total", 0))
+            corpus_total = int(cov.get("corpus_shaders_total", 0))
             corpus_passed = int(cov.get("corpus_shaders_passed", 0))
+            if isinstance(cov.get("families"), list) and cov["families"]:
+                families = cov["families"]
         except Exception:
             pass
 
-    # Count built shim DLL exports (excluding runtime/test helper DLLs)
-    skip = {"dxcompiler.dll", "dxil.dll", "openscarlett_hook.dll", "test_dep_base.dll", "test_dep_mid.dll", "test_dep_top.dll"}
-    dll_exports = 0
-    built_shims = 0
-    if build_dir.exists():
-        for d in sorted(build_dir.glob("*.dll")):
-            if d.name.lower() in skip:
-                continue
-            c = count_pe_exports(d)
-            if c > 0:
-                built_shims += 1
-                dll_exports += c
-
-    return {
-        "opcodes_decoded": opcodes_decoded,
-        "opcodes_total": opcodes_total,
-        "corpus_shaders": corpus_shaders,
-        "corpus_passed": corpus_passed,
-        "built_shims": built_shims or 30,
-        "dll_exports": dll_exports or 926,
-    }
+    return families, opcodes_decoded, opcodes_total, corpus_passed, corpus_total
 
 
-def collect_components() -> tuple[list[Component], int]:
-    has_hook = has("src/loader/apc_injector.cpp") or has("src/loader/hook_dll.cpp")
-    has_d3d_proxy = has("src/shims/d3d12_xs_shim.cpp")
-    has_xgr = has("src/shims/xgameruntime_shim.cpp")
-    has_kernelx = has("src/shims/kernelx_shim.cpp")
-    has_lifter = has("src/gpu/rdna2_lifter.cpp")
-    has_dxr = has("src/gpu/dxr_hardware.cpp")
-    has_fsr = has("src/middleware/ffx_gpu_fsr.cpp")
-    has_gdk_runner = has("tests/test_gdk_live.cpp")
-    has_sprint6 = (
-        has("tests/test_real_gdk_thunks_live.cpp")
-        and has("tests/scarlett_game/test_scarlett_game_live.cpp")
-        and has("src/gpu/bvh4_decoder.cpp")
-    )
-    has_sprint7_w1 = (
-        has("tests/test_d3d12_vk_routing.cpp")
-        and has("tests/test_rdna2_lockstep_isa.cpp")
-        and has("tests/test_s7_pe_gdk_runtime.cpp")
-        and has("tests/test_gdk_3d_scene_dual_api.cpp")
-    )
+def collect_dlls(build_dir: pathlib.Path) -> list[DllInfo]:
+    # Honest tier classification:
+    #   high    = substantial functional implementation & live verified
+    #   partial = core paths implemented; real-game gaps still remain
+    #   stub    = telemetry-logged / fixed-return stubs for boot compatibility
+    catalog = [
+        ("xgameruntime.dll", "high", 337, "292/292 shipping thunks, 24 COM QueryApiImpl interfaces, XUser/XStore/XSave"),
+        ("Microsoft.Xbox.Services.GDK.C.dll", "high", 178, "XSAPI offline profile, achievements, stats & telemetry stubs"),
+        ("kernelx.dll", "high", 48, "VirtualAlloc2 64KB/4MB aliasing, GpuTilePool, XMem/XThread (affinity remap next)"),
+        ("XCurl.dll", "high", 46, "16/16 real thunk imports + WinHTTP-backed easy/multi handles"),
+        ("xg_xs.dll", "high", 25, "15 2D + 6 3D GFX10 tile modes, HTILE/DCC/CMASK, XGEncodeDCC (GPU untile next)"),
+        ("winrt_xs.dll", "high", 18, "RoInitialize, HSTRING, activation factories (CoreWindow/AppModel lifecycle next)"),
+        ("xmem.dll", "high", 15, "XMemAlloc/Free, XMemVirtualQuery & ERA allocation attributes"),
+        ("XAudio2_9.dll", "high", 11, "Live WASAPI, XMA2/Opus/ADPCM, X3DAudio & XAudio2FX (64+ voice stress next)"),
+        ("GameInput.dll", "high", 7, "XInput + keyboard + Raw Input mouse (hot-plug rings & impulse triggers next)"),
+        ("dstorage_xs.dll", "high", 6, "GDeflate v1 + BCPack, request cancellation & physical-page targets"),
+        ("d3d12_xs.dll", "partial", 48, "3/13 COM proxies (DeviceX/QueueX/CmdListX), HDR10 PresentX, early Vulkan routing"),
+        ("libHttpClient.GDK.dll", "partial", 21, "Offline/HTTP request queue & XAsync lifecycle"),
+        ("mfplat_xs.dll", "partial", 16, "MFResetDXGIDeviceManagerX & session scaffolding (H.264/HEVC HW decode pending)"),
+        ("advapi32legacy.dll", "partial", 14, "UE4 startup/login/registry routing shims"),
+        ("xcrdapi.dll", "partial", 13, "Console DirectStorage / container staging & cancellation"),
+        ("Bink2Scarlett.dll", "partial", 12, "KB2i DCT frame decode & shim exports (full retail bitstream pending)"),
+        ("XboxBvhBuilder.dll", "partial", 9, "SAH BVH2->BVH4 builder & RDNA2 BVH4 decoder"),
+        ("amd_fidelityfx_upscaler_xbox.dll", "partial", 6, "Live GPU FSR 1.0 EASU+RCAS (FSR 2/3 temporal pending)"),
+        ("amd_fidelityfx_loader_xbox.dll", "partial", 5, "FidelityFX context loader & version dispatch"),
+        ("AcpHal.dll", "partial", 3, "Shape/audio DSP queue forwarding to software XMA2"),
+        ("pixevt.dll", "stub", 13, "PIX begin/end event & marker telemetry stubs"),
+        ("hix_xs.dll", "stub", 11, "Hang-dump & debug telemetry forward stubs"),
+        ("KernelTraceControl.dll", "stub", 9, "ETW kernel trace control fixed-return stubs"),
+        ("xtfpix.dll", "stub", 9, "XTF PIX capture diagnostic stubs"),
+        ("xbtp.dll", "stub", 8, "Debug transport session stubs"),
+        ("mflnmhelp.dll", "stub", 8, "Media Foundation helper fixed-return stubs"),
+        ("mfhevcdec.dll", "stub", 8, "HEVC decoder registration stubs (full decode pending)"),
+        ("gamecoreclient.dll", "stub", 8, "GameCore client broker stubs"),
+        ("minuserx.dll", "stub", 7, "Console minimal user32 forward stubs"),
+        ("xtfdebugmonitor.dll", "stub", 7, "XTF debug monitor stubs"),
+    ]
+
+    # Auto-upgrade tiers when Sprint 9/10 implementations land!
+    has_proxies = has("tests/test_d3d12_xs_proxies_multiqueue.cpp")
+    has_mf_hw = has("tests/test_media_video_gameinput.cpp")
+
+    out: list[DllInfo] = []
+    for name, tier, fallback_exp, note in catalog:
+        exp = fallback_exp
+        dll_path = build_dir / name
+        if dll_path.exists():
+            measured = count_pe_exports(dll_path)
+            if measured > 0:
+                exp = measured
+        if name == "d3d12_xs.dll" and has_proxies:
+            tier = "high"
+            note = "Full Xbox COM object proxies, multi-queue MT recording, HDR10 PresentX & Vulkan routing"
+        if name == "mfplat_xs.dll" and has_mf_hw:
+            tier = "high"
+            note = "H.264/HEVC D3D12 Media Foundation decode + IMFDXGIDeviceManager lifecycle"
+        out.append(DllInfo(name=name, tier=tier, exports=exp, note=note))
+    return out
+
+
+def collect_translation_items() -> list[TranslationItem]:
+    has_proxies = has("tests/test_d3d12_xs_proxies_multiqueue.cpp")
+    has_title_va = has("src/kernel/title_va_mirror.cpp")
+    has_bindless = has("src/gpu/descriptor_sgpr_bridge.cpp")
+    has_gpu_untile = has("src/gpu/xg_gpu_untile.cpp")
+    has_stages_ext = has("src/gpu/rdna2_stages_ext.cpp")
+    has_probe_veh = has("src/loader/probe_veh.cpp")
+
+    return [
+        TranslationItem("DeviceX / QueueX / CmdListX", "live", "Core Xbox D3D12 COM wrappers + auto-lift PSOs"),
+        TranslationItem("HDR10 / scRGB PresentX", "live", "ST.2084, 60/120 Hz pacing & ACES/Reinhard fallback"),
+        TranslationItem("Vulkan 1.4 Raster + Mesh", "live", "Zero-SDK raster, MSAA, 3D textures, VK_EXT_mesh_shader"),
+        TranslationItem("Sparse / GetResourceTiling", "live", "Vulkan vkQueueBindSparse + D3D12 reserved tiles"),
+        TranslationItem("xg_xs CPU Layout + Metadata", "live", "15 2D + 6 3D tile modes, HTILE/DCC/CMASK"),
+        TranslationItem("d3d12_xs -> Vulkan Routing", "live" if has_proxies else "partial", "Works on GDK samples & 3D scene; broader engine paths next"),
+        TranslationItem("DXR 1.1 + BVH4 Raytracing", "live" if has_stages_ext else "partial", "HW RT cores + SAH BVH live; RDNA2 SBT shader tables next"),
+        TranslationItem("All 13 D3D12 COM Proxies", "live" if has_proxies else "pending", "ResourceX, HeapX, PSOX, FenceX, Indirect, StateObjectX"),
+        TranslationItem("Multi-Queue MT Recording", "live" if has_proxies else "pending", "4-8 thread recording + Direct/Compute/Copy fence sync"),
+        TranslationItem("Title-VA Unified Mirror", "live" if has_title_va else "pending", "64-bit CPU<->VRAM dirty-page sync via MEM_WRITE_WATCH"),
+        TranslationItem("Raw V#/T#/S# Bindless", "live" if has_bindless else "pending", "RDNA2 root-SGPR descriptor tables -> SM6.6 / Vk bindless"),
+        TranslationItem("GPU Compute Untiling", "live" if has_gpu_untile else "pending", "Real-time cs_6_5/SPIR-V GFX10 untile & HS/DS/GS stages"),
+        TranslationItem("First-Boot Probe & VEH", "live" if has_probe_veh else "pending", "Launch any x64 exe with auto-stubbed imports + crash log"),
+    ][:12]
+
+
+def collect_components(
+    dlls: list[DllInfo],
+    trans_items: list[TranslationItem],
+    opcodes_decoded: int,
+    opcodes_total: int,
+    corpus_passed: int,
+    corpus_total: int,
+) -> list[Component]:
+    has_proxies = has("tests/test_d3d12_xs_proxies_multiqueue.cpp")
+    has_title_va = has("src/kernel/title_va_mirror.cpp")
+    has_bindless = has("src/gpu/descriptor_sgpr_bridge.cpp")
+    has_gpu_untile = has("src/gpu/xg_gpu_untile.cpp")
+    has_os_auth = has("tests/test_os_winrt_offline_auth.cpp")
+    has_media = has("tests/test_media_video_gameinput.cpp")
+    has_probe_veh = has("src/loader/probe_veh.cpp")
     has_launcher = has("tests/test_launcher_updater.cpp")
 
-    dll_count = 30 if has_sprint7_w1 else (24 if has_sprint6 else 19)
+    rdna2_pct = min(100, int(round(100.0 * opcodes_decoded / max(1, opcodes_total))))
+    gfx_score = sum(1.0 if t.status == "live" else (0.5 if t.status == "partial" else 0.0) for t in trans_items)
+    gfx_pct = min(100, int(round(100.0 * gfx_score / max(1, len(trans_items)))))
+
+    high_dlls = sum(1 for d in dlls if d.tier == "high")
+    part_dlls = sum(1 for d in dlls if d.tier == "partial")
+    stub_dlls = sum(1 for d in dlls if d.tier == "stub")
+    dll_pct = min(100, int(round(100.0 * (high_dlls * 1.0 + part_dlls * 0.55 + stub_dlls * 0.25) / max(1, len(dlls)))))
+    if has_os_auth:
+        dll_pct = min(95, dll_pct + 15)
+
+    mem_pct = 45 + (30 if has_title_va else 0) + (20 if has_bindless else 0)
+    media_pct = 68 + (25 if has_media else 0)
+    loader_pct = 85 + (12 if has_probe_veh else 0)
+    launcher_pct = (90 + (8 if has_probe_veh else 0)) if has_launcher else 40
+    compat_pct = 20
+
+    corpus_note = f", {corpus_passed}/{corpus_total} corpus shaders validated" if corpus_total else ""
     winrt_exports = count_exports("include/openscarlett/winrt/winrt_abi.h", "OPENSCARLETT_WINRT_API")
 
-    comps = [
+    return [
         Component(
-            short_name="Game Loader & Virtual Drives",
-            plain_summary="Launches unpacked packages, isolates saves, tracks multi-process games",
-            tech_name=f"PE32+ Loader, CoW VFS, {dll_count}-DLL Routing & Child-Hook Propagation",
-            area="Loader",
-            stage="Live-Binary Verified" if has_hook else "Unit-Tested",
-            pill_label="Live Verified",
-            pct=100 if has_hook else 50,
+            short_name="Xbox RDNA2 Shader Translator",
+            plain_summary=f"{opcodes_decoded}/{opcodes_total} GFX10.3 opcodes decoded — MIMG, DS, SMEM & FLAT expanding now",
+            tech_name=f"RDNA2/GFX10.3 Shader Lifter ({opcodes_decoded}/{opcodes_total} Opcodes{corpus_note})",
+            area="Shaders",
+            stage="Live Verified" if rdna2_pct >= 85 else "In Progress",
+            pill_label=f"{opcodes_decoded}/{opcodes_total} Ops",
+            pct=rdna2_pct,
             what_works=(
-                f"`MicrosoftGame.Config` XML loader, nested `G:` CoW overlay VFS (zero base/`C:` writes), `System32`-first `KnownDLL` resolution, RVA-0 reloc & `.xdata` v2/v3 unwind validation, Kahn topo init, {dll_count}-DLL routing, `CreateProcessW/A` child-process APC hook propagation"
-                if has_sprint7_w1
-                else "`MicrosoftGame.Config` XML loader, nested `G:` CoW overlay VFS (zero base/`C:` writes), PE forwarders/TLS/`.pdata` SEH, Kahn topo init, 24-DLL routing, `CreateProcessW/A` child-process APC hook propagation"
+                f"`{opcodes_decoded}/{opcodes_total}` GFX10.3 opcodes decoded & lifted to SPIR-V (`spirv-val`) + DXIL SM 6.5 (`dxc` + MD5 re-signed), lockstep 1-wave LDS barriers, `PSV0` wave bounds, Wave32-on-64 isolation, mesh `merged_wave_info`/`CullPrimitiveEXT`, FSSM/vfetch, CPU interpreter & disk cache{corpus_note}. Still expanding `MIMG`/`DS`/`SMEM`/`FLAT` & HS/DS/GS stages."
             ),
-            verified_on=(
-                "Win10 & Win11 26H2 (`test_s7_pe_gdk_runtime`, `test_loader_child_hook_parity`, `test_loader_vfs_config`, `Pizza House Simulator` + `House Flipper 2`)"
-                if has_sprint7_w1
-                else "Win10 & Win11 26H2 (`test_loader_child_hook_parity`, `test_loader_vfs_config`, `Pizza House Simulator` + `House Flipper 2`)"
-            ),
+            verified_on="`spirv-val` + `dxc` SM 6.5 + 6 GPUs + WARP (`test_rdna2_lockstep_isa`, `test_rdna2_corpus_parity`, `test_rdna2_lifter_live`, `test_d3d12_xs_autolift`)",
         ),
         Component(
             short_name="DirectX 12 & Vulkan 1.4 Graphics",
-            plain_summary="Xbox D3D12 proxy, D3D12-to-Vulkan routing, HDR10 & Mesh Shaders",
-            tech_name="`d3d12_xs` Proxy, Direct Vulkan 1.4 Routing, HDR10 `PresentX` & `xg_xs`",
+            plain_summary=(
+                "Full COM proxies, Vulkan routing, HDR10, Mesh Shaders & GPU untiling"
+                if (has_proxies and has_gpu_untile)
+                else "3/13 COM proxies & early Vulkan live; full proxies, MT & GPU untile next"
+            ),
+            tech_name="`d3d12_xs` Proxy, Vulkan 1.4 Routing, HDR10 `PresentX` & `xg_xs`",
             area="Graphics",
-            stage="Live-GPU Verified" if has_d3d_proxy else "Planned",
-            pill_label="6 GPUs Verified",
-            pct=100 if has_d3d_proxy else 0,
+            stage="Live Verified" if gfx_pct >= 85 else "Partial",
+            pill_label="6 GPUs Verified" if gfx_pct >= 85 else "Partial (6 GPUs)",
+            pct=gfx_pct,
             what_works=(
-                "Direct `d3d12_xs`→Vulkan 1.4 command-list routing (`--backend=vulkan`), Wave32-on-Wave64 compute, staged BC copies, `OPENSCARLETT_VK_DEVICE` selection, mixed-heap slot separation, `R9G9B9E5`→`RGBA16F` UAV fallback, `KickoffX`/`Wait32/64BitValueX`/`RSSetDepthBiasX`, HDR10/scRGB `PresentX`, full GFX10 `xg_xs` + `HTILE`/`DCC`/`CMASK` & `XGEncodeDCC` fuzz check"
-                if has_sprint7_w1
-                else "`DeviceX` auto-lift, `R9G9B9E5`→`RGBA16F` UAV fallback, `CommandListX`/`QueueX` extensions, zero-SDK Vulkan 1.4 graphics + `VK_EXT_mesh_shader` + sparse/reserved resources, HDR10/scRGB `PresentX`, full GFX10 `xg_xs` + `HTILE`/`DCC`/`CMASK`"
+                "Direct `d3d12_xs`->Vulkan 1.4 routing (`--backend=vulkan`), `VK_EXT_mesh_shader`, sparse/`GetResourceTiling`, HDR10/scRGB `PresentX`, NVIDIA `R9G9B9E5`->`RGBA16F` UAV fallback, `KickoffX`/`Wait32/64BitValueX`/`RSSetDepthBiasX`, `xg_xs` 15 2D + 6 3D + `HTILE`/`DCC`/`CMASK`. Remaining: 10+ full COM object proxies, multi-queue MT recording & GPU compute untiling."
             ),
-            verified_on=(
-                "6 GPUs (GTX 1650 Ti, RTX 2060 SUPER/3080 Ti, AMD RX 7600/7900 XTX/9070 XT) + WARP (`test_d3d12_vk_routing`, `test_gpu_d3d12x_vk_parity`, `test_vulkan_graphics_live`, `test_vulkan_mesh_showcase`, `test_hdr10_d3d12`)"
-                if has_sprint7_w1
-                else "6 GPUs (GTX 1650 Ti, RTX 2060 SUPER/3080 Ti, AMD RX 7600/7900 XTX/9070 XT) + WARP (`test_d3d12_xs_live`, `test_gpu_d3d12x_vk_parity`, `test_vulkan_graphics_live`, `test_hdr10_d3d12`)"
-            ),
+            verified_on="6 GPUs (GTX 1650 Ti, RTX 2060 SUPER/3080 Ti, AMD RX 7600/7900 XTX/9070 XT) + WARP (`test_d3d12_vk_routing`, `test_gpu_d3d12x_vk_parity`, `test_vulkan_graphics_live`, `test_vulkan_mesh_showcase`, `test_hdr10_d3d12`)",
         ),
         Component(
-            short_name="Xbox RDNA2 Shader Translator",
-            plain_summary="Translates console GPU shaders to PC DXIL & SPIR-V with disk cache",
-            tech_name="RDNA2/GFX10.3 Shader Lifter, Lockstep LDS Barriers, `PSV0` & DXIL Re-Signing",
-            area="Shaders",
-            stage="Live-GPU Verified" if has_lifter else "In Progress",
-            pill_label="6 GPUs Verified",
-            pct=100 if has_lifter else 45,
-            what_works=(
-                "RDNA2/GFX10.3 disasm/IR/lifter (single-wave lockstep LDS barriers, `s_icache_inv`/`s_ttracedata`/`s_code_end`/`s_version` no-ops, clamped shifts, `v_cmpx`, split `f16`, MTBUF `d16`, NaN/denorm, `PSV0` wave bounds, Wave32-on-64 isolation, mesh `merged_wave_info`/`CullPrimitiveEXT`, FSSM/vfetch, DXIL MD5 re-signing), CPU interpreter, content-hashed disk cache"
-                if has_sprint7_w1
-                else "RDNA2/GFX10.3 disasm/IR/lifter (clamped shifts, `v_cmpx`, split `f16`, MTBUF `d16`, NaN/denorm, `PSV0` wave bounds, Wave32-on-64 isolation, mesh contracts, FSSM/vfetch, DXIL MD5 re-signing), CPU interpreter, disk cache + auto-lift"
+            short_name="Unified Memory & Raw Descriptors",
+            plain_summary=(
+                "VirtualAlloc2 aliasing, Title-VA VRAM mirror & V#/T#/S# bindless bridge"
+                if (has_title_va and has_bindless)
+                else "VirtualAlloc2 & GpuTilePool live; Title-VA mirror & V#/T#/S# bridge next"
             ),
-            verified_on=(
-                "`spirv-val` + `dxc` SM 6.5 + 6 GPUs + WARP (`test_rdna2_lockstep_isa`, `test_rdna2_corpus_parity`, `test_rdna2_lifter_live`, `test_d3d12_xs_autolift`)"
-                if has_sprint7_w1
-                else "`spirv-val` + `dxc` SM 6.5 + 6 GPUs + WARP (`test_rdna2_corpus_parity`, `test_rdna2_lifter_live`, `test_d3d12_xs_autolift`)"
-            ),
-        ),
-        Component(
-            short_name="Unified Memory & Fast Storage",
-            plain_summary="64 KB / 4 MB memory aliasing, tile pools & DirectStorage decompression",
-            tech_name="Xbox Unified Memory (`kernelx` / `xmem`), `GpuTilePool` & `dstorage_xs`",
+            tech_name="Xbox Unified Memory (`kernelx`/`xmem`), `GpuTilePool` & Bindless Bridge",
             area="Memory & IO",
-            stage="Live-Binary Verified" if (has_kernelx and has_gdk_runner) else "Unit-Tested",
-            pill_label="Live Verified",
-            pct=100 if has_kernelx else 0,
+            stage="Live Verified" if mem_pct >= 85 else "Partial",
+            pill_label="Live Verified" if mem_pct >= 85 else "Partial",
+            pct=mem_pct,
             what_works=(
-                "Win10/11 `VirtualAlloc2`/`MapViewOfFile3` 64 KiB & 4 MiB aliasing, `GpuTilePool`, `XMemVirtualQuery` + ERA allocation attributes, placed GPU VA attach, `dstorage_xs` cancellation + bounds + direct physical-page decompression"
-                if has_sprint7_w1
-                else "Win10/11 `VirtualAlloc2`/`MapViewOfFile3` 64 KiB & 4 MiB aliasing, `GpuTilePool`, placed GPU VA attach, `dstorage_xs` cancellation + direct physical-page decompression"
+                "Win10/11 `VirtualAlloc2`/`MapViewOfFile3` 64 KiB & 4 MiB aliasing, `GpuTilePool`, `XMemVirtualQuery` + ERA attributes, `dstorage_xs` cancellation & physical-page decompression. Remaining: 64-bit Title-VA `MEM_WRITE_WATCH` VRAM mirror & raw RDNA2 `V#`/`T#`/`S#` root-SGPR descriptor bridge."
             ),
-            verified_on=(
-                "Win10 & Win11 26H2 (`test_kernelx`, `test_s7_pe_gdk_runtime`, `test_dstorage_audio_diag_parity`, `test_xg_dstorage`)"
-                if has_sprint7_w1
-                else "Win10 & Win11 26H2 (`test_kernelx`, `test_dstorage_audio_diag_parity`, `test_xg_dstorage`)"
+            verified_on="Win10 & Win11 26H2 (`test_kernelx`, `test_s7_pe_gdk_runtime`, `test_dstorage_audio_diag_parity`, `test_xg_dstorage`)",
+        ),
+        Component(
+            short_name="Xbox Live, GDK & OS Shims (30 DLLs)",
+            plain_summary=f"{high_dlls} high-coverage, {part_dlls} partial, {stub_dlls} stub DLLs — 292/292 shipping GDK thunks",
+            tech_name=f"GDK & Console Shims ({len(dlls)} DLLs: {high_dlls} High / {part_dlls} Partial / {stub_dlls} Stub)",
+            area="GDK Shims",
+            stage="Live Verified" if dll_pct >= 85 else "Partial",
+            pill_label=f"{high_dlls}/{len(dlls)} Full DLLs",
+            pct=dll_pct,
+            what_works=(
+                f"{len(dlls)} shimmed DLLs (`{sum(d.exports for d in dlls)}` PE exports): `xgameruntime` (**292/292** shipping `XGamingRuntimeThunks.dll` parity, 24 COM `QueryApiImpl` interfaces), `XCurl` (16/16), `XSAPI` (178), `GameInput`, `winrt_xs` ({winrt_exports} exports), plus 10 partial & 10 stub/diagnostic DLLs. Remaining: 7-core CPU affinity remap, WinRT `CoreWindow` lifecycle & offline XSTS auth."
             ),
+            verified_on="Live `Alexandria IV DEMO` shipping thunks (`0 E_NOINTERFACE`), Win10 & Win11 26H2 (`test_real_gdk_thunks_live`, `test_s7_pe_gdk_runtime`, `test_xgr_conformance_parity`)",
         ),
         Component(
             short_name="Audio, Video & Texture Codecs",
-            plain_summary="Opus, XMA2, 3D audio, Bink2, BCPack BC1-BC7, BVH4 & FSR 1.0",
-            tech_name="BCPack BC1–BC7, RDNA2 BVH4, Opus/XMA2/WASAPI, `X3DAudio` & GPU FSR 1.0",
+            plain_summary=(
+                "Opus, XMA2, 64+ voices, mfplat HW video, Bink2, BCPack & FSR 1.0"
+                if has_media
+                else "Opus/XMA2/BCPack/FSR live; mfplat H.264/HEVC video & GameInput rings next"
+            ),
+            tech_name="BCPack BC1–BC7, RDNA2 BVH4, Opus/XMA2/WASAPI, `mfplat` Video & GPU FSR 1.0",
             area="Media",
-            stage="Live-GPU Verified" if has_fsr else "Unit-Tested",
-            pill_label="6 GPUs Verified",
-            pct=100 if has_fsr else 80,
+            stage="Live Verified" if media_pct >= 85 else "Partial",
+            pill_label="Live Verified" if media_pct >= 85 else "Partial (6 GPUs)",
+            pct=media_pct,
             what_works=(
-                "GDeflate v1, BCPack BC1–BC7 (ring-window/selector-table/NPOT/multi-mip), RDNA2 BVH4 decoder + SAH BVH2→BVH4, XMA2 IMDCT, `MSOpusDecoder` Opus (`0x704F`), IMA-ADPCM, WASAPI (all MMDevice formats), `X3DAudio`/`XAudio2FX`, Bink2, live GPU FSR 1.0"
+                "GDeflate v1, BCPack BC1–BC7, RDNA2 BVH4 decoder + SAH BVH, XMA2 IMDCT, `MSOpusDecoder` Opus (`0x704F`), IMA-ADPCM, WASAPI, `X3DAudio`/`XAudio2FX`, Bink2 `KB2i`, live GPU FSR 1.0 (`0 LSB` on AMD RDNA3/4). Remaining: `mfplat` H.264/HEVC D3D12 video decode, 64+ voice clock sync & full `GameInput` hot-plug rings."
             ),
-            verified_on="6 PCs (GTX 1650 Ti, RTX 2060 SUPER/3080 Ti, AMD RX 7600/7900 XTX/9070 XT) + WARP (`test_codecs`, `test_bcpack_bvh4`, `test_audio_opus_wasapi`, `test_d3d12_xs_live`)",
+            verified_on="6 PCs (NVIDIA + AMD) + WARP (`test_codecs`, `test_bcpack_bvh4`, `test_audio_opus_wasapi`, `test_d3d12_xs_live`)",
         ),
         Component(
-            short_name="Xbox Live, GDK & Input Services",
-            plain_summary=f"{dll_count} shimmed DLLs, 292/292 GDK thunks, saves, Raw Input & WinRT",
-            tech_name=f"GDK & Console Shims ({dll_count} DLLs, 292/292 Thunks, WinRT {winrt_exports} Exports & Raw Input)",
-            area="GDK Shims",
-            stage="Live-Binary Verified" if has_gdk_runner else "Unit-Tested",
+            short_name="PE Loader, CoW VFS & Child Hooks",
+            plain_summary=(
+                "Package loader, nested CoW VFS, child hooks, First-Boot probe & VEH"
+                if has_probe_veh
+                else "Package loader, CoW VFS & child hooks live; First-Boot probe & VEH next"
+            ),
+            tech_name=f"PE32+ Loader, Nested CoW VFS, {len(dlls)}-DLL Routing & Child-Hook Propagation",
+            area="Loader",
+            stage="Live Verified",
             pill_label="Live Verified",
-            pct=100 if has_xgr else 0,
+            pct=loader_pct,
             what_works=(
-                f"{dll_count} shimmed DLLs: `xgameruntime` (**292/292** shipping `XGamingRuntimeThunks.dll` parity, 24 COM `QueryApiImpl` interfaces, `XGameStreaming`/`XSystem`/headless `XStore`), `XCurl` (16/16), `XSAPI` (178), `GameInput` (XInput + Raw Input mouse), `winrt_xs` ({winrt_exports} exports), `mfplat_xs`, `advapi32legacy`, `KernelTraceControl`, `hix_xs`, `xbtp`, `mflnmhelp`, `mfhevcdec`, `gamecoreclient`, `minuserx`, `xtfpix`, `xtfdebugmonitor`"
-                if has_sprint7_w1
-                else f"24 shimmed DLLs: `xgameruntime` (**292/292** shipping `XGamingRuntimeThunks.dll` parity, 24 COM `QueryApiImpl` interfaces, headless `XStore`/PLS), `XCurl` (16/16), `XSAPI` (178), `GameInput`, `winrt_xs` ({winrt_exports} exports), `mfplat_xs`, `advapi32legacy`, `KernelTraceControl`, `hix_xs`, `xbtp`"
+                f"`MicrosoftGame.Config` XML loader, nested `G:` CoW overlay VFS, `System32`-first `KnownDLL` resolution, RVA-0 reloc & `.xdata` v2/v3 unwind checks, Kahn topo init, {len(dlls)}-DLL routing, `CreateProcessW/A` child-process APC hook propagation. Next: unknown-import First-Boot Probe mode & VEH crash/call-ring dumper."
             ),
-            verified_on=(
-                "Live commercial `Alexandria IV DEMO` shipping thunks (`0 E_NOINTERFACE`), Win10 & Win11 26H2 (`test_real_gdk_thunks_live`, `test_s7_pe_gdk_runtime`, `test_xgr_conformance_parity`, `test_winrt_xs`)"
-                if has_sprint7_w1
-                else "Live commercial `Alexandria IV DEMO` shipping thunks (`0 E_NOINTERFACE`), Win10 & Win11 26H2 (`test_real_gdk_thunks_live`, `test_xgr_conformance_parity`, `test_winrt_xs`)"
-            ),
+            verified_on="Win10 & Win11 26H2 (`test_s7_pe_gdk_runtime`, `test_loader_child_hook_parity`, `test_loader_vfs_config`, `Pizza House Simulator` + `House Flipper 2`)",
         ),
         Component(
-            short_name="Playable Demos & 3D GDK Workloads",
-            plain_summary="Freedoom 60 FPS, ScarlettArena, shadowed 3D scene, DXR 1.1 & Meshlets",
-            tech_name="Playable Demos, Dual-API 3D GDK Scene & Hardware DXR Tier 1.1",
-            area="Workloads",
-            stage="Live-GPU Verified" if has_dxr else "Planned",
-            pill_label="6 GPUs Verified",
-            pct=100 if has_dxr else 0,
-            what_works=(
-                "Live 60 FPS **Freedoom: Phase 1** & `ScarlettArena`, 3D shadowed/skinned BC1+BC3 GDK scene over BOTH D3D12 & Vulkan 1.4 (`test_gdk_3d_scene_dual_api`), `ID3D12Device5` DXR 1.1, `SimplePBR`, `MeshletCull`, `SimpleLighting`, `HDRCubeMap`, `VulkanMeshShowcase` (`not_impl=0`)"
-                if has_sprint7_w1
-                else "Live 60 FPS **Freedoom: Phase 1** & `ScarlettArena`, `ID3D12Device5` DXR 1.1, `SimplePBR`, `MeshletCull`, `SimpleLighting`, `HDRCubeMap`, `VulkanMeshShowcase` (`not_impl=0`)"
-            ),
-            verified_on=(
-                "GTX 1650 Ti (HW + WARP, D3D12 + Vulkan 1.4), RTX 2060 SUPER/3080 Ti (`DXR=12`), AMD RX 7600/7900 XTX/9070 XT (`DXR=11`) (`test_scarlett_game_live`, `test_gdk_3d_scene_dual_api`, `test_dxr_live`, `test_vulkan_mesh_showcase`)"
-                if has_sprint7_w1
-                else "GTX 1650 Ti (HW + WARP), RTX 2060 SUPER/3080 Ti (`DXR=12`), AMD RX 7600/7900 XTX/9070 XT (`DXR=11`) (`test_scarlett_game_live`, `test_dxr_live`, `test_vulkan_mesh_showcase`)"
-            ),
-        ),
-        Component(
-            short_name="Windows Launcher GUI & Updater",
-            plain_summary="All-in-one app launcher, built-in 60s hardware tester & SHA-256 updater",
+            short_name="Windows Launcher GUI & 60s Tester",
+            plain_summary="Native Win32/D2D app launcher, integrated 60s HW tester & BCrypt SHA-256 updater",
             tech_name="Native Win32/Direct2D `OpenScarlettLauncher.exe` + Opt-In SHA-256 Updater",
             area="UX & Tools",
-            stage="Live-Binary Verified" if has_launcher else "In Progress",
+            stage="Live Verified" if has_launcher else "In Progress",
             pill_label="Live Verified" if has_launcher else "In Progress",
-            pct=100 if has_launcher else 40,
+            pct=launcher_pct,
             what_works=(
-                "Native Win32/Direct2D launcher with GPU telemetry strip, Play & Launch tab, integrated 60s Hardware Self-Test, PE32+ Binary Inspector, and opt-in WinHTTP + BCrypt SHA-256 verified GitHub updater"
-                if has_launcher
-                else "Wave 2 in progress: native Win32/Direct2D GUI shell, integrated 60s Hardware Self-Test runner, PE32+ inspector, and opt-in WinHTTP + BCrypt SHA-256 verified updater (CLI & `run_hardware_test.ps1` live today)"
+                "Native Win32/Direct2D launcher with GPU telemetry strip, Play & Launch tab, integrated 60s Hardware Self-Test, PE32+ Binary Inspector, and opt-in WinHTTP + BCrypt SHA-256 verified GitHub updater (First-Boot Probe UI next)."
             ),
-            verified_on=(
-                "Win10 & Win11 x64 (`test_launcher_updater`)"
-                if has_launcher
-                else "Wave 2 active (`run_hardware_test.ps1` verified on 6 PCs)"
+            verified_on="Win10 & Win11 26H2 (`test_launcher_updater` + AMD RX 9070 XT live report #14)",
+        ),
+        Component(
+            short_name="Real-World Game Compatibility",
+            plain_summary="Freedoom 60 FPS, 3D GDK scene & samples work — retail games: 0 so far",
+            tech_name="Real-World Title Compatibility (Playable Demos, GDK Samples & Commercial Bring-Up)",
+            area="Compatibility",
+            stage="Early Alpha",
+            pill_label="Early Alpha",
+            pct=compat_pct,
+            what_works=(
+                "Live 60 FPS **Freedoom: Phase 1**, `ScarlettArena`, shadowed/skinned BC1+BC3 3D dual-API GDK scene (`gdk_3d_scene`), official MIT `Xbox-GDK-Samples`, and commercial shipping GDK thunks (`Alexandria IV DEMO`). **Commercial retail Xbox Series games are not playable yet** — join Discord to help test real unpacked GDKs!"
             ),
+            verified_on="GTX 1650 Ti + WARP + 5 community NVIDIA/AMD PCs (`test_scarlett_game_live`, `test_gdk_3d_scene_dual_api`, `test_dxr_live`)",
         ),
     ]
-    return comps, dll_count
 
 
 STAGE_COLOR = {
-    "Live-GPU Verified": "#2ea043",
-    "Live-Binary Verified": "#2ea043",
-    "Unit-Tested": "#8957e5",
-    "In Progress": "#d29922",
+    "Live Verified": "#2ea043",
+    "Partial": "#d29922",
+    "In Progress": "#e11d48",
+    "Early Alpha": "#8957e5",
     "Planned": "#484f58",
 }
 
 STAGE_BADGE = {
-    "Live-GPU Verified": "🟢 Live-GPU Verified",
-    "Live-Binary Verified": "🟢 Live-Binary Verified",
-    "Unit-Tested": "🟣 Unit-Tested",
-    "In Progress": "🟡 In Progress",
+    "Live Verified": "🟢 Live Verified",
+    "Partial": "🟡 Partial",
+    "In Progress": "🔴 In Progress",
+    "Early Alpha": "🟣 Early Alpha",
     "Planned": "⚪ Planned",
 }
 
 
-def render_svg(
+def bar_color(pct: int, stage: str) -> str:
+    if stage == "Early Alpha":
+        return "#8957e5"
+    if pct >= 80:
+        return "#2ea043"
+    if pct >= 40:
+        return "#d29922"
+    return "#e11d48"
+
+
+def render_status_svg(
     components: list[Component],
     ctest: tuple[int, int] | None,
-    dll_count: int,
-    metrics: dict[str, int | str],
+    dlls: list[DllInfo],
+    opcodes_decoded: int,
+    opcodes_total: int,
 ) -> str:
     test_str = f"{ctest[0]}/{ctest[1]} tests passing" if ctest else "tests not run"
-    op_str = f"{metrics['opcodes_decoded']}/{metrics['opcodes_total']} RDNA2 opcodes"
-    exp_str = f"{dll_count} DLLs ({metrics['dll_exports']} exports)"
+    tot_exp = sum(d.exports for d in dlls)
     W = 900
     ROW_H = 52
     TOP_H = 104
     H = TOP_H + len(components) * ROW_H + 22
 
     lines = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" role="img" aria-label="OpenScarlett Core Subsystems ({html.escape(test_str)})">',
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" role="img" aria-label="OpenScarlett Honest Subsystem Progress ({html.escape(test_str)})">',
         "  <defs>",
         '    <linearGradient id="accentBar" x1="0%" y1="0%" x2="100%" y2="0%">',
         '      <stop offset="0%" stop-color="#e11d48"/>',
         '      <stop offset="100%" stop-color="#fb7185"/>',
         "    </linearGradient>",
-        '    <clipPath id="cardClip"><rect width="900" height="' + str(H) + '" rx="12"/></clipPath>',
+        f'    <clipPath id="cardClip"><rect width="{W}" height="{H}" rx="12"/></clipPath>',
         "  </defs>",
         "  <style>",
         "    text { font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif; }",
         "    .h1 { font-size: 19px; font-weight: 700; fill: #f0f6fc; }",
         "    .sub { font-size: 12px; fill: #8b949e; }",
         "    .name { font-size: 13.5px; fill: #e6edf3; font-weight: 600; }",
-        "    .desc { font-size: 11.5px; fill: #8b949e; }",
+        "    .desc { font-size: 11.2px; fill: #8b949e; }",
         "    .pill { font-size: 11px; fill: #ffffff; font-weight: 600; }",
         "    .pct { font-size: 12px; fill: #c9d1d9; font-weight: 600; }",
         "  </style>",
         '  <g clip-path="url(#cardClip)">',
         f'    <rect width="{W}" height="{H}" fill="#0d1117"/>',
         f'    <rect x="0" y="0" width="{W}" height="3" fill="url(#accentBar)"/>',
-        '    <text class="h1" x="28" y="40">OpenScarlett — Core Subsystems</text>',
-        f'    <text class="sub" x="28" y="62">Windows 10/11 x64 · MIT · {html.escape(test_str)} · {html.escape(exp_str)} · {html.escape(op_str)} · 6 PCs</text>',
+        '    <text class="h1" x="28" y="40">OpenScarlett — Honest Subsystem Progress (Early Alpha)</text>',
+        f'    <text class="sub" x="28" y="62">Windows 10/11 x64 · MIT · {html.escape(test_str)} · {len(dlls)} DLLs ({tot_exp} exports) · {opcodes_decoded}/{opcodes_total} RDNA2 ops · 6 PCs</text>',
         '    <line x1="28" y1="82" x2="872" y2="82" stroke="#21262d" stroke-width="1"/>',
     ]
 
     y = TOP_H + 14
     for idx, c in enumerate(components):
-        col = STAGE_COLOR.get(c.stage, "#484f58")
+        col = bar_color(c.pct, c.stage)
         bar_x = 648
         bar_w = 176
-        fill_w = int(round(bar_w * (c.pct / 100.0)))
+        fill_w = max(4, int(round(bar_w * (c.pct / 100.0)))) if c.pct > 0 else 0
 
         lines.append(f'    <text class="name" x="28" y="{y}">{html.escape(c.short_name)}</text>')
         lines.append(f'    <text class="desc" x="28" y="{y + 17}">{html.escape(c.plain_summary)}</text>')
-
-        # Clean non-overlapping status pill (x=488..626)
-        lines.append(f'    <rect x="488" y="{y - 6}" width="138" height="22" rx="11" fill="{col}"/>')
-        lines.append(f'    <text class="pill" x="557" y="{y + 9}" text-anchor="middle">{html.escape(c.pill_label)}</text>')
-
-        # Progress bar (x=648..824) + pct (x=872)
+        lines.append(f'    <rect x="498" y="{y - 6}" width="132" height="22" rx="11" fill="{col}"/>')
+        lines.append(f'    <text class="pill" x="564" y="{y + 9}" text-anchor="middle">{html.escape(c.pill_label)}</text>')
         lines.append(f'    <rect x="{bar_x}" y="{y}" width="{bar_w}" height="10" rx="5" fill="#21262d"/>')
         if fill_w > 0:
             lines.append(f'    <rect x="{bar_x}" y="{y}" width="{fill_w}" height="10" rx="5" fill="{col}"/>')
         lines.append(f'    <text class="pct" x="872" y="{y + 9}" text-anchor="end">{c.pct}%</text>')
-
         if idx < len(components) - 1:
             lines.append(f'    <line x1="28" y1="{y + 30}" x2="872" y2="{y + 30}" stroke="#161b22" stroke-width="1"/>')
         y += ROW_H
@@ -391,23 +481,154 @@ def render_svg(
     return "\n".join(lines) + "\n"
 
 
+def render_matrix_svg(
+    families: list[dict[str, int | str]],
+    opcodes_decoded: int,
+    opcodes_total: int,
+    trans_items: list[TranslationItem],
+    dlls: list[DllInfo],
+) -> str:
+    W = 900
+    # Panel heights:
+    # Header: 76
+    # Panel A (RDNA2 8 families in 2 cols x 4 rows): 168
+    # Panel B (D3D12/Vulkan 12 items in 3 cols x 4 rows): 178
+    # Panel C (30 DLLs in 5 cols x 6 rows): 276
+    H = 716
+
+    rdna_pct = int(round(100.0 * opcodes_decoded / max(1, opcodes_total)))
+    live_t = sum(1 for t in trans_items if t.status == "live")
+    part_t = sum(1 for t in trans_items if t.status == "partial")
+    high_d = sum(1 for d in dlls if d.tier == "high")
+    part_d = sum(1 for d in dlls if d.tier == "partial")
+    stub_d = sum(1 for d in dlls if d.tier == "stub")
+
+    lines = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}" role="img" aria-label="OpenScarlett RDNA2, D3D12/Vulkan and 30-DLL Coverage Matrix">',
+        "  <defs>",
+        '    <linearGradient id="mAccent" x1="0%" y1="0%" x2="100%" y2="0%">',
+        '      <stop offset="0%" stop-color="#e11d48"/>',
+        '      <stop offset="100%" stop-color="#fb7185"/>',
+        "    </linearGradient>",
+        f'    <clipPath id="mClip"><rect width="{W}" height="{H}" rx="12"/></clipPath>',
+        "  </defs>",
+        "  <style>",
+        "    text { font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif; }",
+        "    .h1 { font-size: 18px; font-weight: 700; fill: #f0f6fc; }",
+        "    .h2 { font-size: 13px; font-weight: 700; fill: #e6edf3; }",
+        "    .sub { font-size: 11.5px; fill: #8b949e; }",
+        "    .lbl { font-size: 11px; fill: #c9d1d9; font-weight: 500; }",
+        "    .mono { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 10.5px; fill: #e6edf3; font-weight: 600; }",
+        "    .tiny { font-size: 10px; fill: #8b949e; }",
+        "  </style>",
+        '  <g clip-path="url(#mClip)">',
+        f'    <rect width="{W}" height="{H}" fill="#0d1117"/>',
+        f'    <rect x="0" y="0" width="{W}" height="3" fill="url(#mAccent)"/>',
+        '    <text class="h1" x="26" y="36">Coverage Visualizer — RDNA2 Shaders, D3D12 / Vulkan &amp; All 30 DLLs</text>',
+        '    <text class="sub" x="26" y="56">Honest breakdown of what works vs what is still behind · Green = Live / High · Amber = Partial · Red / Grey = Behind or Stub</text>',
+        '    <line x1="26" y1="70" x2="874" y2="70" stroke="#21262d" stroke-width="1"/>',
+    ]
+
+    # ---- Panel A: RDNA2 Families ----
+    lines.append(f'    <text class="h2" x="26" y="94">1. RDNA2 / GFX10.3 Shader Instruction Coverage ({opcodes_decoded} / {opcodes_total} decoded · {rdna_pct}%)</text>')
+    for idx, fam in enumerate(families[:8]):
+        col_i = idx % 2
+        row_i = idx // 2
+        bx = 26 + col_i * 432
+        by = 114 + row_i * 32
+        done = int(fam["done"])
+        tot = max(1, int(fam["total"]))
+        pct = min(100, int(round(100.0 * done / tot)))
+        c = "#2ea043" if pct >= 80 else ("#d29922" if pct >= 25 else "#e11d48")
+        bar_x = bx + 198
+        bar_w = 156
+        fw = max(3, int(round(bar_w * pct / 100.0))) if done > 0 else 0
+        lines.append(f'    <text class="lbl" x="{bx}" y="{by + 9}">{html.escape(str(fam["name"]))}</text>')
+        lines.append(f'    <rect x="{bar_x}" y="{by + 1}" width="{bar_w}" height="9" rx="4.5" fill="#21262d"/>')
+        if fw > 0:
+            lines.append(f'    <rect x="{bar_x}" y="{by + 1}" width="{fw}" height="9" rx="4.5" fill="{c}"/>')
+        lines.append(f'    <text class="mono" x="{bx + 414}" y="{by + 9}" text-anchor="end">{done}/{tot}</text>')
+
+    lines.append('    <line x1="26" y1="248" x2="874" y2="248" stroke="#21262d" stroke-width="1"/>')
+
+    # ---- Panel B: D3D12.X / Vulkan Translation Items (3 cols x 4 rows) ----
+    lines.append(
+        f'    <text class="h2" x="26" y="272">2. DirectX 12 (d3d12_xs) &amp; Vulkan 1.4 Translation Items ({live_t} live · {part_t} partial · {len(trans_items) - live_t - part_t} pending)</text>'
+    )
+    status_style = {
+        "live": ("#2ea043", "LIVE", "#12261e"),
+        "partial": ("#d29922", "PARTIAL", "#261e10"),
+        "pending": ("#6e7681", "PENDING", "#161b22"),
+    }
+    for idx, t in enumerate(trans_items[:12]):
+        col_i = idx % 3
+        row_i = idx // 3
+        tx = 26 + col_i * 286
+        ty = 286 + row_i * 34
+        scol, slbl, bg = status_style[t.status]
+        lines.append(f'    <rect x="{tx}" y="{ty}" width="274" height="26" rx="6" fill="{bg}" stroke="#30363d" stroke-width="1"/>')
+        lines.append(f'    <circle cx="{tx + 12}" cy="{ty + 13}" r="4" fill="{scol}"/>')
+        lines.append(f'    <text class="lbl" x="{tx + 22}" y="{ty + 17}">{html.escape(t.name)}</text>')
+        lines.append(f'    <text class="tiny" x="{tx + 266}" y="{ty + 16.5}" text-anchor="end" fill="{scol}" font-weight="700">{slbl}</text>')
+
+    lines.append('    <line x1="26" y1="430" x2="874" y2="430" stroke="#21262d" stroke-width="1"/>')
+
+    # ---- Panel C: All 30 Shimmed DLLs (5 cols x 6 rows) ----
+    lines.append(
+        f'    <text class="h2" x="26" y="454">3. All {len(dlls)} Shimmed Xbox / GDK DLLs ({high_d} high coverage · {part_d} partial · {stub_d} stub / telemetry)</text>'
+    )
+    tier_style = {
+        "high": ("#2ea043", "#12261e"),
+        "partial": ("#d29922", "#261e10"),
+        "stub": ("#6e7681", "#161b22"),
+    }
+    short_aliases = {
+        "Microsoft.Xbox.Services.GDK.C.dll": "XSAPI.GDK.C",
+        "amd_fidelityfx_upscaler_xbox.dll": "ffx_upscaler",
+        "amd_fidelityfx_loader_xbox.dll": "ffx_loader",
+        "KernelTraceControl.dll": "KernelTrace",
+        "xtfdebugmonitor.dll": "xtfdebugmon",
+        "libHttpClient.GDK.dll": "libHttpClient",
+        "Bink2Scarlett.dll": "Bink2Scarlett",
+        "XboxBvhBuilder.dll": "XboxBvhBuild",
+        "gamecoreclient.dll": "gamecorecli",
+        "advapi32legacy.dll": "advapi32leg",
+    }
+    for idx, d in enumerate(dlls[:30]):
+        col_i = idx % 5
+        row_i = idx // 5
+        dx = 26 + col_i * 171
+        dy = 468 + row_i * 38
+        tcol, tbg = tier_style[d.tier]
+        disp = short_aliases.get(d.name, d.name.replace(".dll", ""))
+        lines.append(f'    <rect x="{dx}" y="{dy}" width="163" height="30" rx="6" fill="{tbg}" stroke="#30363d" stroke-width="1"/>')
+        lines.append(f'    <rect x="{dx}" y="{dy}" width="3.5" height="30" rx="2" fill="{tcol}"/>')
+        lines.append(f'    <text class="mono" x="{dx + 10}" y="{dy + 14}">{html.escape(disp)}</text>')
+        lines.append(f'    <text class="tiny" x="{dx + 10}" y="{dy + 25}">{d.exports} exports · {d.tier}</text>')
+
+    lines.append("  </g>")
+    lines.append(f'  <rect x="0.5" y="0.5" width="{W - 1}" height="{H - 1}" rx="12" fill="none" stroke="#30363d" stroke-width="1"/>')
+    lines.append("</svg>")
+    return "\n".join(lines) + "\n"
+
+
 def render_markdown(
     components: list[Component],
     ctest: tuple[int, int] | None,
-    dll_count: int,
-    metrics: dict[str, int | str],
+    dlls: list[DllInfo],
+    opcodes_decoded: int,
+    opcodes_total: int,
+    corpus_passed: int,
+    corpus_total: int,
 ) -> str:
     test_str = f"`{ctest[0]}/{ctest[1]}` passing" if ctest else "`not run`"
-    corpus_part = (
-        f" · **Validated Shader Corpus:** `{metrics['corpus_passed']}/{metrics['corpus_shaders']}`"
-        if metrics["corpus_shaders"]
-        else ""
-    )
+    tot_exp = sum(d.exports for d in dlls)
+    corpus_part = f" · **Validated Shader Corpus:** `{corpus_passed}/{corpus_total}`" if corpus_total else ""
     rows = [
         "<!-- OPENSCARLETT_STATUS_START -->",
-        f"**Automated Tests:** {test_str} · **Shimmed DLLs:** `{dll_count}` (`{metrics['dll_exports']}` PE exports) · **Shipping GDK Thunks:** `292/292` · **RDNA2 Opcodes Decoded:** `{metrics['opcodes_decoded']}/{metrics['opcodes_total']}`{corpus_part} · **Verified Hardware:** `6 PCs` (`NVIDIA` + `AMD`)",
+        f"**Automated Tests:** {test_str} · **Shimmed DLLs:** `{len(dlls)}` (`{tot_exp}` PE exports) · **Shipping GDK Thunks:** `292/292` · **RDNA2 Opcodes Decoded:** `{opcodes_decoded}/{opcodes_total}`{corpus_part} · **Verified Hardware:** `6 PCs` (`NVIDIA` + `AMD`)",
         "",
-        "| Subsystem | Area | Status | Progress | Technical Coverage | Verified On |",
+        "| Subsystem | Area | Status | Honest Progress | Technical Coverage | Verified On |",
         "| :--- | :--- | :--- | :---: | :--- | :--- |",
     ]
     for c in components:
@@ -416,7 +637,7 @@ def render_markdown(
         )
     rows += [
         "",
-        "_Auto-generated from live CTest results via `python tools/generate_status.py --build-dir build`._",
+        "_Auto-generated from live codebase & CTest results via `python tools/generate_status.py --build-dir build`._",
         "<!-- OPENSCARLETT_STATUS_END -->",
     ]
     return "\n".join(rows)
@@ -425,11 +646,16 @@ def render_markdown(
 def render_dashboard_html(
     components: list[Component],
     ctest: tuple[int, int] | None,
-    dll_count: int,
-    metrics: dict[str, int | str],
+    dlls: list[DllInfo],
+    families: list[dict[str, int | str]],
+    trans_items: list[TranslationItem],
+    opcodes_decoded: int,
+    opcodes_total: int,
 ) -> str:
     test_label = f"{ctest[0]}/{ctest[1]}" if ctest else "N/A"
-    op_label = f"{metrics['opcodes_decoded']}/{metrics['opcodes_total']}"
+    tot_exp = sum(d.exports for d in dlls)
+    op_label = f"{opcodes_decoded}/{opcodes_total}"
+
     subsystems_json = json.dumps(
         [
             {
@@ -438,14 +664,16 @@ def render_dashboard_html(
                 "area": c.area,
                 "stage": c.pill_label,
                 "pct": c.pct,
-                "color": STAGE_COLOR.get(c.stage, "#484f58"),
+                "color": bar_color(c.pct, c.stage),
                 "tech": re.sub(r"`|\*\*", "", c.what_works),
                 "verified": re.sub(r"`|\*\*", "", c.verified_on),
             }
             for c in components
         ]
     )
-
+    families_json = json.dumps(families)
+    trans_json = json.dumps([{"name": t.name, "status": t.status, "detail": t.detail} for t in trans_items])
+    dlls_json = json.dumps([{"name": d.name, "tier": d.tier, "exports": d.exports, "note": d.note} for d in dlls])
     hardware_json = json.dumps(
         [
             {"tier": "NVIDIA Turing", "status": "verified", "detail": "GTX 1650 Ti (Win10 22H2) · RTX 2060 SUPER (Win11 26H2, DXR=12)"},
@@ -464,7 +692,7 @@ def render_dashboard_html(
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>OpenScarlett — Live Status Dashboard</title>
+  <title>OpenScarlett — Live Progress &amp; DLL / RDNA2 Visualizer</title>
   <link rel="icon" type="image/png" href="icon.png" />
   <style>
     :root {{
@@ -475,18 +703,17 @@ def render_dashboard_html(
       --muted: #8b949e;
       --scarlet: #e11d48;
       --scarlet-soft: #fb7185;
+      --discord: #5865f2;
       --green: #2ea043;
       --amber: #d29922;
+      --grey: #6e7681;
     }}
     * {{ box-sizing: border-box; }}
     body {{
-      margin: 0;
-      background: var(--bg);
-      color: var(--text);
-      font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif;
-      line-height: 1.5;
+      margin: 0; background: var(--bg); color: var(--text);
+      font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif; line-height: 1.5;
     }}
-    .wrap {{ max-width: 980px; margin: 0 auto; padding: 24px 18px 56px; }}
+    .wrap {{ max-width: 1020px; margin: 0 auto; padding: 24px 18px 56px; }}
     .banner {{ width: 100%; max-width: 780px; display: block; margin: 0 auto 14px; border-radius: 12px; }}
     .nav {{ display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; margin-bottom: 24px; }}
     .btn {{
@@ -495,9 +722,10 @@ def render_dashboard_html(
       color: var(--text); background: var(--card);
     }}
     .btn.primary {{ background: var(--scarlet); border-color: var(--scarlet); color: #fff; }}
-    .kpis {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 24px; }}
+    .btn.discord {{ background: var(--discord); border-color: var(--discord); color: #fff; }}
+    .kpis {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(175px, 1fr)); gap: 12px; margin-bottom: 24px; }}
     .kpi {{ background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; text-align: center; }}
-    .kpi .val {{ font-size: 26px; font-weight: 700; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; color: var(--scarlet-soft); }}
+    .kpi .val {{ font-size: 24px; font-weight: 700; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; color: var(--scarlet-soft); }}
     .kpi .lbl {{ font-size: 12px; color: var(--muted); margin-top: 2px; }}
     .section {{ background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 18px; margin-bottom: 20px; }}
     .sec-head {{ display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 14px; }}
@@ -508,25 +736,30 @@ def render_dashboard_html(
       border-radius: 8px; padding: 6px 10px; font-size: 13px; outline: none;
     }}
     input:focus, select:focus {{ border-color: var(--scarlet); }}
-    .row {{ border-top: 1px solid #21262d; padding: 12px 0; }}
+    .row {{ border-top: 1px solid #21262d; padding: 11px 0; }}
     .row:first-child {{ border-top: 0; padding-top: 0; }}
     .row-top {{ display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; }}
     .row-title {{ font-weight: 600; font-size: 14px; }}
     .pill {{ display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 11px; font-weight: 600; color: #fff; }}
-    .plain {{ font-size: 12.5px; color: var(--muted); margin: 3px 0 8px; }}
+    .plain {{ font-size: 12.5px; color: var(--muted); margin: 3px 0 7px; }}
     .bar-wrap {{ display: flex; align-items: center; gap: 10px; }}
     .track {{ flex: 1; height: 8px; background: #21262d; border-radius: 999px; overflow: hidden; }}
     .fill {{ height: 100%; border-radius: 999px; }}
-    .pct {{ font-size: 12px; font-family: ui-monospace, Consolas, monospace; width: 38px; text-align: right; color: var(--muted); }}
-    details.tech {{ margin-top: 8px; font-size: 12px; color: var(--muted); }}
+    .pct {{ font-size: 12px; font-family: ui-monospace, Consolas, monospace; width: 46px; text-align: right; color: var(--muted); }}
+    details.tech {{ margin-top: 6px; font-size: 12px; color: var(--muted); }}
     details.tech summary {{ cursor: pointer; color: var(--scarlet-soft); }}
-    .hw-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; }}
-    .hw-card {{ background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 12px; }}
+    .grid2 {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }}
+    .grid3 {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }}
+    .tile {{ background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 11px 12px; }}
+    .tile.high, .tile.live {{ border-left: 3px solid var(--green); }}
+    .tile.partial {{ border-left: 3px solid var(--amber); }}
+    .tile.stub, .tile.pending {{ border-left: 3px solid var(--grey); }}
+    .tile-head {{ display: flex; justify-content: space-between; align-items: center; gap: 6px; font-weight: 600; font-size: 13px; }}
+    .mono {{ font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }}
+    .tag-live, .tag-high {{ color: var(--green); font-size: 11px; font-weight: 700; text-transform: uppercase; }}
+    .tag-partial {{ color: var(--amber); font-size: 11px; font-weight: 700; text-transform: uppercase; }}
+    .tag-stub, .tag-pending {{ color: var(--muted); font-size: 11px; font-weight: 700; text-transform: uppercase; }}
     .hw-card.needed {{ border-color: rgba(210, 153, 34, 0.55); }}
-    .hw-tier {{ font-weight: 600; font-size: 13.5px; display: flex; justify-content: space-between; align-items: center; }}
-    .hw-detail {{ font-size: 12px; color: var(--muted); margin-top: 4px; }}
-    .tag-ok {{ color: var(--green); font-size: 11px; font-weight: 600; }}
-    .tag-need {{ color: var(--amber); font-size: 11px; font-weight: 600; }}
     footer {{ text-align: center; font-size: 12px; color: var(--muted); margin-top: 24px; }}
     footer a {{ color: var(--scarlet-soft); text-decoration: none; }}
   </style>
@@ -536,35 +769,24 @@ def render_dashboard_html(
     <img class="banner" src="banner.png" alt="OpenScarlett" />
     <div class="nav">
       <a class="btn primary" href="https://github.com/californiaAlmonds/OpenScarlett/releases/latest">Download Latest Win64 Build</a>
-      <a class="btn" href="https://github.com/californiaAlmonds/OpenScarlett">GitHub Repository</a>
-      <a class="btn" href="https://github.com/californiaAlmonds/OpenScarlett/actions">Windows CI</a>
-      <a class="btn" href="https://github.com/californiaAlmonds/OpenScarlett/issues">Submit Hardware Report</a>
+      <a class="btn discord" href="{DISCORD_URL}">Join Discord — Test Real GDKs</a>
+      <a class="btn" href="https://github.com/californiaAlmonds/OpenScarlett">GitHub Repo</a>
+      <a class="btn" href="https://github.com/californiaAlmonds/OpenScarlett/issues">Hardware Reports</a>
     </div>
 
     <div class="kpis">
       <div class="kpi"><div class="val">{html.escape(test_label)}</div><div class="lbl">Automated CTest Passing</div></div>
-      <div class="kpi"><div class="val">{dll_count}</div><div class="lbl">Xbox / GDK DLLs ({metrics['dll_exports']} Exports)</div></div>
+      <div class="kpi"><div class="val">{len(dlls)}</div><div class="lbl">Xbox / GDK DLLs ({tot_exp} Exports)</div></div>
       <div class="kpi"><div class="val">{html.escape(op_label)}</div><div class="lbl">RDNA2 GFX10.3 Opcodes</div></div>
       <div class="kpi"><div class="val">292/292</div><div class="lbl">Shipping GDK Thunks</div></div>
-      <div class="kpi"><div class="val">6 PCs</div><div class="lbl">Real NVIDIA &amp; AMD GPUs</div></div>
+      <div class="kpi"><div class="val">6 PCs</div><div class="lbl">NVIDIA &amp; AMD Verified</div></div>
     </div>
 
     <div class="section">
       <div class="sec-head">
-        <h2>Core Subsystems</h2>
+        <h2>Honest Subsystem Progress</h2>
         <div class="controls">
-          <input id="q" type="search" placeholder="Search shaders, Vulkan, DLLs..." oninput="renderSubsystems()" />
-          <select id="area" onchange="renderSubsystems()">
-            <option value="all">All Areas</option>
-            <option value="Loader">Loader</option>
-            <option value="Graphics">Graphics</option>
-            <option value="Shaders">Shaders</option>
-            <option value="Memory &amp; IO">Memory &amp; IO</option>
-            <option value="Media">Media</option>
-            <option value="GDK Shims">GDK Shims</option>
-            <option value="Workloads">Workloads</option>
-            <option value="UX &amp; Tools">UX &amp; Tools</option>
-          </select>
+          <input id="q" type="search" placeholder="Filter subsystems..." oninput="renderSubsystems()" />
         </div>
       </div>
       <div id="subsystems"></div>
@@ -572,44 +794,76 @@ def render_dashboard_html(
 
     <div class="section">
       <div class="sec-head">
+        <h2>RDNA2 / GFX10.3 Instruction Families ({html.escape(op_label)})</h2>
+      </div>
+      <div id="families" class="grid2"></div>
+    </div>
+
+    <div class="section">
+      <div class="sec-head">
+        <h2>DirectX 12 (d3d12_xs) &amp; Vulkan 1.4 Translation Items</h2>
+        <div class="controls">
+          <select id="tFilter" onchange="renderTrans()">
+            <option value="all">All Items</option>
+            <option value="live">Live Only</option>
+            <option value="partial">Partial Only</option>
+            <option value="pending">Pending Only</option>
+          </select>
+        </div>
+      </div>
+      <div id="trans" class="grid3"></div>
+    </div>
+
+    <div class="section">
+      <div class="sec-head">
+        <h2>All {len(dlls)} Shimmed Xbox / GDK DLLs</h2>
+        <div class="controls">
+          <input id="dq" type="search" placeholder="Search DLLs..." oninput="renderDlls()" />
+          <select id="dTier" onchange="renderDlls()">
+            <option value="all">All Tiers</option>
+            <option value="high">High Coverage</option>
+            <option value="partial">Partial</option>
+            <option value="stub">Stub / Telemetry</option>
+          </select>
+        </div>
+      </div>
+      <div id="dlls" class="grid3"></div>
+    </div>
+
+    <div class="section">
+      <div class="sec-head">
         <h2>GPU Hardware Coverage</h2>
         <div class="controls">
           <select id="hwFilter" onchange="renderHardware()">
-            <option value="all">All Hardware Tiers</option>
-            <option value="verified">Verified Only</option>
+            <option value="all">All Tiers</option>
+            <option value="verified">Verified</option>
             <option value="needed">Testers Needed</option>
           </select>
         </div>
       </div>
-      <div id="hw" class="hw-grid"></div>
+      <div id="hw" class="grid3"></div>
     </div>
 
     <footer>
-      Auto-generated by <code>tools/generate_status.py</code> · <a href="https://github.com/californiaAlmonds/OpenScarlett/blob/main/LICENSE">MIT License</a>
+      Auto-generated by <code>tools/generate_status.py</code> · <a href="{DISCORD_URL}">Discord</a> · <a href="https://github.com/californiaAlmonds/OpenScarlett/blob/main/LICENSE">MIT License</a>
     </footer>
   </div>
 
   <script>
     const SUBSYSTEMS = {subsystems_json};
+    const FAMILIES = {families_json};
+    const TRANS = {trans_json};
+    const DLLS = {dlls_json};
     const HARDWARE = {hardware_json};
 
     function esc(s) {{
-      return s.replace(/[&<>"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
+      return String(s).replace(/[&<>"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
     }}
 
     function renderSubsystems() {{
       const q = document.getElementById('q').value.trim().toLowerCase();
-      const area = document.getElementById('area').value;
-      const root = document.getElementById('subsystems');
-      const items = SUBSYSTEMS.filter(s =>
-        (area === 'all' || s.area === area) &&
-        (!q || (s.name + ' ' + s.plain + ' ' + s.tech + ' ' + s.verified).toLowerCase().includes(q))
-      );
-      if (!items.length) {{
-        root.innerHTML = '<div class="plain">No matching subsystems found.</div>';
-        return;
-      }}
-      root.innerHTML = items.map(s => `
+      const items = SUBSYSTEMS.filter(s => !q || (s.name + ' ' + s.plain + ' ' + s.tech).toLowerCase().includes(q));
+      document.getElementById('subsystems').innerHTML = items.map(s => `
         <div class="row">
           <div class="row-top">
             <span class="row-title">${{esc(s.name)}}</span>
@@ -621,30 +875,66 @@ def render_dashboard_html(
             <div class="pct">${{s.pct}}%</div>
           </div>
           <details class="tech">
-            <summary>Technical details &amp; test coverage</summary>
+            <summary>Technical details &amp; verification</summary>
             <p style="margin:6px 0 4px"><strong>Coverage:</strong> ${{esc(s.tech)}}</p>
             <p style="margin:0"><strong>Verified on:</strong> ${{esc(s.verified)}}</p>
           </details>
         </div>
+      `).join('') || '<div class="plain">No matching subsystems.</div>';
+    }}
+
+    function renderFamilies() {{
+      document.getElementById('families').innerHTML = FAMILIES.map(f => {{
+        const pct = Math.min(100, Math.round(100 * f.done / Math.max(1, f.total)));
+        const col = pct >= 80 ? '#2ea043' : (pct >= 25 ? '#d29922' : '#e11d48');
+        return `
+          <div class="tile">
+            <div class="tile-head"><span>${{esc(f.name)}}</span><span class="mono">${{f.done}}/${{f.total}} (${{pct}}%)</span></div>
+            <div class="bar-wrap" style="margin-top:8px">
+              <div class="track"><div class="fill" style="width:${{pct}}%;background:${{col}}"></div></div>
+            </div>
+          </div>`;
+      }}).join('');
+    }}
+
+    function renderTrans() {{
+      const f = document.getElementById('tFilter').value;
+      const items = TRANS.filter(t => f === 'all' || t.status === f);
+      document.getElementById('trans').innerHTML = items.map(t => `
+        <div class="tile ${{t.status}}">
+          <div class="tile-head"><span>${{esc(t.name)}}</span><span class="tag-${{t.status}}">${{t.status}}</span></div>
+          <div class="plain" style="margin:5px 0 0">${{esc(t.detail)}}</div>
+        </div>
       `).join('');
+    }}
+
+    function renderDlls() {{
+      const q = document.getElementById('dq').value.trim().toLowerCase();
+      const tier = document.getElementById('dTier').value;
+      const items = DLLS.filter(d => (tier === 'all' || d.tier === tier) && (!q || (d.name + ' ' + d.note).toLowerCase().includes(q)));
+      document.getElementById('dlls').innerHTML = items.map(d => `
+        <div class="tile ${{d.tier}}">
+          <div class="tile-head"><span class="mono">${{esc(d.name)}}</span><span class="tag-${{d.tier}}">${{d.exports}} exp</span></div>
+          <div class="plain" style="margin:5px 0 0">${{esc(d.note)}}</div>
+        </div>
+      `).join('') || '<div class="plain">No matching DLLs.</div>';
     }}
 
     function renderHardware() {{
       const f = document.getElementById('hwFilter').value;
-      const root = document.getElementById('hw');
       const items = HARDWARE.filter(h => f === 'all' || h.status === f);
-      root.innerHTML = items.map(h => `
-        <div class="hw-card ${{h.status === 'needed' ? 'needed' : ''}}">
-          <div class="hw-tier">
-            <span>${{esc(h.tier)}}</span>
-            <span class="${{h.status === 'verified' ? 'tag-ok' : 'tag-need'}}">${{h.status === 'verified' ? 'Verified' : 'Tester Needed'}}</span>
-          </div>
-          <div class="hw-detail">${{esc(h.detail)}}</div>
+      document.getElementById('hw').innerHTML = items.map(h => `
+        <div class="tile hw-card ${{h.status === 'needed' ? 'needed' : 'high'}}">
+          <div class="tile-head"><span>${{esc(h.tier)}}</span><span class="${{h.status === 'verified' ? 'tag-high' : 'tag-partial'}}">${{h.status === 'verified' ? 'Verified' : 'Needed'}}</span></div>
+          <div class="plain" style="margin:5px 0 0">${{esc(h.detail)}}</div>
         </div>
       `).join('');
     }}
 
     renderSubsystems();
+    renderFamilies();
+    renderTrans();
+    renderDlls();
     renderHardware();
   </script>
 </body>
@@ -657,16 +947,21 @@ def main() -> int:
     parser.add_argument("--build-dir", type=pathlib.Path, default=ROOT / "build")
     args = parser.parse_args()
 
-    comps, dll_count = collect_components()
     ctest = read_ctest(args.build_dir)
-    metrics = measure_codebase_metrics(args.build_dir)
+    families, op_dec, op_tot, corp_pass, corp_tot = measure_rdna2_families()
+    dlls = collect_dlls(args.build_dir)
+    trans_items = collect_translation_items()
+    comps = collect_components(dlls, trans_items, op_dec, op_tot, corp_pass, corp_tot)
 
     docs_dir = ROOT / "docs"
     docs_dir.mkdir(parents=True, exist_ok=True)
-    (docs_dir / "status.svg").write_text(render_svg(comps, ctest, dll_count, metrics), encoding="utf-8")
-    (docs_dir / "index.html").write_text(render_dashboard_html(comps, ctest, dll_count, metrics), encoding="utf-8")
+    (docs_dir / "status.svg").write_text(render_status_svg(comps, ctest, dlls, op_dec, op_tot), encoding="utf-8")
+    (docs_dir / "matrix.svg").write_text(render_matrix_svg(families, op_dec, op_tot, trans_items, dlls), encoding="utf-8")
+    (docs_dir / "index.html").write_text(
+        render_dashboard_html(comps, ctest, dlls, families, trans_items, op_dec, op_tot), encoding="utf-8"
+    )
 
-    md = render_markdown(comps, ctest, dll_count, metrics)
+    md = render_markdown(comps, ctest, dlls, op_dec, op_tot, corp_pass, corp_tot)
     readme = ROOT / "README.md"
     if readme.exists():
         txt = readme.read_text(encoding="utf-8")
@@ -676,7 +971,11 @@ def main() -> int:
         else:
             txt = txt + "\n\n" + md + "\n"
         readme.write_text(txt, encoding="utf-8")
-    print(f"[generate_status] Updated docs/status.svg, docs/index.html, and README.md (ctest={ctest}, dlls={dll_count}, exports={metrics['dll_exports']}, opcodes={metrics['opcodes_decoded']}/{metrics['opcodes_total']})")
+
+    print(
+        f"[generate_status] Updated docs/status.svg, docs/matrix.svg, docs/index.html, and README.md "
+        f"(ctest={ctest}, dlls={len(dlls)}, exports={sum(d.exports for d in dlls)}, opcodes={op_dec}/{op_tot})"
+    )
     return 0
 
 
