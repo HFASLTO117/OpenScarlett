@@ -395,8 +395,38 @@ $fullLogText
         }
         $compactLog = $compactLog.TrimEnd()
 
+        $slimTableLines = New-Object System.Collections.Generic.List[string]
+        $slimTableLines.Add('| Check | Result | Time |')
+        $slimTableLines.Add('| :--- | :---: | :---: |')
+        foreach ($r in $results) {
+            $badge = if ($r.Passed) { 'PASS' } else { "FAIL (exit $($r.ExitCode))" }
+            $slimTableLines.Add("| ``$($r.Name)`` | **$badge** | $($r.Seconds)s |")
+        }
+        $slimTableMd = ($slimTableLines -join "`n")
+
+        $paramsSlim = @(
+            "template=hardware-report.yml",
+            "labels=hardware-report",
+            "title=$([Uri]::EscapeDataString($issueTitle))",
+            "os_version=$([Uri]::EscapeDataString($OsVersion))",
+            "gpu_summary=$([Uri]::EscapeDataString($gpuSummaryText))",
+            "test_summary=$([Uri]::EscapeDataString("**$passedCount/$totalCount passed** ($failedCount failed)`n`n$slimTableMd"))"
+        )
+        $paramsMin = @(
+            "template=hardware-report.yml",
+            "labels=hardware-report",
+            "title=$([Uri]::EscapeDataString($issueTitle))",
+            "os_version=$([Uri]::EscapeDataString($OsVersion))",
+            "gpu_summary=$([Uri]::EscapeDataString($gpuSummaryText))",
+            "test_summary=$([Uri]::EscapeDataString("**$passedCount/$totalCount passed** ($failedCount failed)`n`n(Full summary table is in your clipboard.)"))"
+        )
+
         $fullUrlCandidate = "$baseUrl?" + (($paramsBase + @("full_report=$([Uri]::EscapeDataString($fullLogText))")) -join '&')
         $compactUrlCandidate = "$baseUrl?" + (($paramsBase + @("full_report=$([Uri]::EscapeDataString($compactLog))")) -join '&')
+        $slimCompactCandidate = "$baseUrl?" + (($paramsSlim + @("full_report=$([Uri]::EscapeDataString($compactLog))")) -join '&')
+
+        $issueUrl = $null
+        $urlMode = 'clipboard'
 
         if ($fullUrlCandidate.Length -le 6200) {
             $issueUrl = $fullUrlCandidate
@@ -404,9 +434,66 @@ $fullLogText
         } elseif ($compactUrlCandidate.Length -le 6200) {
             $issueUrl = $compactUrlCandidate
             $urlMode = 'compact'
-        } else {
+        } elseif ($failedCount -gt 0) {
+            # Embed failing test output directly in the URL (with slim summary table) so failures
+            # are never lost even if the tester skips pressing Ctrl+V.
+            $failLog = "=== Failed Tests ===`n"
+            foreach ($r in $results) {
+                if ($r.Passed) { continue }
+                $failLog += "[FAIL (exit $($r.ExitCode))] $($r.Name)`n"
+                if (-not [string]::IsNullOrWhiteSpace($r.Output)) {
+                    $failLog += "$($r.Output)`n`n"
+                } elseif (-not [string]::IsNullOrWhiteSpace($r.Highlight)) {
+                    $failLog += "$($r.Highlight)`n`n"
+                } else {
+                    $failLog += "(no output captured)`n`n"
+                }
+            }
+            $failLog += "(Full raw test log is also in your clipboard - press Ctrl+V to append passing logs.)"
+
+            $truncSuffix = "`n... (truncated; full raw log is in your clipboard - press Ctrl+V to paste)"
+            foreach ($pSet in @($paramsSlim, $paramsMin)) {
+                $prefixUrl = "$baseUrl?" + ($pSet -join '&') + '&full_report='
+                $exactFailUrl = $prefixUrl + [Uri]::EscapeDataString($failLog)
+                if ($exactFailUrl.Length -le 6200) {
+                    $issueUrl = $exactFailUrl
+                    $urlMode = 'compact'
+                    break
+                }
+                $encSuffix = [Uri]::EscapeDataString($truncSuffix)
+                if (($prefixUrl.Length + $encSuffix.Length + 120) -le 6200) {
+                    $lo = 0
+                    $hi = $failLog.Length
+                    while ($lo -lt $hi) {
+                        $mid = [int][math]::Floor(($lo + $hi + 1) / 2)
+                        $cand = $prefixUrl + [Uri]::EscapeDataString($failLog.Substring(0, $mid)) + $encSuffix
+                        if ($cand.Length -le 6200) { $lo = $mid } else { $hi = $mid - 1 }
+                    }
+                    if ($lo -ge 40) {
+                        $cut = $lo
+                        $lastNl = $failLog.LastIndexOf("`n", $lo - 1)
+                        if ($lastNl -ge 0 -and ($lastNl + 80) -ge $lo) { $cut = $lastNl }
+                        $issueUrl = $prefixUrl + [Uri]::EscapeDataString($failLog.Substring(0, $cut)) + $encSuffix
+                        $urlMode = 'compact'
+                        break
+                    }
+                }
+            }
+        } elseif ($slimCompactCandidate.Length -le 6200) {
+            $issueUrl = $slimCompactCandidate
+            $urlMode = 'compact'
+        }
+
+        if ($null -eq $issueUrl) {
             $fallbackNote = "(Full raw test log is in your clipboard - press Ctrl+V here to paste it.)"
-            $issueUrl = "$baseUrl?" + (($paramsBase + @("full_report=$([Uri]::EscapeDataString($fallbackNote))")) -join '&')
+            $encFallback = "full_report=$([Uri]::EscapeDataString($fallbackNote))"
+            $issueUrl = "$baseUrl?" + (($paramsBase + @($encFallback)) -join '&')
+            if ($issueUrl.Length -gt 6200) {
+                $issueUrl = "$baseUrl?" + (($paramsSlim + @($encFallback)) -join '&')
+            }
+            if ($issueUrl.Length -gt 6200) {
+                $issueUrl = "$baseUrl?" + (($paramsMin + @($encFallback)) -join '&')
+            }
             $urlMode = 'clipboard'
         }
 

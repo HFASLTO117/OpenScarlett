@@ -1425,6 +1425,89 @@ std::string BuildGitHubHardwareReportUrl(const GpuTelemetrySnapshot& probe,
         return compact_url;
     }
 
+    const std::string slim_table = BuildSummaryTableMarkdown(run.rows, false);
+    const std::string slim_url_prefix =
+        std::string(kGitHubIssuesNewUrl) + "?" + make_base_params(headline + "\n\n" + slim_table);
+    const std::string min_url_prefix =
+        std::string(kGitHubIssuesNewUrl) + "?" +
+        make_base_params(headline + "\n\n(Full summary table is in your clipboard.)");
+
+    // When tests failed and the full 42-test summary exceeds the URL budget, prioritize
+    // embedding the failing tests' exact output directly in full_report so failures are
+    // always visible in the GitHub issue even if the user forgets to press Ctrl+V.
+    if (run.failed_count > 0) {
+        std::ostringstream fail_oss;
+        fail_oss << "=== Failed Tests ===\n";
+        for (const auto& r : run.rows) {
+            if (r.passed) {
+                continue;
+            }
+            fail_oss << "[FAIL (exit " << r.exit_code << ")] " << r.name << "\n";
+            const std::string body = TrimTrailingWhitespace(r.output);
+            if (!body.empty()) {
+                fail_oss << body << "\n\n";
+            } else if (!r.highlight.empty()) {
+                fail_oss << r.highlight << "\n\n";
+            } else {
+                fail_oss << "(no output captured)\n\n";
+            }
+        }
+        fail_oss << "(Full raw test log is also in your clipboard - press Ctrl+V to append passing logs.)";
+        const std::string failures_log = fail_oss.str();
+
+        auto try_fit_failures = [&](const std::string& prefix, std::string& out_url) -> bool {
+            const std::string exact = prefix + "&full_report=" + UriEscapeRfc3986(failures_log);
+            if (exact.size() <= kGitHubUrlBudget) {
+                out_url = exact;
+                return true;
+            }
+            const std::string trunc_suffix =
+                "\n... (truncated; full raw log is in your clipboard - press Ctrl+V to paste)";
+            const std::string base_param = prefix + "&full_report=";
+            const std::string encoded_suffix = UriEscapeRfc3986(trunc_suffix);
+            if (base_param.size() + encoded_suffix.size() + 120u > kGitHubUrlBudget) {
+                return false;
+            }
+            size_t lo = 0;
+            size_t hi = failures_log.size();
+            while (lo < hi) {
+                const size_t mid = lo + (hi - lo + 1u) / 2u;
+                const std::string cand =
+                    base_param + UriEscapeRfc3986(std::string_view(failures_log.data(), mid)) + encoded_suffix;
+                if (cand.size() <= kGitHubUrlBudget) {
+                    lo = mid;
+                } else {
+                    hi = mid - 1u;
+                }
+            }
+            if (lo < 40u) {
+                return false;
+            }
+            // Prefer trimming cleanly at a newline boundary when close to the cap.
+            size_t cut = lo;
+            const size_t last_nl = failures_log.rfind('\n', lo - 1u);
+            if (last_nl != std::string::npos && last_nl + 80u >= lo) {
+                cut = last_nl;
+            }
+            out_url = base_param + UriEscapeRfc3986(std::string_view(failures_log.data(), cut)) + encoded_suffix;
+            return out_url.size() <= kGitHubUrlBudget;
+        };
+
+        std::string fitted_url;
+        if (try_fit_failures(slim_url_prefix, fitted_url) ||
+            try_fit_failures(min_url_prefix, fitted_url)) {
+            if (out_mode != nullptr) *out_mode = "compact";
+            return fitted_url;
+        }
+    } else {
+        const std::string slim_compact =
+            slim_url_prefix + "&full_report=" + UriEscapeRfc3986(compact_log);
+        if (slim_compact.size() <= kGitHubUrlBudget) {
+            if (out_mode != nullptr) *out_mode = "compact";
+            return slim_compact;
+        }
+    }
+
     const std::string fallback_note =
         "(Full raw test log is in your clipboard - press Ctrl+V here to paste it.)";
     const std::string encoded_fallback = "&full_report=" + UriEscapeRfc3986(fallback_note);
@@ -1433,14 +1516,10 @@ std::string BuildGitHubHardwareReportUrl(const GpuTelemetrySnapshot& probe,
         std::string(kGitHubIssuesNewUrl) + "?" + params_base + encoded_fallback;
     if (clipboard_url.size() > kGitHubUrlBudget) {
         // Trim table notes if a very large suite pushes the summary table itself over the URL budget.
-        const std::string slim_table = BuildSummaryTableMarkdown(run.rows, false);
-        clipboard_url = std::string(kGitHubIssuesNewUrl) + "?" +
-                        make_base_params(headline + "\n\n" + slim_table) + encoded_fallback;
+        clipboard_url = slim_url_prefix + encoded_fallback;
     }
     if (clipboard_url.size() > kGitHubUrlBudget) {
-        clipboard_url = std::string(kGitHubIssuesNewUrl) + "?" +
-                        make_base_params(headline + "\n\n(Full summary table is in your clipboard.)") +
-                        encoded_fallback;
+        clipboard_url = min_url_prefix + encoded_fallback;
     }
 
     if (out_mode != nullptr) *out_mode = "clipboard";

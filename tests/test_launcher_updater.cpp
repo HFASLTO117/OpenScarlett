@@ -570,24 +570,28 @@ void TestBridgeSubsystems(const fs::path& bin_dir) {
 
     HardwareTestRunResult huge_run{};
     huge_run.completed = true;
-    huge_run.passed_count = 20;
-    huge_run.failed_count = 1;
-    huge_run.total_count = 21;
-    huge_run.report_markdown = std::string(14000u, 'A');
-    for (int i = 0; i < 21; ++i) {
+    huge_run.passed_count = 40;
+    huge_run.failed_count = 2;
+    huge_run.total_count = 42;
+    huge_run.report_markdown = std::string(18000u, 'A');
+    huge_run.full_log_text = std::string(18000u, 'L');
+    for (int i = 0; i < 42; ++i) {
+        const bool failed = (i == 40 || i == 41);
         huge_run.rows.push_back({
             "test_very_long_hardware_suite_item_" + std::to_string(i) + ".exe",
             "Long description for stress-testing URL budget enforcement",
-            i != 20, i == 20 ? 1 : 0, 1.25,
-            std::string(200u, 'H'),
-            std::string(400u, 'O'),
+            !failed, failed ? 1 : 0, 1.25,
+            failed ? "[FAIL] OS_REQUIRE_FAILED_MARKER" : std::string(160u, 'H'),
+            failed ? "[FAIL] OS_REQUIRE(!StartsWithDriveCW(work_build)) line 1264\n" : std::string(300u, 'O'),
         });
     }
     std::string mode_huge;
     const std::string url_huge = BuildGitHubHardwareReportUrl(gpu, huge_run, &mode_huge);
     OS_REQUIRE(!url_huge.empty());
     OS_REQUIRE(url_huge.size() <= 6200u);
-    OS_REQUIRE(mode_huge == "compact" || mode_huge == "clipboard");
+    OS_REQUIRE(mode_huge == "compact");
+    // Even with a 42-test suite exceeding the full-table budget, failing test diagnostics must be embedded!
+    OS_REQUIRE(url_huge.find("StartsWithDriveCW") != std::string::npos);
 
     std::printf("[PASS] Test 5: GPU probe (%zu adapters), demo discovery, PE inspector (%s, 0 missing), GitHub URL budget (%zu/%zu chars)\n",
                 gpu.adapters.size(), pe_target.filename().string().c_str(),
