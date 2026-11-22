@@ -29,6 +29,7 @@ struct WindowCallbackState {
     std::atomic<bool> quit_posted{false};
     std::atomic<bool> is_fullscreen{false};
     std::atomic<bool> in_fullscreen_toggle{false};
+    std::atomic<uint64_t> alt_enter_toggle_count{0ull};
 
     std::mutex fullscreen_mutex;
     LONG_PTR saved_style = 0;
@@ -249,7 +250,9 @@ LRESULT CALLBACK SubclassWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 const bool alt_down = (lParam & (static_cast<LPARAM>(1) << 29)) != 0;
                 const bool is_repeat = (lParam & (static_cast<LPARAM>(1) << 30)) != 0;
                 if (wParam == VK_RETURN && alt_down && !is_repeat) {
-                    ToggleBorderlessFullscreenForWindow(hwnd, *state);
+                    if (SUCCEEDED(ToggleBorderlessFullscreenForWindow(hwnd, *state))) {
+                        state->alt_enter_toggle_count.fetch_add(1ull, std::memory_order_relaxed);
+                    }
                     return 0;
                 }
                 break;
@@ -464,6 +467,59 @@ int64_t QueryQpcNow() noexcept {
     LARGE_INTEGER li{};
     QueryPerformanceCounter(&li);
     return li.QuadPart;
+}
+
+bool IsWritableCpuVa(uint64_t va, size_t byte_size) noexcept {
+    if (va == 0ull || byte_size == 0u || va > UINT64_MAX - byte_size) return false;
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(va)), &mbi, sizeof(mbi)) == 0) {
+        return false;
+    }
+    if (mbi.State != MEM_COMMIT) return false;
+    constexpr DWORD kWritable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    if ((mbi.Protect & kWritable) == 0u || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0u) {
+        return false;
+    }
+    const uint64_t region_end =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(mbi.BaseAddress)) +
+        static_cast<uint64_t>(mbi.RegionSize);
+    return (va + byte_size) <= region_end;
+}
+
+bool TryParseEnvFcapFps(uint32_t& out_fps) noexcept {
+    out_fps = 0u;
+    char buf[64]{};
+    const DWORD len = GetEnvironmentVariableA("OPENSCARLETT_FCAP", buf, static_cast<DWORD>(sizeof(buf)));
+    if (len == 0u || len >= sizeof(buf)) return false;
+    char* end = nullptr;
+    const unsigned long v = std::strtoul(buf, &end, 10);
+    if (!end || end == buf) return false;
+    out_fps = static_cast<uint32_t>(std::min<unsigned long>(v, 10000ul));
+    return true;
+}
+
+bool TryParseCmdLineFcapFps(uint32_t& out_fps) noexcept {
+    out_fps = 0u;
+    const char* cmd = GetCommandLineA();
+    if (!cmd) return false;
+    const char* p = cmd;
+    while ((p = std::strstr(p, "--fcap")) != nullptr) {
+        const bool boundary_before = (p == cmd || p[-1] == ' ' || p[-1] == '\t');
+        const char* after = p + 6;
+        if (boundary_before && (*after == ' ' || *after == '\t' || *after == '=')) {
+            while (*after == ' ' || *after == '\t' || *after == '=') ++after;
+            if (*after >= '0' && *after <= '9') {
+                char* end = nullptr;
+                const unsigned long v = std::strtoul(after, &end, 10);
+                if (end && end != after) {
+                    out_fps = static_cast<uint32_t>(std::min<unsigned long>(v, 10000ul));
+                    return true;
+                }
+            }
+        }
+        p += 6;
+    }
+    return false;
 }
 
 bool IsReadableCpuVa(uint64_t va, size_t byte_size) noexcept {
@@ -701,6 +757,12 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::QueryInterface(REFIID riid, void** ppvO
         RecordQueue("ID3D12CommandQueueX::QueryInterface", 0, S_OK);
         return S_OK;
     }
+    if (IsEqualIID(riid, IID_IOpenScarlettPresentPacing)) {
+        *ppvObject = static_cast<IOpenScarlettPresentPacing*>(this);
+        AddRef();
+        RecordQueue("ID3D12CommandQueueX::QueryInterface", 0, S_OK);
+        return S_OK;
+    }
     RecordQueue("ID3D12CommandQueueX::QueryInterface", 0, E_NOINTERFACE);
     return E_NOINTERFACE;
 }
@@ -789,10 +851,14 @@ void STDMETHODCALLTYPE CommandQueueX::CopyTileMappings(
 void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
     UINT NumCommandLists,
     ID3D12CommandList* const* ppCommandLists) {
-    // Auto-flush any dirty title unified-memory textures before GPU work samples them.
-    if (device_x_ && device_x_->HasDirtyUnifiedTextures() &&
-        host_queue_ && queue_type_ == D3D12_COMMAND_LIST_TYPE_DIRECT) {
-        device_x_->FlushDirtyUnifiedTextures(host_queue_, nullptr);
+    // Auto-flush any dirty title unified-memory textures & TitleVAMirror pages before GPU work samples them.
+    if (device_x_ && host_queue_ && queue_type_ == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        if (device_x_->HasDirtyUnifiedTextures()) {
+            device_x_->FlushDirtyUnifiedTextures(host_queue_, nullptr);
+        }
+        if (device_x_->HasMirroredTitleVaRegions()) {
+            device_x_->FlushMirroredTitleVaPagesOnQueue(host_queue_, queue_type_, nullptr);
+        }
     }
 
     // Unwrap any CommandListX* wrappers back to native host ID3D12CommandList* pointers.
@@ -812,8 +878,25 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
         raw_lists = heap_lists.data();
     }
 
+    std::vector<uint64_t> pending_writeback_vas;
+    std::vector<DeferredCpuWrite32> deferred_writes;
+    std::vector<DeferredCpuWait> deferred_waits;
     for (UINT i = 0; i < NumCommandLists; ++i) {
         raw_lists[i] = CommandListX::UnwrapHostList(ppCommandLists[i]);
+        if (CommandListX* clx = CommandListX::TryFromCommandList(ppCommandLists[i])) {
+            clx->ExtractPendingMirrorWritebacks(pending_writeback_vas);
+            clx->ExtractDeferredCpuOps(deferred_writes, deferred_waits);
+        }
+    }
+
+    // Enforce any CPU/mirrored Wait32BitValueX / Wait64BitValueX recorded on command lists.
+    for (const auto& w : deferred_waits) {
+        if (w.is_64bit) {
+            (void)Wait64BitValueX(w.address, w.value, w.mask, w.op);
+        } else {
+            (void)Wait32BitValueX(
+                w.address, static_cast<uint32_t>(w.value), static_cast<uint32_t>(w.mask), w.op);
+        }
     }
 
     if (const auto hook = submit_hook_.load(std::memory_order_acquire)) {
@@ -821,6 +904,60 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
     }
 
     host_queue_->ExecuteCommandLists(NumCommandLists, raw_lists);
+
+    // Schedule fence-tracked GPU->CPU writeback for any TitleVAMirror resources written by these lists.
+    if (device_x_ && !pending_writeback_vas.empty() &&
+        host_queue_ && queue_type_ == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        std::sort(pending_writeback_vas.begin(), pending_writeback_vas.end());
+        pending_writeback_vas.erase(
+            std::unique(pending_writeback_vas.begin(), pending_writeback_vas.end()),
+            pending_writeback_vas.end());
+        std::lock_guard<std::mutex> lock(present_mutex_);
+        if (SUCCEEDED(EnsurePresentHelperObjectsLocked())) {
+            // Wait for any previous use of present_alloc_ before resetting it.
+            if (present_fence_->GetCompletedValue() < present_fence_val_) {
+                if (SUCCEEDED(present_fence_->SetEventOnCompletion(present_fence_val_, present_fence_event_))) {
+                    WaitForSingleObject(present_fence_event_, 15000u);
+                }
+                PumpMirrorReadbackCompletionLocked();
+            }
+            if (SUCCEEDED(present_alloc_->Reset()) &&
+                SUCCEEDED(present_cmd_->Reset(present_alloc_, nullptr))) {
+                const uint64_t rb_fence = ++present_fence_val_;
+                uint32_t scheduled = 0u;
+                for (uint64_t va : pending_writeback_vas) {
+                    openscarlett::TitleVaRegionInfo rinfo{};
+                    if (device_x_->GetTitleVaMirror().LookupRegion(va, rinfo)) {
+                        if (device_x_->GetTitleVaMirror().ScheduleGpuReadback(
+                                present_cmd_, va, rb_fence, 0ull, 0ull, rinfo.current_state).ok()) {
+                            ++scheduled;
+                        }
+                    }
+                }
+                if (scheduled > 0u && SUCCEEDED(present_cmd_->Close())) {
+                    ID3D12CommandList* rb_lists[] = {present_cmd_};
+                    host_queue_->ExecuteCommandLists(1u, rb_lists);
+                    host_queue_->Signal(present_fence_, rb_fence);
+                } else {
+                    present_cmd_->Close();
+                }
+            }
+        }
+    }
+
+    if (!deferred_writes.empty()) {
+        {
+            std::lock_guard<std::mutex> lock(present_mutex_);
+            if (SUCCEEDED(EnsurePresentHelperObjectsLocked())) {
+                WaitForInternalFenceLocked();
+            }
+        }
+        for (const auto& wr : deferred_writes) {
+            if (IsWritableCpuVa(wr.address, sizeof(uint32_t))) {
+                *reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(wr.address)) = wr.value;
+            }
+        }
+    }
 
     if (device_x_ && device_x_->IsVulkanRoutingActive()) {
         for (UINT i = 0; i < NumCommandLists; ++i) {
@@ -1166,25 +1303,64 @@ void STDMETHODCALLTYPE CommandQueueX::EndEvent() {
 
 HRESULT STDMETHODCALLTYPE CommandQueueX::Signal(ID3D12Fence* pFence, UINT64 Value) {
     const HRESULT hr = host_queue_->Signal(UnwrapFence(pFence), Value);
+    {
+        std::lock_guard<std::mutex> lock(present_mutex_);
+        PumpMirrorReadbackCompletionLocked();
+    }
     RecordQueue("ID3D12CommandQueueX::Signal", 14, hr);
     return hr;
 }
 
 HRESULT STDMETHODCALLTYPE CommandQueueX::Wait(ID3D12Fence* pFence, UINT64 Value) {
     const HRESULT hr = host_queue_->Wait(UnwrapFence(pFence), Value);
+    {
+        std::lock_guard<std::mutex> lock(present_mutex_);
+        PumpMirrorReadbackCompletionLocked();
+    }
     RecordQueue("ID3D12CommandQueueX::Wait", 15, hr);
     return hr;
 }
 
 HRESULT STDMETHODCALLTYPE CommandQueueX::GetTimestampFrequency(UINT64* pFrequency) {
-    const HRESULT hr = host_queue_->GetTimestampFrequency(pFrequency);
+    if (!pFrequency) {
+        RecordQueue("ID3D12CommandQueueX::GetTimestampFrequency", 16, E_POINTER);
+        return E_POINTER;
+    }
+    HRESULT hr = host_queue_->GetTimestampFrequency(pFrequency);
+    if (SUCCEEDED(hr) && *pFrequency > 0ull) {
+        cached_gpu_ts_freq_.store(*pFrequency, std::memory_order_release);
+    } else if (qpc_freq_ > 0) {
+        *pFrequency = static_cast<UINT64>(qpc_freq_);
+        cached_gpu_ts_freq_.store(*pFrequency, std::memory_order_release);
+        hr = S_OK;
+    }
     RecordQueue("ID3D12CommandQueueX::GetTimestampFrequency", 16, hr);
     return hr;
 }
 
 HRESULT STDMETHODCALLTYPE CommandQueueX::GetClockCalibration(
     UINT64* pGpuTimestamp, UINT64* pCpuTimestamp) {
-    const HRESULT hr = host_queue_->GetClockCalibration(pGpuTimestamp, pCpuTimestamp);
+    if (!pGpuTimestamp || !pCpuTimestamp) {
+        RecordQueue("ID3D12CommandQueueX::GetClockCalibration", 17, E_POINTER);
+        return E_POINTER;
+    }
+    HRESULT hr = host_queue_->GetClockCalibration(pGpuTimestamp, pCpuTimestamp);
+    if (FAILED(hr)) {
+        const uint64_t qpc_now = static_cast<uint64_t>(QueryQpcNow());
+        uint64_t gpu_freq = cached_gpu_ts_freq_.load(std::memory_order_acquire);
+        if (gpu_freq == 0ull) {
+            (void)GetTimestampFrequency(&gpu_freq);
+        }
+        *pCpuTimestamp = qpc_now;
+        if (qpc_freq_ > 0 && gpu_freq > 0ull) {
+            *pGpuTimestamp = static_cast<uint64_t>(
+                (static_cast<double>(qpc_now) / static_cast<double>(qpc_freq_)) *
+                static_cast<double>(gpu_freq));
+        } else {
+            *pGpuTimestamp = qpc_now;
+        }
+        hr = S_OK;
+    }
     RecordQueue("ID3D12CommandQueueX::GetClockCalibration", 17, hr);
     return hr;
 }
@@ -1805,6 +1981,11 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
     UINT PlaneCount,
     const D3D12XBOX_PRESENT_PLANE_PARAMETERS* pPlaneParameters,
     const D3D12XBOX_PRESENT_PARAMETERS* pPresentParameters) {
+    if (device_x_ && device_x_->IsDeviceRemoved()) {
+        const HRESULT rem_hr = device_x_->GetDeviceRemovedReason();
+        RecordQueue("ID3D12CommandQueueX::PresentX", 19, rem_hr);
+        return rem_hr;
+    }
     const int64_t total_start_qpc = QueryQpcNow();
 
     // Xbox GDK titles (e.g. Xbox-GDK-Samples DeviceResources::~DeviceResources & resize)
@@ -2265,13 +2446,20 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
         }
     }
 
-    const uint32_t frame_interval_us = device_x_ ? device_x_->FrameIntervalMicroseconds() : 0u;
+    bool fcap_override = false;
+    uint32_t fcap_fps = 0u;
+    const uint32_t frame_interval_us =
+        ResolveEffectiveFrameIntervalUsLocked(fcap_override, fcap_fps);
+    last_effective_interval_us_ = frame_interval_us;
     const bool immediate_flag =
         (pPresentParameters && (pPresentParameters->Flags & D3D12XBOX_PRESENT_FLAG_IMMEDIATE) != 0);
-    const bool should_pace = (use_swapchain && !window_minimized) && !immediate_flag && frame_interval_us > 0u;
+    const bool should_pace =
+        ((use_swapchain && !window_minimized) || fcap_override) &&
+        !immediate_flag && frame_interval_us > 0u;
 
     if (should_pace) {
         PaceFrameLocked(frame_interval_us);
+        ++paced_frame_count_;
     } else {
         const int64_t now_qpc = QueryQpcNow();
         if (last_present_qpc_ != 0 && qpc_freq_ > 0) {
@@ -2392,6 +2580,9 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
     last_present_height_ = has_vk_direct_rt_fb ? vk_direct_rt_fb.height : height;
     ++present_count_;
     ++non_blank_present_count_;
+    if (device_x_) {
+        device_x_->GetQueryAccumulator().BeginFrame(present_count_);
+    }
 
     if (want_capture_this_frame && !last_present_pixels_.empty() &&
         last_present_width_ > 0u && last_present_height_ > 0u) {
@@ -2449,15 +2640,20 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::ResumeX() {
 }
 
 HRESULT STDMETHODCALLTYPE CommandQueueX::KickoffX() {
-    if (device_x_ && device_x_->HasDirtyUnifiedTextures() &&
-        host_queue_ && queue_type_ == D3D12_COMMAND_LIST_TYPE_DIRECT) {
-        device_x_->FlushDirtyUnifiedTextures(host_queue_, nullptr);
+    if (device_x_ && host_queue_ && queue_type_ == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        if (device_x_->HasDirtyUnifiedTextures()) {
+            device_x_->FlushDirtyUnifiedTextures(host_queue_, nullptr);
+        }
+        if (device_x_->HasMirroredTitleVaRegions()) {
+            device_x_->FlushMirroredTitleVaPagesOnQueue(host_queue_, queue_type_, nullptr);
+        }
     }
     {
         std::lock_guard<std::mutex> lock(present_mutex_);
         if (present_fence_ && host_queue_) {
             const uint64_t target = ++present_fence_val_;
             host_queue_->Signal(present_fence_, target);
+            PumpMirrorReadbackCompletionLocked();
         }
     }
     kickoff_count_.fetch_add(1ull, std::memory_order_relaxed);
@@ -2473,6 +2669,32 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::Wait32BitValueX(
     if (Address == 0ull) {
         RecordQueue("ID3D12CommandQueueX::Wait32BitValueX", 23, E_INVALIDARG);
         return E_INVALIDARG;
+    }
+    void* cpu_ptr = nullptr;
+    uint64_t rem_bytes = 0ull;
+    if (device_x_ && device_x_->GetTitleVaMirror().ResolveTitleVaToCpu(Address, cpu_ptr, rem_bytes) &&
+        cpu_ptr && rem_bytes >= sizeof(uint32_t)) {
+        // Mirrored Title-VA address: poll CPU backing memory while pumping GPU->CPU writeback completions.
+        const auto* ptr = reinterpret_cast<const volatile uint32_t*>(cpu_ptr);
+        const int64_t start_qpc = QueryQpcNow();
+        const int64_t timeout_ticks = (qpc_freq_ > 0) ? (qpc_freq_ * 2LL) : 0LL;
+        for (;;) {
+            {
+                std::lock_guard<std::mutex> lock(present_mutex_);
+                PumpMirrorReadbackCompletionLocked();
+            }
+            const uint32_t cur = *ptr;
+            if (EvaluateWaitOp<uint32_t>(cur, Value, Mask, Operation)) {
+                RecordQueue("ID3D12CommandQueueX::Wait32BitValueX", 23, S_OK);
+                return S_OK;
+            }
+            if (timeout_ticks > 0 && (QueryQpcNow() - start_qpc) >= timeout_ticks) {
+                const HRESULT hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+                RecordQueue("ID3D12CommandQueueX::Wait32BitValueX", 23, hr);
+                return hr;
+            }
+            SwitchToThread();
+        }
     }
     if (IsReadableCpuVa(Address, sizeof(uint32_t))) {
         const auto* ptr = reinterpret_cast<const volatile uint32_t*>(static_cast<uintptr_t>(Address));
@@ -2514,6 +2736,31 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::Wait64BitValueX(
         RecordQueue("ID3D12CommandQueueX::Wait64BitValueX", 24, E_INVALIDARG);
         return E_INVALIDARG;
     }
+    void* cpu_ptr = nullptr;
+    uint64_t rem_bytes = 0ull;
+    if (device_x_ && device_x_->GetTitleVaMirror().ResolveTitleVaToCpu(Address, cpu_ptr, rem_bytes) &&
+        cpu_ptr && rem_bytes >= sizeof(uint64_t)) {
+        const auto* ptr = reinterpret_cast<const volatile uint64_t*>(cpu_ptr);
+        const int64_t start_qpc = QueryQpcNow();
+        const int64_t timeout_ticks = (qpc_freq_ > 0) ? (qpc_freq_ * 2LL) : 0LL;
+        for (;;) {
+            {
+                std::lock_guard<std::mutex> lock(present_mutex_);
+                PumpMirrorReadbackCompletionLocked();
+            }
+            const uint64_t cur = *ptr;
+            if (EvaluateWaitOp<uint64_t>(cur, Value, Mask, Operation)) {
+                RecordQueue("ID3D12CommandQueueX::Wait64BitValueX", 24, S_OK);
+                return S_OK;
+            }
+            if (timeout_ticks > 0 && (QueryQpcNow() - start_qpc) >= timeout_ticks) {
+                const HRESULT hr = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+                RecordQueue("ID3D12CommandQueueX::Wait64BitValueX", 24, hr);
+                return hr;
+            }
+            SwitchToThread();
+        }
+    }
     if (IsReadableCpuVa(Address, sizeof(uint64_t))) {
         const auto* ptr = reinterpret_cast<const volatile uint64_t*>(static_cast<uintptr_t>(Address));
         const int64_t start_qpc = QueryQpcNow();
@@ -2543,6 +2790,83 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::Wait64BitValueX(
     }
     RecordQueue("ID3D12CommandQueueX::Wait64BitValueX", 24, hr);
     return hr;
+}
+
+HRESULT STDMETHODCALLTYPE CommandQueueX::Write32BitValueX(
+    D3D12_GPU_VIRTUAL_ADDRESS Address,
+    uint32_t Value,
+    uint32_t Flags) {
+    if (Address == 0ull) {
+        RecordQueue("ID3D12CommandQueueX::Write32BitValueX", 25, E_INVALIDARG);
+        return E_INVALIDARG;
+    }
+
+    uint64_t buf_off = 0ull;
+    ID3D12Resource* host_buf =
+        device_x_ ? device_x_->ResolveBufferResourceByGpuVa(Address, &buf_off) : nullptr;
+    if (host_buf && host_queue_) {
+        std::lock_guard<std::mutex> lock(present_mutex_);
+        HRESULT hr = EnsurePresentHelperObjectsLocked();
+        if (SUCCEEDED(hr)) {
+            if (present_fence_->GetCompletedValue() < present_fence_val_) {
+                if (SUCCEEDED(present_fence_->SetEventOnCompletion(present_fence_val_, present_fence_event_))) {
+                    WaitForSingleObject(present_fence_event_, 15000u);
+                }
+                PumpMirrorReadbackCompletionLocked();
+            }
+            ID3D12GraphicsCommandList2* cmd2 = nullptr;
+            if (SUCCEEDED(present_cmd_->QueryInterface(
+                    OS_D3D12_IID(ID3D12GraphicsCommandList2), reinterpret_cast<void**>(&cmd2))) &&
+                cmd2) {
+                if (SUCCEEDED(present_alloc_->Reset()) &&
+                    SUCCEEDED(present_cmd_->Reset(present_alloc_, nullptr))) {
+                    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER param{};
+                    param.Dest = device_x_->TranslateGuestGpuVa(Address);
+                    param.Value = Value;
+                    D3D12_WRITEBUFFERIMMEDIATE_MODE mode = D3D12_WRITEBUFFERIMMEDIATE_MODE_DEFAULT;
+                    if ((Flags & D3D12XBOX_WRITE_VALUE_FLAG_MARKER_IN) != 0u) {
+                        mode = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_IN;
+                    } else if ((Flags & D3D12XBOX_WRITE_VALUE_FLAG_MARKER_OUT) != 0u) {
+                        mode = D3D12_WRITEBUFFERIMMEDIATE_MODE_MARKER_OUT;
+                    }
+                    cmd2->WriteBufferImmediate(1u, &param, &mode);
+                    uint64_t mirror_va = 0ull;
+                    const uint64_t rb_fence = ++present_fence_val_;
+                    if (device_x_->LookupMirroredTitleVaForResource(host_buf, mirror_va) &&
+                        mirror_va != 0ull) {
+                        openscarlett::TitleVaRegionInfo rinfo{};
+                        if (device_x_->GetTitleVaMirror().LookupRegion(mirror_va, rinfo)) {
+                            (void)device_x_->GetTitleVaMirror().ScheduleGpuReadback(
+                                present_cmd_, mirror_va, rb_fence, 0ull, 0ull, rinfo.current_state);
+                        }
+                    }
+                    if (SUCCEEDED(present_cmd_->Close())) {
+                        ID3D12CommandList* lists[] = {present_cmd_};
+                        host_queue_->ExecuteCommandLists(1u, lists);
+                        host_queue_->Signal(present_fence_, rb_fence);
+                    }
+                }
+                cmd2->Release();
+            }
+        }
+        RecordQueue("ID3D12CommandQueueX::Write32BitValueX", 25, hr);
+        return hr;
+    }
+
+    if (IsWritableCpuVa(Address, sizeof(uint32_t))) {
+        if ((Flags & D3D12XBOX_WRITE_VALUE_FLAG_MARKER_OUT) != 0u) {
+            std::lock_guard<std::mutex> lock(present_mutex_);
+            if (SUCCEEDED(EnsurePresentHelperObjectsLocked())) {
+                WaitForInternalFenceLocked();
+            }
+        }
+        *reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(Address)) = Value;
+        RecordQueue("ID3D12CommandQueueX::Write32BitValueX", 25, S_OK);
+        return S_OK;
+    }
+
+    RecordQueue("ID3D12CommandQueueX::Write32BitValueX", 25, S_OK);
+    return S_OK;
 }
 
 // IOpenScarlettPresentCapture
@@ -2773,6 +3097,71 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::GetPresentTimingStats(
     if (!out_stats) return E_POINTER;
     std::lock_guard<std::mutex> lock(present_mutex_);
     *out_stats = last_timing_stats_;
+    return S_OK;
+}
+
+uint32_t CommandQueueX::ResolveEffectiveFrameIntervalUsLocked(
+    bool& out_override_active,
+    uint32_t& out_fcap_fps) const noexcept {
+    out_override_active = false;
+    out_fcap_fps = 0u;
+    if (fcap_override_active_) {
+        out_override_active = true;
+        out_fcap_fps = fcap_override_fps_;
+        return (fcap_override_fps_ > 0u) ? (1000000u / fcap_override_fps_) : 0u;
+    }
+    uint32_t env_fps = 0u;
+    if (TryParseEnvFcapFps(env_fps)) {
+        out_override_active = true;
+        out_fcap_fps = env_fps;
+        return (env_fps > 0u) ? (1000000u / env_fps) : 0u;
+    }
+    uint32_t cmd_fps = 0u;
+    if (TryParseCmdLineFcapFps(cmd_fps)) {
+        out_override_active = true;
+        out_fcap_fps = cmd_fps;
+        return (cmd_fps > 0u) ? (1000000u / cmd_fps) : 0u;
+    }
+    return device_x_ ? device_x_->FrameIntervalMicroseconds() : 0u;
+}
+
+void CommandQueueX::PumpMirrorReadbackCompletionLocked() noexcept {
+    if (!device_x_ || !present_fence_) return;
+    const uint64_t completed = present_fence_->GetCompletedValue();
+    (void)device_x_->GetTitleVaMirror().CompleteReadbacksOnFence(completed);
+}
+
+// IOpenScarlettPresentPacing
+HRESULT STDMETHODCALLTYPE CommandQueueX::SetFrameCapFps(
+    uint32_t fps_or_zero_for_uncapped,
+    BOOL override_active) {
+    std::lock_guard<std::mutex> lock(present_mutex_);
+    fcap_override_active_ = (override_active != FALSE);
+    fcap_override_fps_ = fps_or_zero_for_uncapped;
+    last_paced_qpc_ = 0;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE CommandQueueX::GetPresentPacingState(
+    D3D12XBOX_PRESENT_PACING_STATE* out_state) {
+    if (!out_state) return E_POINTER;
+    std::memset(out_state, 0, sizeof(*out_state));
+    std::lock_guard<std::mutex> lock(present_mutex_);
+    bool ov_active = false;
+    uint32_t ov_fps = 0u;
+    const uint32_t eff_us = ResolveEffectiveFrameIntervalUsLocked(ov_active, ov_fps);
+    out_state->set_frame_interval_us = device_x_ ? device_x_->FrameIntervalMicroseconds() : 0u;
+    out_state->fcap_override_fps = ov_fps;
+    out_state->fcap_override_active = ov_active ? 1u : 0u;
+    out_state->effective_frame_interval_us = eff_us;
+    out_state->paced_frame_count = paced_frame_count_;
+    if (window_state_) {
+        out_state->alt_enter_toggle_count =
+            window_state_->alt_enter_toggle_count.load(std::memory_order_acquire);
+        out_state->is_fullscreen =
+            window_state_->is_fullscreen.load(std::memory_order_acquire) ? 1u : 0u;
+    }
+    out_state->last_frame_ms = last_frame_ms_;
     return S_OK;
 }
 
