@@ -125,6 +125,7 @@ foreach(_os_module_cmake
     cmake/sprint12_rayquery.cmake
     cmake/sprint12_streaming_vram.cmake
     cmake/sprint12_os_loader.cmake
+    cmake/sprint13_vk_xg_tiled.cmake
 )
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_os_module_cmake}")
         include("${CMAKE_CURRENT_SOURCE_DIR}/${_os_module_cmake}")
