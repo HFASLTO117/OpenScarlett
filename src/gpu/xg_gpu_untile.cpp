@@ -3,6 +3,7 @@
 #endif
 
 #include "openscarlett/gpu/xg_gpu_untile.h"
+#include "openscarlett/kernel/vram_residency_manager.h"
 
 #include <algorithm>
 #include <cstring>
@@ -2584,6 +2585,532 @@ Status XgGpuUntiler::ExecuteVulkan(
         out_metrics->executed_on_hardware_gpu = vk_res.executed_on_vulkan_icd;
         out_metrics->used_warp = false;
         out_metrics->used_vulkan_icd = vk_res.executed_on_vulkan_icd;
+    }
+    return Status::Ok();
+}
+
+// ============================================================================
+// Direct D3D12 / Vulkan HTILE, CMASK & DCC Fast-Clear Metadata Coherency Helpers
+// ============================================================================
+
+namespace {
+
+uint16_t FloatToHalfLocal(float f) noexcept {
+    uint32_t bits = 0u;
+    std::memcpy(&bits, &f, sizeof(bits));
+    const uint32_t sign = (bits >> 16u) & 0x8000u;
+    int32_t exp = static_cast<int32_t>((bits >> 23u) & 0xFFu) - 127 + 15;
+    uint32_t mant = bits & 0x007FFFFFu;
+    if (exp <= 0) {
+        if (exp < -10) return static_cast<uint16_t>(sign);
+        mant = (mant | 0x00800000u) >> static_cast<uint32_t>(1 - exp);
+        return static_cast<uint16_t>(sign | ((mant + 0x00001000u) >> 13u));
+    }
+    if (exp >= 31) {
+        return static_cast<uint16_t>(sign | 0x7C00u);
+    }
+    return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10u) | ((mant + 0x00001000u) >> 13u));
+}
+
+uint32_t FloatToUnormBits(float v, uint32_t bits) noexcept {
+    const float c = std::clamp(v, 0.0f, 1.0f);
+    const uint32_t max_val = (1u << bits) - 1u;
+    return static_cast<uint32_t>(c * static_cast<float>(max_val) + 0.5f);
+}
+
+uint32_t DccBlockWidthForBpe(uint32_t bpe) noexcept {
+    if (bpe < 4u) return 16u;
+    if (bpe < 16u) return 8u;
+    return 4u;
+}
+
+uint32_t DccBlockHeightForBpe(uint32_t bpe) noexcept {
+    if (bpe == 1u) return 16u;
+    if (bpe < 8u) return 8u;
+    return 4u;
+}
+
+uint8_t DccFastClearKeyForState(XG_DCC_BLOCK_STATE state) noexcept {
+    switch (state) {
+        case XG_DCC_STATE_CLEAR_0000: return 0x00u;
+        case XG_DCC_STATE_CLEAR_0001: return 0x40u;
+        case XG_DCC_STATE_CLEAR_1110: return 0x80u;
+        case XG_DCC_STATE_CLEAR_1111: return 0xC0u;
+        case XG_DCC_STATE_CLEAR_REG:  return 0x20u;
+        case XG_DCC_STATE_UNCOMPRESSED:
+        default:
+            return 0xFFu;
+    }
+}
+
+bool IsBlockInRect(
+    uint32_t bx,
+    uint32_t by,
+    uint32_t blk_w,
+    uint32_t blk_h,
+    uint32_t full_w,
+    uint32_t full_h,
+    const XgFastClearRect& rect) noexcept {
+    const uint32_t r_right = (rect.right == 0u) ? full_w : std::min(rect.right, full_w);
+    const uint32_t r_bottom = (rect.bottom == 0u) ? full_h : std::min(rect.bottom, full_h);
+    const uint32_t px0 = bx * blk_w;
+    const uint32_t py0 = by * blk_h;
+    const uint32_t px1 = px0 + blk_w;
+    const uint32_t py1 = py0 + blk_h;
+    return px0 < r_right && px1 > rect.left && py0 < r_bottom && py1 > rect.top;
+}
+
+}  // namespace
+
+void EncodeFormatFastClearRegister(
+    uint32_t dxgi_format,
+    const float rgba_clear[4],
+    float depth_clear,
+    uint8_t stencil_clear,
+    std::array<uint32_t, 4>& out_clear_reg) noexcept {
+    out_clear_reg = {0u, 0u, 0u, 0u};
+    const float r = rgba_clear ? rgba_clear[0] : 0.0f;
+    const float g = rgba_clear ? rgba_clear[1] : 0.0f;
+    const float b = rgba_clear ? rgba_clear[2] : 0.0f;
+    const float a = rgba_clear ? rgba_clear[3] : 1.0f;
+
+#if defined(_WIN32)
+    switch (static_cast<DXGI_FORMAT>(dxgi_format)) {
+        case DXGI_FORMAT_R8G8B8A8_UNORM:
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS: {
+            out_clear_reg[0] = FloatToUnormBits(r, 8u) |
+                               (FloatToUnormBits(g, 8u) << 8u) |
+                               (FloatToUnormBits(b, 8u) << 16u) |
+                               (FloatToUnormBits(a, 8u) << 24u);
+            return;
+        }
+        case DXGI_FORMAT_B8G8R8A8_UNORM:
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS: {
+            out_clear_reg[0] = FloatToUnormBits(b, 8u) |
+                               (FloatToUnormBits(g, 8u) << 8u) |
+                               (FloatToUnormBits(r, 8u) << 16u) |
+                               (FloatToUnormBits(a, 8u) << 24u);
+            return;
+        }
+        case DXGI_FORMAT_R10G10B10A2_UNORM: {
+            out_clear_reg[0] = FloatToUnormBits(r, 10u) |
+                               (FloatToUnormBits(g, 10u) << 10u) |
+                               (FloatToUnormBits(b, 10u) << 20u) |
+                               (FloatToUnormBits(a, 2u) << 30u);
+            return;
+        }
+        case DXGI_FORMAT_R16G16B16A16_FLOAT: {
+            out_clear_reg[0] = static_cast<uint32_t>(FloatToHalfLocal(r)) |
+                               (static_cast<uint32_t>(FloatToHalfLocal(g)) << 16u);
+            out_clear_reg[1] = static_cast<uint32_t>(FloatToHalfLocal(b)) |
+                               (static_cast<uint32_t>(FloatToHalfLocal(a)) << 16u);
+            return;
+        }
+        case DXGI_FORMAT_R32G32B32A32_FLOAT: {
+            std::memcpy(&out_clear_reg[0], &r, 4u);
+            std::memcpy(&out_clear_reg[1], &g, 4u);
+            std::memcpy(&out_clear_reg[2], &b, 4u);
+            std::memcpy(&out_clear_reg[3], &a, 4u);
+            return;
+        }
+        case DXGI_FORMAT_R32_FLOAT:
+        case DXGI_FORMAT_D32_FLOAT:
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT: {
+            const float val = (dxgi_format == DXGI_FORMAT_R32_FLOAT) ? r : depth_clear;
+            std::memcpy(&out_clear_reg[0], &val, 4u);
+            if (dxgi_format == DXGI_FORMAT_D32_FLOAT_S8X24_UINT) {
+                out_clear_reg[1] = static_cast<uint32_t>(stencil_clear);
+            }
+            return;
+        }
+        case DXGI_FORMAT_D16_UNORM:
+        case DXGI_FORMAT_R16_UNORM: {
+            const float val = (dxgi_format == DXGI_FORMAT_R16_UNORM) ? r : depth_clear;
+            out_clear_reg[0] = FloatToUnormBits(val, 16u);
+            return;
+        }
+        case DXGI_FORMAT_D24_UNORM_S8_UINT: {
+            const uint32_t d24 = FloatToUnormBits(depth_clear, 24u);
+            out_clear_reg[0] = (d24 & 0x00FFFFFFu) | (static_cast<uint32_t>(stencil_clear) << 24u);
+            return;
+        }
+        case DXGI_FORMAT_R8_UNORM: {
+            out_clear_reg[0] = FloatToUnormBits(r, 8u);
+            return;
+        }
+        default:
+            break;
+    }
+#else
+    (void)dxgi_format;
+    (void)depth_clear;
+    (void)stencil_clear;
+#endif
+    out_clear_reg[0] = FloatToUnormBits(r, 8u) |
+                       (FloatToUnormBits(g, 8u) << 8u) |
+                       (FloatToUnormBits(b, 8u) << 16u) |
+                       (FloatToUnormBits(a, 8u) << 24u);
+}
+
+Status BuildDccFastClearMetadata(
+    const XG_TEXTURE2D_DESC& desc,
+    XG_CONSOLE_TYPE console_type,
+    uint32_t mip_level,
+    uint32_t slice_index,
+    bool pipe_aligned,
+    XG_DCC_BLOCK_STATE clear_state,
+    const XgFastClearRect& rect,
+    std::vector<uint8_t>& out_dcc_bytes) {
+    out_dcc_bytes.clear();
+    XG_RESOURCE_LAYOUT layout{};
+    if (!xg::ComputeTexture2DLayout(desc, layout) ||
+        mip_level >= layout.MipLevels || slice_index >= layout.ArraySize) {
+        return Status::Error(StatusCode::InvalidArgument, "BuildDccFastClearMetadata invalid texture desc/subresource");
+    }
+    XG_RESOURCE_METADATA_LAYOUT meta{};
+    if (!xg::ComputeTexture2DMetadataLayout(desc, console_type, meta) || meta.Dcc.SizeBytes == 0ull) {
+        return Status::Error(StatusCode::InvalidArgument, "BuildDccFastClearMetadata failed computing metadata layout");
+    }
+    XG_SCARLETT_PIPE_CONFIG pipe_cfg{};
+    xg::QueryScarlettPipeConfig(console_type, pipe_cfg);
+
+    const XG_MIPLEVEL_LAYOUT& ml = layout.Mips[mip_level];
+    const uint32_t bpe = layout.FormatInfo.bytes_per_block;
+    const uint32_t blk_w = DccBlockWidthForBpe(bpe);
+    const uint32_t blk_h = DccBlockHeightForBpe(bpe);
+    const uint32_t blocks_x = std::max(1u, (ml.WidthElements + blk_w - 1u) / blk_w);
+    const uint32_t blocks_y = std::max(1u, (ml.HeightElements + blk_h - 1u) / blk_h);
+    const uint64_t slice_pitch = std::max<uint64_t>(
+        meta.Dcc.SlicePitchBytes, static_cast<uint64_t>(blocks_x) * blocks_y);
+    const uint64_t base_off = static_cast<uint64_t>(slice_index) * meta.Dcc.SlicePitchBytes;
+    const uint64_t total_sz = std::max<uint64_t>(meta.Dcc.SizeBytes, base_off + slice_pitch);
+
+    out_dcc_bytes.assign(static_cast<size_t>(total_sz), 0xFFu);
+    const uint8_t key = DccFastClearKeyForState(clear_state);
+    const uint32_t pipe_mask = (pipe_cfg.NumPipes > 1u) ? (pipe_cfg.NumPipes - 1u) : 0u;
+
+    for (uint32_t by = 0u; by < blocks_y; ++by) {
+        for (uint32_t bx = 0u; bx < blocks_x; ++bx) {
+            if (!IsBlockInRect(bx, by, blk_w, blk_h, ml.WidthElements, ml.HeightElements, rect)) {
+                continue;
+            }
+            uint32_t moff = by * blocks_x + bx;
+            if (pipe_aligned && meta.Dcc.SlicePitchBytes >= 256ull) {
+                const uint32_t xor_bits = ((bx >> 2u) ^ (by >> 2u) ^ mip_level ^ slice_index) & pipe_mask;
+                const uint32_t cand = moff ^ xor_bits;
+                if (cand < static_cast<uint32_t>(meta.Dcc.SlicePitchBytes)) {
+                    moff = cand;
+                }
+            }
+            if (base_off + moff < out_dcc_bytes.size()) {
+                out_dcc_bytes[static_cast<size_t>(base_off + moff)] = key;
+            }
+        }
+    }
+    return Status::Ok();
+}
+
+Status BuildHtileFastClearMetadata(
+    const XG_TEXTURE2D_DESC& desc,
+    XG_CONSOLE_TYPE console_type,
+    uint32_t slice_index,
+    const XgFastClearRect& rect,
+    float depth_clear,
+    uint8_t stencil_clear,
+    std::vector<uint8_t>& out_htile_bytes,
+    std::array<uint32_t, 4>& out_clear_reg) {
+    out_htile_bytes.clear();
+    EncodeFormatFastClearRegister(desc.Format, nullptr, depth_clear, stencil_clear, out_clear_reg);
+
+    XG_RESOURCE_LAYOUT layout{};
+    if (!xg::ComputeTexture2DLayout(desc, layout) || slice_index >= layout.ArraySize) {
+        return Status::Error(StatusCode::InvalidArgument, "BuildHtileFastClearMetadata invalid texture desc/slice");
+    }
+    XG_RESOURCE_METADATA_LAYOUT meta{};
+    if (!xg::ComputeTexture2DMetadataLayout(desc, console_type, meta)) {
+        return Status::Error(StatusCode::InvalidArgument, "BuildHtileFastClearMetadata failed computing metadata layout");
+    }
+
+    const XG_MIPLEVEL_LAYOUT& ml = layout.Mips[0];
+    const uint32_t blocks_x = std::max(1u, (ml.WidthElements + 7u) / 8u);
+    const uint32_t blocks_y = std::max(1u, (ml.HeightElements + 7u) / 8u);
+    const uint64_t min_slice = static_cast<uint64_t>(blocks_x) * blocks_y * 4ull;
+    const uint64_t slice_pitch = std::max<uint64_t>(meta.Htile.SlicePitchBytes, min_slice);
+    const uint64_t base_off = static_cast<uint64_t>(slice_index) * meta.Htile.SlicePitchBytes;
+    const uint64_t total_sz = std::max<uint64_t>(meta.Htile.SizeBytes, base_off + slice_pitch);
+
+    out_htile_bytes.assign(static_cast<size_t>(total_sz), 0u);
+    // Default expanded HTILE word: zmask = 0xF (uncompressed/expanded), full [0..1] Hi-Z range.
+    const uint32_t expanded_word = 0xFFFFFC0Fu;
+    // Fast-clear HTILE word: zmask = 0x0, minZ = maxZ = quantized clear depth (14-bit Hi-Z).
+    const uint32_t qz = FloatToUnormBits(depth_clear, 14u) & 0x3FFFu;
+    const uint32_t clear_word = (qz << 18u) | (qz << 4u);
+
+    for (size_t off = 0u; off + 4u <= out_htile_bytes.size(); off += 4u) {
+        std::memcpy(out_htile_bytes.data() + off, &expanded_word, 4u);
+    }
+    for (uint32_t by = 0u; by < blocks_y; ++by) {
+        for (uint32_t bx = 0u; bx < blocks_x; ++bx) {
+            if (!IsBlockInRect(bx, by, 8u, 8u, ml.WidthElements, ml.HeightElements, rect)) {
+                continue;
+            }
+            const uint64_t off = base_off + static_cast<uint64_t>(by * blocks_x + bx) * 4ull;
+            if (off + 4ull <= out_htile_bytes.size()) {
+                std::memcpy(out_htile_bytes.data() + off, &clear_word, 4u);
+            }
+        }
+    }
+    return Status::Ok();
+}
+
+Status BuildCmaskFastClearMetadata(
+    const XG_TEXTURE2D_DESC& desc,
+    XG_CONSOLE_TYPE console_type,
+    uint32_t slice_index,
+    const XgFastClearRect& rect,
+    std::vector<uint8_t>& out_cmask_bytes) {
+    out_cmask_bytes.clear();
+    XG_RESOURCE_LAYOUT layout{};
+    if (!xg::ComputeTexture2DLayout(desc, layout) || slice_index >= layout.ArraySize) {
+        return Status::Error(StatusCode::InvalidArgument, "BuildCmaskFastClearMetadata invalid texture desc/slice");
+    }
+    XG_RESOURCE_METADATA_LAYOUT meta{};
+    if (!xg::ComputeTexture2DMetadataLayout(desc, console_type, meta)) {
+        return Status::Error(StatusCode::InvalidArgument, "BuildCmaskFastClearMetadata failed computing metadata layout");
+    }
+
+    const XG_MIPLEVEL_LAYOUT& ml = layout.Mips[0];
+    const uint32_t blocks_x = std::max(1u, (ml.WidthElements + 7u) / 8u);
+    const uint32_t blocks_y = std::max(1u, (ml.HeightElements + 7u) / 8u);
+    const uint64_t min_slice = (static_cast<uint64_t>(blocks_x) * blocks_y + 1ull) / 2ull;
+    const uint64_t slice_pitch = std::max<uint64_t>(meta.Cmask.SlicePitchBytes, min_slice);
+    const uint64_t base_off = static_cast<uint64_t>(slice_index) * meta.Cmask.SlicePitchBytes;
+    const uint64_t total_sz = std::max<uint64_t>(meta.Cmask.SizeBytes, base_off + slice_pitch);
+
+    // 0xFF => both nibbles 0xF (expanded / uncompressed)
+    out_cmask_bytes.assign(static_cast<size_t>(total_sz), 0xFFu);
+    for (uint32_t by = 0u; by < blocks_y; ++by) {
+        for (uint32_t bx = 0u; bx < blocks_x; ++bx) {
+            if (!IsBlockInRect(bx, by, 8u, 8u, ml.WidthElements, ml.HeightElements, rect)) {
+                continue;
+            }
+            const uint32_t bidx = by * blocks_x + bx;
+            const uint64_t byte_off = base_off + static_cast<uint64_t>(bidx >> 1u);
+            if (byte_off < out_cmask_bytes.size()) {
+                if ((bidx & 1u) == 0u) {
+                    out_cmask_bytes[static_cast<size_t>(byte_off)] &= 0xF0u;  // low nibble = 0x0 (fast clear)
+                } else {
+                    out_cmask_bytes[static_cast<size_t>(byte_off)] &= 0x0Fu;  // high nibble = 0x0 (fast clear)
+                }
+            }
+        }
+    }
+    return Status::Ok();
+}
+
+Status ResetFastClearMetadataToExpanded(
+    XgGpuMetadataMode mode,
+    std::vector<uint8_t>& io_meta_bytes) noexcept {
+    if (mode == XgGpuMetadataMode::None || io_meta_bytes.empty()) {
+        return Status::Ok();
+    }
+    if (mode == XgGpuMetadataMode::Dcc || mode == XgGpuMetadataMode::Cmask) {
+        std::fill(io_meta_bytes.begin(), io_meta_bytes.end(), static_cast<uint8_t>(0xFFu));
+        return Status::Ok();
+    }
+    if (mode == XgGpuMetadataMode::Htile) {
+        const uint32_t expanded_word = 0xFFFFFC0Fu;
+        for (size_t off = 0u; off + 4u <= io_meta_bytes.size(); off += 4u) {
+            std::memcpy(io_meta_bytes.data() + off, &expanded_word, 4u);
+        }
+        return Status::Ok();
+    }
+    return Status::Error(StatusCode::InvalidArgument, "Unknown XgGpuMetadataMode");
+}
+
+Status ExpandAndSyncFastClearMetadata2D(
+    XgGpuUntiler* untiler,
+    const XgGpuSurface2DRequest& req,
+    const std::vector<uint8_t>& src_tiled_bytes,
+    std::vector<uint8_t>& io_meta_bytes,
+    std::vector<uint8_t>& out_linear_bytes,
+    bool reset_metadata_after_expand,
+    bool use_vulkan,
+    XgFastClearMetadataSyncStats* out_stats) {
+    XgGpuSurface2DRequest untile_req = req;
+    untile_req.direction = XgGpuDirection::Untile;
+
+    XgGpuUntileParams params{};
+    uint64_t linear_bytes = 0ull;
+    uint64_t tiled_bytes = 0ull;
+    Status st = BuildXgGpuUntileParams2D(untile_req, params, &linear_bytes, &tiled_bytes);
+    if (!st.ok()) return st;
+
+    if (src_tiled_bytes.size() < tiled_bytes) {
+        return Status::Error(StatusCode::InvalidArgument, "ExpandAndSyncFastClearMetadata2D: tiled source too small");
+    }
+
+    // Count fast-cleared vs uncompressed metadata blocks before resetting.
+    XgFastClearMetadataSyncStats local_stats{};
+    if (untile_req.metadata_mode == XgGpuMetadataMode::Dcc) {
+        const uint32_t blk_w = DccBlockWidthForBpe(params.bpe);
+        const uint32_t blk_h = DccBlockHeightForBpe(params.bpe);
+        const uint32_t blocks_x = params.meta_blocks_x;
+        const uint32_t blocks_y = std::max(1u, (params.height_elems + blk_h - 1u) / blk_h);
+        const uint32_t pipe_mask = (params.meta_num_pipes > 1u) ? (params.meta_num_pipes - 1u) : 0u;
+        local_stats.total_meta_blocks = blocks_x * blocks_y;
+        for (uint32_t by = 0u; by < blocks_y; ++by) {
+            for (uint32_t bx = 0u; bx < blocks_x; ++bx) {
+                uint32_t moff = by * blocks_x + bx;
+                if (params.meta_pipe_aligned != 0u && params.meta_slice_pitch >= 256u) {
+                    const uint32_t xor_bits =
+                        ((bx >> 2u) ^ (by >> 2u) ^ params.mip_level ^ params.slice_index) & pipe_mask;
+                    const uint32_t cand = moff ^ xor_bits;
+                    if (cand < params.meta_slice_pitch) moff = cand;
+                }
+                const size_t idx = static_cast<size_t>(params.meta_base_offset) + moff;
+                const uint8_t key = (idx < io_meta_bytes.size()) ? io_meta_bytes[idx] : 0xFFu;
+                if (key == 0x00u || key == 0x40u || key == 0x80u || key == 0xC0u || key == 0x20u) {
+                    ++local_stats.fast_cleared_blocks_expanded;
+                } else {
+                    ++local_stats.uncompressed_blocks_preserved;
+                }
+            }
+        }
+        (void)blk_w;
+    } else if (untile_req.metadata_mode == XgGpuMetadataMode::Htile) {
+        const uint32_t blocks_x = params.meta_blocks_x;
+        const uint32_t blocks_y = std::max(1u, (params.height_elems + 7u) / 8u);
+        local_stats.total_meta_blocks = blocks_x * blocks_y;
+        for (uint32_t by = 0u; by < blocks_y; ++by) {
+            for (uint32_t bx = 0u; bx < blocks_x; ++bx) {
+                const size_t off =
+                    static_cast<size_t>(params.meta_base_offset) +
+                    static_cast<size_t>(by * blocks_x + bx) * 4u;
+                uint32_t hword = 0xFFFFFC0Fu;
+                if (off + 4u <= io_meta_bytes.size()) {
+                    std::memcpy(&hword, io_meta_bytes.data() + off, 4u);
+                }
+                if ((hword & 0xFu) == 0u) {
+                    ++local_stats.fast_cleared_blocks_expanded;
+                } else {
+                    ++local_stats.uncompressed_blocks_preserved;
+                }
+            }
+        }
+    } else if (untile_req.metadata_mode == XgGpuMetadataMode::Cmask) {
+        const uint32_t blocks_x = params.meta_blocks_x;
+        const uint32_t blocks_y = std::max(1u, (params.height_elems + 7u) / 8u);
+        local_stats.total_meta_blocks = blocks_x * blocks_y;
+        for (uint32_t by = 0u; by < blocks_y; ++by) {
+            for (uint32_t bx = 0u; bx < blocks_x; ++bx) {
+                const uint32_t bidx = by * blocks_x + bx;
+                const size_t off = static_cast<size_t>(params.meta_base_offset) + (bidx >> 1u);
+                const uint8_t cbyte = (off < io_meta_bytes.size()) ? io_meta_bytes[off] : 0xFFu;
+                const uint8_t nib = ((bidx & 1u) == 0u) ? (cbyte & 0x0Fu) : ((cbyte >> 4u) & 0x0Fu);
+                if (nib == 0u) {
+                    ++local_stats.fast_cleared_blocks_expanded;
+                } else {
+                    ++local_stats.uncompressed_blocks_preserved;
+                }
+            }
+        }
+    }
+
+    out_linear_bytes.assign(static_cast<size_t>(linear_bytes), 0u);
+    bool gpu_done = false;
+    XgGpuDispatchMetrics metrics{};
+
+    if (untiler) {
+        if (use_vulkan && untiler->IsVulkanHardwareIcd()) {
+            st = untiler->ExecuteVulkan(params, src_tiled_bytes, out_linear_bytes, &io_meta_bytes, &metrics);
+            if (!st.ok()) return st;
+            gpu_done = true;
+            local_stats.executed_on_gpu = true;
+            local_stats.backend_name = metrics.backend_name;
+        }
+#if defined(_WIN32)
+        else if (!use_vulkan && untiler->IsD3D12Ready()) {
+            st = untiler->ExecuteD3D12(params, src_tiled_bytes, out_linear_bytes, &io_meta_bytes, &metrics);
+            if (!st.ok()) return st;
+            gpu_done = true;
+            local_stats.executed_on_gpu = true;
+            local_stats.backend_name = metrics.backend_name;
+        }
+#endif
+    }
+
+    if (!gpu_done) {
+        // CPU fallback: untile base surface then coherently apply fast-clear metadata blocks.
+        if (!xg::UntileSurface2DPlane(
+                untile_req.desc,
+                untile_req.plane,
+                untile_req.mip_level,
+                untile_req.slice_index,
+                src_tiled_bytes.data(),
+                src_tiled_bytes.size(),
+                out_linear_bytes.data(),
+                params.linear_row_pitch)) {
+            return Status::Error(StatusCode::DeviceError, "CPU fallback untile failed during metadata sync");
+        }
+        const uint32_t blk_w = DccBlockWidthForBpe(params.bpe);
+        const uint32_t blk_h = DccBlockHeightForBpe(params.bpe);
+        const uint32_t pipe_mask = (params.meta_num_pipes > 1u) ? (params.meta_num_pipes - 1u) : 0u;
+        for (uint32_t y = 0u; y < params.height_elems; ++y) {
+            for (uint32_t x = 0u; x < params.width_elems; ++x) {
+                const uint32_t* clear_src = nullptr;
+                if (untile_req.metadata_mode == XgGpuMetadataMode::Dcc) {
+                    const uint32_t bx = x / blk_w;
+                    const uint32_t by = y / blk_h;
+                    uint32_t moff = by * params.meta_blocks_x + bx;
+                    if (params.meta_pipe_aligned != 0u && params.meta_slice_pitch >= 256u) {
+                        const uint32_t xor_bits =
+                            ((bx >> 2u) ^ (by >> 2u) ^ params.mip_level ^ params.slice_index) & pipe_mask;
+                        const uint32_t cand = moff ^ xor_bits;
+                        if (cand < params.meta_slice_pitch) moff = cand;
+                    }
+                    const size_t idx = static_cast<size_t>(params.meta_base_offset) + moff;
+                    const uint8_t key = (idx < io_meta_bytes.size()) ? io_meta_bytes[idx] : 0xFFu;
+                    if (key == 0x00u) clear_src = params.clear_0000;
+                    else if (key == 0x40u) clear_src = params.clear_0001;
+                    else if (key == 0x80u) clear_src = params.clear_1110;
+                    else if (key == 0xC0u) clear_src = params.clear_1111;
+                    else if (key == 0x20u) clear_src = params.clear_reg;
+                } else if (untile_req.metadata_mode == XgGpuMetadataMode::Htile) {
+                    const size_t off = static_cast<size_t>(params.meta_base_offset) +
+                                       static_cast<size_t>((y >> 3u) * params.meta_blocks_x + (x >> 3u)) * 4u;
+                    uint32_t hword = 0xFFFFFC0Fu;
+                    if (off + 4u <= io_meta_bytes.size()) {
+                        std::memcpy(&hword, io_meta_bytes.data() + off, 4u);
+                    }
+                    if ((hword & 0xFu) == 0u) clear_src = params.clear_reg;
+                } else if (untile_req.metadata_mode == XgGpuMetadataMode::Cmask) {
+                    const uint32_t bidx = (y >> 3u) * params.meta_blocks_x + (x >> 3u);
+                    const size_t off = static_cast<size_t>(params.meta_base_offset) + (bidx >> 1u);
+                    const uint8_t cbyte = (off < io_meta_bytes.size()) ? io_meta_bytes[off] : 0xFFu;
+                    const uint8_t nib = ((bidx & 1u) == 0u) ? (cbyte & 0x0Fu) : ((cbyte >> 4u) & 0x0Fu);
+                    if (nib == 0u) clear_src = params.clear_reg;
+                }
+                if (clear_src) {
+                    const size_t dst_off =
+                        static_cast<size_t>(y) * params.linear_row_pitch + static_cast<size_t>(x) * params.bpe;
+                    std::memcpy(out_linear_bytes.data() + dst_off, clear_src, params.bpe);
+                }
+            }
+        }
+        local_stats.executed_on_gpu = false;
+        local_stats.backend_name = "CPU-CoherentFallback";
+    }
+
+    if (reset_metadata_after_expand) {
+        st = ResetFastClearMetadataToExpanded(untile_req.metadata_mode, io_meta_bytes);
+        if (!st.ok()) return st;
+    }
+
+    if (out_stats) {
+        *out_stats = std::move(local_stats);
     }
     return Status::Ok();
 }
