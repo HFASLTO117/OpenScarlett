@@ -36,6 +36,7 @@
 
 #include "launcher_resource.h"
 #include "launcher_theme.h"
+#include "launcher_probe_bridge.h"
 #include "openscarlett/launcher/hwtest_runner.h"
 #include "openscarlett/launcher/updater.h"
 
@@ -76,6 +77,9 @@ enum ControlId : int {
     kIdBtnStop         = 2010,
     kIdBtnClearLog     = 2011,
     kIdEditLaunchLog   = 2012,
+    kIdChkProbeMode    = 2013,
+    kIdBtnCopyTelemetry = 2014,
+    kIdLblProbeStatus  = 2015,
     kIdBtnDemo0        = 2020,
     kIdBtnDemo1        = 2021,
     kIdBtnDemo2        = 2022,
@@ -958,6 +962,14 @@ private:
         ::EnableWindow(h_btn_stop_, FALSE);
         h_btn_clear_log_ = CreateOwnerBtn(kIdBtnClearLog, L"Clear Log");
 
+        h_chk_probe_mode_ = ::CreateWindowExW(
+            0, L"BUTTON", L"First-Boot Probe (missing imports + VEH)",
+            WS_CHILD | WS_TABSTOP | BS_AUTOCHECKBOX,
+            0, 0, 290, 24,
+            hwnd_, reinterpret_cast<HMENU>(static_cast<INT_PTR>(kIdChkProbeMode)), hinst_, nullptr);
+        h_btn_copy_telemetry_ = CreateOwnerBtn(kIdBtnCopyTelemetry, L"Copy Sanitized Telemetry");
+        h_lbl_probe_status_ = CreateDarkLabel(L"Telemetry ready (usernames & local paths auto-stripped)");
+
         // Quick-launch bundled demos (up to 3 slots)
         const wchar_t* fallback_demo_names[3] = {
             L"ScarlettDoom",
@@ -986,6 +998,7 @@ private:
             h_lbl_backend_, h_combo_backend_, h_lbl_adapter_, h_combo_adapter_,
             h_chk_windowed_, h_chk_null_audio_, h_lbl_args_, h_edit_args_,
             h_btn_launch_, h_btn_stop_, h_btn_clear_log_,
+            h_chk_probe_mode_, h_btn_copy_telemetry_, h_lbl_probe_status_,
             h_btn_demos_[0], h_btn_demos_[1], h_btn_demos_[2],
             h_edit_launch_log_,
         };
@@ -1078,6 +1091,7 @@ private:
         for (HWND h : tab_hw_ctrls_) set_font(h, theme_.font_ui);
         for (HWND h : tab_pe_ctrls_) set_font(h, theme_.font_ui);
         for (HWND h : mono_controls_) set_font(h, theme_.font_mono);
+        set_font(h_lbl_probe_status_, theme_.font_small);
         set_font(h_lbl_report_path_, theme_.font_small);
     }
 
@@ -1168,9 +1182,9 @@ private:
         const int card_w = cw - pad * 2;
 
         if (active_tab_ == kTabPlay) {
-            // Card 1: Launch configuration (y = body_top, h = 166)
+            // Card 1: Launch configuration (y = body_top, h = 200)
             const int c1_y = body_top;
-            const int c1_h = ScalePx(164, dpi_);
+            const int c1_h = ScalePx(200, dpi_);
             play_card1_ = {pad, c1_y, pad + card_w, c1_y + c1_h};
 
             const int x0 = pad + inner;
@@ -1221,6 +1235,17 @@ private:
             ::MoveWindow(h_btn_stop_, bx, y, btn_stop_w, ScalePx(32, dpi_), TRUE);
             bx += btn_stop_w + gap;
             ::MoveWindow(h_btn_clear_log_, bx, y, btn_clr_w, ScalePx(32, dpi_), TRUE);
+
+            // Row 4: First-Boot Probe Mode + Copy Sanitized Telemetry + Status
+            y += ScalePx(38, dpi_);
+            const int chk_probe_w = ScalePx(286, dpi_);
+            const int btn_copy_tel_w = ScalePx(188, dpi_);
+            ::MoveWindow(h_chk_probe_mode_, x0, y + ScalePx(3, dpi_), chk_probe_w, ScalePx(24, dpi_), TRUE);
+            const int copy_x = x0 + chk_probe_w + ScalePx(10, dpi_);
+            ::MoveWindow(h_btn_copy_telemetry_, copy_x, y, btn_copy_tel_w, ScalePx(30, dpi_), TRUE);
+            const int st_x = copy_x + btn_copy_tel_w + ScalePx(12, dpi_);
+            const int st_w = std::max<int>(ScalePx(120, dpi_), rx - st_x);
+            ::MoveWindow(h_lbl_probe_status_, st_x, y + ScalePx(4, dpi_), st_w, ScalePx(22, dpi_), TRUE);
 
             // Card 2: Quick-Launch Bundled Demos (h = 78)
             const int c2_y = c1_y + c1_h + ScalePx(10, dpi_);
@@ -1804,6 +1829,7 @@ private:
         req.windowed = (::SendMessageW(h_chk_windowed_, BM_GETCHECK, 0, 0) == BST_CHECKED);
         req.null_audio = (::SendMessageW(h_chk_null_audio_, BM_GETCHECK, 0, 0) == BST_CHECKED);
         req.extra_args = GetEditTextUtf8(h_edit_args_);
+        const bool probe_mode = (::SendMessageW(h_chk_probe_mode_, BM_GETCHECK, 0, 0) == BST_CHECKED);
 
         launch_running_.store(true);
         cancel_launch_.store(false);
@@ -1811,13 +1837,18 @@ private:
         ::EnableWindow(h_btn_launch_, FALSE);
         ::EnableWindow(h_btn_stop_, TRUE);
         AppendTextToEdit(h_edit_launch_log_, "\n=== Launching: " + target + " ===\n");
+        if (probe_mode) {
+            AppendTextToEdit(h_edit_launch_log_,
+                             "[First-Boot Probe] --probe-unknown-imports + VEH crash monitor enabled\n");
+            ::SetWindowTextW(h_lbl_probe_status_, L"Running in First-Boot Probe Mode...");
+        }
         ::InvalidateRect(hwnd_, &play_telemetry_rect_, FALSE);
 
         if (launch_thread_.joinable()) launch_thread_.join();
         const fs::path bdir = opts_.bundle_dir;
-        launch_thread_ = std::thread([this, bdir, req]() {
-            auto res = LaunchTargetWithOpenScarlett(
-                bdir, req,
+        launch_thread_ = std::thread([this, bdir, req, probe_mode]() {
+            auto res = LaunchTargetWithProbeOption(
+                bdir, req, probe_mode,
                 [this](const std::string& line) {
                     if (shutting_down_.load()) return;
                     auto* s = new std::string(line + "\n");
@@ -2023,6 +2054,7 @@ private:
                 } else if (dis->CtlID == kIdBtnStop || dis->CtlID == kIdBtnCancelHwTest) {
                     role = ButtonRole::Danger;
                 } else if (dis->CtlID == kIdBtnOpenGitHub || dis->CtlID == kIdBtnInspectNow ||
+                           dis->CtlID == kIdBtnCopyTelemetry ||
                            (dis->CtlID >= kIdBtnDemo0 && dis->CtlID <= kIdBtnDemo2)) {
                     role = ButtonRole::AccentBlue;
                 }
@@ -2163,6 +2195,29 @@ private:
                     case kIdBtnClearLog:
                         ::SetWindowTextW(h_edit_launch_log_, L"");
                         return 0;
+
+                    case kIdBtnCopyTelemetry: {
+                        std::string sanitized;
+                        std::string source_label;
+                        const std::string log_text = GetEditTextUtf8(h_edit_launch_log_);
+                        if (BuildSanitizedLatestTelemetryForClipboard(
+                                opts_.bundle_dir,
+                                last_launch_.telemetry_path,
+                                log_text,
+                                sanitized,
+                                source_label) &&
+                            CopyTextToClipboard(sanitized)) {
+                            const std::string status =
+                                "Copied sanitized telemetry (" + source_label + ", " +
+                                std::to_string(sanitized.size()) + " B) to clipboard";
+                            ::SetWindowTextW(h_lbl_probe_status_, Utf8ToWide(status).c_str());
+                            AppendTextToEdit(h_edit_launch_log_, "[Telemetry] " + status + "\n");
+                        } else {
+                            ::SetWindowTextW(h_lbl_probe_status_,
+                                             L"Failed to copy sanitized telemetry to clipboard");
+                        }
+                        return 0;
+                    }
 
                     case kIdBtnDemo0:
                     case kIdBtnDemo1:
@@ -2332,6 +2387,11 @@ private:
                         oss << "Error: " << last_launch_.error_message << "\n";
                     }
                     AppendTextToEdit(h_edit_launch_log_, oss.str());
+                    if (!last_launch_.telemetry_path.empty()) {
+                        const std::string status =
+                            "Telemetry captured (" + last_launch_.telemetry_path.filename().string() + ")";
+                        ::SetWindowTextW(h_lbl_probe_status_, Utf8ToWide(status).c_str());
+                    }
                     ::InvalidateRect(hwnd, &play_telemetry_rect_, FALSE);
                 }
                 return 0;
@@ -2547,6 +2607,9 @@ private:
     HWND h_btn_launch_ = nullptr;
     HWND h_btn_stop_ = nullptr;
     HWND h_btn_clear_log_ = nullptr;
+    HWND h_chk_probe_mode_ = nullptr;
+    HWND h_btn_copy_telemetry_ = nullptr;
+    HWND h_lbl_probe_status_ = nullptr;
     HWND h_btn_demos_[3]{};
     HWND h_edit_launch_log_ = nullptr;
 
