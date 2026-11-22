@@ -1,7 +1,6 @@
 #pragma once
 #include <DirectXMath.h>
 #include <DirectXPackedVector.h>
-#include <Windows.h>
 
 // Clean-room MIT DirectXTK12 SimpleMath subset for untouched Xbox-GDK-Samples.
 
@@ -14,16 +13,7 @@ struct Matrix : public XMFLOAT4X4 {
               1.f, 0.f, 0.f, 0.f,
               0.f, 1.f, 0.f, 0.f,
               0.f, 0.f, 1.f, 0.f,
-              0.f, 0.f, 0.f, 1.f) {
-        static bool s_logged = false;
-        if (!s_logged) {
-            s_logged = true;
-            char buf[4]{};
-            if (::GetEnvironmentVariableA("OPENSCARLETT_TRACE_ODS", buf, sizeof(buf)) == 1u && buf[0] == '1') {
-                ::OutputDebugStringA("TRACE: SimpleMath::Matrix reached\n");
-            }
-        }
-    }
+              0.f, 0.f, 0.f, 1.f) {}
 
     Matrix(const Matrix&) = default;
     Matrix& operator=(const Matrix&) = default;

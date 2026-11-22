@@ -75,11 +75,14 @@ if(WIN32 AND MSVC)
                 "${_os_gdkx_headers}"
                 "${sample_dir}"
             )
+            # NOTE: Do NOT define UNICODE / _UNICODE here! Microsoft's untouched GDKX Main.cpp
+            # uses WNDCLASSEXA + RegisterClassExA + CreateWindowExA + DefWindowProc (ANSI/UTF-8
+            # via utf8.manifest). Defining UNICODE turns DefWindowProc into DefWindowProcW, which
+            # misinterprets ANSI CREATESTRUCTA::lpszName as UTF-16 during WM_NCCREATE and can
+            # cause CreateWindowExA to return NULL (GetLastError() == 0) depending on .rdata layout.
             target_compile_definitions(${target_name} PRIVATE
                 _GAMING_XBOX_SCARLETT=1
                 _GAMING_XBOX=1
-                UNICODE
-                _UNICODE
             )
             # Link ONLY OpenScarlett's GDKX shim libs + standard Win32 OS libs
             # (kernelx precedes xgameruntime so appnotify.h resolves to kernelx.dll, matching GDKX)

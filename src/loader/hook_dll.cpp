@@ -143,8 +143,6 @@ using PfnCreateProcessW = BOOL(WINAPI*)(LPCWSTR,
                                         LPPROCESS_INFORMATION);
 using PfnExitProcess = VOID(WINAPI*)(UINT);
 using PfnOutputDebugStringA = VOID(WINAPI*)(LPCSTR);
-using PfnRegisterClassExA = ATOM(WINAPI*)(const WNDCLASSEXA*);
-using PfnCreateWindowExA = HWND(WINAPI*)(DWORD, LPCSTR, LPCSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
 
 PfnLoadLibraryA g_real_LoadLibraryA = nullptr;
 PfnLoadLibraryW g_real_LoadLibraryW = nullptr;
@@ -172,8 +170,6 @@ PfnCreateProcessA g_kernelbase_CreateProcessA = nullptr;
 PfnCreateProcessW g_kernelbase_CreateProcessW = nullptr;
 PfnExitProcess g_real_ExitProcess = nullptr;
 PfnOutputDebugStringA g_real_OutputDebugStringA = nullptr;
-PfnRegisterClassExA g_real_RegisterClassExA = nullptr;
-PfnCreateWindowExA g_real_CreateWindowExA = nullptr;
 bool g_trace_ods = false;
 PfnNtCreateFile g_real_NtCreateFile = nullptr;
 PfnNtOpenFile g_real_NtOpenFile = nullptr;
@@ -392,7 +388,6 @@ bool IsHookableImportDll(const char* dll_name) {
     if (lo == "kernel32.dll" ||
         lo == "kernelbase.dll" ||
         lo == "ntdll.dll" ||
-        (g_trace_ods && lo == "user32.dll") ||
         lo.rfind("api-ms-win-core-", 0) == 0) {
         return true;
     }
@@ -2369,42 +2364,6 @@ VOID WINAPI Hook_OutputDebugStringA(LPCSTR lpOutputString) {
     }
 }
 
-ATOM WINAPI Hook_RegisterClassExA(const WNDCLASSEXA* lpwcx) {
-    ATOM a = g_real_RegisterClassExA ? g_real_RegisterClassExA(lpwcx) : 0;
-    const DWORD err = ::GetLastError();
-    if (g_trace_ods) {
-        std::fprintf(stderr, "[guest:USER32] RegisterClassExA(cls=%s, cb=%u, hInst=%p) -> atom=%u err=%lu\n",
-                     (lpwcx && lpwcx->lpszClassName) ? lpwcx->lpszClassName : "<null>",
-                     lpwcx ? static_cast<unsigned>(lpwcx->cbSize) : 0u,
-                     lpwcx ? static_cast<void*>(lpwcx->hInstance) : nullptr,
-                     static_cast<unsigned>(a), static_cast<unsigned long>(err));
-        std::fflush(stderr);
-    }
-    ::SetLastError(err);
-    return a;
-}
-
-HWND WINAPI Hook_CreateWindowExA(DWORD dwExStyle, LPCSTR lpClassName, LPCSTR lpWindowName, DWORD dwStyle,
-                                 int X, int Y, int nWidth, int nHeight, HWND hWndParent, HMENU hMenu,
-                                 HINSTANCE hInstance, LPVOID lpParam) {
-    HWND hw = g_real_CreateWindowExA
-                  ? g_real_CreateWindowExA(dwExStyle, lpClassName, lpWindowName, dwStyle, X, Y, nWidth, nHeight,
-                                           hWndParent, hMenu, hInstance, lpParam)
-                  : nullptr;
-    const DWORD err = ::GetLastError();
-    if (g_trace_ods) {
-        std::fprintf(stderr, "[guest:USER32] CreateWindowExA(cls=%s, title=%s, hInst=%p) -> hwnd=%p err=%lu\n",
-                     lpClassName ? lpClassName : "<null>",
-                     lpWindowName ? lpWindowName : "<null>",
-                     static_cast<void*>(hInstance),
-                     static_cast<void*>(hw),
-                     static_cast<unsigned long>(err));
-        std::fflush(stderr);
-    }
-    ::SetLastError(err);
-    return hw;
-}
-
 VOID WINAPI Hook_ExitProcess(UINT uExitCode) {
     if (g_trace_ods && uExitCode != 0u) {
         const DWORD last_err = ::GetLastError();
@@ -2479,10 +2438,6 @@ void* ResolveHookForSymbol(const char* name) {
          reinterpret_cast<void**>(&g_real_ExitProcess)},
         {"OutputDebugStringA", reinterpret_cast<void*>(&Hook_OutputDebugStringA),
          reinterpret_cast<void**>(&g_real_OutputDebugStringA)},
-        {"RegisterClassExA", reinterpret_cast<void*>(&Hook_RegisterClassExA),
-         reinterpret_cast<void**>(&g_real_RegisterClassExA)},
-        {"CreateWindowExA", reinterpret_cast<void*>(&Hook_CreateWindowExA),
-         reinterpret_cast<void**>(&g_real_CreateWindowExA)},
         {"NtCreateFile", reinterpret_cast<void*>(&Hook_NtCreateFile),
          reinterpret_cast<void**>(&g_real_NtCreateFile)},
         {"NtOpenFile", reinterpret_cast<void*>(&Hook_NtOpenFile),
@@ -2534,8 +2489,6 @@ void* ResolveHookForRealAddress(ULONGLONG addr) {
     if (void* p = match(g_kernelbase_CreateProcessW, &Hook_CreateProcessW)) return p;
     if (void* p = match(g_real_ExitProcess, &Hook_ExitProcess)) return p;
     if (void* p = match(g_real_OutputDebugStringA, &Hook_OutputDebugStringA)) return p;
-    if (void* p = match(g_real_RegisterClassExA, &Hook_RegisterClassExA)) return p;
-    if (void* p = match(g_real_CreateWindowExA, &Hook_CreateWindowExA)) return p;
     if (void* p = match(g_real_NtCreateFile, &Hook_NtCreateFile)) return p;
     if (void* p = match(g_real_NtOpenFile, &Hook_NtOpenFile)) return p;
     if (void* p = match(g_real_NtQueryAttributesFile, &Hook_NtQueryAttributesFile)) return p;
@@ -2955,18 +2908,6 @@ bool InitializeHookRuntime(HMODULE self_mod) {
     g_real_OutputDebugStringA =
         reinterpret_cast<PfnOutputDebugStringA>(::GetProcAddress(k32, "OutputDebugStringA"));
     g_trace_ods = (ReadEnvW(L"OPENSCARLETT_TRACE_ODS") == L"1");
-    if (g_trace_ods) {
-        HMODULE u32 = ::GetModuleHandleW(L"user32.dll");
-        if (!u32) {
-            u32 = g_real_LoadLibraryW ? g_real_LoadLibraryW(L"user32.dll") : ::LoadLibraryW(L"user32.dll");
-        }
-        if (u32) {
-            g_real_RegisterClassExA =
-                reinterpret_cast<PfnRegisterClassExA>(::GetProcAddress(u32, "RegisterClassExA"));
-            g_real_CreateWindowExA =
-                reinterpret_cast<PfnCreateWindowExA>(::GetProcAddress(u32, "CreateWindowExA"));
-        }
-    }
     if (g_ntdll_mod != nullptr) {
         g_real_NtCreateFile =
             reinterpret_cast<PfnNtCreateFile>(::GetProcAddress(g_ntdll_mod, "NtCreateFile"));
