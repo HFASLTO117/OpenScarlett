@@ -60,8 +60,11 @@ enum class IrOp : uint16_t {
     WavePermLane16,         // [vsrc0, ssrc1, ssrc2], imm_u32=0 (same 16-lane row) / 1 (cross-16 X16) -> u32
 
     // Mesh & Amplification Shader ops (SM 6.5)
+    MeshGlobalThreadId,     // [] -> group * NumThreads + lane (mesh v5 seeding)
+    MergedWaveInfo,         // [] -> full packed merged_wave_info in s3
     SetMeshOutputCounts,    // [vert_count_u32, prim_count_u32] -> void
     ExportMeshPrim,         // [i0_u32, i1_u32, i2_u32] (imm_u32=0) or [packed_u32] (imm_u32=1) -> void
+    ExportMeshCull,         // [cull_bool] -> void (CullPrimitiveEXT / SV_CullPrimitive)
     DispatchMeshGroups,     // [gx_u32, gy_u32, gz_u32] -> void
 
     // Floating-point arithmetic
@@ -77,6 +80,7 @@ enum class IrOp : uint16_t {
     FRsq,
     FSqrt,
     FFloor,
+    FCeil,
     FFract,
     FDot2,          // V_DOT2_F32_F16(a_packed, b_packed, c_f32)
 
@@ -93,6 +97,8 @@ enum class IrOp : uint16_t {
     BitCount32,     // operands: [src_u32] -> u32 (strictly low 32-bit popcount for S_BCNT1_I32_B32)
     Shl,
     Shr,
+    AlignByte,      // operands: [src0_hi, src1_lo, src2_byte_sel] -> u32 (UB-safe shift < 32)
+    BufferLoadFormat, // operands: [byte_addr_u32], imm_u32 = uav_slot | (fmt<<4) | (comp<<12) | (d16<<16) -> u32/f32
 
     // 32-bit bitfield ops (V_BFE_U32, V_BFE_I32, V_BFI_B32)
     BfeU32,         // operands: [src0, offset, width] -> u32
@@ -123,6 +129,9 @@ enum class IrOp : uint16_t {
     CmpEqU,
     CmpGtU,
     CmpGeU,
+    CmpF16,         // operands: [a_u32, b_u32], imm_u32 = cmp_code(0..15) | (op_sel<<8) | (neg<<12) | (abs<<16) -> Bool
+    LogicalAnd,     // operands: [bool_a, bool_b] -> Bool
+    LogicalNot,     // operands: [bool_a] -> Bool
 
     // Selection & SSA merge
     Select,         // operands: [cond_bool, true_val, false_val]
@@ -150,6 +159,7 @@ struct IrInstruction {
     uint32_t false_block = 0;
     uint8_t export_target = 0;
     uint8_t export_mask = 0xFu;
+    IrValueId exec_pred = kInvalidIrValue;  // Optional active-lane predicate (e.g. from V_CMPX)
 };
 
 struct IrBasicBlock {
@@ -164,7 +174,40 @@ struct Rdna2IrOptStats {
     uint32_t initial_ops = 0;
     uint32_t final_ops = 0;
     uint32_t folded_constants = 0;
+    uint32_t pruned_mask_ops = 0;
     uint32_t eliminated_ops = 0;
+};
+
+// Interpolation mode contract between Pixel Shader and its feeder stage (VS / GS / MS)
+enum class Rdna2InterpMode : uint8_t {
+    Perspective = 0,
+    NoPerspective,
+    Flat,
+    Centroid,
+    Sample,
+};
+
+// Vertex-fetch subroutine table entry (VS prolog / S_SWAPPC_B64 mapping)
+struct VertexFetchEntry {
+    uint32_t table_index = 0;
+    uint32_t vb_slot = 0;
+    uint32_t byte_offset = 0;
+    Rdna2MtbufFormat format = Rdna2MtbufFormat::R32G32B32A32_FLOAT;
+    uint8_t dst_vgpr = 0;
+    uint8_t num_components = 4;
+};
+
+// FSSM (Fragment/Split Shader Model) pixel-input parameter mapping entry
+struct FssmPixelInputEntry {
+    uint32_t param_slot = 0;
+    uint32_t semantic_location = 0;
+    Rdna2InterpMode interp_mode = Rdna2InterpMode::Perspective;
+    uint8_t component_mask = 0xFu;
+};
+
+struct StageContractTable {
+    std::vector<VertexFetchEntry> vertex_fetches;
+    std::vector<FssmPixelInputEntry> pixel_inputs;
 };
 
 struct Rdna2IrModule {
@@ -202,9 +245,16 @@ struct Rdna2IrModule {
     bool exports_mrt0 = false;
     bool exports_param0 = false;
     bool exports_prim = false;
+    bool uses_mesh_cull = false;
+    bool uses_mesh_global_tid = false;
+    bool uses_merged_wave_info = false;
     bool mesh_has_payload = true;
+    uint32_t mesh_num_threads = 1;
     uint32_t mesh_max_vertices = 64;
     uint32_t mesh_max_primitives = 64;
+    StageContractTable stage_contract{};
+    std::vector<Rdna2InterpMode> output_interp_modes;
+    std::vector<Rdna2InterpMode> input_interp_modes;
 
     std::vector<IrBasicBlock> blocks;
     Rdna2IrOptStats opt_stats{};
@@ -236,7 +286,11 @@ bool IrOpHasSideEffects(IrOp op) noexcept;
 Status BuildRdna2Ir(
     const Xs2ShaderContainer& container,
     const std::vector<Rdna2Instruction>& instructions,
-    Rdna2IrModule& out_module);
+    Rdna2IrModule& out_module,
+    const StageContractTable* stage_contract = nullptr);
+
+// Reconciles interpolation modifiers (Flat / NoPerspective / Centroid / Sample) between PS and its feeder stage.
+void ReconcileStageInterpolation(Rdna2IrModule& feeder_ir, Rdna2IrModule& ps_ir) noexcept;
 
 // Runs Constant Folding and Dead-Code Elimination passes on an IR module.
 Status OptimizeRdna2Ir(Rdna2IrModule& module, Rdna2IrOptStats* out_stats = nullptr);
