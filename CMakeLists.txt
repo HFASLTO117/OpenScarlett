@@ -121,6 +121,7 @@ foreach(_os_module_cmake
     cmake/sprint11_xvd_loader_lsa.cmake
     cmake/sprint11_rdna2_gpu_verify.cmake
     cmake/sprint12_d3d12_aaa.cmake
+    cmake/sprint12_xbox_shader.cmake
 )
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_os_module_cmake}")
         include("${CMAKE_CURRENT_SOURCE_DIR}/${_os_module_cmake}")

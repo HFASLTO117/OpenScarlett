@@ -1,4 +1,5 @@
 #include "openscarlett/gpu/rdna2_lifter.h"
+#include "openscarlett/gpu/rdna2_xbox_container.h"
 
 #include <algorithm>
 #include <atomic>
@@ -152,6 +153,8 @@ enum SpirvOp : uint16_t {
     SpvOpLabel = 248,
     SpvOpBranch = 249,
     SpvOpBranchConditional = 250,
+    SpvOpSwitch = 251,
+    SpvOpKill = 252,
     SpvOpReturn = 253,
     SpvOpEmitMeshTasksEXT = 5294,
     SpvOpSetMeshOutputsEXT = 5295,
@@ -282,6 +285,44 @@ bool ModuleUsesStageInput(const Rdna2IrModule& ir) {
     }
     return false;
 }
+
+uint32_t ModuleParamOutputCount(const Rdna2IrModule& ir) noexcept {
+    uint32_t count = ir.exports_param0 ? 1u : 0u;
+    for (const auto& bb : ir.blocks) {
+        for (const auto& inst : bb.instructions) {
+            if (inst.op == IrOp::Export &&
+                inst.export_target >= static_cast<uint8_t>(Rdna2ExportTarget::Param0) &&
+                inst.export_target <= static_cast<uint8_t>(Rdna2ExportTarget::Param3)) {
+                const uint32_t slot = static_cast<uint32_t>(
+                    inst.export_target - static_cast<uint8_t>(Rdna2ExportTarget::Param0));
+                if (slot + 1u > count) count = slot + 1u;
+            }
+        }
+    }
+    if (count > 0u && ir.output_interp_modes.size() > count) {
+        count = std::min<uint32_t>(4u, static_cast<uint32_t>(ir.output_interp_modes.size()));
+    }
+    return std::min<uint32_t>(4u, count);
+}
+
+uint32_t ModuleParamInputCount(const Rdna2IrModule& ir) noexcept {
+    uint32_t count = 0u;
+    for (const auto& bb : ir.blocks) {
+        for (const auto& inst : bb.instructions) {
+            if (inst.op == IrOp::StageInput) {
+                const uint32_t slot = (inst.imm_u32 >> 2) & 3u;
+                if (slot + 1u > count) count = slot + 1u;
+            }
+        }
+    }
+    return std::min<uint32_t>(4u, count);
+}
+
+Rdna2InterpMode SafeInterpMode(const std::vector<Rdna2InterpMode>& modes, uint32_t slot) noexcept {
+    return (slot < modes.size()) ? modes[slot] : Rdna2InterpMode::Perspective;
+}
+
+constexpr uint32_t kIrKillExportMagicLifter = 0xDEAD0001u;
 
 bool ModuleUsesThreadId(const Rdna2IrModule& ir) {
     for (const auto& bb : ir.blocks) {
@@ -997,10 +1038,8 @@ public:
                    "}\n";
         }
 
-        const Rdna2InterpMode out_interp0 =
-            !ir_.output_interp_modes.empty() ? ir_.output_interp_modes[0] : Rdna2InterpMode::Perspective;
-        const Rdna2InterpMode in_interp0 =
-            !ir_.input_interp_modes.empty() ? ir_.input_interp_modes[0] : Rdna2InterpMode::Perspective;
+        const uint32_t param_out_count = ModuleParamOutputCount(ir_);
+        const uint32_t param_in_count = uses_stage_in ? std::max(1u, ModuleParamInputCount(ir_)) : 0u;
         cull_dist_count_ =
             (ir_.stage == ShaderStage::Vertex || ir_.stage == ShaderStage::Geometry || ir_.stage == ShaderStage::Mesh)
                 ? ModuleCullDistanceCount(ir_)
@@ -1024,8 +1063,9 @@ public:
                 out_target = use_sm65_ ? "vs_6_5" : "vs_5_0";
                 hdr << "struct VSOut {\n";
                 hdr << "    float4 pos : SV_POSITION;\n";
-                if (ir_.exports_param0) {
-                    hdr << "    " << HlslInterpModifier(out_interp0) << "float4 param0 : TEXCOORD0;\n";
+                for (uint32_t p = 0u; p < param_out_count; ++p) {
+                    hdr << "    " << HlslInterpModifier(SafeInterpMode(ir_.output_interp_modes, p))
+                        << "float4 param" << p << " : TEXCOORD" << p << ";\n";
                 }
                 if (cull_dist_count_ > 0u) {
                     hdr << "    float4 cull_dist0 : SV_CullDistance0;\n";
@@ -1037,8 +1077,8 @@ public:
                 hdr << "VSOut main(uint _vid : SV_VertexID) {\n";
                 hdr << "    VSOut _out;\n";
                 hdr << "    _out.pos = float4(0.0, 0.0, 0.0, 1.0);\n";
-                if (ir_.exports_param0) {
-                    hdr << "    _out.param0 = float4(0.0, 0.0, 0.0, 1.0);\n";
+                for (uint32_t p = 0u; p < param_out_count; ++p) {
+                    hdr << "    _out.param" << p << " = float4(0.0, 0.0, 0.0, 1.0);\n";
                 }
                 if (cull_dist_count_ > 0u) {
                     hdr << "    _out.cull_dist0 = float4(0.0, 0.0, 0.0, 0.0);\n";
@@ -1051,8 +1091,9 @@ public:
                 out_target = use_sm65_ ? "ps_6_5" : "ps_5_0";
                 hdr << "struct PSIn {\n";
                 hdr << "    float4 pos : SV_POSITION;\n";
-                if (uses_stage_in) {
-                    hdr << "    " << HlslInterpModifier(in_interp0) << "float4 param0 : TEXCOORD0;\n";
+                for (uint32_t p = 0u; p < param_in_count; ++p) {
+                    hdr << "    " << HlslInterpModifier(SafeInterpMode(ir_.input_interp_modes, p))
+                        << "float4 param" << p << " : TEXCOORD" << p << ";\n";
                 }
                 hdr << "};\n";
                 hdr << "float4 main(PSIn _in) : SV_TARGET0 {\n";
@@ -1065,8 +1106,9 @@ public:
                 hdr << "};\n";
                 hdr << "struct GSOut {\n";
                 hdr << "    float4 pos : SV_POSITION;\n";
-                if (ir_.exports_param0) {
-                    hdr << "    " << HlslInterpModifier(out_interp0) << "float4 param0 : TEXCOORD0;\n";
+                for (uint32_t p = 0u; p < param_out_count; ++p) {
+                    hdr << "    " << HlslInterpModifier(SafeInterpMode(ir_.output_interp_modes, p))
+                        << "float4 param" << p << " : TEXCOORD" << p << ";\n";
                 }
                 if (cull_dist_count_ > 0u) {
                     hdr << "    float4 cull_dist0 : SV_CullDistance0;\n";
@@ -1079,8 +1121,8 @@ public:
                 hdr << "void main(triangle GSIn _gs_in[3], inout TriangleStream<GSOut> _gs_stream) {\n";
                 hdr << "    GSOut _gs_out;\n";
                 hdr << "    _gs_out.pos = float4(0.0, 0.0, 0.0, 1.0);\n";
-                if (ir_.exports_param0) {
-                    hdr << "    _gs_out.param0 = float4(0.0, 0.0, 0.0, 1.0);\n";
+                for (uint32_t p = 0u; p < param_out_count; ++p) {
+                    hdr << "    _gs_out.param" << p << " = float4(0.0, 0.0, 0.0, 1.0);\n";
                 }
                 if (cull_dist_count_ > 0u) {
                     hdr << "    _gs_out.cull_dist0 = float4(0.0, 0.0, 0.0, 0.0);\n";
@@ -1106,8 +1148,9 @@ public:
                 }
                 hdr << "struct MeshVert {\n";
                 hdr << "    float4 pos : SV_POSITION;\n";
-                if (ir_.exports_param0) {
-                    hdr << "    " << HlslInterpModifier(out_interp0) << "float4 param0 : TEXCOORD0;\n";
+                for (uint32_t p = 0u; p < param_out_count; ++p) {
+                    hdr << "    " << HlslInterpModifier(SafeInterpMode(ir_.output_interp_modes, p))
+                        << "float4 param" << p << " : TEXCOORD" << p << ";\n";
                 }
                 if (cull_dist_count_ > 0u) {
                     hdr << "    float4 cull_dist0 : SV_CullDistance0;\n";
@@ -1255,9 +1298,12 @@ public:
         const bool wrap_as_single_dispatch =
             (!bounded_wave64_dispatcher_ && ir_.stage == ShaderStage::Amplification);
         const int base_depth = (bounded_wave64_dispatcher_ || wrap_as_single_dispatch) ? 2 : 1;
+        Rdna2CfgAnalysis cfg_info{};
+        AnalyzeRdna2Cfg(ir_, cfg_info);
         std::ostringstream body;
         std::unordered_set<uint32_t> visited;
-        if (EmitStructured(body, 0u, UINT32_MAX, base_depth, visited)) {
+        if (!cfg_info.has_cycles && !cfg_info.is_irreducible &&
+            EmitStructured(body, 0u, UINT32_MAX, base_depth, visited)) {
             if (wrap_as_single_dispatch) {
                 hdr << "    do {\n";
                 hdr << body.str();
@@ -1341,23 +1387,46 @@ private:
     void EmitPhiCopies(std::ostringstream& os, uint32_t from_bb, uint32_t to_bb, int depth) const {
         if (to_bb >= ir_.blocks.size()) return;
         const auto& dst_bb = ir_.blocks[to_bb];
+        struct PhiCopy {
+            IrValueId dst_id;
+            IrType dst_type;
+            IrValueId src_id;
+        };
+        std::vector<PhiCopy> copies;
         for (const auto& inst : dst_bb.instructions) {
             if (inst.op != IrOp::Phi) continue;
             for (const auto& inc : inst.phi_incoming) {
                 if (inc.first == from_bb) {
-                    os << Indent(depth) << "_v" << inst.id << " = ";
-                    if (inst.type == IrType::F32) {
-                        os << AsF32(inc.second);
-                    } else if (inst.type == IrType::Bool) {
-                        os << AsBool(inc.second);
-                    } else {
-                        os << AsU32(inc.second);
-                    }
-                    os << ";\n";
+                    copies.push_back({inst.id, inst.type, inc.second});
                     break;
                 }
             }
         }
+        if (copies.empty()) return;
+        if (copies.size() == 1u) {
+            const auto& c = copies[0];
+            os << Indent(depth) << "_v" << c.dst_id << " = ";
+            if (c.dst_type == IrType::F32) os << AsF32(c.src_id);
+            else if (c.dst_type == IrType::Bool) os << AsBool(c.src_id);
+            else os << AsU32(c.src_id);
+            os << ";\n";
+            return;
+        }
+        // Parallel-safe copy for multiple loop-carried Phis
+        os << Indent(depth) << "{\n";
+        for (size_t k = 0u; k < copies.size(); ++k) {
+            const auto& c = copies[k];
+            const char* ty = (c.dst_type == IrType::F32) ? "float" : (c.dst_type == IrType::Bool ? "bool" : "uint");
+            os << Indent(depth + 1) << ty << " _pt" << k << " = ";
+            if (c.dst_type == IrType::F32) os << AsF32(c.src_id);
+            else if (c.dst_type == IrType::Bool) os << AsBool(c.src_id);
+            else os << AsU32(c.src_id);
+            os << ";\n";
+        }
+        for (size_t k = 0u; k < copies.size(); ++k) {
+            os << Indent(depth + 1) << "_v" << copies[k].dst_id << " = _pt" << k << ";\n";
+        }
+        os << Indent(depth) << "}\n";
     }
 
     bool HasPhiCopies(uint32_t from_bb, uint32_t to_bb) const {
@@ -1436,9 +1505,11 @@ private:
                     }
                     break;
                 }
-                case IrOp::StageInput:
-                    os << ind << "_v" << inst.id << " = _in.param0." << kSwiz[inst.imm_u32 & 3u] << ";\n";
+                case IrOp::StageInput: {
+                    const uint32_t pslot = (inst.imm_u32 >> 2) & 3u;
+                    os << ind << "_v" << inst.id << " = _in.param" << pslot << "." << kSwiz[inst.imm_u32 & 3u] << ";\n";
                     break;
+                }
                 case IrOp::LoadRootConst:
                     os << ind << "_v" << inst.id << " = _rc" << inst.imm_u32 << ";\n";
                     break;
@@ -1589,8 +1660,13 @@ private:
                 }
                 case IrOp::ScratchStore: {
                     const uint32_t scr_mask = (ir_.scratch_size_dwords ? ir_.scratch_size_dwords : 64u) - 1u;
-                    os << ind << "_scratch[((" << AsU32(inst.operands[0]) << ") >> 2u) & " << scr_mask
-                       << "u] = " << AsU32(inst.operands[1]) << ";\n";
+                    if (inst.exec_pred != kInvalidIrValue) {
+                        os << ind << "if (" << AsBool(inst.exec_pred) << ") { _scratch[((" << AsU32(inst.operands[0])
+                           << ") >> 2u) & " << scr_mask << "u] = " << AsU32(inst.operands[1]) << "; }\n";
+                    } else {
+                        os << ind << "_scratch[((" << AsU32(inst.operands[0]) << ") >> 2u) & " << scr_mask
+                           << "u] = " << AsU32(inst.operands[1]) << ";\n";
+                    }
                     break;
                 }
                 case IrOp::WaveLaneId:
@@ -2067,6 +2143,16 @@ private:
                     }
                     break;
                 case IrOp::Export: {
+                    if (inst.export_target == static_cast<uint8_t>(Rdna2ExportTarget::Null) &&
+                        inst.imm_u32 == kIrKillExportMagicLifter &&
+                        ir_.stage == ShaderStage::Pixel) {
+                        if (inst.operands.empty()) {
+                            os << ind << "discard;\n";
+                        } else {
+                            os << ind << "if (" << AsBool(inst.operands[0]) << ") { discard; }\n";
+                        }
+                        break;
+                    }
                     const std::string vec = "float4(" + AsF32(inst.operands[0]) + ", " + AsF32(inst.operands[1]) +
                                             ", " + AsF32(inst.operands[2]) + ", " + AsF32(inst.operands[3]) + ")";
                     const char* mesh_idx = bounded_wave64_dispatcher_ ? "_w64_gtid" : "_gtid";
@@ -2080,14 +2166,17 @@ private:
                             os << ind << "_gs_out.pos = " << vec << ";\n";
                             os << ind << "_gs_stream.Append(_gs_out);\n";
                         }
-                    } else if (inst.export_target == static_cast<uint8_t>(Rdna2ExportTarget::Param0)) {
+                    } else if (inst.export_target >= static_cast<uint8_t>(Rdna2ExportTarget::Param0) &&
+                               inst.export_target <= static_cast<uint8_t>(Rdna2ExportTarget::Param3)) {
+                        const uint32_t pslot = static_cast<uint32_t>(
+                            inst.export_target - static_cast<uint8_t>(Rdna2ExportTarget::Param0));
                         if (ir_.stage == ShaderStage::Vertex) {
-                            os << ind << "_out.param0 = " << vec << ";\n";
+                            os << ind << "_out.param" << pslot << " = " << vec << ";\n";
                         } else if (ir_.stage == ShaderStage::Mesh) {
                             os << ind << "if (" << mesh_idx << " < _mesh_vcnt) { _verts["
-                               << mesh_idx << "].param0 = " << vec << "; }\n";
+                               << mesh_idx << "].param" << pslot << " = " << vec << "; }\n";
                         } else if (ir_.stage == ShaderStage::Geometry) {
-                            os << ind << "_gs_out.param0 = " << vec << ";\n";
+                            os << ind << "_gs_out.param" << pslot << " = " << vec << ";\n";
                         }
                     } else if ((inst.export_target == static_cast<uint8_t>(Rdna2ExportTarget::Pos2) ||
                                 inst.export_target == static_cast<uint8_t>(Rdna2ExportTarget::Pos3)) &&
@@ -2250,36 +2339,43 @@ private:
         const std::string i1 = Indent(base_depth + 1);
         const std::string i2 = Indent(base_depth + 2);
         const std::string i3 = Indent(base_depth + 3);
-        os << i0 << "uint _bb = 0u;\n";
-        os << i0 << "[loop] while (_bb != 0xFFFFFFFFu) {\n";
+        const std::string i4 = Indent(base_depth + 4);
+        os << i0 << "uint _cfg_state = 0u;\n";
+        os << i0 << "[loop] while (true) {\n";
+        os << i1 << "if (_cfg_state == 0xFFFFFFFFu) { break; }\n";
+        os << i1 << "switch (_cfg_state) {\n";
         for (size_t i = 0; i < ir_.blocks.size(); ++i) {
             const auto& bb = ir_.blocks[i];
-            os << i1 << (i == 0 ? "if" : "else if") << " (_bb == " << bb.id << "u) {\n";
-            EmitNonTerminators(os, bb, base_depth + 2);
+            os << i2 << "case " << bb.id << "u: {\n";
+            EmitNonTerminators(os, bb, base_depth + 3);
             if (!bb.instructions.empty()) {
                 const auto& term = bb.instructions.back();
                 if (term.op == IrOp::Return) {
-                    os << i2 << "_bb = 0xFFFFFFFFu;\n";
+                    os << i3 << "_cfg_state = 0xFFFFFFFFu;\n";
                 } else if (term.op == IrOp::Branch) {
-                    EmitPhiCopies(os, bb.id, term.true_block, base_depth + 2);
-                    os << i2 << "_bb = " << term.true_block << "u;\n";
-                } else if (term.op == IrOp::CondBranch) {
-                    os << i2 << "if (" << AsBool(term.operands[0]) << ") {\n";
                     EmitPhiCopies(os, bb.id, term.true_block, base_depth + 3);
-                    os << i3 << "_bb = " << term.true_block << "u;\n";
-                    os << i2 << "} else {\n";
-                    EmitPhiCopies(os, bb.id, term.false_block, base_depth + 3);
-                    os << i3 << "_bb = " << term.false_block << "u;\n";
-                    os << i2 << "}\n";
+                    os << i3 << "_cfg_state = " << term.true_block << "u;\n";
+                } else if (term.op == IrOp::CondBranch) {
+                    os << i3 << "if (" << AsBool(term.operands[0]) << ") {\n";
+                    EmitPhiCopies(os, bb.id, term.true_block, base_depth + 4);
+                    os << i4 << "_cfg_state = " << term.true_block << "u;\n";
+                    os << i3 << "} else {\n";
+                    EmitPhiCopies(os, bb.id, term.false_block, base_depth + 4);
+                    os << i4 << "_cfg_state = " << term.false_block << "u;\n";
+                    os << i3 << "}\n";
                 } else {
-                    os << i2 << "_bb = 0xFFFFFFFFu;\n";
+                    os << i3 << "_cfg_state = 0xFFFFFFFFu;\n";
                 }
             } else {
-                os << i2 << "_bb = 0xFFFFFFFFu;\n";
+                os << i3 << "_cfg_state = 0xFFFFFFFFu;\n";
             }
-            os << i1 << "}\n";
+            os << i3 << "break;\n";
+            os << i2 << "}\n";
         }
-        os << i1 << "else { _bb = 0xFFFFFFFFu; }\n";
+        os << i2 << "default:\n";
+        os << i3 << "_cfg_state = 0xFFFFFFFFu;\n";
+        os << i3 << "break;\n";
+        os << i1 << "}\n";
         os << i0 << "}\n";
     }
 
@@ -2457,6 +2553,7 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
             interface_vars.push_back(var_id);
         }
     };
+    bool emitted_sample_rate_cap = false;
     auto emit_interp_decor = [&](uint32_t var_id, Rdna2InterpMode mode) {
         if (var_id == 0u) return;
         if (mode == Rdna2InterpMode::Flat) {
@@ -2466,6 +2563,10 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         } else if (mode == Rdna2InterpMode::Centroid) {
             EmitSpvInst(sec_decor, SpvOpDecorate, {var_id, kSpvDecCentroid});
         } else if (mode == Rdna2InterpMode::Sample) {
+            if (!emitted_sample_rate_cap) {
+                EmitSpvInst(sec_caps, SpvOpCapability, {35u});  // SampleRateShading
+                emitted_sample_rate_cap = true;
+            }
             EmitSpvInst(sec_decor, SpvOpDecorate, {var_id, kSpvDecSample});
         }
     };
@@ -2487,9 +2588,11 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
     uint32_t var_dm_x = 0;
     uint32_t var_dm_y = 0;
     uint32_t var_dm_z = 0;
-    uint32_t var_param0_out = 0;
-    uint32_t var_param0_in = 0;
+    uint32_t var_param_out[4] = {0u, 0u, 0u, 0u};
+    uint32_t var_param_in[4] = {0u, 0u, 0u, 0u};
     uint32_t var_mrt0 = 0;
+    const uint32_t param_out_count = ModuleParamOutputCount(ir);
+    const uint32_t param_in_count = ModuleUsesStageInput(ir) ? std::max(1u, ModuleParamInputCount(ir)) : 0u;
 
     // Storage buffers (SPIR-V 1.3 core StorageBuffer + Block)
     uint32_t var_uav0 = 0;
@@ -2772,11 +2875,6 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         }
     }
 
-    const Rdna2InterpMode out_interp0 =
-        !ir.output_interp_modes.empty() ? ir.output_interp_modes[0] : Rdna2InterpMode::Perspective;
-    const Rdna2InterpMode in_interp0 =
-        !ir.input_interp_modes.empty() ? ir.input_interp_modes[0] : Rdna2InterpMode::Perspective;
-
     if (ir.stage == ShaderStage::Vertex) {
         if (uses_tid) {
             const uint32_t t_ptr_in_i32 = alloc_id();
@@ -2810,12 +2908,12 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_out_pv, var_pervertex, kSpvStorageOutput});
         interface_vars.push_back(var_pervertex);
 
-        if (ir.exports_param0) {
-            var_param0_out = alloc_id();
-            EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_out_v4f32, var_param0_out, kSpvStorageOutput});
-            EmitSpvInst(sec_decor, SpvOpDecorate, {var_param0_out, kSpvDecLocation, 0u});
-            emit_interp_decor(var_param0_out, out_interp0);
-            interface_vars.push_back(var_param0_out);
+        for (uint32_t p = 0u; p < param_out_count; ++p) {
+            var_param_out[p] = alloc_id();
+            EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_out_v4f32, var_param_out[p], kSpvStorageOutput});
+            EmitSpvInst(sec_decor, SpvOpDecorate, {var_param_out[p], kSpvDecLocation, p});
+            emit_interp_decor(var_param_out[p], SafeInterpMode(ir.output_interp_modes, p));
+            interface_vars.push_back(var_param_out[p]);
         }
     }
 
@@ -2866,16 +2964,18 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_out_pv_arr, var_pervertex, kSpvStorageOutput});
         interface_vars.push_back(var_pervertex);
 
-        if (ir.exports_param0) {
+        if (param_out_count > 0u) {
             const uint32_t t_arr_v4 = alloc_id();
             const uint32_t t_ptr_out_arr_v4 = alloc_id();
             EmitSpvInst(sec_types, SpvOpTypeArray, {t_arr_v4, t_v4f32, c_max_v});
             EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_out_arr_v4, kSpvStorageOutput, t_arr_v4});
-            var_param0_out = alloc_id();
-            EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_out_arr_v4, var_param0_out, kSpvStorageOutput});
-            EmitSpvInst(sec_decor, SpvOpDecorate, {var_param0_out, kSpvDecLocation, 0u});
-            emit_interp_decor(var_param0_out, out_interp0);
-            interface_vars.push_back(var_param0_out);
+            for (uint32_t p = 0u; p < param_out_count; ++p) {
+                var_param_out[p] = alloc_id();
+                EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_out_arr_v4, var_param_out[p], kSpvStorageOutput});
+                EmitSpvInst(sec_decor, SpvOpDecorate, {var_param_out[p], kSpvDecLocation, p});
+                emit_interp_decor(var_param_out[p], SafeInterpMode(ir.output_interp_modes, p));
+                interface_vars.push_back(var_param_out[p]);
+            }
         }
 
         // Primitive triangle indices output array
@@ -2947,14 +3047,16 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
     }
 
     if (ir.stage == ShaderStage::Pixel) {
-        if (uses_stage_in) {
+        if (uses_stage_in && param_in_count > 0u) {
             const uint32_t t_ptr_in_v4f32 = alloc_id();
             EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_in_v4f32, kSpvStorageInput, t_v4f32});
-            var_param0_in = alloc_id();
-            EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_in_v4f32, var_param0_in, kSpvStorageInput});
-            EmitSpvInst(sec_decor, SpvOpDecorate, {var_param0_in, kSpvDecLocation, 0u});
-            emit_interp_decor(var_param0_in, in_interp0);
-            interface_vars.push_back(var_param0_in);
+            for (uint32_t p = 0u; p < param_in_count; ++p) {
+                var_param_in[p] = alloc_id();
+                EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_in_v4f32, var_param_in[p], kSpvStorageInput});
+                EmitSpvInst(sec_decor, SpvOpDecorate, {var_param_in[p], kSpvDecLocation, p});
+                emit_interp_decor(var_param_in[p], SafeInterpMode(ir.input_interp_modes, p));
+                interface_vars.push_back(var_param_in[p]);
+            }
         }
         t_ptr_out_v4f32 = alloc_id();
         EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_out_v4f32, kSpvStorageOutput, t_v4f32});
@@ -3006,12 +3108,26 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         }
     }
 
-    // 5. Block labels, immediate post-dominators (for OpSelectionMerge), and value IDs
+    // 5. Block labels, CFG cycle/irreducibility analysis, immediate post-dominators, and value IDs
+    Rdna2CfgAnalysis spv_cfg{};
+    AnalyzeRdna2Cfg(ir, spv_cfg);
+    bool has_backward_block_edge = false;
+    for (size_t b = 0; b < ir.blocks.size() && !has_backward_block_edge; ++b) {
+        for (uint32_t s : ir.blocks[b].successors) {
+            if (s <= b) {
+                has_backward_block_edge = true;
+                break;
+            }
+        }
+    }
+    const bool use_spv_state_machine =
+        (spv_cfg.has_cycles || spv_cfg.is_irreducible || has_backward_block_edge);
+
     const std::vector<uint32_t> ipdom = ComputeImmediatePostDominators(ir);
     const bool has_cond_branch = ModuleHasCondBranch(ir);
     const uint32_t exit_node = static_cast<uint32_t>(ir.blocks.size());
     bool need_epilogue = is_task_stage;
-    if (has_cond_branch) {
+    if (!use_spv_state_machine && has_cond_branch) {
         for (size_t b = 0; b < ir.blocks.size(); ++b) {
             const auto& ins = ir.blocks[b].instructions;
             if (!ins.empty() && ins.back().op == IrOp::CondBranch && ipdom[b] == exit_node) {
@@ -3027,12 +3143,42 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
     }
     const uint32_t epilogue_label = need_epilogue ? alloc_id() : 0u;
 
+    uint32_t t_ptr_fn_f32 = 0u;
+    uint32_t t_ptr_fn_bool = 0u;
+    uint32_t var_cfg_state = 0u;
+    uint32_t lbl_sm_hdr = 0u;
+    uint32_t lbl_sm_dispatch = 0u;
+    uint32_t lbl_sm_default = 0u;
+    uint32_t lbl_sm_sw_merge = 0u;
+    uint32_t lbl_sm_cont = 0u;
+    uint32_t lbl_sm_exit = 0u;
+    std::unordered_map<IrValueId, uint32_t> val_fn_var;
+
+    if (use_spv_state_machine) {
+        if (t_ptr_fn_u32 == 0u) {
+            t_ptr_fn_u32 = alloc_id();
+            EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_fn_u32, kSpvStorageFunction, t_u32});
+        }
+        t_ptr_fn_f32 = alloc_id();
+        t_ptr_fn_bool = alloc_id();
+        EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_fn_f32, kSpvStorageFunction, t_f32});
+        EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_fn_bool, kSpvStorageFunction, t_bool});
+        lbl_sm_hdr = alloc_id();
+        lbl_sm_dispatch = alloc_id();
+        lbl_sm_default = alloc_id();
+        lbl_sm_sw_merge = alloc_id();
+        lbl_sm_cont = alloc_id();
+        lbl_sm_exit = alloc_id();
+    }
+
     std::unordered_map<IrValueId, uint32_t> val_spv_id;
     std::unordered_map<IrValueId, SpvValKind> val_kind;
+    std::vector<std::pair<IrValueId, SpvValKind>> sm_fn_var_order;
     for (const auto& bb : ir.blocks) {
         for (const auto& inst : bb.instructions) {
             if (inst.id == kInvalidIrValue) continue;
-            val_kind[inst.id] = CanonicalSpvKind(inst.type);
+            const SpvValKind k = CanonicalSpvKind(inst.type);
+            val_kind[inst.id] = k;
             if (inst.op == IrOp::ConstU32) {
                 if (inst.type == IrType::Bool) {
                     val_spv_id[inst.id] = get_const_bool(inst.imm_u32 != 0u);
@@ -3041,6 +3187,11 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                 }
             } else if (inst.op == IrOp::ConstF32) {
                 val_spv_id[inst.id] = get_const_f32(inst.imm_f32);
+            } else if (use_spv_state_machine) {
+                const uint32_t v_id = alloc_id();
+                val_fn_var[inst.id] = v_id;
+                val_spv_id[inst.id] = v_id;
+                sm_fn_var_order.emplace_back(inst.id, k);
             } else {
                 val_spv_id[inst.id] = alloc_id();
             }
@@ -3053,8 +3204,20 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         return t_u32;
     };
 
+    auto get_raw_val = [&](IrValueId v) -> uint32_t {
+        if (use_spv_state_machine) {
+            auto it = val_fn_var.find(v);
+            if (it != val_fn_var.end()) {
+                const uint32_t loaded = alloc_id();
+                EmitSpvInst(sec_fn, SpvOpLoad, {spv_type_for_kind(val_kind[v]), loaded, it->second});
+                return loaded;
+            }
+        }
+        return val_spv_id[v];
+    };
+
     auto get_as_u32 = [&](IrValueId v) -> uint32_t {
-        const uint32_t id = val_spv_id[v];
+        const uint32_t id = get_raw_val(v);
         const SpvValKind k = val_kind[v];
         if (k == SpvValKind::U32) return id;
         if (k == SpvValKind::F32) {
@@ -3075,7 +3238,7 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
     };
 
     auto get_as_f32 = [&](IrValueId v) -> uint32_t {
-        const uint32_t id = val_spv_id[v];
+        const uint32_t id = get_raw_val(v);
         const SpvValKind k = val_kind[v];
         if (k == SpvValKind::F32) return id;
         uint32_t u = get_as_u32(v);
@@ -3085,13 +3248,54 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
     };
 
     auto get_as_bool = [&](IrValueId v) -> uint32_t {
-        const uint32_t id = val_spv_id[v];
+        const uint32_t id = get_raw_val(v);
         const SpvValKind k = val_kind[v];
         if (k == SpvValKind::Bool) return id;
         uint32_t u = get_as_u32(v);
         uint32_t cmp_id = alloc_id();
         EmitSpvInst(sec_fn, SpvOpINotEqual, {t_bool, cmp_id, u, c_u32_0});
         return cmp_id;
+    };
+
+    auto emit_sm_fn_vars = [&]() {
+        if (!use_spv_state_machine) return;
+        var_cfg_state = alloc_id();
+        EmitSpvInst(sec_fn, SpvOpVariable, {t_ptr_fn_u32, var_cfg_state, kSpvStorageFunction, c_u32_0});
+        for (const auto& entry : sm_fn_var_order) {
+            const uint32_t v_id = val_fn_var[entry.first];
+            if (entry.second == SpvValKind::F32) {
+                EmitSpvInst(sec_fn, SpvOpVariable, {t_ptr_fn_f32, v_id, kSpvStorageFunction, c_f32_0});
+            } else if (entry.second == SpvValKind::Bool) {
+                EmitSpvInst(sec_fn, SpvOpVariable,
+                            {t_ptr_fn_bool, v_id, kSpvStorageFunction, get_const_bool(false)});
+            } else {
+                EmitSpvInst(sec_fn, SpvOpVariable, {t_ptr_fn_u32, v_id, kSpvStorageFunction, c_u32_0});
+            }
+        }
+    };
+
+    auto emit_sm_phi_copies = [&](uint32_t from_bb, uint32_t to_bb) {
+        if (!use_spv_state_machine || to_bb >= ir.blocks.size()) return;
+        std::vector<std::pair<uint32_t, uint32_t>> staged;  // (dst_fn_var, loaded_val)
+        for (const auto& inst : ir.blocks[to_bb].instructions) {
+            if (inst.op != IrOp::Phi) continue;
+            auto it_dst = val_fn_var.find(inst.id);
+            if (it_dst == val_fn_var.end()) continue;
+            for (const auto& inc : inst.phi_incoming) {
+                if (inc.first == from_bb) {
+                    const SpvValKind k = CanonicalSpvKind(inst.type);
+                    uint32_t v_val = (k == SpvValKind::F32)
+                                         ? get_as_f32(inc.second)
+                                         : (k == SpvValKind::Bool ? get_as_bool(inc.second)
+                                                                  : get_as_u32(inc.second));
+                    staged.emplace_back(it_dst->second, v_val);
+                    break;
+                }
+            }
+        }
+        for (const auto& s : staged) {
+            EmitSpvInst(sec_fn, SpvOpStore, {s.first, s.second});
+        }
     };
 
     auto emit_wg_barrier = [&]() {
@@ -3129,17 +3333,19 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
     std::unordered_map<uint64_t, uint32_t> phi_edge_override;
     std::vector<std::vector<PhiEdgeFixup>> block_exit_fixups(ir.blocks.size());
 
-    for (const auto& bb : ir.blocks) {
-        for (const auto& inst : bb.instructions) {
-            if (inst.op != IrOp::Phi) continue;
-            const SpvValKind expected = CanonicalSpvKind(inst.type);
-            for (const auto& inc : inst.phi_incoming) {
-                const uint32_t pred = inc.first;
-                const IrValueId v = inc.second;
-                if (val_kind[v] != expected && pred < ir.blocks.size()) {
-                    const uint32_t coerced = alloc_id();
-                    block_exit_fixups[pred].push_back({inst.id, expected, v, coerced});
-                    phi_edge_override[(static_cast<uint64_t>(inst.id) << 32) | pred] = coerced;
+    if (!use_spv_state_machine) {
+        for (const auto& bb : ir.blocks) {
+            for (const auto& inst : bb.instructions) {
+                if (inst.op != IrOp::Phi) continue;
+                const SpvValKind expected = CanonicalSpvKind(inst.type);
+                for (const auto& inc : inst.phi_incoming) {
+                    const uint32_t pred = inc.first;
+                    const IrValueId v = inc.second;
+                    if (val_kind[v] != expected && pred < ir.blocks.size()) {
+                        const uint32_t coerced = alloc_id();
+                        block_exit_fixups[pred].push_back({inst.id, expected, v, coerced});
+                        phi_edge_override[(static_cast<uint64_t>(inst.id) << 32) | pred] = coerced;
+                    }
                 }
             }
         }
@@ -3147,9 +3353,9 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
 
     // 6. Emit Function Body
     EmitSpvInst(sec_fn, SpvOpFunction, {t_void, main_fn_id, 0u, t_fn_void});
+    const uint32_t first_body_target = use_spv_state_machine ? lbl_sm_hdr : bb_labels[0];
 
-    // TaskEXT entry preamble: declare Function-scope dispatch count variables (default 1,1,1),
-    // zero-initialize TaskPayloadWorkgroupEXT on lane 0, cooperatively zero-init LDS if used, then barrier.
+    // TaskEXT entry preamble: declare Function-scope variables first, then zero-init TaskPayload + LDS.
     if (is_task_stage) {
         const uint32_t lbl_task_entry = alloc_id();
         const uint32_t lbl_tp_zero = alloc_id();
@@ -3162,6 +3368,7 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         EmitSpvInst(sec_fn, SpvOpVariable, {t_ptr_fn_u32, var_dm_x, kSpvStorageFunction, c_u32_1});
         EmitSpvInst(sec_fn, SpvOpVariable, {t_ptr_fn_u32, var_dm_y, kSpvStorageFunction, c_u32_1});
         EmitSpvInst(sec_fn, SpvOpVariable, {t_ptr_fn_u32, var_dm_z, kSpvStorageFunction, c_u32_1});
+        emit_sm_fn_vars();
 
         const uint32_t init_lidx = alloc_id();
         const uint32_t is_l0 = alloc_id();
@@ -3221,11 +3428,13 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
             EmitSpvInst(sec_fn, SpvOpLabel, {lbl_loop_merge});
         }
         emit_wg_barrier();
-        EmitSpvInst(sec_fn, SpvOpBranch, {bb_labels[0]});
+        EmitSpvInst(sec_fn, SpvOpBranch, {first_body_target});
     }
 
     // Cooperative Workgroup LDS zero-initialization loop at shader entry followed by OpControlBarrier
-    if (ir.uses_lds && ir.stage == ShaderStage::Compute && var_lds != 0u && var_local_idx != 0u) {
+    const bool has_compute_lds_entry =
+        (ir.uses_lds && ir.stage == ShaderStage::Compute && var_lds != 0u && var_local_idx != 0u);
+    if (has_compute_lds_entry) {
         const uint32_t lbl_init_entry = alloc_id();
         const uint32_t lbl_loop_hdr = alloc_id();
         const uint32_t lbl_loop_body = alloc_id();
@@ -3239,6 +3448,7 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         const uint32_t lds_ptr = alloc_id();
 
         EmitSpvInst(sec_fn, SpvOpLabel, {lbl_init_entry});
+        emit_sm_fn_vars();
         EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, init_gtid, var_local_idx});
         EmitSpvInst(sec_fn, SpvOpBranch, {lbl_loop_hdr});
 
@@ -3259,26 +3469,54 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
 
         EmitSpvInst(sec_fn, SpvOpLabel, {lbl_loop_merge});
         emit_wg_barrier();
-        EmitSpvInst(sec_fn, SpvOpBranch, {bb_labels[0]});
+        EmitSpvInst(sec_fn, SpvOpBranch, {first_body_target});
+    } else if (use_spv_state_machine && !is_task_stage) {
+        // Standalone entry block holding all Function-storage OpVariables for state-machine CFG
+        const uint32_t lbl_sm_entry = alloc_id();
+        EmitSpvInst(sec_fn, SpvOpLabel, {lbl_sm_entry});
+        emit_sm_fn_vars();
+        EmitSpvInst(sec_fn, SpvOpBranch, {lbl_sm_hdr});
+    }
+
+    if (use_spv_state_machine) {
+        // Structured state-machine loop header + OpSwitch dispatch (handles reducible & irreducible CFGs)
+        EmitSpvInst(sec_fn, SpvOpLabel, {lbl_sm_hdr});
+        const uint32_t cur_state = alloc_id();
+        const uint32_t is_done = alloc_id();
+        EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, cur_state, var_cfg_state});
+        EmitSpvInst(sec_fn, SpvOpIEqual, {t_bool, is_done, cur_state, c_u32_allones});
+        EmitSpvInst(sec_fn, SpvOpLoopMerge, {lbl_sm_exit, lbl_sm_cont, 0u});
+        EmitSpvInst(sec_fn, SpvOpBranchConditional, {is_done, lbl_sm_exit, lbl_sm_dispatch});
+
+        EmitSpvInst(sec_fn, SpvOpLabel, {lbl_sm_dispatch});
+        EmitSpvInst(sec_fn, SpvOpSelectionMerge, {lbl_sm_sw_merge, 0u});
+        std::vector<uint32_t> sw_ops = {cur_state, lbl_sm_default};
+        for (size_t bi = 0u; bi < ir.blocks.size(); ++bi) {
+            sw_ops.push_back(static_cast<uint32_t>(bi));
+            sw_ops.push_back(bb_labels[bi]);
+        }
+        EmitSpvInst(sec_fn, SpvOpSwitch, sw_ops);
     }
 
     for (size_t bi = 0; bi < ir.blocks.size(); ++bi) {
         const auto& bb = ir.blocks[bi];
         EmitSpvInst(sec_fn, SpvOpLabel, {bb_labels[bi]});
 
-        // OpPhi strictly first after OpLabel
-        for (const auto& inst : bb.instructions) {
-            if (inst.op != IrOp::Phi) continue;
-            const uint32_t res_type = spv_type_for_kind(CanonicalSpvKind(inst.type));
-            std::vector<uint32_t> ops = {res_type, val_spv_id[inst.id]};
-            for (const auto& inc : inst.phi_incoming) {
-                const uint64_t key = (static_cast<uint64_t>(inst.id) << 32) | inc.first;
-                auto ov = phi_edge_override.find(key);
-                const uint32_t v_id = (ov != phi_edge_override.end()) ? ov->second : val_spv_id[inc.second];
-                ops.push_back(v_id);
-                ops.push_back(bb_labels[inc.first]);
+        // OpPhi strictly first after OpLabel (DAG mode only; SM mode writes Phi vars on incoming edges)
+        if (!use_spv_state_machine) {
+            for (const auto& inst : bb.instructions) {
+                if (inst.op != IrOp::Phi) continue;
+                const uint32_t res_type = spv_type_for_kind(CanonicalSpvKind(inst.type));
+                std::vector<uint32_t> ops = {res_type, val_spv_id[inst.id]};
+                for (const auto& inc : inst.phi_incoming) {
+                    const uint64_t key = (static_cast<uint64_t>(inst.id) << 32) | inc.first;
+                    auto ov = phi_edge_override.find(key);
+                    const uint32_t v_id = (ov != phi_edge_override.end()) ? ov->second : val_spv_id[inc.second];
+                    ops.push_back(v_id);
+                    ops.push_back(bb_labels[inc.first]);
+                }
+                EmitSpvInst(sec_fn, SpvOpPhi, ops);
             }
-            EmitSpvInst(sec_fn, SpvOpPhi, ops);
         }
 
         // Per-block cache for consecutive BvhIntersectRay component extracts
@@ -3291,7 +3529,9 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                 inst.op == IrOp::Branch || inst.op == IrOp::CondBranch || inst.op == IrOp::Return) {
                 continue;
             }
-            const uint32_t res = (inst.id != kInvalidIrValue) ? val_spv_id[inst.id] : 0u;
+            const uint32_t res = (inst.id != kInvalidIrValue)
+                                     ? (use_spv_state_machine ? alloc_id() : val_spv_id[inst.id])
+                                     : 0u;
 
             switch (inst.op) {
                 case IrOp::ThreadIdX:
@@ -3332,8 +3572,10 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                     break;
                 }
                 case IrOp::StageInput: {
+                    const uint32_t pslot = (inst.imm_u32 >> 2) & 3u;
+                    const uint32_t vin = (var_param_in[pslot] != 0u) ? var_param_in[pslot] : var_param_in[0];
                     uint32_t v4 = alloc_id();
-                    EmitSpvInst(sec_fn, SpvOpLoad, {t_v4f32, v4, var_param0_in});
+                    EmitSpvInst(sec_fn, SpvOpLoad, {t_v4f32, v4, vin});
                     EmitSpvInst(sec_fn, SpvOpCompositeExtract, {t_f32, res, v4, inst.imm_u32 & 3u});
                     break;
                 }
@@ -3967,7 +4209,19 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                     EmitSpvInst(sec_fn, SpvOpShiftRightLogical, {t_u32, dword_idx, byte_off, c_u32_2});
                     EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, masked_idx, dword_idx, c_scratch_mask});
                     EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_priv_u32, ptr, var_scratch, masked_idx});
-                    EmitSpvInst(sec_fn, SpvOpStore, {ptr, data_u32});
+                    if (inst.exec_pred != kInvalidIrValue) {
+                        uint32_t pred = get_as_bool(inst.exec_pred);
+                        uint32_t lbl_then = alloc_id();
+                        uint32_t lbl_merge = alloc_id();
+                        EmitSpvInst(sec_fn, SpvOpSelectionMerge, {lbl_merge, 0u});
+                        EmitSpvInst(sec_fn, SpvOpBranchConditional, {pred, lbl_then, lbl_merge});
+                        EmitSpvInst(sec_fn, SpvOpLabel, {lbl_then});
+                        EmitSpvInst(sec_fn, SpvOpStore, {ptr, data_u32});
+                        EmitSpvInst(sec_fn, SpvOpBranch, {lbl_merge});
+                        EmitSpvInst(sec_fn, SpvOpLabel, {lbl_merge});
+                    } else {
+                        EmitSpvInst(sec_fn, SpvOpStore, {ptr, data_u32});
+                    }
                     break;
                 }
                 case IrOp::WaveLaneId: {
@@ -4939,6 +5193,21 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                     }
                     break;
                 case IrOp::Export: {
+                    if (inst.export_target == static_cast<uint8_t>(Rdna2ExportTarget::Null) &&
+                        inst.imm_u32 == kIrKillExportMagicLifter &&
+                        ir.stage == ShaderStage::Pixel) {
+                        const uint32_t kill_cond = inst.operands.empty()
+                                                       ? get_const_bool(true)
+                                                       : get_as_bool(inst.operands[0]);
+                        const uint32_t lbl_kill = alloc_id();
+                        const uint32_t lbl_after = alloc_id();
+                        EmitSpvInst(sec_fn, SpvOpSelectionMerge, {lbl_after, 0u});
+                        EmitSpvInst(sec_fn, SpvOpBranchConditional, {kill_cond, lbl_kill, lbl_after});
+                        EmitSpvInst(sec_fn, SpvOpLabel, {lbl_kill});
+                        EmitSpvInst(sec_fn, SpvOpKill, {});
+                        EmitSpvInst(sec_fn, SpvOpLabel, {lbl_after});
+                        break;
+                    }
                     if ((inst.export_target == static_cast<uint8_t>(Rdna2ExportTarget::Pos2) ||
                          inst.export_target == static_cast<uint8_t>(Rdna2ExportTarget::Pos3)) &&
                         cull_dist_count > 0u && var_pervertex != 0u && t_ptr_out_f32 != 0u) {
@@ -4984,15 +5253,21 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                             EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_out_v4f32, ptr_pos, var_pervertex, c_i32_0});
                         }
                         EmitSpvInst(sec_fn, SpvOpStore, {ptr_pos, vec_id});
-                    } else if (inst.export_target == static_cast<uint8_t>(Rdna2ExportTarget::Param0) && var_param0_out != 0u) {
-                        if (is_mesh_stage) {
-                            uint32_t lidx = alloc_id();
-                            uint32_t ptr_p0 = alloc_id();
-                            EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, lidx, var_local_idx});
-                            EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_out_v4f32, ptr_p0, var_param0_out, lidx});
-                            EmitSpvInst(sec_fn, SpvOpStore, {ptr_p0, vec_id});
-                        } else {
-                            EmitSpvInst(sec_fn, SpvOpStore, {var_param0_out, vec_id});
+                    } else if (inst.export_target >= static_cast<uint8_t>(Rdna2ExportTarget::Param0) &&
+                               inst.export_target <= static_cast<uint8_t>(Rdna2ExportTarget::Param3)) {
+                        const uint32_t pslot = static_cast<uint32_t>(
+                            inst.export_target - static_cast<uint8_t>(Rdna2ExportTarget::Param0));
+                        const uint32_t vout = var_param_out[pslot];
+                        if (vout != 0u) {
+                            if (is_mesh_stage) {
+                                uint32_t lidx = alloc_id();
+                                uint32_t ptr_p = alloc_id();
+                                EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, lidx, var_local_idx});
+                                EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_out_v4f32, ptr_p, vout, lidx});
+                                EmitSpvInst(sec_fn, SpvOpStore, {ptr_p, vec_id});
+                            } else {
+                                EmitSpvInst(sec_fn, SpvOpStore, {vout, vec_id});
+                            }
                         }
                     } else if (inst.export_target == static_cast<uint8_t>(Rdna2ExportTarget::Mrt0) && var_mrt0 != 0u) {
                         EmitSpvInst(sec_fn, SpvOpStore, {var_mrt0, vec_id});
@@ -5002,9 +5277,51 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                 default:
                     break;
             }
+
+            if (use_spv_state_machine && inst.id != kInvalidIrValue && res != 0u) {
+                auto it_v = val_fn_var.find(inst.id);
+                if (it_v != val_fn_var.end()) {
+                    EmitSpvInst(sec_fn, SpvOpStore, {it_v->second, res});
+                }
+            }
         }
 
-        // Phi edge coercions right before terminator
+        if (use_spv_state_machine) {
+            if (!bb.instructions.empty()) {
+                const auto& term = bb.instructions.back();
+                if (term.op == IrOp::Branch) {
+                    emit_sm_phi_copies(static_cast<uint32_t>(bi), term.true_block);
+                    EmitSpvInst(sec_fn, SpvOpStore, {var_cfg_state, get_const_u32(term.true_block)});
+                    EmitSpvInst(sec_fn, SpvOpBranch, {lbl_sm_sw_merge});
+                } else if (term.op == IrOp::CondBranch) {
+                    const uint32_t cond = get_as_bool(term.operands[0]);
+                    const uint32_t lbl_t = alloc_id();
+                    const uint32_t lbl_f = alloc_id();
+                    const uint32_t lbl_m = alloc_id();
+                    EmitSpvInst(sec_fn, SpvOpSelectionMerge, {lbl_m, 0u});
+                    EmitSpvInst(sec_fn, SpvOpBranchConditional, {cond, lbl_t, lbl_f});
+                    EmitSpvInst(sec_fn, SpvOpLabel, {lbl_t});
+                    emit_sm_phi_copies(static_cast<uint32_t>(bi), term.true_block);
+                    EmitSpvInst(sec_fn, SpvOpStore, {var_cfg_state, get_const_u32(term.true_block)});
+                    EmitSpvInst(sec_fn, SpvOpBranch, {lbl_m});
+                    EmitSpvInst(sec_fn, SpvOpLabel, {lbl_f});
+                    emit_sm_phi_copies(static_cast<uint32_t>(bi), term.false_block);
+                    EmitSpvInst(sec_fn, SpvOpStore, {var_cfg_state, get_const_u32(term.false_block)});
+                    EmitSpvInst(sec_fn, SpvOpBranch, {lbl_m});
+                    EmitSpvInst(sec_fn, SpvOpLabel, {lbl_m});
+                    EmitSpvInst(sec_fn, SpvOpBranch, {lbl_sm_sw_merge});
+                } else {
+                    EmitSpvInst(sec_fn, SpvOpStore, {var_cfg_state, c_u32_allones});
+                    EmitSpvInst(sec_fn, SpvOpBranch, {lbl_sm_sw_merge});
+                }
+            } else {
+                EmitSpvInst(sec_fn, SpvOpStore, {var_cfg_state, c_u32_allones});
+                EmitSpvInst(sec_fn, SpvOpBranch, {lbl_sm_sw_merge});
+            }
+            continue;
+        }
+
+        // Phi edge coercions right before terminator (DAG mode)
         for (const auto& fx : block_exit_fixups[bi]) {
             if (fx.expected_kind == SpvValKind::F32) {
                 uint32_t u = get_as_u32(fx.incoming_val);
@@ -5047,6 +5364,25 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
             } else {
                 EmitSpvInst(sec_fn, SpvOpReturn, {});
             }
+        }
+    }
+
+    if (use_spv_state_machine) {
+        EmitSpvInst(sec_fn, SpvOpLabel, {lbl_sm_default});
+        EmitSpvInst(sec_fn, SpvOpStore, {var_cfg_state, c_u32_allones});
+        EmitSpvInst(sec_fn, SpvOpBranch, {lbl_sm_sw_merge});
+
+        EmitSpvInst(sec_fn, SpvOpLabel, {lbl_sm_sw_merge});
+        EmitSpvInst(sec_fn, SpvOpBranch, {lbl_sm_cont});
+
+        EmitSpvInst(sec_fn, SpvOpLabel, {lbl_sm_cont});
+        EmitSpvInst(sec_fn, SpvOpBranch, {lbl_sm_hdr});
+
+        EmitSpvInst(sec_fn, SpvOpLabel, {lbl_sm_exit});
+        if (need_epilogue) {
+            EmitSpvInst(sec_fn, SpvOpBranch, {epilogue_label});
+        } else {
+            EmitSpvInst(sec_fn, SpvOpReturn, {});
         }
     }
 
@@ -5262,6 +5598,21 @@ Status ValidateSpirvBinary(const std::vector<uint32_t>& spirv) {
                     return Status::Error(StatusCode::ShaderError, "Malformed OpBranchConditional");
                 }
                 break;
+            case SpvOpSwitch:
+                if (word_count < 3u || ((word_count - 3u) & 1u) != 0u ||
+                    spirv[pos + 1] == 0u || spirv[pos + 1] >= bound ||
+                    spirv[pos + 2] == 0u || spirv[pos + 2] >= bound) {
+                    return Status::Error(StatusCode::ShaderError, "Malformed OpSwitch");
+                }
+                for (uint16_t k = 4u; k < word_count; k = static_cast<uint16_t>(k + 2u)) {
+                    if (spirv[pos + k] == 0u || spirv[pos + k] >= bound) {
+                        return Status::Error(StatusCode::ShaderError, "OpSwitch target label ID out of bound");
+                    }
+                }
+                break;
+            case SpvOpKill:
+                if (word_count != 1u) return Status::Error(StatusCode::ShaderError, "Malformed OpKill");
+                break;
             case SpvOpReturn:
                 if (word_count != 1u) return Status::Error(StatusCode::ShaderError, "Malformed OpReturn");
                 saw_return = true;
@@ -5447,27 +5798,31 @@ Status LiftRdna2Xs2Shader(
     const Rdna2LiftOptions& options) {
     out_result = Rdna2LiftResult{};
 
-    XboxDxbcContainer container_info{};
-    if (auto st = ParseXboxShaderContainer(xs2_bytes, container_info); !st.ok()) {
+    XboxParsedShaderContainer full_info{};
+    if (auto st = ParseFullXboxShaderContainer(xs2_bytes, full_info); !st.ok()) {
         CallTelemetry::Global().Record("rdna2_lifter", "LiftRdna2Xs2Shader", CallOutcome::Error, -1);
         return st;
     }
-    if (!container_info.has_xs2) {
+    if (!full_info.has_xs2) {
         CallTelemetry::Global().Record("rdna2_lifter", "LiftRdna2Xs2Shader", CallOutcome::Error, -1);
         return Status::Error(StatusCode::UnsupportedFormat,
-                             "Shader container does not carry an Xbox XS2 RDNA2 payload");
+                             "Shader container does not carry an Xbox XS2/RDNA2 payload");
     }
-    out_result.container = std::move(container_info.xs2);
+    out_result.container = full_info.xs2;
 
-    if (auto st = DisassembleRdna2(out_result.container.code_words, out_result.instructions); !st.ok()) {
+    if (auto st = DisassembleRdna2Extended(out_result.container.code_words, out_result.instructions); !st.ok()) {
         CallTelemetry::Global().Record("rdna2_lifter", "LiftRdna2Xs2Shader", CallOutcome::Error, -2);
         return st;
     }
+    Rdna2LiftOptions eff_opts = options;
+    if (eff_opts.stage_contract.pixel_inputs.empty() && eff_opts.stage_contract.vertex_fetches.empty()) {
+        ApplyXboxContainerToLiftOptions(full_info, eff_opts);
+    }
     const StageContractTable* contract_ptr =
-        (!options.stage_contract.vertex_fetches.empty() ||
-         !options.stage_contract.pixel_inputs.empty() ||
-         options.stage_contract.texture_srv_format != Rdna2TextureFormat::Float4)
-            ? &options.stage_contract
+        (!eff_opts.stage_contract.vertex_fetches.empty() ||
+         !eff_opts.stage_contract.pixel_inputs.empty() ||
+         eff_opts.stage_contract.texture_srv_format != Rdna2TextureFormat::Float4)
+            ? &eff_opts.stage_contract
             : nullptr;
     if (auto st = BuildRdna2Ir(out_result.container, out_result.instructions, out_result.ir, contract_ptr); !st.ok()) {
         CallTelemetry::Global().Record("rdna2_lifter", "LiftRdna2Xs2Shader", CallOutcome::Error, -3);
