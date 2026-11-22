@@ -98,6 +98,8 @@ enum ControlId : int {
     kIdBtnInspectCurr  = 4003,
     kIdBtnInspectNow   = 4004,
     kIdListPeModules   = 4005,
+    kIdBtnCopyPeReport = 4006,
+    kIdLblPeCopyStatus = 4007,
 
     // Update dialog controls
     kIdUpdEditNotes    = 5001,
@@ -235,6 +237,94 @@ std::string GetEditTextUtf8(HWND h_edit) {
     ::GetWindowTextW(h_edit, buf.data(), len + 1);
     buf.resize(static_cast<size_t>(len));
     return WideToUtf8(buf);
+}
+
+bool CopyUnicodeTextToClipboard(HWND owner, const std::string& utf8_text) {
+    const std::wstring wtext = NormalizeCrlfWide(utf8_text);
+    const size_t bytes = (wtext.size() + 1u) * sizeof(wchar_t);
+    HGLOBAL hmem = ::GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (!hmem) {
+        return false;
+    }
+    void* dst = ::GlobalLock(hmem);
+    if (!dst) {
+        ::GlobalFree(hmem);
+        return false;
+    }
+    std::memcpy(dst, wtext.c_str(), bytes);
+    ::GlobalUnlock(hmem);
+
+    if (!::OpenClipboard(owner)) {
+        ::GlobalFree(hmem);
+        return false;
+    }
+    ::EmptyClipboard();
+    if (!::SetClipboardData(CF_UNICODETEXT, hmem)) {
+        ::CloseClipboard();
+        ::GlobalFree(hmem);
+        return false;
+    }
+    ::CloseClipboard();
+    return true;
+}
+
+std::string BuildFullPeInspectorReport(const PeInspectorSummary& s) {
+    std::ostringstream oss;
+    oss << "=== OpenScarlett Binary Inspector Full Report ===\n";
+    oss << "Binary Path         : " << s.file_path << "\n";
+    oss << "Architecture        : PE32+ x86-64 (" << (s.is_dll ? "DLL" : "EXE") << ")\n";
+    oss << "ImageBase           : " << FormatHex64(s.image_base) << "\n";
+    oss << "SizeOfImage         : " << FormatHex32(s.image_size) << " (" << s.image_size << " B)\n";
+    oss << "Sections            : " << s.section_count << "\n";
+    oss << "Relocations         : " << (s.has_relocations ? "Yes" : "No") << "\n";
+    oss << "TLS Callbacks       : " << s.tls_callbacks << "\n";
+    oss << ".pdata SEH Entries  : " << s.pdata_entries << "\n";
+    oss << "Exports             : " << s.total_exports
+        << " (Forwarded: " << s.forwarded_exports << ")\n";
+    oss << "Imports             : " << s.total_imports
+        << " (ConsoleExclusive: " << s.console_imports
+        << ", GdkRuntime: " << s.gdk_imports
+        << ", DelayLoad: " << s.delay_load_imports
+        << ") across " << s.modules.size() << " DLLs\n";
+    oss << "Missing Shim Exports: " << s.missing_export_count << "\n\n";
+
+    oss << "--- Imported DLL Summary (" << s.modules.size() << " DLLs) ---\n";
+    for (const auto& m : s.modules) {
+        oss << "  - " << m.dll_name
+            << " | Category=" << m.category
+            << " | Imports=" << m.import_count
+            << " | Routing=" << m.routing_status
+            << " | ShimPresent=" << (m.shim_present ? "Yes" : "No")
+            << " | MissingExports=" << m.missing_exports.size() << "\n";
+    }
+
+    oss << "\n--- Full Unclipped Missing Exports Per DLL ---\n";
+    bool any_missing_section = false;
+    for (const auto& m : s.modules) {
+        if (m.missing_exports.empty() && m.shim_present) {
+            continue;
+        }
+        any_missing_section = true;
+        oss << "\n[" << m.dll_name << "] "
+            << "Category=" << m.category
+            << " | Routing=" << m.routing_status
+            << " | ShimPresent=" << (m.shim_present ? "Yes" : "No");
+        if (!m.missing_exports.empty()) {
+            oss << " | MissingExports=" << m.missing_exports.size() << "\n";
+            for (const auto& sym : m.missing_exports) {
+                oss << "    - " << sym << "\n";
+            }
+        } else {
+            oss << " | AllImportedSymbols=" << m.symbols.size() << " (Shim DLL not found)\n";
+            for (const auto& sym : m.symbols) {
+                oss << "    - " << sym << "\n";
+            }
+        }
+    }
+    if (!any_missing_section) {
+        oss << "  (None - all routed shim exports are present.)\n";
+    }
+    return oss.str();
 }
 
 bool BrowseForFolderDialog(HWND owner, std::wstring& out_path) {
@@ -1064,9 +1154,14 @@ private:
         InsertListColumn(h_list_pe_, 3, L"OpenScarlett Shim Routing", ScalePx(250, dpi_));
         InsertListColumn(h_list_pe_, 4, L"Missing Exports", ScalePx(260, dpi_));
 
+        h_btn_copy_pe_report_ = CreateOwnerBtn(kIdBtnCopyPeReport, L"Copy Full Inspector Report");
+        ::EnableWindow(h_btn_copy_pe_report_, FALSE);
+        h_lbl_pe_copy_status_ = CreateDarkLabel(L"Inspect a PE32+ binary to copy its full unclipped report");
+
         tab_pe_ctrls_ = {
             h_lbl_pe_path_, h_edit_pe_path_, h_btn_browse_pe_,
             h_btn_inspect_curr_, h_btn_inspect_now_, h_list_pe_,
+            h_btn_copy_pe_report_, h_lbl_pe_copy_status_,
         };
     }
 
@@ -1093,6 +1188,7 @@ private:
         for (HWND h : mono_controls_) set_font(h, theme_.font_mono);
         set_font(h_lbl_probe_status_, theme_.font_small);
         set_font(h_lbl_report_path_, theme_.font_small);
+        set_font(h_lbl_pe_copy_status_, theme_.font_small);
     }
 
     void PopulateAdapterCombo() {
@@ -1344,12 +1440,22 @@ private:
             const int c2_h = ScalePx(112, dpi_);
             pe_card_summary_ = {pad, c2_y, pad + card_w, c2_y + c2_h};
 
-            // Card 3: Per-DLL Routing & Missing Exports Table
+            // Card 3: Per-DLL Routing & Missing Exports Table + bottom Copy action bar
+            const int action_h = ScalePx(44, dpi_);
             const int c3_y = c2_y + c2_h + ScalePx(10, dpi_);
-            const int c3_h = std::max<int>(ScalePx(140, dpi_), ch - pad - c3_y);
+            const int c3_h = std::max<int>(ScalePx(120, dpi_), ch - pad - action_h - c3_y - ScalePx(8, dpi_));
             pe_card_table_ = {pad, c3_y, pad + card_w, c3_y + c3_h};
             ::MoveWindow(h_list_pe_, x0, c3_y + ScalePx(32, dpi_),
-                         card_w - inner * 2, std::max<int>(ScalePx(80, dpi_), c3_h - ScalePx(44, dpi_)), TRUE);
+                         card_w - inner * 2, std::max<int>(ScalePx(70, dpi_), c3_h - ScalePx(44, dpi_)), TRUE);
+
+            const int act_y = ch - pad - action_h + ScalePx(6, dpi_);
+            const int btn_cp_w = ScalePx(216, dpi_);
+            ::MoveWindow(h_btn_copy_pe_report_, pad, act_y, btn_cp_w, ScalePx(32, dpi_), TRUE);
+            ::MoveWindow(h_lbl_pe_copy_status_,
+                         pad + btn_cp_w + ScalePx(14, dpi_),
+                         act_y + ScalePx(5, dpi_),
+                         std::max<int>(ScalePx(120, dpi_), card_w - btn_cp_w - ScalePx(14, dpi_)),
+                         ScalePx(24, dpi_), TRUE);
         }
     }
 
@@ -2032,9 +2138,18 @@ private:
                 HDC hdc = reinterpret_cast<HDC>(wParam);
                 HWND ctrl = reinterpret_cast<HWND>(lParam);
                 const bool in_header = (ctrl == h_chk_offline_);
+                const bool on_window_bg = (ctrl == h_lbl_pe_copy_status_ || ctrl == h_lbl_report_path_);
                 ::SetTextColor(hdc, colors::kTextPrimary);
-                ::SetBkColor(hdc, in_header ? colors::kHeaderBg : colors::kSurfaceCard);
-                return reinterpret_cast<LRESULT>(in_header ? theme_.br_header_bg : theme_.br_card_bg);
+                if (in_header) {
+                    ::SetBkColor(hdc, colors::kHeaderBg);
+                    return reinterpret_cast<LRESULT>(theme_.br_header_bg);
+                }
+                if (on_window_bg) {
+                    ::SetBkColor(hdc, colors::kWindowBg);
+                    return reinterpret_cast<LRESULT>(theme_.br_window_bg);
+                }
+                ::SetBkColor(hdc, colors::kSurfaceCard);
+                return reinterpret_cast<LRESULT>(theme_.br_card_bg);
             }
 
             case WM_CTLCOLOREDIT:
@@ -2054,7 +2169,7 @@ private:
                 } else if (dis->CtlID == kIdBtnStop || dis->CtlID == kIdBtnCancelHwTest) {
                     role = ButtonRole::Danger;
                 } else if (dis->CtlID == kIdBtnOpenGitHub || dis->CtlID == kIdBtnInspectNow ||
-                           dis->CtlID == kIdBtnCopyTelemetry ||
+                           dis->CtlID == kIdBtnCopyTelemetry || dis->CtlID == kIdBtnCopyPeReport ||
                            (dis->CtlID >= kIdBtnDemo0 && dis->CtlID <= kIdBtnDemo2)) {
                     role = ButtonRole::AccentBlue;
                 }
@@ -2288,6 +2403,23 @@ private:
                         }
                         return 0;
                     }
+                    case kIdBtnCopyPeReport: {
+                        if (pe_summary_.ok) {
+                            const std::string report = BuildFullPeInspectorReport(pe_summary_);
+                            if (CopyUnicodeTextToClipboard(hwnd, report)) {
+                                const std::string status =
+                                    "Copied full report to clipboard (" +
+                                    std::to_string(pe_summary_.modules.size()) + " DLLs, " +
+                                    std::to_string(pe_summary_.missing_export_count) + " missing exports, " +
+                                    std::to_string(report.size()) + " B)";
+                                ::SetWindowTextW(h_lbl_pe_copy_status_, Utf8ToWide(status).c_str());
+                            } else {
+                                ::SetWindowTextW(h_lbl_pe_copy_status_,
+                                                 L"Failed to copy inspector report to clipboard");
+                            }
+                        }
+                        return 0;
+                    }
                     default:
                         break;
                 }
@@ -2448,6 +2580,17 @@ private:
                 if (sum) {
                     pe_summary_ = std::move(*sum);
                     PopulatePeListView();
+                    ::EnableWindow(h_btn_copy_pe_report_, pe_summary_.ok ? TRUE : FALSE);
+                    if (pe_summary_.ok) {
+                        const std::string status =
+                            "Ready to copy full report (" +
+                            std::to_string(pe_summary_.modules.size()) + " DLLs, " +
+                            std::to_string(pe_summary_.missing_export_count) + " missing exports)";
+                        ::SetWindowTextW(h_lbl_pe_copy_status_, Utf8ToWide(status).c_str());
+                    } else {
+                        ::SetWindowTextW(h_lbl_pe_copy_status_,
+                                         L"Inspection failed; no report available to copy");
+                    }
                     ::InvalidateRect(hwnd, &pe_card_summary_, FALSE);
                 }
                 return 0;
@@ -2627,6 +2770,8 @@ private:
     HWND h_btn_inspect_curr_ = nullptr;
     HWND h_btn_inspect_now_ = nullptr;
     HWND h_list_pe_ = nullptr;
+    HWND h_btn_copy_pe_report_ = nullptr;
+    HWND h_lbl_pe_copy_status_ = nullptr;
 
     std::vector<HWND> tab_play_ctrls_;
     std::vector<HWND> tab_hw_ctrls_;
