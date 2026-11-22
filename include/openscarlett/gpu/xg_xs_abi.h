@@ -126,6 +126,41 @@ struct XG_TEXTURE2D_DESC {
     XG_TILE_MODE TileMode;
 };
 
+// Clean-room AMD GFX10 / RDNA2 DCC metadata block states & encoding parameters.
+enum XG_DCC_BLOCK_STATE : uint32_t {
+    XG_DCC_STATE_UNCOMPRESSED = 0u,
+    XG_DCC_STATE_CLEAR_0000 = 1u,
+    XG_DCC_STATE_CLEAR_0001 = 2u,
+    XG_DCC_STATE_CLEAR_1110 = 3u,
+    XG_DCC_STATE_CLEAR_1111 = 4u,
+    XG_DCC_STATE_CLEAR_REG = 5u,
+    XG_DCC_STATE_COMPRESSED_2TO1 = 6u,
+    XG_DCC_STATE_COMPRESSED_4TO1 = 7u,
+};
+
+struct XG_DCC_ENCODE_PARAMS {
+    XG_TEXTURE2D_DESC Desc;
+    XG_CONSOLE_TYPE ConsoleType;
+    uint32_t MipLevel;
+    uint32_t ArraySlice;
+    XG_DCC_BLOCK_STATE BlockState;
+    uint32_t Independent64BBlocks;
+    uint32_t Independent128BBlocks;
+    uint32_t MaxCompressedBlockSize;  // 0 (default 256), 64, 128, or 256
+    uint32_t PipeAligned;
+};
+
+struct XG_DCC_ENCODE_RESULT {
+    uint64_t DccOffsetBytes;
+    uint64_t DccSizeBytes;
+    uint64_t EncodedByteCount;
+    uint32_t BlockCountX;
+    uint32_t BlockCountY;
+    uint32_t TotalBlocks;
+    uint8_t EncodedKeyByte;
+    uint8_t Reserved[3];
+};
+
 struct XG_TEXTURE3D_DESC {
     uint32_t Width;
     uint32_t Height;
@@ -340,6 +375,29 @@ bool ComputeTexture2DMetadataLayout(
     XG_CONSOLE_TYPE console_type,
     XG_RESOURCE_METADATA_LAYOUT& out_meta) noexcept;
 
+uint8_t EncodeDccKeyByte(
+    XG_DCC_BLOCK_STATE state,
+    uint32_t max_compressed_block_size,
+    uint32_t independent_64b,
+    uint32_t independent_128b,
+    uint32_t sample_count) noexcept;
+
+bool DecodeDccKeyByte(
+    uint8_t key_byte,
+    XG_DCC_BLOCK_STATE& out_state) noexcept;
+
+bool EncodeDccMetadata(
+    const XG_DCC_ENCODE_PARAMS& params,
+    void* dst_dcc_buffer,
+    uint64_t dst_dcc_size_bytes,
+    XG_DCC_ENCODE_RESULT* out_result) noexcept;
+
+bool VerifyDccMetadata(
+    const XG_DCC_ENCODE_PARAMS& params,
+    const void* dcc_buffer,
+    uint64_t dcc_size_bytes,
+    XG_DCC_ENCODE_RESULT* out_result) noexcept;
+
 }  // namespace openscarlett::xg
 
 extern "C" {
@@ -439,6 +497,12 @@ OPENSCARLETT_XG_API int __stdcall OpenScarlettXgGetTelemetryEntry(
     const char* symbol_name,
     uint64_t* out_total_calls);
 
+OPENSCARLETT_XG_API int __stdcall OpenScarlettXgGetTelemetryDetail(
+    const char* symbol_name,
+    uint64_t* out_total_calls,
+    uint64_t* out_not_impl_calls,
+    int32_t* out_last_hr);
+
 OPENSCARLETT_XG_API int32_t __stdcall XGQueryScarlettPipeConfig(
     XG_CONSOLE_TYPE console_type,
     XG_SCARLETT_PIPE_CONFIG* pOutConfig);
@@ -457,5 +521,21 @@ OPENSCARLETT_XG_API int32_t __stdcall XGComputeCmaskLayout(
     const XG_TEXTURE2D_DESC* pDesc,
     XG_CONSOLE_TYPE console_type,
     XG_METADATA_PLANE_INFO* pOutCmask);
+
+OPENSCARLETT_XG_API int32_t __stdcall XGEncodeDCC(
+    const XG_DCC_ENCODE_PARAMS* pParams,
+    void* pDstDccBuffer,
+    uint64_t dstDccSizeBytes,
+    XG_DCC_ENCODE_RESULT* pOutResult);
+
+OPENSCARLETT_XG_API int32_t __stdcall XGDecodeDCCKey(
+    uint8_t dccKeyByte,
+    uint32_t* pOutBlockState);
+
+OPENSCARLETT_XG_API int32_t __stdcall XGVerifyDCC(
+    const XG_DCC_ENCODE_PARAMS* pParams,
+    const void* pDccBuffer,
+    uint64_t dccSizeBytes,
+    XG_DCC_ENCODE_RESULT* pOutResult);
 
 }  // extern "C"

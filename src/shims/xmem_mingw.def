@@ -9,6 +9,9 @@ EXPORTS
     XMemSizeDefault = XMemShim_XMemSizeDefault
     XMemGetAuxiliaryTitleMemory = XMemShim_XMemGetAuxiliaryTitleMemory
     XMemReleaseAuxiliaryTitleMemory = XMemShim_XMemReleaseAuxiliaryTitleMemory
+    XMemVirtualQuery = XMemShim_XMemVirtualQuery
+    XMemDecodeAllocationAttributes = XMemShim_XMemDecodeAllocationAttributes
+    XMemGetAllocationAttributes = XMemShim_XMemGetAllocationAttributes
     XMemMapPhysicalPages = XMemShim_XMemMapPhysicalPages
     XMemUnmapPhysicalPages = XMemShim_XMemUnmapPhysicalPages
     XMemGetTelemetryCallCountForTest = XMemShim_GetTelemetryCallCountForTest

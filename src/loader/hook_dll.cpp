@@ -366,6 +366,11 @@ bool TryLocateLocalOrRoutedDllW(const std::string& import_dll_name,
         return false;
     }
 
+    // KnownDLLs ALWAYS resolve from System32 first — never shadow them with package-local DLLs.
+    if (openscarlett::IsWindowsKnownDll(import_dll_name)) {
+        return false;
+    }
+
     const openscarlett::DllRouteDecision decision =
         g_routing_table.ResolveRoute(import_dll_name, g_shim_dir_w, g_guest_dir_w);
     out_priority = decision.load_priority;
@@ -594,6 +599,22 @@ bool TryTranslateVirtualDllPath(std::wstring_view raw_path, std::wstring& out_ho
     return st == openscarlett::VfsTranslateStatus::Translated;
 }
 
+bool TryResolveKnownDllSystem32FirstW(std::wstring_view raw_name, std::wstring& out_sys32_path) {
+    out_sys32_path.clear();
+    if (raw_name.empty()) {
+        return false;
+    }
+    // Check if an explicit shim override targets this DLL; otherwise enforce KnownDLLs -> System32 first.
+    const auto* rule = g_routing_table.FindRule(openscarlett::WideToUtf8(raw_name));
+    if (rule && rule->policy == openscarlett::DllRoutePolicy::Shim) {
+        return false;
+    }
+    if (!openscarlett::ResolveKnownDllSystem32PathW(raw_name, out_sys32_path)) {
+        return false;
+    }
+    return !out_sys32_path.empty();
+}
+
 HMODULE WINAPI Hook_LoadLibraryA(LPCSTR lpLibFileName) {
     if (!g_shutting_down.load(std::memory_order_acquire) && lpLibFileName != nullptr) {
         std::wstring wide_name = AnsiToWide(lpLibFileName);
@@ -601,6 +622,13 @@ HMODULE WINAPI Hook_LoadLibraryA(LPCSTR lpLibFileName) {
         std::wstring target_path;
         if (MatchRoutedShimOrGuestDllW(wide_name, decision, target_path)) {
             return LoadRoutedDll(decision, target_path, "LoadLibraryA", nullptr, 0, false);
+        }
+        std::wstring known_sys32;
+        if (TryResolveKnownDllSystem32FirstW(wide_name, known_sys32)) {
+            HMODULE mod = g_real_LoadLibraryW(known_sys32.c_str());
+            if (mod != nullptr) {
+                return mod;
+            }
         }
         std::wstring vfs_host;
         if (TryTranslateVirtualDllPath(wide_name, vfs_host)) {
@@ -631,6 +659,13 @@ HMODULE WINAPI Hook_LoadLibraryW(LPCWSTR lpLibFileName) {
         if (MatchRoutedShimOrGuestDllW(lpLibFileName, decision, target_path)) {
             return LoadRoutedDll(decision, target_path, "LoadLibraryW", nullptr, 0, false);
         }
+        std::wstring known_sys32;
+        if (TryResolveKnownDllSystem32FirstW(lpLibFileName, known_sys32)) {
+            HMODULE mod = g_real_LoadLibraryW(known_sys32.c_str());
+            if (mod != nullptr) {
+                return mod;
+            }
+        }
         std::wstring vfs_host;
         if (TryTranslateVirtualDllPath(lpLibFileName, vfs_host)) {
             HMODULE mod = g_real_LoadLibraryW(vfs_host.c_str());
@@ -660,6 +695,13 @@ HMODULE WINAPI Hook_LoadLibraryExA(LPCSTR lpLibFileName, HANDLE hFile, DWORD dwF
         std::wstring target_path;
         if (MatchRoutedShimOrGuestDllW(wide_name, decision, target_path)) {
             return LoadRoutedDll(decision, target_path, "LoadLibraryExA", hFile, dwFlags, true);
+        }
+        std::wstring known_sys32;
+        if (TryResolveKnownDllSystem32FirstW(wide_name, known_sys32)) {
+            HMODULE mod = g_real_LoadLibraryExW(known_sys32.c_str(), hFile, dwFlags);
+            if (mod != nullptr) {
+                return mod;
+            }
         }
         std::wstring vfs_host;
         if (TryTranslateVirtualDllPath(wide_name, vfs_host)) {
@@ -696,6 +738,13 @@ HMODULE WINAPI Hook_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, DWORD dw
         std::wstring target_path;
         if (MatchRoutedShimOrGuestDllW(lpLibFileName, decision, target_path)) {
             return LoadRoutedDll(decision, target_path, "LoadLibraryExW", hFile, dwFlags, true);
+        }
+        std::wstring known_sys32;
+        if (TryResolveKnownDllSystem32FirstW(lpLibFileName, known_sys32)) {
+            HMODULE mod = g_real_LoadLibraryExW(known_sys32.c_str(), hFile, dwFlags);
+            if (mod != nullptr) {
+                return mod;
+            }
         }
         std::wstring vfs_host;
         if (TryTranslateVirtualDllPath(lpLibFileName, vfs_host)) {
@@ -2431,6 +2480,28 @@ __declspec(dllexport) int __cdecl OpenScarlettHook_LoadDllsTopologically(
             static_cast<int32_t>(loaded_order.size()),
             -1);
     }
+    return 1;
+}
+
+__declspec(dllexport) uint32_t __cdecl OpenScarlettHook_GetRoutedDllCount() {
+    return static_cast<uint32_t>(g_routing_table.ListCompleteRules().size());
+}
+
+__declspec(dllexport) int __cdecl OpenScarlettHook_ResolveKnownDllPathW(
+    const wchar_t* dll_name,
+    wchar_t* out_path,
+    uint32_t out_path_cap) {
+    if (!dll_name || !out_path || out_path_cap == 0u) {
+        return 0;
+    }
+    std::wstring resolved;
+    if (!TryResolveKnownDllSystem32FirstW(dll_name, resolved)) {
+        return 0;
+    }
+    if (resolved.size() + 1u > static_cast<size_t>(out_path_cap)) {
+        return 0;
+    }
+    std::memcpy(out_path, resolved.c_str(), (resolved.size() + 1u) * sizeof(wchar_t));
     return 1;
 }
 

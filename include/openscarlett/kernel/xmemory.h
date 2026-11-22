@@ -41,6 +41,28 @@ struct UnifiedMemoryBlock {
     bool write_combined = false;
 };
 
+struct EraAllocationAttributes {
+    uint32_t object_type = 0;
+    uint32_t heap_tracks_attributes = 0;
+    uint32_t must_succeed = 0;
+    uint32_t fixed_size = 0;
+    uint32_t allocator_id = 0;
+    uint32_t alignment_code = 0;
+    uint32_t memory_type = 0;
+    uint32_t page_size_code = 0;
+    uint32_t zero_initialize = 0;
+    uint32_t alloc_flags = 0;      // Synthesized MEM_GRAPHICS | MEM_TITLE | MEM_WRITE_COMBINE | MEM_LARGE_PAGES | MEM_4MB_PAGES
+    uint32_t protect_flags = 0;    // Synthesized PAGE_* flags
+    uint64_t alignment_bytes = 16;
+    uint64_t page_size_bytes = 4096;
+    uint64_t raw_attributes = 0;
+};
+
+// Decodes a 64-bit Xbox ERA XALLOC_ATTRIBUTES bitfield into structured fields,
+// page size (4KB / 64KB / 2MB / 4MB), alignment, and memory/protection flags.
+bool DecodeEraAllocationAttributes(uint64_t raw_attributes,
+                                   EraAllocationAttributes& out_decoded) noexcept;
+
 struct PhysicalAllocation {
     uint64_t physical_id = 0;
     size_t size = 0;
@@ -113,6 +135,12 @@ public:
     Status UnmapPhysicalAlias(void* host_ptr);
     Status ProtectAlias(void* host_ptr, size_t size, MemoryProtection new_protection);
     bool LookupAliasByHostPtr(const void* host_ptr, UnifiedMemoryAlias& out_alias) const;
+    bool LookupBlockByHostPtr(const void* host_ptr, UnifiedMemoryBlock& out_block) const;
+    bool LookupPlaceholderByHostPtr(const void* host_ptr,
+                                    void*& out_base,
+                                    size_t& out_size,
+                                    size_t& out_granule,
+                                    bool& out_mapped) const;
 
     size_t ActivePhysicalPoolCount() const;
     size_t ActiveAliasCount() const;

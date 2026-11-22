@@ -136,6 +136,16 @@ typedef void*(OS_SHIM_CALL* PFN_XMemGetAuxiliaryTitleMemory)(
     size_t requestedSize,
     size_t* outActualSize);
 typedef int32_t(OS_SHIM_CALL* PFN_XMemReleaseAuxiliaryTitleMemory)(void* baseAddress);
+typedef size_t(OS_SHIM_CALL* PFN_XMemVirtualQuery)(
+    const void* lpAddress,
+    void* lpBuffer,
+    size_t dwLength);
+typedef int32_t(OS_SHIM_CALL* PFN_XMemDecodeAllocationAttributes)(
+    uint64_t dwAllocAttributes,
+    void* outDecoded);
+typedef int32_t(OS_SHIM_CALL* PFN_XMemGetAllocationAttributes)(
+    const void* lpAddress,
+    void* outDecoded);
 typedef void*(OS_SHIM_CALL* PFN_XMemMapPhysicalPages)(
     void* virtualAddress,
     uint64_t numberOfPages,

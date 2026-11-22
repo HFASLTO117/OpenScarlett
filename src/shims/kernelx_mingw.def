@@ -15,6 +15,9 @@ EXPORTS
     XMemSizeDefault
     XMemGetAuxiliaryTitleMemory
     XMemReleaseAuxiliaryTitleMemory
+    XMemVirtualQuery
+    XMemDecodeAllocationAttributes
+    XMemGetAllocationAttributes
     AllocateTitlePhysicalPages
     FreeTitlePhysicalPages
     MapTitleVirtualMemory

@@ -70,6 +70,143 @@ bool RvaToFileOffset(const std::vector<SectionRange>& sections, uint32_t rva, si
     return false;
 }
 
+bool RvaToSectionSlice(const std::vector<SectionRange>& sections,
+                       uint32_t rva,
+                       size_t file_size,
+                       size_t& out_off,
+                       size_t& out_avail) {
+    for (const auto& s : sections) {
+        const uint32_t span = std::max(s.vsize, s.raw_size);
+        if (rva >= s.vaddr && rva - s.vaddr < span) {
+            const uint32_t delta = rva - s.vaddr;
+            if (delta >= s.raw_size) {
+                return false;
+            }
+            const size_t sec_raw_end =
+                std::min<size_t>(file_size, static_cast<size_t>(s.raw_ptr) + static_cast<size_t>(s.raw_size));
+            const size_t off = static_cast<size_t>(s.raw_ptr) + static_cast<size_t>(delta);
+            if (off >= sec_raw_end) {
+                return false;
+            }
+            out_off = off;
+            out_avail = sec_raw_end - off;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ReadExportNameString(const std::vector<uint8_t>& buf,
+                          size_t offset,
+                          size_t section_avail,
+                          size_t max_len,
+                          std::string& out) {
+    out.clear();
+    if (offset >= buf.size() || section_avail == 0u) {
+        return false;
+    }
+    const size_t limit = std::min<size_t>({buf.size() - offset, section_avail, max_len});
+    size_t len = 0u;
+    while (len < limit && buf[offset + len] != 0u) {
+        const uint8_t ch = buf[offset + len];
+        if (ch < 0x20u || ch == 0x7Fu) {
+            return false;
+        }
+        ++len;
+    }
+    if (len == 0u || len >= limit || buf[offset + len] != 0u) {
+        return false;
+    }
+    out.assign(reinterpret_cast<const char*>(buf.data() + offset), len);
+    return true;
+}
+
+std::string NormalizeKnownDllBasename(std::string_view raw_name) {
+    std::string trimmed = TrimAscii(raw_name);
+    if (trimmed.empty()) {
+        return {};
+    }
+    const size_t slash = trimmed.find_last_of("\\/");
+    if (slash != std::string::npos) {
+        trimmed = trimmed.substr(slash + 1);
+    }
+    if (trimmed.empty()) {
+        return {};
+    }
+    std::string lo = ToLower(trimmed);
+    if (lo.size() < 4 || lo.compare(lo.size() - 4, 4, ".dll") != 0) {
+        lo.append(".dll");
+    }
+    return lo;
+}
+
+const std::unordered_set<std::string>& KnownDllSet() {
+    static const std::unordered_set<std::string> s_known = []() {
+        std::unordered_set<std::string> set;
+        static constexpr const char* kFallbackKnownDlls[] = {
+            "ntdll.dll",     "kernel32.dll",  "kernelbase.dll", "user32.dll",
+            "gdi32.dll",     "advapi32.dll",  "ole32.dll",      "oleaut32.dll",
+            "rpcrt4.dll",    "sechost.dll",   "combase.dll",    "shlwapi.dll",
+            "ws2_32.dll",    "ucrtbase.dll",  "shell32.dll",    "msvcrt.dll",
+            "imm32.dll",     "setupapi.dll",  "clbcatq.dll",    "comdlg32.dll",
+            "coml2.dll",     "difxapi.dll",   "gdiplus.dll",    "imagehlp.dll",
+            "msctf.dll",     "normaliz.dll",  "nsi.dll",        "psapi.dll",
+            "shcore.dll",    "wldap32.dll",   "wow64.dll",      "wow64cpu.dll",
+            "wow64win.dll",  "crypt32.dll",   "bcrypt.dll",
+        };
+        for (const char* name : kFallbackKnownDlls) {
+            set.insert(name);
+        }
+#if defined(_WIN32)
+        HKEY hkey = nullptr;
+        if (::RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                            L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\KnownDLLs",
+                            0,
+                            KEY_READ,
+                            &hkey) == ERROR_SUCCESS &&
+            hkey != nullptr) {
+            for (DWORD idx = 0;; ++idx) {
+                wchar_t val_name[256]{};
+                DWORD val_name_len = 256u;
+                DWORD val_type = 0u;
+                wchar_t val_data[260]{};
+                DWORD val_data_bytes = sizeof(val_data);
+                const LSTATUS st = ::RegEnumValueW(hkey,
+                                                   idx,
+                                                   val_name,
+                                                   &val_name_len,
+                                                   nullptr,
+                                                   &val_type,
+                                                   reinterpret_cast<LPBYTE>(val_data),
+                                                   &val_data_bytes);
+                if (st == ERROR_NO_MORE_ITEMS) {
+                    break;
+                }
+                if (st != ERROR_SUCCESS || (val_type != REG_SZ && val_type != REG_EXPAND_SZ)) {
+                    continue;
+                }
+                const std::string name_lo = ToLower(WideToUtf8(std::wstring_view(val_name, val_name_len)));
+                if (name_lo == "dlldirectory" || name_lo == "dlldirectory32") {
+                    continue;
+                }
+                size_t wchar_cnt = val_data_bytes / sizeof(wchar_t);
+                while (wchar_cnt > 0 && val_data[wchar_cnt - 1] == L'\0') {
+                    --wchar_cnt;
+                }
+                const std::string dll_u8 = WideToUtf8(std::wstring_view(val_data, wchar_cnt));
+                const std::string norm = NormalizeKnownDllBasename(dll_u8);
+                if (!norm.empty()) {
+                    set.insert(norm);
+                }
+            }
+            ::RegCloseKey(hkey);
+        }
+#endif
+        return set;
+    }();
+    return s_known;
+}
+
 bool FileExistsInDirW(std::wstring_view dir, std::wstring_view filename, std::wstring& out_full) {
     if (dir.empty() || filename.empty()) {
         return false;
@@ -282,7 +419,9 @@ DllCategory ClassifyImportDll(const std::string& dll_name) {
         lo == "xboxbvhbuilder.dll" || lo == "chad.dll" || lo == "xapu.dll" || lo == "xcrdapi.dll" ||
         lo == "pixevt.dll" ||
         lo == "mfplat_xs.dll" || lo == "advapi32legacy.dll" ||
-        lo == "kerneltracecontrol.dll" || lo == "hix_xs.dll" || lo == "xbtp.dll") {
+        lo == "kerneltracecontrol.dll" || lo == "hix_xs.dll" || lo == "xbtp.dll" ||
+        lo == "mflnmhelp.dll" || lo == "mfhevcdec.dll" || lo == "gamecoreclient.dll" ||
+        lo == "minuserx.dll" || lo == "xtfpix.dll" || lo == "xtfdebugmonitor.dll") {
         return DllCategory::ConsoleExclusive;
     }
     if (lo == "xgameruntime.dll" || lo == "xgamingruntimethunks.dll" ||
@@ -311,6 +450,55 @@ DllCategory ClassifyImportDll(const std::string& dll_name) {
         return DllCategory::WindowsNative;
     }
     return DllCategory::Other;
+}
+
+bool IsWindowsKnownDll(std::string_view dll_name) {
+    const std::string key = NormalizeKnownDllBasename(dll_name);
+    if (key.empty()) {
+        return false;
+    }
+    const auto& known = KnownDllSet();
+    return known.find(key) != known.end();
+}
+
+bool ResolveKnownDllSystem32PathW(std::wstring_view dll_name, std::wstring& out_system32_path) {
+    out_system32_path.clear();
+    const std::string key = NormalizeKnownDllBasename(WideToUtf8(dll_name));
+    if (key.empty() || !IsWindowsKnownDll(key)) {
+        return false;
+    }
+#if defined(_WIN32)
+    wchar_t sys_dir[MAX_PATH]{};
+    const UINT len = ::GetSystemDirectoryW(sys_dir, MAX_PATH);
+    if (len == 0u || len >= MAX_PATH) {
+        return false;
+    }
+    std::wstring path(sys_dir, len);
+    while (!path.empty() && (path.back() == L'\\' || path.back() == L'/')) {
+        path.pop_back();
+    }
+    path.push_back(L'\\');
+    path.append(Utf8ToWide(key));
+    const DWORD attrs = ::GetFileAttributesW(path.c_str());
+    if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0u) {
+        out_system32_path = std::move(path);
+        return true;
+    }
+    // Even if a KnownDLL entry is a virtual/redirected name not directly on disk,
+    // return the System32 candidate path so callers never shadow it from a package directory.
+    out_system32_path = std::move(path);
+    return true;
+#else
+    out_system32_path = L"C:\\Windows\\System32\\" + Utf8ToWide(key);
+    return true;
+#endif
+}
+
+std::vector<std::string> GetWindowsKnownDllList() {
+    const auto& known = KnownDllSet();
+    std::vector<std::string> out(known.begin(), known.end());
+    std::sort(out.begin(), out.end());
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -344,38 +532,46 @@ DllRoutingTable::DllRoutingTable() {
         const char* canonical_name;
         int priority;
         bool is_extended;
+        bool is_fixed_stub;
     };
     // 19 core Xbox/GDK shims + 5 diagnostic/media shims (mfplat_xs, advapi32legacy,
-    // KernelTraceControl, hix_xs, xbtp).
+    // KernelTraceControl, hix_xs, xbtp) + 6 Sprint 7 fixed-return stub shims = 30 total.
     static constexpr BuiltinShimSpec kBuiltinShims[] = {
         // Priority 0: base shims
-        {"kernelx.dll", 0, false},
-        {"xgameruntime.dll", 0, false},
-        {"GameInput.dll", 0, false},
-        {"XAudio2_9.dll", 0, false},
+        {"kernelx.dll", 0, false, false},
+        {"xgameruntime.dll", 0, false, false},
+        {"GameInput.dll", 0, false, false},
+        {"XAudio2_9.dll", 0, false, false},
         // Priority 1: core shims
-        {"d3d12_xs.dll", 1, false},
-        {"xg_xs.dll", 1, false},
-        {"AcpHal.dll", 1, false},
-        {"dstorage_xs.dll", 1, false},
-        {"winrt_xs.dll", 1, false},
-        {"xmem.dll", 1, false},
-        {"pixevt.dll", 1, false},
-        {"xcrdapi.dll", 1, false},
-        {"libHttpClient.GDK.dll", 1, false},
-        {"XCurl.dll", 1, false},
-        {"Bink2Scarlett.dll", 1, false},
-        {"amd_fidelityfx_upscaler_xbox.dll", 1, false},
-        {"XboxBvhBuilder.dll", 1, false},
+        {"d3d12_xs.dll", 1, false, false},
+        {"xg_xs.dll", 1, false, false},
+        {"AcpHal.dll", 1, false, false},
+        {"dstorage_xs.dll", 1, false, false},
+        {"winrt_xs.dll", 1, false, false},
+        {"xmem.dll", 1, false, false},
+        {"pixevt.dll", 1, false, false},
+        {"xcrdapi.dll", 1, false, false},
+        {"libHttpClient.GDK.dll", 1, false, false},
+        {"XCurl.dll", 1, false, false},
+        {"Bink2Scarlett.dll", 1, false, false},
+        {"amd_fidelityfx_upscaler_xbox.dll", 1, false, false},
+        {"XboxBvhBuilder.dll", 1, false, false},
         // Priority 2: dependent shims
-        {"Microsoft.Xbox.Services.GDK.C.dll", 2, false},
-        {"amd_fidelityfx_loader_xbox.dll", 2, false},
-        // Extended diagnostic & media shims
-        {"mfplat_xs.dll", 1, true},
-        {"advapi32legacy.dll", 1, true},
-        {"KernelTraceControl.dll", 1, true},
-        {"hix_xs.dll", 1, true},
-        {"xbtp.dll", 1, true},
+        {"Microsoft.Xbox.Services.GDK.C.dll", 2, false, false},
+        {"amd_fidelityfx_loader_xbox.dll", 2, false, false},
+        // Extended diagnostic & media shims (5 -> 24 total)
+        {"mfplat_xs.dll", 1, true, false},
+        {"advapi32legacy.dll", 1, true, false},
+        {"KernelTraceControl.dll", 1, true, false},
+        {"hix_xs.dll", 1, true, false},
+        {"xbtp.dll", 1, true, false},
+        // Sprint 7 clean-room fixed-return stub shims (6 -> 30 total)
+        {"mflnmhelp.dll", 1, true, true},
+        {"mfhevcdec.dll", 1, true, true},
+        {"gamecoreclient.dll", 1, true, true},
+        {"minuserx.dll", 1, true, true},
+        {"xtfpix.dll", 1, true, true},
+        {"xtfdebugmonitor.dll", 1, true, true},
     };
     for (const auto& spec : kBuiltinShims) {
         const std::string key = NormalizeDllKey(spec.canonical_name);
@@ -383,6 +579,7 @@ DllRoutingTable::DllRoutingTable() {
             DllRouteRule{spec.canonical_name, DllRoutePolicy::Shim, spec.priority},
             false,
             spec.is_extended,
+            spec.is_fixed_stub,
         };
     }
 }
@@ -416,7 +613,7 @@ void DllRoutingTable::SetRule(std::string_view dll_name, DllRoutePolicy policy, 
         const int prio = (policy == DllRoutePolicy::Shim)
                              ? load_priority
                              : ((policy == DllRoutePolicy::NativeGuestDll) ? 5 : 10);
-        rules_[key] = Entry{DllRouteRule{canonical, policy, prio}, true, false};
+        rules_[key] = Entry{DllRouteRule{canonical, policy, prio}, true, false, false};
     }
 }
 
@@ -640,8 +837,9 @@ DllRouteDecision DllRoutingTable::ResolveRoute(std::string_view dll_name,
         }
     }
 
-    // 4. No explicit rule or alias: check if WindowsNative vs present in guest package directory.
-    if (ClassifyImportDll(canonical_in) == DllCategory::WindowsNative) {
+    // 4. No explicit rule or alias: KnownDLLs and WindowsNative ALWAYS resolve to Windows
+    //    (System32 first, never shadowed by package-local images).
+    if (IsWindowsKnownDll(canonical_in) || ClassifyImportDll(canonical_in) == DllCategory::WindowsNative) {
         out.policy = DllRoutePolicy::Windows;
         out.load_priority = 10;
         return out;
@@ -670,7 +868,7 @@ std::vector<DllRouteRule> DllRoutingTable::ListRules() const {
     std::vector<DllRouteRule> out;
     out.reserve(rules_.size());
     for (const auto& kv : rules_) {
-        if (!kv.second.is_extended || kv.second.from_override) {
+        if ((!kv.second.is_extended && !kv.second.is_fixed_stub) || kv.second.from_override) {
             out.push_back(kv.second.rule);
         }
     }
@@ -684,6 +882,23 @@ std::vector<DllRouteRule> DllRoutingTable::ListRules() const {
 }
 
 std::vector<DllRouteRule> DllRoutingTable::ListAllRules() const {
+    std::vector<DllRouteRule> out;
+    out.reserve(rules_.size());
+    for (const auto& kv : rules_) {
+        if (!kv.second.is_fixed_stub || kv.second.from_override) {
+            out.push_back(kv.second.rule);
+        }
+    }
+    std::sort(out.begin(), out.end(), [](const DllRouteRule& a, const DllRouteRule& b) {
+        if (a.load_priority != b.load_priority) {
+            return a.load_priority < b.load_priority;
+        }
+        return ToLower(a.canonical_name) < ToLower(b.canonical_name);
+    });
+    return out;
+}
+
+std::vector<DllRouteRule> DllRoutingTable::ListCompleteRules() const {
     std::vector<DllRouteRule> out;
     out.reserve(rules_.size());
     for (const auto& kv : rules_) {
@@ -732,7 +947,8 @@ Status InspectPeBytes(const std::vector<uint8_t>& bytes,
     }
     out_report.section_count = num_sections;
     out_report.is_dll = (characteristics & 0x2000u) != 0;
-    out_report.has_relocations = (characteristics & 0x0001u) == 0;
+    const bool relocs_stripped_flag = (characteristics & 0x0001u) != 0;
+    out_report.has_relocations = false;
 
     const size_t opt_off = coff_off + 20;
     uint16_t opt_magic = 0;
@@ -800,34 +1016,59 @@ Status InspectPeBytes(const std::vector<uint8_t>& bytes,
 
                 std::unordered_map<uint32_t, std::string> index_to_name;
                 size_t names_off = 0;
+                size_t names_avail = 0;
                 size_t ords_off = 0;
+                size_t ords_avail = 0;
                 if (capped_names > 0 &&
-                    RvaToFileOffset(sections, addr_names_rva, bytes.size(), names_off) &&
-                    RvaToFileOffset(sections, addr_ords_rva, bytes.size(), ords_off)) {
+                    addr_names_rva != 0 &&
+                    addr_ords_rva != 0 &&
+                    RvaToSectionSlice(sections, addr_names_rva, bytes.size(), names_off, names_avail) &&
+                    RvaToSectionSlice(sections, addr_ords_rva, bytes.size(), ords_off, ords_avail)) {
                     index_to_name.reserve(capped_names);
                     for (uint32_t i = 0; i < capped_names; ++i) {
-                        uint32_t name_rva = 0;
-                        uint16_t func_idx = 0;
-                        if (!ReadPod(bytes, names_off + static_cast<size_t>(i) * 4, name_rva) ||
-                            !ReadPod(bytes, ords_off + static_cast<size_t>(i) * 2, func_idx)) {
+                        const size_t name_entry_rel = static_cast<size_t>(i) * 4u;
+                        const size_t ord_entry_rel = static_cast<size_t>(i) * 2u;
+                        if (name_entry_rel + 4u > names_avail || ord_entry_rel + 2u > ords_avail) {
+                            ++out_report.malformed_export_names;
                             break;
                         }
+                        uint32_t name_rva = 0;
+                        uint16_t func_idx = 0;
+                        if (!ReadPod(bytes, names_off + name_entry_rel, name_rva) ||
+                            !ReadPod(bytes, ords_off + ord_entry_rel, func_idx)) {
+                            ++out_report.malformed_export_names;
+                            break;
+                        }
+                        if (func_idx >= capped_funcs || name_rva == 0) {
+                            ++out_report.malformed_export_names;
+                            continue;
+                        }
                         size_t str_off = 0;
+                        size_t str_avail = 0;
                         std::string sym_name;
-                        if (RvaToFileOffset(sections, name_rva, bytes.size(), str_off) &&
-                            ReadCString(bytes, str_off, 512, sym_name)) {
+                        if (RvaToSectionSlice(sections, name_rva, bytes.size(), str_off, str_avail) &&
+                            ReadExportNameString(bytes, str_off, str_avail, 512u, sym_name)) {
                             index_to_name.emplace(static_cast<uint32_t>(func_idx), std::move(sym_name));
+                        } else {
+                            ++out_report.malformed_export_names;
                         }
                     }
                 }
 
                 size_t funcs_off = 0;
+                size_t funcs_avail = 0;
                 if (capped_funcs > 0 &&
-                    RvaToFileOffset(sections, addr_funcs_rva, bytes.size(), funcs_off)) {
+                    addr_funcs_rva != 0 &&
+                    RvaToSectionSlice(sections, addr_funcs_rva, bytes.size(), funcs_off, funcs_avail)) {
                     out_report.exports.reserve(capped_funcs);
+                    const uint64_t exp_end_64 = static_cast<uint64_t>(exp_rva) + static_cast<uint64_t>(exp_sz);
                     for (uint32_t i = 0; i < capped_funcs; ++i) {
+                        const size_t fn_entry_rel = static_cast<size_t>(i) * 4u;
+                        if (fn_entry_rel + 4u > funcs_avail) {
+                            break;
+                        }
                         uint32_t fn_rva = 0;
-                        if (!ReadPod(bytes, funcs_off + static_cast<size_t>(i) * 4, fn_rva)) {
+                        if (!ReadPod(bytes, funcs_off + fn_entry_rel, fn_rva)) {
                             break;
                         }
                         if (fn_rva == 0) {
@@ -840,13 +1081,15 @@ Status InspectPeBytes(const std::vector<uint8_t>& bytes,
                         if (name_it != index_to_name.end()) {
                             sym.name = name_it->second;
                         }
-                        if (fn_rva >= exp_rva && fn_rva < exp_rva + exp_sz) {
+                        if (static_cast<uint64_t>(fn_rva) >= static_cast<uint64_t>(exp_rva) &&
+                            static_cast<uint64_t>(fn_rva) < exp_end_64) {
                             sym.is_forwarded = true;
                             size_t fwd_off = 0;
-                            if (RvaToFileOffset(sections, fn_rva, bytes.size(), fwd_off)) {
-                                const size_t max_fwd =
-                                    std::min<size_t>(512u, static_cast<size_t>(exp_rva + exp_sz - fn_rva));
-                                ReadCString(bytes, fwd_off, max_fwd, sym.forwarder);
+                            size_t fwd_avail = 0;
+                            if (RvaToSectionSlice(sections, fn_rva, bytes.size(), fwd_off, fwd_avail)) {
+                                const size_t dir_rem = static_cast<size_t>(exp_end_64 - fn_rva);
+                                const size_t max_fwd = std::min<size_t>({512u, dir_rem, fwd_avail});
+                                ReadExportNameString(bytes, fwd_off, max_fwd, 512u, sym.forwarder);
                             }
                         }
                         out_report.exports.push_back(std::move(sym));
@@ -856,12 +1099,57 @@ Status InspectPeBytes(const std::vector<uint8_t>& bytes,
         }
     }
 
-    // 2. Exception Directory / x64 .pdata (index 3)
+    // 1b. Base Relocation Directory (index 5):
+    //     Strictly treat VirtualAddress == 0 OR Size == 0 (or IMAGE_FILE_RELOCS_STRIPPED)
+    //     as absent, never attempting to read offset 0 as relocation blocks.
+    uint32_t reloc_rva = 0, reloc_sz = 0;
+    if (!relocs_stripped_flag && read_dir(5, reloc_rva, reloc_sz) &&
+        reloc_rva != 0u && reloc_sz >= 8u) {
+        size_t reloc_off = 0;
+        size_t reloc_avail = 0;
+        if (RvaToSectionSlice(sections, reloc_rva, bytes.size(), reloc_off, reloc_avail)) {
+            out_report.has_relocations = true;
+            out_report.reloc_dir_rva = reloc_rva;
+            out_report.reloc_dir_size = reloc_sz;
+            const size_t walk_limit = std::min<size_t>(static_cast<size_t>(reloc_sz), reloc_avail);
+            size_t cursor = 0u;
+            uint32_t block_guard = 0u;
+            while (cursor + 8u <= walk_limit && block_guard < 65536u) {
+                uint32_t page_rva = 0;
+                uint32_t block_size = 0;
+                if (!ReadPod(bytes, reloc_off + cursor, page_rva) ||
+                    !ReadPod(bytes, reloc_off + cursor + 4u, block_size)) {
+                    break;
+                }
+                if (block_size == 0u) {
+                    break;
+                }
+                if (block_size < 8u || (block_size & 1u) != 0u || block_size > walk_limit - cursor) {
+                    break;
+                }
+                (void)page_rva;
+                ++out_report.reloc_block_count;
+                out_report.reloc_entry_count += (block_size - 8u) / 2u;
+                cursor += block_size;
+                ++block_guard;
+            }
+        }
+    }
+
+    // 2. Exception Directory / x64 .pdata (index 3) & .xdata unwind validation
     uint32_t exc_rva = 0, exc_sz = 0;
     if (read_dir(3, exc_rva, exc_sz) && exc_rva != 0 && exc_sz != 0) {
         out_report.exception_dir_rva = exc_rva;
         out_report.exception_dir_size = exc_sz;
         out_report.exception_entry_count = exc_sz / 12u;  // sizeof(RUNTIME_FUNCTION) == 12 on x64
+        PeXdataValidationResult xdata_res{};
+        if (ValidatePeXdataUnwind(bytes, xdata_res).ok()) {
+            out_report.xdata_valid_entries = xdata_res.valid_entries;
+            out_report.xdata_invalid_entries = xdata_res.invalid_entries;
+            out_report.xdata_alloc_large_entries = xdata_res.alloc_large_entries;
+            out_report.xdata_epilog_entries = xdata_res.epilog_code_entries;
+            out_report.xdata_chained_entries = xdata_res.chained_entries;
+        }
     }
 
     // 3. TLS Directory & Callback RVAs (index 9)
@@ -1216,17 +1504,32 @@ bool LookupMappedPeExportForwarder(const void* module_base,
         const auto* names = reinterpret_cast<const uint32_t*>(base + exp->AddressOfNames);
         const auto* ords = reinterpret_cast<const uint16_t*>(base + exp->AddressOfNameOrdinals);
 
+        auto bounded_cmp = [&](uint32_t name_rva, int& out_cmp) -> bool {
+            if (name_rva == 0u || name_rva >= image_size) {
+                return false;
+            }
+            const char* cur_name = reinterpret_cast<const char*>(base + name_rva);
+            const size_t max_n = static_cast<size_t>(image_size - name_rva);
+            size_t len = 0u;
+            while (len < max_n && cur_name[len] != '\0') {
+                ++len;
+            }
+            if (len >= max_n) {
+                return false;  // Unterminated export name inside mapped image bounds
+            }
+            out_cmp = std::strcmp(proc_name_or_ordinal, cur_name);
+            return true;
+        };
+
         // O(log N) binary search per PE/COFF sorted name table specification.
         uint32_t lo = 0;
         uint32_t hi = exp->NumberOfNames;
         while (lo < hi) {
             const uint32_t mid = lo + (hi - lo) / 2u;
-            const uint32_t name_rva = names[mid];
-            if (name_rva == 0 || name_rva >= image_size) {
+            int cmp = 0;
+            if (!bounded_cmp(names[mid], cmp)) {
                 break;
             }
-            const char* cur_name = reinterpret_cast<const char*>(base + name_rva);
-            const int cmp = std::strcmp(proc_name_or_ordinal, cur_name);
             if (cmp == 0) {
                 func_index = ords[mid];
                 break;
@@ -1241,12 +1544,8 @@ bool LookupMappedPeExportForwarder(const void* module_base,
         // Linear fallback for hand-crafted PE images with unsorted export name tables.
         if (func_index == UINT32_MAX) {
             for (uint32_t i = 0; i < exp->NumberOfNames; ++i) {
-                const uint32_t name_rva = names[i];
-                if (name_rva == 0 || name_rva >= image_size) {
-                    continue;
-                }
-                const char* cur_name = reinterpret_cast<const char*>(base + name_rva);
-                if (std::strcmp(proc_name_or_ordinal, cur_name) == 0) {
+                int cmp = 0;
+                if (bounded_cmp(names[i], cmp) && cmp == 0) {
                     func_index = ords[i];
                     break;
                 }
@@ -1481,6 +1780,573 @@ bool UnregisterPeExceptionTable(void* module_base, uint32_t pdata_rva) {
     (void)module_base;
     (void)pdata_rva;
     return false;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Base Relocation Validation (RVA 0 / Size 0 Safe)
+// ---------------------------------------------------------------------------
+Status ValidatePeBaseRelocations(const std::vector<uint8_t>& bytes,
+                                 bool& out_has_relocations,
+                                 uint32_t& out_block_count,
+                                 uint32_t& out_entry_count) {
+    out_has_relocations = false;
+    out_block_count = 0u;
+    out_entry_count = 0u;
+
+    PeInspectionReport rep{};
+    Status st = InspectPeBytes(bytes, "<reloc_check>", rep);
+    if (!st.ok()) {
+        return st;
+    }
+    out_has_relocations = rep.has_relocations;
+    out_block_count = rep.reloc_block_count;
+    out_entry_count = rep.reloc_entry_count;
+    return Status::Ok();
+}
+
+// ---------------------------------------------------------------------------
+// x64 .pdata / .xdata Unwind Metadata Validator
+//   - Validates UNWIND_INFO v1, v2, v3 headers and flags
+//   - Validates UWOP_ALLOC_LARGE (info=0 scaled*8, info=1 unscaled 32-bit, alignment & bounds)
+//   - Validates v2/v3 UWOP_EPILOG unwind codes
+//   - Validates UNW_FLAG_CHAININFO trailing RUNTIME_FUNCTION with cycle detection
+// ---------------------------------------------------------------------------
+Status ValidatePeXdataUnwind(const std::vector<uint8_t>& bytes,
+                             PeXdataValidationResult& out_result) {
+    out_result = {};
+    if (bytes.size() < 0x100u) {
+        return Status::Error(StatusCode::ParseError, "Image too small for PE headers");
+    }
+    uint16_t mz = 0u;
+    uint32_t pe_off = 0u;
+    if (!ReadPod(bytes, 0u, mz) || mz != 0x5A4Du || !ReadPod(bytes, 0x3Cu, pe_off)) {
+        return Status::Error(StatusCode::ParseError, "Missing DOS MZ header");
+    }
+    uint32_t pe_sig = 0u;
+    if (!ReadPod(bytes, pe_off, pe_sig) || pe_sig != 0x00004550u) {
+        return Status::Error(StatusCode::ParseError, "Missing PE signature");
+    }
+
+    const size_t coff_off = static_cast<size_t>(pe_off) + 4u;
+    uint16_t num_sections = 0u;
+    uint16_t opt_size = 0u;
+    if (!ReadPod(bytes, coff_off + 2u, num_sections) ||
+        !ReadPod(bytes, coff_off + 16u, opt_size)) {
+        return Status::Error(StatusCode::ParseError, "Truncated COFF header");
+    }
+    const size_t opt_off = coff_off + 20u;
+    uint16_t opt_magic = 0u;
+    uint32_t image_size = 0u;
+    uint32_t num_rva_and_sizes = 0u;
+    if (opt_size < 0x70u || !ReadPod(bytes, opt_off, opt_magic) || opt_magic != 0x020Bu ||
+        !ReadPod(bytes, opt_off + 56u, image_size) ||
+        !ReadPod(bytes, opt_off + 108u, num_rva_and_sizes)) {
+        return Status::Error(StatusCode::UnsupportedFormat, "Not a valid PE32+ image");
+    }
+
+    const size_t dd_off = opt_off + 112u;
+    if (num_rva_and_sizes <= 3u) {
+        return Status::Ok();
+    }
+    uint32_t exc_rva = 0u;
+    uint32_t exc_sz = 0u;
+    if (!ReadPod(bytes, dd_off + 3u * 8u, exc_rva) ||
+        !ReadPod(bytes, dd_off + 3u * 8u + 4u, exc_sz)) {
+        return Status::Error(StatusCode::ParseError, "Truncated exception data directory");
+    }
+    if (exc_rva == 0u || exc_sz == 0u) {
+        return Status::Ok();
+    }
+
+    const size_t sec_off = opt_off + opt_size;
+    std::vector<SectionRange> sections;
+    sections.reserve(num_sections);
+    for (uint16_t i = 0; i < num_sections; ++i) {
+        const size_t base = sec_off + static_cast<size_t>(i) * 40u;
+        SectionRange sr{};
+        if (!ReadPod(bytes, base + 8u, sr.vsize) ||
+            !ReadPod(bytes, base + 12u, sr.vaddr) ||
+            !ReadPod(bytes, base + 16u, sr.raw_size) ||
+            !ReadPod(bytes, base + 20u, sr.raw_ptr)) {
+            return Status::Error(StatusCode::ParseError, "Truncated section table");
+        }
+        sections.push_back(sr);
+    }
+
+    size_t pdata_off = 0u;
+    size_t pdata_avail = 0u;
+    if (!RvaToSectionSlice(sections, exc_rva, bytes.size(), pdata_off, pdata_avail)) {
+        ++out_result.bounds_errors;
+        out_result.errors.push_back("Exception directory RVA outside raw section data");
+        return Status::Ok();
+    }
+
+    constexpr uint8_t kUnwFlagEhandler = 0x01u;
+    constexpr uint8_t kUnwFlagUhandler = 0x02u;
+    constexpr uint8_t kUnwFlagChainInfo = 0x04u;
+
+    auto record_error = [&](const std::string& msg) {
+        if (out_result.errors.size() < 64u) {
+            out_result.errors.push_back(msg);
+        }
+    };
+
+    // Helper: validates a single UNWIND_INFO at `unwind_rva` plus any chained targets.
+    auto validate_unwind_chain = [&](uint32_t start_unwind_rva,
+                                     bool& out_had_alloc_large,
+                                     bool& out_had_epilog,
+                                     bool& out_had_chain,
+                                     uint8_t& out_primary_version) -> bool {
+        out_had_alloc_large = false;
+        out_had_epilog = false;
+        out_had_chain = false;
+        out_primary_version = 0u;
+
+        std::unordered_set<uint32_t> visited_rvas;
+        uint32_t cur_rva = start_unwind_rva;
+        for (uint32_t depth = 0u; depth < 32u; ++depth) {
+            // Follow odd indirect RUNTIME_FUNCTION pointer (bit 0 set in x64 .pdata ABI).
+            uint32_t indirection_guard = 0u;
+            while ((cur_rva & 1u) != 0u && indirection_guard < 8u) {
+                const uint32_t rf_rva = cur_rva & ~1u;
+                if (!visited_rvas.insert(rf_rva | 1u).second) {
+                    ++out_result.cycle_errors;
+                    record_error("Cyclic indirect RUNTIME_FUNCTION in .pdata");
+                    return false;
+                }
+                size_t rf_off = 0u, rf_avail = 0u;
+                uint32_t r_begin = 0u, r_end = 0u, r_next_unwind = 0u;
+                if (!RvaToSectionSlice(sections, rf_rva, bytes.size(), rf_off, rf_avail) ||
+                    rf_avail < 12u ||
+                    !ReadPod(bytes, rf_off, r_begin) ||
+                    !ReadPod(bytes, rf_off + 4u, r_end) ||
+                    !ReadPod(bytes, rf_off + 8u, r_next_unwind) ||
+                    r_begin >= r_end) {
+                    ++out_result.bounds_errors;
+                    record_error("Invalid indirect RUNTIME_FUNCTION target");
+                    return false;
+                }
+                cur_rva = r_next_unwind;
+                out_had_chain = true;
+                ++indirection_guard;
+            }
+            if ((cur_rva & 1u) != 0u) {
+                ++out_result.cycle_errors;
+                record_error("Excessive indirect RUNTIME_FUNCTION depth");
+                return false;
+            }
+
+            if ((cur_rva & 3u) != 0u) {
+                ++out_result.alignment_errors;
+                record_error("UNWIND_INFO RVA is not 4-byte aligned");
+                return false;
+            }
+            if (cur_rva == 0u || cur_rva >= image_size) {
+                ++out_result.bounds_errors;
+                record_error("UNWIND_INFO RVA out of image bounds");
+                return false;
+            }
+            if (!visited_rvas.insert(cur_rva).second) {
+                ++out_result.cycle_errors;
+                record_error("Cycle detected in chained .xdata UNWIND_INFO");
+                return false;
+            }
+
+            size_t ui_off = 0u;
+            size_t ui_avail = 0u;
+            if (!RvaToSectionSlice(sections, cur_rva, bytes.size(), ui_off, ui_avail) || ui_avail < 4u) {
+                ++out_result.bounds_errors;
+                record_error("UNWIND_INFO header out of section bounds");
+                return false;
+            }
+
+            const uint8_t b0 = bytes[ui_off + 0u];
+            const uint8_t size_of_prolog = bytes[ui_off + 1u];
+            const uint8_t count_of_codes = bytes[ui_off + 2u];
+            const uint8_t b3 = bytes[ui_off + 3u];
+            (void)size_of_prolog;
+            (void)b3;
+
+            const uint8_t version = b0 & 0x07u;
+            const uint8_t flags = static_cast<uint8_t>((b0 >> 3u) & 0x1Fu);
+            if (version < 1u || version > 3u) {
+                ++out_result.bounds_errors;
+                record_error("Unsupported UNWIND_INFO version");
+                return false;
+            }
+            if ((flags & ~static_cast<uint8_t>(kUnwFlagEhandler | kUnwFlagUhandler | kUnwFlagChainInfo)) != 0u) {
+                ++out_result.bounds_errors;
+                record_error("Unknown UNWIND_INFO flags");
+                return false;
+            }
+            if ((flags & kUnwFlagChainInfo) != 0u &&
+                (flags & (kUnwFlagEhandler | kUnwFlagUhandler)) != 0u) {
+                ++out_result.bounds_errors;
+                record_error("UNW_FLAG_CHAININFO cannot combine with exception/unwind handler flags");
+                return false;
+            }
+            if (depth == 0u) {
+                out_primary_version = version;
+            }
+
+            const uint32_t padded_codes = (static_cast<uint32_t>(count_of_codes) + 1u) & ~1u;
+            const size_t codes_bytes = static_cast<size_t>(padded_codes) * 2u;
+            if (4u + codes_bytes > ui_avail) {
+                ++out_result.bounds_errors;
+                record_error("UNWIND_CODE array truncated past section bounds");
+                return false;
+            }
+
+            uint32_t slot = 0u;
+            while (slot < count_of_codes) {
+                const size_t code_off = ui_off + 4u + static_cast<size_t>(slot) * 2u;
+                const uint8_t op_byte = bytes[code_off + 1u];
+                const uint8_t unwind_op = op_byte & 0x0Fu;
+                const uint8_t op_info = static_cast<uint8_t>((op_byte >> 4u) & 0x0Fu);
+
+                switch (unwind_op) {
+                    case 0u:  // UWOP_PUSH_NONVOL
+                        slot += 1u;
+                        break;
+                    case 1u: {  // UWOP_ALLOC_LARGE
+                        out_had_alloc_large = true;
+                        if (op_info == 0u) {
+                            if (slot + 1u >= count_of_codes) {
+                                ++out_result.bounds_errors;
+                                record_error("UWOP_ALLOC_LARGE (info=0) missing scaled size slot");
+                                return false;
+                            }
+                            uint16_t scaled = 0u;
+                            ReadPod(bytes, code_off + 2u, scaled);
+                            const uint32_t alloc_bytes = static_cast<uint32_t>(scaled) * 8u;
+                            if (alloc_bytes == 0u) {
+                                ++out_result.alignment_errors;
+                                record_error("UWOP_ALLOC_LARGE (info=0) has zero allocation size");
+                                return false;
+                            }
+                            slot += 2u;
+                        } else if (op_info == 1u) {
+                            if (slot + 2u >= count_of_codes) {
+                                ++out_result.bounds_errors;
+                                record_error("UWOP_ALLOC_LARGE (info=1) missing 32-bit size slots");
+                                return false;
+                            }
+                            uint32_t unscaled = 0u;
+                            ReadPod(bytes, code_off + 2u, unscaled);
+                            if (unscaled == 0u || (unscaled & 7u) != 0u) {
+                                ++out_result.alignment_errors;
+                                record_error("UWOP_ALLOC_LARGE (info=1) size is zero or not 8-byte stack-slot aligned");
+                                return false;
+                            }
+                            slot += 3u;
+                        } else {
+                            ++out_result.bounds_errors;
+                            record_error("UWOP_ALLOC_LARGE has invalid OpInfo (>1)");
+                            return false;
+                        }
+                        break;
+                    }
+                    case 2u:  // UWOP_ALLOC_SMALL
+                    case 3u:  // UWOP_SET_FPREG
+                        slot += 1u;
+                        break;
+                    case 4u:  // UWOP_SAVE_NONVOL (2 slots)
+                        if (slot + 1u >= count_of_codes) {
+                            ++out_result.bounds_errors;
+                            record_error("UWOP_SAVE_NONVOL truncated");
+                            return false;
+                        }
+                        slot += 2u;
+                        break;
+                    case 5u:  // UWOP_SAVE_NONVOL_FAR (3 slots)
+                        if (slot + 2u >= count_of_codes) {
+                            ++out_result.bounds_errors;
+                            record_error("UWOP_SAVE_NONVOL_FAR truncated");
+                            return false;
+                        }
+                        slot += 3u;
+                        break;
+                    case 6u:  // UWOP_EPILOG (valid in v2/v3 only)
+                        if (version < 2u) {
+                            ++out_result.bounds_errors;
+                            record_error("UWOP_EPILOG encountered in UNWIND_INFO v1");
+                            return false;
+                        }
+                        out_had_epilog = true;
+                        slot += 1u;
+                        break;
+                    case 7u:  // UWOP_SPARE_CODE (v1 legacy 2-slot)
+                        if (version >= 2u || slot + 1u >= count_of_codes) {
+                            ++out_result.bounds_errors;
+                            record_error("Invalid UWOP_SPARE_CODE in UNWIND_INFO");
+                            return false;
+                        }
+                        slot += 2u;
+                        break;
+                    case 8u:  // UWOP_SAVE_XMM128 (2 slots)
+                        if (slot + 1u >= count_of_codes) {
+                            ++out_result.bounds_errors;
+                            record_error("UWOP_SAVE_XMM128 truncated");
+                            return false;
+                        }
+                        slot += 2u;
+                        break;
+                    case 9u:  // UWOP_SAVE_XMM128_FAR (3 slots)
+                        if (slot + 2u >= count_of_codes) {
+                            ++out_result.bounds_errors;
+                            record_error("UWOP_SAVE_XMM128_FAR truncated");
+                            return false;
+                        }
+                        slot += 3u;
+                        break;
+                    case 10u:  // UWOP_PUSH_MACHFRAME (1 slot, op_info 0 or 1)
+                        if (op_info > 1u) {
+                            ++out_result.bounds_errors;
+                            record_error("UWOP_PUSH_MACHFRAME invalid OpInfo");
+                            return false;
+                        }
+                        slot += 1u;
+                        break;
+                    default:
+                        ++out_result.bounds_errors;
+                        record_error("Unknown x64 UNWIND_CODE opcode");
+                        return false;
+                }
+            }
+
+            const size_t tail_off = ui_off + 4u + codes_bytes;
+            const size_t tail_avail = ui_avail - (4u + codes_bytes);
+            if ((flags & kUnwFlagChainInfo) != 0u) {
+                out_had_chain = true;
+                if (tail_avail < 12u) {
+                    ++out_result.bounds_errors;
+                    record_error("Chained RUNTIME_FUNCTION truncated after UNWIND_CODE array");
+                    return false;
+                }
+                uint32_t ch_begin = 0u, ch_end = 0u, ch_unwind = 0u;
+                ReadPod(bytes, tail_off + 0u, ch_begin);
+                ReadPod(bytes, tail_off + 4u, ch_end);
+                ReadPod(bytes, tail_off + 8u, ch_unwind);
+                if (ch_begin >= ch_end || ch_end > image_size || ch_unwind == 0u) {
+                    ++out_result.bounds_errors;
+                    record_error("Chained RUNTIME_FUNCTION has invalid range or unwind RVA");
+                    return false;
+                }
+                cur_rva = ch_unwind;
+                continue;
+            }
+
+            if ((flags & (kUnwFlagEhandler | kUnwFlagUhandler)) != 0u) {
+                if (tail_avail < 4u) {
+                    ++out_result.bounds_errors;
+                    record_error("Exception handler RVA truncated after UNWIND_CODE array");
+                    return false;
+                }
+                uint32_t handler_rva = 0u;
+                ReadPod(bytes, tail_off, handler_rva);
+                if (handler_rva == 0u || handler_rva >= image_size) {
+                    ++out_result.bounds_errors;
+                    record_error("Exception handler RVA out of image bounds");
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        ++out_result.cycle_errors;
+        record_error("Chained UNWIND_INFO depth exceeded maximum limit (32)");
+        return false;
+    };
+
+    const uint32_t capped_entries = std::min<uint32_t>(
+        exc_sz / 12u,
+        static_cast<uint32_t>(pdata_avail / 12u));
+    out_result.runtime_function_count = capped_entries;
+
+    for (uint32_t i = 0u; i < capped_entries; ++i) {
+        const size_t rf_off = pdata_off + static_cast<size_t>(i) * 12u;
+        uint32_t begin_rva = 0u, end_rva = 0u, unwind_rva = 0u;
+        if (!ReadPod(bytes, rf_off + 0u, begin_rva) ||
+            !ReadPod(bytes, rf_off + 4u, end_rva) ||
+            !ReadPod(bytes, rf_off + 8u, unwind_rva)) {
+            ++out_result.invalid_entries;
+            ++out_result.bounds_errors;
+            break;
+        }
+        if (begin_rva == 0u && end_rva == 0u && unwind_rva == 0u) {
+            break;
+        }
+        if (begin_rva >= end_rva || end_rva > image_size) {
+            ++out_result.invalid_entries;
+            ++out_result.bounds_errors;
+            record_error("RUNTIME_FUNCTION BeginAddress/EndAddress invalid");
+            continue;
+        }
+
+        bool had_alloc_large = false;
+        bool had_epilog = false;
+        bool had_chain = false;
+        uint8_t primary_ver = 0u;
+        if (validate_unwind_chain(unwind_rva, had_alloc_large, had_epilog, had_chain, primary_ver)) {
+            ++out_result.valid_entries;
+            if (primary_ver == 1u) ++out_result.v1_entries;
+            else if (primary_ver == 2u) ++out_result.v2_entries;
+            else if (primary_ver == 3u) ++out_result.v3_entries;
+            if (had_alloc_large) ++out_result.alloc_large_entries;
+            if (had_epilog) ++out_result.epilog_code_entries;
+            if (had_chain) ++out_result.chained_entries;
+        } else {
+            ++out_result.invalid_entries;
+        }
+    }
+
+    return Status::Ok();
+}
+
+// ---------------------------------------------------------------------------
+// Fault-Free PE Section Protection Transitions
+// ---------------------------------------------------------------------------
+uint32_t ComputePeSectionProtection(uint32_t section_characteristics) noexcept {
+    constexpr uint32_t kScnNotCached = 0x04000000u;
+    constexpr uint32_t kScnExecute = 0x20000000u;
+    constexpr uint32_t kScnRead = 0x40000000u;
+    constexpr uint32_t kScnWrite = 0x80000000u;
+
+    const bool r = (section_characteristics & kScnRead) != 0u;
+    const bool w = (section_characteristics & kScnWrite) != 0u;
+    const bool x = (section_characteristics & kScnExecute) != 0u;
+
+    uint32_t prot = 0x01u;  // PAGE_NOACCESS
+    if (x) {
+        if (w) {
+            prot = 0x40u;  // PAGE_EXECUTE_READWRITE
+        } else if (r) {
+            prot = 0x20u;  // PAGE_EXECUTE_READ
+        } else {
+            prot = 0x10u;  // PAGE_EXECUTE
+        }
+    } else {
+        if (w) {
+            prot = 0x04u;  // PAGE_READWRITE
+        } else if (r) {
+            prot = 0x02u;  // PAGE_READONLY
+        } else {
+            prot = 0x01u;  // PAGE_NOACCESS
+        }
+    }
+    if ((section_characteristics & kScnNotCached) != 0u && prot != 0x01u) {
+        prot |= 0x200u;  // PAGE_NOCACHE
+    }
+    return prot;
+}
+
+Status ApplyPeSectionProtections(void* module_base,
+                                 PeSectionProtectionSummary* out_summary) {
+    PeSectionProtectionSummary summary{};
+    if (out_summary) {
+        *out_summary = summary;
+    }
+    if (!module_base) {
+        return Status::Error(StatusCode::InvalidArgument, "Null PE module base");
+    }
+#if !defined(_WIN32)
+    return Status::Error(StatusCode::NotImplemented, "ApplyPeSectionProtections requires Windows");
+#else
+    // Validate that the DOS header page is committed before touching memory.
+    MEMORY_BASIC_INFORMATION hdr_mbi{};
+    if (::VirtualQuery(module_base, &hdr_mbi, sizeof(hdr_mbi)) == 0u ||
+        hdr_mbi.State != MEM_COMMIT ||
+        (hdr_mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0u) {
+        return Status::Error(StatusCode::InvalidArgument, "PE header page is not committed/readable");
+    }
+
+    const uint8_t* base = nullptr;
+    const IMAGE_NT_HEADERS64* nt = nullptr;
+    uint32_t image_size = 0u;
+    if (!ReadMappedPeHeaders64(module_base, base, nt, image_size)) {
+        return Status::Error(StatusCode::ParseError, "Invalid mapped PE32+ headers");
+    }
+
+    SYSTEM_INFO si{};
+    ::GetSystemInfo(&si);
+    const size_t page_size = (si.dwPageSize != 0u) ? static_cast<size_t>(si.dwPageSize) : 4096u;
+
+    const IMAGE_SECTION_HEADER* secs = IMAGE_FIRST_SECTION(nt);
+    const uint16_t num_sections = nt->FileHeader.NumberOfSections;
+    summary.total_sections = num_sections;
+
+    const uintptr_t img_start = reinterpret_cast<uintptr_t>(module_base);
+    const uintptr_t img_end = img_start + static_cast<uintptr_t>(image_size);
+
+    for (uint16_t i = 0u; i < num_sections; ++i) {
+        const auto& sec = secs[i];
+        const uint32_t raw_span = std::max<uint32_t>(
+            static_cast<uint32_t>(sec.Misc.VirtualSize),
+            static_cast<uint32_t>(sec.SizeOfRawData));
+        if (sec.VirtualAddress == 0u || raw_span == 0u || sec.VirtualAddress >= image_size) {
+            ++summary.skipped_sections;
+            continue;
+        }
+
+        const uint32_t clamped_span = std::min<uint32_t>(
+            raw_span, image_size - static_cast<uint32_t>(sec.VirtualAddress));
+        const uintptr_t sec_raw_start = img_start + static_cast<uintptr_t>(sec.VirtualAddress);
+        const uintptr_t sec_raw_end = sec_raw_start + static_cast<uintptr_t>(clamped_span);
+
+        const uintptr_t aligned_start = std::max(img_start, sec_raw_start & ~(page_size - 1u));
+        const uintptr_t aligned_end = std::min(img_end, (sec_raw_end + page_size - 1u) & ~(page_size - 1u));
+        if (aligned_end <= aligned_start) {
+            ++summary.skipped_sections;
+            continue;
+        }
+
+        const DWORD new_prot = static_cast<DWORD>(ComputePeSectionProtection(sec.Characteristics));
+        bool any_committed = false;
+        bool any_failed = false;
+
+        uintptr_t cursor = aligned_start;
+        while (cursor < aligned_end) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (::VirtualQuery(reinterpret_cast<const void*>(cursor), &mbi, sizeof(mbi)) == 0u ||
+                mbi.RegionSize == 0u) {
+                break;
+            }
+            const uintptr_t reg_start = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+            const uintptr_t reg_end = reg_start + mbi.RegionSize;
+            const uintptr_t step_end = std::min(aligned_end, reg_end);
+            if (step_end <= cursor) {
+                break;
+            }
+            if (mbi.State == MEM_COMMIT) {
+                any_committed = true;
+                DWORD old_prot = 0u;
+                if (!::VirtualProtect(reinterpret_cast<void*>(cursor),
+                                      static_cast<SIZE_T>(step_end - cursor),
+                                      new_prot,
+                                      &old_prot)) {
+                    any_failed = true;
+                }
+            }
+            cursor = step_end;
+        }
+
+        if (!any_committed) {
+            ++summary.skipped_sections;
+        } else if (any_failed) {
+            ++summary.failed_sections;
+        } else {
+            ++summary.protected_sections;
+        }
+    }
+
+    if (out_summary) {
+        *out_summary = summary;
+    }
+    return summary.failed_sections == 0u
+               ? Status::Ok()
+               : Status::Error(StatusCode::DeviceError, "One or more PE sections failed VirtualProtect");
 #endif
 }
 

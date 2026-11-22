@@ -798,6 +798,144 @@ size_t UnifiedMemoryManager::ActiveAliasCount() const {
     return aliases_.size();
 }
 
+bool UnifiedMemoryManager::LookupBlockByHostPtr(const void* host_ptr,
+                                                UnifiedMemoryBlock& out_block) const {
+    if (!host_ptr) {
+        return false;
+    }
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(host_ptr);
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& [va, block] : blocks_) {
+        (void)va;
+        const uintptr_t base = reinterpret_cast<uintptr_t>(block.host_ptr);
+        if (addr >= base && addr < base + block.size) {
+            out_block = block;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool UnifiedMemoryManager::LookupPlaceholderByHostPtr(const void* host_ptr,
+                                                      void*& out_base,
+                                                      size_t& out_size,
+                                                      size_t& out_granule,
+                                                      bool& out_mapped) const {
+    out_base = nullptr;
+    out_size = 0u;
+    out_granule = 0u;
+    out_mapped = false;
+    if (!host_ptr) {
+        return false;
+    }
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(host_ptr);
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& [rbase, res] : placeholders_) {
+        (void)rbase;
+        if (addr >= res.base && addr < res.base + res.total_size) {
+            for (const auto& sp : res.spans) {
+                if (addr >= sp.base && addr < sp.base + sp.size) {
+                    out_base = reinterpret_cast<void*>(sp.base);
+                    out_size = sp.size;
+                    out_granule = res.granule;
+                    out_mapped = sp.mapped;
+                    return true;
+                }
+            }
+            out_base = reinterpret_cast<void*>(res.base);
+            out_size = res.total_size;
+            out_granule = res.granule;
+            out_mapped = false;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool DecodeEraAllocationAttributes(uint64_t raw_attributes,
+                                   EraAllocationAttributes& out_decoded) noexcept {
+    out_decoded = EraAllocationAttributes{};
+    out_decoded.raw_attributes = raw_attributes;
+
+    const uint32_t obj_type = static_cast<uint32_t>(raw_attributes & 0x1FFFu);
+    const uint32_t heap_tracks = static_cast<uint32_t>((raw_attributes >> 13u) & 0x1u);
+    const uint32_t must_succeed = static_cast<uint32_t>((raw_attributes >> 14u) & 0x1u);
+    const uint32_t fixed_size = static_cast<uint32_t>((raw_attributes >> 15u) & 0x1u);
+    const uint32_t alloc_id = static_cast<uint32_t>((raw_attributes >> 16u) & 0xFFu);
+    const uint32_t align_code = static_cast<uint32_t>((raw_attributes >> 24u) & 0xFu);
+    const uint32_t mem_type = static_cast<uint32_t>((raw_attributes >> 28u) & 0xFu);
+    const uint32_t page_code = static_cast<uint32_t>((raw_attributes >> 32u) & 0x3u);
+    const uint32_t zero_init = static_cast<uint32_t>((raw_attributes >> 34u) & 0x1u);
+    const uint32_t page_2mb_hint = static_cast<uint32_t>((raw_attributes >> 35u) & 0x1u);
+
+    if (mem_type > 4u) {
+        return false;
+    }
+
+    uint64_t align_bytes = 16ull;
+    if (align_code != 0u) {
+        align_bytes = 1ull << (align_code + 1u);  // 1 -> 4B .. 15 -> 64KB
+    }
+
+    uint64_t page_bytes = 4096ull;
+    uint32_t alloc_flags = 0x40000000u;  // MEM_TITLE
+    if (page_2mb_hint != 0u) {
+        page_bytes = 2ull * 1024ull * 1024ull;
+        alloc_flags |= 0x20000000u;  // MEM_LARGE_PAGES (2 MiB)
+    } else if (page_code == 1u) {
+        page_bytes = 4096ull;
+    } else if (page_code == 2u) {
+        page_bytes = 65536ull;
+    } else if (page_code == 3u) {
+        page_bytes = 4ull * 1024ull * 1024ull;
+        alloc_flags |= 0x80000000u | 0x20000000u;  // MEM_4MB_PAGES | MEM_LARGE_PAGES
+    } else {
+        page_bytes = (mem_type == 0u) ? 4096ull : 65536ull;
+    }
+
+    if (page_code != 0u && align_bytes < page_bytes) {
+        align_bytes = page_bytes;
+    }
+
+    uint32_t protect_flags = 0x00000004u;  // PAGE_READWRITE
+    switch (mem_type) {
+        case 0u:  // XALLOC_MEMTYPE_HEAP
+            break;
+        case 1u:  // XALLOC_MEMTYPE_GRAPHICS_WRITECOMBINE
+            alloc_flags |= 0x10000000u | 0x04000000u;  // MEM_GRAPHICS | MEM_WRITE_COMBINE
+            protect_flags |= 0x00000400u;              // PAGE_WRITECOMBINE
+            break;
+        case 2u:  // XALLOC_MEMTYPE_GRAPHICS_WRITECOMBINE_GPU_READONLY
+            alloc_flags |= 0x10000000u | 0x04000000u;  // MEM_GRAPHICS | MEM_WRITE_COMBINE
+            protect_flags |= 0x00000400u | 0x00020000u;  // PAGE_WRITECOMBINE | PAGE_GPU_READONLY
+            break;
+        case 3u:  // XALLOC_MEMTYPE_GRAPHICS_CACHEABLE
+            alloc_flags |= 0x10000000u;                // MEM_GRAPHICS
+            protect_flags |= 0x00010000u;              // PAGE_GPU_COHERENT
+            break;
+        case 4u:  // XALLOC_MEMTYPE_PHYSICAL
+            alloc_flags |= 0x10000000u;                // MEM_GRAPHICS
+            break;
+        default:
+            return false;
+    }
+
+    out_decoded.object_type = obj_type;
+    out_decoded.heap_tracks_attributes = heap_tracks;
+    out_decoded.must_succeed = must_succeed;
+    out_decoded.fixed_size = fixed_size;
+    out_decoded.allocator_id = alloc_id;
+    out_decoded.alignment_code = align_code;
+    out_decoded.memory_type = mem_type;
+    out_decoded.page_size_code = page_code;
+    out_decoded.zero_initialize = zero_init;
+    out_decoded.alloc_flags = alloc_flags;
+    out_decoded.protect_flags = protect_flags;
+    out_decoded.alignment_bytes = align_bytes;
+    out_decoded.page_size_bytes = page_bytes;
+    return true;
+}
+
 size_t UnifiedMemoryManager::ActivePlaceholderCount() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return placeholders_.size();

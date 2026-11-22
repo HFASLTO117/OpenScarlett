@@ -100,21 +100,62 @@ struct PeInspectionReport {
     uint32_t export_dir_rva = 0;
     uint32_t export_dir_size = 0;
     uint32_t export_ordinal_base = 0;
+    uint32_t malformed_export_names = 0;
     std::vector<PeExportSymbol> exports;
+
+    // Base relocation directory (IMAGE_DIRECTORY_ENTRY_BASERELOC)
+    uint32_t reloc_dir_rva = 0;
+    uint32_t reloc_dir_size = 0;
+    uint32_t reloc_block_count = 0;
+    uint32_t reloc_entry_count = 0;
 
     // TLS directory & callback RVAs (IMAGE_DIRECTORY_ENTRY_TLS)
     uint32_t tls_dir_rva = 0;
     uint32_t tls_dir_size = 0;
     std::vector<uint32_t> tls_callback_rvas;
 
-    // x64 .pdata exception table (IMAGE_DIRECTORY_ENTRY_EXCEPTION)
+    // x64 .pdata exception table (IMAGE_DIRECTORY_ENTRY_EXCEPTION) & .xdata unwind validation
     uint32_t exception_dir_rva = 0;
     uint32_t exception_dir_size = 0;
     uint32_t exception_entry_count = 0;
+    uint32_t xdata_valid_entries = 0;
+    uint32_t xdata_invalid_entries = 0;
+    uint32_t xdata_alloc_large_entries = 0;
+    uint32_t xdata_epilog_entries = 0;
+    uint32_t xdata_chained_entries = 0;
+};
+
+struct PeSectionProtectionSummary {
+    uint32_t total_sections = 0;
+    uint32_t protected_sections = 0;
+    uint32_t skipped_sections = 0;
+    uint32_t failed_sections = 0;
+};
+
+struct PeXdataValidationResult {
+    uint32_t runtime_function_count = 0;
+    uint32_t valid_entries = 0;
+    uint32_t invalid_entries = 0;
+    uint32_t v1_entries = 0;
+    uint32_t v2_entries = 0;
+    uint32_t v3_entries = 0;
+    uint32_t alloc_large_entries = 0;
+    uint32_t epilog_code_entries = 0;
+    uint32_t chained_entries = 0;
+    uint32_t cycle_errors = 0;
+    uint32_t alignment_errors = 0;
+    uint32_t bounds_errors = 0;
+    std::vector<std::string> errors;
 };
 
 const char* DllCategoryName(DllCategory category) noexcept;
 DllCategory ClassifyImportDll(const std::string& dll_name);
+
+// Windows KnownDLLs resolution (queries HKLM\...\Session Manager\KnownDLLs + standard fallback set)
+// so System32 KnownDLLs are always resolved from System32 before package-local images.
+bool IsWindowsKnownDll(std::string_view dll_name);
+bool ResolveKnownDllSystem32PathW(std::wstring_view dll_name, std::wstring& out_system32_path);
+std::vector<std::string> GetWindowsKnownDllList();
 
 // Resolves known versioned / thunk GDK DLL names (e.g. Microsoft.Xbox.Services.141.GDK.C.Thunks.dll,
 // libHttpClient.141.GDK.C.dll) to their canonical OpenScarlett shim DLL basename.
@@ -171,6 +212,9 @@ public:
     // ordered by (load_priority, canonical_name).
     std::vector<DllRouteRule> ListAllRules() const;
 
+    // Returns the complete routing set (core + extended + Sprint 7 fixed-return stub shims + overrides).
+    std::vector<DllRouteRule> ListCompleteRules() const;
+
 private:
     static std::string NormalizeDllKey(std::string_view raw_name);
     static std::string NormalizeCanonicalName(std::string_view raw_name);
@@ -179,6 +223,7 @@ private:
         DllRouteRule rule;
         bool from_override = false;
         bool is_extended = false;
+        bool is_fixed_stub = false;
     };
     std::unordered_map<std::string, Entry> rules_;
     std::unordered_map<std::string, std::string> aliases_;
@@ -188,6 +233,26 @@ Status InspectPeFile(const std::string& file_path, PeInspectionReport& out_repor
 Status InspectPeBytes(const std::vector<uint8_t>& bytes,
                       const std::string& label,
                       PeInspectionReport& out_report);
+
+// Walks IMAGE_DIRECTORY_ENTRY_BASERELOC safely (treats RVA==0 or Size==0 as absent, never reading offset 0).
+Status ValidatePeBaseRelocations(const std::vector<uint8_t>& bytes,
+                                 bool& out_has_relocations,
+                                 uint32_t& out_block_count,
+                                 uint32_t& out_entry_count);
+
+// Validates x64 .pdata RUNTIME_FUNCTION entries and their .xdata UNWIND_INFO structures:
+// checks v1/v2/v3 headers, UWOP_ALLOC_LARGE alignment & slot bounds, v2/v3 UWOP_EPILOG codes,
+// and UNW_FLAG_CHAININFO chained metadata with cycle detection.
+Status ValidatePeXdataUnwind(const std::vector<uint8_t>& bytes,
+                             PeXdataValidationResult& out_result);
+
+// Maps PE section characteristics (IMAGE_SCN_MEM_READ/WRITE/EXECUTE/NOT_CACHED) to Win32 PAGE_* flags.
+uint32_t ComputePeSectionProtection(uint32_t section_characteristics) noexcept;
+
+// Fault-free PE section protection transition helper: page-aligns non-empty section ranges,
+// validates committed pages via VirtualQuery before VirtualProtect, and skips uncommitted/zero-size spans.
+Status ApplyPeSectionProtections(void* module_base,
+                                 PeSectionProtectionSummary* out_summary = nullptr);
 
 // Parses a PE export forwarder string ("DLL.Symbol" or "DLL.#Ordinal").
 bool ParseExportForwarder(std::string_view forwarder, PeForwarderTarget& out_target);

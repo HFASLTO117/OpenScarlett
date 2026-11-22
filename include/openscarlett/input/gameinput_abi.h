@@ -130,6 +130,37 @@ struct GameInputKeyState {
     bool isDeadKey;
 };
 
+enum GameInputMouseButtons : uint32_t {
+    GameInputMouseNone = 0x00000000u,
+    GameInputMouseLeftButton = 0x00000001u,
+    GameInputMouseRightButton = 0x00000002u,
+    GameInputMouseMiddleButton = 0x00000004u,
+    GameInputMouseButton4 = 0x00000008u,
+    GameInputMouseButton5 = 0x00000010u,
+    GameInputMouseWheelTiltLeft = 0x00000020u,
+    GameInputMouseWheelTiltRight = 0x00000040u,
+};
+
+struct GameInputMouseState {
+    uint32_t buttons;
+    int64_t positionX;
+    int64_t positionY;
+    int64_t wheelX;
+    int64_t wheelY;
+};
+
+struct GameInputRawMouseFrameDelta {
+    int64_t deltaX;
+    int64_t deltaY;
+    int64_t wheelX;
+    int64_t wheelY;
+    uint32_t buttons;
+    uint32_t packetCount;
+    uint64_t totalPacketsReceived;
+    uint32_t ringBufferedPackets;
+    uint32_t reserved;
+};
+
 struct GameInputRumbleParams {
     float lowFrequency;
     float highFrequency;
@@ -180,6 +211,7 @@ struct IGameInputReading {
     virtual uint32_t OPENSCARLETT_GAMEINPUT_CALL GetKeyCount() = 0;
     virtual uint32_t OPENSCARLETT_GAMEINPUT_CALL GetKeyState(
         uint32_t stateArrayCount, GameInputKeyState* stateArray) = 0;
+    virtual bool OPENSCARLETT_GAMEINPUT_CALL GetMouseState(GameInputMouseState* state) = 0;
 };
 
 struct IGameInput {
@@ -224,6 +256,33 @@ OpenScarlettGameInputInjectTestState(
     const GameInputKeyState* keys,
     uint32_t key_count,
     int enable);
+
+// Native Win32 Raw Input mouse registration, WM_INPUT ingestion, deterministic test injection,
+// and lossless per-frame mouse delta consumption (never drops deltas on ring-buffer overflow).
+OPENSCARLETT_GAMEINPUT_API int32_t OPENSCARLETT_GAMEINPUT_CALL
+OpenScarlettGameInputRegisterRawMouse(
+    IGameInput* input,
+    void* hwnd,
+    uint32_t rawInputFlags);
+
+OPENSCARLETT_GAMEINPUT_API int32_t OPENSCARLETT_GAMEINPUT_CALL
+OpenScarlettGameInputProcessRawInput(
+    IGameInput* input,
+    void* hRawInput);
+
+OPENSCARLETT_GAMEINPUT_API int32_t OPENSCARLETT_GAMEINPUT_CALL
+OpenScarlettGameInputInjectRawMouseDelta(
+    IGameInput* input,
+    int32_t deltaX,
+    int32_t deltaY,
+    int32_t wheelX,
+    int32_t wheelY,
+    uint32_t buttons);
+
+OPENSCARLETT_GAMEINPUT_API int32_t OPENSCARLETT_GAMEINPUT_CALL
+OpenScarlettGameInputConsumeFrameMouseDelta(
+    IGameInput* input,
+    GameInputRawMouseFrameDelta* outDelta);
 
 #ifdef __cplusplus
 }

@@ -72,6 +72,7 @@ enum XGameRuntimeFeature : uint32_t {
     XGameRuntimeFeature_XThread = 17,
     XGameRuntimeFeature_XUser = 18,
     XGameRuntimeFeature_XError = 19,
+    XGameRuntimeFeature_XGameStreaming = 20,
 };
 
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameRuntimeInitialize(void);
@@ -718,6 +719,8 @@ struct XSystemRuntimeInfo {
     XVersion availableVersion;
 };
 
+constexpr size_t XSystemAppSpecificDeviceIdBytes = 45;
+
 OPENSCARLETT_GDK_API XSystemDeviceType OPENSCARLETT_GDK_CALL XSystemGetDeviceType(void);
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XSystemGetConsoleId(
     size_t consoleIdSize,
@@ -728,8 +731,66 @@ OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XSystemGetXboxLiveSandbox
     char* sandboxId,
     size_t* sandboxIdUsed);
 OPENSCARLETT_GDK_API XSystemAnalyticsInfo OPENSCARLETT_GDK_CALL XSystemGetAnalyticsInfo(void);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XSystemGetAppSpecificDeviceId(
+    size_t appSpecificDeviceIdSize,
+    char* appSpecificDeviceId,
+    size_t* appSpecificDeviceIdUsed);
 OPENSCARLETT_GDK_API XSystemRuntimeInfo OPENSCARLETT_GDK_CALL XSystemGetRuntimeInfo(void);
 OPENSCARLETT_GDK_API bool OPENSCARLETT_GDK_CALL XSystemIsHandleValid(void* handle);
+
+// ---------------------------------------------------------------------------
+// XGameStreaming (clean-room local-PC compatibility surface)
+// ---------------------------------------------------------------------------
+typedef uint64_t XGameStreamingClientId;
+constexpr XGameStreamingClientId XGameStreamingAllClients = 0ull;
+
+enum XGameStreamingConnectionState : uint32_t {
+    XGameStreamingConnectionState_Disconnected = 0,
+    XGameStreamingConnectionState_Connected = 1,
+};
+
+typedef void(OPENSCARLETT_GDK_CALL* XGameStreamingConnectionStateChangedCallback)(
+    void* context,
+    XGameStreamingClientId client,
+    XGameStreamingConnectionState state);
+
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameStreamingInitialize(void);
+OPENSCARLETT_GDK_API void OPENSCARLETT_GDK_CALL XGameStreamingUninitialize(void);
+OPENSCARLETT_GDK_API bool OPENSCARLETT_GDK_CALL XGameStreamingIsStreaming(void);
+OPENSCARLETT_GDK_API uint32_t OPENSCARLETT_GDK_CALL XGameStreamingGetClientCount(void);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameStreamingGetClients(
+    uint32_t clientCount,
+    XGameStreamingClientId* clients,
+    uint32_t* clientsUsed);
+OPENSCARLETT_GDK_API XGameStreamingConnectionState OPENSCARLETT_GDK_CALL
+XGameStreamingGetConnectionState(XGameStreamingClientId client);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL
+XGameStreamingRegisterConnectionStateChanged(
+    XTaskQueueHandle queue,
+    void* context,
+    XGameStreamingConnectionStateChangedCallback callback,
+    XTaskQueueRegistrationToken* token);
+OPENSCARLETT_GDK_API bool OPENSCARLETT_GDK_CALL
+XGameStreamingUnregisterConnectionStateChanged(
+    XTaskQueueRegistrationToken token,
+    bool wait);
+OPENSCARLETT_GDK_API void OPENSCARLETT_GDK_CALL XGameStreamingHideTouchControls(void);
+OPENSCARLETT_GDK_API void OPENSCARLETT_GDK_CALL XGameStreamingShowTouchControlLayout(
+    const char* layout);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameStreamingGetStreamPhysicalDimensions(
+    XGameStreamingClientId client,
+    uint32_t* horizontalMm,
+    uint32_t* verticalMm);
+OPENSCARLETT_GDK_API size_t OPENSCARLETT_GDK_CALL XGameStreamingGetServerLocationNameSize(void);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameStreamingGetServerLocationName(
+    size_t serverLocationNameSize,
+    char* serverLocationName);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameStreamingGetLastFrameDisplayed(
+    XGameStreamingClientId client,
+    uint64_t* frameId);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameStreamingIsTouchInputEnabledOnClient(
+    XGameStreamingClientId client,
+    bool* touchInputEnabled);
 
 // ---------------------------------------------------------------------------
 // XMem
@@ -2191,6 +2252,8 @@ constexpr XgrGuid XGR_API_GUID_NETWORKING = {
     0x4F534752u, 0x000Eu, 0x4000u, {0x80, 0x0E, 0x00, 0x58, 0x4E, 0x57, 0x00, 0x0E}};
 constexpr XgrGuid XGR_API_GUID_CORE_RUNTIME = {
     0x4F534752u, 0x000Fu, 0x4000u, {0x80, 0x0F, 0x00, 0x58, 0x43, 0x52, 0x00, 0x0F}};
+constexpr XgrGuid XGR_API_GUID_GAME_STREAMING = {
+    0x4F534752u, 0x0010u, 0x4000u, {0x80, 0x10, 0x00, 0x58, 0x47, 0x54, 0x00, 0x10}};
 
 typedef XGameResult(OPENSCARLETT_GDK_CALL* XgrQueryInterfaceFn)(
     const void* self,
@@ -2569,8 +2632,12 @@ struct IXgrSystemApiVtable {
     XSystemAnalyticsInfo(OPENSCARLETT_GDK_CALL* XSystemGetAnalyticsInfo)(void);
     XSystemRuntimeInfo(OPENSCARLETT_GDK_CALL* XSystemGetRuntimeInfo)(void);
     bool(OPENSCARLETT_GDK_CALL* XSystemIsHandleValid)(void* handle);
-    // Extended System entry
+    // Extended System entries
     bool(OPENSCARLETT_GDK_CALL* XGameRuntimeIsFeatureAvailable)(XGameRuntimeFeature feature);
+    XGameResult(OPENSCARLETT_GDK_CALL* XSystemGetAppSpecificDeviceId)(
+        size_t appSpecificDeviceIdSize,
+        char* appSpecificDeviceId,
+        size_t* appSpecificDeviceIdUsed);
 };
 
 struct IXgrMemApiVtable {
@@ -3287,6 +3354,47 @@ struct IXgrCoreRuntimeApiVtable {
     XGameResult(OPENSCARLETT_GDK_CALL* XClosedCaptionGetProperties)(
         XClosedCaptionProperties* properties);
     XGameResult(OPENSCARLETT_GDK_CALL* XClosedCaptionSetEnabled)(bool enabled);
+};
+
+struct IXgrGameStreamingApiVtable {
+    XgrQueryInterfaceFn QueryInterface;
+    XgrAddRefFn AddRef;
+    XgrReleaseFn Release;
+
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameStreamingInitialize)(void);
+    void(OPENSCARLETT_GDK_CALL* XGameStreamingUninitialize)(void);
+    bool(OPENSCARLETT_GDK_CALL* XGameStreamingIsStreaming)(void);
+    uint32_t(OPENSCARLETT_GDK_CALL* XGameStreamingGetClientCount)(void);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameStreamingGetClients)(
+        uint32_t clientCount,
+        XGameStreamingClientId* clients,
+        uint32_t* clientsUsed);
+    XGameStreamingConnectionState(OPENSCARLETT_GDK_CALL* XGameStreamingGetConnectionState)(
+        XGameStreamingClientId client);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameStreamingRegisterConnectionStateChanged)(
+        XTaskQueueHandle queue,
+        void* context,
+        XGameStreamingConnectionStateChangedCallback callback,
+        XTaskQueueRegistrationToken* token);
+    bool(OPENSCARLETT_GDK_CALL* XGameStreamingUnregisterConnectionStateChanged)(
+        XTaskQueueRegistrationToken token,
+        bool wait);
+    void(OPENSCARLETT_GDK_CALL* XGameStreamingHideTouchControls)(void);
+    void(OPENSCARLETT_GDK_CALL* XGameStreamingShowTouchControlLayout)(const char* layout);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameStreamingGetStreamPhysicalDimensions)(
+        XGameStreamingClientId client,
+        uint32_t* horizontalMm,
+        uint32_t* verticalMm);
+    size_t(OPENSCARLETT_GDK_CALL* XGameStreamingGetServerLocationNameSize)(void);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameStreamingGetServerLocationName)(
+        size_t serverLocationNameSize,
+        char* serverLocationName);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameStreamingGetLastFrameDisplayed)(
+        XGameStreamingClientId client,
+        uint64_t* frameId);
+    XGameResult(OPENSCARLETT_GDK_CALL* XGameStreamingIsTouchInputEnabledOnClient)(
+        XGameStreamingClientId client,
+        bool* touchInputEnabled);
 };
 
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL InitializeApiImpl(void);
