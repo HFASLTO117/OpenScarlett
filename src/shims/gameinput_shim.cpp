@@ -294,7 +294,8 @@ public:
         info_.revisionNumber = 0x0500u;
         info_.deviceFamily = GameInputFamilyXboxOne;
         info_.supportedInput = GameInputKindGamepad | GameInputKindController |
-                               GameInputKindKeyboard | GameInputKindUiNavigation;
+                               GameInputKindKeyboard | GameInputKindMouse |
+                               GameInputKindUiNavigation;
         info_.supportedRumbleMotors = GameInputRumbleLowFrequency |
                                       GameInputRumbleHighFrequency |
                                       GameInputRumbleLeftTrigger |
@@ -393,13 +394,15 @@ public:
         uint64_t timestamp,
         GameInputDeviceImpl* device,
         const GameInputGamepadState& gamepad,
-        std::vector<GameInputKeyState> keys)
+        std::vector<GameInputKeyState> keys,
+        const GameInputMouseState& mouse)
         : kind_(kind),
           seq_(seq),
           timestamp_(timestamp),
           device_(device),
           gamepad_(gamepad),
-          keys_(std::move(keys)) {
+          keys_(std::move(keys)),
+          mouse_(mouse) {
         if (device_) {
             device_->AddRef();
         }
@@ -488,6 +491,13 @@ public:
         return count;
     }
 
+    bool OPENSCARLETT_GAMEINPUT_CALL GetMouseState(GameInputMouseState* state) override {
+        RecordOk("IGameInputReading::GetMouseState", 10);
+        if (!state) return false;
+        *state = mouse_;
+        return (kind_ & GameInputKindMouse) != 0;
+    }
+
     uint64_t Sequence() const { return seq_; }
     GameInputKind KindRaw() const { return kind_; }
     IGameInputDevice* DevicePtr() const { return device_; }
@@ -500,6 +510,7 @@ private:
     GameInputDeviceImpl* device_;
     GameInputGamepadState gamepad_;
     std::vector<GameInputKeyState> keys_;
+    GameInputMouseState mouse_;
 };
 
 class GameInputImpl;
@@ -607,8 +618,21 @@ public:
 
         const GameInputKind resolved_kind =
             (inputKind == GameInputKindUnknown)
-                ? static_cast<GameInputKind>(GameInputKindGamepad | GameInputKindKeyboard)
+                ? static_cast<GameInputKind>(GameInputKindGamepad | GameInputKindKeyboard |
+                                             GameInputKindMouse)
                 : inputKind;
+
+        GameInputMouseState mouse_snapshot{};
+        {
+            std::lock_guard<std::mutex> mlk(raw_mouse_mutex_);
+            if (input_allowed) {
+                mouse_snapshot.buttons = mouse_buttons_;
+                mouse_snapshot.positionX = mouse_cumulative_x_;
+                mouse_snapshot.positionY = mouse_cumulative_y_;
+                mouse_snapshot.wheelX = mouse_cumulative_wheel_x_;
+                mouse_snapshot.wheelY = mouse_cumulative_wheel_y_;
+            }
+        }
 
         std::lock_guard<std::mutex> lk(mutex_);
         const uint64_t seq = next_seq_++;
@@ -617,7 +641,7 @@ public:
         last_ts_ = ts;
 
         auto* r = new (std::nothrow) GameInputReadingImpl(
-            resolved_kind, seq, ts, target_dev, gp, std::move(keys));
+            resolved_kind, seq, ts, target_dev, gp, std::move(keys), mouse_snapshot);
         if (!r) {
             return RecordHr("IGameInput::GetCurrentReading", GAMEINPUT_E_OUTOFMEMORY, 4);
         }
@@ -707,7 +731,156 @@ public:
         }
     }
 
+    int32_t RegisterRawMouse(void* hwnd, uint32_t raw_flags) {
+#if defined(_WIN32)
+        RAWINPUTDEVICE rid{};
+        rid.usUsagePage = 0x01u;  // HID_USAGE_PAGE_GENERIC
+        rid.usUsage = 0x02u;      // HID_USAGE_GENERIC_MOUSE
+        rid.dwFlags = raw_flags;
+        rid.hwndTarget = reinterpret_cast<HWND>(hwnd);
+        if (!::RegisterRawInputDevices(&rid, 1u, static_cast<UINT>(sizeof(rid)))) {
+            return GAMEINPUT_E_INVALIDARG;
+        }
+        raw_mouse_registered_.store(true, std::memory_order_release);
+        if (hwnd) {
+            target_hwnd_.store(hwnd, std::memory_order_release);
+        }
+        return GAMEINPUT_S_OK;
+#else
+        (void)hwnd;
+        (void)raw_flags;
+        raw_mouse_registered_.store(true, std::memory_order_release);
+        return GAMEINPUT_S_OK;
+#endif
+    }
+
+    int32_t ProcessWin32RawInput(void* h_raw_input) {
+#if defined(_WIN32)
+        if (!h_raw_input) {
+            return GAMEINPUT_E_INVALIDARG;
+        }
+        UINT data_size = 0u;
+        if (::GetRawInputData(reinterpret_cast<HRAWINPUT>(h_raw_input),
+                              RID_INPUT,
+                              nullptr,
+                              &data_size,
+                              sizeof(RAWINPUTHEADER)) != 0u ||
+            data_size < sizeof(RAWINPUTHEADER)) {
+            return GAMEINPUT_E_INVALIDARG;
+        }
+        std::vector<uint8_t> buf(data_size);
+        if (::GetRawInputData(reinterpret_cast<HRAWINPUT>(h_raw_input),
+                              RID_INPUT,
+                              buf.data(),
+                              &data_size,
+                              sizeof(RAWINPUTHEADER)) != data_size) {
+            return GAMEINPUT_E_INVALIDARG;
+        }
+        const auto* raw = reinterpret_cast<const RAWINPUT*>(buf.data());
+        if (raw->header.dwType != RIM_TYPEMOUSE) {
+            return GAMEINPUT_S_OK;
+        }
+        const RAWMOUSE& m = raw->data.mouse;
+        int32_t dx = 0;
+        int32_t dy = 0;
+        if ((m.usFlags & MOUSE_MOVE_ABSOLUTE) == 0u) {
+            dx = static_cast<int32_t>(m.lLastX);
+            dy = static_cast<int32_t>(m.lLastY);
+        }
+        int32_t wx = 0;
+        int32_t wy = 0;
+        if ((m.usButtonFlags & RI_MOUSE_WHEEL) != 0u) {
+            wy = static_cast<int16_t>(m.usButtonData);
+        }
+#if defined(RI_MOUSE_HWHEEL)
+        if ((m.usButtonFlags & RI_MOUSE_HWHEEL) != 0u) {
+            wx = static_cast<int16_t>(m.usButtonData);
+        }
+#endif
+        std::lock_guard<std::mutex> lk(raw_mouse_mutex_);
+        uint32_t btns = mouse_buttons_;
+        if (m.usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN) btns |= GameInputMouseLeftButton;
+        if (m.usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP) btns &= ~GameInputMouseLeftButton;
+        if (m.usButtonFlags & RI_MOUSE_RIGHT_BUTTON_DOWN) btns |= GameInputMouseRightButton;
+        if (m.usButtonFlags & RI_MOUSE_RIGHT_BUTTON_UP) btns &= ~GameInputMouseRightButton;
+        if (m.usButtonFlags & RI_MOUSE_MIDDLE_BUTTON_DOWN) btns |= GameInputMouseMiddleButton;
+        if (m.usButtonFlags & RI_MOUSE_MIDDLE_BUTTON_UP) btns &= ~GameInputMouseMiddleButton;
+        if (m.usButtonFlags & RI_MOUSE_BUTTON_4_DOWN) btns |= GameInputMouseButton4;
+        if (m.usButtonFlags & RI_MOUSE_BUTTON_4_UP) btns &= ~GameInputMouseButton4;
+        if (m.usButtonFlags & RI_MOUSE_BUTTON_5_DOWN) btns |= GameInputMouseButton5;
+        if (m.usButtonFlags & RI_MOUSE_BUTTON_5_UP) btns &= ~GameInputMouseButton5;
+        AccumulateRawMousePacketLocked(dx, dy, wx, wy, btns);
+        return GAMEINPUT_S_OK;
+#else
+        (void)h_raw_input;
+        return GAMEINPUT_E_INVALIDARG;
+#endif
+    }
+
+    void InjectRawMouseDelta(int32_t dx, int32_t dy, int32_t wx, int32_t wy, uint32_t buttons) {
+        std::lock_guard<std::mutex> lk(raw_mouse_mutex_);
+        AccumulateRawMousePacketLocked(dx, dy, wx, wy, buttons);
+    }
+
+    void ConsumeFrameMouseDelta(GameInputRawMouseFrameDelta& out_delta) {
+        std::lock_guard<std::mutex> lk(raw_mouse_mutex_);
+        out_delta.deltaX = pending_mouse_dx_;
+        out_delta.deltaY = pending_mouse_dy_;
+        out_delta.wheelX = pending_wheel_x_;
+        out_delta.wheelY = pending_wheel_y_;
+        out_delta.buttons = mouse_buttons_;
+        out_delta.packetCount = pending_packet_count_;
+        out_delta.totalPacketsReceived = total_mouse_packets_;
+        out_delta.ringBufferedPackets = static_cast<uint32_t>(raw_mouse_ring_.size());
+        out_delta.reserved = 0u;
+        pending_mouse_dx_ = 0;
+        pending_mouse_dy_ = 0;
+        pending_wheel_x_ = 0;
+        pending_wheel_y_ = 0;
+        pending_packet_count_ = 0u;
+    }
+
 private:
+    struct RawMousePacket {
+        int32_t dx = 0;
+        int32_t dy = 0;
+        int32_t wheel_x = 0;
+        int32_t wheel_y = 0;
+        uint32_t buttons = 0u;
+        uint64_t timestamp = 0u;
+    };
+
+    static constexpr size_t kRawMouseRingCapacity = 256u;
+
+    void AccumulateRawMousePacketLocked(
+        int32_t dx, int32_t dy, int32_t wx, int32_t wy, uint32_t buttons) {
+        // Always fold into lossless 64-bit cumulative & per-frame accumulators BEFORE
+        // updating the bounded packet ring buffer, so 1,000+ high-frequency packets
+        // between frames never lose a single count of delta.
+        mouse_cumulative_x_ += static_cast<int64_t>(dx);
+        mouse_cumulative_y_ += static_cast<int64_t>(dy);
+        mouse_cumulative_wheel_x_ += static_cast<int64_t>(wx);
+        mouse_cumulative_wheel_y_ += static_cast<int64_t>(wy);
+        pending_mouse_dx_ += static_cast<int64_t>(dx);
+        pending_mouse_dy_ += static_cast<int64_t>(dy);
+        pending_wheel_x_ += static_cast<int64_t>(wx);
+        pending_wheel_y_ += static_cast<int64_t>(wy);
+        mouse_buttons_ = buttons;
+        ++pending_packet_count_;
+        ++total_mouse_packets_;
+
+        RawMousePacket pkt{};
+        pkt.dx = dx;
+        pkt.dy = dy;
+        pkt.wheel_x = wx;
+        pkt.wheel_y = wy;
+        pkt.buttons = buttons;
+        pkt.timestamp = QueryTimestampMicros();
+        if (raw_mouse_ring_.size() >= kRawMouseRingCapacity) {
+            raw_mouse_ring_.pop_front();
+        }
+        raw_mouse_ring_.push_back(pkt);
+    }
     bool ShouldAllowInput() const noexcept {
         const uint32_t policy = focus_policy_.load(std::memory_order_acquire);
         if ((policy & GameInputEnableBackgroundInput) != 0u) {
@@ -749,6 +922,22 @@ private:
     bool test_inject_enabled_ = false;
     GameInputGamepadState injected_gamepad_{};
     std::vector<GameInputKeyState> injected_keys_;
+
+    // Lossless Win32 Raw Input mouse delta state
+    std::atomic<bool> raw_mouse_registered_{false};
+    std::mutex raw_mouse_mutex_;
+    int64_t mouse_cumulative_x_ = 0;
+    int64_t mouse_cumulative_y_ = 0;
+    int64_t mouse_cumulative_wheel_x_ = 0;
+    int64_t mouse_cumulative_wheel_y_ = 0;
+    int64_t pending_mouse_dx_ = 0;
+    int64_t pending_mouse_dy_ = 0;
+    int64_t pending_wheel_x_ = 0;
+    int64_t pending_wheel_y_ = 0;
+    uint32_t mouse_buttons_ = GameInputMouseNone;
+    uint32_t pending_packet_count_ = 0u;
+    uint64_t total_mouse_packets_ = 0ull;
+    std::deque<RawMousePacket> raw_mouse_ring_;
 };
 
 GameInputImpl* AcquireLiveGameInput(IGameInput* input) {
@@ -808,6 +997,62 @@ int32_t OPENSCARLETT_GAMEINPUT_CALL OpenScarlettGameInputInjectTestState(
     impl->SetInjectedTestState(gp, keys, key_count, enable != 0);
     impl->Release();
     return RecordHr("OpenScarlettGameInputInjectTestState", GAMEINPUT_S_OK);
+}
+
+int32_t OPENSCARLETT_GAMEINPUT_CALL OpenScarlettGameInputRegisterRawMouse(
+    IGameInput* input,
+    void* hwnd,
+    uint32_t rawInputFlags) {
+    GameInputImpl* impl = AcquireLiveGameInput(input);
+    if (!impl) {
+        return RecordHr("OpenScarlettGameInputRegisterRawMouse", GAMEINPUT_E_INVALIDARG);
+    }
+    const int32_t hr = impl->RegisterRawMouse(hwnd, rawInputFlags);
+    impl->Release();
+    return RecordHr("OpenScarlettGameInputRegisterRawMouse", hr);
+}
+
+int32_t OPENSCARLETT_GAMEINPUT_CALL OpenScarlettGameInputProcessRawInput(
+    IGameInput* input,
+    void* hRawInput) {
+    GameInputImpl* impl = AcquireLiveGameInput(input);
+    if (!impl) {
+        return RecordHr("OpenScarlettGameInputProcessRawInput", GAMEINPUT_E_INVALIDARG);
+    }
+    const int32_t hr = impl->ProcessWin32RawInput(hRawInput);
+    impl->Release();
+    return RecordHr("OpenScarlettGameInputProcessRawInput", hr);
+}
+
+int32_t OPENSCARLETT_GAMEINPUT_CALL OpenScarlettGameInputInjectRawMouseDelta(
+    IGameInput* input,
+    int32_t deltaX,
+    int32_t deltaY,
+    int32_t wheelX,
+    int32_t wheelY,
+    uint32_t buttons) {
+    GameInputImpl* impl = AcquireLiveGameInput(input);
+    if (!impl) {
+        return RecordHr("OpenScarlettGameInputInjectRawMouseDelta", GAMEINPUT_E_INVALIDARG);
+    }
+    impl->InjectRawMouseDelta(deltaX, deltaY, wheelX, wheelY, buttons);
+    impl->Release();
+    return RecordHr("OpenScarlettGameInputInjectRawMouseDelta", GAMEINPUT_S_OK);
+}
+
+int32_t OPENSCARLETT_GAMEINPUT_CALL OpenScarlettGameInputConsumeFrameMouseDelta(
+    IGameInput* input,
+    GameInputRawMouseFrameDelta* outDelta) {
+    if (!outDelta) {
+        return RecordHr("OpenScarlettGameInputConsumeFrameMouseDelta", GAMEINPUT_E_POINTER);
+    }
+    GameInputImpl* impl = AcquireLiveGameInput(input);
+    if (!impl) {
+        return RecordHr("OpenScarlettGameInputConsumeFrameMouseDelta", GAMEINPUT_E_INVALIDARG);
+    }
+    impl->ConsumeFrameMouseDelta(*outDelta);
+    impl->Release();
+    return RecordHr("OpenScarlettGameInputConsumeFrameMouseDelta", GAMEINPUT_S_OK);
 }
 
 }  // extern "C"

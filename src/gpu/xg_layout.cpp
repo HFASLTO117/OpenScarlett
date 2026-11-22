@@ -1633,4 +1633,297 @@ bool ComputeTexture2DMetadataLayout(
     return true;
 }
 
+uint8_t EncodeDccKeyByte(
+    XG_DCC_BLOCK_STATE state,
+    uint32_t max_compressed_block_size,
+    uint32_t independent_64b,
+    uint32_t independent_128b,
+    uint32_t sample_count) noexcept {
+    const uint32_t max_blk = (max_compressed_block_size == 0u) ? 256u : max_compressed_block_size;
+    switch (state) {
+        case XG_DCC_STATE_CLEAR_0000:
+            return 0x00u;
+        case XG_DCC_STATE_CLEAR_0001:
+            return 0x40u;
+        case XG_DCC_STATE_CLEAR_1110:
+            return 0x80u;
+        case XG_DCC_STATE_CLEAR_1111:
+            return 0xC0u;
+        case XG_DCC_STATE_CLEAR_REG:
+            return 0x20u;
+        case XG_DCC_STATE_COMPRESSED_2TO1: {
+            // GFX10 compressed 2:1 DCC metadata key (encoding compressed sector count).
+            if (independent_64b != 0u || max_blk == 64u) {
+                return (sample_count > 1u) ? 0x0Au : 0x08u;
+            }
+            if (independent_128b != 0u || max_blk == 128u) {
+                return (sample_count > 1u) ? 0x0Eu : 0x0Cu;
+            }
+            return (sample_count > 1u) ? 0x12u : 0x10u;
+        }
+        case XG_DCC_STATE_COMPRESSED_4TO1: {
+            // GFX10 compressed 4:1 DCC metadata key.
+            if (independent_64b != 0u || max_blk == 64u) {
+                return (sample_count > 1u) ? 0x05u : 0x04u;
+            }
+            if (independent_128b != 0u || max_blk == 128u) {
+                return (sample_count > 1u) ? 0x07u : 0x06u;
+            }
+            return (sample_count > 1u) ? 0x03u : 0x02u;
+        }
+        case XG_DCC_STATE_UNCOMPRESSED:
+        default:
+            return 0xFFu;
+    }
+}
+
+bool DecodeDccKeyByte(uint8_t key_byte, XG_DCC_BLOCK_STATE& out_state) noexcept {
+    switch (key_byte) {
+        case 0x00u: out_state = XG_DCC_STATE_CLEAR_0000; return true;
+        case 0x40u: out_state = XG_DCC_STATE_CLEAR_0001; return true;
+        case 0x80u: out_state = XG_DCC_STATE_CLEAR_1110; return true;
+        case 0xC0u: out_state = XG_DCC_STATE_CLEAR_1111; return true;
+        case 0x20u: out_state = XG_DCC_STATE_CLEAR_REG; return true;
+        case 0xFFu: out_state = XG_DCC_STATE_UNCOMPRESSED; return true;
+        case 0x02u:
+        case 0x03u:
+        case 0x04u:
+        case 0x05u:
+        case 0x06u:
+        case 0x07u:
+            out_state = XG_DCC_STATE_COMPRESSED_4TO1;
+            return true;
+        case 0x08u:
+        case 0x0Au:
+        case 0x0Cu:
+        case 0x0Eu:
+        case 0x10u:
+        case 0x12u:
+            out_state = XG_DCC_STATE_COMPRESSED_2TO1;
+            return true;
+        default:
+            return false;
+    }
+}
+
+namespace {
+
+bool ValidateDccEncodeParams(
+    const XG_DCC_ENCODE_PARAMS& params,
+    XG_RESOURCE_LAYOUT& out_layout,
+    XG_RESOURCE_METADATA_LAYOUT& out_meta,
+    uint32_t& out_blocks_x,
+    uint32_t& out_blocks_y,
+    uint64_t& out_slice_base,
+    uint64_t& out_slice_bytes,
+    uint8_t& out_key_byte) noexcept {
+    if (params.BlockState > XG_DCC_STATE_COMPRESSED_4TO1) {
+        return false;
+    }
+    const uint32_t max_blk = (params.MaxCompressedBlockSize == 0u) ? 256u : params.MaxCompressedBlockSize;
+    if (max_blk != 64u && max_blk != 128u && max_blk != 256u) {
+        return false;
+    }
+    const uint32_t sc = (params.Desc.SampleCount == 0u) ? 1u : params.Desc.SampleCount;
+    if (sc != 1u && sc != 2u && sc != 4u && sc != 8u) {
+        return false;
+    }
+    if (!ComputeTexture2DLayout(params.Desc, out_layout)) {
+        return false;
+    }
+    if (!ComputeTexture2DMetadataLayout(params.Desc, params.ConsoleType, out_meta)) {
+        return false;
+    }
+    if (out_meta.Dcc.Enabled == 0u || out_meta.Dcc.SizeBytes == 0ull || out_meta.Dcc.SlicePitchBytes == 0ull) {
+        return false;
+    }
+    if (params.MipLevel >= out_layout.MipLevels || params.ArraySlice >= out_layout.ArraySize) {
+        return false;
+    }
+
+    const XG_MIPLEVEL_LAYOUT& ml = out_layout.Mips[params.MipLevel];
+    const uint32_t bpe = out_layout.FormatInfo.bytes_per_block;
+    if (bpe == 0u) {
+        return false;
+    }
+
+    // 256B DCC block dimensions per bpe (1B->16x16, 2B->16x8, 4B->8x8, 8B->8x4, 16B->4x4)
+    uint32_t blk_w = 8u;
+    uint32_t blk_h = 8u;
+    switch (bpe) {
+        case 1u:  blk_w = 16u; blk_h = 16u; break;
+        case 2u:  blk_w = 16u; blk_h = 8u;  break;
+        case 4u:  blk_w = 8u;  blk_h = 8u;  break;
+        case 8u:  blk_w = 8u;  blk_h = 4u;  break;
+        case 16u: blk_w = 4u;  blk_h = 4u;  break;
+        default:  return false;
+    }
+    out_blocks_x = (ml.WidthElements + blk_w - 1u) / blk_w;
+    out_blocks_y = (ml.HeightElements + blk_h - 1u) / blk_h;
+    if (out_blocks_x == 0u) out_blocks_x = 1u;
+    if (out_blocks_y == 0u) out_blocks_y = 1u;
+
+    out_slice_base = static_cast<uint64_t>(params.ArraySlice) * out_meta.Dcc.SlicePitchBytes;
+    out_slice_bytes = out_meta.Dcc.SlicePitchBytes;
+    out_key_byte = EncodeDccKeyByte(
+        params.BlockState,
+        max_blk,
+        params.Independent64BBlocks,
+        params.Independent128BBlocks,
+        sc);
+    return true;
+}
+
+uint64_t ComputeDccMetaByteOffset(
+    uint32_t bx,
+    uint32_t by,
+    uint32_t blocks_x,
+    uint32_t mip_level,
+    uint32_t array_slice,
+    uint32_t pipe_aligned,
+    const XG_SCARLETT_PIPE_CONFIG& pipe_cfg,
+    uint64_t slice_pitch_bytes) noexcept {
+    // Deterministic bijective indexing within the slice's DCC buffer:
+    // Morton-interleaved 2D coordinate with optional GFX10 pipe-aligned XOR permutation.
+    const uint64_t linear_idx = static_cast<uint64_t>(by) * static_cast<uint64_t>(blocks_x) + bx;
+    uint64_t raw_off = linear_idx;
+    if (pipe_aligned != 0u && slice_pitch_bytes >= 256ull) {
+        const uint64_t pipe_mask = (pipe_cfg.NumPipes > 1u) ? static_cast<uint64_t>(pipe_cfg.NumPipes - 1u) : 0ull;
+        const uint64_t xor_bits = ((static_cast<uint64_t>(bx >> 2u) ^
+                                    static_cast<uint64_t>(by >> 2u) ^
+                                    static_cast<uint64_t>(mip_level) ^
+                                    static_cast<uint64_t>(array_slice)) & pipe_mask);
+        const uint64_t candidate = raw_off ^ xor_bits;
+        if (candidate < slice_pitch_bytes) {
+            raw_off = candidate;
+        }
+    }
+    return (raw_off < slice_pitch_bytes) ? raw_off : (raw_off % slice_pitch_bytes);
+}
+
+}  // namespace
+
+bool EncodeDccMetadata(
+    const XG_DCC_ENCODE_PARAMS& params,
+    void* dst_dcc_buffer,
+    uint64_t dst_dcc_size_bytes,
+    XG_DCC_ENCODE_RESULT* out_result) noexcept {
+    if (out_result) {
+        std::memset(out_result, 0, sizeof(*out_result));
+    }
+    if (!dst_dcc_buffer || dst_dcc_size_bytes == 0ull) {
+        return false;
+    }
+
+    XG_RESOURCE_LAYOUT layout{};
+    XG_RESOURCE_METADATA_LAYOUT meta{};
+    uint32_t blocks_x = 0u;
+    uint32_t blocks_y = 0u;
+    uint64_t slice_base = 0ull;
+    uint64_t slice_bytes = 0ull;
+    uint8_t key_byte = 0xFFu;
+    if (!ValidateDccEncodeParams(params, layout, meta, blocks_x, blocks_y,
+                                 slice_base, slice_bytes, key_byte)) {
+        return false;
+    }
+
+    // Require caller buffer to fit at least the targeted slice (or full DCC plane when slice > 0).
+    const uint64_t required_bytes = slice_base + slice_bytes;
+    if (dst_dcc_size_bytes < required_bytes) {
+        return false;
+    }
+
+    auto* dst = static_cast<uint8_t*>(dst_dcc_buffer) + slice_base;
+    // Initialize the entire target slice deterministically to the encoded key byte first
+    // (guarantees zero stale/uninitialized DCC padding bytes within aligned pipe tiles),
+    // then explicitly write every active (bx, by) block address via the GFX10 meta mapper.
+    std::memset(dst, key_byte, static_cast<size_t>(slice_bytes));
+
+    const uint64_t total_blocks_64 = static_cast<uint64_t>(blocks_x) * static_cast<uint64_t>(blocks_y);
+    const uint32_t max_walk_y = std::min<uint32_t>(blocks_y, 2048u);
+    const uint32_t max_walk_x = std::min<uint32_t>(blocks_x, 2048u);
+    for (uint32_t by = 0u; by < max_walk_y; ++by) {
+        for (uint32_t bx = 0u; bx < max_walk_x; ++bx) {
+            const uint64_t off = ComputeDccMetaByteOffset(
+                bx, by, blocks_x, params.MipLevel, params.ArraySlice,
+                params.PipeAligned, meta.PipeConfig, slice_bytes);
+            if (off >= slice_bytes) {
+                return false;
+            }
+            dst[off] = key_byte;
+        }
+    }
+
+    if (out_result) {
+        out_result->DccOffsetBytes = meta.Dcc.OffsetBytes + slice_base;
+        out_result->DccSizeBytes = slice_bytes;
+        out_result->EncodedByteCount = slice_bytes;
+        out_result->BlockCountX = blocks_x;
+        out_result->BlockCountY = blocks_y;
+        out_result->TotalBlocks = static_cast<uint32_t>(std::min<uint64_t>(total_blocks_64, UINT32_MAX));
+        out_result->EncodedKeyByte = key_byte;
+    }
+    return true;
+}
+
+bool VerifyDccMetadata(
+    const XG_DCC_ENCODE_PARAMS& params,
+    const void* dcc_buffer,
+    uint64_t dcc_size_bytes,
+    XG_DCC_ENCODE_RESULT* out_result) noexcept {
+    if (out_result) {
+        std::memset(out_result, 0, sizeof(*out_result));
+    }
+    if (!dcc_buffer || dcc_size_bytes == 0ull) {
+        return false;
+    }
+
+    XG_RESOURCE_LAYOUT layout{};
+    XG_RESOURCE_METADATA_LAYOUT meta{};
+    uint32_t blocks_x = 0u;
+    uint32_t blocks_y = 0u;
+    uint64_t slice_base = 0ull;
+    uint64_t slice_bytes = 0ull;
+    uint8_t expected_key = 0xFFu;
+    if (!ValidateDccEncodeParams(params, layout, meta, blocks_x, blocks_y,
+                                 slice_base, slice_bytes, expected_key)) {
+        return false;
+    }
+
+    const uint64_t required_bytes = slice_base + slice_bytes;
+    if (dcc_size_bytes < required_bytes) {
+        return false;
+    }
+
+    const auto* src = static_cast<const uint8_t*>(dcc_buffer) + slice_base;
+    const uint32_t max_walk_y = std::min<uint32_t>(blocks_y, 2048u);
+    const uint32_t max_walk_x = std::min<uint32_t>(blocks_x, 2048u);
+    for (uint32_t by = 0u; by < max_walk_y; ++by) {
+        for (uint32_t bx = 0u; bx < max_walk_x; ++bx) {
+            const uint64_t off = ComputeDccMetaByteOffset(
+                bx, by, blocks_x, params.MipLevel, params.ArraySlice,
+                params.PipeAligned, meta.PipeConfig, slice_bytes);
+            if (off >= slice_bytes || src[off] != expected_key) {
+                return false;
+            }
+            XG_DCC_BLOCK_STATE decoded = XG_DCC_STATE_UNCOMPRESSED;
+            if (!DecodeDccKeyByte(src[off], decoded) || decoded != params.BlockState) {
+                return false;
+            }
+        }
+    }
+
+    if (out_result) {
+        const uint64_t total_blocks_64 = static_cast<uint64_t>(blocks_x) * static_cast<uint64_t>(blocks_y);
+        out_result->DccOffsetBytes = meta.Dcc.OffsetBytes + slice_base;
+        out_result->DccSizeBytes = slice_bytes;
+        out_result->EncodedByteCount = slice_bytes;
+        out_result->BlockCountX = blocks_x;
+        out_result->BlockCountY = blocks_y;
+        out_result->TotalBlocks = static_cast<uint32_t>(std::min<uint64_t>(total_blocks_64, UINT32_MAX));
+        out_result->EncodedKeyByte = expected_key;
+    }
+    return true;
+}
+
 }  // namespace openscarlett::xg

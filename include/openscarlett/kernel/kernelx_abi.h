@@ -34,6 +34,9 @@
 #ifndef MEM_TOP_DOWN
 #  define MEM_TOP_DOWN 0x00100000u
 #endif
+#ifndef MEM_WRITE_COMBINE
+#  define MEM_WRITE_COMBINE 0x04000000u
+#endif
 #ifndef MEM_GRAPHICS
 #  define MEM_GRAPHICS 0x10000000u
 #endif
@@ -128,8 +131,9 @@
 #define XALLOC_PAGESIZE_64KB    0x2u
 #define XALLOC_PAGESIZE_4MB     0x3u
 
-// Clean-room Xbox XALLOC_ATTRIBUTES zero-initialize bit (bit 34).
+// Clean-room Xbox XALLOC_ATTRIBUTES zero-initialize & 2 MiB page-hint bits (bits 34..35).
 #define XALLOC_FLAG_ZERO_INIT (1ull << 34)
+#define XALLOC_FLAG_2MB_PAGES (1ull << 35)
 
 #ifdef __cplusplus
 extern "C" {
@@ -205,6 +209,37 @@ typedef struct KERNELX_OS_VERSION {
     uint16_t Revision;
 } KERNELX_OS_VERSION;
 
+// ABI-identical clean-room layout matching Win32 MEMORY_BASIC_INFORMATION (48 bytes on x64).
+typedef struct XMEM_MEMORY_BASIC_INFORMATION {
+    void* BaseAddress;
+    void* AllocationBase;
+    uint32_t AllocationProtect;
+    uint16_t PartitionId;
+    uint16_t Reserved0;
+    size_t RegionSize;
+    uint32_t State;
+    uint32_t Protect;
+    uint32_t Type;
+    uint32_t Reserved1;
+} XMEM_MEMORY_BASIC_INFORMATION;
+
+typedef struct XMEM_DECODED_ALLOC_ATTRIBUTES {
+    uint32_t objectType;
+    uint32_t heapTracksAttributes;
+    uint32_t mustSucceed;
+    uint32_t fixedSize;
+    uint32_t allocatorId;
+    uint32_t alignmentCode;
+    uint32_t memoryType;
+    uint32_t pageSizeCode;
+    uint32_t zeroInitialize;
+    uint32_t allocFlags;       // MEM_GRAPHICS | MEM_TITLE | MEM_WRITE_COMBINE | MEM_LARGE_PAGES | MEM_4MB_PAGES
+    uint32_t protectFlags;     // PAGE_* flags including PAGE_WRITECOMBINE / PAGE_GPU_*
+    uint64_t alignmentBytes;   // Decoded alignment in bytes
+    uint64_t pageSizeBytes;    // Decoded page size in bytes (4KB / 64KB / 2MB / 4MB)
+    uint64_t rawAttributes;    // Original 64-bit XALLOC_ATTRIBUTES bitfield
+} XMEM_DECODED_ALLOC_ATTRIBUTES;
+
 // ---------------------------------------------------------------------------
 // Scarlett Game OS (kernelx.dll) Memory Status & XMem Allocator
 // ---------------------------------------------------------------------------
@@ -249,6 +284,21 @@ OPENSCARLETT_KERNELX_API void* OPENSCARLETT_KERNELX_CALL XMemGetAuxiliaryTitleMe
 
 OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL XMemReleaseAuxiliaryTitleMemory(
     void* baseAddress);
+
+// Queries tracked Xbox unified/ERA allocations (falling back to host VirtualQuery).
+// `lpBuffer` accepts Win32 MEMORY_BASIC_INFORMATION* or XMEM_MEMORY_BASIC_INFORMATION*.
+OPENSCARLETT_KERNELX_API size_t OPENSCARLETT_KERNELX_CALL XMemVirtualQuery(
+    const void* lpAddress,
+    void* lpBuffer,
+    size_t dwLength);
+
+OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL XMemDecodeAllocationAttributes(
+    uint64_t dwAllocAttributes,
+    XMEM_DECODED_ALLOC_ATTRIBUTES* outDecoded);
+
+OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL XMemGetAllocationAttributes(
+    const void* lpAddress,
+    XMEM_DECODED_ALLOC_ATTRIBUTES* outDecoded);
 
 // ---------------------------------------------------------------------------
 // Scarlett Physical Page Allocation & Virtual Aliasing (VirtualAlloc2/MapViewOfFile3)

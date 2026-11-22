@@ -648,6 +648,7 @@ enum RegFamily : uint32_t {
     kRegGameInvite = 10,
     kRegAppBroadcast = 11,
     kRegAppCaptureMetadataPurged = 12,
+    kRegGameStreamingConnection = 13,
 };
 
 thread_local bool g_thread_time_sensitive = false;
@@ -656,8 +657,8 @@ struct RuntimeState {
     std::mutex mutex;
     std::atomic<int32_t> init_count{0};
     std::atomic<int32_t> api_impl_init_count{0};
-    std::atomic<uint32_t> vtable_refs[15]{
-        1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u};
+    std::atomic<uint32_t> vtable_refs[16]{
+        1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u};
 
     // Task queues
     std::unordered_map<XTaskQueueObject*, std::shared_ptr<XTaskQueueObject>> live_queues;
@@ -748,6 +749,11 @@ struct RuntimeState {
     std::mutex stt_mutex;
     XSpeechToTextPositionHint stt_position_hint = XSpeechToTextPositionHint_BottomCenter;
     uint32_t next_stt_hypothesis_id = 1;
+
+    // XGameStreaming state
+    std::mutex streaming_mutex;
+    uint32_t streaming_init_count = 0;
+    std::string active_touch_layout;
     std::unordered_map<uint32_t, std::string> active_stt_hypotheses;
 };
 
@@ -2285,7 +2291,7 @@ void OPENSCARLETT_GDK_CALL XGameRuntimeUninitialize(void) {
 
 bool OPENSCARLETT_GDK_CALL XGameRuntimeIsFeatureAvailable(XGameRuntimeFeature feature) {
     RecordOk("XGameRuntimeIsFeatureAvailable");
-    return static_cast<uint32_t>(feature) <= static_cast<uint32_t>(XGameRuntimeFeature_XError);
+    return static_cast<uint32_t>(feature) <= static_cast<uint32_t>(XGameRuntimeFeature_XGameStreaming);
 }
 
 XGameResult OPENSCARLETT_GDK_CALL XGameGetXboxTitleId(uint32_t* titleId) {
@@ -2509,6 +2515,7 @@ XGameResult OPENSCARLETT_GDK_CALL XTaskQueueSubmitDelayedCallback(
                 return RecordHr("XTaskQueueSubmitDelayedCallback", XGR_E_ABORT);
             }
         }
+        NotifyMonitors(obj.get(), port);
         if (delayMs > 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(delayMs));
         }
@@ -4549,9 +4556,161 @@ XSystemRuntimeInfo OPENSCARLETT_GDK_CALL XSystemGetRuntimeInfo(void) {
     return info;
 }
 
+XGameResult OPENSCARLETT_GDK_CALL XSystemGetAppSpecificDeviceId(
+    size_t appSpecificDeviceIdSize,
+    char* appSpecificDeviceId,
+    size_t* appSpecificDeviceIdUsed) {
+    // Clean-room deterministic 44-character base64 app-specific device ID (+ null = 45 bytes).
+    const std::string asid = "T3BlblNjYXJsZXR0QXBwU3BlY2lmaWNEZXZpY2VJZA==";
+    return RecordHr("XSystemGetAppSpecificDeviceId",
+                    CopyStringResult(asid, appSpecificDeviceIdSize, appSpecificDeviceId,
+                                     appSpecificDeviceIdUsed));
+}
+
 bool OPENSCARLETT_GDK_CALL XSystemIsHandleValid(void* handle) {
     RecordOk("XSystemIsHandleValid");
     return handle != nullptr && handle != reinterpret_cast<void*>(static_cast<intptr_t>(-1));
+}
+
+// ===========================================================================
+// XGameStreaming (Clean-Room Local-PC Compatibility Surface)
+// ===========================================================================
+XGameResult OPENSCARLETT_GDK_CALL XGameStreamingInitialize(void) {
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.streaming_mutex);
+    ++rt.streaming_init_count;
+    return RecordHr("XGameStreamingInitialize", XGR_S_OK);
+}
+
+void OPENSCARLETT_GDK_CALL XGameStreamingUninitialize(void) {
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.streaming_mutex);
+    if (rt.streaming_init_count > 0u) {
+        --rt.streaming_init_count;
+    }
+    if (rt.streaming_init_count == 0u) {
+        rt.active_touch_layout.clear();
+    }
+    RecordOk("XGameStreamingUninitialize");
+}
+
+bool OPENSCARLETT_GDK_CALL XGameStreamingIsStreaming(void) {
+    RecordOk("XGameStreamingIsStreaming");
+    return false;
+}
+
+uint32_t OPENSCARLETT_GDK_CALL XGameStreamingGetClientCount(void) {
+    RecordOk("XGameStreamingGetClientCount");
+    return 0u;
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameStreamingGetClients(
+    uint32_t clientCount,
+    XGameStreamingClientId* clients,
+    uint32_t* clientsUsed) {
+    if (!clientsUsed || (clientCount > 0u && !clients)) {
+        return RecordHr("XGameStreamingGetClients", XGR_E_INVALIDARG);
+    }
+    *clientsUsed = 0u;
+    return RecordHr("XGameStreamingGetClients", XGR_S_OK);
+}
+
+XGameStreamingConnectionState OPENSCARLETT_GDK_CALL XGameStreamingGetConnectionState(
+    XGameStreamingClientId /*client*/) {
+    RecordOk("XGameStreamingGetConnectionState");
+    return XGameStreamingConnectionState_Disconnected;
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameStreamingRegisterConnectionStateChanged(
+    XTaskQueueHandle /*queue*/,
+    void* /*context*/,
+    XGameStreamingConnectionStateChangedCallback callback,
+    XTaskQueueRegistrationToken* token) {
+    if (!callback || !token) {
+        return RecordHr("XGameStreamingRegisterConnectionStateChanged", XGR_E_INVALIDARG);
+    }
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.reg_mutex);
+    const uint64_t tok = rt.next_reg_token++;
+    rt.live_reg_tokens[tok] = kRegGameStreamingConnection;
+    token->token = tok;
+    return RecordHr("XGameStreamingRegisterConnectionStateChanged", XGR_S_OK);
+}
+
+bool OPENSCARLETT_GDK_CALL XGameStreamingUnregisterConnectionStateChanged(
+    XTaskQueueRegistrationToken token,
+    bool /*wait*/) {
+    RecordOk("XGameStreamingUnregisterConnectionStateChanged");
+    if (token.token == 0ull) {
+        return false;
+    }
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.reg_mutex);
+    auto it = rt.live_reg_tokens.find(token.token);
+    if (it == rt.live_reg_tokens.end() || it->second != kRegGameStreamingConnection) {
+        return false;
+    }
+    rt.live_reg_tokens.erase(it);
+    return true;
+}
+
+void OPENSCARLETT_GDK_CALL XGameStreamingHideTouchControls(void) {
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.streaming_mutex);
+    rt.active_touch_layout.clear();
+    RecordOk("XGameStreamingHideTouchControls");
+}
+
+void OPENSCARLETT_GDK_CALL XGameStreamingShowTouchControlLayout(const char* layout) {
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.streaming_mutex);
+    rt.active_touch_layout = layout ? std::string(layout) : std::string();
+    RecordOk("XGameStreamingShowTouchControlLayout");
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameStreamingGetStreamPhysicalDimensions(
+    XGameStreamingClientId /*client*/,
+    uint32_t* horizontalMm,
+    uint32_t* verticalMm) {
+    if (!horizontalMm || !verticalMm) {
+        return RecordHr("XGameStreamingGetStreamPhysicalDimensions", XGR_E_INVALIDARG);
+    }
+    *horizontalMm = 0u;
+    *verticalMm = 0u;
+    return RecordHr("XGameStreamingGetStreamPhysicalDimensions", XGR_S_OK);
+}
+
+size_t OPENSCARLETT_GDK_CALL XGameStreamingGetServerLocationNameSize(void) {
+    RecordOk("XGameStreamingGetServerLocationNameSize");
+    return sizeof("LocalPC");
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameStreamingGetServerLocationName(
+    size_t serverLocationNameSize,
+    char* serverLocationName) {
+    const std::string loc = "LocalPC";
+    return RecordHr("XGameStreamingGetServerLocationName",
+                    CopyStringResult(loc, serverLocationNameSize, serverLocationName, nullptr));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameStreamingGetLastFrameDisplayed(
+    XGameStreamingClientId /*client*/,
+    uint64_t* frameId) {
+    if (!frameId) {
+        return RecordHr("XGameStreamingGetLastFrameDisplayed", XGR_E_INVALIDARG);
+    }
+    *frameId = 0ull;
+    return RecordHr("XGameStreamingGetLastFrameDisplayed", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameStreamingIsTouchInputEnabledOnClient(
+    XGameStreamingClientId /*client*/,
+    bool* touchInputEnabled) {
+    if (!touchInputEnabled) {
+        return RecordHr("XGameStreamingIsTouchInputEnabledOnClient", XGR_E_INVALIDARG);
+    }
+    *touchInputEnabled = false;
+    return RecordHr("XGameStreamingIsTouchInputEnabledOnClient", XGR_S_OK);
 }
 
 // ===========================================================================
@@ -8375,7 +8534,8 @@ enum XgrApiIndex : size_t {
     kApiStore = 12,
     kApiNetworking = 13,
     kApiCoreRuntime = 14,
-    kApiCount = 15,
+    kApiGameStreaming = 15,
+    kApiCount = 16,
 };
 
 extern const IXgrTaskQueueApiVtable g_task_queue_vtable;
@@ -8393,6 +8553,7 @@ extern const IXgrSpeechSynthesizerApiVtable g_speech_synth_vtable;
 extern const IXgrStoreApiVtable g_store_vtable;
 extern const IXgrNetworkingApiVtable g_networking_vtable;
 extern const IXgrCoreRuntimeApiVtable g_core_runtime_vtable;
+extern const IXgrGameStreamingApiVtable g_game_streaming_vtable;
 
 int FindApiIndexByVtablePtr(const void* self) noexcept {
     if (self == &g_task_queue_vtable) return static_cast<int>(kApiTaskQueue);
@@ -8410,6 +8571,7 @@ int FindApiIndexByVtablePtr(const void* self) noexcept {
     if (self == &g_store_vtable) return static_cast<int>(kApiStore);
     if (self == &g_networking_vtable) return static_cast<int>(kApiNetworking);
     if (self == &g_core_runtime_vtable) return static_cast<int>(kApiCoreRuntime);
+    if (self == &g_game_streaming_vtable) return static_cast<int>(kApiGameStreaming);
     return -1;
 }
 
@@ -8585,6 +8747,7 @@ const IXgrSystemApiVtable g_system_vtable = {
     &XSystemGetRuntimeInfo,
     &XSystemIsHandleValid,
     &XGameRuntimeIsFeatureAvailable,
+    &XSystemGetAppSpecificDeviceId,
 };
 
 const IXgrMemApiVtable g_mem_vtable = {
@@ -8832,6 +8995,27 @@ const IXgrCoreRuntimeApiVtable g_core_runtime_vtable = {
     &XHighContrastGetMode,
     &XClosedCaptionGetProperties,
     &XClosedCaptionSetEnabled,
+};
+
+const IXgrGameStreamingApiVtable g_game_streaming_vtable = {
+    &XgrVtableQueryInterface,
+    &XgrVtableAddRef,
+    &XgrVtableRelease,
+    &XGameStreamingInitialize,
+    &XGameStreamingUninitialize,
+    &XGameStreamingIsStreaming,
+    &XGameStreamingGetClientCount,
+    &XGameStreamingGetClients,
+    &XGameStreamingGetConnectionState,
+    &XGameStreamingRegisterConnectionStateChanged,
+    &XGameStreamingUnregisterConnectionStateChanged,
+    &XGameStreamingHideTouchControls,
+    &XGameStreamingShowTouchControlLayout,
+    &XGameStreamingGetStreamPhysicalDimensions,
+    &XGameStreamingGetServerLocationNameSize,
+    &XGameStreamingGetServerLocationName,
+    &XGameStreamingGetLastFrameDisplayed,
+    &XGameStreamingIsTouchInputEnabledOnClient,
 };
 
 // ===========================================================================
@@ -9563,6 +9747,7 @@ const void* LookupInternal2ArgVtable(const XgrGuid& apiId) noexcept {
     if (XgrGuidEquals(apiId, XGR_API_GUID_STORE)) return &g_store_vtable;
     if (XgrGuidEquals(apiId, XGR_API_GUID_NETWORKING)) return &g_networking_vtable;
     if (XgrGuidEquals(apiId, XGR_API_GUID_CORE_RUNTIME)) return &g_core_runtime_vtable;
+    if (XgrGuidEquals(apiId, XGR_API_GUID_GAME_STREAMING)) return &g_game_streaming_vtable;
     return nullptr;
 }
 

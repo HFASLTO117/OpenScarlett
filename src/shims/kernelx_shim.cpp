@@ -453,6 +453,284 @@ public:
         return it->second.requested_size;
     }
 
+    size_t XMemVirtualQueryImpl(const void* address, void* buffer, size_t length) const {
+        if (!buffer || length < sizeof(XMEM_MEMORY_BASIC_INFORMATION)) {
+            SetHostLastError(87u);
+            return 0u;
+        }
+#if defined(_WIN32)
+        static_assert(sizeof(XMEM_MEMORY_BASIC_INFORMATION) == sizeof(MEMORY_BASIC_INFORMATION),
+                      "XMEM_MEMORY_BASIC_INFORMATION must match Win32 MEMORY_BASIC_INFORMATION");
+#endif
+        auto* out = static_cast<XMEM_MEMORY_BASIC_INFORMATION*>(buffer);
+        std::memset(out, 0, sizeof(XMEM_MEMORY_BASIC_INFORMATION));
+
+        if (!address) {
+            SetHostLastError(87u);
+            return 0u;
+        }
+
+        const uintptr_t addr = reinterpret_cast<uintptr_t>(address);
+        constexpr uint32_t kMemPrivate = 0x00020000u;
+        constexpr uint32_t kMemMapped = 0x00040000u;
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+
+            // 1. Tracked XMemAlloc / XMemAllocAligned / XMemAllocDefault allocations
+            for (const auto& [base, rec] : xmem_allocs_) {
+                if (addr >= base && addr < base + rec.allocated_size) {
+                    openscarlett::EraAllocationAttributes era{};
+                    openscarlett::DecodeEraAllocationAttributes(rec.attributes, era);
+                    const uintptr_t page_mask = static_cast<uintptr_t>(kPage4KB - 1u);
+                    const uintptr_t aligned_addr = addr & ~page_mask;
+                    const uintptr_t region_base = (aligned_addr >= base) ? aligned_addr : base;
+                    const uintptr_t region_end = base + rec.allocated_size;
+                    out->BaseAddress = reinterpret_cast<void*>(region_base);
+                    out->AllocationBase = reinterpret_cast<void*>(base);
+                    out->AllocationProtect = era.protect_flags;
+                    out->RegionSize = static_cast<size_t>(region_end - region_base);
+                    out->State = MEM_COMMIT;
+                    out->Protect = era.protect_flags;
+                    out->Type = kMemPrivate | era.alloc_flags;
+                    return sizeof(XMEM_MEMORY_BASIC_INFORMATION);
+                }
+            }
+
+            // 2. Tracked MapTitlePhysicalPages / MapTitleVirtualMemory / XMemMapPhysicalPages mappings
+            for (const auto& [base, m] : mappings_) {
+                if (addr >= base && addr < base + m.size_bytes) {
+                    const uintptr_t gran_mask = static_cast<uintptr_t>(kPage4KB - 1u);
+                    const uintptr_t region_base = std::max(base, addr & ~gran_mask);
+                    const uintptr_t region_end = base + m.size_bytes;
+                    out->BaseAddress = reinterpret_cast<void*>(region_base);
+                    out->AllocationBase = reinterpret_cast<void*>(base);
+                    out->AllocationProtect = m.win32_protect;
+                    out->RegionSize = static_cast<size_t>(region_end - region_base);
+                    out->State = MEM_COMMIT;
+                    out->Protect = m.win32_protect;
+                    out->Type = kMemMapped | (m.alloc_flags & (MEM_GRAPHICS | MEM_TITLE |
+                                                               MEM_WRITE_COMBINE | MEM_LARGE_PAGES |
+                                                               MEM_4MB_PAGES));
+                    return sizeof(XMEM_MEMORY_BASIC_INFORMATION);
+                }
+            }
+
+            // 3. Tracked VirtualAllocFromApp allocations & placeholders
+            for (const auto& [base, rec] : app_allocs_) {
+                if (addr >= base && addr < base + rec.size) {
+                    const uintptr_t region_base = std::max(base, addr & ~static_cast<uintptr_t>(kPage4KB - 1u));
+                    const uintptr_t region_end = base + rec.size;
+                    out->BaseAddress = reinterpret_cast<void*>(region_base);
+                    out->AllocationBase = reinterpret_cast<void*>(base);
+                    out->AllocationProtect = rec.protection;
+                    out->RegionSize = static_cast<size_t>(region_end - region_base);
+                    out->State = (rec.committed_bytes > 0u && !rec.is_placeholder) ? MEM_COMMIT : MEM_RESERVE;
+                    out->Protect = rec.is_placeholder ? PAGE_NOACCESS : rec.protection;
+                    out->Type = kMemPrivate | (rec.alloc_flags & (MEM_GRAPHICS | MEM_TITLE |
+                                                                  MEM_WRITE_COMBINE | MEM_LARGE_PAGES |
+                                                                  MEM_4MB_PAGES));
+                    return sizeof(XMEM_MEMORY_BASIC_INFORMATION);
+                }
+            }
+
+            // 4. Tracked Auxiliary Title Memory allocations
+            for (const auto& [base, sz] : aux_allocs_) {
+                if (addr >= base && addr < base + sz) {
+                    const uintptr_t region_base = std::max(base, addr & ~static_cast<uintptr_t>(kPage4KB - 1u));
+                    const uintptr_t region_end = base + sz;
+                    out->BaseAddress = reinterpret_cast<void*>(region_base);
+                    out->AllocationBase = reinterpret_cast<void*>(base);
+                    out->AllocationProtect = PAGE_READWRITE;
+                    out->RegionSize = static_cast<size_t>(region_end - region_base);
+                    out->State = MEM_COMMIT;
+                    out->Protect = PAGE_READWRITE;
+                    out->Type = kMemPrivate | MEM_TITLE;
+                    return sizeof(XMEM_MEMORY_BASIC_INFORMATION);
+                }
+            }
+        }
+
+        // 5. Tracked UnifiedMemoryManager blocks or aliases
+        openscarlett::UnifiedMemoryBlock block{};
+        if (memory_.LookupBlockByHostPtr(address, block)) {
+            const uintptr_t base = reinterpret_cast<uintptr_t>(block.host_ptr);
+            const uintptr_t region_base = std::max(base, addr & ~static_cast<uintptr_t>(kPage4KB - 1u));
+            uint32_t era_flags = MEM_TITLE;
+            if (block.gpu_visible) era_flags |= MEM_GRAPHICS;
+            if (block.write_combined) era_flags |= MEM_WRITE_COMBINE;
+            if (block.page_size == MemoryPageSize::Page2MB) era_flags |= MEM_LARGE_PAGES;
+            if (block.page_size == MemoryPageSize::Page4MB) era_flags |= MEM_4MB_PAGES | MEM_LARGE_PAGES;
+            const uint32_t prot = block.write_combined ? (PAGE_READWRITE | PAGE_WRITECOMBINE) : PAGE_READWRITE;
+            out->BaseAddress = reinterpret_cast<void*>(region_base);
+            out->AllocationBase = block.host_ptr;
+            out->AllocationProtect = prot;
+            out->RegionSize = static_cast<size_t>((base + block.size) - region_base);
+            out->State = MEM_COMMIT;
+            out->Protect = prot;
+            out->Type = kMemPrivate | era_flags;
+            return sizeof(XMEM_MEMORY_BASIC_INFORMATION);
+        }
+
+        UnifiedMemoryAlias alias{};
+        if (memory_.LookupAliasByHostPtr(address, alias)) {
+            const uintptr_t base = reinterpret_cast<uintptr_t>(alias.host_ptr);
+            const uintptr_t region_base = std::max(base, addr & ~static_cast<uintptr_t>(kPage4KB - 1u));
+            uint32_t era_flags = MEM_TITLE;
+            if (alias.flags & openscarlett::kMemFlagGraphics) era_flags |= MEM_GRAPHICS;
+            if (alias.flags & openscarlett::kMemFlagLargePages) era_flags |= MEM_LARGE_PAGES;
+            if (alias.flags & openscarlett::kMemFlagWriteCombined) era_flags |= MEM_WRITE_COMBINE;
+            const uint32_t prot = (alias.protection == MemoryProtection::ReadOnly)
+                                      ? PAGE_READONLY
+                                      : ((alias.protection == MemoryProtection::NoAccess)
+                                             ? PAGE_NOACCESS
+                                             : ((alias.protection == MemoryProtection::WriteCombined)
+                                                    ? (PAGE_READWRITE | PAGE_WRITECOMBINE)
+                                                    : PAGE_READWRITE));
+            out->BaseAddress = reinterpret_cast<void*>(region_base);
+            out->AllocationBase = alias.host_ptr;
+            out->AllocationProtect = prot;
+            out->RegionSize = static_cast<size_t>((base + alias.size) - region_base);
+            out->State = MEM_COMMIT;
+            out->Protect = prot;
+            out->Type = kMemMapped | era_flags;
+            return sizeof(XMEM_MEMORY_BASIC_INFORMATION);
+        }
+
+        // 6. Host Win32 VirtualQuery fallback for standard process memory ranges
+#if defined(_WIN32)
+        MEMORY_BASIC_INFORMATION host_mbi{};
+        const SIZE_T got = ::VirtualQuery(address, &host_mbi, sizeof(host_mbi));
+        if (got == 0u) {
+            return 0u;
+        }
+        std::memcpy(out, &host_mbi, sizeof(host_mbi));
+        return static_cast<size_t>(got);
+#else
+        SetHostLastError(87u);
+        return 0u;
+#endif
+    }
+
+    int32_t XMemGetAllocationAttributesImpl(const void* address,
+                                            XMEM_DECODED_ALLOC_ATTRIBUTES* outDecoded) const {
+        if (!address || !outDecoded) {
+            SetHostLastError(87u);
+            return 0;
+        }
+        std::memset(outDecoded, 0, sizeof(*outDecoded));
+        const uintptr_t addr = reinterpret_cast<uintptr_t>(address);
+
+        auto copy_from_era = [&](const openscarlett::EraAllocationAttributes& era) {
+            outDecoded->objectType = era.object_type;
+            outDecoded->heapTracksAttributes = era.heap_tracks_attributes;
+            outDecoded->mustSucceed = era.must_succeed;
+            outDecoded->fixedSize = era.fixed_size;
+            outDecoded->allocatorId = era.allocator_id;
+            outDecoded->alignmentCode = era.alignment_code;
+            outDecoded->memoryType = era.memory_type;
+            outDecoded->pageSizeCode = era.page_size_code;
+            outDecoded->zeroInitialize = era.zero_initialize;
+            outDecoded->allocFlags = era.alloc_flags;
+            outDecoded->protectFlags = era.protect_flags;
+            outDecoded->alignmentBytes = era.alignment_bytes;
+            outDecoded->pageSizeBytes = era.page_size_bytes;
+            outDecoded->rawAttributes = era.raw_attributes;
+        };
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (const auto& [base, rec] : xmem_allocs_) {
+                if (addr >= base && addr < base + rec.allocated_size) {
+                    openscarlett::EraAllocationAttributes era{};
+                    if (!openscarlett::DecodeEraAllocationAttributes(rec.attributes, era)) {
+                        return 0;
+                    }
+                    era.alignment_bytes = std::max<uint64_t>(era.alignment_bytes, rec.alignment);
+                    copy_from_era(era);
+                    return 1;
+                }
+            }
+            for (const auto& [base, m] : mappings_) {
+                if (addr >= base && addr < base + m.size_bytes) {
+                    const uint32_t page_code =
+                        (m.page_size_bytes >= kPage4MB)
+                            ? XALLOC_PAGESIZE_4MB
+                            : ((m.page_size_bytes >= kPage64KB) ? XALLOC_PAGESIZE_64KB : XALLOC_PAGESIZE_4KB);
+                    const bool wc = (m.win32_protect & PAGE_WRITECOMBINE) != 0u ||
+                                    (m.alloc_flags & MEM_WRITE_COMBINE) != 0u;
+                    const uint32_t mem_type = wc ? XALLOC_MEMTYPE_GRAPHICS_WRITECOMBINE
+                                                 : XALLOC_MEMTYPE_PHYSICAL;
+                    const uint64_t raw = MAKE_XALLOC_ATTRIBUTES(
+                        0u, 1u, 0u, 0u, 0u, XALLOC_ALIGNMENT_64K, mem_type, page_code, 0u);
+                    openscarlett::EraAllocationAttributes era{};
+                    openscarlett::DecodeEraAllocationAttributes(raw, era);
+                    era.page_size_bytes = m.page_size_bytes;
+                    era.alloc_flags |= (m.alloc_flags & (MEM_GRAPHICS | MEM_TITLE | MEM_WRITE_COMBINE |
+                                                         MEM_LARGE_PAGES | MEM_4MB_PAGES));
+                    era.protect_flags = m.win32_protect;
+                    copy_from_era(era);
+                    return 1;
+                }
+            }
+            for (const auto& [base, rec] : app_allocs_) {
+                if (addr >= base && addr < base + rec.size) {
+                    const bool is_4mb = (rec.alloc_flags & MEM_4MB_PAGES) != 0u;
+                    const bool is_large = (rec.alloc_flags & MEM_LARGE_PAGES) != 0u;
+                    const bool is_gfx = (rec.alloc_flags & MEM_GRAPHICS) != 0u;
+                    const bool is_wc = (rec.protection & PAGE_WRITECOMBINE) != 0u ||
+                                       (rec.alloc_flags & MEM_WRITE_COMBINE) != 0u;
+                    const uint32_t page_code =
+                        is_4mb ? XALLOC_PAGESIZE_4MB
+                               : (is_gfx ? XALLOC_PAGESIZE_64KB : XALLOC_PAGESIZE_4KB);
+                    const uint32_t mem_type =
+                        is_gfx ? (is_wc ? XALLOC_MEMTYPE_GRAPHICS_WRITECOMBINE
+                                        : XALLOC_MEMTYPE_GRAPHICS_CACHEABLE)
+                               : XALLOC_MEMTYPE_HEAP;
+                    uint64_t raw = MAKE_XALLOC_ATTRIBUTES(
+                        0u, 1u, 0u, 0u, 0u, XALLOC_ALIGNMENT_DEFAULT, mem_type, page_code, 0u);
+                    if (is_large && !is_4mb) {
+                        raw |= XALLOC_FLAG_2MB_PAGES;
+                    }
+                    openscarlett::EraAllocationAttributes era{};
+                    openscarlett::DecodeEraAllocationAttributes(raw, era);
+                    era.alloc_flags |= (rec.alloc_flags & (MEM_GRAPHICS | MEM_TITLE | MEM_WRITE_COMBINE |
+                                                           MEM_LARGE_PAGES | MEM_4MB_PAGES));
+                    era.protect_flags = rec.protection;
+                    copy_from_era(era);
+                    return 1;
+                }
+            }
+            for (const auto& [base, sz] : aux_allocs_) {
+                if (addr >= base && addr < base + sz) {
+                    const uint64_t raw = MAKE_XALLOC_ATTRIBUTES(
+                        0u, 1u, 0u, 0u, 0u, XALLOC_ALIGNMENT_64K, XALLOC_MEMTYPE_HEAP,
+                        XALLOC_PAGESIZE_64KB, 1u);
+                    openscarlett::EraAllocationAttributes era{};
+                    openscarlett::DecodeEraAllocationAttributes(raw, era);
+                    copy_from_era(era);
+                    return 1;
+                }
+            }
+        }
+
+        // Host Win32 fallback: synthesize baseline 4KB page attributes for valid committed ranges
+#if defined(_WIN32)
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (::VirtualQuery(address, &mbi, sizeof(mbi)) != 0u && mbi.State != MEM_FREE) {
+            outDecoded->memoryType = XALLOC_MEMTYPE_HEAP;
+            outDecoded->pageSizeCode = XALLOC_PAGESIZE_4KB;
+            outDecoded->alignmentBytes = kPage4KB;
+            outDecoded->pageSizeBytes = kPage4KB;
+            outDecoded->protectFlags = static_cast<uint32_t>(mbi.Protect);
+            outDecoded->allocFlags = 0u;
+            return 1;
+        }
+#endif
+        SetHostLastError(87u);
+        return 0;
+    }
+
     void* GetAuxTitleMemory(size_t requestedSize, size_t* outActualSize) {
         const size_t raw_size = (requestedSize == 0) ? kDefaultAuxTitleMemoryBytes : requestedSize;
         const size_t aligned_size = AlignUp(raw_size, kPage64KB);
@@ -1560,6 +1838,56 @@ void* OPENSCARLETT_KERNELX_CALL XMemGetAuxiliaryTitleMemory(size_t requestedSize
 int32_t OPENSCARLETT_KERNELX_CALL XMemReleaseAuxiliaryTitleMemory(void* baseAddress) {
     const int32_t ok = KernelXState::Instance().ReleaseAuxTitleMemory(baseAddress);
     RecordTelemetry(__func__, ok ? CallOutcome::Ok : CallOutcome::Error, ok ? kHrOk : kHrInvalidArg);
+    return ok;
+}
+
+size_t OPENSCARLETT_KERNELX_CALL XMemVirtualQuery(const void* lpAddress,
+                                                  void* lpBuffer,
+                                                  size_t dwLength) {
+    const size_t bytes = KernelXState::Instance().XMemVirtualQueryImpl(lpAddress, lpBuffer, dwLength);
+    RecordTelemetry(__func__, bytes > 0u ? CallOutcome::Ok : CallOutcome::Error,
+                    bytes > 0u ? kHrOk : kHrInvalidArg);
+    return bytes;
+}
+
+int32_t OPENSCARLETT_KERNELX_CALL XMemDecodeAllocationAttributes(
+    uint64_t dwAllocAttributes,
+    XMEM_DECODED_ALLOC_ATTRIBUTES* outDecoded) {
+    if (!outDecoded) {
+        SetHostLastError(87u);
+        RecordTelemetry(__func__, CallOutcome::Error, kHrInvalidArg);
+        return 0;
+    }
+    openscarlett::EraAllocationAttributes era{};
+    if (!openscarlett::DecodeEraAllocationAttributes(dwAllocAttributes, era)) {
+        SetHostLastError(87u);
+        RecordTelemetry(__func__, CallOutcome::Error, kHrInvalidArg);
+        return 0;
+    }
+    outDecoded->objectType = era.object_type;
+    outDecoded->heapTracksAttributes = era.heap_tracks_attributes;
+    outDecoded->mustSucceed = era.must_succeed;
+    outDecoded->fixedSize = era.fixed_size;
+    outDecoded->allocatorId = era.allocator_id;
+    outDecoded->alignmentCode = era.alignment_code;
+    outDecoded->memoryType = era.memory_type;
+    outDecoded->pageSizeCode = era.page_size_code;
+    outDecoded->zeroInitialize = era.zero_initialize;
+    outDecoded->allocFlags = era.alloc_flags;
+    outDecoded->protectFlags = era.protect_flags;
+    outDecoded->alignmentBytes = era.alignment_bytes;
+    outDecoded->pageSizeBytes = era.page_size_bytes;
+    outDecoded->rawAttributes = era.raw_attributes;
+    RecordTelemetry(__func__, CallOutcome::Ok, kHrOk);
+    return 1;
+}
+
+int32_t OPENSCARLETT_KERNELX_CALL XMemGetAllocationAttributes(
+    const void* lpAddress,
+    XMEM_DECODED_ALLOC_ATTRIBUTES* outDecoded) {
+    const int32_t ok = KernelXState::Instance().XMemGetAllocationAttributesImpl(lpAddress, outDecoded);
+    RecordTelemetry(__func__, ok != 0 ? CallOutcome::Ok : CallOutcome::Error,
+                    ok != 0 ? kHrOk : kHrInvalidArg);
     return ok;
 }
 

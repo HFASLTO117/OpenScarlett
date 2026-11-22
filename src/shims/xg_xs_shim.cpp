@@ -587,6 +587,67 @@ OPENSCARLETT_XG_API int32_t __stdcall XGComputeCmaskLayout(
     return hr;
 }
 
+OPENSCARLETT_XG_API int32_t __stdcall XGEncodeDCC(
+    const XG_DCC_ENCODE_PARAMS* pParams,
+    void* pDstDccBuffer,
+    uint64_t dstDccSizeBytes,
+    XG_DCC_ENCODE_RESULT* pOutResult) {
+    if (!pParams || !pDstDccBuffer || dstDccSizeBytes == 0ull) {
+        openscarlett::CallTelemetry::Global().Record(
+            kXgModule, "XGEncodeDCC",
+            openscarlett::CallOutcome::Error, kHrInvalidArg);
+        return kHrInvalidArg;
+    }
+    const bool ok = openscarlett::xg::EncodeDccMetadata(
+        *pParams, pDstDccBuffer, dstDccSizeBytes, pOutResult);
+    const int32_t hr = ok ? kHrOk : kHrInvalidArg;
+    openscarlett::CallTelemetry::Global().Record(
+        kXgModule, "XGEncodeDCC",
+        ok ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error, hr);
+    return hr;
+}
+
+OPENSCARLETT_XG_API int32_t __stdcall XGDecodeDCCKey(
+    uint8_t dccKeyByte,
+    uint32_t* pOutBlockState) {
+    if (!pOutBlockState) {
+        openscarlett::CallTelemetry::Global().Record(
+            kXgModule, "XGDecodeDCCKey",
+            openscarlett::CallOutcome::Error, kHrPointer);
+        return kHrPointer;
+    }
+    XG_DCC_BLOCK_STATE state = XG_DCC_STATE_UNCOMPRESSED;
+    const bool ok = openscarlett::xg::DecodeDccKeyByte(dccKeyByte, state);
+    if (ok) {
+        *pOutBlockState = static_cast<uint32_t>(state);
+    }
+    const int32_t hr = ok ? kHrOk : kHrInvalidArg;
+    openscarlett::CallTelemetry::Global().Record(
+        kXgModule, "XGDecodeDCCKey",
+        ok ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error, hr);
+    return hr;
+}
+
+OPENSCARLETT_XG_API int32_t __stdcall XGVerifyDCC(
+    const XG_DCC_ENCODE_PARAMS* pParams,
+    const void* pDccBuffer,
+    uint64_t dccSizeBytes,
+    XG_DCC_ENCODE_RESULT* pOutResult) {
+    if (!pParams || !pDccBuffer || dccSizeBytes == 0ull) {
+        openscarlett::CallTelemetry::Global().Record(
+            kXgModule, "XGVerifyDCC",
+            openscarlett::CallOutcome::Error, kHrInvalidArg);
+        return kHrInvalidArg;
+    }
+    const bool ok = openscarlett::xg::VerifyDccMetadata(
+        *pParams, pDccBuffer, dccSizeBytes, pOutResult);
+    const int32_t hr = ok ? kHrOk : kHrInvalidArg;
+    openscarlett::CallTelemetry::Global().Record(
+        kXgModule, "XGVerifyDCC",
+        ok ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error, hr);
+    return hr;
+}
+
 OPENSCARLETT_XG_API int __stdcall OpenScarlettXgGetTelemetryDetail(
     const char* symbol_name,
     uint64_t* out_total_calls,

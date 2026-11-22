@@ -24,6 +24,9 @@
 #pragma comment(linker, "/export:XMemSizeDefault=XMemShim_XMemSizeDefault")
 #pragma comment(linker, "/export:XMemGetAuxiliaryTitleMemory=XMemShim_XMemGetAuxiliaryTitleMemory")
 #pragma comment(linker, "/export:XMemReleaseAuxiliaryTitleMemory=XMemShim_XMemReleaseAuxiliaryTitleMemory")
+#pragma comment(linker, "/export:XMemVirtualQuery=XMemShim_XMemVirtualQuery")
+#pragma comment(linker, "/export:XMemDecodeAllocationAttributes=XMemShim_XMemDecodeAllocationAttributes")
+#pragma comment(linker, "/export:XMemGetAllocationAttributes=XMemShim_XMemGetAllocationAttributes")
 #pragma comment(linker, "/export:XMemMapPhysicalPages=XMemShim_XMemMapPhysicalPages")
 #pragma comment(linker, "/export:XMemUnmapPhysicalPages=XMemShim_XMemUnmapPhysicalPages")
 #pragma comment(linker, "/export:XMemGetTelemetryCallCountForTest=XMemShim_GetTelemetryCallCountForTest")
@@ -115,6 +118,31 @@ void* OPENSCARLETT_KERNELX_CALL XMemShim_XMemGetAuxiliaryTitleMemory(
 int32_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemReleaseAuxiliaryTitleMemory(void* baseAddress) {
     const int32_t ok = ::XMemReleaseAuxiliaryTitleMemory(baseAddress);
     RecordOutcome("XMemReleaseAuxiliaryTitleMemory", ok != 0);
+    return ok;
+}
+
+size_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemVirtualQuery(
+    const void* lpAddress,
+    void* lpBuffer,
+    size_t dwLength) {
+    const size_t bytes = ::XMemVirtualQuery(lpAddress, lpBuffer, dwLength);
+    RecordOutcome("XMemVirtualQuery", bytes > 0u);
+    return bytes;
+}
+
+int32_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemDecodeAllocationAttributes(
+    uint64_t dwAllocAttributes,
+    XMEM_DECODED_ALLOC_ATTRIBUTES* outDecoded) {
+    const int32_t ok = ::XMemDecodeAllocationAttributes(dwAllocAttributes, outDecoded);
+    RecordOutcome("XMemDecodeAllocationAttributes", ok != 0);
+    return ok;
+}
+
+int32_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemGetAllocationAttributes(
+    const void* lpAddress,
+    XMEM_DECODED_ALLOC_ATTRIBUTES* outDecoded) {
+    const int32_t ok = ::XMemGetAllocationAttributes(lpAddress, outDecoded);
+    RecordOutcome("XMemGetAllocationAttributes", ok != 0);
     return ok;
 }
 
