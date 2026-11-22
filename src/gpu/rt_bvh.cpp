@@ -1,4 +1,5 @@
 #include "openscarlett/gpu/rt_bvh.h"
+#include "openscarlett/gpu/rdna2_rayquery_bridge.h"
 
 #include <algorithm>
 #include <array>
@@ -404,6 +405,74 @@ bool IntersectRayTriangle(const RtTriangle& tri,
                           float& out_v,
                           Vec3& out_normal) noexcept {
     return IntersectTriangle(tri, ray, t_best, out_t, out_u, out_v, out_normal);
+}
+
+bool IntersectRayAabbSlabs(const RtAabb& box,
+                           const RtRay& ray,
+                           float t_best,
+                           float& out_t_near) noexcept {
+    return IntersectAabb(box, ray, t_best, out_t_near);
+}
+
+bool IntersectRayTriangleEx(const RtTriangle& tri,
+                            const RtRay& ray,
+                            float t_best,
+                            uint32_t ray_flags,
+                            uint32_t instance_flags,
+                            float& out_t,
+                            float& out_u,
+                            float& out_v,
+                            Vec3& out_normal,
+                            bool& out_front_face) noexcept {
+    const Vec3 e1 = Sub(tri.v1, tri.v0);
+    const Vec3 e2 = Sub(tri.v2, tri.v0);
+    const Vec3 pvec = Cross(ray.direction, e2);
+    const float det = Dot(e1, pvec);
+    if (std::fabs(det) < 1e-7f) {
+        return false;
+    }
+
+    // Standard D3D12/DXR winding convention: det > 0 is front-facing unless
+    // D3D12_RAYTRACING_INSTANCE_FLAG_TRIANGLE_FRONT_COUNTERCLOCKWISE flips it.
+    const bool front_ccw = (instance_flags & kDxrInstanceTriangleFrontCounterClockwise) != 0u;
+    const bool front_face = front_ccw ? (det < 0.0f) : (det > 0.0f);
+
+    const bool cull_disable = (instance_flags & kDxrInstanceTriangleCullDisable) != 0u;
+    if (!cull_disable) {
+        if ((ray_flags & kRdna2RayFlagCullBackFacingTriangles) != 0u && !front_face) {
+            return false;
+        }
+        if ((ray_flags & kRdna2RayFlagCullFrontFacingTriangles) != 0u && front_face) {
+            return false;
+        }
+    }
+
+    const float inv_det = 1.0f / det;
+    const Vec3 tvec = Sub(ray.origin, tri.v0);
+    const float u = Dot(tvec, pvec) * inv_det;
+    if (u < 0.0f || u > 1.0f) {
+        return false;
+    }
+    const Vec3 qvec = Cross(tvec, e1);
+    const float v = Dot(ray.direction, qvec) * inv_det;
+    if (v < 0.0f || u + v > 1.0f) {
+        return false;
+    }
+    const float t = Dot(e2, qvec) * inv_det;
+    if (t < ray.t_min || t >= t_best) {
+        return false;
+    }
+
+    out_t = t;
+    out_u = u;
+    out_v = v;
+    out_front_face = front_face;
+    Vec3 n = Normalize(Cross(e1, e2));
+    if (Dot(n, ray.direction) > 0.0f) {
+        n = Mul(n, -1.0f);
+    }
+    out_normal = n;
+    return true;
 }
 
 bool BvhAccelerationStructure::GetNodeView(uint32_t index, BvhNodeView& out_node) const noexcept {
