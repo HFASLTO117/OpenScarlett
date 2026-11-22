@@ -1,0 +1,40 @@
+OpenScarlett Sprint 7 (v0.4.0-alpha) — Wave 2 Worker A Integration Notes
+Branch: swarm/s7-w2-updater
+Worktree: E:\OpenScarlett\.worktrees\s7-w2-updater
+
+=== Owned Source File ===
+- src/launcher/updater.cpp
+  Implements all declarations in include/openscarlett/launcher/updater.h:
+  * ParseSemVer, CompareSemVer, IsNewerVersion
+  * IsUpdateCheckDisabledByEnv (OPENSCARLETT_NO_UPDATE_CHECK = 1/true/yes, case-insensitive)
+  * ParseGitHubReleaseJson (clean-room recursive-descent JSON parser with escape & UTF-16 surrogate pair decoding, nested object skipping, and Windows x64 zip + .sha256 asset matching)
+  * ParseSha256ChecksumFile (strict 64-hex validation, UTF-8 BOM handling, optional *filename)
+  * ComputeBufferSha256Hex, ComputeFileSha256Hex, VerifyFileSha256 (native Windows BCrypt SHA-256 streaming with RAII cleanup & constant-time hex comparison)
+  * CheckLatestGitHubRelease (opt-in read-only WinHTTP HTTPS GET with offline & env bypass, 2 MiB response cap, HTTPS downgrade protection)
+  * DownloadVerifyAndStageUpdate (WinHTTP HTTPS download of .sha256 + .zip into <app_dir>/_openscarlett_update_staging with progress & cancellation)
+  * VerifyAndStageLocalUpdateFiles (strict pre-extraction BCrypt SHA-256 verification; hard-fails & purges staging folder on mismatch/malformed checksum; extracts via native PowerShell Expand-Archive; generates transparent _openscarlett_apply_update.cmd preserving saves\, S\, T\, G_overlay\, openscarlett_config.json, launcher_config.json, user_config.json)
+  * LaunchUpdateRestartHelper (detached CreateProcessW launch of cmd.exe with working directory outside staging_dir)
+
+=== Required Windows Link Libraries (Zero Third-Party Dependencies) ===
+- winhttp (winhttp.lib)
+- bcrypt (bcrypt.lib)
+- shell32 (shell32.lib)
+
+=== Verification Results ===
+1. MSVC 2022 Release (/std:c++20 /O2 /MD /W4 /WX /D_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR):
+   - 0 warnings, 0 errors
+   - Harness (E:\OpenScarlett\.tmp\test_updater_a.cpp): ALL UPDATER TESTS PASSED!
+2. MSVC 2022 Debug (/std:c++20 /Od /MDd /W4 /WX /Zi /D_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR):
+   - 0 warnings, 0 errors
+   - Harness (E:\OpenScarlett\.tmp\test_updater_a.cpp): ALL UPDATER TESTS PASSED!
+3. Verified test coverage:
+   - SemVer parsing, +build metadata stripping, prerelease numeric/lexical ordering, invalid version rejection
+   - GitHub /releases/latest JSON parsing (escapes, unicode/surrogate pairs, nested author/uploader skipping, exact & fallback -win64.zip + .sha256 matching, malformed rejection)
+   - Windows BCrypt SHA-256 known vectors ("" = e3b0c442..., "abc" = ba7816bf..., NIST 56-byte vector = 248d6a61..., 150 KiB multi-chunk streaming file hash)
+   - Strict .sha256 checksum parser (standard, binary *, raw, BOM, uppercase normalization, rejection of 63/65-char/non-hex/missing-separator/HTML)
+   - Valid zip staging, single top-level OpenScarlett-<tag>-win64\ folder resolution, and _openscarlett_apply_update.cmd verification
+   - Tampered zip hard-fail + full deletion of staging directory and staged temp files
+   - Malformed checksum hard-fail + full deletion of staging directory
+   - Non-HTTPS URL rejection in DownloadVerifyAndStageUpdate
+   - Offline mode and OPENSCARLETT_NO_UPDATE_CHECK=1/true/yes instant bypass
+   - LaunchUpdateRestartHelper missing-script rejection and detached script execution
