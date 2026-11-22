@@ -50,6 +50,18 @@ bool GuidEquals(const XAudio2Guid* a, const XAudio2Guid& b) {
     return a && std::memcmp(a, &b, sizeof(XAudio2Guid)) == 0;
 }
 
+#if defined(_WIN32)
+// Inline Core Audio / WASAPI GUIDs (portable across MSVC, Clang-CL, and MinGW-w64; zero __uuidof).
+constexpr GUID kClsidMmDeviceEnumerator = {
+    0xBCDE0395u, 0xE52Fu, 0x467Cu, {0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E}};
+constexpr GUID kIidImmDeviceEnumerator = {
+    0xA95664D2u, 0x9614u, 0x4F35u, {0xA7, 0x46, 0xDE, 0x8D, 0xB6, 0x36, 0x17, 0xE6}};
+constexpr GUID kIidIAudioClient = {
+    0x1CB9AD4Cu, 0xDBFAu, 0x4C32u, {0xB1, 0x78, 0xC2, 0xF5, 0x68, 0xA7, 0x03, 0xB2}};
+constexpr GUID kIidIAudioRenderClient = {
+    0xF294ACFCu, 0x3146u, 0x4483u, {0xA7, 0xBF, 0xAD, 0xDC, 0xA7, 0xC2, 0x60, 0xE2}};
+#endif
+
 std::string GetEnvString(const char* name) {
 #if defined(_WIN32)
     char buf[256]{};
@@ -266,6 +278,69 @@ class XAudio2Impl;
 class SubmixVoiceImpl;
 class MasteringVoiceImpl;
 class SourceVoiceImpl;
+class ReverbApoImpl;
+class VolumeMeterApoImpl;
+
+// Standard XAudio2 Effect Chain ABI structs (matching xaudio2.h)
+struct OsXAudio2EffectDescriptor {
+    OS_IXAudio2Unknown* pEffect;
+    int32_t InitialState;
+    uint32_t OutputChannels;
+};
+
+struct OsXAudio2EffectChain {
+    uint32_t EffectCount;
+    OsXAudio2EffectDescriptor* pEffectDescriptors;
+};
+
+struct VoiceEffectSlot {
+    OS_IXAudio2Unknown* effect = nullptr;
+    bool enabled = true;
+    uint32_t output_channels = 2u;
+};
+
+void ProcessEffectApo(
+    OS_IXAudio2Unknown* effect,
+    float* interleaved,
+    uint32_t frames,
+    uint32_t channels,
+    uint32_t sample_rate);
+
+void ClearEffectSlots(std::vector<VoiceEffectSlot>& slots) {
+    for (auto& s : slots) {
+        if (s.effect) {
+            s.effect->Release();
+            s.effect = nullptr;
+        }
+    }
+    slots.clear();
+}
+
+int32_t ReplaceEffectSlots(std::vector<VoiceEffectSlot>& dst, const void* pEffectChain) {
+    ClearEffectSlots(dst);
+    if (!pEffectChain) {
+        return OS_XAUDIO2_S_OK;
+    }
+    const auto* chain = static_cast<const OsXAudio2EffectChain*>(pEffectChain);
+    if (chain->EffectCount > 16u || (chain->EffectCount > 0u && !chain->pEffectDescriptors)) {
+        return OS_XAUDIO2_E_INVALIDARG;
+    }
+    dst.reserve(chain->EffectCount);
+    for (uint32_t i = 0u; i < chain->EffectCount; ++i) {
+        const auto& desc = chain->pEffectDescriptors[i];
+        if (!desc.pEffect) {
+            ClearEffectSlots(dst);
+            return OS_XAUDIO2_E_INVALIDARG;
+        }
+        desc.pEffect->AddRef();
+        VoiceEffectSlot slot{};
+        slot.effect = desc.pEffect;
+        slot.enabled = (desc.InitialState != 0);
+        slot.output_channels = desc.OutputChannels;
+        dst.push_back(slot);
+    }
+    return OS_XAUDIO2_S_OK;
+}
 
 // ===========================================================================
 // Decoded Queued PCM Buffer (Interleaved float32)
@@ -285,7 +360,10 @@ struct QueuedAudioBuffer {
 
 struct DeferredVoiceCallbacks {
     IXAudio2VoiceCallback* cb = nullptr;
+    bool pass_started = false;
+    uint32_t bytes_required = 0u;
     std::vector<void*> started;
+    std::vector<void*> loop_ended;
     std::vector<void*> ended;
     bool stream_ended = false;
 };
@@ -295,12 +373,22 @@ struct DeferredVoiceCallbacks {
 // ===========================================================================
 class SubmixVoiceImpl final : public IXAudio2SubmixVoice {
 public:
-    SubmixVoiceImpl(XAudio2Impl* engine, uint32_t channels, uint32_t sample_rate, uint32_t flags)
+    SubmixVoiceImpl(
+        XAudio2Impl* engine,
+        uint32_t channels,
+        uint32_t sample_rate,
+        uint32_t flags,
+        uint32_t processing_stage)
         : engine_(engine),
           channels_(std::max(1u, channels)),
           sample_rate_(std::max(1u, sample_rate)),
           flags_(flags),
+          processing_stage_(processing_stage),
           channel_volumes_(std::max(1u, channels), 1.0f) {}
+
+    ~SubmixVoiceImpl() {
+        ClearEffectSlots(effect_chain_);
+    }
 
     void OPENSCARLETT_XAUDIO2_CALL GetVoiceDetails(
         OS_XAUDIO2_VOICE_DETAILS* pVoiceDetails) override {
@@ -313,7 +401,18 @@ public:
     }
 
     int32_t OPENSCARLETT_XAUDIO2_CALL SetOutputVoices(
-        const OS_XAUDIO2_VOICE_SENDS* /*pSendList*/) override {
+        const OS_XAUDIO2_VOICE_SENDS* pSendList) override {
+        std::lock_guard<std::mutex> lk(mutex_);
+        target_submix_ = nullptr;
+        if (pSendList && pSendList->SendCount > 0u && pSendList->pSends) {
+            for (uint32_t i = 0u; i < pSendList->SendCount; ++i) {
+                auto* sub = dynamic_cast<SubmixVoiceImpl*>(pSendList->pSends[i].pOutputVoice);
+                if (sub && sub != this) {
+                    target_submix_ = sub;
+                    break;
+                }
+            }
+        }
         return RecordHr("IXAudio2SubmixVoice::SetOutputVoices", OS_XAUDIO2_S_OK, 1);
     }
 
@@ -347,16 +446,120 @@ public:
 
     void OPENSCARLETT_XAUDIO2_CALL DestroyVoice() override;
 
+    int32_t SetEffectChain(const void* pEffectChain) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        return ReplaceEffectSlots(effect_chain_, pEffectChain);
+    }
+
+    int32_t EnableEffect(uint32_t index, bool enable) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (index >= effect_chain_.size()) return OS_XAUDIO2_E_INVALIDARG;
+        effect_chain_[index].enabled = enable;
+        return OS_XAUDIO2_S_OK;
+    }
+
+    int32_t GetEffectState(uint32_t index, int32_t* out_enabled) {
+        if (!out_enabled) return OS_XAUDIO2_E_POINTER;
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (index >= effect_chain_.size()) return OS_XAUDIO2_E_INVALIDARG;
+        *out_enabled = effect_chain_[index].enabled ? 1 : 0;
+        return OS_XAUDIO2_S_OK;
+    }
+
+    int32_t SetEffectParameters(uint32_t index, const void* params, uint32_t bytes) {
+        if (!params || bytes == 0u) return OS_XAUDIO2_E_INVALIDARG;
+        OS_IXAudio2Unknown* eff = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            if (index >= effect_chain_.size()) return OS_XAUDIO2_E_INVALIDARG;
+            eff = effect_chain_[index].effect;
+            if (eff) eff->AddRef();
+        }
+        if (!eff) return OS_XAUDIO2_E_INVALIDARG;
+        OS_IXAPOParameters* xapo = nullptr;
+        const int32_t hr = eff->QueryInterface(&IID_OS_IXAPOParameters, reinterpret_cast<void**>(&xapo));
+        eff->Release();
+        if (hr < 0 || !xapo) return OS_XAUDIO2_E_INVALIDARG;
+        xapo->SetParameters(params, bytes);
+        xapo->Release();
+        return OS_XAUDIO2_S_OK;
+    }
+
+    int32_t GetEffectParameters(uint32_t index, void* params, uint32_t bytes) {
+        if (!params || bytes == 0u) return OS_XAUDIO2_E_INVALIDARG;
+        OS_IXAudio2Unknown* eff = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            if (index >= effect_chain_.size()) return OS_XAUDIO2_E_INVALIDARG;
+            eff = effect_chain_[index].effect;
+            if (eff) eff->AddRef();
+        }
+        if (!eff) return OS_XAUDIO2_E_INVALIDARG;
+        OS_IXAPOParameters* xapo = nullptr;
+        const int32_t hr = eff->QueryInterface(&IID_OS_IXAPOParameters, reinterpret_cast<void**>(&xapo));
+        eff->Release();
+        if (hr < 0 || !xapo) return OS_XAUDIO2_E_INVALIDARG;
+        xapo->GetParameters(params, bytes);
+        xapo->Release();
+        return OS_XAUDIO2_S_OK;
+    }
+
+    void PrepareBus(uint32_t frames, uint32_t channels) {
+        const size_t n = static_cast<size_t>(frames) * channels;
+        if (mix_bus_.size() != n) {
+            mix_bus_.assign(n, 0.0f);
+        } else {
+            std::fill_n(mix_bus_.data(), n, 0.0f);
+        }
+    }
+
+    float* BusData() { return mix_bus_.data(); }
+
+    void ProcessAndAccumulateTo(
+        float* dst_interleaved,
+        uint32_t frames,
+        uint32_t channels,
+        uint32_t sample_rate) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        for (const auto& slot : effect_chain_) {
+            if (slot.enabled && slot.effect) {
+                ProcessEffectApo(slot.effect, mix_bus_.data(), frames, channels, sample_rate);
+            }
+        }
+        const float vol = volume_.load(std::memory_order_relaxed);
+        float* target = target_submix_ ? target_submix_->BusData() : dst_interleaved;
+        if (!target) target = dst_interleaved;
+        for (uint32_t f = 0u; f < frames; ++f) {
+            for (uint32_t c = 0u; c < channels; ++c) {
+                const float cg = (c < channel_volumes_.size()) ? channel_volumes_[c] : 1.0f;
+                target[static_cast<size_t>(f) * channels + c] +=
+                    mix_bus_[static_cast<size_t>(f) * channels + c] * vol * cg;
+            }
+        }
+    }
+
+    void ClearSubmixReference(SubmixVoiceImpl* dead) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (target_submix_ == dead) {
+            target_submix_ = nullptr;
+        }
+    }
+
     float Volume() const { return volume_.load(std::memory_order_relaxed); }
+    uint32_t ProcessingStage() const { return processing_stage_; }
 
 private:
     XAudio2Impl* engine_;
     uint32_t channels_;
     uint32_t sample_rate_;
     uint32_t flags_;
+    uint32_t processing_stage_ = 0u;
     std::atomic<float> volume_{1.0f};
     std::mutex mutex_;
+    SubmixVoiceImpl* target_submix_ = nullptr;
     std::vector<float> channel_volumes_;
+    std::vector<VoiceEffectSlot> effect_chain_;
+    std::vector<float> mix_bus_;
 };
 
 // ===========================================================================
@@ -370,6 +573,10 @@ public:
           sample_rate_(sample_rate != 0 ? sample_rate : 48000u),
           flags_(flags),
           channel_volumes_(channels != 0 ? channels : 2u, 1.0f) {}
+
+    ~MasteringVoiceImpl() {
+        ClearEffectSlots(effect_chain_);
+    }
 
     void OPENSCARLETT_XAUDIO2_CALL GetVoiceDetails(
         OS_XAUDIO2_VOICE_DETAILS* pVoiceDetails) override {
@@ -424,6 +631,73 @@ public:
         return RecordHr("IXAudio2MasteringVoice::GetChannelMask", OS_XAUDIO2_S_OK, 7);
     }
 
+    int32_t SetEffectChain(const void* pEffectChain) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        return ReplaceEffectSlots(effect_chain_, pEffectChain);
+    }
+
+    int32_t EnableEffect(uint32_t index, bool enable) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (index >= effect_chain_.size()) return OS_XAUDIO2_E_INVALIDARG;
+        effect_chain_[index].enabled = enable;
+        return OS_XAUDIO2_S_OK;
+    }
+
+    int32_t GetEffectState(uint32_t index, int32_t* out_enabled) {
+        if (!out_enabled) return OS_XAUDIO2_E_POINTER;
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (index >= effect_chain_.size()) return OS_XAUDIO2_E_INVALIDARG;
+        *out_enabled = effect_chain_[index].enabled ? 1 : 0;
+        return OS_XAUDIO2_S_OK;
+    }
+
+    int32_t SetEffectParameters(uint32_t index, const void* params, uint32_t bytes) {
+        if (!params || bytes == 0u) return OS_XAUDIO2_E_INVALIDARG;
+        OS_IXAudio2Unknown* eff = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            if (index >= effect_chain_.size()) return OS_XAUDIO2_E_INVALIDARG;
+            eff = effect_chain_[index].effect;
+            if (eff) eff->AddRef();
+        }
+        if (!eff) return OS_XAUDIO2_E_INVALIDARG;
+        OS_IXAPOParameters* xapo = nullptr;
+        const int32_t hr = eff->QueryInterface(&IID_OS_IXAPOParameters, reinterpret_cast<void**>(&xapo));
+        eff->Release();
+        if (hr < 0 || !xapo) return OS_XAUDIO2_E_INVALIDARG;
+        xapo->SetParameters(params, bytes);
+        xapo->Release();
+        return OS_XAUDIO2_S_OK;
+    }
+
+    int32_t GetEffectParameters(uint32_t index, void* params, uint32_t bytes) {
+        if (!params || bytes == 0u) return OS_XAUDIO2_E_INVALIDARG;
+        OS_IXAudio2Unknown* eff = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            if (index >= effect_chain_.size()) return OS_XAUDIO2_E_INVALIDARG;
+            eff = effect_chain_[index].effect;
+            if (eff) eff->AddRef();
+        }
+        if (!eff) return OS_XAUDIO2_E_INVALIDARG;
+        OS_IXAPOParameters* xapo = nullptr;
+        const int32_t hr = eff->QueryInterface(&IID_OS_IXAPOParameters, reinterpret_cast<void**>(&xapo));
+        eff->Release();
+        if (hr < 0 || !xapo) return OS_XAUDIO2_E_INVALIDARG;
+        xapo->GetParameters(params, bytes);
+        xapo->Release();
+        return OS_XAUDIO2_S_OK;
+    }
+
+    void ProcessMasterEffects(float* interleaved, uint32_t frames, uint32_t channels, uint32_t sample_rate) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        for (const auto& slot : effect_chain_) {
+            if (slot.enabled && slot.effect) {
+                ProcessEffectApo(slot.effect, interleaved, frames, channels, sample_rate);
+            }
+        }
+    }
+
     uint32_t Channels() const { return channels_; }
     uint32_t SampleRate() const { return sample_rate_; }
     float Volume() const { return volume_.load(std::memory_order_relaxed); }
@@ -441,6 +715,7 @@ private:
     std::atomic<float> volume_{1.0f};
     std::mutex mutex_;
     std::vector<float> channel_volumes_;
+    std::vector<VoiceEffectSlot> effect_chain_;
 };
 
 // ===========================================================================
@@ -468,11 +743,83 @@ public:
         }
     }
 
+    ~SourceVoiceImpl() {
+        ClearEffectSlots(effect_chain_);
+    }
+
     void SetEffectiveFormatTag(uint16_t tag) { effective_format_tag_ = tag; }
     void SetAdpcmSamplesPerBlock(uint16_t spb) { adpcm_samples_per_block_ = spb; }
     void SetOpusPreSkip(uint16_t pre_skip) { opus_pre_skip_ = pre_skip; }
     bool IsOpusMftActive() const {
         return opus_mft_active_.load(std::memory_order_acquire);
+    }
+
+    int32_t SetEffectChain(const void* pEffectChain) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        return ReplaceEffectSlots(effect_chain_, pEffectChain);
+    }
+
+    int32_t EnableEffect(uint32_t index, bool enable) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (index >= effect_chain_.size()) return OS_XAUDIO2_E_INVALIDARG;
+        effect_chain_[index].enabled = enable;
+        return OS_XAUDIO2_S_OK;
+    }
+
+    int32_t GetEffectState(uint32_t index, int32_t* out_enabled) {
+        if (!out_enabled) return OS_XAUDIO2_E_POINTER;
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (index >= effect_chain_.size()) return OS_XAUDIO2_E_INVALIDARG;
+        *out_enabled = effect_chain_[index].enabled ? 1 : 0;
+        return OS_XAUDIO2_S_OK;
+    }
+
+    int32_t SetEffectParameters(uint32_t index, const void* params, uint32_t bytes) {
+        if (!params || bytes == 0u) return OS_XAUDIO2_E_INVALIDARG;
+        OS_IXAudio2Unknown* eff = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            if (index >= effect_chain_.size()) return OS_XAUDIO2_E_INVALIDARG;
+            eff = effect_chain_[index].effect;
+            if (eff) eff->AddRef();
+        }
+        if (!eff) return OS_XAUDIO2_E_INVALIDARG;
+        OS_IXAPOParameters* xapo = nullptr;
+        const int32_t hr = eff->QueryInterface(&IID_OS_IXAPOParameters, reinterpret_cast<void**>(&xapo));
+        eff->Release();
+        if (hr < 0 || !xapo) return OS_XAUDIO2_E_INVALIDARG;
+        xapo->SetParameters(params, bytes);
+        xapo->Release();
+        return OS_XAUDIO2_S_OK;
+    }
+
+    int32_t GetEffectParameters(uint32_t index, void* params, uint32_t bytes) {
+        if (!params || bytes == 0u) return OS_XAUDIO2_E_INVALIDARG;
+        OS_IXAudio2Unknown* eff = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            if (index >= effect_chain_.size()) return OS_XAUDIO2_E_INVALIDARG;
+            eff = effect_chain_[index].effect;
+            if (eff) eff->AddRef();
+        }
+        if (!eff) return OS_XAUDIO2_E_INVALIDARG;
+        OS_IXAPOParameters* xapo = nullptr;
+        const int32_t hr = eff->QueryInterface(&IID_OS_IXAPOParameters, reinterpret_cast<void**>(&xapo));
+        eff->Release();
+        if (hr < 0 || !xapo) return OS_XAUDIO2_E_INVALIDARG;
+        xapo->GetParameters(params, bytes);
+        xapo->Release();
+        return OS_XAUDIO2_S_OK;
+    }
+
+    void ClearSubmixReference(SubmixVoiceImpl* dead) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        send_submixes_.erase(
+            std::remove(send_submixes_.begin(), send_submixes_.end(), dead),
+            send_submixes_.end());
+        if (send_submixes_.empty()) {
+            send_to_master_ = true;
+        }
     }
 
     void OPENSCARLETT_XAUDIO2_CALL GetVoiceDetails(
@@ -488,13 +835,24 @@ public:
     int32_t OPENSCARLETT_XAUDIO2_CALL SetOutputVoices(
         const OS_XAUDIO2_VOICE_SENDS* pSendList) override {
         std::lock_guard<std::mutex> lk(mutex_);
-        target_submix_ = nullptr;
-        if (pSendList && pSendList->SendCount > 0 && pSendList->pSends) {
-            for (uint32_t i = 0; i < pSendList->SendCount; ++i) {
-                if (auto* sub = dynamic_cast<SubmixVoiceImpl*>(pSendList->pSends[i].pOutputVoice)) {
-                    target_submix_ = sub;
-                    break;
+        send_submixes_.clear();
+        send_to_master_ = false;
+        if (!pSendList || pSendList->SendCount == 0u || !pSendList->pSends) {
+            send_to_master_ = true;
+        } else {
+            for (uint32_t i = 0u; i < pSendList->SendCount; ++i) {
+                IXAudio2Voice* dst = pSendList->pSends[i].pOutputVoice;
+                if (auto* sub = dynamic_cast<SubmixVoiceImpl*>(dst)) {
+                    if (std::find(send_submixes_.begin(), send_submixes_.end(), sub) ==
+                        send_submixes_.end()) {
+                        send_submixes_.push_back(sub);
+                    }
+                } else if (dynamic_cast<MasteringVoiceImpl*>(dst) != nullptr) {
+                    send_to_master_ = true;
                 }
+            }
+            if (send_submixes_.empty() && !send_to_master_) {
+                send_to_master_ = true;
             }
         }
         return RecordHr("IXAudio2SourceVoice::SetOutputVoices", OS_XAUDIO2_S_OK, 1);
@@ -679,28 +1037,34 @@ public:
         }
         uint32_t total_frames = static_cast<uint32_t>(decoded.size() / std::max<uint32_t>(1u, eff_ch));
 
+        uint32_t play_slice_start = 0u;
         // Apply optional PlayBegin / PlayLength range.
         if (pBuffer->PlayBegin > 0 || pBuffer->PlayLength > 0) {
-            const uint32_t start = std::min<uint32_t>(pBuffer->PlayBegin, total_frames);
-            const uint32_t max_avail = total_frames - start;
+            play_slice_start = std::min<uint32_t>(pBuffer->PlayBegin, total_frames);
+            const uint32_t max_avail = total_frames - play_slice_start;
             const uint32_t len = (pBuffer->PlayLength > 0)
                                      ? std::min<uint32_t>(pBuffer->PlayLength, max_avail)
                                      : max_avail;
             std::vector<float> sliced(len * eff_ch);
             if (len > 0) {
-                std::memcpy(sliced.data(), decoded.data() + start * eff_ch,
+                std::memcpy(sliced.data(), decoded.data() + play_slice_start * eff_ch,
                             len * eff_ch * sizeof(float));
             }
             decoded = std::move(sliced);
             total_frames = len;
         }
 
+        const uint32_t adj_loop_begin =
+            (pBuffer->LoopBegin >= play_slice_start)
+                ? std::min<uint32_t>(pBuffer->LoopBegin - play_slice_start, total_frames)
+                : 0u;
+
         QueuedAudioBuffer qb{};
         qb.samples = std::move(decoded);
         qb.channels = eff_ch;
         qb.total_frames = total_frames;
         qb.play_cursor = 0.0;
-        qb.loop_begin = std::min(pBuffer->LoopBegin, total_frames);
+        qb.loop_begin = adj_loop_begin;
         qb.loop_length = (pBuffer->LoopLength > 0 && qb.loop_begin + pBuffer->LoopLength <= total_frames)
                              ? pBuffer->LoopLength
                              : (total_frames - qb.loop_begin);
@@ -756,7 +1120,7 @@ public:
         std::lock_guard<std::mutex> lk(mutex_);
         pVoiceState->BuffersQueued = static_cast<uint32_t>(buffers_.size());
         pVoiceState->pCurrentBufferContext = buffers_.empty() ? nullptr : buffers_.front().context;
-        pVoiceState->SamplesPlayed = samples_played_;
+        pVoiceState->SamplesPlayed = samples_played_.load(std::memory_order_acquire);
     }
 
     int32_t OPENSCARLETT_XAUDIO2_CALL SetFrequencyRatio(
@@ -785,7 +1149,7 @@ public:
     bool IsXma2() const { return effective_format_tag_ == OS_WAVE_FORMAT_XMA2; }
 
     void MixInto(
-        float* out_interleaved,
+        float* master_interleaved,
         uint32_t out_frames,
         uint32_t out_channels,
         uint32_t out_sample_rate,
@@ -798,14 +1162,22 @@ public:
             return;
         }
         out_cbs.cb = callback_;
+        out_cbs.pass_started = true;
+        out_cbs.bytes_required = 0u;
 
         const float voice_vol = volume_.load(std::memory_order_relaxed);
-        const float submix_vol = target_submix_ ? target_submix_->Volume() : 1.0f;
-        const float combined_vol = voice_vol * submix_vol;
         const double src_rate = static_cast<double>(sample_rate_.load(std::memory_order_relaxed));
         const double ratio = static_cast<double>(freq_ratio_.load(std::memory_order_relaxed));
         const double step = (src_rate / static_cast<double>(std::max(1u, out_sample_rate))) * ratio;
 
+        const size_t total_samples = static_cast<size_t>(out_frames) * out_channels;
+        if (voice_scratch_.size() != total_samples) {
+            voice_scratch_.assign(total_samples, 0.0f);
+        } else {
+            std::fill_n(voice_scratch_.data(), total_samples, 0.0f);
+        }
+
+        uint32_t mixed_frames = 0u;
         for (uint32_t f = 0; f < out_frames; ++f) {
             while (!buffers_.empty()) {
                 auto& buf = buffers_.front();
@@ -820,6 +1192,7 @@ public:
                             --buf.loops_remaining;
                         }
                         buf.play_cursor = static_cast<double>(buf.loop_begin);
+                        out_cbs.loop_ended.push_back(buf.context);
                         break;
                     }
                     const bool eos = buf.end_of_stream;
@@ -848,19 +1221,54 @@ public:
                 const float s1 = buf.samples[static_cast<size_t>(i1) * src_ch + sc];
                 const float sample = s0 + (s1 - s0) * frac;
                 const float ch_gain = (sc < channel_volumes_.size()) ? channel_volumes_[sc] : 1.0f;
-                out_interleaved[static_cast<size_t>(f) * out_channels + oc] +=
-                    sample * combined_vol * ch_gain;
+                voice_scratch_[static_cast<size_t>(f) * out_channels + oc] =
+                    sample * voice_vol * ch_gain;
             }
 
             buf.play_cursor += step;
-            ++samples_played_;
+            ++mixed_frames;
+            samples_played_.fetch_add(1ull, std::memory_order_release);
 
-            if (buf.loops_remaining > 0 && buf.loop_length > 0 &&
+            // Handle loop point wrap OR exact end-of-buffer completion on this frame
+            if (buf.loops_remaining > 0u && buf.loop_length > 0u &&
                 buf.play_cursor >= static_cast<double>(buf.loop_begin + buf.loop_length)) {
+                const double overshoot =
+                    buf.play_cursor - static_cast<double>(buf.loop_begin + buf.loop_length);
                 if (buf.loops_remaining != OS_XAUDIO2_LOOP_INFINITE) {
                     --buf.loops_remaining;
                 }
-                buf.play_cursor = static_cast<double>(buf.loop_begin);
+                buf.play_cursor = static_cast<double>(buf.loop_begin) +
+                                  std::fmod(overshoot, static_cast<double>(buf.loop_length));
+                out_cbs.loop_ended.push_back(buf.context);
+            } else if (buf.play_cursor >= static_cast<double>(buf.total_frames)) {
+                const bool eos = buf.end_of_stream;
+                out_cbs.ended.push_back(buf.context);
+                buffers_.pop_front();
+                if (eos) {
+                    out_cbs.stream_ended = true;
+                }
+            }
+        }
+
+        if (mixed_frames > 0u) {
+            for (const auto& slot : effect_chain_) {
+                if (slot.enabled && slot.effect) {
+                    ProcessEffectApo(
+                        slot.effect, voice_scratch_.data(), out_frames, out_channels, out_sample_rate);
+                }
+            }
+            if (send_to_master_) {
+                for (size_t i = 0u; i < total_samples; ++i) {
+                    master_interleaved[i] += voice_scratch_[i];
+                }
+            }
+            for (auto* sub : send_submixes_) {
+                if (sub && sub->BusData()) {
+                    float* dst = sub->BusData();
+                    for (size_t i = 0u; i < total_samples; ++i) {
+                        dst[i] += voice_scratch_[i];
+                    }
+                }
             }
         }
     }
@@ -887,10 +1295,13 @@ private:
     std::atomic<bool> opus_mft_active_{false};
 
     std::mutex mutex_;
-    SubmixVoiceImpl* target_submix_ = nullptr;
+    std::vector<SubmixVoiceImpl*> send_submixes_;
+    bool send_to_master_ = true;
     std::vector<float> channel_volumes_;
+    std::vector<VoiceEffectSlot> effect_chain_;
+    std::vector<float> voice_scratch_;
     std::deque<QueuedAudioBuffer> buffers_;
-    uint64_t samples_played_ = 0;
+    std::atomic<uint64_t> samples_played_{0ull};
 };
 
 // ===========================================================================
@@ -964,7 +1375,7 @@ public:
         float MaxFrequencyRatio,
         IXAudio2VoiceCallback* pCallback,
         const OS_XAUDIO2_VOICE_SENDS* pSendList,
-        const void* /*pEffectChain*/) override {
+        const void* pEffectChain) override {
         if (!ppSourceVoice || !pSourceFormat) {
             return RecordHr("IXAudio2::CreateSourceVoice", OS_XAUDIO2_E_INVALIDARG, 5);
         }
@@ -1007,6 +1418,12 @@ public:
         if (pSendList) {
             voice->SetOutputVoices(pSendList);
         }
+        if (pEffectChain) {
+            const int32_t ehr = voice->SetEffectChain(pEffectChain);
+            if (ehr < 0) {
+                return RecordHr("IXAudio2::CreateSourceVoice", ehr, 5);
+            }
+        }
 
         SourceVoiceImpl* raw = voice.get();
         {
@@ -1022,13 +1439,23 @@ public:
         uint32_t InputChannels,
         uint32_t InputSampleRate,
         uint32_t Flags,
-        uint32_t /*ProcessingStage*/,
-        const OS_XAUDIO2_VOICE_SENDS* /*pSendList*/,
-        const void* /*pEffectChain*/) override {
+        uint32_t ProcessingStage,
+        const OS_XAUDIO2_VOICE_SENDS* pSendList,
+        const void* pEffectChain) override {
         if (!ppSubmixVoice || InputChannels == 0 || InputSampleRate == 0) {
             return RecordHr("IXAudio2::CreateSubmixVoice", OS_XAUDIO2_E_INVALIDARG, 6);
         }
-        auto sub = std::make_unique<SubmixVoiceImpl>(this, InputChannels, InputSampleRate, Flags);
+        auto sub = std::make_unique<SubmixVoiceImpl>(
+            this, InputChannels, InputSampleRate, Flags, ProcessingStage);
+        if (pSendList) {
+            sub->SetOutputVoices(pSendList);
+        }
+        if (pEffectChain) {
+            const int32_t ehr = sub->SetEffectChain(pEffectChain);
+            if (ehr < 0) {
+                return RecordHr("IXAudio2::CreateSubmixVoice", ehr, 6);
+            }
+        }
         SubmixVoiceImpl* raw = sub.get();
         {
             std::lock_guard<std::mutex> lk(mutex_);
@@ -1044,7 +1471,7 @@ public:
         uint32_t InputSampleRate,
         uint32_t Flags,
         const wchar_t* szDeviceId,
-        const void* /*pEffectChain*/,
+        const void* pEffectChain,
         uint32_t /*StreamCategory*/) override {
         if (!ppMasteringVoice) {
             return RecordHr("IXAudio2::CreateMasteringVoice", OS_XAUDIO2_E_INVALIDARG, 7);
@@ -1062,11 +1489,18 @@ public:
 #endif
         {
             std::lock_guard<std::mutex> lk(mutex_);
-            mastering_voice_ = std::make_unique<MasteringVoiceImpl>(
+            auto mv = std::make_unique<MasteringVoiceImpl>(
                 this,
                 InputChannels != 0 ? InputChannels : 2u,
                 InputSampleRate != 0 ? InputSampleRate : 48000u,
                 Flags);
+            if (pEffectChain) {
+                const int32_t ehr = mv->SetEffectChain(pEffectChain);
+                if (ehr < 0) {
+                    return RecordHr("IXAudio2::CreateMasteringVoice", ehr, 7);
+                }
+            }
+            mastering_voice_ = std::move(mv);
             *ppMasteringVoice = mastering_voice_.get();
         }
         StartWasapiThreadIfAllowed();
@@ -1126,6 +1560,14 @@ public:
 
     void RemoveSubmixVoice(SubmixVoiceImpl* v) {
         std::lock_guard<std::mutex> lk(mutex_);
+        for (auto& sv : source_voices_) {
+            sv->ClearSubmixReference(v);
+        }
+        for (auto& sub : submix_voices_) {
+            if (sub.get() != v) {
+                sub->ClearSubmixReference(v);
+            }
+        }
         submix_voices_.erase(
             std::remove_if(submix_voices_.begin(), submix_voices_.end(),
                            [&](const std::unique_ptr<SubmixVoiceImpl>& p) { return p.get() == v; }),
@@ -1138,6 +1580,10 @@ public:
         if (mastering_voice_.get() == v) {
             mastering_voice_.reset();
         }
+    }
+
+    uint64_t TotalFramesMixed() const {
+        return total_frames_mixed_.load(std::memory_order_acquire);
     }
 
     int32_t RenderMixFrames(
@@ -1171,13 +1617,39 @@ public:
             std::fill_n(out_frames, static_cast<size_t>(frame_count) * out_ch, 0.0f);
 
             if (engine_running_.load(std::memory_order_acquire)) {
+                for (auto& sub : submix_voices_) {
+                    sub->PrepareBus(frame_count, out_ch);
+                }
+
                 voice_cbs.reserve(source_voices_.size());
                 for (auto& v : source_voices_) {
                     DeferredVoiceCallbacks dcb{};
                     v->MixInto(out_frames, frame_count, out_ch, out_sr, dcb);
-                    if (dcb.cb && (!dcb.started.empty() || !dcb.ended.empty() || dcb.stream_ended)) {
+                    if (dcb.cb && (dcb.pass_started || !dcb.started.empty() ||
+                                   !dcb.loop_ended.empty() || !dcb.ended.empty() ||
+                                   dcb.stream_ended)) {
                         voice_cbs.push_back(std::move(dcb));
                     }
+                }
+
+                if (!submix_voices_.empty()) {
+                    std::vector<SubmixVoiceImpl*> ordered;
+                    ordered.reserve(submix_voices_.size());
+                    for (auto& sub : submix_voices_) {
+                        ordered.push_back(sub.get());
+                    }
+                    std::stable_sort(
+                        ordered.begin(), ordered.end(),
+                        [](const SubmixVoiceImpl* a, const SubmixVoiceImpl* b) {
+                            return a->ProcessingStage() < b->ProcessingStage();
+                        });
+                    for (auto* sub : ordered) {
+                        sub->ProcessAndAccumulateTo(out_frames, frame_count, out_ch, out_sr);
+                    }
+                }
+
+                if (mastering_voice_) {
+                    mastering_voice_->ProcessMasterEffects(out_frames, frame_count, out_ch, out_sr);
                 }
             }
         }
@@ -1191,14 +1663,23 @@ public:
             }
         }
 
-        // Deliver callbacks outside internal locks.
+        total_frames_mixed_.fetch_add(frame_count, std::memory_order_release);
+
+        // Deliver callbacks strictly outside internal locks.
         for (auto* ecb : eng_cbs) {
             if (ecb) ecb->OnProcessingPassStart();
         }
         for (const auto& dcb : voice_cbs) {
+            if (dcb.pass_started) {
+                dcb.cb->OnVoiceProcessingPassStart(dcb.bytes_required);
+            }
             for (void* ctx : dcb.started) dcb.cb->OnBufferStart(ctx);
+            for (void* ctx : dcb.loop_ended) dcb.cb->OnLoopEnd(ctx);
             for (void* ctx : dcb.ended) dcb.cb->OnBufferEnd(ctx);
             if (dcb.stream_ended) dcb.cb->OnStreamEnd();
+            if (dcb.pass_started) {
+                dcb.cb->OnVoiceProcessingPassEnd();
+            }
         }
         for (auto* ecb : eng_cbs) {
             if (ecb) ecb->OnProcessingPassEnd();
@@ -1319,8 +1800,8 @@ private:
         };
 
         HRESULT hr = CoCreateInstance(
-            __uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-            __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&enumerator));
+            kClsidMmDeviceEnumerator, nullptr, CLSCTX_ALL,
+            kIidImmDeviceEnumerator, reinterpret_cast<void**>(&enumerator));
         wasapi_last_hr_.store(static_cast<int32_t>(hr), std::memory_order_release);
         if (FAILED(hr) || !enumerator) {
             cleanup();
@@ -1349,7 +1830,7 @@ private:
             return;
         }
 
-        hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+        hr = device->Activate(kIidIAudioClient, CLSCTX_ALL, nullptr,
                               reinterpret_cast<void**>(&client));
         wasapi_last_hr_.store(static_cast<int32_t>(hr), std::memory_order_release);
         if (FAILED(hr) || !client || wasapi_stop_.load(std::memory_order_acquire)) {
@@ -1391,7 +1872,7 @@ private:
                 client = nullptr;
                 CloseHandle(ready_event);
                 ready_event = nullptr;
-                hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+                hr = device->Activate(kIidIAudioClient, CLSCTX_ALL, nullptr,
                                       reinterpret_cast<void**>(&client));
                 if (FAILED(hr) || !client) {
                     wasapi_last_hr_.store(static_cast<int32_t>(hr), std::memory_order_release);
@@ -1420,7 +1901,7 @@ private:
             return;
         }
 
-        hr = client->GetService(__uuidof(IAudioRenderClient),
+        hr = client->GetService(kIidIAudioRenderClient,
                                 reinterpret_cast<void**>(&render_client));
         wasapi_last_hr_.store(static_cast<int32_t>(hr), std::memory_order_release);
         if (FAILED(hr) || !render_client) {
@@ -1525,6 +2006,7 @@ private:
 
     std::atomic<uint32_t> ref_count_{1};
     std::atomic<bool> engine_running_{true};
+    std::atomic<uint64_t> total_frames_mixed_{0ull};
     std::mutex mutex_;
     std::unique_ptr<MasteringVoiceImpl> mastering_voice_;
     std::vector<std::unique_ptr<SubmixVoiceImpl>> submix_voices_;
@@ -1793,11 +2275,71 @@ public:
         std::memcpy(pParameters, &params_, copy_bytes);
     }
 
+    void ProcessAudio(
+        float* interleaved,
+        uint32_t frames,
+        uint32_t channels,
+        uint32_t sample_rate) {
+        if (!interleaved || frames == 0u || channels == 0u) return;
+        OS_XAUDIO2FX_REVERB_PARAMETERS p{};
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            p = params_;
+            const uint32_t sr = std::max<uint32_t>(8000u, sample_rate);
+            const size_t base_delay = std::clamp<size_t>(
+                static_cast<size_t>((sr * std::max<uint32_t>(5u, p.ReflectionsDelay + p.ReverbDelay)) / 1000u),
+                64u, 4800u);
+            if (comb_len_[0] != base_delay) {
+                comb_len_[0] = base_delay;
+                comb_len_[1] = (base_delay * 117u) / 100u + 13u;
+                comb_len_[2] = (base_delay * 139u) / 100u + 29u;
+                comb_len_[3] = (base_delay * 161u) / 100u + 41u;
+                for (int k = 0; k < 4; ++k) {
+                    comb_buf_[k].assign(comb_len_[k], 0.0f);
+                    comb_pos_[k] = 0u;
+                }
+            }
+            const float wet = std::clamp(p.WetDryMix / 100.0f, 0.0f, 1.0f);
+            const float dry = 1.0f - wet * 0.5f;
+            const float decay = std::clamp(0.35f + p.DecayTime * 0.25f, 0.2f, 0.85f);
+            const float rev_gain = std::pow(10.0f, std::clamp(p.ReverbGain, -24.0f, 6.0f) / 20.0f);
+            for (uint32_t f = 0u; f < frames; ++f) {
+                float mono_in = 0.0f;
+                for (uint32_t c = 0u; c < channels; ++c) {
+                    mono_in += interleaved[static_cast<size_t>(f) * channels + c];
+                }
+                mono_in /= static_cast<float>(channels);
+
+                float wet_l = 0.0f;
+                float wet_r = 0.0f;
+                for (int k = 0; k < 4; ++k) {
+                    const size_t idx = comb_pos_[k];
+                    const float delayed = comb_buf_[k][idx];
+                    comb_buf_[k][idx] = mono_in + delayed * decay;
+                    comb_pos_[k] = (idx + 1u) % comb_len_[k];
+                    if ((k & 1) == 0) {
+                        wet_l += delayed * 0.5f;
+                    } else {
+                        wet_r += delayed * 0.5f;
+                    }
+                }
+                for (uint32_t c = 0u; c < channels; ++c) {
+                    const float wet_s = ((c & 1u) == 0u ? wet_l : wet_r) * rev_gain;
+                    float& dst = interleaved[static_cast<size_t>(f) * channels + c];
+                    dst = dst * dry + wet_s * wet;
+                }
+            }
+        }
+    }
+
 private:
     std::atomic<uint32_t> ref_count_{1u};
     uint32_t flags_ = 0u;
     std::mutex mutex_;
     OS_XAUDIO2FX_REVERB_PARAMETERS params_{};
+    std::vector<float> comb_buf_[4];
+    size_t comb_len_[4] = {0u, 0u, 0u, 0u};
+    size_t comb_pos_[4] = {0u, 0u, 0u, 0u};
 };
 
 class VolumeMeterApoImpl final : public OS_IXAPOParameters {
@@ -1875,6 +2417,31 @@ public:
         }
     }
 
+    void ProcessAudio(
+        const float* interleaved,
+        uint32_t frames,
+        uint32_t channels) {
+        if (!interleaved || frames == 0u || channels == 0u) return;
+        const uint32_t ch = std::min<uint32_t>(channels, 64u);
+        std::vector<float> peaks(ch, 0.0f);
+        std::vector<double> sum_sq(ch, 0.0);
+        for (uint32_t f = 0u; f < frames; ++f) {
+            for (uint32_t c = 0u; c < ch; ++c) {
+                const float s = interleaved[static_cast<size_t>(f) * channels + c];
+                const float a = std::fabs(s);
+                if (a > peaks[c]) peaks[c] = a;
+                sum_sq[c] += static_cast<double>(s) * static_cast<double>(s);
+            }
+        }
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (peak_levels_.size() < ch) peak_levels_.resize(ch, 0.0f);
+        if (rms_levels_.size() < ch) rms_levels_.resize(ch, 0.0f);
+        for (uint32_t c = 0u; c < ch; ++c) {
+            peak_levels_[c] = peaks[c];
+            rms_levels_[c] = static_cast<float>(std::sqrt(sum_sq[c] / static_cast<double>(frames)));
+        }
+    }
+
 private:
     std::atomic<uint32_t> ref_count_{1u};
     uint32_t flags_ = 0u;
@@ -1882,6 +2449,20 @@ private:
     std::vector<float> peak_levels_;
     std::vector<float> rms_levels_;
 };
+
+void ProcessEffectApo(
+    OS_IXAudio2Unknown* effect,
+    float* interleaved,
+    uint32_t frames,
+    uint32_t channels,
+    uint32_t sample_rate) {
+    if (!effect || !interleaved || frames == 0u || channels == 0u) return;
+    if (auto* rev = dynamic_cast<ReverbApoImpl*>(effect)) {
+        rev->ProcessAudio(interleaved, frames, channels, sample_rate);
+    } else if (auto* vm = dynamic_cast<VolumeMeterApoImpl*>(effect)) {
+        vm->ProcessAudio(interleaved, frames, channels);
+    }
+}
 
 }  // namespace
 
@@ -2317,8 +2898,8 @@ int32_t OPENSCARLETT_XAUDIO2_CALL OpenScarlettXAudio2ProbeWasapiEndpointW(
         WAVEFORMATEX* mix_fmt = nullptr;
 
         HRESULT hr = CoCreateInstance(
-            __uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
-            __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&enumerator));
+            kClsidMmDeviceEnumerator, nullptr, CLSCTX_ALL,
+            kIidImmDeviceEnumerator, reinterpret_cast<void**>(&enumerator));
         if (SUCCEEDED(hr) && enumerator) {
             if (!parsed.is_default) {
                 hr = enumerator->GetDevice(parsed.canonical_id.c_str(), &device);
@@ -2347,7 +2928,7 @@ int32_t OPENSCARLETT_XAUDIO2_CALL OpenScarlettXAudio2ProbeWasapiEndpointW(
                 }
             }
             if (device) {
-                hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+                hr = device->Activate(kIidIAudioClient, CLSCTX_ALL, nullptr,
                                       reinterpret_cast<void**>(&client));
                 if (SUCCEEDED(hr) && client) {
                     hr = client->GetMixFormat(&mix_fmt);
@@ -2369,6 +2950,103 @@ int32_t OPENSCARLETT_XAUDIO2_CALL OpenScarlettXAudio2ProbeWasapiEndpointW(
 #endif
 
     return RecordHr("OpenScarlettXAudio2ProbeWasapiEndpointW", OS_XAUDIO2_S_OK);
+}
+
+// --- Sprint 9/10 Effect Chain Control & Null-Mode Audio Clock Advancement ---
+
+OPENSCARLETT_XAUDIO2_API int32_t OPENSCARLETT_XAUDIO2_CALL
+OpenScarlettXAudio2SetEffectChain(IXAudio2Voice* pVoice, const void* pEffectChain) {
+    if (!pVoice) return RecordHr("OpenScarlettXAudio2SetEffectChain", OS_XAUDIO2_E_INVALIDARG);
+    int32_t hr = OS_XAUDIO2_E_INVALIDARG;
+    if (auto* sub = dynamic_cast<SubmixVoiceImpl*>(pVoice)) {
+        hr = sub->SetEffectChain(pEffectChain);
+    } else if (auto* src = dynamic_cast<SourceVoiceImpl*>(pVoice)) {
+        hr = src->SetEffectChain(pEffectChain);
+    } else if (auto* mv = dynamic_cast<MasteringVoiceImpl*>(pVoice)) {
+        hr = mv->SetEffectChain(pEffectChain);
+    }
+    return RecordHr("OpenScarlettXAudio2SetEffectChain", hr);
+}
+
+OPENSCARLETT_XAUDIO2_API int32_t OPENSCARLETT_XAUDIO2_CALL
+OpenScarlettXAudio2EnableEffect(IXAudio2Voice* pVoice, uint32_t EffectIndex, int32_t Enable) {
+    if (!pVoice) return RecordHr("OpenScarlettXAudio2EnableEffect", OS_XAUDIO2_E_INVALIDARG);
+    int32_t hr = OS_XAUDIO2_E_INVALIDARG;
+    if (auto* sub = dynamic_cast<SubmixVoiceImpl*>(pVoice)) {
+        hr = sub->EnableEffect(EffectIndex, Enable != 0);
+    } else if (auto* src = dynamic_cast<SourceVoiceImpl*>(pVoice)) {
+        hr = src->EnableEffect(EffectIndex, Enable != 0);
+    } else if (auto* mv = dynamic_cast<MasteringVoiceImpl*>(pVoice)) {
+        hr = mv->EnableEffect(EffectIndex, Enable != 0);
+    }
+    return RecordHr("OpenScarlettXAudio2EnableEffect", hr);
+}
+
+OPENSCARLETT_XAUDIO2_API int32_t OPENSCARLETT_XAUDIO2_CALL
+OpenScarlettXAudio2GetEffectState(IXAudio2Voice* pVoice, uint32_t EffectIndex, int32_t* pEnabled) {
+    if (!pVoice || !pEnabled) return RecordHr("OpenScarlettXAudio2GetEffectState", OS_XAUDIO2_E_INVALIDARG);
+    int32_t hr = OS_XAUDIO2_E_INVALIDARG;
+    if (auto* sub = dynamic_cast<SubmixVoiceImpl*>(pVoice)) {
+        hr = sub->GetEffectState(EffectIndex, pEnabled);
+    } else if (auto* src = dynamic_cast<SourceVoiceImpl*>(pVoice)) {
+        hr = src->GetEffectState(EffectIndex, pEnabled);
+    } else if (auto* mv = dynamic_cast<MasteringVoiceImpl*>(pVoice)) {
+        hr = mv->GetEffectState(EffectIndex, pEnabled);
+    }
+    return RecordHr("OpenScarlettXAudio2GetEffectState", hr);
+}
+
+OPENSCARLETT_XAUDIO2_API int32_t OPENSCARLETT_XAUDIO2_CALL
+OpenScarlettXAudio2SetEffectParameters(
+    IXAudio2Voice* pVoice,
+    uint32_t EffectIndex,
+    const void* pParameters,
+    uint32_t ParametersByteSize) {
+    if (!pVoice) return RecordHr("OpenScarlettXAudio2SetEffectParameters", OS_XAUDIO2_E_INVALIDARG);
+    int32_t hr = OS_XAUDIO2_E_INVALIDARG;
+    if (auto* sub = dynamic_cast<SubmixVoiceImpl*>(pVoice)) {
+        hr = sub->SetEffectParameters(EffectIndex, pParameters, ParametersByteSize);
+    } else if (auto* src = dynamic_cast<SourceVoiceImpl*>(pVoice)) {
+        hr = src->SetEffectParameters(EffectIndex, pParameters, ParametersByteSize);
+    } else if (auto* mv = dynamic_cast<MasteringVoiceImpl*>(pVoice)) {
+        hr = mv->SetEffectParameters(EffectIndex, pParameters, ParametersByteSize);
+    }
+    return RecordHr("OpenScarlettXAudio2SetEffectParameters", hr);
+}
+
+OPENSCARLETT_XAUDIO2_API int32_t OPENSCARLETT_XAUDIO2_CALL
+OpenScarlettXAudio2GetEffectParameters(
+    IXAudio2Voice* pVoice,
+    uint32_t EffectIndex,
+    void* pParameters,
+    uint32_t ParametersByteSize) {
+    if (!pVoice) return RecordHr("OpenScarlettXAudio2GetEffectParameters", OS_XAUDIO2_E_INVALIDARG);
+    int32_t hr = OS_XAUDIO2_E_INVALIDARG;
+    if (auto* sub = dynamic_cast<SubmixVoiceImpl*>(pVoice)) {
+        hr = sub->GetEffectParameters(EffectIndex, pParameters, ParametersByteSize);
+    } else if (auto* src = dynamic_cast<SourceVoiceImpl*>(pVoice)) {
+        hr = src->GetEffectParameters(EffectIndex, pParameters, ParametersByteSize);
+    } else if (auto* mv = dynamic_cast<MasteringVoiceImpl*>(pVoice)) {
+        hr = mv->GetEffectParameters(EffectIndex, pParameters, ParametersByteSize);
+    }
+    return RecordHr("OpenScarlettXAudio2GetEffectParameters", hr);
+}
+
+OPENSCARLETT_XAUDIO2_API int32_t OPENSCARLETT_XAUDIO2_CALL
+OpenScarlettXAudio2AdvanceClock(
+    IXAudio2* pXAudio2,
+    uint32_t frame_count,
+    uint64_t* out_total_frames_mixed) {
+    if (!pXAudio2 || frame_count == 0u) {
+        return RecordHr("OpenScarlettXAudio2AdvanceClock", OS_XAUDIO2_E_INVALIDARG);
+    }
+    auto* impl = static_cast<XAudio2Impl*>(pXAudio2);
+    std::vector<float> discard(static_cast<size_t>(frame_count) * 8u, 0.0f);
+    const int32_t hr = impl->RenderMixFrames(discard.data(), frame_count);
+    if (out_total_frames_mixed) {
+        *out_total_frames_mixed = impl->TotalFramesMixed();
+    }
+    return RecordHr("OpenScarlettXAudio2AdvanceClock", hr);
 }
 
 }  // extern "C"
