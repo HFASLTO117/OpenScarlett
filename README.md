@@ -7,7 +7,7 @@
   <a href="https://discord.gg/sShMY2fjR"><img height="20" src="https://img.shields.io/badge/discord-join%20community-5865F2" alt="Join Discord" /></a>
   <a href="https://github.com/californiaAlmonds/OpenScarlett/actions/workflows/ci.yml"><img height="20" src="https://img.shields.io/github/actions/workflow/status/californiaAlmonds/OpenScarlett/ci.yml?label=windows%20ci" alt="Windows CI" /></a>
   <a href="https://californiaalmonds.github.io/OpenScarlett/"><img height="20" src="https://img.shields.io/badge/dashboard-interactive-1f6feb" alt="Interactive Dashboard" /></a>
-  <a href="wiki/Home.md"><img height="20" src="https://img.shields.io/badge/wiki-documentation-e11d48" alt="OpenScarlett Wiki" /></a>
+  <a href="https://github.com/californiaAlmonds/OpenScarlett/wiki"><img height="20" src="https://img.shields.io/badge/wiki-documentation-e11d48" alt="OpenScarlett Wiki" /></a>
   <a href="LICENSE"><img height="20" src="https://img.shields.io/badge/license-MIT-30363d" alt="MIT License" /></a>
 </p>
 

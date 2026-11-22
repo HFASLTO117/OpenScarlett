@@ -48,10 +48,21 @@ if ($LASTEXITCODE -ne 0) {
 # Remove stale markdown pages in the wiki clone (keep .git)
 Get-ChildItem -Path $SyncDir -Filter "*.md" -File | Remove-Item -Force
 
-# Copy all canonical wiki/*.md files
+# Copy all canonical wiki/*.md files and rewrite relative *.md links to GitHub Wiki slugs
+# (GitHub Wiki expects [Title](Page-Name) / [Title](Page-Name#anchor), without the .md suffix).
 $pages = Get-ChildItem -Path $WikiSrc -Filter "*.md" -File | Sort-Object Name
 foreach ($p in $pages) {
-    Copy-Item -Path $p.FullName -Destination (Join-Path $SyncDir $p.Name) -Force
+    $content = [System.IO.File]::ReadAllText($p.FullName, [System.Text.Encoding]::UTF8)
+    $rewritten = [regex]::Replace(
+        $content,
+        '\]\((?!https?://)([^)#/]+)\.md(#[^)]*)?\)',
+        ']($1$2)'
+    )
+    [System.IO.File]::WriteAllText(
+        (Join-Path $SyncDir $p.Name),
+        $rewritten,
+        (New-Object System.Text.UTF8Encoding($false))
+    )
 }
 
 Push-Location $SyncDir
