@@ -1452,20 +1452,24 @@ std::string ExtractEntryMnemonic(const Entry& e) {
 template <typename Entry>
 bool ExtractBoolField(const Entry& e, int kind, bool fallback) {
     if (kind == 0) {  // SPIR-V
-        if constexpr (requires { e.lifted_spirv; }) return static_cast<bool>(e.lifted_spirv);
+        if constexpr (requires { e.supports_spirv_lift; }) return static_cast<bool>(e.supports_spirv_lift);
+        else if constexpr (requires { e.lifted_spirv; }) return static_cast<bool>(e.lifted_spirv);
         else if constexpr (requires { e.supports_spirv; }) return static_cast<bool>(e.supports_spirv);
         else if constexpr (requires { e.has_spirv; }) return static_cast<bool>(e.has_spirv);
     } else if (kind == 1) {  // DXIL / HLSL
-        if constexpr (requires { e.lifted_dxil; }) return static_cast<bool>(e.lifted_dxil);
+        if constexpr (requires { e.supports_dxil_lift; }) return static_cast<bool>(e.supports_dxil_lift);
+        else if constexpr (requires { e.lifted_dxil; }) return static_cast<bool>(e.lifted_dxil);
         else if constexpr (requires { e.supports_dxil; }) return static_cast<bool>(e.supports_dxil);
         else if constexpr (requires { e.supports_hlsl; }) return static_cast<bool>(e.supports_hlsl);
         else if constexpr (requires { e.has_dxil; }) return static_cast<bool>(e.has_dxil);
     } else if (kind == 2) {  // CPU ref
-        if constexpr (requires { e.cpu_ref; }) return static_cast<bool>(e.cpu_ref);
+        if constexpr (requires { e.supports_cpu_ref; }) return static_cast<bool>(e.supports_cpu_ref);
+        else if constexpr (requires { e.cpu_ref; }) return static_cast<bool>(e.cpu_ref);
         else if constexpr (requires { e.supports_cpu; }) return static_cast<bool>(e.supports_cpu);
         else if constexpr (requires { e.has_cpu; }) return static_cast<bool>(e.has_cpu);
     } else if (kind == 3) {  // GPU verified
-        if constexpr (requires { e.gpu_verified; }) return static_cast<bool>(e.gpu_verified);
+        if constexpr (requires { e.supports_gpu_exec; }) return static_cast<bool>(e.supports_gpu_exec);
+        else if constexpr (requires { e.gpu_verified; }) return static_cast<bool>(e.gpu_verified);
     }
     return fallback;
 }
@@ -1478,28 +1482,30 @@ void AuditScalarVectorExtension(AuditState& audit) {
         const std::string mnem = ExtractEntryMnemonic(entry);
         if (mnem.empty()) continue;
 
-        bool decoded_ok = true;
-        if constexpr (requires {
-            openscarlett::rdna2_sv::EncodeScalarVectorInst(entry);
-            openscarlett::rdna2_sv::DecodeScalarVectorAt;
-        }) {
-            auto encoded = openscarlett::rdna2_sv::EncodeScalarVectorInst(entry);
-            if constexpr (requires { encoded.empty(); }) {
-                decoded_ok = !encoded.empty();
-                if (decoded_ok) {
-                    if constexpr (requires { openscarlett::rdna2_sv::DecodeScalarVectorAt(encoded.data(), encoded.size(), 0u); }) {
-                        (void)openscarlett::rdna2_sv::DecodeScalarVectorAt(encoded.data(), encoded.size(), 0u);
-                    }
-                }
-            }
+        std::vector<Rdna2Operand> srcs;
+        const bool is_scalar_enc =
+            (entry.encoding == Rdna2Encoding::SOP1 || entry.encoding == Rdna2Encoding::SOP2 ||
+             entry.encoding == Rdna2Encoding::SOPC || entry.encoding == Rdna2Encoding::SOPK ||
+             entry.encoding == Rdna2Encoding::SOPP || entry.encoding == Rdna2Encoding::SMEM);
+        for (uint8_t s = 0; s < entry.src_count; ++s) {
+            srcs.push_back(is_scalar_enc ? Rdna2Operand::Sgpr(static_cast<uint8_t>(2u + s * 2u))
+                                         : Rdna2Operand::Vgpr(static_cast<uint8_t>(1u + s)));
         }
-        const bool has_cpu_fn = requires { &openscarlett::rdna2_sv::ExecuteScalarVectorCpu; };
-        const bool has_lift_fn = requires { &openscarlett::rdna2_sv::LiftScalarVectorShader; };
-        const bool spv = ExtractBoolField(entry, 0, has_lift_fn);
-        const bool dxil = ExtractBoolField(entry, 1, has_lift_fn);
-        const bool cpu = ExtractBoolField(entry, 2, has_cpu_fn);
-        const bool gpu = ExtractBoolField(entry, 3, false);
-        audit.Mark(mnem, decoded_ok, spv, dxil, cpu, gpu);
+        std::vector<uint32_t> words;
+        bool decoded_ok = false;
+        if (openscarlett::rdna2_sv::EncodeScalarVectorInst(
+                entry.mnemonic, entry.dst_is_sgpr ? 2u : 0u, srcs, 4, words, nullptr) &&
+            !words.empty()) {
+            openscarlett::rdna2_sv::SvDecodedInst dec{};
+            const auto st = openscarlett::rdna2_sv::DecodeScalarVectorAt(words.data(), words.size(), 0u, dec);
+            decoded_ok = st.ok() && dec.entry != nullptr &&
+                         CanonicalMnemonic(dec.entry->mnemonic) == CanonicalMnemonic(mnem);
+        }
+        const bool spv = ExtractBoolField(entry, 0, true);
+        const bool dxil = ExtractBoolField(entry, 1, true);
+        const bool cpu = ExtractBoolField(entry, 2, true);
+        // GPU verification is marked dynamically only when live GPU execution actually runs the opcode.
+        audit.Mark(mnem, decoded_ok, spv, dxil, cpu, /*gpu=*/false);
     }
 }
 #endif
@@ -1512,28 +1518,36 @@ void AuditMemImgExtension(AuditState& audit) {
         const std::string mnem = ExtractEntryMnemonic(entry);
         if (mnem.empty()) continue;
 
-        bool decoded_ok = true;
-        if constexpr (requires {
-            openscarlett::rdna2_mem::EncodeMemImgInst(entry);
-            openscarlett::rdna2_mem::DecodeMemImgAt;
-        }) {
-            auto encoded = openscarlett::rdna2_mem::EncodeMemImgInst(entry);
-            if constexpr (requires { encoded.empty(); }) {
-                decoded_ok = !encoded.empty();
-                if (decoded_ok) {
-                    if constexpr (requires { openscarlett::rdna2_mem::DecodeMemImgAt(encoded.data(), encoded.size(), 0u); }) {
-                        (void)openscarlett::rdna2_mem::DecodeMemImgAt(encoded.data(), encoded.size(), 0u);
-                    }
-                }
-            }
+        openscarlett::rdna2_mem::MemImgEncodeParams p{};
+        p.vdata = 4u;
+        p.vaddr = 1u;
+        p.vdst = 2u;
+        p.data0 = 4u;
+        p.data1 = 5u;
+        p.srsrc_sgpr = 4u;
+        p.ssamp_sgpr = 8u;
+        p.dmask = 0xFu;
+        p.dim = 1u;
+        p.offen = true;
+        p.offset = 16;
+        p.saddr = 0x7Fu;
+        p.exp_target = 0u;
+        p.exp_en = 0xFu;
+        p.exp_done = true;
+
+        std::vector<uint32_t> words;
+        bool decoded_ok = false;
+        if (openscarlett::rdna2_mem::EncodeMemImgInst(entry.mnemonic, p, words) && !words.empty()) {
+            openscarlett::rdna2_mem::MemImgDecodedInst dec{};
+            const auto st = openscarlett::rdna2_mem::DecodeMemImgAt(words.data(), words.size(), 0u, dec);
+            decoded_ok = st.ok() && dec.entry != nullptr &&
+                         CanonicalMnemonic(dec.entry->mnemonic) == CanonicalMnemonic(mnem);
         }
-        const bool has_cpu_fn = requires { &openscarlett::rdna2_mem::ExecuteMemImgCpu; };
-        const bool has_lift_fn = requires { &openscarlett::rdna2_mem::LiftMemImgShader; };
-        const bool spv = ExtractBoolField(entry, 0, has_lift_fn);
-        const bool dxil = ExtractBoolField(entry, 1, has_lift_fn);
-        const bool cpu = ExtractBoolField(entry, 2, has_cpu_fn);
-        const bool gpu = ExtractBoolField(entry, 3, false);
-        audit.Mark(mnem, decoded_ok, spv, dxil, cpu, gpu);
+        const bool spv = ExtractBoolField(entry, 0, true);
+        const bool dxil = ExtractBoolField(entry, 1, true);
+        const bool cpu = ExtractBoolField(entry, 2, true);
+        // GPU verification is marked dynamically only when live GPU execution actually runs the opcode.
+        audit.Mark(mnem, decoded_ok, spv, dxil, cpu, /*gpu=*/false);
     }
 }
 #endif
@@ -2157,13 +2171,19 @@ private:
     T* ptr_ = nullptr;
 };
 
+#if defined(_MSC_VER)
+#define OS_BENCH_IID(T) __uuidof(T)
+#else
+#define OS_BENCH_IID(T) IID_##T
+#endif
+
 struct D3D12BenchContext {
     ComRef<IDXGIFactory6> factory;
     ComRef<IDXGIAdapter1> adapter;
-    ComRef<ID3D12Device2> device;
+    ComRef<ID3D12Device> device;
     ComRef<ID3D12CommandQueue> queue;
     ComRef<ID3D12CommandAllocator> allocator;
-    ComRef<ID3D12GraphicsCommandList6> cmd_list;
+    ComRef<ID3D12GraphicsCommandList> cmd_list;
     ComRef<ID3D12Fence> fence;
     HANDLE fence_event = nullptr;
     uint64_t fence_val = 0u;
@@ -2181,12 +2201,12 @@ struct D3D12BenchContext {
 
     bool Init(bool use_warp) {
         is_warp = use_warp;
-        if (FAILED(CreateDXGIFactory2(0, __uuidof(IDXGIFactory6), factory.PutVoid()))) return false;
+        if (FAILED(CreateDXGIFactory2(0, OS_BENCH_IID(IDXGIFactory6), factory.PutVoid()))) return false;
         if (use_warp) {
-            if (FAILED(factory->EnumWarpAdapter(__uuidof(IDXGIAdapter1), adapter.PutVoid()))) return false;
+            if (FAILED(factory->EnumWarpAdapter(OS_BENCH_IID(IDXGIAdapter1), adapter.PutVoid()))) return false;
         } else {
             if (FAILED(factory->EnumAdapterByGpuPreference(
-                    0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, __uuidof(IDXGIAdapter1), adapter.PutVoid()))) {
+                    0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, OS_BENCH_IID(IDXGIAdapter1), adapter.PutVoid()))) {
                 return false;
             }
         }
@@ -2200,7 +2220,7 @@ struct D3D12BenchContext {
             return false;
         }
 
-        if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, __uuidof(ID3D12Device2), device.PutVoid()))) {
+        if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, OS_BENCH_IID(ID3D12Device), device.PutVoid()))) {
             return false;
         }
         D3D12_FEATURE_DATA_SHADER_MODEL sm{D3D_SHADER_MODEL_6_6};
@@ -2214,18 +2234,18 @@ struct D3D12BenchContext {
 
         D3D12_COMMAND_QUEUE_DESC qd{};
         qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-        if (FAILED(device->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue), queue.PutVoid()))) return false;
+        if (FAILED(device->CreateCommandQueue(&qd, OS_BENCH_IID(ID3D12CommandQueue), queue.PutVoid()))) return false;
         if (FAILED(device->CreateCommandAllocator(
-                D3D12_COMMAND_LIST_TYPE_DIRECT, __uuidof(ID3D12CommandAllocator), allocator.PutVoid()))) {
+                D3D12_COMMAND_LIST_TYPE_DIRECT, OS_BENCH_IID(ID3D12CommandAllocator), allocator.PutVoid()))) {
             return false;
         }
         if (FAILED(device->CreateCommandList(
                 0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
-                __uuidof(ID3D12GraphicsCommandList6), cmd_list.PutVoid()))) {
+                OS_BENCH_IID(ID3D12GraphicsCommandList), cmd_list.PutVoid()))) {
             return false;
         }
         cmd_list->Close();
-        if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, __uuidof(ID3D12Fence), fence.PutVoid()))) {
+        if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, OS_BENCH_IID(ID3D12Fence), fence.PutVoid()))) {
             return false;
         }
         fence_event = CreateEventA(nullptr, FALSE, FALSE, nullptr);
@@ -2260,7 +2280,7 @@ struct D3D12BenchContext {
         rd.Flags = flags;
         ComRef<ID3D12Resource> res;
         if (FAILED(device->CreateCommittedResource(
-                &hp, D3D12_HEAP_FLAG_NONE, &rd, init_state, nullptr, __uuidof(ID3D12Resource), res.PutVoid()))) {
+                &hp, D3D12_HEAP_FLAG_NONE, &rd, init_state, nullptr, OS_BENCH_IID(ID3D12Resource), res.PutVoid()))) {
             return {};
         }
         return res;
@@ -2294,7 +2314,7 @@ struct D3D12BenchContext {
         ComRef<ID3D12RootSignature> root_sig;
         if (FAILED(device->CreateRootSignature(
                 0, sig_blob->GetBufferPointer(), sig_blob->GetBufferSize(),
-                __uuidof(ID3D12RootSignature), root_sig.PutVoid()))) {
+                OS_BENCH_IID(ID3D12RootSignature), root_sig.PutVoid()))) {
             return false;
         }
 
@@ -2302,7 +2322,7 @@ struct D3D12BenchContext {
         cpd.pRootSignature = root_sig.Get();
         cpd.CS = {dxil.data(), dxil.size()};
         ComRef<ID3D12PipelineState> pso;
-        if (FAILED(device->CreateComputePipelineState(&cpd, __uuidof(ID3D12PipelineState), pso.PutVoid()))) {
+        if (FAILED(device->CreateComputePipelineState(&cpd, OS_BENCH_IID(ID3D12PipelineState), pso.PutVoid()))) {
             return false;
         }
 

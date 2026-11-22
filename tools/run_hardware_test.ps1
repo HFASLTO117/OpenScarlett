@@ -1,4 +1,4 @@
-﻿# OpenScarlett — 1-Click Portable Hardware & Self-Test Runner
+# OpenScarlett — 1-Click Portable Hardware & Self-Test Runner
 # Runs host GPU/OS probes + all OpenScarlett live tests, shows clear live results,
 # saves a privacy-sanitized Markdown report, and optionally opens a pre-filled GitHub Issue.
 
@@ -117,7 +117,10 @@ $TestDescriptions = @{
     'test_rdna2_lockstep_isa.exe'      = 'Single-wave lockstep LDS barriers, 5 RDNA2 no-ops & CPU-vs-GPU differential ISA checks'
     'test_s7_pe_gdk_runtime.exe'       = 'PE/KnownDLL/.xdata hardening, XMemVirtualQuery, Minecraft-GDK surface, 6 stubs, RawInput & DCC fuzz'
     'test_gdk_3d_scene_dual_api.exe'   = '3D shadowed/skinned/BC1+BC3 GDK scene launched via openscarlett run on D3D12 & Vulkan 1.4'
-    'test_launcher_updater.exe'        = 'Native Win32/D2D OpenScarlettLauncher GUI smoke, privacy sanitizer & BCrypt SHA-256 updater'
+    'test_launcher_updater.exe'        = 'Native Win32/D2D OpenScarlettLauncher GUI smoke, icon, privacy sanitizer & BCrypt SHA-256 updater'
+    'test_rdna2_isa_scalar_vector.exe' = 'GFX10.3 scalar & vector ISA (SOP/SMEM/VOP1-3P/SDWA/DPP16/DPP8) CPU-vs-live-GPU parity'
+    'test_rdna2_isa_mem_img.exe'       = 'GFX10.3 MUBUF/MTBUF/MIMG/DS/FLAT/GLOBAL/SCRATCH/EXP ISA CPU-vs-live-GPU parity'
+    'test_rdna2_corpus_bench.exe'      = 'GFX10.3 779-opcode ISA coverage auditor & 5-stage AAA shader corpus benchmark'
 }
 
 Write-Host ''

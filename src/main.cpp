@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "openscarlett/gpu/vulkan_backend.h"
+#include "rdna2_coverage_tool.h"
 #include "openscarlett/loader/apc_injector.h"
 #include "openscarlett/loader/game_config.h"
 #include "openscarlett/loader/pe_inspector.h"
@@ -543,6 +544,11 @@ void PrintUsage() {
         "Usage:\n"
         "  openscarlett probe-gpu               Probe host D3D12, Vulkan, and DXC capabilities\n"
         "  openscarlett inspect <exe_or_dll>    Inspect PE32+ x64 imports, exports, TLS & .pdata\n"
+        "  openscarlett rdna2-bench [options]   Audit 779 GFX10.3 opcodes & validate 3,000+ shader corpus\n"
+        "      --full | --fast                  Run full 3,120-shader corpus or fast 240-shader sweep\n"
+        "      --json <path>                    Write deterministic JSON coverage report\n"
+        "      --corpus-count <N>               Override number of generated corpus shaders\n"
+        "      --no-gpu | --no-external         Skip live GPU execution or external spirv-val/dxc\n"
         "  openscarlett run <package_dir_or_config_or_exe> [options] [-- <guest-args...>]\n"
         "      --shim-dir <dir>                 Directory containing OpenScarlett shim DLLs\n"
         "      --vfs-g <dir>                    Backing directory for virtual G:\\ / GAME:\\ (read-only)\n"
@@ -564,6 +570,7 @@ int main(int argc, char** argv) {
     std::string cmd = argv[1];
     if (cmd == "probe-gpu") return RunProbeGpu();
     if (cmd == "inspect" && argc >= 3) return RunInspect(argv[2]);
+    if (cmd == "rdna2-bench") return openscarlett::RunRdna2BenchCli(argc, argv);
     if (cmd == "run") return RunGuestExecutable(argc, argv);
     PrintUsage();
     return 1;
