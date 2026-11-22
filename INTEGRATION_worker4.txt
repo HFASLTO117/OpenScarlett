@@ -1,0 +1,142 @@
+OpenScarlett Sprint 7 (v0.4.0-alpha) — Worker 4 Integration Notes
+Branch: swarm/s7-3d-gdk-title
+Worktree: E:\OpenScarlett\.worktrees\s7-3d-gdk-title
+
+=============================================================================
+1. NEW FILES OWNED BY WORKER 4
+=============================================================================
+- tests/gdk_3d_scene/MicrosoftGame.Config
+    Valid Xbox GDK package XML (TitleId=5CA03D01, PackageId=OpenScarlett.Scarlett3DScene,
+    Executable=gdk_3d_scene.exe, TargetDeviceFamily=Scarlett).
+- tests/gdk_3d_scene/scene_math.h
+    100% clean-room MIT C++20 row-major 3D math (Vec2/Vec3/Mat4, LookAtRH,
+    PerspectiveFovRH, OrthoOffCenterRH, hierarchical transforms).
+- tests/gdk_3d_scene/bc_textures.h
+    100% clean-room MIT procedural 4x4 block-compressed texture encoder:
+      * BC1 (DXT1, DXGI_FORMAT_BC1_UNORM) 256x256 stone-tile floor (32,768 B)
+      * BC3 (DXT5, DXGI_FORMAT_BC3_UNORM) 256x256 metallic/emissive tech panels (65,536 B)
+- tests/gdk_3d_scene/scene_meshes.h
+    Unified 80-byte SceneVertex mesh builder (Position, Normal, UV, Color,
+    BlendIndices, BlendWeights) generating:
+      * 8x8 subdivided stone plaza floor plane
+      * Stepped rotating central monument/pedestal
+      * 3-bone linear-blend-skinned solid articulated banner/armature
+      * Orbiting satellite UV-sphere + 3-level hierarchical child sub-moon
+      * Orbiting spinning satellite cube
+      * Two architectural corner pillars
+- tests/gdk_3d_scene/gdk_3d_scene.cpp
+    Pure standalone Xbox-ABI 3D multi-mesh GDK title (gdk_3d_scene.exe):
+      * Two-pass rendering: 1024x1024 D32_FLOAT directional light shadow map (Pass 1)
+        + main camera PBR/Blinn-Phong lit pass with 3x3 PCF shadow sampling,
+        D32_FLOAT depth buffer, BC1/BC3 texture sampling, rim/fill lighting,
+        hemisphere/height AO, BC3 alpha-driven emissive, and 3-bone GPU vertex skinning (Pass 2).
+      * Embedded HLSL SM 5.0 shaders compiled at runtime via D3DCompile (zero external files).
+      * Interactive orbital camera (WASD / Arrow keys / Q-E zoom / GameInput Xbox gamepad)
+        in default/--windowed mode (1280x720) + deterministic --headless --frames N --stats-out
+        [--ppm-out] [--width W --height H] [--warp] modes.
+      * Honors OPENSCARLETT_PREFER_WARP=1 via D3D12XboxCreateDevice (PreferWarp) and
+        OPENSCARLETT_AUDIO_NULL=1 cleanly via XAudio2_9.dll harmonic triad synth cues.
+      * Writes & verifies S:\scene_checkpoint.txt via Win32 CreateFileW (VFS-routed).
+      * Presents every frame via ID3D12CommandQueueX::PresentX.
+- tests/test_gdk_3d_scene_dual_api.cpp
+    End-to-end isolated zero-DLL dual-API launch test harness:
+      * Verifies PE imports via InspectPeFile (pure Xbox ABI; no openscarlett_hook.dll).
+      * Stages ONLY gdk_3d_scene.exe + MicrosoftGame.Config into an isolated zero-DLL
+        directory under E:\OpenScarlett\.tmp\...
+      * Launches via `openscarlett.exe run` on BOTH `--backend=d3d12` AND `--backend=vulkan`.
+      * Validates zero-DLL package immutability, exit code 0, 12/12 animated frames with
+        distinct non-zero PresentX hashes, visual sanity (non-black, lit + shadow pixel
+        variance, BC1/BC3 textured pixels, luminance stddev), S:\scene_checkpoint.txt
+        materialization, and unified CallTelemetry JSON (not_impl == 0 across all 6 modules).
+
+=============================================================================
+2. RECOMMENDED CMAKE INTEGRATION SNIPPET (e.g., cmake/s7_3d_gdk_title.cmake)
+=============================================================================
+if(WIN32)
+    # Target 1: gdk_3d_scene (Pure standalone Xbox-ABI guest executable — NEVER links openscarlett_core!)
+    add_executable(gdk_3d_scene
+        tests/gdk_3d_scene/gdk_3d_scene.cpp
+    )
+    target_include_directories(gdk_3d_scene PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/gdk_3d_scene
+    )
+    target_compile_definitions(gdk_3d_scene PRIVATE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+        _CRT_SECURE_NO_WARNINGS
+    )
+    target_link_libraries(gdk_3d_scene PRIVATE
+        d3d12_xs
+        xgameruntime
+        GameInput
+        XAudio2_9
+        kernelx
+        d3d12
+        dxgi
+        d3dcompiler
+        user32
+        kernel32
+        ole32
+        uuid
+    )
+    if(MSVC)
+        target_compile_options(gdk_3d_scene PRIVATE /W4)
+    else()
+        target_compile_options(gdk_3d_scene PRIVATE -Wall -Wextra)
+    endif()
+
+    # Copy MicrosoftGame.Config alongside build output for direct portable/launcher packaging
+    configure_file(
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/gdk_3d_scene/MicrosoftGame.Config
+        ${CMAKE_BINARY_DIR}/gdk_3d_scene_MicrosoftGame.Config
+        COPYONLY
+    )
+
+    # Target 2: test_gdk_3d_scene_dual_api (CTest dual-API isolated launch harness)
+    openscarlett_add_test(test_gdk_3d_scene_dual_api tests/test_gdk_3d_scene_dual_api.cpp)
+    add_dependencies(test_gdk_3d_scene_dual_api
+        openscarlett
+        openscarlett_hook
+        d3d12_xs
+        xgameruntime
+        GameInput
+        XAudio2_9
+        kernelx
+        gdk_3d_scene
+    )
+    set_tests_properties(test_gdk_3d_scene_dual_api PROPERTIES
+        ENVIRONMENT "OPENSCARLETT_AUDIO_NULL=1"
+    )
+endif()
+
+Note: `.github/workflows/ci.yml` already copies `gdk_*.exe` into the portable release zip,
+so `gdk_3d_scene.exe` is automatically included in portable artifacts.
+
+=============================================================================
+3. VERIFIED BUILD & TEST RESULTS
+=============================================================================
+- Existing worktree CTest suite: 37/37 passed (100%).
+- Compiler checks: MSVC 19.44 Release (/O2 /MD /W4 /WX) & Debug (/Od /MDd /D_DEBUG /W4 /WX):
+  ZERO warnings, ZERO errors on both gdk_3d_scene.cpp and test_gdk_3d_scene_dual_api.cpp.
+- PE Import Verification (`openscarlett.exe inspect build\gdk_3d_scene.exe`):
+    * d3d12_xs.dll     [ConsoleExclusive] 6 imports
+    * xgameruntime.dll [GdkRuntime]       6 imports
+    * GameInput.dll    [GdkRuntime]       2 imports
+    * XAudio2_9.dll    [GdkRuntime]       1 import
+    * kernelx.dll      [ConsoleExclusive] 3 imports
+    * Zero openscarlett_core, zero openscarlett_hook.dll, zero d3d12.dll!
+- Hardware GPU (NVIDIA GeForce GTX 1650 Ti):
+    * --backend=d3d12 : exit=0, 12/12 unique frame hashes, LitPx=145435, ShadowPx=2783,
+      BcTexPx=149192, LumStd=87.21, Audio=2, S:\scene_checkpoint.txt verified,
+      CallTelemetry=82 symbols / 908 calls / not_impl=0 across 6 modules.
+    * --backend=vulkan: exit=0, 12/12 unique frame hashes, LitPx=145435, ShadowPx=2783,
+      BcTexPx=149192, LumStd=87.21, Audio=2, S:\scene_checkpoint.txt verified,
+      CallTelemetry=82 symbols / 908 calls / not_impl=0 across 6 modules.
+- D3D12 WARP (OPENSCARLETT_PREFER_WARP=1, Microsoft Basic Render Driver):
+    * --backend=d3d12 : exit=0, 12/12 unique frame hashes, LitPx=145435, ShadowPx=2801,
+      BcTexPx=149192, LumStd=87.19, Audio=2, S:\scene_checkpoint.txt verified,
+      CallTelemetry=82 symbols / 908 calls / not_impl=0 across 6 modules.
+    * --backend=vulkan: exit=0, 12/12 unique frame hashes, LitPx=145435, ShadowPx=2801,
+      BcTexPx=149192, LumStd=87.19, Audio=2, S:\scene_checkpoint.txt verified,
+      CallTelemetry=82 symbols / 908 calls / not_impl=0 across 6 modules.
