@@ -1,0 +1,72 @@
+OpenScarlett Worker 1 Integration Summary — RDNA2 / GFX10.3 Corpus Parity
+=========================================================================
+Branch: feat/rdna2-corpus-parity
+Worktree: E:\OpenScarlett\.worktrees\wt-rdna2-corpus
+
+Modified Files (all within owned set):
+- include/openscarlett/gpu/rdna2_disasm.h
+- src/gpu/rdna2_disasm.cpp
+- include/openscarlett/gpu/rdna2_ir.h
+- src/gpu/rdna2_ir.cpp
+- include/openscarlett/gpu/rdna2_interpreter.h
+- src/gpu/rdna2_interpreter.cpp
+- include/openscarlett/gpu/rdna2_lifter.h
+- src/gpu/rdna2_lifter.cpp
+- src/gpu/shader_cache.cpp
+
+New Files:
+- tests/test_rdna2_corpus_parity.cpp
+- cmake/worker_rdna2_corpus.cmake
+- INTEGRATION_rdna2_corpus.txt
+
+CMake Integration:
+Add `cmake/worker_rdna2_corpus.cmake` to the `foreach(_os_module_cmake ...)` list
+in `CMakeLists.txt`.
+
+New CTest Target:
+- test_rdna2_corpus_parity
+
+Implemented Capabilities (100% Clean-Room MIT C++20):
+1. Bit-shift UB & ISA accuracy:
+   - Guarded/clamped shift amounts (< 32) in `v_alignbyte_b32` and unaligned
+     `buffer_load_format` sub-dword merge lowering across CPU, HLSL/DXIL, and SPIR-V.
+   - GFX10 `v_cmpx` execution-mask compare lowering (updates EXEC without clobbering
+     VCC, guards predicated VGPR writes and UAV stores) + split-range F16 compares
+     (`0xC8..0xCF` lower + `0xD8..0xDF` upper / `V_CMPX` variants).
+   - MTBUF `d16` format-conversion accuracy (`R8G8B8A8_UNORM/SNORM/UINT/SINT`,
+     `R16G16_FLOAT/UNORM/SNORM/UINT/SINT`, etc.) across CPU, HLSL/DXIL, and SPIR-V.
+   - IEEE/ISA-exact NaN quieting (bit 22 quiet bit) + denormal-preserving `v_floor_f32`
+     / `v_ceil_f32` / `v_min_f32` / `v_max_f32` across IR folding, CPU, HLSL/DXIL, and SPIR-V.
+   - Active-mask Bitmask / Xor / Ballot implication & disjoint pruning pass in
+     `OptimizeRdna2Ir` (`pruned_mask_ops` telemetry).
+
+2. Wave-size & cross-vendor subgroup parity:
+   - `PSV0` chunk parsing (`MinimumExpectedWaveLaneCount`, `MaximumExpectedWaveLaneCount`,
+     `NumThreadsX/Y/Z`) and `SelectGuestWaveSizeFromPsv0` wired into
+     `ParseXboxShaderContainer`, plus guest wave-size keying in `shader_cache.cpp`.
+   - Guest Wave32 lane ops (`WaveBallotLo/Hi`, `WaveReadFirstLane`, `WaveReadLaneAt`,
+     `WavePrefixCountBits`) isolated per 32-lane guest half (`_gw_id`, `_gw_base`,
+     `WaveBallotHi == 0`) for clean execution on 64-lane AMD host waves.
+
+3. Mesh/Pixel stage contract & DXIL container re-signing:
+   - Full `merged_wave_info` modeled in `s3` (`PackMergedWaveInfo`/`UnpackMergedWaveInfo`),
+     ISA-exact 11-bit `GS_ALLOC_REQ` `M0` field widths (`M0[10:0]` verts, `M0[22:12]` prims,
+     preserving legacy `s0`/`s1` fallback when `M0` is unwritten), and Mesh `NumThreads`
+     registration before `v5` workgroup seeding (`group * NumThreads + lane`).
+   - Mesh SPIR-V 1.4 (`SPV_EXT_mesh_shader`) emits `CullPrimitiveEXT` as `Block`-decorated
+     struct with `OpTypeBool` (validated by `spirv-val --target-env vulkan1.3`).
+   - FSSM pixel-input (`V_INTERP_P1/P2/MOV_F32`) & vertex-fetch subroutine table
+     (`S_SWAPPC_B64`/`S_SETPC_B64`) mapping via `StageContractTable`, plus
+     `ReconcileStageInterpolation` matching `nointerpolation`/`noperspective` qualifiers
+     between PS and its feeder stage in both HLSL and SPIR-V.
+   - Clean-room DXBC/DXIL container MD5 hash computation, verification, and re-signing
+     (`ComputeDxbcContainerHash`, `VerifyDxbcContainerHash`, `ResignDxilContainer`),
+     verified bit-for-bit against `dxc.exe` and accepted live by D3D12 PSO creation on
+     both NVIDIA GeForce GTX 1650 Ti and Microsoft WARP.
+
+Verification Summary:
+- MSVC 19.44 Release build at `/W4`: 0 warnings on all modified and new files.
+- CTest: 100% pass across `test_rdna2_corpus_parity`, `test_rdna2_core`,
+  `test_rdna2_lifter_live`, and `test_d3d12_xs_autolift` (and full 30/30 suite).
+- Hardware & software GPU parity: CPU == DXIL (GTX 1650 Ti SM 6.5) == DXIL (WARP SM 6.2)
+  == Vulkan SPIR-V (GTX 1650 Ti Vulkan 1.4.329) + `spirv-val` (`vulkan1.2` / `vulkan1.3`).

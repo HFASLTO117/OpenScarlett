@@ -18,9 +18,43 @@ constexpr uint32_t kXs2HeaderSizeBytes = 40u;
 constexpr uint32_t kXs2HeaderSizeBytesV2 = 44u;
 constexpr uint32_t kXs2SgprFlagWave64 = 0x80000000u;
 
-// Public RDNA2 / GFX10.3 S_SENDMSG message IDs
+// Public RDNA2 / GFX10.3 S_SENDMSG message IDs & ISA-exact GS_ALLOC_REQ field widths
 constexpr uint16_t kRdna2SendMsgGsAllocReq = 9u;
 constexpr uint16_t kRdna2SendMsgDispatchMesh = 10u;
+constexpr uint32_t kGsAllocReqVertMask = 0x7FFu;   // M0[10:0]  (11 bits, 0..2047)
+constexpr uint32_t kGsAllocReqPrimShift = 12u;     // M0[22:12] (11 bits, 0..2047)
+constexpr uint32_t kGsAllocReqPrimMask = 0x7FFu;
+
+inline constexpr uint32_t PackGsAllocReqM0(uint32_t vert_count, uint32_t prim_count) noexcept {
+    return (vert_count & kGsAllocReqVertMask) | ((prim_count & kGsAllocReqPrimMask) << kGsAllocReqPrimShift);
+}
+
+// GFX10.3 / RDNA2 merged_wave_info packed in s3 for merged ES/GS & Mesh stages
+struct Rdna2MergedWaveInfo {
+    uint8_t es_thread_count = 0;    // [7:0]   vertex / ES thread count (0..255)
+    uint8_t gs_thread_count = 0;    // [15:8]  primitive / GS thread count (0..255)
+    uint8_t gs_wave_id = 0;         // [23:16] wave ID in subgroup / workgroup
+    uint8_t wave_in_group_idx = 0;  // [27:24] wave index within workgroup (0..15)
+    uint8_t waves_in_group = 1;     // [31:28] total waves in workgroup (0..15)
+};
+
+inline constexpr uint32_t PackMergedWaveInfo(const Rdna2MergedWaveInfo& info) noexcept {
+    return static_cast<uint32_t>(info.es_thread_count) |
+           (static_cast<uint32_t>(info.gs_thread_count) << 8) |
+           (static_cast<uint32_t>(info.gs_wave_id) << 16) |
+           (static_cast<uint32_t>(info.wave_in_group_idx & 0xFu) << 24) |
+           (static_cast<uint32_t>(info.waves_in_group & 0xFu) << 28);
+}
+
+inline constexpr Rdna2MergedWaveInfo UnpackMergedWaveInfo(uint32_t s3) noexcept {
+    Rdna2MergedWaveInfo info{};
+    info.es_thread_count = static_cast<uint8_t>(s3 & 0xFFu);
+    info.gs_thread_count = static_cast<uint8_t>((s3 >> 8) & 0xFFu);
+    info.gs_wave_id = static_cast<uint8_t>((s3 >> 16) & 0xFFu);
+    info.wave_in_group_idx = static_cast<uint8_t>((s3 >> 24) & 0xFu);
+    info.waves_in_group = static_cast<uint8_t>((s3 >> 28) & 0xFu);
+    return info;
+}
 
 struct Xs2ShaderContainer {
     uint32_t version = kXs2ContainerVersion;
@@ -80,6 +114,17 @@ struct XboxStaticSamplerInfo {
     uint32_t shader_visibility = 0;
 };
 
+struct XboxPsv0Info {
+    bool present = false;
+    uint32_t runtime_info_size = 0;
+    uint32_t min_wave_lane_count = 0;  // 0 = unspecified, 32, 64
+    uint32_t max_wave_lane_count = 0;  // 0 or 0xFFFFFFFF = unspecified/unbounded, 32, 64
+    uint8_t shader_stage = 0;          // DXIL PSV shader stage ID
+    uint32_t num_threads_x = 0;
+    uint32_t num_threads_y = 0;
+    uint32_t num_threads_z = 0;
+};
+
 struct XboxDxbcContainer {
     XboxShaderBlobFormat format = XboxShaderBlobFormat::Unknown;
     bool has_xs2 = false;
@@ -91,6 +136,7 @@ struct XboxDxbcContainer {
     std::vector<XboxSignatureElement> output_signature;  // Parsed from OSG1 / OSGN
     std::vector<XboxStaticSamplerInfo> static_samplers;  // Parsed from RTS0 / STSM
     std::vector<uint8_t> raw_root_signature_chunk;       // Raw RTS0 chunk payload if present
+    XboxPsv0Info psv0{};                                 // Parsed from PSV0 runtime info chunk
 };
 
 struct XboxDxbcBuildDesc {
@@ -102,7 +148,16 @@ struct XboxDxbcBuildDesc {
     bool emit_rts0_for_samplers = false;    // Emit RTS0 root signature chunk vs STSM chunk
     std::vector<uint8_t> aux_dxil_or_shdr;  // Optional "DXIL"/"SHEX"/"SHDR" chunk payload
     std::string aux_shader_fourcc = "DXIL";
+    XboxPsv0Info psv0{};                    // Optional PSV0 chunk (wave lane bounds & NumThreads)
 };
+
+// Selects guest Wave32 vs Wave64 mode from parsed PSV0 wave lane bounds.
+uint32_t SelectGuestWaveSizeFromPsv0(const XboxPsv0Info& psv0, uint32_t default_wave_size = 32u) noexcept;
+
+// Clean-room DXBC / DXIL container MD5 hash computation, verification, and in-place re-signing.
+void ComputeDxbcContainerHash(const uint8_t* dxbc_bytes, size_t size, uint8_t out_hash[16]) noexcept;
+bool VerifyDxbcContainerHash(const uint8_t* dxbc_bytes, size_t size) noexcept;
+Status ResignDxilContainer(std::vector<uint8_t>& dxbc_bytes);
 
 // Fast, zero-allocation check: returns true iff blob is raw "XS2\0" or "DXBC" with "XBOX"/"XS2M" chunk.
 bool IsXboxShaderBytecode(const void* data, size_t size) noexcept;
@@ -118,6 +173,44 @@ std::vector<uint8_t> BuildXboxDxbcContainer(const XboxDxbcBuildDesc& desc);
 // ---------------------------------------------------------------------------
 // AMD RDNA2 / GFX10.3 Binary Instruction Model (Public ISA Reference Guide)
 // ---------------------------------------------------------------------------
+// Public GFX10.3 unified 7-bit MTBUF buffer format IDs (dfmt + nfmt combined)
+enum class Rdna2MtbufFormat : uint8_t {
+    Invalid = 0,
+    R8_UNORM = 1,
+    R8_SNORM = 2,
+    R8_UINT = 3,
+    R8_SINT = 4,
+    R16_UNORM = 5,
+    R16_SNORM = 6,
+    R16_UINT = 7,
+    R16_SINT = 8,
+    R16_FLOAT = 9,
+    R8G8_UNORM = 10,
+    R8G8_SNORM = 11,
+    R8G8_UINT = 12,
+    R8G8_SINT = 13,
+    R32_UINT = 14,
+    R32_SINT = 15,
+    R32_FLOAT = 16,
+    R16G16_UNORM = 17,
+    R16G16_SNORM = 18,
+    R16G16_UINT = 19,
+    R16G16_SINT = 20,
+    R16G16_FLOAT = 21,
+    R8G8B8A8_UNORM = 28,
+    R8G8B8A8_SNORM = 29,
+    R8G8B8A8_UINT = 30,
+    R8G8B8A8_SINT = 31,
+    R32G32_FLOAT = 46,
+    R16G16B16A16_UNORM = 47,
+    R16G16B16A16_SNORM = 48,
+    R16G16B16A16_UINT = 49,
+    R16G16B16A16_SINT = 50,
+    R16G16B16A16_FLOAT = 51,
+    R32G32B32_FLOAT = 60,
+    R32G32B32A32_FLOAT = 74,
+};
+
 enum class Rdna2Encoding : uint8_t {
     Unknown = 0,
     SOP2,
@@ -132,10 +225,12 @@ enum class Rdna2Encoding : uint8_t {
     VOP3P,
     SMEM,
     MUBUF,
+    MTBUF,
     MIMG,
     DS,
     FLAT,
     EXP,
+    VINTRP,
 };
 
 enum class Rdna2Opcode : uint16_t {
@@ -154,6 +249,7 @@ enum class Rdna2Opcode : uint16_t {
     S_AND_B32,
     S_OR_B32,
     S_XOR_B32,
+    S_ANDN2_B32,
     S_LSHL_B32,
     S_LSHR_B32,
     S_ASHR_I32,
@@ -164,6 +260,8 @@ enum class Rdna2Opcode : uint16_t {
     S_NOT_B32,
     S_BCNT1_I32_B32,
     S_BCNT1_I32_B64,
+    S_SETPC_B64,
+    S_SWAPPC_B64,
     S_GETPC_B64,
 
     // SOPC
@@ -239,23 +337,62 @@ enum class Rdna2Opcode : uint16_t {
     V_RSQ_F32,
     V_SQRT_F32,
     V_FLOOR_F32,
+    V_CEIL_F32,
     V_FRACT_F32,
 
-    // VOPC
+    // VOPC (and GFX10 V_CMPX execution-mask compares + split-range F16 compares)
     V_CMP_LT_F32,
     V_CMP_EQ_F32,
     V_CMP_LE_F32,
     V_CMP_GT_F32,
     V_CMP_LG_F32,
     V_CMP_GE_F32,
+    V_CMPX_LT_F32,
+    V_CMPX_EQ_F32,
+    V_CMPX_LE_F32,
+    V_CMPX_GT_F32,
+    V_CMPX_LG_F32,
+    V_CMPX_GE_F32,
     V_CMP_LT_I32,
     V_CMP_EQ_I32,
     V_CMP_GT_I32,
     V_CMP_GE_I32,
+    V_CMPX_LT_I32,
+    V_CMPX_EQ_I32,
+    V_CMPX_GT_I32,
+    V_CMPX_GE_I32,
     V_CMP_LT_U32,
     V_CMP_EQ_U32,
     V_CMP_GT_U32,
     V_CMP_GE_U32,
+    V_CMPX_LT_U32,
+    V_CMPX_EQ_U32,
+    V_CMPX_GT_U32,
+    V_CMPX_GE_U32,
+    // GFX10 split F16 compare range: [0xC8..0xCF] (ordered) and [0xD8..0xDF] (unordered/negated)
+    V_CMP_LT_F16,
+    V_CMP_EQ_F16,
+    V_CMP_LE_F16,
+    V_CMP_GT_F16,
+    V_CMP_LG_F16,
+    V_CMP_GE_F16,
+    V_CMP_U_F16,
+    V_CMP_NGE_F16,
+    V_CMP_NLG_F16,
+    V_CMP_NGT_F16,
+    V_CMP_NLE_F16,
+    V_CMP_NEQ_F16,
+    V_CMP_NLT_F16,
+    V_CMP_TRU_F16,
+    // GFX10 split F16 V_CMPX range: [0xE8..0xEF] and [0xF8..0xFF]
+    V_CMPX_LT_F16,
+    V_CMPX_EQ_F16,
+    V_CMPX_LE_F16,
+    V_CMPX_GT_F16,
+    V_CMPX_LG_F16,
+    V_CMPX_GE_F16,
+    V_CMPX_NEQ_F16,
+    V_CMPX_NLT_F16,
 
     // VOP3 (native 3-operand / wave / bitfield / 16-bit ops)
     V_FMA_F32,
@@ -264,6 +401,7 @@ enum class Rdna2Opcode : uint16_t {
     V_BFE_U32,
     V_BFE_I32,
     V_BFI_B32,
+    V_ALIGNBYTE_B32,
     V_MUL_LO_U32,
     V_ADD_NC_U16,
     V_SUB_NC_U16,
@@ -296,8 +434,26 @@ enum class Rdna2Opcode : uint16_t {
     S_BUFFER_LOAD_DWORD,
 
     // MUBUF
+    BUFFER_LOAD_FORMAT_X,
+    BUFFER_LOAD_FORMAT_XY,
+    BUFFER_LOAD_FORMAT_XYZ,
+    BUFFER_LOAD_FORMAT_XYZW,
+    BUFFER_LOAD_FORMAT_D16_X,
+    BUFFER_LOAD_FORMAT_D16_XY,
+    BUFFER_LOAD_FORMAT_D16_XYZ,
+    BUFFER_LOAD_FORMAT_D16_XYZW,
     BUFFER_LOAD_DWORD,
     BUFFER_STORE_DWORD,
+
+    // MTBUF (typed format-converting buffer loads, including D16)
+    TBUFFER_LOAD_FORMAT_X,
+    TBUFFER_LOAD_FORMAT_XY,
+    TBUFFER_LOAD_FORMAT_XYZ,
+    TBUFFER_LOAD_FORMAT_XYZW,
+    TBUFFER_LOAD_FORMAT_D16_X,
+    TBUFFER_LOAD_FORMAT_D16_XY,
+    TBUFFER_LOAD_FORMAT_D16_XYZ,
+    TBUFFER_LOAD_FORMAT_D16_XYZW,
 
     // MIMG
     IMAGE_LOAD,
@@ -325,6 +481,11 @@ enum class Rdna2Opcode : uint16_t {
 
     // EXP
     EXP,
+
+    // VINTRP (FSSM pixel shader parameter interpolation)
+    V_INTERP_P1_F32,
+    V_INTERP_P2_F32,
+    V_INTERP_MOV_F32,
 };
 
 enum class Rdna2OperandKind : uint8_t {
@@ -364,6 +525,7 @@ struct Rdna2Operand {
     static Rdna2Operand ExecLo();
     static Rdna2Operand ExecHi();
     static Rdna2Operand Scc();
+    static Rdna2Operand M0();
     static Rdna2Operand Null();
 };
 
@@ -459,6 +621,11 @@ struct Rdna2Instruction {
     bool exp_compr = false;
     bool exp_vm = false;
 
+    // MTBUF & VINTRP metadata
+    uint8_t mtbuf_format = 0;  // 7-bit GFX10 unified buffer format (Rdna2MtbufFormat)
+    uint8_t vintrp_attr = 0;   // 6-bit parameter attribute slot (0..31)
+    uint8_t vintrp_chan = 0;   // 2-bit attribute channel (0..3)
+
     std::string mnemonic;
     std::string disasm;
 };
@@ -479,6 +646,8 @@ const char* Rdna2EncodingName(Rdna2Encoding enc) noexcept;
 bool IsVop3EncodingWord(uint32_t word0) noexcept;
 bool IsVop3Int16Instruction(const Rdna2Instruction& inst) noexcept;
 bool IsVop3Float16Instruction(const Rdna2Instruction& inst) noexcept;
+bool IsVcmpxOpcode(Rdna2Opcode op) noexcept;
+bool IsF16CompareOpcode(Rdna2Opcode op) noexcept;
 std::string FormatRdna2Operand(const Rdna2Operand& op);
 std::string FormatRdna2Instruction(const Rdna2Instruction& inst);
 
@@ -552,6 +721,26 @@ public:
         bool offen = true,
         bool idxen = false,
         uint8_t soffset = 128);
+
+    // MTBUF (64-bit: TBUFFER_LOAD_FORMAT_* / TBUFFER_LOAD_FORMAT_D16_*)
+    void EmitMtbuf(
+        Rdna2Opcode op,
+        uint8_t vdata,
+        uint8_t vaddr,
+        uint8_t srsrc_sgpr,
+        Rdna2MtbufFormat format,
+        uint16_t offset = 0,
+        bool offen = true,
+        bool idxen = false,
+        uint8_t soffset = 128);
+
+    // VINTRP (32-bit: V_INTERP_P1_F32, V_INTERP_P2_F32, V_INTERP_MOV_F32)
+    void EmitVintrp(
+        Rdna2Opcode op,
+        uint8_t vdst,
+        uint8_t vsrc,
+        uint8_t attr,
+        uint8_t chan);
 
     // MIMG (64-bit: IMAGE_LOAD, IMAGE_LOAD_MIP, IMAGE_STORE, IMAGE_ATOMIC_CMPSWAP,
     // IMAGE_SAMPLE, IMAGE_SAMPLE_LZ, IMAGE_BVH_INTERSECT_RAY)

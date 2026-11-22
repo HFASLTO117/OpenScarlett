@@ -700,6 +700,7 @@ Status ShaderCache::GetOrLiftXboxShader(
     const std::string target_profile = SelectTargetProfileForStage(stage, request.highest_shader_model);
     const uint32_t sm_flags =
         ((stage == ShaderStage::Mesh && request.mesh_has_payload) ? 1u : 0u) |
+        ((container.xs2.wave_size == 64u) ? 2u : 0u) |
         ((request.highest_shader_model & 0xFFu) << 8) |
         ((static_cast<uint32_t>(stage) & 0xFFu) << 16);
 

@@ -18,10 +18,13 @@ inline constexpr const char* kLifterTempDir = "E:\\OpenScarlett\\.tmp\\lifter";
 struct Rdna2LiftOptions {
     bool use_sm65 = true;
     bool emit_spirv = true;
+    bool emit_mesh_spirv = false;  // Emit SPIR-V 1.4 SPV_EXT_mesh_shader (with Block+bool CullPrimitiveEXT) for Mesh stage
     bool emit_hlsl = true;
     bool validate_spirv_external = false;
     bool compile_dxil_with_dxc = false;
+    bool resign_dxil = true;       // Verify/re-sign DXIL container MD5 digest after compilation/retargeting
     bool mesh_has_payload = true;
+    StageContractTable stage_contract{};  // Optional FSSM pixel-input & vertex-fetch subroutine table mapping
     std::string target_profile_override;  // Optional explicit DXC profile (e.g. "cs_6_2", "ps_6_2")
     std::string spirv_val_path = kDefaultSpirvValPath;
     std::string spirv_target_env = "vulkan1.2";

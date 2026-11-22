@@ -52,6 +52,7 @@ struct Rdna2CpuThreadExport {
     bool wrote_param0 = false;
     bool wrote_mrt0 = false;
     bool wrote_prim = false;
+    bool culled_prim = false;
 };
 
 struct Rdna2CpuExecState {

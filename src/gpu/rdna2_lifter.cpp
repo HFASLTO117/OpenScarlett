@@ -42,13 +42,15 @@ uint64_t HashBytesFnv1a(const uint8_t* data, size_t size) noexcept {
 }
 
 // ---------------------------------------------------------------------------
-// SPIR-V 1.3 Constants (Khronos SPIR-V 1.3 Specification)
+// SPIR-V 1.3 / 1.4 Constants (Khronos SPIR-V Specification)
 // ---------------------------------------------------------------------------
 constexpr uint32_t kSpirvMagic = 0x07230203u;
 constexpr uint32_t kSpirvVersion13 = 0x00010300u;
+constexpr uint32_t kSpirvVersion14 = 0x00010400u;
 constexpr uint32_t kSpirvGeneratorOpenScarlett = 0x4F533200u;  // "OS2\0"
 
 enum SpirvOp : uint16_t {
+    SpvOpExtension = 10,
     SpvOpExtInstImport = 11,
     SpvOpExtInst = 12,
     SpvOpMemoryModel = 14,
@@ -102,8 +104,10 @@ enum SpirvOp : uint16_t {
     SpvOpFMul = 133,
     SpvOpFDiv = 136,
     SpvOpDot = 148,
+    SpvOpIsNan = 156,
     SpvOpLogicalOr = 166,
     SpvOpLogicalAnd = 167,
+    SpvOpLogicalNot = 168,
     SpvOpSelect = 169,
     SpvOpIEqual = 170,
     SpvOpINotEqual = 171,
@@ -114,11 +118,17 @@ enum SpirvOp : uint16_t {
     SpvOpULessThan = 176,
     SpvOpSLessThan = 177,
     SpvOpFOrdEqual = 180,
+    SpvOpFUnordEqual = 181,
     SpvOpFOrdNotEqual = 182,
+    SpvOpFUnordNotEqual = 183,
     SpvOpFOrdLessThan = 184,
+    SpvOpFUnordLessThan = 185,
     SpvOpFOrdGreaterThan = 186,
+    SpvOpFUnordGreaterThan = 187,
     SpvOpFOrdLessThanEqual = 188,
+    SpvOpFUnordLessThanEqual = 189,
     SpvOpFOrdGreaterThanEqual = 190,
+    SpvOpFUnordGreaterThanEqual = 191,
     SpvOpShiftRightLogical = 194,
     SpvOpShiftRightArithmetic = 195,
     SpvOpShiftLeftLogical = 196,
@@ -141,11 +151,13 @@ enum SpirvOp : uint16_t {
     SpvOpBranch = 249,
     SpvOpBranchConditional = 250,
     SpvOpReturn = 253,
+    SpvOpSetMeshOutputsEXT = 5295,
 };
 
 enum GlslStd450Op : uint32_t {
     GlslFAbs = 4,
     GlslFloor = 8,
+    GlslCeil = 9,
     GlslFract = 10,
     GlslSqrt = 31,
     GlslInverseSqrt = 32,
@@ -179,6 +191,10 @@ constexpr uint32_t kSpvImgFmtR32ui = 33u;
 constexpr uint32_t kSpvDecBlock = 2u;
 constexpr uint32_t kSpvDecArrayStride = 6u;
 constexpr uint32_t kSpvDecBuiltIn = 11u;
+constexpr uint32_t kSpvDecNoPerspective = 13u;
+constexpr uint32_t kSpvDecFlat = 14u;
+constexpr uint32_t kSpvDecCentroid = 16u;
+constexpr uint32_t kSpvDecSample = 17u;
 constexpr uint32_t kSpvDecNonWritable = 24u;
 constexpr uint32_t kSpvDecNonReadable = 25u;
 constexpr uint32_t kSpvDecLocation = 30u;
@@ -186,12 +202,40 @@ constexpr uint32_t kSpvDecBinding = 33u;
 constexpr uint32_t kSpvDecDescriptorSet = 34u;
 constexpr uint32_t kSpvDecOffset = 35u;
 constexpr uint32_t kSpvDecNoContraction = 42u;
+constexpr uint32_t kSpvDecPerPrimitiveEXT = 5271u;
 
 // SPIR-V BuiltIns
 constexpr uint32_t kSpvBuiltInPosition = 0u;
+constexpr uint32_t kSpvBuiltInWorkgroupId = 26u;
 constexpr uint32_t kSpvBuiltInGlobalInvocationId = 28u;
 constexpr uint32_t kSpvBuiltInLocalInvocationIndex = 29u;
 constexpr uint32_t kSpvBuiltInVertexIndex = 42u;
+constexpr uint32_t kSpvBuiltInPrimitiveTriangleIndicesEXT = 5294u;
+constexpr uint32_t kSpvBuiltInCullPrimitiveEXT = 5299u;
+
+// SPIR-V Mesh Shader EXT constants
+constexpr uint32_t kSpvCapMeshShadingEXT = 5283u;
+constexpr uint32_t kSpvExecModelMeshEXT = 5365u;
+constexpr uint32_t kSpvExecModeOutputVertices = 26u;
+constexpr uint32_t kSpvExecModeOutputPrimitivesEXT = 5270u;
+constexpr uint32_t kSpvExecModeOutputTrianglesEXT = 5298u;
+
+const char* HlslInterpModifier(Rdna2InterpMode mode) noexcept {
+    switch (mode) {
+        case Rdna2InterpMode::NoPerspective: return "noperspective ";
+        case Rdna2InterpMode::Flat:          return "nointerpolation ";
+        case Rdna2InterpMode::Centroid:      return "centroid ";
+        case Rdna2InterpMode::Sample:        return "sample ";
+        case Rdna2InterpMode::Perspective:
+        default:                             return "";
+    }
+}
+
+uint32_t ComputeMaxGuestWaves(const Rdna2IrModule& ir) noexcept {
+    const uint32_t tg = std::max(1u, ir.threadgroup_x * ir.threadgroup_y * ir.threadgroup_z);
+    const uint32_t ws = (ir.wave_size == 64u) ? 64u : 32u;
+    return std::max(1u, (tg + ws - 1u) / ws);
+}
 
 // SPIR-V Scopes & Semantics
 constexpr uint32_t kSpvScopeDevice = 1u;
@@ -516,6 +560,12 @@ public:
         const bool uses_uav0 = ir_.uses_uav0 || (ir_.uses_uav && !ir_.uses_uav1);
         const bool uses_fma = ModuleUsesOp(ir_, IrOp::FFma) || ModuleUsesOp(ir_, IrOp::FFma16);
         const bool uses_mad = ModuleUsesOp(ir_, IrOp::FMad);
+        const bool uses_alignbyte = ModuleUsesOp(ir_, IrOp::AlignByte);
+        const bool uses_buf_load_fmt = ModuleUsesOp(ir_, IrOp::BufferLoadFormat);
+        const bool uses_exact_fp =
+            ModuleUsesOp(ir_, IrOp::FFloor) || ModuleUsesOp(ir_, IrOp::FCeil) ||
+            ModuleUsesOp(ir_, IrOp::FFract) || ModuleUsesOp(ir_, IrOp::FMin) ||
+            ModuleUsesOp(ir_, IrOp::FMax);
         const bool uses_ps_quad_deriv =
             (ir_.stage == ShaderStage::Pixel) &&
             (ir_.uses_pixel_quad_derivatives || ModuleUsesOp(ir_, IrOp::ImageSampleImplicit));
@@ -584,8 +634,123 @@ public:
         }
         if ((ir_.uses_wave64_emulation || bounded_wave64_dispatcher_) && is_group_stage) {
             const uint32_t w_cap = ComputeWaveLanesCapacity(ir_);
-            hdr << "groupshared uint _w64_ballot[2];\n";
+            const uint32_t max_waves = ComputeMaxGuestWaves(ir_);
+            hdr << "groupshared uint _w64_ballot[" << (max_waves * 2u) << "];\n";
             hdr << "groupshared uint _w64_lanes[" << w_cap << "];\n";
+        }
+        if (uses_alignbyte) {
+            hdr << "// UB-free v_alignbyte_b32 helper (all shift amounts strictly < 32)\n";
+            hdr << "uint _os_alignbyte_b32(uint hi, uint lo, uint byte_sel) {\n"
+                   "    uint rsh = (byte_sel & 3u) << 3u;\n"
+                   "    uint lsh = (32u - rsh) & 31u;\n"
+                   "    return (lo >> rsh) | ((rsh != 0u) ? (hi << lsh) : 0u);\n"
+                   "}\n";
+        }
+        if (uses_exact_fp) {
+            hdr << "// IEEE/ISA-exact NaN quieting + denormal-preserving floor/ceil helpers\n";
+            hdr << "float _os_quiet_nan(float x) {\n"
+                   "    uint b = asuint(x);\n"
+                   "    return ((b & 0x7FFFFFFFu) > 0x7F800000u) ? asfloat(b | 0x00400000u) : x;\n"
+                   "}\n";
+            hdr << "float _os_floor_f32(float x) {\n"
+                   "    uint b = asuint(x);\n"
+                   "    if ((b & 0x7FFFFFFFu) > 0x7F800000u) return asfloat(b | 0x00400000u);\n"
+                   "    if (((b & 0x7F800000u) == 0u) && ((b & 0x007FFFFFu) != 0u)) {\n"
+                   "        return ((b & 0x80000000u) != 0u) ? -1.0 : 0.0;\n"
+                   "    }\n"
+                   "    return floor(x);\n"
+                   "}\n";
+            hdr << "float _os_ceil_f32(float x) {\n"
+                   "    uint b = asuint(x);\n"
+                   "    if ((b & 0x7FFFFFFFu) > 0x7F800000u) return asfloat(b | 0x00400000u);\n"
+                   "    if (((b & 0x7F800000u) == 0u) && ((b & 0x007FFFFFu) != 0u)) {\n"
+                   "        return ((b & 0x80000000u) != 0u) ? asfloat(0x80000000u) : 1.0;\n"
+                   "    }\n"
+                   "    return ceil(x);\n"
+                   "}\n";
+            hdr << "float _os_fmin_f32(float a, float b) {\n"
+                   "    uint ba = asuint(a); uint bb = asuint(b);\n"
+                   "    bool na = (ba & 0x7FFFFFFFu) > 0x7F800000u;\n"
+                   "    bool nb = (bb & 0x7FFFFFFFu) > 0x7F800000u;\n"
+                   "    if (na && nb) return asfloat(ba | 0x00400000u);\n"
+                   "    if (na) return b;\n"
+                   "    if (nb) return a;\n"
+                   "    return min(a, b);\n"
+                   "}\n";
+            hdr << "float _os_fmax_f32(float a, float b) {\n"
+                   "    uint ba = asuint(a); uint bb = asuint(b);\n"
+                   "    bool na = (ba & 0x7FFFFFFFu) > 0x7F800000u;\n"
+                   "    bool nb = (bb & 0x7FFFFFFFu) > 0x7F800000u;\n"
+                   "    if (na && nb) return asfloat(ba | 0x00400000u);\n"
+                   "    if (na) return b;\n"
+                   "    if (nb) return a;\n"
+                   "    return max(a, b);\n"
+                   "}\n";
+        }
+        if (uses_buf_load_fmt) {
+            hdr << "// UB-free sub-dword merge & MTBUF D16 format-conversion helpers (shifts strictly < 32)\n";
+            if (uses_uav0) {
+                hdr << "uint _os_load_unaligned_u0(uint byte_addr) {\n"
+                       "    uint aligned = byte_addr & ~3u;\n"
+                       "    uint bit_off = (byte_addr & 3u) << 3u;\n"
+                       "    uint w0 = _in0.Load(aligned);\n"
+                       "    uint w1 = (bit_off != 0u) ? _in0.Load(aligned + 4u) : 0u;\n"
+                       "    uint hi_sh = (32u - bit_off) & 31u;\n"
+                       "    return (w0 >> bit_off) | ((bit_off != 0u) ? (w1 << hi_sh) : 0u);\n"
+                       "}\n";
+            }
+            if (uses_dual_uav) {
+                hdr << "uint _os_load_unaligned_u1(uint byte_addr) {\n"
+                       "    uint aligned = byte_addr & ~3u;\n"
+                       "    uint bit_off = (byte_addr & 3u) << 3u;\n"
+                       "    uint w0 = _out0.Load(aligned);\n"
+                       "    uint w1 = (bit_off != 0u) ? _out0.Load(aligned + 4u) : 0u;\n"
+                       "    uint hi_sh = (32u - bit_off) & 31u;\n"
+                       "    return (w0 >> bit_off) | ((bit_off != 0u) ? (w1 << hi_sh) : 0u);\n"
+                       "}\n";
+            }
+            hdr << "uint _os_decode_fmt_comp(uint raw, uint fmt, bool as_d16) {\n"
+                   "    if (fmt == 1u || fmt == 10u || fmt == 28u) {\n"
+                   "        float f = (float)(raw & 0xFFu) / 255.0;\n"
+                   "        return as_d16 ? (f32tof16(f) & 0xFFFFu) : asuint(f);\n"
+                   "    }\n"
+                   "    if (fmt == 2u || fmt == 11u || fmt == 29u) {\n"
+                   "        int s = ((int)((raw & 0xFFu) << 24u)) >> 24;\n"
+                   "        float f = clamp((float)s / 127.0, -1.0, 1.0);\n"
+                   "        return as_d16 ? (f32tof16(f) & 0xFFFFu) : asuint(f);\n"
+                   "    }\n"
+                   "    if (fmt == 3u || fmt == 12u || fmt == 30u) {\n"
+                   "        return raw & 0xFFu;\n"
+                   "    }\n"
+                   "    if (fmt == 4u || fmt == 13u || fmt == 31u) {\n"
+                   "        uint s = asuint(((int)((raw & 0xFFu) << 24u)) >> 24);\n"
+                   "        return as_d16 ? (s & 0xFFFFu) : s;\n"
+                   "    }\n"
+                   "    if (fmt == 5u || fmt == 17u || fmt == 47u) {\n"
+                   "        float f = (float)(raw & 0xFFFFu) / 65535.0;\n"
+                   "        return as_d16 ? (f32tof16(f) & 0xFFFFu) : asuint(f);\n"
+                   "    }\n"
+                   "    if (fmt == 6u || fmt == 18u || fmt == 48u) {\n"
+                   "        int s = ((int)((raw & 0xFFFFu) << 16u)) >> 16;\n"
+                   "        float f = clamp((float)s / 32767.0, -1.0, 1.0);\n"
+                   "        return as_d16 ? (f32tof16(f) & 0xFFFFu) : asuint(f);\n"
+                   "    }\n"
+                   "    if (fmt == 7u || fmt == 19u || fmt == 49u) {\n"
+                   "        return raw & 0xFFFFu;\n"
+                   "    }\n"
+                   "    if (fmt == 8u || fmt == 20u || fmt == 50u) {\n"
+                   "        uint s = asuint(((int)((raw & 0xFFFFu) << 16u)) >> 16);\n"
+                   "        return as_d16 ? (s & 0xFFFFu) : s;\n"
+                   "    }\n"
+                   "    if (fmt == 9u || fmt == 21u || fmt == 51u) {\n"
+                   "        uint h = raw & 0xFFFFu;\n"
+                   "        return as_d16 ? h : asuint(f16tof32(h));\n"
+                   "    }\n"
+                   "    if (fmt == 14u || fmt == 15u) {\n"
+                   "        return as_d16 ? (raw & 0xFFFFu) : raw;\n"
+                   "    }\n"
+                   "    return as_d16 ? (f32tof16(asfloat(raw)) & 0xFFFFu) : raw;\n"
+                   "}\n";
         }
         if (uses_mad) {
             hdr << "// GFX10.3 unfused denormal-flushing MAD (distinct from single-rounding fused FMA)\n";
@@ -723,6 +888,11 @@ public:
                    "}\n";
         }
 
+        const Rdna2InterpMode out_interp0 =
+            !ir_.output_interp_modes.empty() ? ir_.output_interp_modes[0] : Rdna2InterpMode::Perspective;
+        const Rdna2InterpMode in_interp0 =
+            !ir_.input_interp_modes.empty() ? ir_.input_interp_modes[0] : Rdna2InterpMode::Perspective;
+
         switch (ir_.stage) {
             case ShaderStage::Compute:
                 out_target = use_sm65_ ? "cs_6_5" : "cs_5_0";
@@ -731,7 +901,10 @@ public:
                 hdr << "void main(uint3 _tid : SV_DispatchThreadID, uint _gtid : SV_GroupIndex) {\n";
                 if (ir_.uses_wave64_emulation) {
                     const uint32_t lane_mask = (ir_.wave_size == 64u) ? 63u : 31u;
+                    const uint32_t wave_shift = (ir_.wave_size == 64u) ? 6u : 5u;
+                    hdr << "    uint _gw_id = _gtid >> " << wave_shift << "u;\n";
                     hdr << "    uint _w64_lane = _gtid & " << lane_mask << "u;\n";
+                    hdr << "    uint _gw_base = _gw_id << " << wave_shift << "u;\n";
                 }
                 break;
             case ShaderStage::Vertex:
@@ -739,7 +912,7 @@ public:
                 hdr << "struct VSOut {\n";
                 hdr << "    float4 pos : SV_POSITION;\n";
                 if (ir_.exports_param0) {
-                    hdr << "    float4 param0 : TEXCOORD0;\n";
+                    hdr << "    " << HlslInterpModifier(out_interp0) << "float4 param0 : TEXCOORD0;\n";
                 }
                 hdr << "};\n";
                 hdr << "VSOut main(uint _vid : SV_VertexID) {\n";
@@ -754,7 +927,7 @@ public:
                 hdr << "struct PSIn {\n";
                 hdr << "    float4 pos : SV_POSITION;\n";
                 if (uses_stage_in) {
-                    hdr << "    float4 param0 : TEXCOORD0;\n";
+                    hdr << "    " << HlslInterpModifier(in_interp0) << "float4 param0 : TEXCOORD0;\n";
                 }
                 hdr << "};\n";
                 hdr << "float4 main(PSIn _in) : SV_TARGET0 {\n";
@@ -768,7 +941,7 @@ public:
                 hdr << "struct GSOut {\n";
                 hdr << "    float4 pos : SV_POSITION;\n";
                 if (ir_.exports_param0) {
-                    hdr << "    float4 param0 : TEXCOORD0;\n";
+                    hdr << "    " << HlslInterpModifier(out_interp0) << "float4 param0 : TEXCOORD0;\n";
                 }
                 hdr << "};\n";
                 hdr << "[maxvertexcount(6)]\n";
@@ -797,20 +970,40 @@ public:
                 hdr << "struct MeshVert {\n";
                 hdr << "    float4 pos : SV_POSITION;\n";
                 if (ir_.exports_param0) {
-                    hdr << "    float4 param0 : TEXCOORD0;\n";
+                    hdr << "    " << HlslInterpModifier(out_interp0) << "float4 param0 : TEXCOORD0;\n";
                 }
                 hdr << "};\n";
+                if (ir_.uses_mesh_cull) {
+                    hdr << "struct MeshPrimAttr {\n";
+                    hdr << "    bool cull : SV_CullPrimitive;\n";
+                    hdr << "};\n";
+                }
                 hdr << "[outputtopology(\"triangle\")]\n";
                 hdr << "[numthreads(" << hw_tg_x << ", " << hw_tg_y << ", " << hw_tg_z << ")]\n";
                 hdr << "void main(\n";
+                if (ir_.uses_mesh_global_tid) {
+                    hdr << "    uint3 _gid : SV_GroupID,\n";
+                }
                 hdr << "    uint _gtid : SV_GroupIndex,\n";
                 if (ir_.mesh_has_payload) {
                     hdr << "    in payload ASPayload _payload,\n";
                 }
                 hdr << "    out vertices MeshVert _verts[" << max_v << "],\n";
-                hdr << "    out indices uint3 _prims[" << max_p << "])\n{\n";
+                if (ir_.uses_mesh_cull) {
+                    hdr << "    out indices uint3 _prims[" << max_p << "],\n";
+                    hdr << "    out primitives MeshPrimAttr _prim_attrs[" << max_p << "])\n{\n";
+                } else {
+                    hdr << "    out indices uint3 _prims[" << max_p << "])\n{\n";
+                }
                 hdr << "    uint _mesh_vcnt = " << max_v << "u;\n";
                 hdr << "    uint _mesh_pcnt = " << max_p << "u;\n";
+                if (ir_.uses_wave64_emulation && !bounded_wave64_dispatcher_) {
+                    const uint32_t lane_mask = (ir_.wave_size == 64u) ? 63u : 31u;
+                    const uint32_t wave_shift = (ir_.wave_size == 64u) ? 6u : 5u;
+                    hdr << "    uint _gw_id = _gtid >> " << wave_shift << "u;\n";
+                    hdr << "    uint _w64_lane = _gtid & " << lane_mask << "u;\n";
+                    hdr << "    uint _gw_base = _gw_id << " << wave_shift << "u;\n";
+                }
                 break;
             }
             case ShaderStage::Amplification:
@@ -1047,6 +1240,36 @@ private:
                         os << ind << "_v" << inst.id << " = _tid.x;\n";
                     }
                     break;
+                case IrOp::MeshGlobalThreadId: {
+                    const char* lidx = bounded_wave64_dispatcher_ ? "_w64_gtid" : "_gtid";
+                    const uint32_t nt = inst.imm_u32 ? inst.imm_u32 : ir_.mesh_num_threads;
+                    os << ind << "_v" << inst.id << " = (_gid.x * " << nt << "u + " << lidx << ");\n";
+                    break;
+                }
+                case IrOp::MergedWaveInfo: {
+                    const uint32_t tg_total = std::max(1u, ir_.threadgroup_x * ir_.threadgroup_y * ir_.threadgroup_z);
+                    const uint32_t ws = (ir_.wave_size == 64u) ? 64u : 32u;
+                    const uint32_t nwaves = std::min(15u, std::max(1u, (tg_total + ws - 1u) / ws));
+                    if (ir_.stage == ShaderStage::Mesh) {
+                        const char* lidx = bounded_wave64_dispatcher_ ? "_w64_gtid" : "_gtid";
+                        const uint32_t wshift = (ws == 64u) ? 6u : 5u;
+                        os << ind << "{\n";
+                        os << ind << "    uint _mwi_w = (" << lidx << " >> " << wshift << "u);\n";
+                        os << ind << "    uint _mwi_es = min(255u, min(" << ws << "u, " << tg_total
+                           << "u - (_mwi_w << " << wshift << "u)));\n";
+                        os << ind << "    _v" << inst.id << " = _mwi_es | (" << std::min(255u, tg_total)
+                           << "u << 8u) | ((_mwi_w & 0xFFu) << 16u) | ((_mwi_w & 0xFu) << 24u) | ("
+                           << nwaves << "u << 28u);\n";
+                        os << ind << "}\n";
+                    } else {
+                        Rdna2MergedWaveInfo mwi{};
+                        mwi.es_thread_count = static_cast<uint8_t>(std::min(255u, ws));
+                        mwi.gs_thread_count = static_cast<uint8_t>(std::min(255u, tg_total));
+                        mwi.waves_in_group = static_cast<uint8_t>(nwaves);
+                        os << ind << "_v" << inst.id << " = " << HexU32(PackMergedWaveInfo(mwi)) << ";\n";
+                    }
+                    break;
+                }
                 case IrOp::StageInput:
                     os << ind << "_v" << inst.id << " = _in.param0." << kSwiz[inst.imm_u32 & 3u] << ";\n";
                     break;
@@ -1060,7 +1283,54 @@ private:
                 }
                 case IrOp::StoreUav: {
                     const char* buf = (inst.imm_u32 == 1u && ir_.uses_uav1) ? "_out0" : "_in0";
-                    os << ind << buf << ".Store(" << AsU32(inst.operands[0]) << ", " << AsU32(inst.operands[1]) << ");\n";
+                    if (inst.exec_pred != kInvalidIrValue) {
+                        os << ind << "if (" << AsBool(inst.exec_pred) << ") { "
+                           << buf << ".Store(" << AsU32(inst.operands[0]) << ", " << AsU32(inst.operands[1]) << "); }\n";
+                    } else {
+                        os << ind << buf << ".Store(" << AsU32(inst.operands[0]) << ", " << AsU32(inst.operands[1]) << ");\n";
+                    }
+                    break;
+                }
+                case IrOp::BufferLoadFormat: {
+                    const uint32_t uav_slot = inst.imm_u32 & 0xFu;
+                    const uint32_t fmt = (inst.imm_u32 >> 4) & 0x7Fu;
+                    const uint32_t comp_idx = (inst.imm_u32 >> 12) & 0xFu;
+                    const bool is_d16 = ((inst.imm_u32 >> 16) & 1u) != 0u;
+                    const bool has_hi = ((inst.imm_u32 >> 17) & 1u) != 0u;
+                    const char* loader = (uav_slot == 1u && ir_.uses_uav1) ? "_os_load_unaligned_u1" : "_os_load_unaligned_u0";
+                    uint32_t elem_bytes = 4u;
+                    if (fmt == 1u || fmt == 2u || fmt == 3u || fmt == 4u ||
+                        fmt == 10u || fmt == 11u || fmt == 12u || fmt == 13u ||
+                        fmt == 28u || fmt == 29u || fmt == 30u || fmt == 31u) {
+                        elem_bytes = 1u;
+                    } else if (fmt == 5u || fmt == 6u || fmt == 7u || fmt == 8u || fmt == 9u ||
+                               fmt == 17u || fmt == 18u || fmt == 19u || fmt == 20u || fmt == 21u ||
+                               fmt == 47u || fmt == 48u || fmt == 49u || fmt == 50u || fmt == 51u) {
+                        elem_bytes = 2u;
+                    }
+                    const std::string base_addr = AsU32(inst.operands[0]);
+                    if (is_d16) {
+                        os << ind << "{\n";
+                        os << ind << "    uint _bf_lo = _os_decode_fmt_comp(" << loader << "(" << base_addr
+                           << " + " << (comp_idx * elem_bytes) << "u), " << fmt << "u, true) & 0xFFFFu;\n";
+                        if (has_hi) {
+                            os << ind << "    uint _bf_hi = _os_decode_fmt_comp(" << loader << "(" << base_addr
+                               << " + " << ((comp_idx + 1u) * elem_bytes) << "u), " << fmt << "u, true) & 0xFFFFu;\n";
+                        } else {
+                            os << ind << "    uint _bf_hi = 0u;\n";
+                        }
+                        os << ind << "    _v" << inst.id << " = _bf_lo | (_bf_hi << 16u);\n";
+                        os << ind << "}\n";
+                    } else {
+                        const std::string dec = "_os_decode_fmt_comp(" + std::string(loader) + "(" + base_addr +
+                                                " + " + std::to_string(comp_idx * elem_bytes) + "u), " +
+                                                std::to_string(fmt) + "u, false)";
+                        if (inst.type == IrType::F32) {
+                            os << ind << "_v" << inst.id << " = asfloat(" << dec << ");\n";
+                        } else {
+                            os << ind << "_v" << inst.id << " = " << dec << ";\n";
+                        }
+                    }
                     break;
                 }
                 case IrOp::ImageSample:
@@ -1163,7 +1433,10 @@ private:
                 case IrOp::WaveBallotLo:
                 case IrOp::WaveBallotHi: {
                     const uint32_t word_idx = (inst.op == IrOp::WaveBallotHi) ? 1u : 0u;
-                    if (bounded_wave64_dispatcher_ && ir_.stage == ShaderStage::Geometry) {
+                    if (ir_.wave_size == 32u && word_idx == 1u) {
+                        // Guest Wave32 has no upper 32 lanes (32..63); never bleed into other half of a 64-lane host wave
+                        os << ind << "_v" << inst.id << " = 0u;\n";
+                    } else if (bounded_wave64_dispatcher_ && ir_.stage == ShaderStage::Geometry) {
                         os << ind << "_w64_ballot[_w64_half] = WaveActiveBallot(" << AsBool(inst.operands[0]) << ").x;\n";
                         os << ind << "_v" << inst.id << " = _w64_ballot[" << word_idx << "];\n";
                     } else if (bounded_wave64_dispatcher_) {
@@ -1175,13 +1448,14 @@ private:
                         os << ind << "GroupMemoryBarrierWithGroupSync();\n";
                         os << ind << "_v" << inst.id << " = _w64_ballot[" << word_idx << "];\n";
                     } else {
+                        // Per-guest-wave isolated ballot (prevents Wave32 lanes from colliding across halves on 64-lane AMD host waves)
                         os << ind << "GroupMemoryBarrierWithGroupSync();\n";
-                        os << ind << "if (_w64_lane == 0u) { _w64_ballot[0] = 0u; _w64_ballot[1] = 0u; }\n";
+                        os << ind << "if (_w64_lane == 0u) { _w64_ballot[_gw_id * 2u] = 0u; _w64_ballot[_gw_id * 2u + 1u] = 0u; }\n";
                         os << ind << "GroupMemoryBarrierWithGroupSync();\n";
-                        os << ind << "InterlockedOr(_w64_ballot[_w64_lane >> 5u], (" << AsBool(inst.operands[0])
+                        os << ind << "InterlockedOr(_w64_ballot[_gw_id * 2u + (_w64_lane >> 5u)], (" << AsBool(inst.operands[0])
                            << " ? (1u << (_w64_lane & 31u)) : 0u));\n";
                         os << ind << "GroupMemoryBarrierWithGroupSync();\n";
-                        os << ind << "_v" << inst.id << " = _w64_ballot[" << word_idx << "];\n";
+                        os << ind << "_v" << inst.id << " = _w64_ballot[_gw_id * 2u + " << word_idx << "u];\n";
                     }
                     break;
                 }
@@ -1202,36 +1476,40 @@ private:
                     break;
                 case IrOp::WaveReadFirstLane:
                 case IrOp::WaveReadLaneAt: {
+                    const uint32_t lane_mask = (ir_.wave_size == 64u) ? 63u : 31u;
                     const uint32_t w_mask = ComputeWaveLanesCapacity(ir_) - 1u;
+                    const std::string base_off = bounded_wave64_dispatcher_ ? "0u" : "_gw_base";
                     const std::string lane_expr = (inst.op == IrOp::WaveReadFirstLane)
                                                       ? "0u"
-                                                      : ("(" + AsU32(inst.operands[1]) + " & " + std::to_string(w_mask) + "u)");
+                                                      : ("(" + AsU32(inst.operands[1]) + " & " + std::to_string(lane_mask) + "u)");
                     os << ind << "GroupMemoryBarrierWithGroupSync();\n";
-                    os << ind << "_w64_lanes[_w64_lane] = " << AsU32(inst.operands[0]) << ";\n";
+                    os << ind << "_w64_lanes[(" << base_off << " + _w64_lane) & " << w_mask << "u] = " << AsU32(inst.operands[0]) << ";\n";
                     os << ind << "GroupMemoryBarrierWithGroupSync();\n";
                     if (inst.type == IrType::F32) {
-                        os << ind << "_v" << inst.id << " = asfloat(_w64_lanes[" << lane_expr << "]);\n";
+                        os << ind << "_v" << inst.id << " = asfloat(_w64_lanes[(" << base_off << " + " << lane_expr << ") & " << w_mask << "u]);\n";
                     } else {
-                        os << ind << "_v" << inst.id << " = _w64_lanes[" << lane_expr << "];\n";
+                        os << ind << "_v" << inst.id << " = _w64_lanes[(" << base_off << " + " << lane_expr << ") & " << w_mask << "u];\n";
                     }
                     break;
                 }
                 case IrOp::WavePermLane16: {
+                    const uint32_t lane_mask = (ir_.wave_size == 64u) ? 63u : 31u;
                     const uint32_t w_mask = ComputeWaveLanesCapacity(ir_) - 1u;
                     const uint32_t x16_xor = (inst.imm_u32 != 0u) ? 16u : 0u;
+                    const std::string base_off = bounded_wave64_dispatcher_ ? "0u" : "_gw_base";
                     os << ind << "GroupMemoryBarrierWithGroupSync();\n";
-                    os << ind << "_w64_lanes[_gtid & " << w_mask << "u] = " << AsU32(inst.operands[0]) << ";\n";
+                    os << ind << "_w64_lanes[(" << base_off << " + _w64_lane) & " << w_mask << "u] = " << AsU32(inst.operands[0]) << ";\n";
                     os << ind << "GroupMemoryBarrierWithGroupSync();\n";
                     os << ind << "{\n";
-                    os << ind << "    uint _pl_lane = _gtid & " << w_mask << "u;\n";
+                    os << ind << "    uint _pl_lane = _w64_lane;\n";
                     os << ind << "    uint _pl_row = _pl_lane & 15u;\n";
                     os << ind << "    uint _pl_base = (_pl_lane & ~15u) ^ " << x16_xor << "u;\n";
                     os << ind << "    uint _pl_word = (_pl_row < 8u) ? " << AsU32(inst.operands[1]) << " : " << AsU32(inst.operands[2]) << ";\n";
                     os << ind << "    uint _pl_sel = (_pl_word >> ((_pl_row & 7u) << 2u)) & 15u;\n";
                     if (inst.type == IrType::F32) {
-                        os << ind << "    _v" << inst.id << " = asfloat(_w64_lanes[(_pl_base | _pl_sel) & " << w_mask << "u]);\n";
+                        os << ind << "    _v" << inst.id << " = asfloat(_w64_lanes[(" << base_off << " + ((_pl_base | _pl_sel) & " << lane_mask << "u)) & " << w_mask << "u]);\n";
                     } else {
-                        os << ind << "    _v" << inst.id << " = _w64_lanes[(_pl_base | _pl_sel) & " << w_mask << "u];\n";
+                        os << ind << "    _v" << inst.id << " = _w64_lanes[(" << base_off << " + ((_pl_base | _pl_sel) & " << lane_mask << "u)) & " << w_mask << "u];\n";
                     }
                     os << ind << "}\n";
                     break;
@@ -1255,6 +1533,12 @@ private:
                            << "] = uint3(" << AsU32(inst.operands[0]) << ", "
                            << AsU32(inst.operands[1]) << ", " << AsU32(inst.operands[2]) << "); }\n";
                     }
+                    break;
+                }
+                case IrOp::ExportMeshCull: {
+                    const char* idx_var = bounded_wave64_dispatcher_ ? "_w64_gtid" : "_gtid";
+                    os << ind << "if (" << idx_var << " < _mesh_pcnt) { _prim_attrs[" << idx_var
+                       << "].cull = " << AsBool(inst.operands[0]) << "; }\n";
                     break;
                 }
                 case IrOp::DispatchMeshGroups:
@@ -1302,10 +1586,10 @@ private:
                     break;
                 }
                 case IrOp::FMin:
-                    os << ind << "_v" << inst.id << " = min(" << AsF32(inst.operands[0]) << ", " << AsF32(inst.operands[1]) << ");\n";
+                    os << ind << "_v" << inst.id << " = _os_fmin_f32(" << AsF32(inst.operands[0]) << ", " << AsF32(inst.operands[1]) << ");\n";
                     break;
                 case IrOp::FMax:
-                    os << ind << "_v" << inst.id << " = max(" << AsF32(inst.operands[0]) << ", " << AsF32(inst.operands[1]) << ");\n";
+                    os << ind << "_v" << inst.id << " = _os_fmax_f32(" << AsF32(inst.operands[0]) << ", " << AsF32(inst.operands[1]) << ");\n";
                     break;
                 case IrOp::FRcp:
                     os << ind << "_v" << inst.id << " = rcp(" << AsF32(inst.operands[0]) << ");\n";
@@ -1317,10 +1601,13 @@ private:
                     os << ind << "_v" << inst.id << " = sqrt(" << AsF32(inst.operands[0]) << ");\n";
                     break;
                 case IrOp::FFloor:
-                    os << ind << "_v" << inst.id << " = floor(" << AsF32(inst.operands[0]) << ");\n";
+                    os << ind << "_v" << inst.id << " = _os_floor_f32(" << AsF32(inst.operands[0]) << ");\n";
+                    break;
+                case IrOp::FCeil:
+                    os << ind << "_v" << inst.id << " = _os_ceil_f32(" << AsF32(inst.operands[0]) << ");\n";
                     break;
                 case IrOp::FFract:
-                    os << ind << "_v" << inst.id << " = frac(" << AsF32(inst.operands[0]) << ");\n";
+                    os << ind << "_v" << inst.id << " = _os_quiet_nan(" << AsF32(inst.operands[0]) << " - _os_floor_f32(" << AsF32(inst.operands[0]) << "));\n";
                     break;
                 case IrOp::FDot2: {
                     const std::string a = AsU32(inst.operands[0]);
@@ -1378,6 +1665,10 @@ private:
                     } else {
                         os << ind << "_v" << inst.id << " = (" << AsU32(inst.operands[0]) << " >> (" << AsU32(inst.operands[1]) << " & 31u));\n";
                     }
+                    break;
+                case IrOp::AlignByte:
+                    os << ind << "_v" << inst.id << " = _os_alignbyte_b32(" << AsU32(inst.operands[0]) << ", "
+                       << AsU32(inst.operands[1]) << ", " << AsU32(inst.operands[2]) << ");\n";
                     break;
                 case IrOp::BfeU32:
                     os << ind << "_v" << inst.id << " = ((" << AsU32(inst.operands[0]) << " >> ("
@@ -1509,6 +1800,54 @@ private:
                     break;
                 case IrOp::CmpGeU:
                     os << ind << "_v" << inst.id << " = (" << AsU32(inst.operands[0]) << " >= " << AsU32(inst.operands[1]) << ");\n";
+                    break;
+                case IrOp::CmpF16: {
+                    const uint32_t imm = inst.imm_u32;
+                    const uint32_t pred = imm & 15u;
+                    const uint32_t op_sel = (imm >> 8) & 3u;
+                    const uint32_t neg_m = (imm >> 12) & 3u;
+                    const uint32_t abs_m = (imm >> 16) & 3u;
+                    auto f16_op = [&](IrValueId v, uint32_t bit) -> std::string {
+                        std::string ex = ((op_sel & bit) != 0u)
+                                             ? ("f16tof32((" + AsU32(v) + " >> 16u) & 0xFFFFu)")
+                                             : ("f16tof32(" + AsU32(v) + " & 0xFFFFu)");
+                        if ((abs_m & bit) != 0u) ex = "abs(" + ex + ")";
+                        if ((neg_m & bit) != 0u) ex = "(-" + ex + ")";
+                        return ex;
+                    };
+                    os << ind << "{\n";
+                    os << ind << "    float _fa16 = " << f16_op(inst.operands[0], 1u) << ";\n";
+                    os << ind << "    float _fb16 = " << f16_op(inst.operands[1], 2u) << ";\n";
+                    os << ind << "    bool _unord16 = isnan(_fa16) || isnan(_fb16);\n";
+                    os << ind << "    _v" << inst.id << " = ";
+                    switch (pred) {
+                        case 0u:  os << "false"; break;
+                        case 1u:  os << "(!_unord16 && (_fa16 < _fb16))"; break;
+                        case 2u:  os << "(!_unord16 && (_fa16 == _fb16))"; break;
+                        case 3u:  os << "(!_unord16 && (_fa16 <= _fb16))"; break;
+                        case 4u:  os << "(!_unord16 && (_fa16 > _fb16))"; break;
+                        case 5u:  os << "(!_unord16 && (_fa16 != _fb16))"; break;
+                        case 6u:  os << "(!_unord16 && (_fa16 >= _fb16))"; break;
+                        case 7u:  os << "(!_unord16)"; break;
+                        case 8u:  os << "_unord16"; break;
+                        case 9u:  os << "(_unord16 || (_fa16 < _fb16))"; break;
+                        case 10u: os << "(_unord16 || (_fa16 == _fb16))"; break;
+                        case 11u: os << "(_unord16 || (_fa16 <= _fb16))"; break;
+                        case 12u: os << "(_unord16 || (_fa16 > _fb16))"; break;
+                        case 13u: os << "(_unord16 || (_fa16 != _fb16))"; break;
+                        case 14u: os << "(_unord16 || (_fa16 >= _fb16))"; break;
+                        case 15u: os << "true"; break;
+                        default:  os << "false"; break;
+                    }
+                    os << ";\n";
+                    os << ind << "}\n";
+                    break;
+                }
+                case IrOp::LogicalAnd:
+                    os << ind << "_v" << inst.id << " = (" << AsBool(inst.operands[0]) << " && " << AsBool(inst.operands[1]) << ");\n";
+                    break;
+                case IrOp::LogicalNot:
+                    os << ind << "_v" << inst.id << " = (!" << AsBool(inst.operands[0]) << ");\n";
                     break;
                 case IrOp::Select:
                     if (inst.type == IrType::F32) {
@@ -1748,16 +2087,20 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         CallTelemetry::Global().Record("rdna2_lifter", "EmitSpirv", CallOutcome::Error, -1);
         return Status::Error(StatusCode::ShaderError, "Cannot emit SPIR-V from empty IR module");
     }
-    if (ir.stage != ShaderStage::Compute && ir.stage != ShaderStage::Vertex && ir.stage != ShaderStage::Pixel) {
+    if (ir.stage != ShaderStage::Compute && ir.stage != ShaderStage::Vertex &&
+        ir.stage != ShaderStage::Pixel && ir.stage != ShaderStage::Mesh) {
         CallTelemetry::Global().Record("rdna2_lifter", "EmitSpirv", CallOutcome::NotImplemented, -1);
         return Status::Error(StatusCode::UnsupportedFormat,
-                             "SPIR-V 1.3 emitter supports Compute/Vertex/Pixel (use DXC SM 6.5 for Mesh/AS)");
+                             "SPIR-V emitter supports Compute/Vertex/Pixel/Mesh (use DXC SM 6.5 for AS/GS)");
     }
 
+    const bool is_mesh_stage = (ir.stage == ShaderStage::Mesh);
+    const bool is_spirv14 = is_mesh_stage;
     uint32_t next_id = 1;
     auto alloc_id = [&]() -> uint32_t { return next_id++; };
 
     std::vector<uint32_t> sec_caps;
+    std::vector<uint32_t> sec_exts;
     std::vector<uint32_t> sec_ext;
     std::vector<uint32_t> sec_mem;
     std::vector<uint32_t> sec_entry;
@@ -1767,8 +2110,14 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
     std::vector<uint32_t> sec_globals;
     std::vector<uint32_t> sec_fn;
 
-    // 1. Capabilities, ExtInstImport, MemoryModel
+    // 1. Capabilities, Extensions, ExtInstImport, MemoryModel
     EmitSpvInst(sec_caps, SpvOpCapability, {1u});  // Shader
+    if (is_mesh_stage) {
+        EmitSpvInst(sec_caps, SpvOpCapability, {kSpvCapMeshShadingEXT});
+        std::vector<uint32_t> ext_ops;
+        AppendSpvString(ext_ops, "SPV_EXT_mesh_shader");
+        EmitSpvInst(sec_exts, SpvOpExtension, ext_ops);
+    }
     const uint32_t glsl_ext_id = alloc_id();
     {
         std::vector<uint32_t> ops = {glsl_ext_id};
@@ -1880,12 +2229,34 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
 
     // 3. Interface variables, descriptors, and workgroup shared memory
     std::vector<uint32_t> interface_vars;
+    auto register_spv14_global = [&](uint32_t var_id) {
+        if (is_spirv14 && var_id != 0u) {
+            interface_vars.push_back(var_id);
+        }
+    };
+    auto emit_interp_decor = [&](uint32_t var_id, Rdna2InterpMode mode) {
+        if (var_id == 0u) return;
+        if (mode == Rdna2InterpMode::Flat) {
+            EmitSpvInst(sec_decor, SpvOpDecorate, {var_id, kSpvDecFlat});
+        } else if (mode == Rdna2InterpMode::NoPerspective) {
+            EmitSpvInst(sec_decor, SpvOpDecorate, {var_id, kSpvDecNoPerspective});
+        } else if (mode == Rdna2InterpMode::Centroid) {
+            EmitSpvInst(sec_decor, SpvOpDecorate, {var_id, kSpvDecCentroid});
+        } else if (mode == Rdna2InterpMode::Sample) {
+            EmitSpvInst(sec_decor, SpvOpDecorate, {var_id, kSpvDecSample});
+        }
+    };
     uint32_t var_gid = 0;
+    uint32_t var_wg_id = 0;
     uint32_t var_local_idx = 0;
     uint32_t t_ptr_in_u32 = 0;
     uint32_t var_vid = 0;
     uint32_t var_pervertex = 0;
     uint32_t t_ptr_out_v4f32 = 0;
+    uint32_t t_ptr_out_v3u32 = 0;
+    uint32_t t_ptr_out_bool = 0;
+    uint32_t var_mesh_prims = 0;
+    uint32_t var_mesh_cull = 0;
     uint32_t var_param0_out = 0;
     uint32_t var_param0_in = 0;
     uint32_t var_mrt0 = 0;
@@ -1917,12 +2288,14 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
             EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_sb_struct, var_uav0, kSpvStorageStorageBuffer});
             EmitSpvInst(sec_decor, SpvOpDecorate, {var_uav0, kSpvDecDescriptorSet, 0u});
             EmitSpvInst(sec_decor, SpvOpDecorate, {var_uav0, kSpvDecBinding, 0u});
+            register_spv14_global(var_uav0);
         }
         if (uses_uav1) {
             var_uav1 = alloc_id();
             EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_sb_struct, var_uav1, kSpvStorageStorageBuffer});
             EmitSpvInst(sec_decor, SpvOpDecorate, {var_uav1, kSpvDecDescriptorSet, 0u});
             EmitSpvInst(sec_decor, SpvOpDecorate, {var_uav1, kSpvDecBinding, 1u});
+            register_spv14_global(var_uav1);
         }
     }
 
@@ -1949,6 +2322,7 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_rc_struct, var_rc, kSpvStorageUniform});
         EmitSpvInst(sec_decor, SpvOpDecorate, {var_rc, kSpvDecDescriptorSet, 0u});
         EmitSpvInst(sec_decor, SpvOpDecorate, {var_rc, kSpvDecBinding, 2u});
+        register_spv14_global(var_rc);
     }
 
     // MIMG Texture & Sampler descriptors
@@ -2070,6 +2444,7 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         EmitSpvInst(sec_types, SpvOpConstantNull, {t_scr_arr, c_null_scr});
         var_scratch = alloc_id();
         EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_priv_scr, var_scratch, kSpvStoragePrivate, c_null_scr});
+        register_spv14_global(var_scratch);
     }
 
     // Workgroup shared memory for LDS and/or wave64->wave32 emulation
@@ -2098,15 +2473,17 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_wg_lds, kSpvStorageWorkgroup, t_lds_arr});
         var_lds = alloc_id();
         EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_wg_lds, var_lds, kSpvStorageWorkgroup});
+        register_spv14_global(var_lds);
     }
     if (ir.uses_wave64_emulation) {
-        const uint32_t c_len_2 = get_const_u32(2u);
+        const uint32_t max_waves = ComputeMaxGuestWaves(ir);
+        const uint32_t c_len_ballot = get_const_u32(max_waves * 2u);
         const uint32_t c_len_lanes = get_const_u32(w_lanes_cap);
         const uint32_t t_arr_2 = alloc_id();
         const uint32_t t_arr_lanes = alloc_id();
         const uint32_t t_ptr_wg_2 = alloc_id();
         const uint32_t t_ptr_wg_lanes = alloc_id();
-        EmitSpvInst(sec_types, SpvOpTypeArray, {t_arr_2, t_u32, c_len_2});
+        EmitSpvInst(sec_types, SpvOpTypeArray, {t_arr_2, t_u32, c_len_ballot});
         EmitSpvInst(sec_types, SpvOpTypeArray, {t_arr_lanes, t_u32, c_len_lanes});
         EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_wg_2, kSpvStorageWorkgroup, t_arr_2});
         EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_wg_lanes, kSpvStorageWorkgroup, t_arr_lanes});
@@ -2114,6 +2491,8 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         var_w64_lanes = alloc_id();
         EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_wg_2, var_w64_ballot, kSpvStorageWorkgroup});
         EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_wg_lanes, var_w64_lanes, kSpvStorageWorkgroup});
+        register_spv14_global(var_w64_ballot);
+        register_spv14_global(var_w64_lanes);
     }
 
     const bool uses_tid = ModuleUsesThreadId(ir);
@@ -2139,6 +2518,11 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
             interface_vars.push_back(var_local_idx);
         }
     }
+
+    const Rdna2InterpMode out_interp0 =
+        !ir.output_interp_modes.empty() ? ir.output_interp_modes[0] : Rdna2InterpMode::Perspective;
+    const Rdna2InterpMode in_interp0 =
+        !ir.input_interp_modes.empty() ? ir.input_interp_modes[0] : Rdna2InterpMode::Perspective;
 
     if (ir.stage == ShaderStage::Vertex) {
         if (uses_tid) {
@@ -2166,7 +2550,88 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
             var_param0_out = alloc_id();
             EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_out_v4f32, var_param0_out, kSpvStorageOutput});
             EmitSpvInst(sec_decor, SpvOpDecorate, {var_param0_out, kSpvDecLocation, 0u});
+            emit_interp_decor(var_param0_out, out_interp0);
             interface_vars.push_back(var_param0_out);
+        }
+    }
+
+    if (ir.stage == ShaderStage::Mesh) {
+        const uint32_t max_v = ir.mesh_max_vertices ? ir.mesh_max_vertices : 64u;
+        const uint32_t max_p = ir.mesh_max_primitives ? ir.mesh_max_primitives : 64u;
+        const uint32_t c_max_v = get_const_u32(max_v);
+        const uint32_t c_max_p = get_const_u32(max_p);
+
+        t_ptr_in_u32 = alloc_id();
+        EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_in_u32, kSpvStorageInput, t_u32});
+        var_local_idx = alloc_id();
+        EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_in_u32, var_local_idx, kSpvStorageInput});
+        EmitSpvInst(sec_decor, SpvOpDecorate, {var_local_idx, kSpvDecBuiltIn, kSpvBuiltInLocalInvocationIndex});
+        interface_vars.push_back(var_local_idx);
+
+        if (ir.uses_mesh_global_tid) {
+            const uint32_t t_ptr_in_v3u32 = alloc_id();
+            EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_in_v3u32, kSpvStorageInput, t_v3u32});
+            var_wg_id = alloc_id();
+            EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_in_v3u32, var_wg_id, kSpvStorageInput});
+            EmitSpvInst(sec_decor, SpvOpDecorate, {var_wg_id, kSpvDecBuiltIn, kSpvBuiltInWorkgroupId});
+            interface_vars.push_back(var_wg_id);
+        }
+
+        // Per-vertex gl_MeshVerticesEXT[] (Block-decorated struct with BuiltIn Position)
+        const uint32_t t_pervertex = alloc_id();
+        const uint32_t t_arr_pv = alloc_id();
+        const uint32_t t_ptr_out_pv_arr = alloc_id();
+        t_ptr_out_v4f32 = alloc_id();
+        EmitSpvInst(sec_types, SpvOpTypeStruct, {t_pervertex, t_v4f32});
+        EmitSpvInst(sec_decor, SpvOpDecorate, {t_pervertex, kSpvDecBlock});
+        EmitSpvInst(sec_decor, SpvOpMemberDecorate, {t_pervertex, 0u, kSpvDecBuiltIn, kSpvBuiltInPosition});
+        EmitSpvInst(sec_types, SpvOpTypeArray, {t_arr_pv, t_pervertex, c_max_v});
+        EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_out_pv_arr, kSpvStorageOutput, t_arr_pv});
+        EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_out_v4f32, kSpvStorageOutput, t_v4f32});
+        var_pervertex = alloc_id();
+        EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_out_pv_arr, var_pervertex, kSpvStorageOutput});
+        interface_vars.push_back(var_pervertex);
+
+        if (ir.exports_param0) {
+            const uint32_t t_arr_v4 = alloc_id();
+            const uint32_t t_ptr_out_arr_v4 = alloc_id();
+            EmitSpvInst(sec_types, SpvOpTypeArray, {t_arr_v4, t_v4f32, c_max_v});
+            EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_out_arr_v4, kSpvStorageOutput, t_arr_v4});
+            var_param0_out = alloc_id();
+            EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_out_arr_v4, var_param0_out, kSpvStorageOutput});
+            EmitSpvInst(sec_decor, SpvOpDecorate, {var_param0_out, kSpvDecLocation, 0u});
+            emit_interp_decor(var_param0_out, out_interp0);
+            interface_vars.push_back(var_param0_out);
+        }
+
+        // Primitive triangle indices output array
+        const uint32_t t_arr_prims = alloc_id();
+        const uint32_t t_ptr_out_prims = alloc_id();
+        t_ptr_out_v3u32 = alloc_id();
+        EmitSpvInst(sec_types, SpvOpTypeArray, {t_arr_prims, t_v3u32, c_max_p});
+        EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_out_prims, kSpvStorageOutput, t_arr_prims});
+        EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_out_v3u32, kSpvStorageOutput, t_v3u32});
+        var_mesh_prims = alloc_id();
+        EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_out_prims, var_mesh_prims, kSpvStorageOutput});
+        EmitSpvInst(sec_decor, SpvOpDecorate, {var_mesh_prims, kSpvDecBuiltIn, kSpvBuiltInPrimitiveTriangleIndicesEXT});
+        interface_vars.push_back(var_mesh_prims);
+
+        // Emit CullPrimitiveEXT as Block+bool struct array for older spirv-val (v2022.4+) compatibility!
+        if (ir.uses_mesh_cull) {
+            const uint32_t t_cull_blk = alloc_id();
+            const uint32_t t_arr_cull = alloc_id();
+            const uint32_t t_ptr_out_cull = alloc_id();
+            t_ptr_out_bool = alloc_id();
+            EmitSpvInst(sec_types, SpvOpTypeStruct, {t_cull_blk, t_bool});
+            EmitSpvInst(sec_decor, SpvOpDecorate, {t_cull_blk, kSpvDecBlock});
+            EmitSpvInst(sec_decor, SpvOpMemberDecorate, {t_cull_blk, 0u, kSpvDecBuiltIn, kSpvBuiltInCullPrimitiveEXT});
+            EmitSpvInst(sec_types, SpvOpTypeArray, {t_arr_cull, t_cull_blk, c_max_p});
+            EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_out_cull, kSpvStorageOutput, t_arr_cull});
+            EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_out_bool, kSpvStorageOutput, t_bool});
+            var_mesh_cull = alloc_id();
+            EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_out_cull, var_mesh_cull, kSpvStorageOutput});
+            EmitSpvInst(sec_decor, SpvOpDecorate, {var_mesh_cull, kSpvDecPerPrimitiveEXT});
+            interface_vars.push_back(var_mesh_cull);
         }
     }
 
@@ -2177,6 +2642,7 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
             var_param0_in = alloc_id();
             EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_in_v4f32, var_param0_in, kSpvStorageInput});
             EmitSpvInst(sec_decor, SpvOpDecorate, {var_param0_in, kSpvDecLocation, 0u});
+            emit_interp_decor(var_param0_in, in_interp0);
             interface_vars.push_back(var_param0_in);
         }
         t_ptr_out_v4f32 = alloc_id();
@@ -2193,6 +2659,7 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         uint32_t exec_model = 5u;  // GLCompute
         if (ir.stage == ShaderStage::Vertex) exec_model = 0u;
         else if (ir.stage == ShaderStage::Pixel) exec_model = 4u;
+        else if (ir.stage == ShaderStage::Mesh) exec_model = kSpvExecModelMeshEXT;
 
         std::vector<uint32_t> ops = {exec_model, main_fn_id};
         AppendSpvString(ops, "main");
@@ -2204,6 +2671,14 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                         {main_fn_id, 17u, ir.threadgroup_x, ir.threadgroup_y, ir.threadgroup_z});
         } else if (ir.stage == ShaderStage::Pixel) {
             EmitSpvInst(sec_exec, SpvOpExecutionMode, {main_fn_id, 7u});  // OriginUpperLeft
+        } else if (ir.stage == ShaderStage::Mesh) {
+            const uint32_t max_v = ir.mesh_max_vertices ? ir.mesh_max_vertices : 64u;
+            const uint32_t max_p = ir.mesh_max_primitives ? ir.mesh_max_primitives : 64u;
+            EmitSpvInst(sec_exec, SpvOpExecutionMode,
+                        {main_fn_id, 17u, ir.threadgroup_x, ir.threadgroup_y, ir.threadgroup_z});
+            EmitSpvInst(sec_exec, SpvOpExecutionMode, {main_fn_id, kSpvExecModeOutputVertices, max_v});
+            EmitSpvInst(sec_exec, SpvOpExecutionMode, {main_fn_id, kSpvExecModeOutputPrimitivesEXT, max_p});
+            EmitSpvInst(sec_exec, SpvOpExecutionMode, {main_fn_id, kSpvExecModeOutputTrianglesEXT});
         }
     }
 
@@ -2301,13 +2776,23 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         EmitSpvInst(sec_fn, SpvOpControlBarrier, {c_scope, c_scope, c_sem});
     };
 
-    auto emit_lane_id = [&]() -> uint32_t {
+    auto emit_guest_wave_coords = [&](uint32_t& out_gw_id, uint32_t& out_gw_lane, uint32_t& out_gw_base) {
         const uint32_t raw_idx = alloc_id();
         EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, raw_idx, var_local_idx});
-        const uint32_t mask = (ir.wave_size == 64u) ? c_u32_63 : c_u32_31;
-        const uint32_t lane = alloc_id();
-        EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, lane, raw_idx, mask});
-        return lane;
+        const uint32_t shift_c = get_const_u32((ir.wave_size == 64u) ? 6u : 5u);
+        const uint32_t mask_c = (ir.wave_size == 64u) ? c_u32_63 : c_u32_31;
+        out_gw_id = alloc_id();
+        out_gw_lane = alloc_id();
+        out_gw_base = alloc_id();
+        EmitSpvInst(sec_fn, SpvOpShiftRightLogical, {t_u32, out_gw_id, raw_idx, shift_c});
+        EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, out_gw_lane, raw_idx, mask_c});
+        EmitSpvInst(sec_fn, SpvOpShiftLeftLogical, {t_u32, out_gw_base, out_gw_id, shift_c});
+    };
+
+    auto emit_lane_id = [&]() -> uint32_t {
+        uint32_t gw_id = 0, gw_lane = 0, gw_base = 0;
+        emit_guest_wave_coords(gw_id, gw_lane, gw_base);
+        return gw_lane;
     };
 
     // Precompute any Phi incoming edge coercions
@@ -2418,8 +2903,34 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                         uint32_t vid_i32 = alloc_id();
                         EmitSpvInst(sec_fn, SpvOpLoad, {t_i32, vid_i32, var_vid});
                         EmitSpvInst(sec_fn, SpvOpBitcast, {t_u32, res, vid_i32});
+                    } else if (ir.stage == ShaderStage::Mesh) {
+                        EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, res, var_local_idx});
                     }
                     break;
+                case IrOp::MeshGlobalThreadId: {
+                    const uint32_t nt = inst.imm_u32 ? inst.imm_u32 : ir.mesh_num_threads;
+                    uint32_t ptr_gx = alloc_id();
+                    uint32_t gx = alloc_id();
+                    uint32_t lidx = alloc_id();
+                    uint32_t prod = alloc_id();
+                    EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_in_u32, ptr_gx, var_wg_id, c_u32_0});
+                    EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, gx, ptr_gx});
+                    EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, lidx, var_local_idx});
+                    EmitSpvInst(sec_fn, SpvOpIMul, {t_u32, prod, gx, get_const_u32(nt)});
+                    EmitSpvInst(sec_fn, SpvOpIAdd, {t_u32, res, prod, lidx});
+                    break;
+                }
+                case IrOp::MergedWaveInfo: {
+                    const uint32_t tg_total = std::max(1u, ir.threadgroup_x * ir.threadgroup_y * ir.threadgroup_z);
+                    const uint32_t ws = (ir.wave_size == 64u) ? 64u : 32u;
+                    const uint32_t nwaves = std::min(15u, std::max(1u, (tg_total + ws - 1u) / ws));
+                    Rdna2MergedWaveInfo mwi{};
+                    mwi.es_thread_count = static_cast<uint8_t>(std::min(255u, std::min(ws, tg_total)));
+                    mwi.gs_thread_count = static_cast<uint8_t>(std::min(255u, tg_total));
+                    mwi.waves_in_group = static_cast<uint8_t>(nwaves);
+                    EmitSpvInst(sec_fn, SpvOpIAdd, {t_u32, res, get_const_u32(PackMergedWaveInfo(mwi)), c_u32_0});
+                    break;
+                }
                 case IrOp::StageInput: {
                     uint32_t v4 = alloc_id();
                     EmitSpvInst(sec_fn, SpvOpLoad, {t_v4f32, v4, var_param0_in});
@@ -2451,7 +2962,235 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                     EmitSpvInst(sec_fn, SpvOpShiftRightLogical, {t_u32, dword_idx, byte_off, c_u32_2});
                     uint32_t ptr = alloc_id();
                     EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_sb_u32, ptr, var_buf, c_i32_0, dword_idx});
-                    EmitSpvInst(sec_fn, SpvOpStore, {ptr, data_u32});
+                    if (inst.exec_pred != kInvalidIrValue) {
+                        uint32_t pred = get_as_bool(inst.exec_pred);
+                        uint32_t lbl_then = alloc_id();
+                        uint32_t lbl_merge = alloc_id();
+                        EmitSpvInst(sec_fn, SpvOpSelectionMerge, {lbl_merge, 0u});
+                        EmitSpvInst(sec_fn, SpvOpBranchConditional, {pred, lbl_then, lbl_merge});
+                        EmitSpvInst(sec_fn, SpvOpLabel, {lbl_then});
+                        EmitSpvInst(sec_fn, SpvOpStore, {ptr, data_u32});
+                        EmitSpvInst(sec_fn, SpvOpBranch, {lbl_merge});
+                        EmitSpvInst(sec_fn, SpvOpLabel, {lbl_merge});
+                    } else {
+                        EmitSpvInst(sec_fn, SpvOpStore, {ptr, data_u32});
+                    }
+                    break;
+                }
+                case IrOp::BufferLoadFormat: {
+                    // UB-free sub-dword merge (all shift amounts strictly < 32) + MTBUF D16 format conversion
+                    const uint32_t uav_slot = inst.imm_u32 & 0xFu;
+                    const uint32_t fmt = (inst.imm_u32 >> 4) & 0x7Fu;
+                    const uint32_t comp_idx = (inst.imm_u32 >> 12) & 0xFu;
+                    const bool is_d16 = ((inst.imm_u32 >> 16) & 1u) != 0u;
+                    const bool has_hi = ((inst.imm_u32 >> 17) & 1u) != 0u;
+                    const uint32_t var_buf = (uav_slot == 1u && var_uav1 != 0u) ? var_uav1 : var_uav0;
+                    uint32_t elem_bytes = 4u;
+                    if (fmt == 1u || fmt == 2u || fmt == 3u || fmt == 4u ||
+                        fmt == 10u || fmt == 11u || fmt == 12u || fmt == 13u ||
+                        fmt == 28u || fmt == 29u || fmt == 30u || fmt == 31u) {
+                        elem_bytes = 1u;
+                    } else if (fmt == 5u || fmt == 6u || fmt == 7u || fmt == 8u || fmt == 9u ||
+                               fmt == 17u || fmt == 18u || fmt == 19u || fmt == 20u || fmt == 21u ||
+                               fmt == 47u || fmt == 48u || fmt == 49u || fmt == 50u || fmt == 51u) {
+                        elem_bytes = 2u;
+                    }
+                    const uint32_t c_u32_3 = get_const_u32(3u);
+                    const uint32_t c_u32_24 = get_const_u32(24u);
+                    const uint32_t c_u32_255 = get_const_u32(255u);
+                    const uint32_t c_f32_inv255 = get_const_f32(1.0f / 255.0f);
+                    const uint32_t c_f32_inv127 = get_const_f32(1.0f / 127.0f);
+                    const uint32_t c_f32_inv65535 = get_const_f32(1.0f / 65535.0f);
+                    const uint32_t c_f32_inv32767 = get_const_f32(1.0f / 32767.0f);
+                    const uint32_t c_f32_neg1 = get_const_f32(-1.0f);
+
+                    auto load_unaligned_u32 = [&](uint32_t addr_id) -> uint32_t {
+                        uint32_t dw0 = alloc_id();
+                        uint32_t dw1 = alloc_id();
+                        uint32_t ptr0 = alloc_id();
+                        uint32_t ptr1 = alloc_id();
+                        uint32_t w0 = alloc_id();
+                        uint32_t w1 = alloc_id();
+                        uint32_t byte_rem = alloc_id();
+                        uint32_t bit_off = alloc_id();
+                        uint32_t lo_part = alloc_id();
+                        uint32_t raw_hi_sh = alloc_id();
+                        uint32_t safe_hi_sh = alloc_id();
+                        uint32_t hi_shifted = alloc_id();
+                        uint32_t nz = alloc_id();
+                        uint32_t hi_part = alloc_id();
+                        uint32_t merged = alloc_id();
+                        EmitSpvInst(sec_fn, SpvOpShiftRightLogical, {t_u32, dw0, addr_id, c_u32_2});
+                        EmitSpvInst(sec_fn, SpvOpIAdd, {t_u32, dw1, dw0, c_u32_1});
+                        EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_sb_u32, ptr0, var_buf, c_i32_0, dw0});
+                        EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_sb_u32, ptr1, var_buf, c_i32_0, dw1});
+                        EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, w0, ptr0});
+                        EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, w1, ptr1});
+                        EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, byte_rem, addr_id, c_u32_3});
+                        EmitSpvInst(sec_fn, SpvOpShiftLeftLogical, {t_u32, bit_off, byte_rem, get_const_u32(3u)});
+                        EmitSpvInst(sec_fn, SpvOpShiftRightLogical, {t_u32, lo_part, w0, bit_off});
+                        EmitSpvInst(sec_fn, SpvOpISub, {t_u32, raw_hi_sh, c_u32_32, bit_off});
+                        EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, safe_hi_sh, raw_hi_sh, c_u32_31});
+                        EmitSpvInst(sec_fn, SpvOpShiftLeftLogical, {t_u32, hi_shifted, w1, safe_hi_sh});
+                        EmitSpvInst(sec_fn, SpvOpINotEqual, {t_bool, nz, bit_off, c_u32_0});
+                        EmitSpvInst(sec_fn, SpvOpSelect, {t_u32, hi_part, nz, hi_shifted, c_u32_0});
+                        EmitSpvInst(sec_fn, SpvOpBitwiseOr, {t_u32, merged, lo_part, hi_part});
+                        return merged;
+                    };
+
+                    auto decode_comp = [&](uint32_t raw_u, bool d16_out) -> uint32_t {
+                        auto pack_f32_out = [&](uint32_t f_id) -> uint32_t {
+                            if (d16_out) {
+                                uint32_t v2 = alloc_id();
+                                uint32_t pk = alloc_id();
+                                uint32_t lo = alloc_id();
+                                EmitSpvInst(sec_fn, SpvOpCompositeConstruct, {t_v2f32, v2, f_id, c_f32_0});
+                                EmitSpvInst(sec_fn, SpvOpExtInst, {t_u32, pk, glsl_ext_id, GlslPackHalf2x16, v2});
+                                EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, lo, pk, c_u32_65535});
+                                return lo;
+                            }
+                            uint32_t u = alloc_id();
+                            EmitSpvInst(sec_fn, SpvOpBitcast, {t_u32, u, f_id});
+                            return u;
+                        };
+                        if (fmt == 1u || fmt == 10u || fmt == 28u) {  // R8 UNORM
+                            uint32_t b = alloc_id();
+                            uint32_t f = alloc_id();
+                            uint32_t s = alloc_id();
+                            EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, b, raw_u, c_u32_255});
+                            EmitSpvInst(sec_fn, SpvOpConvertUToF, {t_f32, f, b});
+                            EmitSpvInst(sec_fn, SpvOpFMul, {t_f32, s, f, c_f32_inv255});
+                            return pack_f32_out(s);
+                        }
+                        if (fmt == 2u || fmt == 11u || fmt == 29u) {  // R8 SNORM
+                            uint32_t shl = alloc_id();
+                            uint32_t shl_i = alloc_id();
+                            uint32_t sext = alloc_id();
+                            uint32_t f = alloc_id();
+                            uint32_t sc = alloc_id();
+                            uint32_t lo = alloc_id();
+                            uint32_t cl = alloc_id();
+                            EmitSpvInst(sec_fn, SpvOpShiftLeftLogical, {t_u32, shl, raw_u, c_u32_24});
+                            EmitSpvInst(sec_fn, SpvOpBitcast, {t_i32, shl_i, shl});
+                            EmitSpvInst(sec_fn, SpvOpShiftRightArithmetic, {t_i32, sext, shl_i, c_u32_24});
+                            EmitSpvInst(sec_fn, SpvOpConvertSToF, {t_f32, f, sext});
+                            EmitSpvInst(sec_fn, SpvOpFMul, {t_f32, sc, f, c_f32_inv127});
+                            EmitSpvInst(sec_fn, SpvOpExtInst, {t_f32, lo, glsl_ext_id, GlslFMax, sc, c_f32_neg1});
+                            EmitSpvInst(sec_fn, SpvOpExtInst, {t_f32, cl, glsl_ext_id, GlslFMin, lo, c_f32_1});
+                            return pack_f32_out(cl);
+                        }
+                        if (fmt == 3u || fmt == 12u || fmt == 30u) {  // R8 UINT
+                            uint32_t b = alloc_id();
+                            EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, b, raw_u, c_u32_255});
+                            return b;
+                        }
+                        if (fmt == 4u || fmt == 13u || fmt == 31u) {  // R8 SINT
+                            uint32_t shl = alloc_id();
+                            uint32_t shl_i = alloc_id();
+                            uint32_t sext = alloc_id();
+                            uint32_t su = alloc_id();
+                            EmitSpvInst(sec_fn, SpvOpShiftLeftLogical, {t_u32, shl, raw_u, c_u32_24});
+                            EmitSpvInst(sec_fn, SpvOpBitcast, {t_i32, shl_i, shl});
+                            EmitSpvInst(sec_fn, SpvOpShiftRightArithmetic, {t_i32, sext, shl_i, c_u32_24});
+                            EmitSpvInst(sec_fn, SpvOpBitcast, {t_u32, su, sext});
+                            if (!d16_out) return su;
+                            uint32_t lo = alloc_id();
+                            EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, lo, su, c_u32_65535});
+                            return lo;
+                        }
+                        if (fmt == 5u || fmt == 17u || fmt == 47u) {  // R16 UNORM
+                            uint32_t h = alloc_id();
+                            uint32_t f = alloc_id();
+                            uint32_t s = alloc_id();
+                            EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, h, raw_u, c_u32_65535});
+                            EmitSpvInst(sec_fn, SpvOpConvertUToF, {t_f32, f, h});
+                            EmitSpvInst(sec_fn, SpvOpFMul, {t_f32, s, f, c_f32_inv65535});
+                            return pack_f32_out(s);
+                        }
+                        if (fmt == 6u || fmt == 18u || fmt == 48u) {  // R16 SNORM
+                            uint32_t shl = alloc_id();
+                            uint32_t shl_i = alloc_id();
+                            uint32_t sext = alloc_id();
+                            uint32_t f = alloc_id();
+                            uint32_t sc = alloc_id();
+                            uint32_t lo = alloc_id();
+                            uint32_t cl = alloc_id();
+                            EmitSpvInst(sec_fn, SpvOpShiftLeftLogical, {t_u32, shl, raw_u, c_u32_16});
+                            EmitSpvInst(sec_fn, SpvOpBitcast, {t_i32, shl_i, shl});
+                            EmitSpvInst(sec_fn, SpvOpShiftRightArithmetic, {t_i32, sext, shl_i, c_u32_16});
+                            EmitSpvInst(sec_fn, SpvOpConvertSToF, {t_f32, f, sext});
+                            EmitSpvInst(sec_fn, SpvOpFMul, {t_f32, sc, f, c_f32_inv32767});
+                            EmitSpvInst(sec_fn, SpvOpExtInst, {t_f32, lo, glsl_ext_id, GlslFMax, sc, c_f32_neg1});
+                            EmitSpvInst(sec_fn, SpvOpExtInst, {t_f32, cl, glsl_ext_id, GlslFMin, lo, c_f32_1});
+                            return pack_f32_out(cl);
+                        }
+                        if (fmt == 7u || fmt == 19u || fmt == 49u) {  // R16 UINT
+                            uint32_t h = alloc_id();
+                            EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, h, raw_u, c_u32_65535});
+                            return h;
+                        }
+                        if (fmt == 8u || fmt == 20u || fmt == 50u) {  // R16 SINT
+                            uint32_t shl = alloc_id();
+                            uint32_t shl_i = alloc_id();
+                            uint32_t sext = alloc_id();
+                            uint32_t su = alloc_id();
+                            EmitSpvInst(sec_fn, SpvOpShiftLeftLogical, {t_u32, shl, raw_u, c_u32_16});
+                            EmitSpvInst(sec_fn, SpvOpBitcast, {t_i32, shl_i, shl});
+                            EmitSpvInst(sec_fn, SpvOpShiftRightArithmetic, {t_i32, sext, shl_i, c_u32_16});
+                            EmitSpvInst(sec_fn, SpvOpBitcast, {t_u32, su, sext});
+                            if (!d16_out) return su;
+                            uint32_t lo = alloc_id();
+                            EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, lo, su, c_u32_65535});
+                            return lo;
+                        }
+                        if (fmt == 9u || fmt == 21u || fmt == 51u) {  // R16 FLOAT
+                            uint32_t h = alloc_id();
+                            EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, h, raw_u, c_u32_65535});
+                            if (d16_out) return h;
+                            uint32_t v2 = alloc_id();
+                            uint32_t f = alloc_id();
+                            EmitSpvInst(sec_fn, SpvOpExtInst, {t_v2f32, v2, glsl_ext_id, GlslUnpackHalf2x16, h});
+                            EmitSpvInst(sec_fn, SpvOpCompositeExtract, {t_f32, f, v2, 0u});
+                            return pack_f32_out(f);
+                        }
+                        if (fmt == 14u || fmt == 15u) {  // R32 UINT/SINT
+                            if (!d16_out) return raw_u;
+                            uint32_t lo = alloc_id();
+                            EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, lo, raw_u, c_u32_65535});
+                            return lo;
+                        }
+                        if (d16_out) {
+                            uint32_t f = alloc_id();
+                            EmitSpvInst(sec_fn, SpvOpBitcast, {t_f32, f, raw_u});
+                            return pack_f32_out(f);
+                        }
+                        return raw_u;
+                    };
+
+                    const uint32_t base_addr = get_as_u32(inst.operands[0]);
+                    auto addr_at = [&](uint32_t off_bytes) -> uint32_t {
+                        if (off_bytes == 0u) return base_addr;
+                        uint32_t a = alloc_id();
+                        EmitSpvInst(sec_fn, SpvOpIAdd, {t_u32, a, base_addr, get_const_u32(off_bytes)});
+                        return a;
+                    };
+                    if (is_d16) {
+                        const uint32_t lo_u = decode_comp(load_unaligned_u32(addr_at(comp_idx * elem_bytes)), true);
+                        uint32_t hi_u = c_u32_0;
+                        if (has_hi) {
+                            hi_u = decode_comp(load_unaligned_u32(addr_at((comp_idx + 1u) * elem_bytes)), true);
+                        }
+                        uint32_t hi_sh = alloc_id();
+                        EmitSpvInst(sec_fn, SpvOpShiftLeftLogical, {t_u32, hi_sh, hi_u, c_u32_16});
+                        EmitSpvInst(sec_fn, SpvOpBitwiseOr, {t_u32, res, lo_u, hi_sh});
+                    } else {
+                        const uint32_t u = decode_comp(load_unaligned_u32(addr_at(comp_idx * elem_bytes)), false);
+                        if (CanonicalSpvKind(inst.type) == SpvValKind::F32) {
+                            EmitSpvInst(sec_fn, SpvOpBitcast, {t_f32, res, u});
+                        } else {
+                            EmitSpvInst(sec_fn, SpvOpIAdd, {t_u32, res, u, c_u32_0});
+                        }
+                    }
                     break;
                 }
                 case IrOp::ImageSample: {
@@ -2838,23 +3577,34 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                 }
                 case IrOp::WaveBallotLo:
                 case IrOp::WaveBallotHi: {
-                    // Race-free, branchless workgroup-emulated 64-lane ballot (works on any HW wave size!)
+                    if (ir.wave_size == 32u && inst.op == IrOp::WaveBallotHi) {
+                        // Guest Wave32 has no upper 32 lanes (isolated from 64-lane host wave upper half)
+                        EmitSpvInst(sec_fn, SpvOpIAdd, {t_u32, res, c_u32_0, c_u32_0});
+                        break;
+                    }
+                    // Race-free, per-guest-wave isolated ballot (works on 32-lane NVIDIA/WARP and 64-lane AMD host waves!)
                     const uint32_t c_scope = get_const_u32(kSpvScopeWorkgroup);
                     const uint32_t c_sem_none = get_const_u32(kSpvMemSemNone);
+                    uint32_t gw_id = 0, lane = 0, gw_base = 0;
+                    emit_guest_wave_coords(gw_id, lane, gw_base);
+                    uint32_t ballot_base = alloc_id();
+                    uint32_t ballot_hi_idx = alloc_id();
                     uint32_t ptr_b0 = alloc_id();
                     uint32_t ptr_b1 = alloc_id();
                     uint32_t clr0 = alloc_id();
                     uint32_t clr1 = alloc_id();
-                    EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_wg_u32, ptr_b0, var_w64_ballot, c_u32_0});
-                    EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_wg_u32, ptr_b1, var_w64_ballot, c_u32_1});
+                    EmitSpvInst(sec_fn, SpvOpShiftLeftLogical, {t_u32, ballot_base, gw_id, c_u32_1});
+                    EmitSpvInst(sec_fn, SpvOpIAdd, {t_u32, ballot_hi_idx, ballot_base, c_u32_1});
+                    EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_wg_u32, ptr_b0, var_w64_ballot, ballot_base});
+                    EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_wg_u32, ptr_b1, var_w64_ballot, ballot_hi_idx});
 
                     emit_wg_barrier();
                     EmitSpvInst(sec_fn, SpvOpAtomicAnd, {t_u32, clr0, ptr_b0, c_scope, c_sem_none, c_u32_0});
                     EmitSpvInst(sec_fn, SpvOpAtomicAnd, {t_u32, clr1, ptr_b1, c_scope, c_sem_none, c_u32_0});
                     emit_wg_barrier();
 
-                    uint32_t lane = emit_lane_id();
                     uint32_t word_idx = alloc_id();
+                    uint32_t slot_idx = alloc_id();
                     uint32_t bit_idx = alloc_id();
                     uint32_t bit_mask = alloc_id();
                     uint32_t contrib = alloc_id();
@@ -2863,10 +3613,11 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                     uint32_t pred = get_as_bool(inst.operands[0]);
 
                     EmitSpvInst(sec_fn, SpvOpShiftRightLogical, {t_u32, word_idx, lane, c_u32_5});
+                    EmitSpvInst(sec_fn, SpvOpIAdd, {t_u32, slot_idx, ballot_base, word_idx});
                     EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, bit_idx, lane, c_u32_31});
                     EmitSpvInst(sec_fn, SpvOpShiftLeftLogical, {t_u32, bit_mask, c_u32_1, bit_idx});
                     EmitSpvInst(sec_fn, SpvOpSelect, {t_u32, contrib, pred, bit_mask, c_u32_0});
-                    EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_wg_u32, ptr_bw, var_w64_ballot, word_idx});
+                    EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_wg_u32, ptr_bw, var_w64_ballot, slot_idx});
                     EmitSpvInst(sec_fn, SpvOpAtomicOr, {t_u32, or_old, ptr_bw, c_scope, c_sem_none, contrib});
 
                     emit_wg_barrier();
@@ -2920,19 +3671,29 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                 case IrOp::WaveReadFirstLane:
                 case IrOp::WaveReadLaneAt: {
                     uint32_t val_u32 = get_as_u32(inst.operands[0]);
-                    uint32_t lane = emit_lane_id();
+                    uint32_t gw_id = 0, lane = 0, gw_base = 0;
+                    emit_guest_wave_coords(gw_id, lane, gw_base);
+                    uint32_t me_raw = alloc_id();
+                    uint32_t me_idx = alloc_id();
                     uint32_t ptr_me = alloc_id();
                     emit_wg_barrier();
-                    EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_wg_u32, ptr_me, var_w64_lanes, lane});
+                    EmitSpvInst(sec_fn, SpvOpIAdd, {t_u32, me_raw, gw_base, lane});
+                    EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, me_idx, me_raw, c_w_lanes_mask});
+                    EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_wg_u32, ptr_me, var_w64_lanes, me_idx});
                     EmitSpvInst(sec_fn, SpvOpStore, {ptr_me, val_u32});
                     emit_wg_barrier();
 
-                    uint32_t src_idx = c_u32_0;
+                    const uint32_t lane_mask = (ir.wave_size == 64u) ? c_u32_63 : c_u32_31;
+                    uint32_t src_lane = c_u32_0;
                     if (inst.op == IrOp::WaveReadLaneAt) {
-                        src_idx = alloc_id();
-                        EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, src_idx, get_as_u32(inst.operands[1]), c_w_lanes_mask});
+                        src_lane = alloc_id();
+                        EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, src_lane, get_as_u32(inst.operands[1]), lane_mask});
                     }
+                    uint32_t src_raw = alloc_id();
+                    uint32_t src_idx = alloc_id();
                     uint32_t ptr_src = alloc_id();
+                    EmitSpvInst(sec_fn, SpvOpIAdd, {t_u32, src_raw, gw_base, src_lane});
+                    EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, src_idx, src_raw, c_w_lanes_mask});
                     EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_wg_u32, ptr_src, var_w64_lanes, src_idx});
                     if (CanonicalSpvKind(inst.type) == SpvValKind::F32) {
                         uint32_t loaded = alloc_id();
@@ -2947,16 +3708,19 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                     uint32_t val_u32 = get_as_u32(inst.operands[0]);
                     uint32_t s1_u32 = get_as_u32(inst.operands[1]);
                     uint32_t s2_u32 = get_as_u32(inst.operands[2]);
-                    uint32_t raw_idx = alloc_id();
-                    uint32_t lane = alloc_id();
+                    uint32_t gw_id = 0, lane = 0, gw_base = 0;
+                    emit_guest_wave_coords(gw_id, lane, gw_base);
+                    uint32_t me_raw = alloc_id();
+                    uint32_t me_idx = alloc_id();
                     uint32_t ptr_me = alloc_id();
-                    EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, raw_idx, var_local_idx});
-                    EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, lane, raw_idx, c_w_lanes_mask});
                     emit_wg_barrier();
-                    EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_wg_u32, ptr_me, var_w64_lanes, lane});
+                    EmitSpvInst(sec_fn, SpvOpIAdd, {t_u32, me_raw, gw_base, lane});
+                    EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, me_idx, me_raw, c_w_lanes_mask});
+                    EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_wg_u32, ptr_me, var_w64_lanes, me_idx});
                     EmitSpvInst(sec_fn, SpvOpStore, {ptr_me, val_u32});
                     emit_wg_barrier();
 
+                    const uint32_t lane_mask = (ir.wave_size == 64u) ? c_u32_63 : c_u32_31;
                     uint32_t row = alloc_id();
                     uint32_t row_base = alloc_id();
                     EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, row, lane, c_u32_15});
@@ -2972,6 +3736,8 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                     uint32_t shift = alloc_id();
                     uint32_t shifted = alloc_id();
                     uint32_t sel = alloc_id();
+                    uint32_t tgt_lane_raw = alloc_id();
+                    uint32_t tgt_lane = alloc_id();
                     uint32_t tgt_raw = alloc_id();
                     uint32_t tgt = alloc_id();
                     uint32_t ptr_tgt = alloc_id();
@@ -2981,7 +3747,9 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                     EmitSpvInst(sec_fn, SpvOpShiftLeftLogical, {t_u32, shift, nib, c_u32_2});
                     EmitSpvInst(sec_fn, SpvOpShiftRightLogical, {t_u32, shifted, word, shift});
                     EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, sel, shifted, c_u32_15});
-                    EmitSpvInst(sec_fn, SpvOpBitwiseOr, {t_u32, tgt_raw, row_base, sel});
+                    EmitSpvInst(sec_fn, SpvOpBitwiseOr, {t_u32, tgt_lane_raw, row_base, sel});
+                    EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, tgt_lane, tgt_lane_raw, lane_mask});
+                    EmitSpvInst(sec_fn, SpvOpIAdd, {t_u32, tgt_raw, gw_base, tgt_lane});
                     EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, tgt, tgt_raw, c_w_lanes_mask});
                     EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_wg_u32, ptr_tgt, var_w64_lanes, tgt});
                     if (CanonicalSpvKind(inst.type) == SpvValKind::F32) {
@@ -2993,6 +3761,53 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                     }
                     break;
                 }
+                case IrOp::SetMeshOutputCounts:
+                    if (is_mesh_stage) {
+                        EmitSpvInst(sec_fn, SpvOpSetMeshOutputsEXT,
+                                    {get_as_u32(inst.operands[0]), get_as_u32(inst.operands[1])});
+                    }
+                    break;
+                case IrOp::ExportMeshPrim:
+                    if (is_mesh_stage && var_mesh_prims != 0u) {
+                        uint32_t lidx = alloc_id();
+                        EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, lidx, var_local_idx});
+                        uint32_t i0 = 0, i1 = 0, i2 = 0;
+                        if (inst.imm_u32 == 1u) {
+                            const uint32_t p = get_as_u32(inst.operands[0]);
+                            const uint32_t c_m10 = get_const_u32(0x3FFu);
+                            const uint32_t c_sh10 = get_const_u32(10u);
+                            const uint32_t c_sh20 = get_const_u32(20u);
+                            uint32_t s1 = alloc_id();
+                            uint32_t s2 = alloc_id();
+                            i0 = alloc_id();
+                            i1 = alloc_id();
+                            i2 = alloc_id();
+                            EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, i0, p, c_m10});
+                            EmitSpvInst(sec_fn, SpvOpShiftRightLogical, {t_u32, s1, p, c_sh10});
+                            EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, i1, s1, c_m10});
+                            EmitSpvInst(sec_fn, SpvOpShiftRightLogical, {t_u32, s2, p, c_sh20});
+                            EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, i2, s2, c_m10});
+                        } else {
+                            i0 = get_as_u32(inst.operands[0]);
+                            i1 = get_as_u32(inst.operands[1]);
+                            i2 = get_as_u32(inst.operands[2]);
+                        }
+                        uint32_t tri = alloc_id();
+                        uint32_t ptr_p = alloc_id();
+                        EmitSpvInst(sec_fn, SpvOpCompositeConstruct, {t_v3u32, tri, i0, i1, i2});
+                        EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_out_v3u32, ptr_p, var_mesh_prims, lidx});
+                        EmitSpvInst(sec_fn, SpvOpStore, {ptr_p, tri});
+                    }
+                    break;
+                case IrOp::ExportMeshCull:
+                    if (is_mesh_stage && var_mesh_cull != 0u) {
+                        uint32_t lidx = alloc_id();
+                        uint32_t ptr_c = alloc_id();
+                        EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, lidx, var_local_idx});
+                        EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_out_bool, ptr_c, var_mesh_cull, lidx, c_i32_0});
+                        EmitSpvInst(sec_fn, SpvOpStore, {ptr_c, get_as_bool(inst.operands[0])});
+                    }
+                    break;
                 case IrOp::FAdd:
                     EmitSpvInst(sec_fn, SpvOpFAdd, {t_f32, res, get_as_f32(inst.operands[0]), get_as_f32(inst.operands[1])});
                     break;
@@ -3141,13 +3956,33 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                     break;
                 }
                 case IrOp::FMin:
-                    EmitSpvInst(sec_fn, SpvOpExtInst, {t_f32, res, glsl_ext_id, GlslFMin,
-                                                       get_as_f32(inst.operands[0]), get_as_f32(inst.operands[1])});
+                case IrOp::FMax: {
+                    const uint32_t fa = get_as_f32(inst.operands[0]);
+                    const uint32_t fb = get_as_f32(inst.operands[1]);
+                    const uint32_t c_abs_mask = get_const_u32(0x7FFFFFFFu);
+                    const uint32_t c_inf_bits = get_const_u32(0x7F800000u);
+                    const uint32_t c_qnan_bit = get_const_u32(0x00400000u);
+                    uint32_t a_bits = alloc_id(), b_bits = alloc_id();
+                    uint32_t aa = alloc_id(), ab = alloc_id();
+                    uint32_t na = alloc_id(), nb = alloc_id(), both_n = alloc_id();
+                    uint32_t qa_u = alloc_id(), qa_f = alloc_id();
+                    uint32_t mm = alloc_id(), s1 = alloc_id(), s2 = alloc_id();
+                    EmitSpvInst(sec_fn, SpvOpBitcast, {t_u32, a_bits, fa});
+                    EmitSpvInst(sec_fn, SpvOpBitcast, {t_u32, b_bits, fb});
+                    EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, aa, a_bits, c_abs_mask});
+                    EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, ab, b_bits, c_abs_mask});
+                    EmitSpvInst(sec_fn, SpvOpUGreaterThan, {t_bool, na, aa, c_inf_bits});
+                    EmitSpvInst(sec_fn, SpvOpUGreaterThan, {t_bool, nb, ab, c_inf_bits});
+                    EmitSpvInst(sec_fn, SpvOpLogicalAnd, {t_bool, both_n, na, nb});
+                    EmitSpvInst(sec_fn, SpvOpBitwiseOr, {t_u32, qa_u, a_bits, c_qnan_bit});
+                    EmitSpvInst(sec_fn, SpvOpBitcast, {t_f32, qa_f, qa_u});
+                    EmitSpvInst(sec_fn, SpvOpExtInst,
+                                {t_f32, mm, glsl_ext_id, (inst.op == IrOp::FMin) ? GlslFMin : GlslFMax, fa, fb});
+                    EmitSpvInst(sec_fn, SpvOpSelect, {t_f32, s1, nb, fa, mm});
+                    EmitSpvInst(sec_fn, SpvOpSelect, {t_f32, s2, na, fb, s1});
+                    EmitSpvInst(sec_fn, SpvOpSelect, {t_f32, res, both_n, qa_f, s2});
                     break;
-                case IrOp::FMax:
-                    EmitSpvInst(sec_fn, SpvOpExtInst, {t_f32, res, glsl_ext_id, GlslFMax,
-                                                       get_as_f32(inst.operands[0]), get_as_f32(inst.operands[1])});
-                    break;
+                }
                 case IrOp::FRcp:
                     EmitSpvInst(sec_fn, SpvOpFDiv, {t_f32, res, c_f32_1, get_as_f32(inst.operands[0])});
                     break;
@@ -3158,8 +3993,43 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                     EmitSpvInst(sec_fn, SpvOpExtInst, {t_f32, res, glsl_ext_id, GlslSqrt, get_as_f32(inst.operands[0])});
                     break;
                 case IrOp::FFloor:
-                    EmitSpvInst(sec_fn, SpvOpExtInst, {t_f32, res, glsl_ext_id, GlslFloor, get_as_f32(inst.operands[0])});
+                case IrOp::FCeil: {
+                    // IEEE/ISA-exact NaN quieting + denormal floor/ceil
+                    const uint32_t fx = get_as_f32(inst.operands[0]);
+                    const uint32_t c_abs_mask = get_const_u32(0x7FFFFFFFu);
+                    const uint32_t c_inf_bits = get_const_u32(0x7F800000u);
+                    const uint32_t c_qnan_bit = get_const_u32(0x00400000u);
+                    uint32_t bx = alloc_id(), ax = alloc_id();
+                    uint32_t is_nan = alloc_id();
+                    uint32_t qx_u = alloc_id(), qx_f = alloc_id();
+                    uint32_t exp_b = alloc_id(), mant_b = alloc_id();
+                    uint32_t exp_z = alloc_id(), mant_nz = alloc_id(), is_den = alloc_id();
+                    uint32_t sign_b = alloc_id(), is_neg = alloc_id();
+                    uint32_t den_res = alloc_id(), norm_res = alloc_id(), non_nan = alloc_id();
+                    EmitSpvInst(sec_fn, SpvOpBitcast, {t_u32, bx, fx});
+                    EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, ax, bx, c_abs_mask});
+                    EmitSpvInst(sec_fn, SpvOpUGreaterThan, {t_bool, is_nan, ax, c_inf_bits});
+                    EmitSpvInst(sec_fn, SpvOpBitwiseOr, {t_u32, qx_u, bx, c_qnan_bit});
+                    EmitSpvInst(sec_fn, SpvOpBitcast, {t_f32, qx_f, qx_u});
+                    EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, exp_b, bx, c_u32_exp_mask});
+                    EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, mant_b, bx, c_u32_mant_mask});
+                    EmitSpvInst(sec_fn, SpvOpIEqual, {t_bool, exp_z, exp_b, c_u32_0});
+                    EmitSpvInst(sec_fn, SpvOpINotEqual, {t_bool, mant_nz, mant_b, c_u32_0});
+                    EmitSpvInst(sec_fn, SpvOpLogicalAnd, {t_bool, is_den, exp_z, mant_nz});
+                    EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, sign_b, bx, c_u32_sign_mask});
+                    EmitSpvInst(sec_fn, SpvOpINotEqual, {t_bool, is_neg, sign_b, c_u32_0});
+                    if (inst.op == IrOp::FFloor) {
+                        EmitSpvInst(sec_fn, SpvOpSelect, {t_f32, den_res, is_neg, get_const_f32(-1.0f), c_f32_0});
+                        EmitSpvInst(sec_fn, SpvOpExtInst, {t_f32, norm_res, glsl_ext_id, GlslFloor, fx});
+                    } else {
+                        const uint32_t neg_zero = get_const_f32(-0.0f);
+                        EmitSpvInst(sec_fn, SpvOpSelect, {t_f32, den_res, is_neg, neg_zero, c_f32_1});
+                        EmitSpvInst(sec_fn, SpvOpExtInst, {t_f32, norm_res, glsl_ext_id, GlslCeil, fx});
+                    }
+                    EmitSpvInst(sec_fn, SpvOpSelect, {t_f32, non_nan, is_den, den_res, norm_res});
+                    EmitSpvInst(sec_fn, SpvOpSelect, {t_f32, res, is_nan, qx_f, non_nan});
                     break;
+                }
                 case IrOp::FFract:
                     EmitSpvInst(sec_fn, SpvOpExtInst, {t_f32, res, glsl_ext_id, GlslFract, get_as_f32(inst.operands[0])});
                     break;
@@ -3235,6 +4105,31 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                     } else {
                         EmitSpvInst(sec_fn, SpvOpShiftRightLogical, {t_u32, res, get_as_u32(inst.operands[0]), masked});
                     }
+                    break;
+                }
+                case IrOp::AlignByte: {
+                    // UB-free v_alignbyte_b32 in SPIR-V: every shift amount strictly < 32
+                    const uint32_t hi = get_as_u32(inst.operands[0]);
+                    const uint32_t lo = get_as_u32(inst.operands[1]);
+                    const uint32_t sel = get_as_u32(inst.operands[2]);
+                    const uint32_t c_u32_3 = get_const_u32(3u);
+                    uint32_t bs = alloc_id();
+                    uint32_t rsh = alloc_id();
+                    uint32_t lo_p = alloc_id();
+                    uint32_t raw_lsh = alloc_id();
+                    uint32_t lsh = alloc_id();
+                    uint32_t hi_sh = alloc_id();
+                    uint32_t nz = alloc_id();
+                    uint32_t hi_p = alloc_id();
+                    EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, bs, sel, c_u32_3});
+                    EmitSpvInst(sec_fn, SpvOpShiftLeftLogical, {t_u32, rsh, bs, c_u32_3});
+                    EmitSpvInst(sec_fn, SpvOpShiftRightLogical, {t_u32, lo_p, lo, rsh});
+                    EmitSpvInst(sec_fn, SpvOpISub, {t_u32, raw_lsh, c_u32_32, rsh});
+                    EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, lsh, raw_lsh, c_u32_31});
+                    EmitSpvInst(sec_fn, SpvOpShiftLeftLogical, {t_u32, hi_sh, hi, lsh});
+                    EmitSpvInst(sec_fn, SpvOpINotEqual, {t_bool, nz, rsh, c_u32_0});
+                    EmitSpvInst(sec_fn, SpvOpSelect, {t_u32, hi_p, nz, hi_sh, c_u32_0});
+                    EmitSpvInst(sec_fn, SpvOpBitwiseOr, {t_u32, res, lo_p, hi_p});
                     break;
                 }
                 case IrOp::BfeU32: {
@@ -3461,6 +4356,71 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                 case IrOp::CmpGeU:
                     EmitSpvInst(sec_fn, SpvOpUGreaterThanEqual, {t_bool, res, get_as_u32(inst.operands[0]), get_as_u32(inst.operands[1])});
                     break;
+                case IrOp::CmpF16: {
+                    const uint32_t imm = inst.imm_u32;
+                    const uint32_t pred = imm & 15u;
+                    const uint32_t op_sel = (imm >> 8) & 3u;
+                    const uint32_t neg_m = (imm >> 12) & 3u;
+                    const uint32_t abs_m = (imm >> 16) & 3u;
+                    auto unpack_h = [&](IrValueId v, uint32_t bit) -> uint32_t {
+                        uint32_t v2 = alloc_id();
+                        uint32_t elem = alloc_id();
+                        EmitSpvInst(sec_fn, SpvOpExtInst, {t_v2f32, v2, glsl_ext_id, GlslUnpackHalf2x16, get_as_u32(v)});
+                        EmitSpvInst(sec_fn, SpvOpCompositeExtract, {t_f32, elem, v2, ((op_sel & bit) != 0u) ? 1u : 0u});
+                        if ((abs_m & bit) != 0u) {
+                            uint32_t ab = alloc_id();
+                            EmitSpvInst(sec_fn, SpvOpExtInst, {t_f32, ab, glsl_ext_id, GlslFAbs, elem});
+                            elem = ab;
+                        }
+                        if ((neg_m & bit) != 0u) {
+                            uint32_t ng = alloc_id();
+                            EmitSpvInst(sec_fn, SpvOpFNegate, {t_f32, ng, elem});
+                            elem = ng;
+                        }
+                        return elem;
+                    };
+                    const uint32_t fa = unpack_h(inst.operands[0], 1u);
+                    const uint32_t fb = unpack_h(inst.operands[1], 2u);
+                    switch (pred) {
+                        case 0u: EmitSpvInst(sec_fn, SpvOpLogicalAnd, {t_bool, res, get_const_bool(false), get_const_bool(false)}); break;
+                        case 1u: EmitSpvInst(sec_fn, SpvOpFOrdLessThan, {t_bool, res, fa, fb}); break;
+                        case 2u: EmitSpvInst(sec_fn, SpvOpFOrdEqual, {t_bool, res, fa, fb}); break;
+                        case 3u: EmitSpvInst(sec_fn, SpvOpFOrdLessThanEqual, {t_bool, res, fa, fb}); break;
+                        case 4u: EmitSpvInst(sec_fn, SpvOpFOrdGreaterThan, {t_bool, res, fa, fb}); break;
+                        case 5u: EmitSpvInst(sec_fn, SpvOpFOrdNotEqual, {t_bool, res, fa, fb}); break;
+                        case 6u: EmitSpvInst(sec_fn, SpvOpFOrdGreaterThanEqual, {t_bool, res, fa, fb}); break;
+                        case 7u: {
+                            uint32_t na = alloc_id(), nb = alloc_id(), un = alloc_id();
+                            EmitSpvInst(sec_fn, SpvOpIsNan, {t_bool, na, fa});
+                            EmitSpvInst(sec_fn, SpvOpIsNan, {t_bool, nb, fb});
+                            EmitSpvInst(sec_fn, SpvOpLogicalOr, {t_bool, un, na, nb});
+                            EmitSpvInst(sec_fn, SpvOpLogicalNot, {t_bool, res, un});
+                            break;
+                        }
+                        case 8u: {
+                            uint32_t na = alloc_id(), nb = alloc_id();
+                            EmitSpvInst(sec_fn, SpvOpIsNan, {t_bool, na, fa});
+                            EmitSpvInst(sec_fn, SpvOpIsNan, {t_bool, nb, fb});
+                            EmitSpvInst(sec_fn, SpvOpLogicalOr, {t_bool, res, na, nb});
+                            break;
+                        }
+                        case 9u:  EmitSpvInst(sec_fn, SpvOpFUnordLessThan, {t_bool, res, fa, fb}); break;
+                        case 10u: EmitSpvInst(sec_fn, SpvOpFUnordEqual, {t_bool, res, fa, fb}); break;
+                        case 11u: EmitSpvInst(sec_fn, SpvOpFUnordLessThanEqual, {t_bool, res, fa, fb}); break;
+                        case 12u: EmitSpvInst(sec_fn, SpvOpFUnordGreaterThan, {t_bool, res, fa, fb}); break;
+                        case 13u: EmitSpvInst(sec_fn, SpvOpFUnordNotEqual, {t_bool, res, fa, fb}); break;
+                        case 14u: EmitSpvInst(sec_fn, SpvOpFUnordGreaterThanEqual, {t_bool, res, fa, fb}); break;
+                        case 15u:
+                        default:  EmitSpvInst(sec_fn, SpvOpLogicalOr, {t_bool, res, get_const_bool(true), get_const_bool(true)}); break;
+                    }
+                    break;
+                }
+                case IrOp::LogicalAnd:
+                    EmitSpvInst(sec_fn, SpvOpLogicalAnd, {t_bool, res, get_as_bool(inst.operands[0]), get_as_bool(inst.operands[1])});
+                    break;
+                case IrOp::LogicalNot:
+                    EmitSpvInst(sec_fn, SpvOpLogicalNot, {t_bool, res, get_as_bool(inst.operands[0])});
+                    break;
                 case IrOp::Select: {
                     const SpvValKind k = CanonicalSpvKind(inst.type);
                     const uint32_t c = get_as_bool(inst.operands[0]);
@@ -3489,10 +4449,24 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                     });
                     if (inst.export_target == static_cast<uint8_t>(Rdna2ExportTarget::Pos0) && var_pervertex != 0u) {
                         uint32_t ptr_pos = alloc_id();
-                        EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_out_v4f32, ptr_pos, var_pervertex, c_i32_0});
+                        if (is_mesh_stage) {
+                            uint32_t lidx = alloc_id();
+                            EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, lidx, var_local_idx});
+                            EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_out_v4f32, ptr_pos, var_pervertex, lidx, c_i32_0});
+                        } else {
+                            EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_out_v4f32, ptr_pos, var_pervertex, c_i32_0});
+                        }
                         EmitSpvInst(sec_fn, SpvOpStore, {ptr_pos, vec_id});
                     } else if (inst.export_target == static_cast<uint8_t>(Rdna2ExportTarget::Param0) && var_param0_out != 0u) {
-                        EmitSpvInst(sec_fn, SpvOpStore, {var_param0_out, vec_id});
+                        if (is_mesh_stage) {
+                            uint32_t lidx = alloc_id();
+                            uint32_t ptr_p0 = alloc_id();
+                            EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, lidx, var_local_idx});
+                            EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_out_v4f32, ptr_p0, var_param0_out, lidx});
+                            EmitSpvInst(sec_fn, SpvOpStore, {ptr_p0, vec_id});
+                        } else {
+                            EmitSpvInst(sec_fn, SpvOpStore, {var_param0_out, vec_id});
+                        }
                     } else if (inst.export_target == static_cast<uint8_t>(Rdna2ExportTarget::Mrt0) && var_mrt0 != 0u) {
                         EmitSpvInst(sec_fn, SpvOpStore, {var_mrt0, vec_id});
                     }
@@ -3556,13 +4530,13 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
 
     EmitSpvInst(sec_fn, SpvOpFunctionEnd, {});
 
-    // 7. Assemble final SPIR-V 1.3 binary stream
-    const size_t total_words = 5u + sec_caps.size() + sec_ext.size() + sec_mem.size() +
+    // 7. Assemble final SPIR-V 1.3 / 1.4 binary stream
+    const size_t total_words = 5u + sec_caps.size() + sec_exts.size() + sec_ext.size() + sec_mem.size() +
                                sec_entry.size() + sec_exec.size() + sec_decor.size() +
                                sec_types.size() + sec_globals.size() + sec_fn.size();
     out_spirv.reserve(total_words);
     out_spirv.push_back(kSpirvMagic);
-    out_spirv.push_back(kSpirvVersion13);
+    out_spirv.push_back(is_spirv14 ? kSpirvVersion14 : kSpirvVersion13);
     out_spirv.push_back(kSpirvGeneratorOpenScarlett);
     out_spirv.push_back(next_id);
     out_spirv.push_back(0u);
@@ -3571,6 +4545,7 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         out_spirv.insert(out_spirv.end(), s.begin(), s.end());
     };
     append_sec(sec_caps);
+    append_sec(sec_exts);
     append_sec(sec_ext);
     append_sec(sec_mem);
     append_sec(sec_entry);
@@ -3591,8 +4566,8 @@ Status ValidateSpirvBinary(const std::vector<uint32_t>& spirv) {
     if (spirv[0] != kSpirvMagic) {
         return Status::Error(StatusCode::ShaderError, "Invalid SPIR-V magic number");
     }
-    if (spirv[1] != kSpirvVersion13) {
-        return Status::Error(StatusCode::ShaderError, "Unexpected SPIR-V version (expected 1.3)");
+    if (spirv[1] != kSpirvVersion13 && spirv[1] != kSpirvVersion14) {
+        return Status::Error(StatusCode::ShaderError, "Unexpected SPIR-V version (expected 1.3 or 1.4)");
     }
     const uint32_t bound = spirv[3];
     if (bound < 2u) {
@@ -3881,7 +4856,11 @@ Status LiftRdna2Xs2Shader(
         CallTelemetry::Global().Record("rdna2_lifter", "LiftRdna2Xs2Shader", CallOutcome::Error, -2);
         return st;
     }
-    if (auto st = BuildRdna2Ir(out_result.container, out_result.instructions, out_result.ir); !st.ok()) {
+    const StageContractTable* contract_ptr =
+        (!options.stage_contract.vertex_fetches.empty() || !options.stage_contract.pixel_inputs.empty())
+            ? &options.stage_contract
+            : nullptr;
+    if (auto st = BuildRdna2Ir(out_result.container, out_result.instructions, out_result.ir, contract_ptr); !st.ok()) {
         CallTelemetry::Global().Record("rdna2_lifter", "LiftRdna2Xs2Shader", CallOutcome::Error, -3);
         return st;
     }
@@ -3895,7 +4874,8 @@ Status LiftRdna2Xs2Shader(
     const bool stage_supports_spirv =
         (out_result.ir.stage == ShaderStage::Compute ||
          out_result.ir.stage == ShaderStage::Vertex ||
-         out_result.ir.stage == ShaderStage::Pixel);
+         out_result.ir.stage == ShaderStage::Pixel ||
+         (out_result.ir.stage == ShaderStage::Mesh && options.emit_mesh_spirv));
 
     if (options.emit_spirv && stage_supports_spirv) {
         if (auto st = EmitSpirv(out_result.ir, out_result.spirv_words); !st.ok()) {
@@ -3907,8 +4887,11 @@ Status LiftRdna2Xs2Shader(
             return st;
         }
         if (options.validate_spirv_external) {
+            const std::string env = (out_result.ir.stage == ShaderStage::Mesh && options.spirv_target_env == "vulkan1.2")
+                                        ? "vulkan1.3"
+                                        : options.spirv_target_env;
             if (auto st = ValidateSpirvExternal(out_result.spirv_words, out_result.spirv_val_diagnostics,
-                                                options.spirv_val_path, options.spirv_target_env);
+                                                options.spirv_val_path, env);
                 !st.ok()) {
                 CallTelemetry::Global().Record("rdna2_lifter", "LiftRdna2Xs2Shader", CallOutcome::Error, -7);
                 return st;
@@ -3931,6 +4914,12 @@ Status LiftRdna2Xs2Shader(
                 !st.ok()) {
                 CallTelemetry::Global().Record("rdna2_lifter", "LiftRdna2Xs2Shader", CallOutcome::Error, -9);
                 return st;
+            }
+            if (options.resign_dxil && !VerifyDxbcContainerHash(out_result.pc_dxil.data(), out_result.pc_dxil.size())) {
+                if (auto rs = ResignDxilContainer(out_result.pc_dxil); !rs.ok()) {
+                    CallTelemetry::Global().Record("rdna2_lifter", "LiftRdna2Xs2Shader", CallOutcome::Error, -10);
+                    return rs;
+                }
             }
             out_result.pc_dxil_hash = HashBytesFnv1a(out_result.pc_dxil.data(), out_result.pc_dxil.size());
         }

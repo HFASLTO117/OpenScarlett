@@ -96,6 +96,197 @@ float FlushDenormF32(float x) noexcept {
     return x;
 }
 
+bool IsNanF32Bits(uint32_t bits) noexcept {
+    return (bits & 0x7FFFFFFFu) > 0x7F800000u;
+}
+
+float QuietNanF32(float x) noexcept {
+    const uint32_t bits = FloatToBits(x);
+    if (IsNanF32Bits(bits)) {
+        return BitsToFloat(bits | 0x00400000u);
+    }
+    return x;
+}
+
+float ExactFloorF32(float x) noexcept {
+    const uint32_t bits = FloatToBits(x);
+    if (IsNanF32Bits(bits)) {
+        return BitsToFloat(bits | 0x00400000u);
+    }
+    const bool is_denorm = ((bits & 0x7F800000u) == 0u) && ((bits & 0x007FFFFFu) != 0u);
+    if (is_denorm) {
+        return ((bits & 0x80000000u) != 0u) ? -1.0f : 0.0f;
+    }
+    return std::floor(x);
+}
+
+float ExactCeilF32(float x) noexcept {
+    const uint32_t bits = FloatToBits(x);
+    if (IsNanF32Bits(bits)) {
+        return BitsToFloat(bits | 0x00400000u);
+    }
+    const bool is_denorm = ((bits & 0x7F800000u) == 0u) && ((bits & 0x007FFFFFu) != 0u);
+    if (is_denorm) {
+        return ((bits & 0x80000000u) != 0u) ? BitsToFloat(0x80000000u) : 1.0f;
+    }
+    return std::ceil(x);
+}
+
+float ExactMinF32(float a, float b) noexcept {
+    const uint32_t ba = FloatToBits(a);
+    const uint32_t bb = FloatToBits(b);
+    const bool na = IsNanF32Bits(ba);
+    const bool nb = IsNanF32Bits(bb);
+    if (na && nb) return BitsToFloat(ba | 0x00400000u);
+    if (na) return b;
+    if (nb) return a;
+    return std::fmin(a, b);
+}
+
+float ExactMaxF32(float a, float b) noexcept {
+    const uint32_t ba = FloatToBits(a);
+    const uint32_t bb = FloatToBits(b);
+    const bool na = IsNanF32Bits(ba);
+    const bool nb = IsNanF32Bits(bb);
+    if (na && nb) return BitsToFloat(ba | 0x00400000u);
+    if (na) return b;
+    if (nb) return a;
+    return std::fmax(a, b);
+}
+
+uint32_t EvalAlignByteB32(uint32_t hi, uint32_t lo, uint32_t byte_sel) noexcept {
+    const uint32_t rshift = (byte_sel & 3u) << 3u;
+    const uint32_t lo_part = lo >> rshift;
+    const uint32_t hi_shift = (32u - rshift) & 31u;
+    const uint32_t hi_part = (rshift != 0u) ? (hi << hi_shift) : 0u;
+    return lo_part | hi_part;
+}
+
+bool EvalF16CompareCpu(Rdna2Opcode op, float a, float b) noexcept {
+    const bool unord = std::isnan(a) || std::isnan(b);
+    switch (op) {
+        case Rdna2Opcode::V_CMP_LT_F16:
+        case Rdna2Opcode::V_CMPX_LT_F16:  return !unord && (a < b);
+        case Rdna2Opcode::V_CMP_EQ_F16:
+        case Rdna2Opcode::V_CMPX_EQ_F16:  return !unord && (a == b);
+        case Rdna2Opcode::V_CMP_LE_F16:
+        case Rdna2Opcode::V_CMPX_LE_F16:  return !unord && (a <= b);
+        case Rdna2Opcode::V_CMP_GT_F16:
+        case Rdna2Opcode::V_CMPX_GT_F16:  return !unord && (a > b);
+        case Rdna2Opcode::V_CMP_LG_F16:
+        case Rdna2Opcode::V_CMPX_LG_F16:  return !unord && (a != b);
+        case Rdna2Opcode::V_CMP_GE_F16:
+        case Rdna2Opcode::V_CMPX_GE_F16:  return !unord && (a >= b);
+        case Rdna2Opcode::V_CMP_U_F16:    return unord;
+        case Rdna2Opcode::V_CMP_NGE_F16:  return unord || (a < b);
+        case Rdna2Opcode::V_CMP_NLG_F16:  return unord || (a == b);
+        case Rdna2Opcode::V_CMP_NGT_F16:  return unord || (a <= b);
+        case Rdna2Opcode::V_CMP_NLE_F16:  return unord || (a > b);
+        case Rdna2Opcode::V_CMP_NEQ_F16:
+        case Rdna2Opcode::V_CMPX_NEQ_F16: return unord || (a != b);
+        case Rdna2Opcode::V_CMP_NLT_F16:
+        case Rdna2Opcode::V_CMPX_NLT_F16: return unord || (a >= b);
+        case Rdna2Opcode::V_CMP_TRU_F16:  return true;
+        default:                          return false;
+    }
+}
+
+uint32_t ReadUnalignedU32Cpu(const std::vector<uint32_t>& buf, uint32_t byte_addr) noexcept {
+    // Strictly UB-free sub-dword merge: all shifts guarded < 32
+    const uint32_t aligned_addr = byte_addr & ~3u;
+    const uint32_t bit_off = (byte_addr & 3u) << 3u;
+    const size_t idx0 = static_cast<size_t>(aligned_addr >> 2);
+    const uint32_t w0 = (idx0 < buf.size()) ? buf[idx0] : 0u;
+    const uint32_t w1 = (idx0 + 1u < buf.size()) ? buf[idx0 + 1u] : 0u;
+    const uint32_t hi_shift = (32u - bit_off) & 31u;
+    return (w0 >> bit_off) | ((bit_off != 0u) ? (w1 << hi_shift) : 0u);
+}
+
+uint32_t DecodeFormatComponentCpu(
+    const std::vector<uint32_t>& buf,
+    uint32_t base_byte_addr,
+    Rdna2MtbufFormat fmt,
+    uint32_t comp_idx,
+    bool as_d16_lane) noexcept {
+    auto read_u8 = [&](uint32_t off) -> uint32_t {
+        return ReadUnalignedU32Cpu(buf, base_byte_addr + off) & 0xFFu;
+    };
+    auto read_u16 = [&](uint32_t off) -> uint32_t {
+        return ReadUnalignedU32Cpu(buf, base_byte_addr + off) & 0xFFFFu;
+    };
+    auto read_u32 = [&](uint32_t off) -> uint32_t {
+        return ReadUnalignedU32Cpu(buf, base_byte_addr + off);
+    };
+    auto to_out_float = [&](float f) -> uint32_t {
+        return as_d16_lane ? static_cast<uint32_t>(FloatToHalfBits(f)) : FloatToBits(f);
+    };
+    auto to_out_u16 = [&](uint32_t u) -> uint32_t {
+        return as_d16_lane ? (u & 0xFFFFu) : u;
+    };
+
+    switch (fmt) {
+        case Rdna2MtbufFormat::R8_UNORM:
+        case Rdna2MtbufFormat::R8G8_UNORM:
+        case Rdna2MtbufFormat::R8G8B8A8_UNORM:
+            return to_out_float(static_cast<float>(read_u8(comp_idx)) / 255.0f);
+        case Rdna2MtbufFormat::R8_SNORM:
+        case Rdna2MtbufFormat::R8G8_SNORM:
+        case Rdna2MtbufFormat::R8G8B8A8_SNORM: {
+            const int8_t s = static_cast<int8_t>(read_u8(comp_idx));
+            const float f = std::clamp(static_cast<float>(s) / 127.0f, -1.0f, 1.0f);
+            return to_out_float(f);
+        }
+        case Rdna2MtbufFormat::R8_UINT:
+        case Rdna2MtbufFormat::R8G8_UINT:
+        case Rdna2MtbufFormat::R8G8B8A8_UINT:
+            return to_out_u16(read_u8(comp_idx));
+        case Rdna2MtbufFormat::R8_SINT:
+        case Rdna2MtbufFormat::R8G8_SINT:
+        case Rdna2MtbufFormat::R8G8B8A8_SINT: {
+            const int32_t s = static_cast<int8_t>(read_u8(comp_idx));
+            return to_out_u16(static_cast<uint32_t>(s));
+        }
+        case Rdna2MtbufFormat::R16_UNORM:
+        case Rdna2MtbufFormat::R16G16_UNORM:
+        case Rdna2MtbufFormat::R16G16B16A16_UNORM:
+            return to_out_float(static_cast<float>(read_u16(comp_idx * 2u)) / 65535.0f);
+        case Rdna2MtbufFormat::R16_SNORM:
+        case Rdna2MtbufFormat::R16G16_SNORM:
+        case Rdna2MtbufFormat::R16G16B16A16_SNORM: {
+            const int16_t s = static_cast<int16_t>(read_u16(comp_idx * 2u));
+            const float f = std::clamp(static_cast<float>(s) / 32767.0f, -1.0f, 1.0f);
+            return to_out_float(f);
+        }
+        case Rdna2MtbufFormat::R16_UINT:
+        case Rdna2MtbufFormat::R16G16_UINT:
+        case Rdna2MtbufFormat::R16G16B16A16_UINT:
+            return to_out_u16(read_u16(comp_idx * 2u));
+        case Rdna2MtbufFormat::R16_SINT:
+        case Rdna2MtbufFormat::R16G16_SINT:
+        case Rdna2MtbufFormat::R16G16B16A16_SINT: {
+            const int32_t s = static_cast<int16_t>(read_u16(comp_idx * 2u));
+            return to_out_u16(static_cast<uint32_t>(s));
+        }
+        case Rdna2MtbufFormat::R16_FLOAT:
+        case Rdna2MtbufFormat::R16G16_FLOAT:
+        case Rdna2MtbufFormat::R16G16B16A16_FLOAT: {
+            const uint16_t h = static_cast<uint16_t>(read_u16(comp_idx * 2u));
+            return as_d16_lane ? static_cast<uint32_t>(h) : FloatToBits(HalfBitsToFloat(h));
+        }
+        case Rdna2MtbufFormat::R32_UINT:
+        case Rdna2MtbufFormat::R32_SINT:
+            return to_out_u16(read_u32(comp_idx * 4u));
+        case Rdna2MtbufFormat::R32_FLOAT:
+        case Rdna2MtbufFormat::R32G32_FLOAT:
+        case Rdna2MtbufFormat::R32G32B32_FLOAT:
+        case Rdna2MtbufFormat::R32G32B32A32_FLOAT:
+        default: {
+            const uint32_t raw = read_u32(comp_idx * 4u);
+            return as_d16_lane ? static_cast<uint32_t>(FloatToHalfBits(BitsToFloat(raw))) : raw;
+        }
+    }
+}
+
 float EvalMadF32(float a, float b, float c) noexcept {
     const float fa = FlushDenormF32(a);
     const float fb = FlushDenormF32(b);
@@ -306,6 +497,7 @@ struct CpuWaveState {
     uint64_t vcc = 0;
     bool scc = false;
     uint32_t m0 = 0;
+    bool m0_written = false;
 
     size_t pc = 0;
     size_t cur_reconv_pc = SIZE_MAX;
@@ -492,6 +684,17 @@ Status ExecuteRdna2Cpu(
                     for (size_t rc = 0; rc < std::min<size_t>(16u, state.root_constants.size()); ++rc) {
                         wv.sgpr[rc] = state.root_constants[rc];
                     }
+                    // Seed full GFX10.3 merged_wave_info in s3 for Mesh/Geometry shaders (when not overridden by root_constants)
+                    if ((container.stage == ShaderStage::Mesh || container.stage == ShaderStage::Geometry) &&
+                        state.root_constants.size() <= 3u) {
+                        Rdna2MergedWaveInfo mwi{};
+                        mwi.es_thread_count = static_cast<uint8_t>(std::min(255u, wv.lane_count));
+                        mwi.gs_thread_count = static_cast<uint8_t>(std::min(255u, tg_threads));
+                        mwi.gs_wave_id = static_cast<uint8_t>(w & 0xFFu);
+                        mwi.wave_in_group_idx = static_cast<uint8_t>(w & 0xFu);
+                        mwi.waves_in_group = static_cast<uint8_t>(std::min(15u, num_waves));
+                        wv.sgpr[3] = PackMergedWaveInfo(mwi);
+                    }
 
                     for (uint32_t l = 0; l < wv.lane_count; ++l) {
                         const uint32_t local_idx = wv.base_local_idx + l;
@@ -510,6 +713,10 @@ Status ExecuteRdna2Cpu(
                         } else if (container.stage == ShaderStage::Mesh ||
                                    container.stage == ShaderStage::Amplification) {
                             wv.vgpr[l][0] = local_idx;
+                            // Register mesh NumThreads (tg_threads) before v5 workgroup seeding: group * NumThreads + lane
+                            if (container.stage == ShaderStage::Mesh) {
+                                wv.vgpr[l][5] = group_linear * tg_threads + local_idx;
+                            }
                         } else {
                             // 1D / Compute / Vertex: SV_DispatchThreadID.x = gx * tg_x + lx
                             wv.vgpr[l][0] = gx * tg_x + lx;
@@ -593,7 +800,10 @@ Status ExecuteRdna2Cpu(
                             };
 
                             auto clamp_f32 = [&](float v) -> float {
-                                return inst.clamp ? std::fmin(std::fmax(v, 0.0f), 1.0f) : v;
+                                const float q = QuietNanF32(v);
+                                if (!inst.clamp) return q;
+                                if (IsNanF32Bits(FloatToBits(q))) return 0.0f;
+                                return std::fmin(std::fmax(q, 0.0f), 1.0f);
                             };
 
                             auto write_sgpr = [&](const Rdna2Operand& dst, uint32_t val) {
@@ -603,8 +813,13 @@ Status ExecuteRdna2Cpu(
                                     wv.vcc = (wv.vcc & 0xFFFFFFFF00000000ull) | val;
                                 } else if (dst.kind == Rdna2OperandKind::VccHi) {
                                     wv.vcc = (wv.vcc & 0x00000000FFFFFFFFull) | (static_cast<uint64_t>(val) << 32);
+                                } else if (dst.kind == Rdna2OperandKind::ExecLo) {
+                                    wv.exec = (wv.exec & 0xFFFFFFFF00000000ull) | val;
+                                } else if (dst.kind == Rdna2OperandKind::ExecHi) {
+                                    wv.exec = (wv.exec & 0x00000000FFFFFFFFull) | (static_cast<uint64_t>(val) << 32);
                                 } else if (dst.kind == Rdna2OperandKind::M0) {
                                     wv.m0 = val;
+                                    wv.m0_written = true;
                                 }
                             };
 
@@ -740,6 +955,12 @@ Status ExecuteRdna2Cpu(
                                     wv.scc = (r != 0u);
                                     break;
                                 }
+                                case Rdna2Opcode::S_ANDN2_B32: {
+                                    const uint32_t r = read_op_u32(inst.src[0], 0) & ~read_op_u32(inst.src[1], 0);
+                                    write_sgpr(inst.dst, r);
+                                    wv.scc = (r != 0u);
+                                    break;
+                                }
                                 case Rdna2Opcode::S_LSHL_B32: {
                                     const uint32_t r = read_op_u32(inst.src[0], 0) << (read_op_u32(inst.src[1], 0) & 31u);
                                     write_sgpr(inst.dst, r);
@@ -783,6 +1004,16 @@ Status ExecuteRdna2Cpu(
                                     const uint32_t cnt = PopCount64(read_mask64(inst.src[0]));
                                     write_sgpr(inst.dst, cnt);
                                     wv.scc = (cnt != 0u);
+                                    break;
+                                }
+                                case Rdna2Opcode::S_SETPC_B64:
+                                case Rdna2Opcode::S_SWAPPC_B64: {
+                                    if (inst.opcode == Rdna2Opcode::S_SWAPPC_B64) {
+                                        write_sgpr(inst.dst, (inst.word_offset + 1u) * 4u);
+                                        if (inst.dst.kind == Rdna2OperandKind::Sgpr && inst.dst.reg_index + 1u < 106u) {
+                                            wv.sgpr[inst.dst.reg_index + 1u] = 0u;
+                                        }
+                                    }
                                     break;
                                 }
                                 case Rdna2Opcode::S_GETPC_B64: {
@@ -857,8 +1088,14 @@ Status ExecuteRdna2Cpu(
                                 case Rdna2Opcode::S_SENDMSG: {
                                     const uint16_t msg_id = static_cast<uint16_t>(static_cast<uint16_t>(inst.simm16) & 0xFu);
                                     if (container.stage == ShaderStage::Mesh || msg_id == kRdna2SendMsgGsAllocReq) {
-                                        state.mesh_vertex_count = wv.sgpr[0];
-                                        state.mesh_primitive_count = wv.sgpr[1];
+                                        if (wv.m0_written) {
+                                            // ISA-exact GFX10.3 GS_ALLOC_REQ 11-bit fields: M0[10:0], M0[22:12]
+                                            state.mesh_vertex_count = wv.m0 & kGsAllocReqVertMask;
+                                            state.mesh_primitive_count = (wv.m0 >> kGsAllocReqPrimShift) & kGsAllocReqPrimMask;
+                                        } else {
+                                            state.mesh_vertex_count = wv.sgpr[0];
+                                            state.mesh_primitive_count = wv.sgpr[1];
+                                        }
                                     } else if (container.stage == ShaderStage::Amplification || msg_id == kRdna2SendMsgDispatchMesh) {
                                         state.dispatch_mesh_groups = {wv.sgpr[0], wv.sgpr[1], wv.sgpr[2]};
                                     }
@@ -953,14 +1190,14 @@ Status ExecuteRdna2Cpu(
                                     for (uint32_t l = 0; l < wv.lane_count; ++l) {
                                         if (!lane_active(l)) continue;
                                         wv.vgpr[l][inst.dst.reg_index] = FloatToBits(
-                                            clamp_f32(std::fmin(read_op_f32(inst.src[0], l), read_op_f32(inst.src[1], l))));
+                                            clamp_f32(ExactMinF32(read_op_f32(inst.src[0], l), read_op_f32(inst.src[1], l))));
                                     }
                                     break;
                                 case Rdna2Opcode::V_MAX_F32:
                                     for (uint32_t l = 0; l < wv.lane_count; ++l) {
                                         if (!lane_active(l)) continue;
                                         wv.vgpr[l][inst.dst.reg_index] = FloatToBits(
-                                            clamp_f32(std::fmax(read_op_f32(inst.src[0], l), read_op_f32(inst.src[1], l))));
+                                            clamp_f32(ExactMaxF32(read_op_f32(inst.src[0], l), read_op_f32(inst.src[1], l))));
                                     }
                                     break;
                                 case Rdna2Opcode::V_MIN_I32:
@@ -1150,56 +1387,132 @@ Status ExecuteRdna2Cpu(
                                 case Rdna2Opcode::V_FLOOR_F32:
                                     for (uint32_t l = 0; l < wv.lane_count; ++l) {
                                         if (!lane_active(l)) continue;
-                                        wv.vgpr[l][inst.dst.reg_index] = FloatToBits(clamp_f32(std::floor(read_op_f32(inst.src[0], l))));
+                                        wv.vgpr[l][inst.dst.reg_index] = FloatToBits(clamp_f32(ExactFloorF32(read_op_f32(inst.src[0], l))));
+                                    }
+                                    break;
+                                case Rdna2Opcode::V_CEIL_F32:
+                                    for (uint32_t l = 0; l < wv.lane_count; ++l) {
+                                        if (!lane_active(l)) continue;
+                                        wv.vgpr[l][inst.dst.reg_index] = FloatToBits(clamp_f32(ExactCeilF32(read_op_f32(inst.src[0], l))));
                                     }
                                     break;
                                 case Rdna2Opcode::V_FRACT_F32:
                                     for (uint32_t l = 0; l < wv.lane_count; ++l) {
                                         if (!lane_active(l)) continue;
                                         const float x = read_op_f32(inst.src[0], l);
-                                        wv.vgpr[l][inst.dst.reg_index] = FloatToBits(clamp_f32(x - std::floor(x)));
+                                        wv.vgpr[l][inst.dst.reg_index] = FloatToBits(clamp_f32(x - ExactFloorF32(x)));
                                     }
                                     break;
 
-                                // ----- VOPC -----
+                                // ----- VOPC & GFX10 V_CMPX & split-range F16 compares -----
                                 case Rdna2Opcode::V_CMP_LT_F32:
                                 case Rdna2Opcode::V_CMP_EQ_F32:
                                 case Rdna2Opcode::V_CMP_LE_F32:
                                 case Rdna2Opcode::V_CMP_GT_F32:
                                 case Rdna2Opcode::V_CMP_LG_F32:
                                 case Rdna2Opcode::V_CMP_GE_F32:
+                                case Rdna2Opcode::V_CMPX_LT_F32:
+                                case Rdna2Opcode::V_CMPX_EQ_F32:
+                                case Rdna2Opcode::V_CMPX_LE_F32:
+                                case Rdna2Opcode::V_CMPX_GT_F32:
+                                case Rdna2Opcode::V_CMPX_LG_F32:
+                                case Rdna2Opcode::V_CMPX_GE_F32:
                                 case Rdna2Opcode::V_CMP_LT_I32:
                                 case Rdna2Opcode::V_CMP_EQ_I32:
                                 case Rdna2Opcode::V_CMP_GT_I32:
                                 case Rdna2Opcode::V_CMP_GE_I32:
+                                case Rdna2Opcode::V_CMPX_LT_I32:
+                                case Rdna2Opcode::V_CMPX_EQ_I32:
+                                case Rdna2Opcode::V_CMPX_GT_I32:
+                                case Rdna2Opcode::V_CMPX_GE_I32:
                                 case Rdna2Opcode::V_CMP_LT_U32:
                                 case Rdna2Opcode::V_CMP_EQ_U32:
                                 case Rdna2Opcode::V_CMP_GT_U32:
-                                case Rdna2Opcode::V_CMP_GE_U32: {
+                                case Rdna2Opcode::V_CMP_GE_U32:
+                                case Rdna2Opcode::V_CMPX_LT_U32:
+                                case Rdna2Opcode::V_CMPX_EQ_U32:
+                                case Rdna2Opcode::V_CMPX_GT_U32:
+                                case Rdna2Opcode::V_CMPX_GE_U32:
+                                case Rdna2Opcode::V_CMP_LT_F16:
+                                case Rdna2Opcode::V_CMP_EQ_F16:
+                                case Rdna2Opcode::V_CMP_LE_F16:
+                                case Rdna2Opcode::V_CMP_GT_F16:
+                                case Rdna2Opcode::V_CMP_LG_F16:
+                                case Rdna2Opcode::V_CMP_GE_F16:
+                                case Rdna2Opcode::V_CMP_U_F16:
+                                case Rdna2Opcode::V_CMP_NGE_F16:
+                                case Rdna2Opcode::V_CMP_NLG_F16:
+                                case Rdna2Opcode::V_CMP_NGT_F16:
+                                case Rdna2Opcode::V_CMP_NLE_F16:
+                                case Rdna2Opcode::V_CMP_NEQ_F16:
+                                case Rdna2Opcode::V_CMP_NLT_F16:
+                                case Rdna2Opcode::V_CMP_TRU_F16:
+                                case Rdna2Opcode::V_CMPX_LT_F16:
+                                case Rdna2Opcode::V_CMPX_EQ_F16:
+                                case Rdna2Opcode::V_CMPX_LE_F16:
+                                case Rdna2Opcode::V_CMPX_GT_F16:
+                                case Rdna2Opcode::V_CMPX_LG_F16:
+                                case Rdna2Opcode::V_CMPX_GE_F16:
+                                case Rdna2Opcode::V_CMPX_NEQ_F16:
+                                case Rdna2Opcode::V_CMPX_NLT_F16: {
                                     uint64_t mask = 0ull;
                                     for (uint32_t l = 0; l < wv.lane_count; ++l) {
                                         if (!lane_active(l)) continue;
                                         bool r = false;
-                                        switch (inst.opcode) {
-                                            case Rdna2Opcode::V_CMP_LT_F32: r = read_op_f32(inst.src[0], l) < read_op_f32(inst.src[1], l); break;
-                                            case Rdna2Opcode::V_CMP_EQ_F32: r = read_op_f32(inst.src[0], l) == read_op_f32(inst.src[1], l); break;
-                                            case Rdna2Opcode::V_CMP_LE_F32: r = read_op_f32(inst.src[0], l) <= read_op_f32(inst.src[1], l); break;
-                                            case Rdna2Opcode::V_CMP_GT_F32: r = read_op_f32(inst.src[0], l) > read_op_f32(inst.src[1], l); break;
-                                            case Rdna2Opcode::V_CMP_LG_F32: r = read_op_f32(inst.src[0], l) != read_op_f32(inst.src[1], l); break;
-                                            case Rdna2Opcode::V_CMP_GE_F32: r = read_op_f32(inst.src[0], l) >= read_op_f32(inst.src[1], l); break;
-                                            case Rdna2Opcode::V_CMP_LT_I32: r = static_cast<int32_t>(read_op_u32(inst.src[0], l)) < static_cast<int32_t>(read_op_u32(inst.src[1], l)); break;
-                                            case Rdna2Opcode::V_CMP_EQ_I32: r = static_cast<int32_t>(read_op_u32(inst.src[0], l)) == static_cast<int32_t>(read_op_u32(inst.src[1], l)); break;
-                                            case Rdna2Opcode::V_CMP_GT_I32: r = static_cast<int32_t>(read_op_u32(inst.src[0], l)) > static_cast<int32_t>(read_op_u32(inst.src[1], l)); break;
-                                            case Rdna2Opcode::V_CMP_GE_I32: r = static_cast<int32_t>(read_op_u32(inst.src[0], l)) >= static_cast<int32_t>(read_op_u32(inst.src[1], l)); break;
-                                            case Rdna2Opcode::V_CMP_LT_U32: r = read_op_u32(inst.src[0], l) < read_op_u32(inst.src[1], l); break;
-                                            case Rdna2Opcode::V_CMP_EQ_U32: r = read_op_u32(inst.src[0], l) == read_op_u32(inst.src[1], l); break;
-                                            case Rdna2Opcode::V_CMP_GT_U32: r = read_op_u32(inst.src[0], l) > read_op_u32(inst.src[1], l); break;
-                                            case Rdna2Opcode::V_CMP_GE_U32: r = read_op_u32(inst.src[0], l) >= read_op_u32(inst.src[1], l); break;
-                                            default: break;
+                                        if (IsF16CompareOpcode(inst.opcode)) {
+                                            float a = HalfBitsToFloat(PickHalf16(read_op_u32(inst.src[0], l), (inst.vop3_op_sel & 1u) != 0u));
+                                            float b = HalfBitsToFloat(PickHalf16(read_op_u32(inst.src[1], l), ((inst.vop3_op_sel >> 1) & 1u) != 0u));
+                                            if (inst.src[0].abs) a = std::fabs(a);
+                                            if (inst.src[1].abs) b = std::fabs(b);
+                                            if (inst.src[0].neg) a = -a;
+                                            if (inst.src[1].neg) b = -b;
+                                            r = EvalF16CompareCpu(inst.opcode, a, b);
+                                        } else {
+                                            switch (inst.opcode) {
+                                                case Rdna2Opcode::V_CMP_LT_F32:
+                                                case Rdna2Opcode::V_CMPX_LT_F32: r = read_op_f32(inst.src[0], l) < read_op_f32(inst.src[1], l); break;
+                                                case Rdna2Opcode::V_CMP_EQ_F32:
+                                                case Rdna2Opcode::V_CMPX_EQ_F32: r = read_op_f32(inst.src[0], l) == read_op_f32(inst.src[1], l); break;
+                                                case Rdna2Opcode::V_CMP_LE_F32:
+                                                case Rdna2Opcode::V_CMPX_LE_F32: r = read_op_f32(inst.src[0], l) <= read_op_f32(inst.src[1], l); break;
+                                                case Rdna2Opcode::V_CMP_GT_F32:
+                                                case Rdna2Opcode::V_CMPX_GT_F32: r = read_op_f32(inst.src[0], l) > read_op_f32(inst.src[1], l); break;
+                                                case Rdna2Opcode::V_CMP_LG_F32:
+                                                case Rdna2Opcode::V_CMPX_LG_F32: {
+                                                    const float fa = read_op_f32(inst.src[0], l);
+                                                    const float fb = read_op_f32(inst.src[1], l);
+                                                    r = (!std::isnan(fa) && !std::isnan(fb) && fa != fb);
+                                                    break;
+                                                }
+                                                case Rdna2Opcode::V_CMP_GE_F32:
+                                                case Rdna2Opcode::V_CMPX_GE_F32: r = read_op_f32(inst.src[0], l) >= read_op_f32(inst.src[1], l); break;
+                                                case Rdna2Opcode::V_CMP_LT_I32:
+                                                case Rdna2Opcode::V_CMPX_LT_I32: r = static_cast<int32_t>(read_op_u32(inst.src[0], l)) < static_cast<int32_t>(read_op_u32(inst.src[1], l)); break;
+                                                case Rdna2Opcode::V_CMP_EQ_I32:
+                                                case Rdna2Opcode::V_CMPX_EQ_I32: r = static_cast<int32_t>(read_op_u32(inst.src[0], l)) == static_cast<int32_t>(read_op_u32(inst.src[1], l)); break;
+                                                case Rdna2Opcode::V_CMP_GT_I32:
+                                                case Rdna2Opcode::V_CMPX_GT_I32: r = static_cast<int32_t>(read_op_u32(inst.src[0], l)) > static_cast<int32_t>(read_op_u32(inst.src[1], l)); break;
+                                                case Rdna2Opcode::V_CMP_GE_I32:
+                                                case Rdna2Opcode::V_CMPX_GE_I32: r = static_cast<int32_t>(read_op_u32(inst.src[0], l)) >= static_cast<int32_t>(read_op_u32(inst.src[1], l)); break;
+                                                case Rdna2Opcode::V_CMP_LT_U32:
+                                                case Rdna2Opcode::V_CMPX_LT_U32: r = read_op_u32(inst.src[0], l) < read_op_u32(inst.src[1], l); break;
+                                                case Rdna2Opcode::V_CMP_EQ_U32:
+                                                case Rdna2Opcode::V_CMPX_EQ_U32: r = read_op_u32(inst.src[0], l) == read_op_u32(inst.src[1], l); break;
+                                                case Rdna2Opcode::V_CMP_GT_U32:
+                                                case Rdna2Opcode::V_CMPX_GT_U32: r = read_op_u32(inst.src[0], l) > read_op_u32(inst.src[1], l); break;
+                                                case Rdna2Opcode::V_CMP_GE_U32:
+                                                case Rdna2Opcode::V_CMPX_GE_U32: r = read_op_u32(inst.src[0], l) >= read_op_u32(inst.src[1], l); break;
+                                                default: break;
+                                            }
                                         }
                                         if (r) mask |= (1ull << l);
                                     }
-                                    write_mask64(inst.dst, mask);
+                                    if (IsVcmpxOpcode(inst.opcode)) {
+                                        // GFX10 V_CMPX writes ONLY EXEC (EXEC = EXEC & cmp_mask), never clobbers VCC
+                                        wv.exec &= mask;
+                                    } else {
+                                        write_mask64(inst.dst, mask);
+                                    }
                                     break;
                                 }
 
@@ -1306,6 +1619,15 @@ Status ExecuteRdna2Cpu(
                                         const uint32_t ins = read_op_u32(inst.src[1], l);
                                         const uint32_t base = read_op_u32(inst.src[2], l);
                                         wv.vgpr[l][inst.dst.reg_index] = (m & ins) | (~m & base);
+                                    }
+                                    break;
+                                case Rdna2Opcode::V_ALIGNBYTE_B32:
+                                    for (uint32_t l = 0; l < wv.lane_count; ++l) {
+                                        if (!lane_active(l)) continue;
+                                        wv.vgpr[l][inst.dst.reg_index] = EvalAlignByteB32(
+                                            read_op_u32(inst.src[0], l),
+                                            read_op_u32(inst.src[1], l),
+                                            read_op_u32(inst.src[2], l));
                                     }
                                     break;
                                 case Rdna2Opcode::V_MUL_LO_U32:
@@ -1451,7 +1773,76 @@ Status ExecuteRdna2Cpu(
                                     break;
                                 }
 
-                                // ----- MUBUF -----
+                                // ----- MUBUF & MTBUF -----
+                                case Rdna2Opcode::BUFFER_LOAD_FORMAT_X:
+                                case Rdna2Opcode::BUFFER_LOAD_FORMAT_XY:
+                                case Rdna2Opcode::BUFFER_LOAD_FORMAT_XYZ:
+                                case Rdna2Opcode::BUFFER_LOAD_FORMAT_XYZW:
+                                case Rdna2Opcode::BUFFER_LOAD_FORMAT_D16_X:
+                                case Rdna2Opcode::BUFFER_LOAD_FORMAT_D16_XY:
+                                case Rdna2Opcode::BUFFER_LOAD_FORMAT_D16_XYZ:
+                                case Rdna2Opcode::BUFFER_LOAD_FORMAT_D16_XYZW:
+                                case Rdna2Opcode::TBUFFER_LOAD_FORMAT_X:
+                                case Rdna2Opcode::TBUFFER_LOAD_FORMAT_XY:
+                                case Rdna2Opcode::TBUFFER_LOAD_FORMAT_XYZ:
+                                case Rdna2Opcode::TBUFFER_LOAD_FORMAT_XYZW:
+                                case Rdna2Opcode::TBUFFER_LOAD_FORMAT_D16_X:
+                                case Rdna2Opcode::TBUFFER_LOAD_FORMAT_D16_XY:
+                                case Rdna2Opcode::TBUFFER_LOAD_FORMAT_D16_XYZ:
+                                case Rdna2Opcode::TBUFFER_LOAD_FORMAT_D16_XYZW: {
+                                    auto& buf = (inst.srsrc == 0u) ? state.uav0 : state.uav1;
+                                    bool is_d16 = false;
+                                    uint32_t comps = 1u;
+                                    switch (inst.opcode) {
+                                        case Rdna2Opcode::BUFFER_LOAD_FORMAT_X:
+                                        case Rdna2Opcode::TBUFFER_LOAD_FORMAT_X: comps = 1u; break;
+                                        case Rdna2Opcode::BUFFER_LOAD_FORMAT_XY:
+                                        case Rdna2Opcode::TBUFFER_LOAD_FORMAT_XY: comps = 2u; break;
+                                        case Rdna2Opcode::BUFFER_LOAD_FORMAT_XYZ:
+                                        case Rdna2Opcode::TBUFFER_LOAD_FORMAT_XYZ: comps = 3u; break;
+                                        case Rdna2Opcode::BUFFER_LOAD_FORMAT_XYZW:
+                                        case Rdna2Opcode::TBUFFER_LOAD_FORMAT_XYZW: comps = 4u; break;
+                                        case Rdna2Opcode::BUFFER_LOAD_FORMAT_D16_X:
+                                        case Rdna2Opcode::TBUFFER_LOAD_FORMAT_D16_X: is_d16 = true; comps = 1u; break;
+                                        case Rdna2Opcode::BUFFER_LOAD_FORMAT_D16_XY:
+                                        case Rdna2Opcode::TBUFFER_LOAD_FORMAT_D16_XY: is_d16 = true; comps = 2u; break;
+                                        case Rdna2Opcode::BUFFER_LOAD_FORMAT_D16_XYZ:
+                                        case Rdna2Opcode::TBUFFER_LOAD_FORMAT_D16_XYZ: is_d16 = true; comps = 3u; break;
+                                        case Rdna2Opcode::BUFFER_LOAD_FORMAT_D16_XYZW:
+                                        case Rdna2Opcode::TBUFFER_LOAD_FORMAT_D16_XYZW: is_d16 = true; comps = 4u; break;
+                                        default: break;
+                                    }
+                                    const auto fmt = (inst.encoding == Rdna2Encoding::MTBUF && inst.mtbuf_format != 0u)
+                                                         ? static_cast<Rdna2MtbufFormat>(inst.mtbuf_format)
+                                                         : Rdna2MtbufFormat::R32G32B32A32_FLOAT;
+                                    const uint8_t dst_b = static_cast<uint8_t>(inst.dst.reg_index);
+                                    for (uint32_t l = 0; l < wv.lane_count; ++l) {
+                                        if (!lane_active(l)) continue;
+                                        uint32_t addr = 0u;
+                                        if (inst.offen) addr = read_op_u32(inst.src[1], l);
+                                        else if (inst.idxen) addr = read_op_u32(inst.src[1], l) << 2;
+                                        addr += static_cast<uint32_t>(inst.mem_offset);
+                                        if (inst.soffset != 128u && inst.soffset != 125u) {
+                                            addr += read_op_u32(DecodeRdna2SourceOperand(inst.soffset), l);
+                                        }
+                                        if (is_d16) {
+                                            const uint32_t nregs = (comps + 1u) / 2u;
+                                            for (uint32_t r = 0; r < nregs; ++r) {
+                                                const uint32_t lo = DecodeFormatComponentCpu(buf, addr, fmt, r * 2u, true) & 0xFFFFu;
+                                                const uint32_t hi = (r * 2u + 1u < comps)
+                                                                        ? (DecodeFormatComponentCpu(buf, addr, fmt, r * 2u + 1u, true) & 0xFFFFu)
+                                                                        : 0u;
+                                                wv.vgpr[l][static_cast<uint8_t>(dst_b + r)] = lo | (hi << 16);
+                                            }
+                                        } else {
+                                            for (uint32_t c = 0; c < comps; ++c) {
+                                                wv.vgpr[l][static_cast<uint8_t>(dst_b + c)] =
+                                                    DecodeFormatComponentCpu(buf, addr, fmt, c, false);
+                                            }
+                                        }
+                                    }
+                                    break;
+                                }
                                 case Rdna2Opcode::BUFFER_LOAD_DWORD:
                                 case Rdna2Opcode::BUFFER_STORE_DWORD: {
                                     auto& buf = (inst.srsrc == 0u) ? state.uav0 : state.uav1;
@@ -1703,6 +2094,21 @@ Status ExecuteRdna2Cpu(
                                     }
                                     break;
 
+                                // ----- VINTRP (FSSM Pixel Interpolation) -----
+                                case Rdna2Opcode::V_INTERP_P1_F32:
+                                case Rdna2Opcode::V_INTERP_P2_F32:
+                                case Rdna2Opcode::V_INTERP_MOV_F32:
+                                    for (uint32_t l = 0; l < wv.lane_count; ++l) {
+                                        if (!lane_active(l)) continue;
+                                        const uint32_t gid_l = wv.global_thread_ids[l];
+                                        float val = 0.0f;
+                                        if (gid_l < state.stage_inputs.size()) {
+                                            val = state.stage_inputs[gid_l][inst.vintrp_chan & 3u];
+                                        }
+                                        wv.vgpr[l][inst.dst.reg_index] = FloatToBits(val);
+                                    }
+                                    break;
+
                                 // ----- EXP -----
                                 case Rdna2Opcode::EXP:
                                     for (uint32_t l = 0; l < wv.lane_count; ++l) {
@@ -1713,6 +2119,9 @@ Status ExecuteRdna2Cpu(
                                             if (inst.exp_en == 0x1u) {
                                                 const uint32_t p = read_op_u32(inst.src[0], l);
                                                 ex.prim = {p & 0x3FFu, (p >> 10) & 0x3FFu, (p >> 20) & 0x3FFu};
+                                                if (inst.exp_compr) {
+                                                    ex.culled_prim = ((p >> 31) != 0u);
+                                                }
                                             } else {
                                                 ex.prim = {read_op_u32(inst.src[0], l),
                                                            read_op_u32(inst.src[1], l),
