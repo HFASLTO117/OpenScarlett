@@ -10,6 +10,8 @@
 
 #if defined(_MSC_VER)
 #define OS_UUIDOF(T) __uuidof(T)
+#elif defined(__CRT_UUID_DECL)
+#define OS_UUIDOF(T) __mingw_uuidof<T>()
 #else
 #define OS_UUIDOF(T) IID_##T
 #endif

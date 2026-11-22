@@ -26,6 +26,8 @@
 
 #if defined(_MSC_VER)
 #define OS_UUIDOF(T) __uuidof(T)
+#elif defined(__CRT_UUID_DECL)
+#define OS_UUIDOF(T) __mingw_uuidof<T>()
 #else
 #define OS_UUIDOF(T) IID_##T
 #endif
@@ -2139,10 +2141,10 @@ uint64_t AsyncPsoCompilePool::ComputeJobContentHash(const AsyncPsoJobDesc& desc)
     h = Fnv1a64Update(h, desc.target_profile.data(), desc.target_profile.size());
     h = Fnv1a64Update(h, desc.hlsl_entry.data(), desc.hlsl_entry.size());
     const uint8_t flags[4] = {
-        desc.is_hlsl_source ? 1u : 0u,
-        desc.emit_spirv ? 1u : 0u,
-        desc.compile_dxil ? 1u : 0u,
-        desc.create_d3d12_pso ? 1u : 0u,
+        static_cast<uint8_t>(desc.is_hlsl_source ? 1u : 0u),
+        static_cast<uint8_t>(desc.emit_spirv ? 1u : 0u),
+        static_cast<uint8_t>(desc.compile_dxil ? 1u : 0u),
+        static_cast<uint8_t>(desc.create_d3d12_pso ? 1u : 0u),
     };
     h = Fnv1a64Update(h, flags, sizeof(flags));
     return h;

@@ -756,7 +756,14 @@ void RunAllTenProxiesTest(bool use_warp, IDXGIAdapter1* hw_adapter, const char* 
     OS_REQUIRE(props.Get() != nullptr);
     void* shader_id = props->GetShaderIdentifier(L"MyRaygen");
     OS_REQUIRE(shader_id != nullptr);
-    OS_REQUIRE(props->GetShaderStackSize(L"MyRaygen") > 0ull);
+    const UINT64 raygen_stack = props->GetShaderStackSize(L"MyRaygen");
+    // Host DXR (e.g. Windows Server WARP Tier 1.1) validly returns 0 for an empty
+    // non-recursive raygen shader, and UINT64_MAX only for unknown exports; our SW proxy returns 256.
+    if (has_hw_dxr) {
+        OS_REQUIRE(raygen_stack != UINT64_MAX);
+    } else {
+        OS_REQUIRE(raygen_stack > 0ull);
+    }
     const UINT64 orig_stack = props->GetPipelineStackSize();
     props->SetPipelineStackSize(orig_stack + 256ull);
     OS_REQUIRE(props->GetPipelineStackSize() >= orig_stack);
