@@ -521,11 +521,12 @@ Status RunExternalProcess(const std::string& cmdline, uint32_t& out_exit_code, s
         SIZE_T attr_size = 0;
         InitializeProcThreadAttributeList(nullptr, 1, 0, &attr_size);
         std::vector<uint8_t> attr_buf(attr_size);
+        // Must outlive CreateProcessA and DeleteProcThreadAttributeList (UpdateProcThreadAttribute stores pointer).
+        HANDLE inherit_list[1] = {h_write};
         bool has_attr_list = false;
         if (attr_size > 0 &&
             InitializeProcThreadAttributeList(
                 reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_buf.data()), 1, 0, &attr_size)) {
-            HANDLE inherit_list[1] = {h_write};
             if (UpdateProcThreadAttribute(
                     reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_buf.data()),
                     0,
