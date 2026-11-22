@@ -5,12 +5,18 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <unordered_map>
 #include <vector>
+
+#if defined(_WIN32)
+#  include <malloc.h>
+#endif
 
 namespace {
 
@@ -218,6 +224,391 @@ private:
     std::unordered_map<uint32_t, std::unique_ptr<openscarlett::Xma2Decoder>> decoders_;
 };
 
+// ---------------------------------------------------------------------------
+// Thread-safe Xbox APU Audio Heap Manager (ApuCreateHeap / ApuAlloc / ApuFree /
+// ApuHeapGetState / ApuIsVirtualAddressValid / ApuMapVirtualAddress / ApuMapApuAddress)
+// ---------------------------------------------------------------------------
+
+constexpr uint32_t kDefaultApuCachedHeapBytes = 64u * 1024u * 1024u;
+constexpr uint32_t kDefaultApuNonCachedHeapBytes = 64u * 1024u * 1024u;
+constexpr uint32_t kCachedApuSpaceBase = 0x10000000u;
+constexpr uint32_t kCachedApuSpaceSize = 0x70000000u;
+constexpr uint32_t kNonCachedApuSpaceBase = 0x80000000u;
+constexpr uint32_t kNonCachedApuSpaceSize = 0x70000000u;
+constexpr uint32_t kDefaultAlignmentBytes = 64u;
+
+inline bool IsPowerOfTwo(uint32_t v) {
+    return v != 0u && (v & (v - 1u)) == 0u;
+}
+
+inline uint64_t AlignUpU64(uint64_t value, uint64_t alignment) {
+    return (value + alignment - 1ull) & ~(alignment - 1ull);
+}
+
+inline void* AlignedAllocHost(size_t size, size_t alignment) {
+#if defined(_WIN32)
+    return _aligned_malloc(size, alignment);
+#else
+    void* ptr = nullptr;
+    if (posix_memalign(&ptr, std::max<size_t>(alignment, sizeof(void*)), size) != 0) {
+        return nullptr;
+    }
+    return ptr;
+#endif
+}
+
+inline void AlignedFreeHost(void* ptr) {
+    if (!ptr) return;
+#if defined(_WIN32)
+    _aligned_free(ptr);
+#else
+    std::free(ptr);
+#endif
+}
+
+struct ApuFreeRange {
+    uint32_t start = 0;
+    uint32_t size = 0;
+};
+
+struct ApuHeapPool {
+    uint32_t capacity = 0;
+    uint32_t bytes_allocated = 0;
+    uint32_t bytes_lost = 0;
+    uint32_t allocation_count = 0;
+    std::vector<ApuFreeRange> free_ranges;
+
+    void InitAddressSpace(uint32_t base, uint32_t size) {
+        free_ranges.clear();
+        free_ranges.push_back(ApuFreeRange{base, size});
+    }
+
+    bool AllocateApuRange(uint32_t span, uint32_t alignment, APU_ADDRESS* out_addr) {
+        for (size_t i = 0; i < free_ranges.size(); ++i) {
+            const uint64_t r_start = free_ranges[i].start;
+            const uint64_t r_end = r_start + free_ranges[i].size;
+            const uint64_t aligned = AlignUpU64(r_start, alignment);
+            if (aligned < r_start || aligned + span > r_end || aligned > 0xFFFFFFFFull) {
+                continue;
+            }
+
+            const uint32_t alloc_start = static_cast<uint32_t>(aligned);
+            const uint64_t alloc_end = aligned + span;
+            const uint32_t prefix_size = static_cast<uint32_t>(aligned - r_start);
+            const uint32_t suffix_size = static_cast<uint32_t>(r_end - alloc_end);
+
+            if (prefix_size > 0u && suffix_size > 0u) {
+                free_ranges[i].size = prefix_size;
+                free_ranges.insert(
+                    free_ranges.begin() + static_cast<std::ptrdiff_t>(i + 1u),
+                    ApuFreeRange{static_cast<uint32_t>(alloc_end), suffix_size});
+            } else if (prefix_size > 0u) {
+                free_ranges[i].size = prefix_size;
+            } else if (suffix_size > 0u) {
+                free_ranges[i].start = static_cast<uint32_t>(alloc_end);
+                free_ranges[i].size = suffix_size;
+            } else {
+                free_ranges.erase(free_ranges.begin() + static_cast<std::ptrdiff_t>(i));
+            }
+
+            *out_addr = alloc_start;
+            return true;
+        }
+        return false;
+    }
+
+    void FreeApuRange(APU_ADDRESS start, uint32_t span) {
+        if (span == 0u) return;
+        ApuFreeRange entry{start, span};
+        auto it = std::lower_bound(
+            free_ranges.begin(),
+            free_ranges.end(),
+            entry.start,
+            [](const ApuFreeRange& r, uint32_t addr) { return r.start < addr; });
+        it = free_ranges.insert(it, entry);
+
+        // Coalesce with next range if contiguous.
+        if (it + 1 != free_ranges.end()) {
+            const uint64_t cur_end = static_cast<uint64_t>(it->start) + it->size;
+            if (cur_end == (it + 1)->start) {
+                it->size += (it + 1)->size;
+                free_ranges.erase(it + 1);
+            }
+        }
+        // Coalesce with previous range if contiguous.
+        if (it != free_ranges.begin()) {
+            auto prev = it - 1;
+            const uint64_t prev_end = static_cast<uint64_t>(prev->start) + prev->size;
+            if (prev_end == it->start) {
+                prev->size += it->size;
+                free_ranges.erase(it);
+            }
+        }
+    }
+};
+
+struct ApuAllocRecord {
+    void* virtual_address = nullptr;
+    APU_ADDRESS apu_address = APU_INVALID_ADDRESS;
+    uint32_t requested_size = 0;
+    uint32_t pad_bytes = 0;
+    uint32_t apu_span = 0;
+    bool non_cached = false;
+};
+
+class ApuHeapManager {
+public:
+    static ApuHeapManager& Instance() {
+        static ApuHeapManager mgr;
+        return mgr;
+    }
+
+    ApuHeapManager() {
+        cached_.InitAddressSpace(kCachedApuSpaceBase, kCachedApuSpaceSize);
+        non_cached_.InitAddressSpace(kNonCachedApuSpaceBase, kNonCachedApuSpaceSize);
+    }
+
+    ~ApuHeapManager() {
+        std::lock_guard<std::mutex> lk(mutex_);
+        for (const auto& kv : by_va_) {
+            AlignedFreeHost(kv.second.virtual_address);
+        }
+        by_va_.clear();
+        by_apu_.clear();
+    }
+
+    int32_t CreateHeap(uint32_t cached_bytes, uint32_t non_cached_bytes) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        const uint32_t cached_used = cached_.bytes_allocated + cached_.bytes_lost;
+        const uint32_t non_cached_used = non_cached_.bytes_allocated + non_cached_.bytes_lost;
+        cached_.capacity = std::max(cached_bytes, cached_used);
+        non_cached_.capacity = std::max(non_cached_bytes, non_cached_used);
+        initialized_ = true;
+        return ACPHAL_S_OK;
+    }
+
+    int32_t Alloc(
+        void** virtual_address,
+        APU_ADDRESS* physical_address,
+        uint32_t size_in_bytes,
+        uint32_t alignment_in_bytes,
+        uint32_t flags) {
+        if (physical_address) {
+            *physical_address = APU_INVALID_ADDRESS;
+        }
+        if (!virtual_address) {
+            return ACPHAL_E_POINTER;
+        }
+        *virtual_address = nullptr;
+
+        if (size_in_bytes == 0u) {
+            return ACPHAL_E_INVALIDARG;
+        }
+        if (alignment_in_bytes != 0u && !IsPowerOfTwo(alignment_in_bytes)) {
+            return ACPHAL_E_INVALIDARG;
+        }
+
+        const uint32_t req_align =
+            (alignment_in_bytes == 0u) ? kDefaultAlignmentBytes : alignment_in_bytes;
+        const size_t os_align = std::max<size_t>(req_align, alignof(void*));
+        const uint32_t apu_align = std::max<uint32_t>(req_align, 4u);
+        const uint32_t pad_bytes =
+            (size_in_bytes % 4u == 0u) ? 0u : (4u - (size_in_bytes % 4u));
+        const uint64_t span64 = static_cast<uint64_t>(size_in_bytes) + pad_bytes;
+        if (span64 > 0xFFFFFFFFull) {
+            return ACPHAL_E_OUTOFMEMORY;
+        }
+        const uint32_t apu_span = static_cast<uint32_t>(span64);
+        const bool is_non_cached = (flags & APU_ALLOC_NONCACHED) != 0u;
+
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (!initialized_) {
+            cached_.capacity = kDefaultApuCachedHeapBytes;
+            non_cached_.capacity = kDefaultApuNonCachedHeapBytes;
+            initialized_ = true;
+        }
+
+        ApuHeapPool& pool = is_non_cached ? non_cached_ : cached_;
+        const uint64_t used_after =
+            static_cast<uint64_t>(pool.bytes_allocated) + pool.bytes_lost + span64;
+        if (used_after > pool.capacity) {
+            return ACPHAL_E_OUTOFMEMORY;
+        }
+
+        APU_ADDRESS apu_addr = APU_INVALID_ADDRESS;
+        if (!pool.AllocateApuRange(apu_span, apu_align, &apu_addr)) {
+            return ACPHAL_E_OUTOFMEMORY;
+        }
+
+        void* ptr = AlignedAllocHost(size_in_bytes, os_align);
+        if (!ptr) {
+            pool.FreeApuRange(apu_addr, apu_span);
+            return ACPHAL_E_OUTOFMEMORY;
+        }
+        std::memset(ptr, 0, size_in_bytes);
+
+        const uintptr_t va_key = reinterpret_cast<uintptr_t>(ptr);
+        ApuAllocRecord rec{};
+        rec.virtual_address = ptr;
+        rec.apu_address = apu_addr;
+        rec.requested_size = size_in_bytes;
+        rec.pad_bytes = pad_bytes;
+        rec.apu_span = apu_span;
+        rec.non_cached = is_non_cached;
+
+        by_va_[va_key] = rec;
+        by_apu_[apu_addr] = va_key;
+
+        pool.bytes_allocated += size_in_bytes;
+        pool.bytes_lost += pad_bytes;
+        pool.allocation_count += 1u;
+
+        *virtual_address = ptr;
+        if (physical_address) {
+            *physical_address = apu_addr;
+        }
+        return ACPHAL_S_OK;
+    }
+
+    int32_t Free(void* virtual_address) {
+        if (!virtual_address) {
+            return ACPHAL_S_OK;
+        }
+
+        void* to_free = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            const uintptr_t va_key = reinterpret_cast<uintptr_t>(virtual_address);
+            auto it = by_va_.find(va_key);
+            if (it == by_va_.end()) {
+                return ACPHAL_E_INVALIDARG;
+            }
+
+            const ApuAllocRecord rec = it->second;
+            by_apu_.erase(rec.apu_address);
+            by_va_.erase(it);
+
+            ApuHeapPool& pool = rec.non_cached ? non_cached_ : cached_;
+            pool.FreeApuRange(rec.apu_address, rec.apu_span);
+            pool.bytes_allocated -= rec.requested_size;
+            pool.bytes_lost -= rec.pad_bytes;
+            pool.allocation_count -= 1u;
+            to_free = rec.virtual_address;
+        }
+
+        AlignedFreeHost(to_free);
+        return ACPHAL_S_OK;
+    }
+
+    int32_t GetState(APU_HEAP_STATE* state, uint32_t flags) {
+        if (!state) {
+            return ACPHAL_E_POINTER;
+        }
+        std::memset(state, 0, sizeof(*state));
+
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (!initialized_) {
+            return ACPHAL_S_OK;
+        }
+
+        const bool is_non_cached = (flags & APU_ALLOC_NONCACHED) != 0u;
+        const ApuHeapPool& pool = is_non_cached ? non_cached_ : cached_;
+        const uint64_t used = static_cast<uint64_t>(pool.bytes_allocated) + pool.bytes_lost;
+        const uint32_t free_bytes =
+            (used < pool.capacity) ? static_cast<uint32_t>(pool.capacity - used) : 0u;
+
+        state->bytesAllocated = pool.bytes_allocated;
+        state->bytesFree = free_bytes;
+        state->bytesLost = pool.bytes_lost;
+        state->maximumBlockSizeAvailable = free_bytes;
+        state->allocationCount = pool.allocation_count;
+        return ACPHAL_S_OK;
+    }
+
+    int32_t IsVirtualAddressValid(const void* virtual_address, uint32_t size_in_bytes) {
+        if (!virtual_address) {
+            return 0;
+        }
+        const uintptr_t va = reinterpret_cast<uintptr_t>(virtual_address);
+        std::lock_guard<std::mutex> lk(mutex_);
+        auto it = by_va_.upper_bound(va);
+        if (it == by_va_.begin()) {
+            return 0;
+        }
+        --it;
+        const uintptr_t base = it->first;
+        const ApuAllocRecord& rec = it->second;
+        if (va < base) {
+            return 0;
+        }
+        const uint64_t offset = static_cast<uint64_t>(va - base);
+        if (offset >= rec.requested_size) {
+            return 0;
+        }
+        if (size_in_bytes == 0u) {
+            return 1;
+        }
+        return (offset + static_cast<uint64_t>(size_in_bytes) <= rec.requested_size) ? 1 : 0;
+    }
+
+    APU_ADDRESS MapVirtualAddress(const void* virtual_address) {
+        if (!virtual_address) {
+            return APU_INVALID_ADDRESS;
+        }
+        const uintptr_t va = reinterpret_cast<uintptr_t>(virtual_address);
+        std::lock_guard<std::mutex> lk(mutex_);
+        auto it = by_va_.upper_bound(va);
+        if (it == by_va_.begin()) {
+            return APU_INVALID_ADDRESS;
+        }
+        --it;
+        const uintptr_t base = it->first;
+        const ApuAllocRecord& rec = it->second;
+        if (va < base) {
+            return APU_INVALID_ADDRESS;
+        }
+        const uint64_t offset = static_cast<uint64_t>(va - base);
+        if (offset >= rec.requested_size) {
+            return APU_INVALID_ADDRESS;
+        }
+        return rec.apu_address + static_cast<uint32_t>(offset);
+    }
+
+    void* MapApuAddress(APU_ADDRESS apu_address) {
+        if (apu_address == APU_INVALID_ADDRESS) {
+            return nullptr;
+        }
+        std::lock_guard<std::mutex> lk(mutex_);
+        auto it = by_apu_.upper_bound(apu_address);
+        if (it == by_apu_.begin()) {
+            return nullptr;
+        }
+        --it;
+        const APU_ADDRESS apu_base = it->first;
+        if (apu_address < apu_base) {
+            return nullptr;
+        }
+        auto va_it = by_va_.find(it->second);
+        if (va_it == by_va_.end()) {
+            return nullptr;
+        }
+        const ApuAllocRecord& rec = va_it->second;
+        const uint32_t offset = apu_address - apu_base;
+        if (offset >= rec.requested_size) {
+            return nullptr;
+        }
+        return static_cast<uint8_t*>(rec.virtual_address) + offset;
+    }
+
+private:
+    std::mutex mutex_;
+    bool initialized_ = false;
+    ApuHeapPool cached_{};
+    ApuHeapPool non_cached_{};
+    std::map<uintptr_t, ApuAllocRecord> by_va_;
+    std::map<APU_ADDRESS, uintptr_t> by_apu_;
+};
+
 }  // namespace
 
 extern "C" {
@@ -265,6 +656,57 @@ int32_t OPENSCARLETT_ACPHAL_CALL AcpHalReleaseShapeContexts(AcpHalShapeContexts*
     delete static_cast<AcpShapeAllocation*>(pAllocated->internalAllocation);
     std::memset(pAllocated, 0, sizeof(*pAllocated));
     return RecordHr("AcpHalReleaseShapeContexts", ACPHAL_S_OK);
+}
+
+int32_t OPENSCARLETT_ACPHAL_CALL ApuCreateHeap(
+    uint32_t cachedSizeInBytes,
+    uint32_t nonCachedSizeInBytes) {
+    return RecordHr(
+        "ApuCreateHeap",
+        ApuHeapManager::Instance().CreateHeap(cachedSizeInBytes, nonCachedSizeInBytes));
+}
+
+int32_t OPENSCARLETT_ACPHAL_CALL ApuAlloc(
+    void** virtualAddress,
+    APU_ADDRESS* physicalAddress,
+    uint32_t sizeInBytes,
+    uint32_t alignmentInBytes,
+    uint32_t flags) {
+    return RecordHr(
+        "ApuAlloc",
+        ApuHeapManager::Instance().Alloc(
+            virtualAddress, physicalAddress, sizeInBytes, alignmentInBytes, flags));
+}
+
+int32_t OPENSCARLETT_ACPHAL_CALL ApuFree(void* virtualAddress) {
+    return RecordHr("ApuFree", ApuHeapManager::Instance().Free(virtualAddress));
+}
+
+int32_t OPENSCARLETT_ACPHAL_CALL ApuHeapGetState(
+    APU_HEAP_STATE* state,
+    uint32_t flags) {
+    return RecordHr("ApuHeapGetState", ApuHeapManager::Instance().GetState(state, flags));
+}
+
+int32_t OPENSCARLETT_ACPHAL_CALL ApuIsVirtualAddressValid(
+    const void* virtualAddress,
+    uint32_t sizeInBytes) {
+    const int32_t valid =
+        ApuHeapManager::Instance().IsVirtualAddressValid(virtualAddress, sizeInBytes);
+    RecordOk("ApuIsVirtualAddressValid");
+    return valid;
+}
+
+APU_ADDRESS OPENSCARLETT_ACPHAL_CALL ApuMapVirtualAddress(const void* virtualAddress) {
+    const APU_ADDRESS addr = ApuHeapManager::Instance().MapVirtualAddress(virtualAddress);
+    RecordOk("ApuMapVirtualAddress");
+    return addr;
+}
+
+void* OPENSCARLETT_ACPHAL_CALL ApuMapApuAddress(APU_ADDRESS apuAddress) {
+    void* va = ApuHeapManager::Instance().MapApuAddress(apuAddress);
+    RecordOk("ApuMapApuAddress");
+    return va;
 }
 
 }  // extern "C"
