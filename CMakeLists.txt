@@ -133,6 +133,7 @@ foreach(_os_module_cmake
     cmake/sprint14_d3d12_residency.cmake
     cmake/sprint14_bvh_builder.cmake
     cmake/sprint14_dstorage_x2.cmake
+    cmake/sprint14_shader_sm66.cmake
 )
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_os_module_cmake}")
         include("${CMAKE_CURRENT_SOURCE_DIR}/${_os_module_cmake}")

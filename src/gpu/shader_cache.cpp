@@ -502,6 +502,26 @@ std::string BuildStandInHlsl(ShaderStage stage, bool mesh_has_payload) {
                    "    _p._data[0] = 0u; _p._data[1] = 0u; _p._data[2] = 0u; _p._data[3] = 0u;\n"
                    "    DispatchMesh(0, 0, 0, _p);\n"
                    "}\n";
+        case ShaderStage::Geometry:
+            return "struct GSIn { float4 pos : SV_POSITION; };\n"
+                   "[maxvertexcount(3)] void main(triangle GSIn v[3], inout TriangleStream<GSIn> s) {}\n";
+        case ShaderStage::Hull:
+            return "struct HSIn { float4 pos : SV_POSITION; };\n"
+                   "struct PatchConst { float edges[3] : SV_TessFactor; float inside : SV_InsideTessFactor; };\n"
+                   "PatchConst PatchCF(InputPatch<HSIn, 3> p) {\n"
+                   "    PatchConst o; o.edges[0] = 1.0; o.edges[1] = 1.0; o.edges[2] = 1.0; o.inside = 1.0; return o;\n"
+                   "}\n"
+                   "[domain(\"tri\")] [partitioning(\"integer\")] [outputtopology(\"triangle_cw\")]\n"
+                   "[outputcontrolpoints(3)] [patchconstantfunc(\"PatchCF\")]\n"
+                   "HSIn main(InputPatch<HSIn, 3> p, uint i : SV_OutputControlPointID) { return p[i]; }\n";
+        case ShaderStage::Domain:
+            return "struct DSIn { float4 pos : SV_POSITION; };\n"
+                   "struct PatchConst { float edges[3] : SV_TessFactor; float inside : SV_InsideTessFactor; };\n"
+                   "[domain(\"tri\")] DSIn main(PatchConst pc, float3 b : SV_DomainLocation, const OutputPatch<DSIn, 3> p) {\n"
+                   "    DSIn o; o.pos = p[0].pos * b.x + p[1].pos * b.y + p[2].pos * b.z; return o;\n"
+                   "}\n";
+        case ShaderStage::Library:
+            return "[shader(\"raygeneration\")] void main() {}\n";
         default:
             return "[numthreads(1, 1, 1)] void main() {}\n";
     }
@@ -509,10 +529,13 @@ std::string BuildStandInHlsl(ShaderStage stage, bool mesh_has_payload) {
 
 std::string StageStandInFxcTarget(ShaderStage stage) {
     switch (stage) {
-        case ShaderStage::Vertex: return "vs_5_0";
-        case ShaderStage::Pixel:  return "ps_5_0";
+        case ShaderStage::Vertex:   return "vs_5_0";
+        case ShaderStage::Pixel:    return "ps_5_0";
+        case ShaderStage::Geometry: return "gs_5_0";
+        case ShaderStage::Hull:     return "hs_5_0";
+        case ShaderStage::Domain:   return "ds_5_0";
         case ShaderStage::Compute:
-        default:                  return "cs_5_0";
+        default:                    return "cs_5_0";
     }
 }
 
@@ -680,13 +703,33 @@ ShaderCacheKey ComputeShaderCacheKey(
 }
 
 std::string SelectTargetProfileForStage(ShaderStage stage, uint32_t highest_shader_model) {
-    if (stage == ShaderStage::Mesh) return "ms_6_5";
-    if (stage == ShaderStage::Amplification) return "as_6_5";
+    // SM 6.6 enables HLSL ResourceDescriptorHeap[] / SamplerDescriptorHeap[] bindless
+    // and 64-bit typed/buffer atomics (gated on D3D12_FEATURE_DATA_D3D12_OPTIONS9);
+    // adapters supporting only SM 6.5 cleanly fall back to _6_5 (and Vulkan VK_EXT_descriptor_indexing).
+    if (stage == ShaderStage::Mesh) {
+        return (highest_shader_model >= 0x66u) ? "ms_6_6" : "ms_6_5";
+    }
+    if (stage == ShaderStage::Amplification) {
+        return (highest_shader_model >= 0x66u) ? "as_6_6" : "as_6_5";
+    }
+    if (stage == ShaderStage::Library) {
+        if (highest_shader_model >= 0x66u) return "lib_6_6";
+        if (highest_shader_model >= 0x65u) return "lib_6_5";
+        return "lib_6_3";
+    }
 
     const char* prefix = "cs";
-    if (stage == ShaderStage::Vertex) prefix = "vs";
-    else if (stage == ShaderStage::Pixel) prefix = "ps";
+    switch (stage) {
+        case ShaderStage::Vertex:   prefix = "vs"; break;
+        case ShaderStage::Pixel:    prefix = "ps"; break;
+        case ShaderStage::Geometry: prefix = "gs"; break;
+        case ShaderStage::Hull:     prefix = "hs"; break;
+        case ShaderStage::Domain:   prefix = "ds"; break;
+        case ShaderStage::Compute:
+        default:                    prefix = "cs"; break;
+    }
 
+    if (highest_shader_model >= 0x66u) return std::string(prefix) + "_6_6";
     if (highest_shader_model >= 0x65u) return std::string(prefix) + "_6_5";
     if (highest_shader_model >= 0x62u) return std::string(prefix) + "_6_2";
     if (highest_shader_model >= 0x60u) return std::string(prefix) + "_6_0";
@@ -716,20 +759,26 @@ std::string ShaderCache::ResolveCacheDirectory() const {
     }
 #if defined(_WIN32)
     char env_buf[1024]{};
-    DWORD len = GetEnvironmentVariableA("OPENSCARLETT_SHADER_CACHE", env_buf, static_cast<DWORD>(sizeof(env_buf)));
+    const DWORD len = GetEnvironmentVariableA("OPENSCARLETT_SHADER_CACHE", env_buf, static_cast<DWORD>(sizeof(env_buf)));
     if (len > 0 && len < sizeof(env_buf)) {
         return std::string(env_buf, len);
     }
-    len = GetEnvironmentVariableA("TEMP", env_buf, static_cast<DWORD>(sizeof(env_buf)));
-    if (len == 0 || len >= sizeof(env_buf)) {
-        len = GetEnvironmentVariableA("TMP", env_buf, static_cast<DWORD>(sizeof(env_buf)));
-    }
-    if (len > 0 && len < sizeof(env_buf)) {
-        return (std::filesystem::path(std::string(env_buf, len)) / "openscarlett_shader_cache").string();
+    // Keep default shader cache off C:\ (%TEMP%): resolve to executable-local cache/shaders.
+    wchar_t exe_buf[MAX_PATH]{};
+    const DWORD exe_len = GetModuleFileNameW(nullptr, exe_buf, static_cast<DWORD>(MAX_PATH));
+    if (exe_len > 0u && exe_len < MAX_PATH) {
+        const std::filesystem::path exe_dir = std::filesystem::path(exe_buf).parent_path();
+        if (!exe_dir.empty()) {
+            return (exe_dir / "cache" / "shaders").string();
+        }
     }
 #endif
     std::error_code ec;
-    return (std::filesystem::temp_directory_path(ec) / "openscarlett_shader_cache").string();
+    const std::filesystem::path cwd = std::filesystem::current_path(ec);
+    if (!ec && !cwd.empty()) {
+        return (cwd / "cache" / "shaders").string();
+    }
+    return (std::filesystem::path("cache") / "shaders").string();
 }
 
 std::string ShaderCache::CacheFilePathForKey(const ShaderCacheKey& key) const {
@@ -991,7 +1040,8 @@ Status ShaderCache::CompileStandInShader(
     const std::string& dxc_path,
     std::vector<uint8_t>& out_bytecode,
     std::string* out_diagnostics) {
-    const bool needs_dxc = (stage == ShaderStage::Mesh || stage == ShaderStage::Amplification || prefer_dxil);
+    const bool needs_dxc = (stage == ShaderStage::Mesh || stage == ShaderStage::Amplification ||
+                            stage == ShaderStage::Library || prefer_dxil);
     const std::string standin_target = needs_dxc ? target_profile : StageStandInFxcTarget(stage);
     const std::string cache_id = std::to_string(static_cast<uint32_t>(stage)) + ":" +
                                  standin_target + ":" + (mesh_has_payload ? "1" : "0");
