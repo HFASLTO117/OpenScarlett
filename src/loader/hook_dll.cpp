@@ -1520,6 +1520,19 @@ bool IsProtectedStoreOrSystemExeW(const std::wstring& exe_path) {
     return false;
 }
 
+bool IsInternalToolchainExeW(const std::wstring& exe_path) {
+    if (exe_path.empty()) {
+        return false;
+    }
+    const std::wstring leaf_lo = ToLowerAsciiW(std::filesystem::path(exe_path).filename().wstring());
+    return leaf_lo == L"dxc.exe" ||
+           leaf_lo == L"spirv-val.exe" ||
+           leaf_lo == L"spirv-as.exe" ||
+           leaf_lo == L"spirv-dis.exe" ||
+           leaf_lo == L"openscarlett.exe" ||
+           leaf_lo == L"openscarlettlauncher.exe";
+}
+
 std::string WideToAnsiAcp(std::wstring_view wide) {
     if (wide.empty()) {
         return {};
@@ -1540,11 +1553,15 @@ void PropagateHookToCreatedChild(const PROCESS_INFORMATION& pi,
                                  const char* api_tag) {
     const std::wstring child_exe_w = QueryChildProcessImagePathW(pi.hProcess);
 
-    // Strictly respect Microsoft Store / WindowsApps & Windows system process boundaries.
-    if (IsProtectedStoreOrSystemExeW(child_exe_w)) {
+    // Strictly respect Microsoft Store / WindowsApps & Windows system process boundaries,
+    // and never APC-inject into OpenScarlett's own internal shader compiler/validator helpers
+    // (e.g. dxc.exe / spirv-val.exe spawned by d3d12_xs.dll during RDNA2 auto-lifting).
+    if (IsProtectedStoreOrSystemExeW(child_exe_w) || IsInternalToolchainExeW(child_exe_w)) {
+        const char* skip_suffix =
+            IsInternalToolchainExeW(child_exe_w) ? ":child_skipped_toolchain" : ":child_skipped_protected";
         openscarlett::CallTelemetry::Global().Record(
             "loader",
-            std::string(api_tag) + ":child_skipped_protected",
+            std::string(api_tag) + skip_suffix,
             openscarlett::CallOutcome::StubOk,
             static_cast<int32_t>(pi.dwProcessId),
             -1);

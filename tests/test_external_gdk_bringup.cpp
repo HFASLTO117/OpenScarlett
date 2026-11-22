@@ -817,12 +817,17 @@ int main() {
             const uint64_t sc_mem = tel.GetCallCount("shader_cache", "MemoryHit");
             const uint64_t sc_disk = tel.GetCallCount("shader_cache", "DiskHit");
             OS_REQUIRE(sc_mem >= 1u);
+            // Internal shader compiler helpers (dxc.exe) must NEVER be APC-injected as guest children!
+            OS_REQUIRE(tel.GetCallCount("loader", "CreateProcessA:child_hook_propagated") == 0u);
             if (expect_disk_hit) {
                 OS_REQUIRE(sc_disk >= 1u);
                 OS_REQUIRE(sc_miss == 0u);
             } else {
                 OS_REQUIRE(sc_miss >= 1u);
                 OS_REQUIRE(tel.GetCallCount("rdna2_lifter", "LiftRdna2Xs2Shader") >= 1u);
+                if (tel.GetCallCount("rdna2_lifter", "CompileHlslWithDxc") >= 1u) {
+                    OS_REQUIRE(tel.GetCallCount("loader", "CreateProcessA:child_skipped_toolchain") >= 1u);
+                }
             }
 
             std::printf("[PASS] External #2 (%s): %zu/19 shims + vfs/loader | %zu symbols | %llu calls | "

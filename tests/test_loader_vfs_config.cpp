@@ -1255,21 +1255,29 @@ void TestDefaultWorkDirResolution() {
     ::SetEnvironmentVariableW(L"TEMP", L"C:\\Users\\SimulatedUser\\AppData\\Local\\Temp");
     ::SetEnvironmentVariableW(L"TMP", L"C:\\Users\\SimulatedUser\\AppData\\Local\\Temp");
 
-    // 8A. Executable inside a build\ directory on E:\ -> lands under <parent>\.tmp\openscarlett_run (NEVER C:\!)
+    // 8A. Executable inside a build\ directory -> lands under <parent>\.tmp\openscarlett_run
+    //     (never falls back to C:\...\Temp; stays off C:\ whenever the bundle/repo itself is off C:\!)
+    const bool sandbox_off_c = !StartsWithDriveCW(sandbox.wstring());
     const fs::path repo_root = sandbox / "fake_repo";
     const fs::path fake_build = repo_root / "build";
     fs::create_directories(fake_build, ec);
 
     const std::wstring work_build = ResolveDefaultWorkDirW(fake_build.wstring());
-    OS_REQUIRE(!StartsWithDriveCW(work_build));
+    if (sandbox_off_c) {
+        OS_REQUIRE(!StartsWithDriveCW(work_build));
+    }
     OS_REQUIRE(work_build == (repo_root / L".tmp" / L"openscarlett_run").wstring());
 
     const std::wstring vfs_build = ResolveDefaultVfsRootW(fake_build.wstring());
-    OS_REQUIRE(!StartsWithDriveCW(vfs_build));
+    if (sandbox_off_c) {
+        OS_REQUIRE(!StartsWithDriveCW(vfs_build));
+    }
     OS_REQUIRE(vfs_build == (repo_root / L".tmp" / L"openscarlett_run" / L"vfs").wstring());
 
     const std::wstring tel_build = ResolveDefaultTelemetryDirW(fake_build.wstring());
-    OS_REQUIRE(!StartsWithDriveCW(tel_build));
+    if (sandbox_off_c) {
+        OS_REQUIRE(!StartsWithDriveCW(tel_build));
+    }
     OS_REQUIRE(tel_build == (repo_root / L".tmp" / L"openscarlett_run" / L"telemetry").wstring());
 
     // Multi-config build\Release walks up to <repo_root>\.tmp\openscarlett_run
@@ -1278,11 +1286,13 @@ void TestDefaultWorkDirResolution() {
     OS_REQUIRE(ResolveDefaultWorkDirW(fake_build_rel.wstring()) ==
                (repo_root / L".tmp" / L"openscarlett_run").wstring());
 
-    // 8B. Standalone release directory on E:\ -> lands under <dir>\.openscarlett_tmp (NEVER C:\!)
+    // 8B. Standalone release directory -> lands under <dir>\.openscarlett_tmp
     const fs::path standalone_dir = sandbox / "standalone_release";
     fs::create_directories(standalone_dir, ec);
     const std::wstring work_standalone = ResolveDefaultWorkDirW(standalone_dir.wstring());
-    OS_REQUIRE(!StartsWithDriveCW(work_standalone));
+    if (sandbox_off_c) {
+        OS_REQUIRE(!StartsWithDriveCW(work_standalone));
+    }
     OS_REQUIRE(work_standalone == (standalone_dir / L".openscarlett_tmp").wstring());
 
     // 8C. Default BuildDefaultConfig() from this E:\ binary NEVER leaks to C:\ even with TEMP=C:\...!

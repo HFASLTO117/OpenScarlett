@@ -379,7 +379,9 @@ void TestHardenedCowVfs() {
     cfg.t_root = t_dir.wstring();
     cfg.s_root = s_dir.wstring();
     cfg.g_overlay_root = g_ovl.wstring();
-    cfg.forbid_system_drive_writes = true;
+    // Only forbid system-drive writes on this scratch mount when the scratch root itself is off C:\;
+    // section 2D explicitly verifies forbid_system_drive_writes=true against C:\ regardless of host drive.
+    cfg.forbid_system_drive_writes = !IsPathOnSystemDriveW(root.wstring());
 
     VfsMounts vfs(cfg);
     OS_REQUIRE(vfs.AddGameSubMount(L"DLC/Pack1", g_dlc1.wstring()));

@@ -438,7 +438,17 @@ std::string ResolveDxcExecutable(const std::string& requested_path) {
             return beside_exe.string();
         }
     }
-    // 2. Explicit environment override
+    // 2. Check OpenScarlett shim/bundle directory (for APC-hooked guests running outside the bundle dir)
+    char shim_dir_buf[1024]{};
+    const DWORD shim_len =
+        GetEnvironmentVariableA("OPENSCARLETT_SHIM_DIR", shim_dir_buf, static_cast<DWORD>(sizeof(shim_dir_buf)));
+    if (shim_len > 0 && shim_len < sizeof(shim_dir_buf)) {
+        const auto beside_shims = std::filesystem::path(std::string(shim_dir_buf, shim_len)) / "dxc.exe";
+        if (std::filesystem::exists(beside_shims, ec)) {
+            return beside_shims.string();
+        }
+    }
+    // 3. Explicit environment override
     char env_dxc[1024]{};
     const DWORD env_len = GetEnvironmentVariableA("OPENSCARLETT_DXC_PATH", env_dxc, static_cast<DWORD>(sizeof(env_dxc)));
     if (env_len > 0 && env_len < sizeof(env_dxc) && std::filesystem::exists(env_dxc, ec)) {
