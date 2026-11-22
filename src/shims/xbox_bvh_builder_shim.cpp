@@ -2,16 +2,23 @@
 #include "openscarlett/shims/secondary_shims_abi.h"
 #include "openscarlett/core/framebuffer.h"
 #include "openscarlett/core/telemetry.h"
+#include "openscarlett/gpu/bvh4_decoder.h"
 #include "openscarlett/gpu/dxr_hardware.h"
 #include "openscarlett/gpu/rdna2_rayquery_bridge.h"
 #include "openscarlett/gpu/rt_bvh.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+
+#if defined(_WIN32)
+#include <windows.h>
+#include <d3d12.h>
+#endif
 
 struct XboxBvhBuilderObject {
     std::mutex mutex;
@@ -624,3 +631,640 @@ int32_t OS_SHIM_CALL XboxBvhDispatchRays(
 }
 
 }  // extern "C"
+
+// ===========================================================================
+// Real MSVC-Mangled C++ Class ABI: class XboxBvhBuilder
+// ===========================================================================
+namespace {
+
+inline OsBvhHresult RecordCppHr(const char* sym, int32_t hr) {
+    return static_cast<OsBvhHresult>(RecordHr(sym, hr));
+}
+
+#if defined(_WIN32)
+ID3D12Device* CastDevice11ToBase(ID3D12Device11* device) noexcept {
+#  if defined(__ID3D12Device11_INTERFACE_DEFINED__)
+    return static_cast<ID3D12Device*>(device);
+#  else
+    return reinterpret_cast<ID3D12Device*>(device);
+#  endif
+}
+
+ID3D12GraphicsCommandList4* CastCmdList6To4(ID3D12GraphicsCommandList6* cmd) noexcept {
+#  if defined(__ID3D12GraphicsCommandList6_INTERFACE_DEFINED__)
+    return static_cast<ID3D12GraphicsCommandList4*>(cmd);
+#  else
+    return reinterpret_cast<ID3D12GraphicsCommandList4*>(cmd);
+#  endif
+}
+
+ID3D12GraphicsCommandList4* CastCmdList8To4(ID3D12GraphicsCommandList8* cmd) noexcept {
+#  if defined(__ID3D12GraphicsCommandList8_INTERFACE_DEFINED__)
+    return static_cast<ID3D12GraphicsCommandList4*>(cmd);
+#  else
+    return reinterpret_cast<ID3D12GraphicsCommandList4*>(cmd);
+#  endif
+}
+#endif
+
+}  // namespace
+
+struct XboxBvhBuilder::Impl {
+    mutable std::mutex mutex;
+    std::atomic<uint32_t> ref_count{1u};
+    bool heap_allocated = false;
+    bool initialized = false;
+    uint32_t flags = kXboxBvhBuilderFlagPreferHardwareDxr;
+    bool use_64bit_morton_codes = false;
+    openscarlett::DxrHardwareEngine engine;
+    openscarlett::XboxBvh4RehydrationManager rehydrator;
+    std::unordered_map<uint64_t, uint64_t> built_va_to_pc_va;
+    uint64_t build_count = 0ull;
+    uint64_t rehydrate_count = 0ull;
+};
+
+XboxBvhBuilder::XboxBvhBuilder() : impl_(new Impl()) {
+    RecordOk("XboxBvhBuilder::XboxBvhBuilder");
+}
+
+XboxBvhBuilder::~XboxBvhBuilder() {
+    Shutdown();
+    delete impl_;
+    impl_ = nullptr;
+    RecordOk("XboxBvhBuilder::~XboxBvhBuilder");
+}
+
+OsBvhHresult XboxBvhBuilder::Create(ID3D12Device11* device, XboxBvhBuilder** outBuilder) {
+    if (!outBuilder) {
+        return RecordCppHr("XboxBvhBuilder::Create", OS_SHIM_E_POINTER);
+    }
+    *outBuilder = nullptr;
+    auto* builder = new (std::nothrow) XboxBvhBuilder();
+    if (!builder || !builder->impl_) {
+        delete builder;
+        return RecordCppHr("XboxBvhBuilder::Create", OS_SHIM_E_OUTOFMEMORY);
+    }
+    builder->impl_->heap_allocated = true;
+    const OsBvhHresult hr = builder->Initialize(device, kXboxBvhBuilderFlagPreferHardwareDxr);
+    if (hr < 0) {
+        delete builder;
+        return RecordCppHr("XboxBvhBuilder::Create", static_cast<int32_t>(hr));
+    }
+    *outBuilder = builder;
+    return RecordCppHr("XboxBvhBuilder::Create", OS_SHIM_S_OK);
+}
+
+OsBvhHresult XboxBvhBuilder::Initialize(ID3D12Device11* device, uint32_t flags) {
+    if (!impl_) {
+        return RecordCppHr("XboxBvhBuilder::Initialize", OS_SHIM_E_FAIL);
+    }
+    std::lock_guard<std::mutex> lk(impl_->mutex);
+    impl_->rehydrator.Clear();
+    impl_->built_va_to_pc_va.clear();
+    impl_->engine.Shutdown();
+
+    impl_->flags = flags;
+    impl_->use_64bit_morton_codes = (flags & kXboxBvhBuilderFlag64BitMortonCodes) != 0u;
+    const bool force_sw = (flags & kXboxBvhBuilderFlagForceSoftwareBvh4) != 0u;
+
+    openscarlett::Status st{};
+#if defined(_WIN32)
+    if (device != nullptr) {
+        st = impl_->engine.Initialize(CastDevice11ToBase(device), force_sw);
+    } else
+#else
+    (void)device;
+#endif
+    {
+        openscarlett::DxrInitOptions opts{};
+        opts.prefer_warp = false;
+        opts.force_software_path = force_sw;
+        st = impl_->engine.Initialize(opts);
+    }
+    if (!st.ok()) {
+        impl_->initialized = false;
+        return RecordCppHr("XboxBvhBuilder::Initialize", StatusToHr(st));
+    }
+
+    st = impl_->rehydrator.Initialize(&impl_->engine, force_sw);
+    if (!st.ok()) {
+        impl_->engine.Shutdown();
+        impl_->initialized = false;
+        return RecordCppHr("XboxBvhBuilder::Initialize", StatusToHr(st));
+    }
+
+    impl_->initialized = true;
+    return RecordCppHr("XboxBvhBuilder::Initialize", OS_SHIM_S_OK);
+}
+
+void XboxBvhBuilder::Shutdown() {
+    if (!impl_) return;
+    std::lock_guard<std::mutex> lk(impl_->mutex);
+    impl_->rehydrator.Clear();
+    impl_->built_va_to_pc_va.clear();
+    impl_->engine.Shutdown();
+    impl_->initialized = false;
+    RecordOk("XboxBvhBuilder::Shutdown");
+}
+
+OsBvhHresult XboxBvhBuilder::GetRaytracingAccelerationStructurePrebuildInfoX(
+    const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* pDesc,
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO* pInfo) const {
+    if (!impl_ || !pDesc || !pInfo) {
+        return RecordCppHr("XboxBvhBuilder::GetRaytracingAccelerationStructurePrebuildInfoX",
+                           OS_SHIM_E_INVALIDARG);
+    }
+#if defined(_WIN32)
+    openscarlett::DxrAsInputs inputs{};
+    inputs.build_flags = static_cast<uint32_t>(pDesc->Flags);
+    if (pDesc->Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL) {
+        inputs.type = openscarlett::DxrAsType::TopLevel;
+        inputs.primitive_count = pDesc->NumDescs == 0u ? 1u : pDesc->NumDescs;
+        inputs.geometry_count = 1u;
+    } else {
+        inputs.type = openscarlett::DxrAsType::BottomLevel;
+        inputs.geometry_count = pDesc->NumDescs == 0u ? 1u : pDesc->NumDescs;
+        uint32_t total_prims = 0u;
+        uint32_t stride = 12u;
+        bool is_opaque = true;
+        for (UINT i = 0u; i < pDesc->NumDescs; ++i) {
+            const D3D12_RAYTRACING_GEOMETRY_DESC* g = nullptr;
+            if (pDesc->DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY && pDesc->pGeometryDescs) {
+                g = &pDesc->pGeometryDescs[i];
+            } else if (pDesc->DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS &&
+                       pDesc->ppGeometryDescs) {
+                g = pDesc->ppGeometryDescs[i];
+            }
+            if (!g) continue;
+            if (g->Type == D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES) {
+                if (g->Triangles.IndexCount >= 3u) {
+                    total_prims += g->Triangles.IndexCount / 3u;
+                } else if (g->Triangles.VertexCount >= 3u) {
+                    total_prims += g->Triangles.VertexCount / 3u;
+                }
+                if (g->Triangles.VertexBuffer.StrideInBytes >= 12u) {
+                    stride = static_cast<uint32_t>(g->Triangles.VertexBuffer.StrideInBytes);
+                }
+            } else if (g->Type == D3D12_RAYTRACING_GEOMETRY_TYPE_PROCEDURAL_PRIMITIVE_AABBS) {
+                total_prims += static_cast<uint32_t>(g->AABBs.AABBCount);
+            }
+            if ((g->Flags & D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE) == 0u) {
+                is_opaque = false;
+            }
+        }
+        inputs.primitive_count = total_prims == 0u ? 1u : total_prims;
+        inputs.vertex_stride = stride;
+        inputs.is_opaque = is_opaque;
+    }
+
+    openscarlett::DxrPrebuildInfo prebuild{};
+    bool morton64 = false;
+    {
+        std::lock_guard<std::mutex> lk(impl_->mutex);
+        morton64 = impl_->use_64bit_morton_codes;
+        if (impl_->initialized) {
+            const openscarlett::Status st = impl_->engine.QueryPrebuildInfo(inputs, prebuild);
+            if (!st.ok()) {
+                return RecordCppHr("XboxBvhBuilder::GetRaytracingAccelerationStructurePrebuildInfoX",
+                                   StatusToHr(st));
+            }
+        } else {
+            const uint64_t n = inputs.primitive_count;
+            const auto align256 = [](uint64_t v) noexcept -> uint64_t {
+                return (v + 255ull) & ~255ull;
+            };
+            prebuild.result_data_max_size_bytes = align256(256ull + n * 192ull);
+            prebuild.scratch_data_size_bytes = align256(256ull + n * 160ull);
+            prebuild.update_scratch_data_size_bytes =
+                ((inputs.build_flags & openscarlett::kDxrBuildAllowUpdate) != 0u)
+                    ? align256(256ull + n * 64ull)
+                    : 0ull;
+        }
+    }
+
+    // 64-bit Morton code sorting requires 8 bytes per primitive of extra scratch workspace (256B aligned).
+    uint64_t scratch_bytes = prebuild.scratch_data_size_bytes;
+    if (morton64) {
+        const uint64_t extra =
+            ((static_cast<uint64_t>(inputs.primitive_count) * 8ull) + 255ull) & ~255ull;
+        scratch_bytes += extra;
+    }
+
+    pInfo->ResultDataMaxSizeInBytes = prebuild.result_data_max_size_bytes;
+    pInfo->ScratchDataSizeInBytes = scratch_bytes;
+    pInfo->UpdateScratchDataSizeInBytes = prebuild.update_scratch_data_size_bytes;
+    return RecordCppHr("XboxBvhBuilder::GetRaytracingAccelerationStructurePrebuildInfoX", OS_SHIM_S_OK);
+#else
+    return RecordCppHr("XboxBvhBuilder::GetRaytracingAccelerationStructurePrebuildInfoX", OS_SHIM_S_OK);
+#endif
+}
+
+OsBvhHresult XboxBvhBuilder::BuildRaytracingAccelerationStructureX(
+    ID3D12GraphicsCommandList4* commandList,
+    const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* pDesc,
+    uint32_t numPostbuildInfoDescs,
+    const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* pPostbuildInfoDescs) {
+    if (!impl_ || !pDesc) {
+        return RecordCppHr("XboxBvhBuilder::BuildRaytracingAccelerationStructureX",
+                           OS_SHIM_E_INVALIDARG);
+    }
+#if defined(_WIN32)
+    if (pDesc->DestAccelerationStructureData == 0ull ||
+        (pDesc->DestAccelerationStructureData & (openscarlett::kDxrAsByteAlignment - 1u)) != 0ull) {
+        return RecordCppHr("XboxBvhBuilder::BuildRaytracingAccelerationStructureX",
+                           OS_SHIM_E_INVALIDARG);
+    }
+    if (pDesc->ScratchAccelerationStructureData == 0ull ||
+        (pDesc->ScratchAccelerationStructureData & (openscarlett::kDxrAsByteAlignment - 1u)) != 0ull) {
+        return RecordCppHr("XboxBvhBuilder::BuildRaytracingAccelerationStructureX",
+                           OS_SHIM_E_INVALIDARG);
+    }
+
+    std::lock_guard<std::mutex> lk(impl_->mutex);
+    if (commandList != nullptr && impl_->initialized && impl_->engine.using_hardware_path()) {
+        commandList->BuildRaytracingAccelerationStructure(
+            pDesc, numPostbuildInfoDescs, pPostbuildInfoDescs);
+    } else {
+        (void)numPostbuildInfoDescs;
+        (void)pPostbuildInfoDescs;
+    }
+    impl_->built_va_to_pc_va[pDesc->DestAccelerationStructureData] =
+        pDesc->DestAccelerationStructureData;
+    ++impl_->build_count;
+    return RecordCppHr("XboxBvhBuilder::BuildRaytracingAccelerationStructureX", OS_SHIM_S_OK);
+#else
+    (void)commandList;
+    (void)numPostbuildInfoDescs;
+    (void)pPostbuildInfoDescs;
+    return RecordCppHr("XboxBvhBuilder::BuildRaytracingAccelerationStructureX", OS_SHIM_S_OK);
+#endif
+}
+
+OsBvhHresult XboxBvhBuilder::BuildRaytracingAccelerationStructureBatchedX(
+    ID3D12GraphicsCommandList6* commandList,
+    uint32_t numDescs,
+    const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* pDescs) {
+    if (!impl_ || numDescs == 0u || !pDescs) {
+        return RecordCppHr("XboxBvhBuilder::BuildRaytracingAccelerationStructureBatchedX",
+                           OS_SHIM_E_INVALIDARG);
+    }
+#if defined(_WIN32)
+    ID3D12GraphicsCommandList4* cmd4 = CastCmdList6To4(commandList);
+    for (uint32_t i = 0u; i < numDescs; ++i) {
+        const OsBvhHresult hr =
+            BuildRaytracingAccelerationStructureX(cmd4, &pDescs[i], 0u, nullptr);
+        if (hr < 0) {
+            return RecordCppHr("XboxBvhBuilder::BuildRaytracingAccelerationStructureBatchedX",
+                               static_cast<int32_t>(hr));
+        }
+    }
+#else
+    (void)commandList;
+#endif
+    return RecordCppHr("XboxBvhBuilder::BuildRaytracingAccelerationStructureBatchedX", OS_SHIM_S_OK);
+}
+
+OsBvhHresult XboxBvhBuilder::BuildRaytracingAccelerationStructureBatched2X(
+    ID3D12GraphicsCommandList8* commandList,
+    const XboxBvhBatchedBuildDesc* pBatchDesc) {
+    if (!impl_ || !pBatchDesc || pBatchDesc->numDescs == 0u || !pBatchDesc->pDescs) {
+        return RecordCppHr("XboxBvhBuilder::BuildRaytracingAccelerationStructureBatched2X",
+                           OS_SHIM_E_INVALIDARG);
+    }
+#if defined(_WIN32)
+    ID3D12GraphicsCommandList4* cmd4 = CastCmdList8To4(commandList);
+    for (uint32_t i = 0u; i < pBatchDesc->numDescs; ++i) {
+        const uint32_t pb_count =
+            (i == pBatchDesc->numDescs - 1u) ? pBatchDesc->numPostbuildInfoDescs : 0u;
+        const auto* pb_ptr = (pb_count > 0u) ? pBatchDesc->pPostbuildInfoDescs : nullptr;
+        const OsBvhHresult hr =
+            BuildRaytracingAccelerationStructureX(cmd4, &pBatchDesc->pDescs[i], pb_count, pb_ptr);
+        if (hr < 0) {
+            return RecordCppHr("XboxBvhBuilder::BuildRaytracingAccelerationStructureBatched2X",
+                               static_cast<int32_t>(hr));
+        }
+    }
+#else
+    (void)commandList;
+#endif
+    return RecordCppHr("XboxBvhBuilder::BuildRaytracingAccelerationStructureBatched2X", OS_SHIM_S_OK);
+}
+
+OsBvhHresult XboxBvhBuilder::ValidateRehydrateAccelerationStructureBuildDesc(
+    const XboxBvhRehydrateDesc* pDesc) const {
+    if (!pDesc) {
+        return RecordCppHr("XboxBvhBuilder::ValidateRehydrateAccelerationStructureBuildDesc",
+                           OS_SHIM_E_INVALIDARG);
+    }
+    if (pDesc->destAccelerationStructureVa == 0ull ||
+        (pDesc->destAccelerationStructureVa & (openscarlett::kDxrAsByteAlignment - 1u)) != 0ull) {
+        return RecordCppHr("XboxBvhBuilder::ValidateRehydrateAccelerationStructureBuildDesc",
+                           OS_SHIM_E_INVALIDARG);
+    }
+    if (pDesc->sourceAccelerationStructureVa != 0ull &&
+        (pDesc->sourceAccelerationStructureVa & (openscarlett::kDxrAsByteAlignment - 1u)) != 0ull) {
+        return RecordCppHr("XboxBvhBuilder::ValidateRehydrateAccelerationStructureBuildDesc",
+                           OS_SHIM_E_INVALIDARG);
+    }
+    if (pDesc->cpuBvhBuffer != nullptr) {
+        if (pDesc->cpuBvhBufferSize < openscarlett::kRdna2BvhHeaderSize) {
+            return RecordCppHr("XboxBvhBuilder::ValidateRehydrateAccelerationStructureBuildDesc",
+                               OS_SHIM_E_INVALIDARG);
+        }
+        const openscarlett::Status st = openscarlett::ValidateRdna2Bvh4(
+            static_cast<const uint8_t*>(pDesc->cpuBvhBuffer), pDesc->cpuBvhBufferSize, nullptr);
+        if (!st.ok()) {
+            return RecordCppHr("XboxBvhBuilder::ValidateRehydrateAccelerationStructureBuildDesc",
+                               OS_SHIM_E_INVALIDARG);
+        }
+    }
+    return RecordCppHr("XboxBvhBuilder::ValidateRehydrateAccelerationStructureBuildDesc",
+                       OS_SHIM_S_OK);
+}
+
+OsBvhHresult XboxBvhBuilder::RehydrateRaytracingAccelerationStructureX(
+    ID3D12GraphicsCommandList4* commandList,
+    const XboxBvhRehydrateDesc* pDesc) {
+    (void)commandList;
+    if (!impl_) {
+        return RecordCppHr("XboxBvhBuilder::RehydrateRaytracingAccelerationStructureX",
+                           OS_SHIM_E_FAIL);
+    }
+    const OsBvhHresult val_hr = ValidateRehydrateAccelerationStructureBuildDesc(pDesc);
+    if (val_hr < 0) {
+        return RecordCppHr("XboxBvhBuilder::RehydrateRaytracingAccelerationStructureX",
+                           static_cast<int32_t>(val_hr));
+    }
+
+    std::lock_guard<std::mutex> lk(impl_->mutex);
+    if (!impl_->initialized) {
+        openscarlett::DxrInitOptions opts{};
+        opts.force_software_path = (impl_->flags & kXboxBvhBuilderFlagForceSoftwareBvh4) != 0u;
+        if (impl_->engine.Initialize(opts).ok()) {
+            impl_->rehydrator.Initialize(&impl_->engine, opts.force_software_path);
+            impl_->initialized = true;
+        }
+    }
+
+    if (pDesc->cpuBvhBuffer != nullptr && pDesc->cpuBvhBufferSize >= openscarlett::kRdna2BvhHeaderSize) {
+        auto* raw_ptr = static_cast<uint8_t*>(pDesc->cpuBvhBuffer);
+        openscarlett::Rdna2BvhHeader hdr{};
+        openscarlett::Status st = openscarlett::DecodeRdna2BvhHeader(raw_ptr, pDesc->cpuBvhBufferSize, hdr);
+        if (!st.ok()) {
+            return RecordCppHr("XboxBvhBuilder::RehydrateRaytracingAccelerationStructureX",
+                               StatusToHr(st));
+        }
+
+        std::vector<uint8_t> buf(raw_ptr, raw_ptr + pDesc->cpuBvhBufferSize);
+        openscarlett::XboxBvh4RehydrateResult res{};
+        if (hdr.as_type == openscarlett::Rdna2BvhAsType::TopLevel) {
+            st = impl_->rehydrator.RehydrateTlas(
+                pDesc->sourceAccelerationStructureVa,
+                pDesc->destAccelerationStructureVa,
+                buf,
+                pDesc->buildFlags,
+                res);
+        } else {
+            st = impl_->rehydrator.RehydrateBlas(
+                pDesc->sourceAccelerationStructureVa,
+                pDesc->destAccelerationStructureVa,
+                buf,
+                pDesc->buildFlags,
+                res);
+        }
+        if (!st.ok()) {
+            return RecordCppHr("XboxBvhBuilder::RehydrateRaytracingAccelerationStructureX",
+                               StatusToHr(st));
+        }
+
+        // Write in-place patched BVH4 bytes (including updated CRC32) back to caller buffer.
+        if (buf.size() == pDesc->cpuBvhBufferSize) {
+            std::memcpy(raw_ptr, buf.data(), buf.size());
+        }
+        impl_->built_va_to_pc_va[pDesc->destAccelerationStructureVa] = res.native_pc_gpu_va;
+    } else {
+        if (pDesc->sourceAccelerationStructureVa != 0ull) {
+            impl_->rehydrator.RegisterVaRelocation(
+                pDesc->sourceAccelerationStructureVa, pDesc->destAccelerationStructureVa);
+        }
+        impl_->built_va_to_pc_va[pDesc->destAccelerationStructureVa] =
+            pDesc->destAccelerationStructureVa;
+    }
+
+    ++impl_->rehydrate_count;
+    return RecordCppHr("XboxBvhBuilder::RehydrateRaytracingAccelerationStructureX", OS_SHIM_S_OK);
+}
+
+OsBvhHresult XboxBvhBuilder::RehydrateRaytracingAccelerationStructureBatchedX(
+    ID3D12GraphicsCommandList6* commandList,
+    uint32_t numDescs,
+    const XboxBvhRehydrateDesc* pDescs) {
+    if (!impl_ || numDescs == 0u || !pDescs) {
+        return RecordCppHr("XboxBvhBuilder::RehydrateRaytracingAccelerationStructureBatchedX",
+                           OS_SHIM_E_INVALIDARG);
+    }
+#if defined(_WIN32)
+    ID3D12GraphicsCommandList4* cmd4 = CastCmdList6To4(commandList);
+#else
+    ID3D12GraphicsCommandList4* cmd4 = nullptr;
+    (void)commandList;
+#endif
+    for (uint32_t i = 0u; i < numDescs; ++i) {
+        const OsBvhHresult hr = RehydrateRaytracingAccelerationStructureX(cmd4, &pDescs[i]);
+        if (hr < 0) {
+            return RecordCppHr("XboxBvhBuilder::RehydrateRaytracingAccelerationStructureBatchedX",
+                               static_cast<int32_t>(hr));
+        }
+    }
+    return RecordCppHr("XboxBvhBuilder::RehydrateRaytracingAccelerationStructureBatchedX",
+                       OS_SHIM_S_OK);
+}
+
+OsBvhHresult XboxBvhBuilder::RehydrateRaytracingAccelerationStructureBatched2X(
+    ID3D12GraphicsCommandList8* commandList,
+    uint32_t numDescs,
+    const XboxBvhRehydrateDesc* pDescs,
+    uint32_t rehydrateFlags) {
+    if (!impl_ || numDescs == 0u || !pDescs) {
+        return RecordCppHr("XboxBvhBuilder::RehydrateRaytracingAccelerationStructureBatched2X",
+                           OS_SHIM_E_INVALIDARG);
+    }
+#if defined(_WIN32)
+    ID3D12GraphicsCommandList4* cmd4 = CastCmdList8To4(commandList);
+#else
+    ID3D12GraphicsCommandList4* cmd4 = nullptr;
+    (void)commandList;
+#endif
+    for (uint32_t i = 0u; i < numDescs; ++i) {
+        const OsBvhHresult hr = RehydrateRaytracingAccelerationStructureX(cmd4, &pDescs[i]);
+        if (hr < 0) {
+            return RecordCppHr("XboxBvhBuilder::RehydrateRaytracingAccelerationStructureBatched2X",
+                               static_cast<int32_t>(hr));
+        }
+        if ((rehydrateFlags & kXboxBvhBuilderFlagEnableCpuValidation) != 0u &&
+            pDescs[i].cpuBvhBuffer != nullptr) {
+            XboxBvhCpuValidationResult vres{};
+            const OsBvhHresult vhr =
+                CpuValidateResultX(pDescs[i].cpuBvhBuffer, pDescs[i].cpuBvhBufferSize, &vres);
+            if (vhr < 0 || !vres.valid) {
+                return RecordCppHr(
+                    "XboxBvhBuilder::RehydrateRaytracingAccelerationStructureBatched2X",
+                    OS_SHIM_E_FAIL);
+            }
+        }
+    }
+    return RecordCppHr("XboxBvhBuilder::RehydrateRaytracingAccelerationStructureBatched2X",
+                       OS_SHIM_S_OK);
+}
+
+void XboxBvhBuilder::Set64BitMortonCodes(bool enable) {
+    if (!impl_) return;
+    std::lock_guard<std::mutex> lk(impl_->mutex);
+    impl_->use_64bit_morton_codes = enable;
+    if (enable) {
+        impl_->flags |= kXboxBvhBuilderFlag64BitMortonCodes;
+    } else {
+        impl_->flags &= ~kXboxBvhBuilderFlag64BitMortonCodes;
+    }
+    RecordOk("XboxBvhBuilder::Set64BitMortonCodes");
+}
+
+bool XboxBvhBuilder::Get64BitMortonCodes() const noexcept {
+    if (!impl_) return false;
+    std::lock_guard<std::mutex> lk(impl_->mutex);
+    return impl_->use_64bit_morton_codes;
+}
+
+OsBvhHresult XboxBvhBuilder::CpuValidateResultX(
+    const void* bvhData,
+    size_t bvhDataSize,
+    XboxBvhCpuValidationResult* outResult) const {
+    if (outResult) {
+        std::memset(outResult, 0, sizeof(XboxBvhCpuValidationResult));
+    }
+    if (!bvhData || bvhDataSize < openscarlett::kRdna2BvhHeaderSize) {
+        if (outResult) {
+            outResult->errorCode = static_cast<uint32_t>(openscarlett::StatusCode::InvalidArgument);
+            std::snprintf(outResult->diagnostic, sizeof(outResult->diagnostic),
+                          "%s", "BVH buffer is null or smaller than 256-byte RDNA2 header");
+        }
+        return RecordCppHr("XboxBvhBuilder::CpuValidateResultX", OS_SHIM_E_INVALIDARG);
+    }
+
+    const auto* bytes = static_cast<const uint8_t*>(bvhData);
+    openscarlett::Rdna2BvhHeader hdr{};
+    openscarlett::Status hst = openscarlett::DecodeRdna2BvhHeader(bytes, bvhDataSize, hdr);
+    if (!hst.ok()) {
+        if (outResult) {
+            outResult->errorCode = static_cast<uint32_t>(hst.code);
+            std::snprintf(outResult->diagnostic, sizeof(outResult->diagnostic),
+                          "%s", hst.message.c_str());
+        }
+        return RecordCppHr("XboxBvhBuilder::CpuValidateResultX", OS_SHIM_E_FAIL);
+    }
+
+    openscarlett::Rdna2BvhValidationReport rep{};
+    openscarlett::Status vst = openscarlett::ValidateRdna2Bvh4(bytes, bvhDataSize, &rep);
+    if (outResult) {
+        outResult->headerValid = true;
+        outResult->valid = vst.ok();
+        outResult->crcValid = vst.ok();
+        outResult->boundsValid = vst.ok();
+        outResult->visitedInternalNodes = rep.visited_internal_nodes;
+        outResult->visitedLeafNodes =
+            rep.visited_triangle_nodes + rep.visited_instance_nodes + rep.visited_procedural_nodes;
+        outResult->maxDepthObserved = rep.max_depth_observed;
+        outResult->errorCode = vst.ok() ? 0u : static_cast<uint32_t>(vst.code);
+        std::snprintf(outResult->diagnostic, sizeof(outResult->diagnostic),
+                      "%s", vst.ok() ? "OK" : vst.message.c_str());
+    }
+    return RecordCppHr("XboxBvhBuilder::CpuValidateResultX",
+                       vst.ok() ? OS_SHIM_S_OK : OS_SHIM_E_FAIL);
+}
+
+uint32_t XboxBvhBuilder::GetFlags() const noexcept {
+    if (!impl_) return 0u;
+    std::lock_guard<std::mutex> lk(impl_->mutex);
+    return impl_->flags;
+}
+
+void XboxBvhBuilder::SetFlags(uint32_t flags) noexcept {
+    if (!impl_) return;
+    std::lock_guard<std::mutex> lk(impl_->mutex);
+    impl_->flags = flags;
+    impl_->use_64bit_morton_codes = (flags & kXboxBvhBuilderFlag64BitMortonCodes) != 0u;
+    RecordOk("XboxBvhBuilder::SetFlags");
+}
+
+bool XboxBvhBuilder::LookupNativeBlasVa(
+    uint64_t xboxBlasVa,
+    uint64_t* outNativePcVa) const noexcept {
+    if (outNativePcVa) {
+        *outNativePcVa = 0ull;
+    }
+    if (!impl_ || xboxBlasVa == 0ull) {
+        return false;
+    }
+    openscarlett::XboxVaTranslationEntry entry{};
+    if (impl_->rehydrator.TranslateXboxVaToNativePcVa(xboxBlasVa, entry)) {
+        if (outNativePcVa) {
+            *outNativePcVa = entry.native_pc_gpu_va;
+        }
+        return true;
+    }
+    std::lock_guard<std::mutex> lk(impl_->mutex);
+    auto it = impl_->built_va_to_pc_va.find(xboxBlasVa);
+    if (it == impl_->built_va_to_pc_va.end()) {
+        return false;
+    }
+    if (outNativePcVa) {
+        *outNativePcVa = it->second;
+    }
+    return true;
+}
+
+uint32_t XboxBvhBuilder::GetRehydratedWindowCount() const noexcept {
+    if (!impl_) return 0u;
+    return static_cast<uint32_t>(impl_->rehydrator.RehydratedWindowCount());
+}
+
+bool XboxBvhBuilder::UsesHardwareDxrPath() const noexcept {
+    if (!impl_) return false;
+    return impl_->rehydrator.ActivePath() == openscarlett::Bvh4RehydrationPath::HardwareDxr11;
+}
+
+OsBvhHresult XboxBvhBuilder::TraceRehydratedRayX(
+    uint64_t rootXboxVa,
+    const openscarlett::Rdna2RayQueryInput* ray,
+    openscarlett::Rdna2RayQueryHit* outHit) const {
+    if (!impl_ || rootXboxVa == 0ull || !ray || !outHit) {
+        return RecordCppHr("XboxBvhBuilder::TraceRehydratedRayX", OS_SHIM_E_INVALIDARG);
+    }
+    const openscarlett::Status st = impl_->rehydrator.TraceRehydratedRay(rootXboxVa, *ray, *outHit);
+    return RecordCppHr("XboxBvhBuilder::TraceRehydratedRayX", StatusToHr(st));
+}
+
+uint32_t XboxBvhBuilder::Release() {
+    if (!impl_) return 0u;
+    const uint32_t prev = impl_->ref_count.fetch_sub(1u, std::memory_order_acq_rel);
+    const uint32_t remaining = prev > 0u ? (prev - 1u) : 0u;
+    RecordOk("XboxBvhBuilder::Release");
+    if (remaining == 0u) {
+        const bool heap = impl_->heap_allocated;
+        Shutdown();
+        if (heap) {
+            delete this;
+        }
+    }
+    return remaining;
+}
+
+void XboxBvhBuilder::Destroy() {
+    if (!impl_) return;
+    RecordOk("XboxBvhBuilder::Destroy");
+    const bool heap = impl_->heap_allocated;
+    Shutdown();
+    if (heap) {
+        delete this;
+    }
+}

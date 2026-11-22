@@ -1234,6 +1234,305 @@ Status BuildRdna2Bvh4Tlas(
     return Status::Ok();
 }
 
+Status BuildRdna2Bvh4ProceduralBlas(
+    const std::vector<Rdna2BvhProceduralInput>& procedurals,
+    const Rdna2BvhEncodeOptions& options,
+    std::vector<uint8_t>& out_buffer,
+    Rdna2BvhHeader* out_header) {
+    out_buffer.clear();
+    if (procedurals.empty()) {
+        return Status::Error(StatusCode::RaytracingError,
+                             "Cannot build RDNA2 BVH4 procedural BLAS with zero AABBs");
+    }
+
+    out_buffer.assign(kRdna2BvhHeaderSize, 0u);
+    std::vector<TlasLeafRecord> leaves;
+    leaves.reserve(procedurals.size());
+    Bvh4BuildCounters counters{};
+
+    for (const auto& proc : procedurals) {
+        if (!IsAabbValid(proc.bounds)) {
+            out_buffer.clear();
+            return Status::Error(StatusCode::InvalidArgument, "Invalid procedural BLAS AABB");
+        }
+        Rdna2BvhProceduralNode pnode{};
+        pnode.bounds = proc.bounds;
+        pnode.primitive_index = proc.primitive_index;
+        pnode.geometry_index = proc.geometry_index;
+        pnode.geometry_flags = proc.geometry_flags;
+        pnode.user_data = proc.user_data;
+
+        const uint32_t offset = AllocateNodeBytes(out_buffer, kRdna2BvhProceduralNodeSize);
+        EncodeRdna2ProceduralNode(pnode, out_buffer.data() + offset, kRdna2BvhProceduralNodeSize);
+        ++counters.leaf_nodes;
+
+        leaves.push_back({
+            EncodeRdna2NodePtr(offset, Rdna2BvhNodeType::Procedural),
+            proc.bounds,
+            proc.bounds.Center(),
+        });
+    }
+
+    const Bvh4EmitResult root = BuildTlasHierarchy(leaves, 0u, leaves.size(), options, out_buffer, counters);
+    const size_t aligned_total = (out_buffer.size() + kRdna2BvhNodeAlignment - 1u) &
+                                 ~static_cast<size_t>(kRdna2BvhNodeAlignment - 1u);
+    out_buffer.resize(aligned_total, 0u);
+
+    Rdna2BvhHeader hdr{};
+    hdr.magic = kRdna2BvhMagic;
+    hdr.version = kRdna2BvhVersion;
+    hdr.as_type = Rdna2BvhAsType::BottomLevel;
+    hdr.build_flags = options.build_flags;
+    hdr.total_size_bytes = static_cast<uint32_t>(out_buffer.size());
+    hdr.header_size_bytes = kRdna2BvhHeaderSize;
+    hdr.nodes_offset_bytes = kRdna2BvhHeaderSize;
+    hdr.nodes_size_bytes = static_cast<uint32_t>(out_buffer.size() - kRdna2BvhHeaderSize);
+    hdr.root_node_ptr = root.node_ptr;
+    hdr.internal_node_count = counters.internal_nodes;
+    hdr.leaf_node_count = counters.leaf_nodes;
+    hdr.primitive_count = static_cast<uint32_t>(leaves.size());
+    hdr.geometry_count = 1u;
+    hdr.max_depth = root.max_depth;
+    hdr.root_aabb = root.bounds;
+    hdr.payload_crc32 = ComputeBvhCrc32(out_buffer.data() + hdr.nodes_offset_bytes, hdr.nodes_size_bytes);
+
+    Status st = EncodeRdna2BvhHeader(hdr, out_buffer.data(), out_buffer.size());
+    if (!st.ok()) {
+        out_buffer.clear();
+        return st;
+    }
+
+    if (out_header) {
+        *out_header = hdr;
+    }
+    return Status::Ok();
+}
+
+Status ExtractRdna2Bvh4Leaves(
+    const uint8_t* data,
+    size_t size,
+    Rdna2Bvh4DecodedLeaves& out_leaves) {
+    out_leaves = Rdna2Bvh4DecodedLeaves{};
+    Status st = ValidateRdna2Bvh4(data, size, nullptr);
+    if (!st.ok()) {
+        return st;
+    }
+
+    Rdna2BvhHeader hdr{};
+    st = DecodeRdna2BvhHeader(data, size, hdr);
+    if (!st.ok()) {
+        return st;
+    }
+    out_leaves.as_type = hdr.as_type;
+
+    std::vector<uint32_t> stack;
+    stack.push_back(hdr.root_node_ptr);
+    std::unordered_set<uint64_t> visited;
+
+    while (!stack.empty()) {
+        const uint32_t ptr = stack.back();
+        stack.pop_back();
+        if (!IsRdna2NodePtrValid(ptr)) {
+            continue;
+        }
+        const uint64_t off = DecodeRdna2NodeByteOffset(ptr);
+        if (!visited.insert(off).second) {
+            continue;
+        }
+
+        const Rdna2BvhNodeType type = DecodeRdna2NodeType(ptr);
+        if (type == Rdna2BvhNodeType::Box32) {
+            Rdna2BvhBox32Node box32{};
+            st = DecodeRdna2Box32Node(data, size, ptr, box32);
+            if (!st.ok()) return st;
+            for (int c = 3; c >= 0; --c) {
+                if (IsRdna2NodePtrValid(box32.children[static_cast<size_t>(c)])) {
+                    stack.push_back(box32.children[static_cast<size_t>(c)]);
+                }
+            }
+        } else if (type == Rdna2BvhNodeType::Box16) {
+            Rdna2BvhBox16Node box16{};
+            st = DecodeRdna2Box16Node(data, size, ptr, box16);
+            if (!st.ok()) return st;
+            for (int c = 3; c >= 0; --c) {
+                if (IsRdna2NodePtrValid(box16.children[static_cast<size_t>(c)])) {
+                    stack.push_back(box16.children[static_cast<size_t>(c)]);
+                }
+            }
+        } else if (IsRdna2TriangleNodeType(type)) {
+            Rdna2BvhTriangleNode tnode{};
+            st = DecodeRdna2TriangleNode(data, size, ptr, tnode);
+            if (!st.ok()) return st;
+            const uint32_t tri_count = std::min<uint32_t>(2u, tnode.triangle_id & 0x3u);
+            if (tri_count >= 1u) {
+                RtTriangle tri{};
+                tri.v0 = tnode.v0;
+                tri.v1 = tnode.v1;
+                tri.v2 = tnode.v2;
+                out_leaves.triangles.push_back(tri);
+                out_leaves.triangle_primitive_indices.push_back(tnode.primitive_index);
+                out_leaves.triangle_geometry_indices.push_back(tnode.geometry_index);
+                out_leaves.triangle_geometry_flags.push_back(tnode.geometry_flags);
+            }
+            if (tri_count >= 2u) {
+                RtTriangle tri2{};
+                tri2.v0 = tnode.v1;
+                tri2.v1 = tnode.v2;
+                tri2.v2 = tnode.v3;
+                out_leaves.triangles.push_back(tri2);
+                out_leaves.triangle_primitive_indices.push_back(tnode.extra_index);
+                out_leaves.triangle_geometry_indices.push_back(tnode.geometry_index);
+                out_leaves.triangle_geometry_flags.push_back(tnode.geometry_flags);
+            }
+        } else if (type == Rdna2BvhNodeType::Procedural) {
+            Rdna2BvhProceduralNode pnode{};
+            st = DecodeRdna2ProceduralNode(data, size, ptr, pnode);
+            if (!st.ok()) return st;
+            out_leaves.procedurals.push_back(pnode);
+        } else if (type == Rdna2BvhNodeType::Instance) {
+            Rdna2BvhInstanceNode inode{};
+            st = DecodeRdna2InstanceNode(data, size, ptr, inode);
+            if (!st.ok()) return st;
+            out_leaves.instances.push_back(inode);
+        }
+    }
+
+    return Status::Ok();
+}
+
+Status PatchRdna2Bvh4PointersInPlace(
+    uint8_t* data,
+    size_t size,
+    uint64_t source_base_va,
+    uint64_t dest_base_va,
+    const std::vector<Rdna2Bvh4RelocationEntry>& blas_relocations,
+    Rdna2Bvh4RelocationReport* out_report) {
+    if (!data || size < kRdna2BvhHeaderSize) {
+        return Status::Error(StatusCode::InvalidArgument,
+                             "PatchRdna2Bvh4PointersInPlace requires valid non-null BVH4 buffer");
+    }
+    if (dest_base_va == 0ull || (dest_base_va & (kRdna2BvhNodeAlignment - 1u)) != 0ull) {
+        return Status::Error(StatusCode::InvalidArgument,
+                             "PatchRdna2Bvh4PointersInPlace dest_base_va must be non-zero and 64-byte aligned");
+    }
+    if (source_base_va != 0ull && (source_base_va & (kRdna2BvhNodeAlignment - 1u)) != 0ull) {
+        return Status::Error(StatusCode::InvalidArgument,
+                             "PatchRdna2Bvh4PointersInPlace source_base_va must be 64-byte aligned");
+    }
+    for (const auto& r : blas_relocations) {
+        if (r.dest_va == 0ull || (r.dest_va & (kRdna2BvhNodeAlignment - 1u)) != 0ull) {
+            return Status::Error(StatusCode::InvalidArgument,
+                                 "Relocation dest_va must be non-zero and 64-byte aligned");
+        }
+    }
+
+    Rdna2BvhValidationReport pre_val{};
+    Status st = ValidateRdna2Bvh4(data, size, &pre_val);
+    if (!st.ok()) {
+        return st;
+    }
+
+    Rdna2BvhHeader hdr{};
+    st = DecodeRdna2BvhHeader(data, size, hdr);
+    if (!st.ok()) {
+        return st;
+    }
+
+    Rdna2Bvh4RelocationReport report{};
+    report.old_payload_crc32 = hdr.payload_crc32;
+
+    const uint64_t nodes_end = static_cast<uint64_t>(hdr.nodes_offset_bytes) +
+                               static_cast<uint64_t>(hdr.nodes_size_bytes);
+    std::vector<uint32_t> stack;
+    stack.push_back(hdr.root_node_ptr);
+    std::unordered_set<uint64_t> visited;
+
+    while (!stack.empty()) {
+        const uint32_t ptr = stack.back();
+        stack.pop_back();
+        if (!IsRdna2NodePtrValid(ptr)) {
+            continue;
+        }
+        const Rdna2BvhNodeType type = DecodeRdna2NodeType(ptr);
+        const uint64_t byte_off = DecodeRdna2NodeByteOffset(ptr);
+        const uint32_t node_sz = Rdna2NodeByteSize(type);
+        if (byte_off < hdr.nodes_offset_bytes ||
+            byte_off + node_sz > nodes_end ||
+            byte_off + node_sz > size ||
+            (byte_off & (kRdna2BvhNodeAlignment - 1u)) != 0ull) {
+            return Status::Error(StatusCode::ParseError,
+                                 "BVH4 node pointer failed bounds/alignment check during relocation");
+        }
+        if (!visited.insert(byte_off).second) {
+            continue;
+        }
+
+        if (type == Rdna2BvhNodeType::Box32) {
+            Rdna2BvhBox32Node b32{};
+            st = DecodeRdna2Box32Node(data, size, ptr, b32);
+            if (!st.ok()) return st;
+            ++report.verified_internal_nodes;
+            for (uint32_t c = 0; c < 4u; ++c) {
+                if (IsRdna2NodePtrValid(b32.children[c])) {
+                    stack.push_back(b32.children[c]);
+                }
+            }
+        } else if (type == Rdna2BvhNodeType::Box16) {
+            Rdna2BvhBox16Node b16{};
+            st = DecodeRdna2Box16Node(data, size, ptr, b16);
+            if (!st.ok()) return st;
+            ++report.verified_internal_nodes;
+            for (uint32_t c = 0; c < 4u; ++c) {
+                if (IsRdna2NodePtrValid(b16.children[c])) {
+                    stack.push_back(b16.children[c]);
+                }
+            }
+        } else if (type == Rdna2BvhNodeType::Instance) {
+            Rdna2BvhInstanceNode inode{};
+            st = DecodeRdna2InstanceNode(data, size, ptr, inode);
+            if (!st.ok()) return st;
+            ++report.verified_leaf_nodes;
+
+            uint64_t new_blas_va = inode.blas_base_va;
+            bool matched = false;
+            for (const auto& r : blas_relocations) {
+                if (r.source_xbox_va == inode.blas_base_va) {
+                    new_blas_va = r.dest_va;
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched && source_base_va != 0ull && inode.blas_base_va == source_base_va) {
+                new_blas_va = dest_base_va;
+                matched = true;
+            }
+            if (matched && new_blas_va != inode.blas_base_va) {
+                WriteLe64(data + byte_off, new_blas_va);
+                ++report.patched_instance_nodes;
+            }
+        } else {
+            ++report.verified_leaf_nodes;
+        }
+    }
+
+    const uint32_t new_crc = ComputeBvhCrc32(data + hdr.nodes_offset_bytes, hdr.nodes_size_bytes);
+    report.new_payload_crc32 = new_crc;
+    if (new_crc != hdr.payload_crc32) {
+        WriteLe32(data + 80u, new_crc);
+        report.crc_updated = true;
+    }
+
+    st = ValidateRdna2Bvh4(data, size, nullptr);
+    if (!st.ok()) {
+        return st;
+    }
+
+    if (out_report) {
+        *out_report = report;
+    }
+    return Status::Ok();
+}
+
 // ---------------------------------------------------------------------------
 // Full RDNA2 BVH4 Tree Validation
 // ---------------------------------------------------------------------------
@@ -1916,6 +2215,22 @@ Status Rdna2Bvh64MultiWindow::TraceRay64(
                         out_hit.geometry_index = bstep.geometry_index;
                         out_hit.sbt_offset = step.sbt_offset;
                         out_hit.front_face = bstep.front_face ? 1u : 0u;
+                        if (accept_first) {
+                            return Status::Ok();
+                        }
+                    }
+                } else if (bstep.is_procedural) {
+                    if (bstep.triangle_hit && bstep.hit_t < out_hit.t) {
+                        out_hit.committed_status = kRdna2CommittedProceduralHit;
+                        out_hit.t = bstep.hit_t;
+                        out_hit.bary_u = 0.0f;
+                        out_hit.bary_v = 0.0f;
+                        out_hit.primitive_index = bstep.primitive_index;
+                        out_hit.instance_index = step.instance_index;
+                        out_hit.instance_id = step.instance_id;
+                        out_hit.geometry_index = bstep.geometry_index;
+                        out_hit.sbt_offset = step.sbt_offset;
+                        out_hit.front_face = 1u;
                         if (accept_first) {
                             return Status::Ok();
                         }
