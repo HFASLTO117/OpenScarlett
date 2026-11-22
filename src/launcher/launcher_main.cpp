@@ -34,6 +34,7 @@
 #include <thread>
 #include <vector>
 
+#include "launcher_resource.h"
 #include "launcher_theme.h"
 #include "openscarlett/launcher/hwtest_runner.h"
 #include "openscarlett/launcher/updater.h"
@@ -563,6 +564,11 @@ public:
     ~LauncherWindow() {
         JoinAllWorkers();
         DiscardD2DResources();
+        if (hinst_) {
+            ::UnregisterClassW(kMainClassName, hinst_);
+            ::UnregisterClassW(kUpdateClassName, hinst_);
+        }
+        DestroyAppIcons();
     }
 
     int Run(HINSTANCE hInstance, int nCmdShow) {
@@ -600,6 +606,13 @@ public:
             nullptr, nullptr, hinst_, this);
         if (!hwnd_) return 1;
 
+        if (icon_big_) {
+            ::SendMessageW(hwnd_, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(icon_big_));
+        }
+        if (icon_small_) {
+            ::SendMessageW(hwnd_, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(icon_small_));
+        }
+
         ::ShowWindow(hwnd_, opts_.smoke_mode ? SW_SHOWNOACTIVATE : nCmdShow);
         ::UpdateWindow(hwnd_);
 
@@ -627,12 +640,58 @@ private:
     static constexpr const wchar_t* kMainClassName   = L"OpenScarlettLauncherMainWnd";
     static constexpr const wchar_t* kUpdateClassName = L"OpenScarlettLauncherUpdateDlg";
 
+    void LoadAppIcons() {
+        if (!icon_big_) {
+            const int cx = ::GetSystemMetrics(SM_CXICON);
+            const int cy = ::GetSystemMetrics(SM_CYICON);
+            icon_big_ = static_cast<HICON>(::LoadImageW(
+                hinst_, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
+                cx > 0 ? cx : 32, cy > 0 ? cy : 32, LR_DEFAULTCOLOR));
+            if (icon_big_) {
+                own_icon_big_ = true;
+            } else {
+                icon_big_ = ::LoadIconW(nullptr, IDI_APPLICATION);
+                own_icon_big_ = false;
+            }
+        }
+        if (!icon_small_) {
+            const int cx = ::GetSystemMetrics(SM_CXSMICON);
+            const int cy = ::GetSystemMetrics(SM_CYSMICON);
+            icon_small_ = static_cast<HICON>(::LoadImageW(
+                hinst_, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
+                cx > 0 ? cx : 16, cy > 0 ? cy : 16, LR_DEFAULTCOLOR));
+            if (icon_small_) {
+                own_icon_small_ = true;
+            } else {
+                icon_small_ = ::LoadIconW(nullptr, IDI_APPLICATION);
+                own_icon_small_ = false;
+            }
+        }
+    }
+
+    void DestroyAppIcons() noexcept {
+        if (own_icon_big_ && icon_big_) {
+            ::DestroyIcon(icon_big_);
+        }
+        if (own_icon_small_ && icon_small_) {
+            ::DestroyIcon(icon_small_);
+        }
+        icon_big_ = nullptr;
+        icon_small_ = nullptr;
+        own_icon_big_ = false;
+        own_icon_small_ = false;
+    }
+
     void RegisterClasses() {
+        LoadAppIcons();
+
         WNDCLASSEXW wc{};
         wc.cbSize = sizeof(wc);
         wc.style = CS_HREDRAW | CS_VREDRAW;
         wc.lpfnWndProc = &LauncherWindow::StaticWndProc;
         wc.hInstance = hinst_;
+        wc.hIcon = icon_big_;
+        wc.hIconSm = icon_small_;
         wc.hCursor = ::LoadCursorW(nullptr, IDC_ARROW);
         wc.hbrBackground = nullptr;
         wc.lpszClassName = kMainClassName;
@@ -642,6 +701,8 @@ private:
         uwc.cbSize = sizeof(uwc);
         uwc.lpfnWndProc = &UpdateDialogWndProc;
         uwc.hInstance = hinst_;
+        uwc.hIcon = icon_big_;
+        uwc.hIconSm = icon_small_;
         uwc.hCursor = ::LoadCursorW(nullptr, IDC_ARROW);
         uwc.hbrBackground = nullptr;
         uwc.lpszClassName = kUpdateClassName;
@@ -1858,6 +1919,13 @@ private:
             hwnd_, nullptr, hinst_, &dlg_st);
         if (!hdlg) return;
 
+        if (icon_big_) {
+            ::SendMessageW(hdlg, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(icon_big_));
+        }
+        if (icon_small_) {
+            ::SendMessageW(hdlg, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(icon_small_));
+        }
+
         ::EnableWindow(hwnd_, FALSE);
         MSG msg{};
         while (::IsWindow(hdlg) && ::GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -2406,6 +2474,10 @@ private:
     Options opts_;
     HINSTANCE hinst_ = nullptr;
     HWND hwnd_ = nullptr;
+    HICON icon_big_ = nullptr;
+    HICON icon_small_ = nullptr;
+    bool own_icon_big_ = false;
+    bool own_icon_small_ = false;
     UINT dpi_ = 96u;
     LauncherThemeResources theme_;
 

@@ -1,0 +1,102 @@
+OpenScarlett Sprint 8 — Worker 4 Integration Summary
+Branch: swarm/s8-launcher-icon-ci-fix
+Worktree: E:\OpenScarlett\.worktrees\s8-launcher-icon-ci-fix
+
+========================================================================
+1. Updater Zip Extraction Hardening & CI Regression Coverage
+========================================================================
+Files modified:
+- src/launcher/updater.cpp
+- tests/test_launcher_updater.cpp
+
+Changes:
+- Hardened zip extraction in `src/launcher/updater.cpp` (`ExtractZipArchive`,
+  replacing `ExtractZipWithPowerShell`) into a 3-tier resilient pipeline:
+  1. Fast path 1: Windows built-in `System32\tar.exe` using proper MSVCRT /
+     `CommandLineToArgvW` quoting (`QuoteWin32Arg`) and absolute normalized
+     paths stripped of trailing separators (`StripTrailingSeparators`),
+     plus non-empty output verification (`DirectoryHasAnyEntries`).
+  2. Fallback 2: `.NET System.IO.Compression.ZipFile` via
+     `WindowsPowerShell\v1.0\powershell.exe` invoked with `-EncodedCommand`
+     (UTF-16LE Base64 via `Base64EncodeUtf16Le`) and direct
+     `[System.Reflection.Assembly]::Load('System.IO.Compression.FileSystem, ...')`
+     — zero PowerShell module imports (immune to pwsh7/CI `PSModulePath`
+     pollution) and immune to spaces, parentheses, `$`, `&`, or special
+     characters in paths.
+  3. Fallback 3: Clean-room pure C++ PKZIP STORE (method 0) extractor
+     (`ExtractStoredZipNative`) with full EOCD / Central Directory / Local
+     Header parsing, strict Zip-Slip path traversal rejection, and IEEE
+     802.3 CRC-32 verification (zero-subprocess fallback).
+- Each extraction tier cleans and recreates the extraction directory before
+  running so partial failures never cause `.NET ZipFile` "already exists"
+  exceptions, and combined per-tier diagnostics are returned on failure.
+- Hardened `CleanDirectoryBestEffort` to strip Windows read-only/system/hidden
+  attributes and retry `remove_all` if initial cleanup fails.
+- Hardened `IsPathInsideDirectory` against trailing path separators.
+- Hardened `WriteRestartApplyScript` by stripping trailing backslashes from
+  `APP_DIR`, `STAGING_DIR`, and `SRC_DIR` so `robocopy` never sees `\"`.
+- Added regression test 3F in `tests/test_launcher_updater.cpp` exercising
+  `VerifyAndStageLocalUpdateFiles` under a directory path containing spaces,
+  parentheses, and `&` (`CI Dir With Spaces (x64 & Release)`) while
+  `PSModulePath` is poisoned to pwsh7 + nonexistent paths (restored via RAII).
+  All existing assertions remain intact and unweakened.
+
+========================================================================
+2. Embedded Win32 App Icon (`docs/icon.ico`) for OpenScarlettLauncher.exe
+========================================================================
+Files created/modified:
+- src/launcher/launcher_resource.h (new)
+- src/launcher/launcher.rc (new)
+- src/launcher/launcher_main.cpp
+- cmake/sprint7_launcher.cmake
+- tests/test_launcher_updater.cpp
+
+Changes:
+- Created `src/launcher/launcher_resource.h` defining plain integer macro
+  `#define IDI_APP_ICON 101` (compatible with `rc.exe`, `llvm-rc`, and
+  MinGW GNU `windres`).
+- Created `src/launcher/launcher.rc` embedding `../../docs/icon.ico` as
+  `IDI_APP_ICON ICON "../../docs/icon.ico"`.
+- Updated `cmake/sprint7_launcher.cmake`:
+  * Added `enable_language(RC)` under `if(WIN32)`.
+  * Guarded C/C++ compiler warning flags (`/W4`, `-Wall`, `-Wextra`, etc.)
+    with `$<$<COMPILE_LANGUAGE:C,CXX>:...>` so they are never passed to
+    `rc.exe`, `llvm-rc`, or `windres.exe` (verified in generated `build.ninja`).
+  * Added `src/launcher/launcher.rc` (with `OBJECT_DEPENDS` on `docs/icon.ico`)
+    to `OpenScarlettLauncher` and added `docs` to its include directories.
+  * Added `src/launcher` to `test_launcher_updater` include directories so
+    the test shares `IDI_APP_ICON`.
+- Updated `src/launcher/launcher_main.cpp`:
+  * Loads large (`SM_CXICON` x `SM_CYICON`) and small (`SM_CXSMICON` x
+    `SM_CYSMICON`) icons from `IDI_APP_ICON` via `LoadImageW` (with
+    `IDI_APPLICATION` fallback).
+  * Sets `WNDCLASSEXW::hIcon` and `WNDCLASSEXW::hIconSm` on both the main
+    launcher window class and the update dialog window class.
+  * Sends `WM_SETICON` (`ICON_BIG` and `ICON_SMALL`) after `CreateWindowExW`
+    for both the main window and update dialog.
+  * Unregisters window classes and calls `DestroyIcon` for owned icons on
+    shutdown in `~LauncherWindow()`.
+- Added Test 6E in `tests/test_launcher_updater.cpp`: loads compiled
+  `OpenScarlettLauncher.exe` via `LoadLibraryExW(..., LOAD_LIBRARY_AS_DATAFILE)`,
+  verifies `FindResourceW(..., MAKEINTRESOURCEW(IDI_APP_ICON), RT_GROUP_ICON)`
+  is non-null, and verifies `LoadImageW` succeeds for both 32x32 and 16x16 icons.
+
+========================================================================
+3. Verification Results (0 Warnings across Release & Debug)
+========================================================================
+- MSVC Release (19.44.35225.0, Ninja, /W4):
+  * `openscarlett_launcher_core`, `OpenScarlettLauncher`, `test_launcher_updater`:
+    0 warnings, 0 errors.
+  * `build\OpenScarlettLauncher.exe --headless-check`: PASS
+    (d2d=ok, dwrite=ok, gpu=NVIDIA GeForce GTX 1650 Ti, adapters=4, sanitize=ok)
+  * `build\test_launcher_updater.exe`: PASS (6/6 tests)
+  * `ctest --test-dir build -R test_launcher_updater --output-on-failure`:
+    1/1 Passed (2.10s)
+- MSVC Debug (19.44.35225.0, Ninja, /W4):
+  * `openscarlett_launcher_core`, `OpenScarlettLauncher`, `test_launcher_updater`:
+    0 warnings, 0 errors.
+  * `ctest --test-dir build-debug -R test_launcher_updater --output-on-failure`:
+    1/1 Passed (2.35s)
+- `build/build.ninja` RC verification:
+  * Confirmed `RC_COMPILER__OpenScarlettLauncher` uses `FLAGS = -DWIN32`
+    (no `/W4` or `-Wall` passed to RC) and includes `src/launcher` and `docs`.
