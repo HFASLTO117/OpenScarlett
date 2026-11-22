@@ -1,4 +1,5 @@
 #include "openscarlett/gpu/rdna2_ir.h"
+#include "openscarlett/gpu/rdna2_xbox_container.h"
 
 #include <algorithm>
 #include <array>
@@ -321,7 +322,195 @@ struct RegState {
     IrValueId m0 = kInvalidIrValue;
 };
 
+constexpr uint32_t kIrKillExportMagic = 0xDEAD0001u;
+
+bool IsExtendedSaveExecSop1(const Rdna2Instruction& inst) noexcept {
+    if (inst.encoding != Rdna2Encoding::SOP1 || inst.opcode != Rdna2Opcode::Unknown) return false;
+    const uint16_t r = inst.raw_opcode;
+    return r == kSop1RawAndSaveExecB64 || r == kSop1RawOrSaveExecB64 ||
+           r == kSop1RawXorSaveExecB64 || r == kSop1RawAndN2SaveExecB64 ||
+           r == kSop1RawAndSaveExecB32 || r == kSop1RawOrSaveExecB32 ||
+           r == kSop1RawXorSaveExecB32 || r == kSop1RawAndN2SaveExecB32;
+}
+
+bool IsExtendedMovB64Sop1(const Rdna2Instruction& inst) noexcept {
+    return inst.encoding == Rdna2Encoding::SOP1 &&
+           inst.opcode == Rdna2Opcode::Unknown &&
+           inst.raw_opcode == kSop1RawMovB64;
+}
+
+bool IsExtendedExecSop2(const Rdna2Instruction& inst) noexcept {
+    if (inst.encoding != Rdna2Encoding::SOP2 || inst.opcode != Rdna2Opcode::Unknown) return false;
+    const uint16_t r = inst.raw_opcode;
+    return r == kSop2RawAndB64 || r == kSop2RawOrB64 ||
+           r == kSop2RawXorB64 || r == kSop2RawAndN2B64;
+}
+
+uint32_t RoundUpPow2U32(uint32_t v, uint32_t min_val, uint32_t max_val) noexcept {
+    uint32_t r = min_val;
+    while (r < v && r < max_val) {
+        r <<= 1;
+    }
+    return std::min(r, max_val);
+}
+
 }  // namespace
+
+void AnalyzeRdna2Cfg(const Rdna2IrModule& ir, Rdna2CfgAnalysis& out_analysis) {
+    out_analysis = Rdna2CfgAnalysis{};
+    const size_t n = ir.blocks.size();
+    if (n == 0u) return;
+
+    std::vector<std::vector<uint32_t>> succs(n);
+    std::vector<std::vector<uint32_t>> preds(n);
+    for (size_t b = 0u; b < n; ++b) {
+        const auto& ins = ir.blocks[b].instructions;
+        if (ins.empty()) continue;
+        const auto& term = ins.back();
+        if (term.op == IrOp::Branch && term.true_block < n) {
+            succs[b].push_back(term.true_block);
+        } else if (term.op == IrOp::CondBranch) {
+            if (term.true_block < n) succs[b].push_back(term.true_block);
+            if (term.false_block < n && term.false_block != term.true_block) {
+                succs[b].push_back(term.false_block);
+            }
+        }
+    }
+
+    // 1. Reachability from entry block 0
+    std::vector<uint8_t> reachable(n, 0u);
+    std::vector<uint32_t> stack = {0u};
+    reachable[0] = 1u;
+    while (!stack.empty()) {
+        const uint32_t u = stack.back();
+        stack.pop_back();
+        for (uint32_t v : succs[u]) {
+            if (!reachable[v]) {
+                reachable[v] = 1u;
+                stack.push_back(v);
+            }
+        }
+    }
+    for (size_t b = 0u; b < n; ++b) {
+        if (!reachable[b]) continue;
+        ++out_analysis.reachable_block_count;
+        for (uint32_t v : succs[b]) {
+            if (reachable[v]) {
+                preds[v].push_back(static_cast<uint32_t>(b));
+            }
+        }
+    }
+
+    // 2. Iterative dominators over reachable blocks
+    std::vector<std::vector<uint8_t>> dom(n, std::vector<uint8_t>(n, 1u));
+    dom[0].assign(n, 0u);
+    dom[0][0] = 1u;
+    bool changed = true;
+    for (size_t iter = 0u; changed && iter < (n + 2u) * 8u; ++iter) {
+        changed = false;
+        for (size_t b = 1u; b < n; ++b) {
+            if (!reachable[b] || preds[b].empty()) continue;
+            std::vector<uint8_t> next_dom(n, 1u);
+            for (uint32_t p : preds[b]) {
+                for (size_t k = 0u; k < n; ++k) {
+                    next_dom[k] = static_cast<uint8_t>(next_dom[k] & dom[p][k]);
+                }
+            }
+            next_dom[b] = 1u;
+            if (next_dom != dom[b]) {
+                dom[b] = std::move(next_dom);
+                changed = true;
+            }
+        }
+    }
+
+    // 3. Tarjan's Strongly Connected Components over reachable blocks
+    std::vector<int32_t> dfn(n, -1);
+    std::vector<int32_t> low(n, -1);
+    std::vector<uint8_t> on_stack(n, 0u);
+    std::vector<uint32_t> tarjan_stk;
+    int32_t cur_time = 0;
+    std::vector<std::vector<uint32_t>> sccs;
+
+    auto strongconnect = [&](auto&& self, uint32_t u) -> void {
+        dfn[u] = low[u] = cur_time++;
+        tarjan_stk.push_back(u);
+        on_stack[u] = 1u;
+        for (uint32_t v : succs[u]) {
+            if (!reachable[v]) continue;
+            if (dfn[v] == -1) {
+                self(self, v);
+                low[u] = std::min(low[u], low[v]);
+            } else if (on_stack[v]) {
+                low[u] = std::min(low[u], dfn[v]);
+            }
+        }
+        if (low[u] == dfn[u]) {
+            std::vector<uint32_t> comp;
+            for (;;) {
+                const uint32_t w = tarjan_stk.back();
+                tarjan_stk.pop_back();
+                on_stack[w] = 0u;
+                comp.push_back(w);
+                if (w == u) break;
+            }
+            std::sort(comp.begin(), comp.end());
+            sccs.push_back(std::move(comp));
+        }
+    };
+    strongconnect(strongconnect, 0u);
+
+    // 4. Identify natural loops (dominator back-edges) and irreducible multi-entry SCCs
+    std::set<uint32_t> header_set;
+    for (size_t u = 0u; u < n; ++u) {
+        if (!reachable[u]) continue;
+        for (uint32_t v : succs[u]) {
+            if (!reachable[v]) continue;
+            if (dom[u][v]) {
+                out_analysis.has_cycles = true;
+                out_analysis.back_edges.emplace_back(static_cast<uint32_t>(u), v);
+                header_set.insert(v);
+            }
+        }
+    }
+    out_analysis.loop_headers.assign(header_set.begin(), header_set.end());
+    out_analysis.natural_loop_count = static_cast<uint32_t>(out_analysis.loop_headers.size());
+
+    for (const auto& comp : sccs) {
+        bool is_cyclic = (comp.size() > 1u);
+        if (!is_cyclic && comp.size() == 1u) {
+            const uint32_t u = comp[0];
+            for (uint32_t v : succs[u]) {
+                if (v == u) {
+                    is_cyclic = true;
+                    break;
+                }
+            }
+        }
+        if (!is_cyclic) continue;
+        out_analysis.has_cycles = true;
+
+        std::unordered_set<uint32_t> in_comp(comp.begin(), comp.end());
+        uint32_t entry_count = 0u;
+        for (uint32_t u : comp) {
+            bool is_entry = (u == 0u);
+            if (!is_entry) {
+                for (uint32_t p : preds[u]) {
+                    if (in_comp.count(p) == 0u) {
+                        is_entry = true;
+                        break;
+                    }
+                }
+            }
+            if (is_entry) ++entry_count;
+        }
+        if (entry_count >= 2u) {
+            out_analysis.is_irreducible = true;
+            ++out_analysis.irreducible_scc_count;
+            out_analysis.irreducible_sccs.push_back(comp);
+        }
+    }
+}
 
 const IrInstruction* Rdna2IrModule::FindDef(IrValueId id) const noexcept {
     if (id == kInvalidIrValue) return nullptr;
@@ -529,36 +718,125 @@ Status BuildRdna2Ir(
     std::set<size_t> leader_set;
     leader_set.insert(0);
     std::unordered_map<size_t, size_t> branch_target_idx;
+    std::unordered_map<size_t, size_t> call_target_idx;
+    std::unordered_map<size_t, size_t> call_return_idx;
+    std::unordered_map<size_t, size_t> setpc_target_idx;
+    std::vector<std::pair<uint32_t, size_t>> call_return_sites;  // (ret_pc_bytes, return_inst_idx)
 
-    for (size_t i = 0; i < instructions.size(); ++i) {
-        const auto& inst = instructions[i];
-        if (IsBranchOpcode(inst.opcode)) {
-            const int64_t target_word =
-                static_cast<int64_t>(inst.word_offset) + 1 + static_cast<int64_t>(inst.simm16);
-            if (target_word < 0) {
-                return Status::Error(StatusCode::ParseError, "RDNA2 branch target out of range (< 0)");
-            }
-            auto it = word_to_idx.find(static_cast<uint32_t>(target_word));
-            if (it == word_to_idx.end()) {
-                return Status::Error(StatusCode::ParseError, "RDNA2 branch target does not land on instruction boundary");
-            }
-            branch_target_idx[i] = it->second;
-            leader_set.insert(it->second);
-            if (i + 1 < instructions.size()) {
-                leader_set.insert(i + 1);
-            }
-        } else if (inst.opcode == Rdna2Opcode::S_ENDPGM) {
-            if (i + 1 < instructions.size()) {
-                bool has_non_pad = false;
-                for (size_t k = i + 1; k < instructions.size(); ++k) {
-                    if (instructions[k].opcode != Rdna2Opcode::S_CODE_END &&
-                        instructions[k].opcode != Rdna2Opcode::S_NOP) {
-                        has_non_pad = true;
-                        break;
+    // Pre-pass: track statically resolved PC byte addresses in SGPRs for s_swappc_b64 / s_setpc_b64
+    {
+        std::array<bool, 106> sgpr_has_pc{};
+        std::array<int64_t, 106> sgpr_pc_bytes{};
+        const bool has_vf_contract = !out_module.stage_contract.vertex_fetches.empty();
+
+        for (size_t i = 0; i < instructions.size(); ++i) {
+            const auto& inst = instructions[i];
+            if (IsBranchOpcode(inst.opcode)) {
+                const int64_t target_word =
+                    static_cast<int64_t>(inst.word_offset) + 1 + static_cast<int64_t>(inst.simm16);
+                if (target_word < 0) {
+                    return Status::Error(StatusCode::ParseError, "RDNA2 branch target out of range (< 0)");
+                }
+                auto it = word_to_idx.find(static_cast<uint32_t>(target_word));
+                if (it == word_to_idx.end()) {
+                    return Status::Error(StatusCode::ParseError, "RDNA2 branch target does not land on instruction boundary");
+                }
+                branch_target_idx[i] = it->second;
+                leader_set.insert(it->second);
+                if (i + 1 < instructions.size()) {
+                    leader_set.insert(i + 1);
+                }
+            } else if (inst.opcode == Rdna2Opcode::S_GETPC_B64 &&
+                       inst.dst.kind == Rdna2OperandKind::Sgpr && inst.dst.reg_index < 106u) {
+                sgpr_has_pc[inst.dst.reg_index] = true;
+                sgpr_pc_bytes[inst.dst.reg_index] = static_cast<int64_t>(inst.word_offset + 1u) * 4;
+            } else if (inst.opcode == Rdna2Opcode::S_MOV_B32 &&
+                       inst.dst.kind == Rdna2OperandKind::Sgpr && inst.dst.reg_index < 106u) {
+                if (inst.src[0].kind == Rdna2OperandKind::InlineInt) {
+                    sgpr_has_pc[inst.dst.reg_index] = true;
+                    sgpr_pc_bytes[inst.dst.reg_index] = inst.src[0].int_value;
+                } else if (inst.src[0].kind == Rdna2OperandKind::Literal32) {
+                    sgpr_has_pc[inst.dst.reg_index] = true;
+                    sgpr_pc_bytes[inst.dst.reg_index] = static_cast<int64_t>(inst.src[0].literal_bits);
+                } else if (inst.src[0].kind == Rdna2OperandKind::Sgpr && inst.src[0].reg_index < 106u &&
+                           sgpr_has_pc[inst.src[0].reg_index]) {
+                    sgpr_has_pc[inst.dst.reg_index] = true;
+                    sgpr_pc_bytes[inst.dst.reg_index] = sgpr_pc_bytes[inst.src[0].reg_index];
+                } else {
+                    sgpr_has_pc[inst.dst.reg_index] = false;
+                }
+            } else if (inst.opcode == Rdna2Opcode::S_MOVK_I32 &&
+                       inst.dst.kind == Rdna2OperandKind::Sgpr && inst.dst.reg_index < 106u) {
+                sgpr_has_pc[inst.dst.reg_index] = true;
+                sgpr_pc_bytes[inst.dst.reg_index] = static_cast<int64_t>(inst.simm16);
+            } else if ((inst.opcode == Rdna2Opcode::S_ADD_U32 || inst.opcode == Rdna2Opcode::S_ADD_I32) &&
+                       inst.dst.kind == Rdna2OperandKind::Sgpr && inst.dst.reg_index < 106u) {
+                auto try_const_s = [&](const Rdna2Operand& op, int64_t& out_v) -> bool {
+                    if (op.kind == Rdna2OperandKind::InlineInt) { out_v = op.int_value; return true; }
+                    if (op.kind == Rdna2OperandKind::Literal32) { out_v = static_cast<int32_t>(op.literal_bits); return true; }
+                    if (op.kind == Rdna2OperandKind::Sgpr && op.reg_index < 106u && sgpr_has_pc[op.reg_index]) {
+                        out_v = sgpr_pc_bytes[op.reg_index];
+                        return true;
+                    }
+                    return false;
+                };
+                int64_t a = 0, b = 0;
+                if (try_const_s(inst.src[0], a) && try_const_s(inst.src[1], b)) {
+                    sgpr_has_pc[inst.dst.reg_index] = true;
+                    sgpr_pc_bytes[inst.dst.reg_index] = a + b;
+                } else {
+                    sgpr_has_pc[inst.dst.reg_index] = false;
+                }
+            } else if (inst.opcode == Rdna2Opcode::S_ADDK_I32 &&
+                       inst.dst.kind == Rdna2OperandKind::Sgpr && inst.dst.reg_index < 106u &&
+                       sgpr_has_pc[inst.dst.reg_index]) {
+                sgpr_pc_bytes[inst.dst.reg_index] += static_cast<int64_t>(inst.simm16);
+            } else if (!has_vf_contract && inst.opcode == Rdna2Opcode::S_SWAPPC_B64) {
+                if (inst.src[0].kind == Rdna2OperandKind::Sgpr && inst.src[0].reg_index < 106u &&
+                    sgpr_has_pc[inst.src[0].reg_index]) {
+                    const int64_t byte_tgt = sgpr_pc_bytes[inst.src[0].reg_index];
+                    if (byte_tgt >= 0 && (byte_tgt & 3) == 0) {
+                        auto it = word_to_idx.find(static_cast<uint32_t>(byte_tgt / 4));
+                        if (it != word_to_idx.end() && i + 1 < instructions.size()) {
+                            call_target_idx[i] = it->second;
+                            call_return_idx[i] = i + 1;
+                            call_return_sites.emplace_back((inst.word_offset + 1u) * 4u, i + 1);
+                            leader_set.insert(it->second);
+                            leader_set.insert(i + 1);
+                        }
                     }
                 }
-                if (has_non_pad) {
+                if (inst.dst.kind == Rdna2OperandKind::Sgpr && inst.dst.reg_index < 106u) {
+                    sgpr_has_pc[inst.dst.reg_index] = false;
+                }
+            } else if (!has_vf_contract && inst.opcode == Rdna2Opcode::S_SETPC_B64) {
+                if (inst.src[0].kind == Rdna2OperandKind::Sgpr && inst.src[0].reg_index < 106u &&
+                    sgpr_has_pc[inst.src[0].reg_index]) {
+                    const int64_t byte_tgt = sgpr_pc_bytes[inst.src[0].reg_index];
+                    if (byte_tgt >= 0 && (byte_tgt & 3) == 0) {
+                        auto it = word_to_idx.find(static_cast<uint32_t>(byte_tgt / 4));
+                        if (it != word_to_idx.end()) {
+                            setpc_target_idx[i] = it->second;
+                            leader_set.insert(it->second);
+                        }
+                    }
+                }
+                if (i + 1 < instructions.size()) {
                     leader_set.insert(i + 1);
+                }
+            } else if (inst.opcode == Rdna2Opcode::S_ENDPGM) {
+                if (i + 1 < instructions.size()) {
+                    bool has_non_pad = false;
+                    for (size_t k = i + 1; k < instructions.size(); ++k) {
+                        if (instructions[k].opcode != Rdna2Opcode::S_CODE_END &&
+                            instructions[k].opcode != Rdna2Opcode::S_NOP) {
+                            has_non_pad = true;
+                            break;
+                        }
+                    }
+                    if (has_non_pad) {
+                        leader_set.insert(i + 1);
+                    }
                 }
             }
         }
@@ -585,6 +863,23 @@ Status BuildRdna2Ir(
             const uint32_t tgt_bb = inst_idx_to_bb[branch_target_idx[last_i]];
             AddUnique(out_module.blocks[b].successors, tgt_bb);
             AddUnique(out_module.blocks[tgt_bb].predecessors, static_cast<uint32_t>(b));
+        } else if (call_target_idx.count(last_i) > 0u) {
+            const uint32_t tgt_bb = inst_idx_to_bb[call_target_idx[last_i]];
+            AddUnique(out_module.blocks[b].successors, tgt_bb);
+            AddUnique(out_module.blocks[tgt_bb].predecessors, static_cast<uint32_t>(b));
+        } else if (last.opcode == Rdna2Opcode::S_SETPC_B64 &&
+                   (setpc_target_idx.count(last_i) > 0u || !call_return_sites.empty())) {
+            if (setpc_target_idx.count(last_i) > 0u) {
+                const uint32_t tgt_bb = inst_idx_to_bb[setpc_target_idx[last_i]];
+                AddUnique(out_module.blocks[b].successors, tgt_bb);
+                AddUnique(out_module.blocks[tgt_bb].predecessors, static_cast<uint32_t>(b));
+            } else {
+                for (const auto& rs : call_return_sites) {
+                    const uint32_t ret_bb = inst_idx_to_bb[rs.second];
+                    AddUnique(out_module.blocks[b].successors, ret_bb);
+                    AddUnique(out_module.blocks[ret_bb].predecessors, static_cast<uint32_t>(b));
+                }
+            }
         } else if (IsConditionalBranchOpcode(last.opcode)) {
             const uint32_t tgt_bb = inst_idx_to_bb[branch_target_idx[last_i]];
             AddUnique(out_module.blocks[b].successors, tgt_bb);
@@ -622,7 +917,9 @@ Status BuildRdna2Ir(
     IrValueId merged_wave_info_val = kInvalidIrValue;
     IrValueId zero_u32_val = kInvalidIrValue;
     IrValueId zero_f32_val = kInvalidIrValue;
-    std::array<IrValueId, 4> ps_inputs{};
+    IrValueId true_bool_val = kInvalidIrValue;
+    IrValueId false_bool_val = kInvalidIrValue;
+    std::array<IrValueId, 16> ps_inputs{};
     std::unordered_map<uint32_t, IrValueId> root_const_vals;
 
     auto get_zero_u32 = [&]() -> IrValueId {
@@ -637,6 +934,20 @@ Status BuildRdna2Ir(
             zero_f32_val = register_preamble(IrOp::ConstF32, IrType::F32, 0u, 0.0f);
         }
         return zero_f32_val;
+    };
+
+    auto get_true_bool = [&]() -> IrValueId {
+        if (true_bool_val == kInvalidIrValue) {
+            true_bool_val = register_preamble(IrOp::ConstU32, IrType::Bool, 1u, 0.0f);
+        }
+        return true_bool_val;
+    };
+
+    auto get_false_bool = [&]() -> IrValueId {
+        if (false_bool_val == kInvalidIrValue) {
+            false_bool_val = register_preamble(IrOp::ConstU32, IrType::Bool, 0u, 0.0f);
+        }
+        return false_bool_val;
     };
 
     auto get_tid_x = [&]() -> IrValueId {
@@ -663,11 +974,13 @@ Status BuildRdna2Ir(
         return merged_wave_info_val;
     };
 
-    auto get_ps_input = [&](uint32_t ch) -> IrValueId {
-        if (ch < 4u && ps_inputs[ch] == kInvalidIrValue) {
-            ps_inputs[ch] = register_preamble(IrOp::StageInput, IrType::F32, ch, 0.0f);
+    auto get_ps_input = [&](uint32_t ch, uint32_t param_slot = 0u) -> IrValueId {
+        const uint32_t slot = (param_slot & 3u) * 4u + (ch & 3u);
+        if (slot < 16u && ps_inputs[slot] == kInvalidIrValue) {
+            const uint32_t imm = (ch & 3u) | ((param_slot & 3u) << 2);
+            ps_inputs[slot] = register_preamble(IrOp::StageInput, IrType::F32, imm, 0.0f);
         }
-        return ch < 4u ? ps_inputs[ch] : get_zero_f32();
+        return slot < 16u ? ps_inputs[slot] : get_zero_f32();
     };
 
     auto get_root_const = [&](uint32_t idx) -> IrValueId {
@@ -687,9 +1000,67 @@ Status BuildRdna2Ir(
         return it != value_types.end() ? it->second : IrType::U32;
     };
 
-    // 3. Lower each basic block into SSA IR.
+    // 3. Lower each basic block into SSA IR (with back-edge / irreducible loop-carried Phi patching).
     std::vector<RegState> exit_states(leaders.size());
     std::vector<bool> block_processed(leaders.size(), false);
+    uint32_t max_scratch_byte_end = 0u;
+
+    // Track which registers are written in each block so loop headers pre-allocate loop-carried Phis.
+    struct BlockWrites {
+        std::array<uint8_t, 256> vgpr{};
+        std::array<uint8_t, 106> sgpr{};
+        bool scc = false;
+        bool vcc = false;
+        bool exec = false;
+        bool m0 = false;
+    };
+    std::vector<BlockWrites> block_writes(leaders.size());
+    for (size_t b = 0; b < leaders.size(); ++b) {
+        const size_t s_i = leaders[b];
+        const size_t e_i = (b + 1 < leaders.size()) ? leaders[b + 1] : instructions.size();
+        auto& bw = block_writes[b];
+        for (size_t i = s_i; i < e_i; ++i) {
+            const auto& ins = instructions[i];
+            auto mark_dst = [&](const Rdna2Operand& d) {
+                if (d.kind == Rdna2OperandKind::Vgpr && d.reg_index < 256u) bw.vgpr[d.reg_index] = 1u;
+                else if (d.kind == Rdna2OperandKind::Sgpr && d.reg_index < 106u) bw.sgpr[d.reg_index] = 1u;
+                else if (d.kind == Rdna2OperandKind::VccLo || d.kind == Rdna2OperandKind::VccHi) bw.vcc = true;
+                else if (d.kind == Rdna2OperandKind::ExecLo || d.kind == Rdna2OperandKind::ExecHi) bw.exec = true;
+                else if (d.kind == Rdna2OperandKind::M0) bw.m0 = true;
+                else if (d.kind == Rdna2OperandKind::Scc) bw.scc = true;
+            };
+            mark_dst(ins.dst);
+            if (IsExtendedSaveExecSop1(ins)) {
+                bw.exec = true;
+                bw.scc = true;
+            } else if (IsExtendedExecSop2(ins)) {
+                bw.scc = true;
+            } else if (IsVcmpxOpcode(ins.opcode)) {
+                bw.exec = true;
+            } else if (ins.encoding == Rdna2Encoding::SOPC ||
+                       ins.opcode == Rdna2Opcode::S_AND_B32 || ins.opcode == Rdna2Opcode::S_OR_B32 ||
+                       ins.opcode == Rdna2Opcode::S_XOR_B32 || ins.opcode == Rdna2Opcode::S_ANDN2_B32) {
+                bw.scc = true;
+            }
+            if ((ins.opcode == Rdna2Opcode::IMAGE_LOAD || ins.opcode == Rdna2Opcode::IMAGE_LOAD_MIP ||
+                 ins.opcode == Rdna2Opcode::IMAGE_SAMPLE || ins.opcode == Rdna2Opcode::IMAGE_SAMPLE_LZ ||
+                 ins.opcode == Rdna2Opcode::IMAGE_BVH_INTERSECT_RAY) &&
+                ins.dst.kind == Rdna2OperandKind::Vgpr) {
+                for (uint32_t k = 0u; k < 4u && ins.dst.reg_index + k < 256u; ++k) {
+                    bw.vgpr[ins.dst.reg_index + k] = 1u;
+                }
+            }
+        }
+    }
+
+    enum class PendingRegKind : uint8_t { Vgpr, Sgpr, Scc, Vcc, Exec, M0 };
+    struct PendingBackEdgePhi {
+        uint32_t bb_id = 0;
+        size_t inst_index = 0;
+        PendingRegKind kind = PendingRegKind::Vgpr;
+        uint16_t reg_index = 0;
+    };
+    std::vector<PendingBackEdgePhi> pending_loop_phis;
 
     for (size_t b = 0; b < leaders.size(); ++b) {
         auto& bb = out_module.blocks[b];
@@ -711,32 +1082,102 @@ Status BuildRdna2Ir(
             return bb.instructions.back().id;
         };
 
-        // Merge register state from predecessors (emitting Phi nodes at join blocks).
+        // Merge register state from predecessors (emitting Phi nodes at join & loop-header blocks).
         std::vector<uint32_t> ready_preds;
+        bool has_unprocessed_pred = false;
         for (uint32_t p : bb.predecessors) {
             if (block_processed[p]) ready_preds.push_back(p);
+            else has_unprocessed_pred = true;
         }
 
-        if (ready_preds.size() == 1) {
-            state = exit_states[ready_preds[0]];
-        } else if (ready_preds.size() > 1) {
-            auto merge_reg = [&](auto getter) -> IrValueId {
+        if (!has_unprocessed_pred) {
+            if (ready_preds.size() == 1) {
+                state = exit_states[ready_preds[0]];
+            } else if (ready_preds.size() > 1) {
+                auto merge_reg = [&](auto getter) -> IrValueId {
+                    IrValueId first = kInvalidIrValue;
+                    bool differs = false;
+                    bool any_set = false;
+                    for (uint32_t p : ready_preds) {
+                        IrValueId v = getter(exit_states[p]);
+                        if (v != kInvalidIrValue) any_set = true;
+                        if (first == kInvalidIrValue) {
+                            first = v;
+                        } else if (v != first) {
+                            differs = true;
+                        }
+                    }
+                    if (!any_set) return kInvalidIrValue;
+                    if (!differs) return first;
+
+                    IrType phi_type = IrType::U32;
+                    for (uint32_t p : ready_preds) {
+                        IrValueId v = getter(exit_states[p]);
+                        if (v != kInvalidIrValue) {
+                            phi_type = get_type(v);
+                            break;
+                        }
+                    }
+
+                    IrInstruction phi{};
+                    phi.id = out_module.AllocateValueId();
+                    phi.op = IrOp::Phi;
+                    phi.type = phi_type;
+                    for (uint32_t p : ready_preds) {
+                        IrValueId v = getter(exit_states[p]);
+                        if (v == kInvalidIrValue) {
+                            v = (phi_type == IrType::F32)
+                                    ? get_zero_f32()
+                                    : (phi_type == IrType::Bool ? get_true_bool() : get_zero_u32());
+                        }
+                        phi.phi_incoming.emplace_back(p, v);
+                    }
+                    value_types[phi.id] = phi_type;
+                    bb.instructions.push_back(std::move(phi));
+                    return bb.instructions.back().id;
+                };
+
+                for (size_t r = 0; r < 256; ++r) {
+                    state.vgpr[r] = merge_reg([r](const RegState& s) { return s.vgpr[r]; });
+                }
+                for (size_t r = 0; r < 106; ++r) {
+                    state.sgpr[r] = merge_reg([r](const RegState& s) { return s.sgpr[r]; });
+                }
+                state.scc = merge_reg([](const RegState& s) { return s.scc; });
+                state.vcc = merge_reg([](const RegState& s) { return s.vcc; });
+                state.exec = merge_reg([](const RegState& s) { return s.exec; });
+                state.m0 = merge_reg([](const RegState& s) { return s.m0; });
+            }
+        } else {
+            // Loop header or irreducible multi-entry header: compute registers written in blocks >= b
+            BlockWrites loop_mod{};
+            for (size_t k = b; k < leaders.size(); ++k) {
+                for (size_t r = 0; r < 256; ++r) loop_mod.vgpr[r] |= block_writes[k].vgpr[r];
+                for (size_t r = 0; r < 106; ++r) loop_mod.sgpr[r] |= block_writes[k].sgpr[r];
+                loop_mod.scc = loop_mod.scc || block_writes[k].scc;
+                loop_mod.vcc = loop_mod.vcc || block_writes[k].vcc;
+                loop_mod.exec = loop_mod.exec || block_writes[k].exec;
+                loop_mod.m0 = loop_mod.m0 || block_writes[k].m0;
+            }
+
+            auto make_loop_phi = [&](PendingRegKind kind, uint16_t reg_idx, bool written_in_loop,
+                                     auto getter, IrType default_type) -> IrValueId {
                 IrValueId first = kInvalidIrValue;
                 bool differs = false;
                 bool any_set = false;
                 for (uint32_t p : ready_preds) {
                     IrValueId v = getter(exit_states[p]);
                     if (v != kInvalidIrValue) any_set = true;
-                    if (first == kInvalidIrValue) {
-                        first = v;
-                    } else if (v != first) {
-                        differs = true;
-                    }
+                    if (first == kInvalidIrValue) first = v;
+                    else if (v != first) differs = true;
                 }
-                if (!any_set) return kInvalidIrValue;
-                if (!differs) return first;
-
-                IrType phi_type = IrType::U32;
+                if (!written_in_loop && !differs) {
+                    return first;
+                }
+                if (!any_set && !written_in_loop) {
+                    return kInvalidIrValue;
+                }
+                IrType phi_type = default_type;
                 for (uint32_t p : ready_preds) {
                     IrValueId v = getter(exit_states[p]);
                     if (v != kInvalidIrValue) {
@@ -744,7 +1185,6 @@ Status BuildRdna2Ir(
                         break;
                     }
                 }
-
                 IrInstruction phi{};
                 phi.id = out_module.AllocateValueId();
                 phi.op = IrOp::Phi;
@@ -752,25 +1192,51 @@ Status BuildRdna2Ir(
                 for (uint32_t p : ready_preds) {
                     IrValueId v = getter(exit_states[p]);
                     if (v == kInvalidIrValue) {
-                        v = (phi_type == IrType::F32) ? get_zero_f32() : get_zero_u32();
+                        if (kind == PendingRegKind::Exec) {
+                            v = get_true_bool();
+                        } else if (kind == PendingRegKind::Vgpr && reg_idx == 0u &&
+                                   (out_module.stage == ShaderStage::Compute || out_module.stage == ShaderStage::Vertex ||
+                                    out_module.stage == ShaderStage::Geometry || out_module.stage == ShaderStage::Mesh ||
+                                    out_module.stage == ShaderStage::Amplification)) {
+                            v = get_tid_x();
+                        } else if (kind == PendingRegKind::Vgpr && reg_idx < 4u &&
+                                   out_module.stage == ShaderStage::Pixel) {
+                            v = get_ps_input(reg_idx);
+                        } else if (phi_type == IrType::F32) {
+                            v = get_zero_f32();
+                        } else if (phi_type == IrType::Bool) {
+                            v = get_false_bool();
+                        } else {
+                            v = get_zero_u32();
+                        }
                     }
                     phi.phi_incoming.emplace_back(p, v);
                 }
                 value_types[phi.id] = phi_type;
+                const size_t idx = bb.instructions.size();
                 bb.instructions.push_back(std::move(phi));
-                return bb.instructions.back().id;
+                pending_loop_phis.push_back({static_cast<uint32_t>(b), idx, kind, reg_idx});
+                return bb.instructions[idx].id;
             };
 
             for (size_t r = 0; r < 256; ++r) {
-                state.vgpr[r] = merge_reg([r](const RegState& s) { return s.vgpr[r]; });
+                state.vgpr[r] = make_loop_phi(PendingRegKind::Vgpr, static_cast<uint16_t>(r),
+                                              loop_mod.vgpr[r] != 0u,
+                                              [r](const RegState& s) { return s.vgpr[r]; }, IrType::U32);
             }
             for (size_t r = 0; r < 106; ++r) {
-                state.sgpr[r] = merge_reg([r](const RegState& s) { return s.sgpr[r]; });
+                state.sgpr[r] = make_loop_phi(PendingRegKind::Sgpr, static_cast<uint16_t>(r),
+                                              loop_mod.sgpr[r] != 0u,
+                                              [r](const RegState& s) { return s.sgpr[r]; }, IrType::U32);
             }
-            state.scc = merge_reg([](const RegState& s) { return s.scc; });
-            state.vcc = merge_reg([](const RegState& s) { return s.vcc; });
-            state.exec = merge_reg([](const RegState& s) { return s.exec; });
-            state.m0 = merge_reg([](const RegState& s) { return s.m0; });
+            state.scc = make_loop_phi(PendingRegKind::Scc, 0u, loop_mod.scc,
+                                      [](const RegState& s) { return s.scc; }, IrType::Bool);
+            state.vcc = make_loop_phi(PendingRegKind::Vcc, 0u, loop_mod.vcc,
+                                      [](const RegState& s) { return s.vcc; }, IrType::Bool);
+            state.exec = make_loop_phi(PendingRegKind::Exec, 0u, loop_mod.exec,
+                                       [](const RegState& s) { return s.exec; }, IrType::Bool);
+            state.m0 = make_loop_phi(PendingRegKind::M0, 0u, loop_mod.m0,
+                                     [](const RegState& s) { return s.m0; }, IrType::U32);
         }
 
         auto read_vgpr = [&](uint8_t idx, bool expect_float) -> IrValueId {
@@ -942,12 +1408,136 @@ Status BuildRdna2Ir(
             }
         };
 
+        auto is_lane_pred_operand = [&](const Rdna2Operand& op) -> bool {
+            if (op.kind == Rdna2OperandKind::ExecLo || op.kind == Rdna2OperandKind::ExecHi ||
+                op.kind == Rdna2OperandKind::VccLo || op.kind == Rdna2OperandKind::VccHi) {
+                return true;
+            }
+            if (op.kind == Rdna2OperandKind::Sgpr && op.reg_index < 106u &&
+                state.sgpr[op.reg_index] != kInvalidIrValue &&
+                get_type(state.sgpr[op.reg_index]) == IrType::Bool) {
+                return true;
+            }
+            return false;
+        };
+
+        auto eval_lane_pred = [&](const Rdna2Operand& op) -> IrValueId {
+            if (op.kind == Rdna2OperandKind::ExecLo || op.kind == Rdna2OperandKind::ExecHi) {
+                if (state.exec == kInvalidIrValue) return get_true_bool();
+                return ensure_bool(state.exec);
+            }
+            if (op.kind == Rdna2OperandKind::VccLo || op.kind == Rdna2OperandKind::VccHi) {
+                return ensure_bool(state.vcc);
+            }
+            if (op.kind == Rdna2OperandKind::Sgpr && op.reg_index < 106u) {
+                if (state.sgpr[op.reg_index] != kInvalidIrValue) {
+                    return ensure_bool(state.sgpr[op.reg_index]);
+                }
+                return get_false_bool();
+            }
+            if (op.kind == Rdna2OperandKind::InlineInt) {
+                return (op.int_value != 0) ? get_true_bool() : get_false_bool();
+            }
+            if (op.kind == Rdna2OperandKind::Literal32) {
+                return (op.literal_bits != 0u) ? get_true_bool() : get_false_bool();
+            }
+            return ensure_bool(eval_operand(op, false));
+        };
+
+        auto emit_bool_or = [&](IrValueId a, IrValueId b_val) -> IrValueId {
+            IrValueId na = emit_in_bb(IrOp::LogicalNot, IrType::Bool, {a});
+            IrValueId nb = emit_in_bb(IrOp::LogicalNot, IrType::Bool, {b_val});
+            IrValueId nand = emit_in_bb(IrOp::LogicalAnd, IrType::Bool, {na, nb});
+            return emit_in_bb(IrOp::LogicalNot, IrType::Bool, {nand});
+        };
+
+        auto emit_bool_xor = [&](IrValueId a, IrValueId b_val) -> IrValueId {
+            IrValueId na = emit_in_bb(IrOp::LogicalNot, IrType::Bool, {a});
+            IrValueId nb = emit_in_bb(IrOp::LogicalNot, IrType::Bool, {b_val});
+            IrValueId a_nb = emit_in_bb(IrOp::LogicalAnd, IrType::Bool, {a, nb});
+            IrValueId na_b = emit_in_bb(IrOp::LogicalAnd, IrType::Bool, {na, b_val});
+            return emit_bool_or(a_nb, na_b);
+        };
+
+        auto emit_pixel_kill = [&](IrValueId kill_cond_or_invalid) {
+            if (out_module.stage != ShaderStage::Pixel) return;
+            IrInstruction kill_inst{};
+            kill_inst.op = IrOp::Export;
+            kill_inst.type = IrType::Void;
+            kill_inst.export_target = static_cast<uint8_t>(Rdna2ExportTarget::Null);
+            kill_inst.export_mask = 0u;
+            kill_inst.imm_u32 = kIrKillExportMagic;
+            if (kill_cond_or_invalid != kInvalidIrValue) {
+                kill_inst.operands.push_back(kill_cond_or_invalid);
+            }
+            bb.instructions.push_back(std::move(kill_inst));
+        };
+
         const size_t start_i = leaders[b];
         const size_t end_i = (b + 1 < leaders.size()) ? leaders[b + 1] : instructions.size();
         bool terminated = false;
 
         for (size_t i = start_i; i < end_i; ++i) {
             const auto& inst = instructions[i];
+
+            // Extended GFX10.3 64-bit / 32-bit EXEC-mask manipulation instructions
+            if (IsExtendedSaveExecSop1(inst)) {
+                const IrValueId old_exec = eval_lane_pred(Rdna2Operand::ExecLo());
+                const IrValueId rhs = eval_lane_pred(inst.src[0]);
+                write_dst(inst.dst, old_exec);
+                IrValueId new_exec = old_exec;
+                if (inst.raw_opcode == kSop1RawAndSaveExecB64 || inst.raw_opcode == kSop1RawAndSaveExecB32) {
+                    new_exec = emit_in_bb(IrOp::LogicalAnd, IrType::Bool, {old_exec, rhs});
+                } else if (inst.raw_opcode == kSop1RawOrSaveExecB64 || inst.raw_opcode == kSop1RawOrSaveExecB32) {
+                    new_exec = emit_bool_or(old_exec, rhs);
+                } else if (inst.raw_opcode == kSop1RawXorSaveExecB64 || inst.raw_opcode == kSop1RawXorSaveExecB32) {
+                    new_exec = emit_bool_xor(old_exec, rhs);
+                } else {
+                    IrValueId nr = emit_in_bb(IrOp::LogicalNot, IrType::Bool, {rhs});
+                    new_exec = emit_in_bb(IrOp::LogicalAnd, IrType::Bool, {old_exec, nr});
+                }
+                state.exec = new_exec;
+                state.scc = new_exec;
+                continue;
+            }
+            if (IsExtendedMovB64Sop1(inst)) {
+                if (inst.dst.kind == Rdna2OperandKind::ExecLo || inst.dst.kind == Rdna2OperandKind::ExecHi) {
+                    if ((inst.src[0].kind == Rdna2OperandKind::InlineInt && inst.src[0].int_value == -1) ||
+                        (inst.src[0].kind == Rdna2OperandKind::Literal32 && inst.src[0].literal_bits == 0xFFFFFFFFu)) {
+                        state.exec = get_true_bool();
+                    } else if ((inst.src[0].kind == Rdna2OperandKind::InlineInt && inst.src[0].int_value == 0) ||
+                               (inst.src[0].kind == Rdna2OperandKind::Literal32 && inst.src[0].literal_bits == 0u)) {
+                        state.exec = get_false_bool();
+                        emit_pixel_kill(kInvalidIrValue);
+                    } else {
+                        state.exec = eval_lane_pred(inst.src[0]);
+                    }
+                } else if (is_lane_pred_operand(inst.src[0])) {
+                    write_dst(inst.dst, eval_lane_pred(inst.src[0]));
+                } else {
+                    write_dst(inst.dst, eval_operand(inst.src[0], false));
+                }
+                continue;
+            }
+            if (IsExtendedExecSop2(inst)) {
+                const IrValueId a = eval_lane_pred(inst.src[0]);
+                const IrValueId bval = eval_lane_pred(inst.src[1]);
+                IrValueId res = a;
+                if (inst.raw_opcode == kSop2RawAndB64) {
+                    res = emit_in_bb(IrOp::LogicalAnd, IrType::Bool, {a, bval});
+                } else if (inst.raw_opcode == kSop2RawOrB64) {
+                    res = emit_bool_or(a, bval);
+                } else if (inst.raw_opcode == kSop2RawXorB64) {
+                    res = emit_bool_xor(a, bval);
+                } else {
+                    IrValueId nb = emit_in_bb(IrOp::LogicalNot, IrType::Bool, {bval});
+                    res = emit_in_bb(IrOp::LogicalAnd, IrType::Bool, {a, nb});
+                }
+                write_dst(inst.dst, res);
+                state.scc = res;
+                continue;
+            }
+
             switch (inst.opcode) {
                 // ----- SOP2 -----
                 case Rdna2Opcode::S_ADD_U32:
@@ -982,19 +1572,51 @@ Status BuildRdna2Ir(
                     break;
                 }
                 case Rdna2Opcode::S_AND_B32:
-                    write_dst(inst.dst, emit_in_bb(IrOp::BitAnd, IrType::U32, {eval_operand(inst.src[0], false), eval_operand(inst.src[1], false)}));
+                    if (inst.dst.kind == Rdna2OperandKind::ExecLo || inst.dst.kind == Rdna2OperandKind::ExecHi ||
+                        is_lane_pred_operand(inst.src[0]) || is_lane_pred_operand(inst.src[1])) {
+                        IrValueId r = emit_in_bb(IrOp::LogicalAnd, IrType::Bool,
+                                                 {eval_lane_pred(inst.src[0]), eval_lane_pred(inst.src[1])});
+                        write_dst(inst.dst, r);
+                        state.scc = r;
+                    } else {
+                        write_dst(inst.dst, emit_in_bb(IrOp::BitAnd, IrType::U32, {eval_operand(inst.src[0], false), eval_operand(inst.src[1], false)}));
+                    }
                     break;
                 case Rdna2Opcode::S_OR_B32:
-                    write_dst(inst.dst, emit_in_bb(IrOp::BitOr, IrType::U32, {eval_operand(inst.src[0], false), eval_operand(inst.src[1], false)}));
+                    if (inst.dst.kind == Rdna2OperandKind::ExecLo || inst.dst.kind == Rdna2OperandKind::ExecHi ||
+                        is_lane_pred_operand(inst.src[0]) || is_lane_pred_operand(inst.src[1])) {
+                        IrValueId r = emit_bool_or(eval_lane_pred(inst.src[0]), eval_lane_pred(inst.src[1]));
+                        write_dst(inst.dst, r);
+                        state.scc = r;
+                    } else {
+                        write_dst(inst.dst, emit_in_bb(IrOp::BitOr, IrType::U32, {eval_operand(inst.src[0], false), eval_operand(inst.src[1], false)}));
+                    }
                     break;
                 case Rdna2Opcode::S_XOR_B32:
-                    write_dst(inst.dst, emit_in_bb(IrOp::BitXor, IrType::U32, {eval_operand(inst.src[0], false), eval_operand(inst.src[1], false)}));
+                    if (inst.dst.kind == Rdna2OperandKind::ExecLo || inst.dst.kind == Rdna2OperandKind::ExecHi ||
+                        is_lane_pred_operand(inst.src[0]) || is_lane_pred_operand(inst.src[1])) {
+                        IrValueId r = emit_bool_xor(eval_lane_pred(inst.src[0]), eval_lane_pred(inst.src[1]));
+                        write_dst(inst.dst, r);
+                        state.scc = r;
+                    } else {
+                        write_dst(inst.dst, emit_in_bb(IrOp::BitXor, IrType::U32, {eval_operand(inst.src[0], false), eval_operand(inst.src[1], false)}));
+                    }
                     break;
                 case Rdna2Opcode::S_ANDN2_B32: {
-                    IrValueId a = eval_operand(inst.src[0], false);
-                    IrValueId bval = eval_operand(inst.src[1], false);
-                    IrValueId nb = emit_in_bb(IrOp::BitNot, IrType::U32, {bval});
-                    write_dst(inst.dst, emit_in_bb(IrOp::BitAnd, IrType::U32, {a, nb}));
+                    if (inst.dst.kind == Rdna2OperandKind::ExecLo || inst.dst.kind == Rdna2OperandKind::ExecHi ||
+                        is_lane_pred_operand(inst.src[0]) || is_lane_pred_operand(inst.src[1])) {
+                        IrValueId a = eval_lane_pred(inst.src[0]);
+                        IrValueId bval = eval_lane_pred(inst.src[1]);
+                        IrValueId nb = emit_in_bb(IrOp::LogicalNot, IrType::Bool, {bval});
+                        IrValueId r = emit_in_bb(IrOp::LogicalAnd, IrType::Bool, {a, nb});
+                        write_dst(inst.dst, r);
+                        state.scc = r;
+                    } else {
+                        IrValueId a = eval_operand(inst.src[0], false);
+                        IrValueId bval = eval_operand(inst.src[1], false);
+                        IrValueId nb = emit_in_bb(IrOp::BitNot, IrType::U32, {bval});
+                        write_dst(inst.dst, emit_in_bb(IrOp::BitAnd, IrType::U32, {a, nb}));
+                    }
                     break;
                 }
                 case Rdna2Opcode::S_LSHL_B32:
@@ -1030,8 +1652,23 @@ Status BuildRdna2Ir(
 
                 // ----- SOP1 -----
                 case Rdna2Opcode::S_MOV_B32: {
-                    const bool is_flt = (inst.src[0].kind == Rdna2OperandKind::InlineFloat);
-                    write_dst(inst.dst, eval_operand(inst.src[0], is_flt));
+                    if (inst.dst.kind == Rdna2OperandKind::ExecLo || inst.dst.kind == Rdna2OperandKind::ExecHi) {
+                        if ((inst.src[0].kind == Rdna2OperandKind::InlineInt && inst.src[0].int_value == -1) ||
+                            (inst.src[0].kind == Rdna2OperandKind::Literal32 && inst.src[0].literal_bits == 0xFFFFFFFFu)) {
+                            state.exec = get_true_bool();
+                        } else if ((inst.src[0].kind == Rdna2OperandKind::InlineInt && inst.src[0].int_value == 0) ||
+                                   (inst.src[0].kind == Rdna2OperandKind::Literal32 && inst.src[0].literal_bits == 0u)) {
+                            state.exec = get_false_bool();
+                            emit_pixel_kill(kInvalidIrValue);
+                        } else {
+                            state.exec = eval_lane_pred(inst.src[0]);
+                        }
+                    } else if (is_lane_pred_operand(inst.src[0])) {
+                        write_dst(inst.dst, eval_lane_pred(inst.src[0]));
+                    } else {
+                        const bool is_flt = (inst.src[0].kind == Rdna2OperandKind::InlineFloat);
+                        write_dst(inst.dst, eval_operand(inst.src[0], is_flt));
+                    }
                     break;
                 }
                 case Rdna2Opcode::S_NOT_B32:
@@ -1048,6 +1685,11 @@ Status BuildRdna2Ir(
                     } else if (inst.src[0].kind == Rdna2OperandKind::ExecHi) {
                         word = emit_in_bb(IrOp::ConstU32, IrType::U32, {},
                                           (out_module.wave_size == 64u) ? 0xFFFFFFFFu : 0u, 0.0f);
+                    } else if (inst.src[0].kind == Rdna2OperandKind::Sgpr &&
+                               inst.src[0].reg_index < 106u &&
+                               state.sgpr[inst.src[0].reg_index] != kInvalidIrValue &&
+                               get_type(state.sgpr[inst.src[0].reg_index]) == IrType::Bool) {
+                        word = get_ballot_pair(state.sgpr[inst.src[0].reg_index]).first;
                     } else {
                         word = eval_operand(inst.src[0], false);
                     }
@@ -1069,8 +1711,14 @@ Status BuildRdna2Ir(
                                         (out_module.wave_size == 64u) ? 0xFFFFFFFFu : 0u, 0.0f);
                     } else if (inst.src[0].kind == Rdna2OperandKind::Sgpr) {
                         const uint8_t idx = static_cast<uint8_t>(inst.src[0].reg_index);
-                        lo = read_sgpr(idx);
-                        hi = (idx + 1u < 106u) ? read_sgpr(static_cast<uint8_t>(idx + 1u)) : get_zero_u32();
+                        if (state.sgpr[idx] != kInvalidIrValue && get_type(state.sgpr[idx]) == IrType::Bool) {
+                            auto pair = get_ballot_pair(state.sgpr[idx]);
+                            lo = pair.first;
+                            hi = (out_module.wave_size == 64u) ? pair.second : get_zero_u32();
+                        } else {
+                            lo = read_sgpr(idx);
+                            hi = (idx + 1u < 106u) ? read_sgpr(static_cast<uint8_t>(idx + 1u)) : get_zero_u32();
+                        }
                     } else if (inst.src[0].kind == Rdna2OperandKind::InlineInt && inst.src[0].int_value < 0) {
                         lo = eval_operand(inst.src[0], false);
                         hi = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, 0xFFFFFFFFu, 0.0f);
@@ -1115,6 +1763,42 @@ Status BuildRdna2Ir(
                                 state.vgpr[static_cast<uint8_t>(vf.dst_vgpr + c)] =
                                     emit_in_bb(IrOp::BufferLoadFormat, res_t, {base_addr}, imm);
                             }
+                        }
+                    } else if (inst.opcode == Rdna2Opcode::S_SWAPPC_B64 && call_target_idx.count(i) > 0u) {
+                        IrInstruction br{};
+                        br.op = IrOp::Branch;
+                        br.type = IrType::Void;
+                        br.true_block = inst_idx_to_bb[call_target_idx[i]];
+                        bb.instructions.push_back(std::move(br));
+                        terminated = true;
+                    } else if (inst.opcode == Rdna2Opcode::S_SETPC_B64) {
+                        if (setpc_target_idx.count(i) > 0u) {
+                            IrInstruction br{};
+                            br.op = IrOp::Branch;
+                            br.type = IrType::Void;
+                            br.true_block = inst_idx_to_bb[setpc_target_idx[i]];
+                            bb.instructions.push_back(std::move(br));
+                            terminated = true;
+                        } else if (call_return_sites.size() == 1u) {
+                            IrInstruction br{};
+                            br.op = IrOp::Branch;
+                            br.type = IrType::Void;
+                            br.true_block = inst_idx_to_bb[call_return_sites[0].second];
+                            bb.instructions.push_back(std::move(br));
+                            terminated = true;
+                        } else if (call_return_sites.size() > 1u) {
+                            // Indirect return dispatch: compare saved return PC against known call return sites
+                            IrValueId ret_addr = eval_operand(inst.src[0], false);
+                            IrValueId c0 = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, call_return_sites[0].first, 0.0f);
+                            IrValueId eq0 = emit_in_bb(IrOp::CmpEqU, IrType::Bool, {ret_addr, c0});
+                            IrInstruction cbr{};
+                            cbr.op = IrOp::CondBranch;
+                            cbr.type = IrType::Void;
+                            cbr.operands.push_back(eq0);
+                            cbr.true_block = inst_idx_to_bb[call_return_sites[0].second];
+                            cbr.false_block = inst_idx_to_bb[call_return_sites[1].second];
+                            bb.instructions.push_back(std::move(cbr));
+                            terminated = true;
                         }
                     }
                     break;
@@ -2224,6 +2908,9 @@ Status BuildRdna2Ir(
                     if (inst.mem_offset != 0) {
                         IrValueId off = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, static_cast<uint32_t>(inst.mem_offset), 0.0f);
                         addr = emit_in_bb(IrOp::IAdd, IrType::U32, {addr, off});
+                        if (inst.mem_offset > 0) {
+                            max_scratch_byte_end = std::max(max_scratch_byte_end, static_cast<uint32_t>(inst.mem_offset) + 4u);
+                        }
                     }
                     write_dst(inst.dst, emit_in_bb(IrOp::ScratchLoad, IrType::U32, {addr}));
                     break;
@@ -2237,9 +2924,13 @@ Status BuildRdna2Ir(
                     if (inst.mem_offset != 0) {
                         IrValueId off = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, static_cast<uint32_t>(inst.mem_offset), 0.0f);
                         addr = emit_in_bb(IrOp::IAdd, IrType::U32, {addr, off});
+                        if (inst.mem_offset > 0) {
+                            max_scratch_byte_end = std::max(max_scratch_byte_end, static_cast<uint32_t>(inst.mem_offset) + 4u);
+                        }
                     }
                     IrValueId data = eval_operand(inst.src[1], false);
                     emit_in_bb(IrOp::ScratchStore, IrType::Void, {addr, data});
+                    attach_exec_pred();
                     break;
                 }
 
@@ -2269,18 +2960,29 @@ Status BuildRdna2Ir(
                         out_module.input_interp_modes[sem_loc] == Rdna2InterpMode::Perspective) {
                         out_module.input_interp_modes[sem_loc] = mode;
                     }
+                    const uint32_t pslot = std::min<uint32_t>(3u, sem_loc);
                     if (inst.opcode == Rdna2Opcode::V_INTERP_P1_F32) {
                         // P1 sets up intermediate barycentric step; P2 completes final interpolated value
-                        write_dst(inst.dst, get_ps_input(inst.vintrp_chan & 3u));
+                        write_dst(inst.dst, get_ps_input(inst.vintrp_chan & 3u, pslot));
                     } else {
                         // P2 or MOV produces the interpolated/flat attribute channel
-                        write_dst(inst.dst, get_ps_input(inst.vintrp_chan & 3u));
+                        write_dst(inst.dst, get_ps_input(inst.vintrp_chan & 3u, pslot));
                     }
                     break;
                 }
 
                 // ----- EXP -----
                 case Rdna2Opcode::EXP: {
+                    if (inst.exp_target == static_cast<uint8_t>(Rdna2ExportTarget::Null)) {
+                        // Pixel shader null-export kill (exp null, off, off, off, off done vm)
+                        if (out_module.stage == ShaderStage::Pixel) {
+                            IrValueId cond = (state.exec != kInvalidIrValue && get_type(state.exec) == IrType::Bool)
+                                                 ? state.exec
+                                                 : kInvalidIrValue;
+                            emit_pixel_kill(cond);
+                        }
+                        break;
+                    }
                     if (inst.exp_target == static_cast<uint8_t>(Rdna2ExportTarget::Prim)) {
                         out_module.exports_prim = true;
                         if (inst.exp_en == 0x1u) {
@@ -2301,6 +3003,13 @@ Status BuildRdna2Ir(
                             emit_in_bb(IrOp::ExportMeshPrim, IrType::Void, {i0, i1, i2}, 0u);
                         }
                         break;
+                    }
+                    if (inst.exp_target == static_cast<uint8_t>(Rdna2ExportTarget::Mrt0) &&
+                        out_module.stage == ShaderStage::Pixel &&
+                        state.exec != kInvalidIrValue && get_type(state.exec) == IrType::Bool) {
+                        // Any lane deactivated in EXEC before final MRT0 export is discarded
+                        IrValueId kill_cond = emit_in_bb(IrOp::LogicalNot, IrType::Bool, {state.exec});
+                        emit_pixel_kill(kill_cond);
                     }
                     std::vector<IrValueId> ch(4);
                     for (uint8_t c = 0; c < 4; ++c) {
@@ -2324,10 +3033,13 @@ Status BuildRdna2Ir(
                         out_module.exports_pos0 = true;
                     } else if (inst.exp_target == static_cast<uint8_t>(Rdna2ExportTarget::Mrt0)) {
                         out_module.exports_mrt0 = true;
-                    } else if (inst.exp_target == static_cast<uint8_t>(Rdna2ExportTarget::Param0)) {
+                    } else if (inst.exp_target >= static_cast<uint8_t>(Rdna2ExportTarget::Param0) &&
+                               inst.exp_target <= static_cast<uint8_t>(Rdna2ExportTarget::Param3)) {
                         out_module.exports_param0 = true;
-                        if (out_module.output_interp_modes.empty()) {
-                            out_module.output_interp_modes.push_back(Rdna2InterpMode::Perspective);
+                        const size_t pidx = static_cast<size_t>(
+                            inst.exp_target - static_cast<uint8_t>(Rdna2ExportTarget::Param0));
+                        if (out_module.output_interp_modes.size() <= pidx) {
+                            out_module.output_interp_modes.resize(pidx + 1u, Rdna2InterpMode::Perspective);
                         }
                     }
                     break;
@@ -2357,6 +3069,53 @@ Status BuildRdna2Ir(
 
         exit_states[b] = state;
         block_processed[b] = true;
+    }
+
+    // Patch back-edge / irreducible incoming values into pre-allocated loop header Phis.
+    for (const auto& pend : pending_loop_phis) {
+        auto& bb = out_module.blocks[pend.bb_id];
+        if (pend.inst_index >= bb.instructions.size()) continue;
+        auto& phi = bb.instructions[pend.inst_index];
+        if (phi.op != IrOp::Phi) continue;
+
+        for (uint32_t p : bb.predecessors) {
+            bool already = false;
+            for (const auto& inc : phi.phi_incoming) {
+                if (inc.first == p) {
+                    already = true;
+                    break;
+                }
+            }
+            if (already) continue;
+            IrValueId val = kInvalidIrValue;
+            const auto& es = exit_states[p];
+            switch (pend.kind) {
+                case PendingRegKind::Vgpr: val = es.vgpr[pend.reg_index]; break;
+                case PendingRegKind::Sgpr: val = es.sgpr[pend.reg_index]; break;
+                case PendingRegKind::Scc:  val = es.scc; break;
+                case PendingRegKind::Vcc:  val = es.vcc; break;
+                case PendingRegKind::Exec: val = es.exec; break;
+                case PendingRegKind::M0:   val = es.m0; break;
+            }
+            if (val == kInvalidIrValue) {
+                if (pend.kind == PendingRegKind::Exec) {
+                    val = get_true_bool();
+                } else if (phi.type == IrType::F32) {
+                    val = get_zero_f32();
+                } else if (phi.type == IrType::Bool) {
+                    val = get_false_bool();
+                } else {
+                    val = get_zero_u32();
+                }
+            }
+            phi.phi_incoming.emplace_back(p, val);
+        }
+    }
+
+    // Grow per-thread scratch frame size to fit heavy VGPR spilling offsets (power-of-2, min 64 dwords).
+    if (out_module.uses_scratch && max_scratch_byte_end > 0u) {
+        const uint32_t needed_dwords = (max_scratch_byte_end + 3u) / 4u;
+        out_module.scratch_size_dwords = RoundUpPow2U32(needed_dwords, 64u, 2048u);
     }
 
     // Prepend hoisted entry preamble into block 0.
