@@ -327,8 +327,14 @@ fs::path ResolveXsapiDir(const std::string& scid) {
         base = fs::path(env_root);
     } else {
         const std::string env_temp = GetEnvString("TEMP");
-        base = !env_temp.empty() ? (fs::path(env_temp) / "saves")
-                                 : fs::path("E:\\OpenScarlett\\.tmp\\saves");
+        if (!env_temp.empty()) {
+            base = fs::path(env_temp) / "saves";
+        } else {
+            std::error_code ec;
+            const fs::path tmp = fs::temp_directory_path(ec);
+            base = (!ec && !tmp.empty()) ? (tmp / "openscarlett_saves")
+                                         : fs::path("openscarlett_saves");
+        }
     }
     return base / "xsapi" / SanitizePathToken(scid);
 }
@@ -5755,6 +5761,155 @@ XGameResult OPENSCARLETT_XSAPI_CALL XblPresenceUnsubscribeFromTitlePresenceChang
     std::lock_guard<std::mutex> lk(s.mutex);
     s.live_subscriptions.erase(subscriptionHandle);
     return RecordHr("XblPresenceUnsubscribeFromTitlePresenceChange", XBL_S_OK);
+}
+
+// ===========================================================================
+// Multiplayer Activity (Non-Blocking Offline Simulation)
+// ===========================================================================
+static const char kIdMpaFlushRecent[] = "XblMultiplayerActivityFlushRecentPlayersAsync";
+static const char kIdMpaSetActivity[] = "XblMultiplayerActivitySetActivityAsync";
+static const char kIdMpaGetActivity[] = "XblMultiplayerActivityGetActivityAsync";
+static const char kIdMpaDeleteActivity[] = "XblMultiplayerActivityDeleteActivityAsync";
+static const char kIdMpaSendInvites[] = "XblMultiplayerActivitySendInvitesAsync";
+
+OPENSCARLETT_XSAPI_API XGameResult OPENSCARLETT_XSAPI_CALL
+XblMultiplayerActivityUpdateRecentPlayers(
+    XblContextHandle xblContext,
+    const void* updates,
+    size_t updatesCount) {
+    if (!xblContext || (!updates && updatesCount > 0)) {
+        return RecordHr("XblMultiplayerActivityUpdateRecentPlayers", XGR_E_INVALIDARG);
+    }
+    if (!LookupContext(xblContext)) {
+        return RecordHr("XblMultiplayerActivityUpdateRecentPlayers", XGR_E_HANDLE);
+    }
+    return RecordHr("XblMultiplayerActivityUpdateRecentPlayers", XBL_S_OK);
+}
+
+OPENSCARLETT_XSAPI_API XGameResult OPENSCARLETT_XSAPI_CALL
+XblMultiplayerActivityFlushRecentPlayersAsync(
+    XblContextHandle xblContext,
+    XAsyncBlock* async) {
+    if (!xblContext || !async) {
+        return RecordHr("XblMultiplayerActivityFlushRecentPlayersAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupContext(xblContext)) {
+        return RecordHr("XblMultiplayerActivityFlushRecentPlayersAsync", XGR_E_HANDLE);
+    }
+    auto op = std::make_unique<XsapiAsyncOp>();
+    op->work_fn = [](XsapiAsyncOp&) -> XGameResult { return XBL_S_OK; };
+    return RecordHr("XblMultiplayerActivityFlushRecentPlayersAsync",
+                    StartXsapiAsync(async, kIdMpaFlushRecent, std::move(op)));
+}
+
+OPENSCARLETT_XSAPI_API XGameResult OPENSCARLETT_XSAPI_CALL
+XblMultiplayerActivitySetActivityAsync(
+    XblContextHandle xblContext,
+    const void* activityInfo,
+    bool /*allowCrossPlatformJoin*/,
+    XAsyncBlock* async) {
+    if (!xblContext || !activityInfo || !async) {
+        return RecordHr("XblMultiplayerActivitySetActivityAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupContext(xblContext)) {
+        return RecordHr("XblMultiplayerActivitySetActivityAsync", XGR_E_HANDLE);
+    }
+    auto op = std::make_unique<XsapiAsyncOp>();
+    op->work_fn = [](XsapiAsyncOp&) -> XGameResult { return XBL_S_OK; };
+    return RecordHr("XblMultiplayerActivitySetActivityAsync",
+                    StartXsapiAsync(async, kIdMpaSetActivity, std::move(op)));
+}
+
+OPENSCARLETT_XSAPI_API XGameResult OPENSCARLETT_XSAPI_CALL
+XblMultiplayerActivityGetActivityAsync(
+    XblContextHandle xblContext,
+    const uint64_t* xuids,
+    size_t xuidsCount,
+    XAsyncBlock* async) {
+    if (!xblContext || !async || (!xuids && xuidsCount > 0)) {
+        return RecordHr("XblMultiplayerActivityGetActivityAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupContext(xblContext)) {
+        return RecordHr("XblMultiplayerActivityGetActivityAsync", XGR_E_HANDLE);
+    }
+    auto op = std::make_unique<XsapiAsyncOp>();
+    op->work_fn = [](XsapiAsyncOp& self) -> XGameResult {
+        self.required_buffer_size = 0;
+        return XBL_S_OK;
+    };
+    op->get_result_fn = [](void*, size_t) -> XGameResult { return XBL_S_OK; };
+    return RecordHr("XblMultiplayerActivityGetActivityAsync",
+                    StartXsapiAsync(async, kIdMpaGetActivity, std::move(op)));
+}
+
+OPENSCARLETT_XSAPI_API XGameResult OPENSCARLETT_XSAPI_CALL
+XblMultiplayerActivityGetActivityResultSize(
+    XAsyncBlock* async,
+    size_t* resultSizeInBytes) {
+    if (!async || !resultSizeInBytes) {
+        return RecordHr("XblMultiplayerActivityGetActivityResultSize", XGR_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) return RecordHr("XblMultiplayerActivityGetActivityResultSize", hr);
+    *resultSizeInBytes = 0;
+    return RecordHr("XblMultiplayerActivityGetActivityResultSize", XBL_S_OK);
+}
+
+OPENSCARLETT_XSAPI_API XGameResult OPENSCARLETT_XSAPI_CALL
+XblMultiplayerActivityGetActivityResult(
+    XAsyncBlock* async,
+    size_t bufferSize,
+    void* buffer,
+    void** ptrToBufferResults,
+    size_t* resultCount,
+    size_t* bufferUsed) {
+    if (!async || !ptrToBufferResults || !resultCount) {
+        return RecordHr("XblMultiplayerActivityGetActivityResult", XGR_E_INVALIDARG);
+    }
+    (void)bufferSize;
+    (void)buffer;
+    XGameResult hr = XAsyncGetStatus(async, true);
+    if (hr < 0) return RecordHr("XblMultiplayerActivityGetActivityResult", hr);
+    *ptrToBufferResults = nullptr;
+    *resultCount = 0;
+    if (bufferUsed) *bufferUsed = 0;
+    return RecordHr("XblMultiplayerActivityGetActivityResult", XBL_S_OK);
+}
+
+OPENSCARLETT_XSAPI_API XGameResult OPENSCARLETT_XSAPI_CALL
+XblMultiplayerActivityDeleteActivityAsync(
+    XblContextHandle xblContext,
+    XAsyncBlock* async) {
+    if (!xblContext || !async) {
+        return RecordHr("XblMultiplayerActivityDeleteActivityAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupContext(xblContext)) {
+        return RecordHr("XblMultiplayerActivityDeleteActivityAsync", XGR_E_HANDLE);
+    }
+    auto op = std::make_unique<XsapiAsyncOp>();
+    op->work_fn = [](XsapiAsyncOp&) -> XGameResult { return XBL_S_OK; };
+    return RecordHr("XblMultiplayerActivityDeleteActivityAsync",
+                    StartXsapiAsync(async, kIdMpaDeleteActivity, std::move(op)));
+}
+
+OPENSCARLETT_XSAPI_API XGameResult OPENSCARLETT_XSAPI_CALL
+XblMultiplayerActivitySendInvitesAsync(
+    XblContextHandle xblContext,
+    const uint64_t* xuids,
+    size_t xuidsCount,
+    bool /*allowCrossPlatformJoin*/,
+    const char* /*connectionString*/,
+    XAsyncBlock* async) {
+    if (!xblContext || !async || (!xuids && xuidsCount > 0)) {
+        return RecordHr("XblMultiplayerActivitySendInvitesAsync", XGR_E_INVALIDARG);
+    }
+    if (!LookupContext(xblContext)) {
+        return RecordHr("XblMultiplayerActivitySendInvitesAsync", XGR_E_HANDLE);
+    }
+    auto op = std::make_unique<XsapiAsyncOp>();
+    op->work_fn = [](XsapiAsyncOp&) -> XGameResult { return XBL_S_OK; };
+    return RecordHr("XblMultiplayerActivitySendInvitesAsync",
+                    StartXsapiAsync(async, kIdMpaSendInvites, std::move(op)));
 }
 
 }  // extern "C"
