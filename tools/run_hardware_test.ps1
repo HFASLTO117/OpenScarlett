@@ -154,6 +154,10 @@ $TestDescriptions = @{
     'test_probe_veh_capture.exe'       = 'First-Boot Probe E_NOTIMPL trampolines, Win32 VEH crash dumper & per-draw PNG/JSON capture'
     'test_gdkx_abi.exe'                = 'GDKX COM zero-escape (Device..Device12), IDXGIDevice1 virtual output, 5-arg WaitFrameEventX, 3-arg PresentX & appnotify PLM'
     'test_gdkx_untouched_samples.exe'  = 'Untouched Microsoft _GAMING_XBOX_SCARLETT SimpleTriangle & SimpleLighting end-to-end APC boot + 4K PNG pixel check'
+    'test_rdna2_gpu_accuracy.exe'      = 'GFX10.3 HW accuracy rules (v_sin/cos turns, s_bfe, fused fp16 FMA, D16/snorm) & 615/779 real-GPU opcode audit'
+    'test_rdna2_as_task_spirv.exe'     = 'Amplification/Task SPIR-V 1.6 TaskEXT (130/130 spirv-val), Wave64-on-32 LDS & VS/GS/MS CullDistance'
+    'test_d3d12_feedback_queries.exe'  = 'Console Sampler Feedback readback/clear, QueryAccumulatorX, predicated byte copies & GPU-QPC clock calibration'
+    'test_xvd_loader_lsa.exe'          = '12 KiB XVD header geometry inspector, mixed-case PE forwarders/API-sets & Console LSA/PFN policy state'
 }
 
 Write-Host ''

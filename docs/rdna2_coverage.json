@@ -10,8 +10,8 @@
   "corpus_shaders_total": 3120,
   "corpus_shaders_passed": 3120,
   "corpus_unique_hashes": 3120,
-  "corpus_spirv_validated": 2990,
-  "spirv_val_external_validated": 414,
+  "corpus_spirv_validated": 3120,
+  "spirv_val_external_validated": 432,
   "corpus_dxil_compiled": 432,
   "corpus_dxil_resigned_verified": 432,
   "corpus_cpu_ref_executed": 48,
@@ -28,7 +28,7 @@
   "has_vulkan_hw": true,
   "d3d12_hw_adapter": "NVIDIA GeForce GTX 1650 Ti",
   "vulkan_adapter": "NVIDIA GeForce GTX 1650 Ti",
-  "elapsed_seconds": 16.139,
+  "elapsed_seconds": 19.287,
   "families": {
     "SOP1": {"total": 58, "decoded": 58, "lifted_spirv": 58, "lifted_dxil": 58, "cpu_ref": 58, "gpu_verified": 28},
     "SOP2": {"total": 43, "decoded": 43, "lifted_spirv": 43, "lifted_dxil": 43, "cpu_ref": 43, "gpu_verified": 42},
@@ -56,14 +56,14 @@
     "VS": {"total": 260, "passed": 260, "disasm_passed": 260, "spirv_passed": 260, "dxil_passed": 36, "cpu_ref_passed": 4, "gpu_passed": 1},
     "PS": {"total": 520, "passed": 520, "disasm_passed": 520, "spirv_passed": 520, "dxil_passed": 72, "cpu_ref_passed": 8, "gpu_passed": 1},
     "MS": {"total": 130, "passed": 130, "disasm_passed": 130, "spirv_passed": 130, "dxil_passed": 18, "cpu_ref_passed": 2, "gpu_passed": 0},
-    "AS": {"total": 130, "passed": 130, "disasm_passed": 130, "spirv_passed": 0, "dxil_passed": 18, "cpu_ref_passed": 2, "gpu_passed": 0}
+    "AS": {"total": 130, "passed": 130, "disasm_passed": 130, "spirv_passed": 130, "dxil_passed": 18, "cpu_ref_passed": 2, "gpu_passed": 0}
   },
   "workloads": {
     "pbr_ibl": {"description": "PBR/IBL microfacet shading (GGX/Fresnel, PS VINTRP + CS)", "total": 260, "passed": 260, "spirv_passed": 260, "dxil_passed": 36, "cpu_ref_passed": 4, "gpu_passed": 7},
     "cascaded_shadows": {"description": "Cascaded shadow maps & PCF depth filtering (PS + CS)", "total": 260, "passed": 260, "spirv_passed": 260, "dxil_passed": 36, "cpu_ref_passed": 4, "gpu_passed": 3},
     "deferred_gbuffer": {"description": "Deferred G-buffer f16/snorm16/unorm16 pack & unpack (CS + PS)", "total": 260, "passed": 260, "spirv_passed": 260, "dxil_passed": 36, "cpu_ref_passed": 4, "gpu_passed": 4},
     "skeletal_skinning": {"description": "Bone matrix palette skinning & MTBUF D16 vertex fetch (VS + CS)", "total": 260, "passed": 260, "spirv_passed": 260, "dxil_passed": 36, "cpu_ref_passed": 4, "gpu_passed": 3},
-    "meshlet_culling": {"description": "AS+MS frustum/cone culling, GS_ALLOC_REQ & merged_wave_info (AS + MS)", "total": 260, "passed": 260, "spirv_passed": 130, "dxil_passed": 36, "cpu_ref_passed": 4, "gpu_passed": 0},
+    "meshlet_culling": {"description": "AS+MS frustum/cone culling, GS_ALLOC_REQ & merged_wave_info (AS + MS)", "total": 260, "passed": 260, "spirv_passed": 260, "dxil_passed": 36, "cpu_ref_passed": 4, "gpu_passed": 0},
     "clustered_tiled_lighting": {"description": "Tiled/clustered light culling with LDS & root constants (CS)", "total": 260, "passed": 260, "spirv_passed": 260, "dxil_passed": 36, "cpu_ref_passed": 4, "gpu_passed": 2},
     "postfx_bloom_tonemap_fsr_taa": {"description": "Bloom, ACES tonemap, FSR 1.0 & TAA history clamp (CS + PS)", "total": 260, "passed": 260, "spirv_passed": 260, "dxil_passed": 36, "cpu_ref_passed": 4, "gpu_passed": 1},
     "bvh4_ray_traversal": {"description": "BVH4 ray-box & ray-triangle traversal via image_bvh_intersect_ray (CS)", "total": 260, "passed": 260, "spirv_passed": 260, "dxil_passed": 36, "cpu_ref_passed": 4, "gpu_passed": 1},

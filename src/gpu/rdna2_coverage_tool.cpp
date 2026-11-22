@@ -1868,7 +1868,7 @@ GeneratedCorpusShader GenerateCorpusShader(uint32_t workload_idx, uint32_t varia
             } else {
                 xs2.stage = ShaderStage::Amplification;
                 xs2.threadgroup_x = 1u;
-                out.supports_spirv = false;  // Amplification emits SM 6.5 as_6_5 DXIL
+                out.supports_spirv = true;  // Amplification emits SPIR-V 1.6 TaskEXT (SPV_EXT_mesh_shader) & SM 6.5 as_6_5 DXIL
                 const int32_t gx = 1 + static_cast<int32_t>(variant % 8u);
                 const int32_t gy = 1 + static_cast<int32_t>((variant / 8u) % 4u);
                 const int32_t gz = 1 + static_cast<int32_t>((variant / 32u) % 2u);
@@ -5341,7 +5341,9 @@ Status RunRdna2CoverageBenchmark(const Rdna2BenchOptions& opts, Rdna2CoverageRep
                             " (" + kStageNames[st_idx] + ")";
                 if (job.do_spv_val) {
                     job.spirv_words = lifted.spirv_words;
-                    job.spirv_env = (gen.stage == ShaderStage::Mesh) ? "vulkan1.3" : "vulkan1.2";
+                    job.spirv_env = (gen.stage == ShaderStage::Mesh || gen.stage == ShaderStage::Amplification)
+                                        ? "vulkan1.3"
+                                        : "vulkan1.2";
                     if (ext_spv_budget > 0u) --ext_spv_budget;
                 }
                 if (job.do_dxc) {
