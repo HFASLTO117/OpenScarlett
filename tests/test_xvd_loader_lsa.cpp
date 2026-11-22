@@ -252,8 +252,13 @@ void TestXvdInspector() {
     OS_REQUIRE(ComputeXvdHashTreeGeometry(28901u, false, lvls, hpages) && lvls == 3u && hpages == 174u);
     OS_REQUIRE(!ComputeXvdHashTreeGeometry(0x31C84B11ull, false, lvls, hpages));
 
-    // 4. Streaming InspectXvdFile on disk
-    const auto tmp_path = std::filesystem::path(OPENSCARLETT_BINARY_DIR) / "test_synthetic_xvd.xvc";
+    // 4. Streaming InspectXvdFile on disk (portable across both CTest build dir & standalone zip bundle)
+    std::error_code ec;
+    auto tmp_dir = std::filesystem::temp_directory_path(ec);
+    if (ec || tmp_dir.empty()) {
+        tmp_dir = std::filesystem::current_path(ec);
+    }
+    const auto tmp_path = tmp_dir / "openscarlett_test_synthetic_xvd.xvc";
     {
         std::ofstream ofs(tmp_path, std::ios::binary | std::ios::trunc);
         OS_REQUIRE(ofs.good());
@@ -264,7 +269,6 @@ void TestXvdInspector() {
     OS_REQUIRE(file_rep.xvc_metadata.parsed);
     OS_REQUIRE(file_rep.xvc_metadata.regions.size() == 2u);
     OS_REQUIRE(file_rep.geometry.drive_data_offset == 0xF000u);
-    std::error_code ec;
     std::filesystem::remove(tmp_path, ec);
 
     // 5. Negative controls: truncated, bad magic, bad version, bad type, zero/unaligned/overflow DriveSize
@@ -581,12 +585,14 @@ void TestConsoleLsaPolicy() {
     OS_REQUIRE(acct == cfg_pkg.package_family_name && dom == "APPLICATION PACKAGE AUTHORITY");
 
     // Load staged untouched Microsoft Xbox-GDK-Samples MicrosoftGameConfig.mgc files
+    // when running inside the source checkout (skipped gracefully in standalone portable zip bundles).
+    std::error_code mgc_ec;
     const auto extra_dir = std::filesystem::path(OPENSCARLETT_SOURCE_DIR) / "tests" / "gdkx_bringup_extra";
     const auto tex_mgc = extra_dir / "SimpleTexture" / "MicrosoftGameConfig.mgc";
     const auto inst_mgc = extra_dir / "SimpleInstancing" / "MicrosoftGameConfig.mgc";
-    OS_REQUIRE(std::filesystem::exists(tex_mgc));
-    OS_REQUIRE(std::filesystem::exists(inst_mgc));
-    {
+    if (std::filesystem::exists(extra_dir, mgc_ec)) {
+        OS_REQUIRE(std::filesystem::exists(tex_mgc, mgc_ec));
+        OS_REQUIRE(std::filesystem::exists(inst_mgc, mgc_ec));
         ConsoleLsaPolicy sample_policy;
         OS_REQUIRE(sample_policy.LoadFromMicrosoftGameConfigFile(tex_mgc.string()).ok());
         OS_REQUIRE(sample_policy.GetPackageIdentity().display_name == "SimpleTexture");
