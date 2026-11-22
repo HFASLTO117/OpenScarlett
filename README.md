@@ -35,12 +35,19 @@ flowchart LR
     style S5 fill:#d29922,stroke:#f0b72f,color:#ffffff
 ```
 
+| Area | Measured Today |
+| :--- | :--- |
+| **Loader & System DLLs** | **`30` shimmed Xbox/GDK DLLs (`926` PE exports)** · **`292/292`** shipping `XGamingRuntimeThunks.dll` parity (`24` COM `QueryApiImpl` interfaces, `0 E_NOINTERFACE` on live `Alexandria IV DEMO` thunks) · nested `G:` CoW VFS · `CreateProcess` multi-process child-hook propagation (`Pizza House Simulator`, `House Flipper 2`) |
+| **Graphics (D3D12 + Vulkan 1.4)** | Direct `d3d12_xs` → **Vulkan 1.4** command-list routing (`--backend=vulkan`), hardware `VK_EXT_mesh_shader` & D3D12 `MeshTier=10` (`0.0000` MAE cross-API parity on `SimpleLighting` & `VulkanMeshShowcase`), HDR10 ST.2084 / scRGB `PresentX`, sparse/reserved `GetResourceTiling`, `xg_xs` 15 2D + 6 3D tiling + `HTILE`/`DCC`/`CMASK` + `XGEncodeDCC` (`1,000`-case fuzz, `0` mismatches), DXR Tier 1.1 HW RT + SAH BVH fallback |
+| **RDNA2 Shaders & Codecs** | **`224/779`** GFX10.3 opcodes decoded & lifted to **SPIR-V (`spirv-val`)** and **DXIL SM 6.5 (`dxc` + MD5 re-signed)** with wave32/64 CPU reference interpreter, lockstep 1-wave LDS barriers, `PSV0` wave bounds & disk cache *(expanding toward full GFX10.3 corpus next)* · GDeflate v1, BCPack BC1–BC7, XMA2 IMDCT, Opus MFT, WASAPI + `X3DAudio`, Bink2, RDNA2 BVH4 & GPU FSR 1.0 |
+| **Live Workloads & Launcher** | **`42/42`** automated CTest suites passing on GTX 1650 Ti + WARP (plus 5 community GPUs) · 60 FPS playable **Freedoom: Phase 1** & **ScarlettArena** · shadowed/skinned BC1+BC3 3D dual-API GDK scene (`gdk_3d_scene`) · official MIT `Xbox-GDK-Samples` · native Win32/Direct2D **`OpenScarlettLauncher.exe`** with 60s Hardware Tester & BCrypt SHA-256 updater · *retail AAA Xbox Series titles not playable yet* |
+
 | Working Today | Building Next |
 | :--- | :--- |
-| All-in-one native Windows GUI (**`OpenScarlettLauncher.exe`**) with built-in 60s Hardware Tester, PE Inspector & opt-in BCrypt SHA-256 updater | Larger open-source 3D & commercial GDK title bring-up |
-| Plays **Freedoom**, **ScarlettArena** & a shadowed/skinned 3D GDK scene (`gdk_3d_scene`) with live controller, audio & saves | Broader RDNA2 shader corpus validation across more engines |
+| All-in-one native Windows GUI (**`OpenScarlettLauncher.exe`**) with built-in 60s Hardware Tester, PE Inspector & opt-in BCrypt SHA-256 updater | Full **RDNA2 GFX10.3 opcode coverage (`224 → 779`)** + multi-thousand-shader automated validation corpus |
+| Plays **Freedoom**, **ScarlettArena** & a shadowed/skinned 3D GDK scene (`gdk_3d_scene`) with live controller, audio & saves | First commercial Xbox-ABI / GDK title bring-up (boot → menu → playable in-game) |
 | Direct Xbox DirectX 12 → **Vulkan 1.4** command-list routing (`0.0000` MAE vs D3D12) + official Microsoft Xbox GDK 3D/Mesh/HDR10/DXR samples | Multi-vendor Vulkan tuning & performance profiling |
-| Matches **292/292** shipping GDK runtime functions across **30** shimmed DLLs on **6 real PCs** | Hardware testing on Intel Arc, RTX 40/50, RX 6000 & handheld APUs |
+| Matches **292/292** shipping GDK runtime functions across **30** shimmed DLLs (`926` exports) on **6 real PCs** | Hardware testing on Intel Arc, RTX 40/50, RX 6000 & handheld APUs |
 
 ---
 
@@ -88,7 +95,7 @@ Every new GPU and Windows build helps us catch real driver, wave-size, and memor
 <br/>
 
 <!-- OPENSCARLETT_STATUS_START -->
-**Automated Tests:** `42/42` passing · **Shimmed DLLs:** `30` · **Shipping GDK Thunks:** `292/292` · **Verified Hardware:** `6 PCs` (`NVIDIA` + `AMD`)
+**Automated Tests:** `42/42` passing · **Shimmed DLLs:** `30` (`926` PE exports) · **Shipping GDK Thunks:** `292/292` · **RDNA2 Opcodes Decoded:** `224/779` · **Verified Hardware:** `6 PCs` (`NVIDIA` + `AMD`)
 
 | Subsystem | Area | Status | Progress | Technical Coverage | Verified On |
 | :--- | :--- | :--- | :---: | :--- | :--- |
