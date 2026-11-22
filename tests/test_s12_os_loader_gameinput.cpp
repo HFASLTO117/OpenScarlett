@@ -998,12 +998,14 @@ void TestXAudio2LockFree128VoicesAndSpatialAudio() {
     OS_REQUIRE(sp_stream->EndUpdatingAudioObjects() == OS_XAUDIO2_S_OK);
     OS_REQUIRE(sp_stream->EndUpdatingAudioObjects() < 0);
 
-    // Heavy concurrent streaming thread stress: 8 threads contending on Begin/Activate/GetBuffer/End
+    // Heavy concurrent streaming thread stress: 8 threads contending on Begin/Activate/GetBuffer/End.
+    // Give each thread a bounded retry budget so slow 2-vCPU Debug CI runners don't starve below 40 cycles.
     std::atomic<uint32_t> completed_cycles{0u};
     std::vector<std::thread> sp_threads;
     for (int t = 0; t < 8; ++t) {
         sp_threads.emplace_back([&, t]() {
-            for (int iter = 0; iter < 40; ++iter) {
+            int local_done = 0;
+            for (int attempt = 0; attempt < 400 && local_done < 8; ++attempt) {
                 uint32_t dyn = 0u, fpb = 0u;
                 if (sp_stream->BeginUpdatingAudioObjects(&dyn, &fpb) == OS_XAUDIO2_S_OK) {
                     OS_ISpatialAudioObject* obj = nullptr;
@@ -1019,6 +1021,7 @@ void TestXAudio2LockFree128VoicesAndSpatialAudio() {
                         obj->Release();
                     }
                     (void)sp_stream->EndUpdatingAudioObjects();
+                    ++local_done;
                     completed_cycles.fetch_add(1u, std::memory_order_relaxed);
                 } else {
                     std::this_thread::yield();

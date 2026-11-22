@@ -4257,7 +4257,10 @@ Status EmitSvHlsl(
                     case 0x30E: os << "        _r = _a - _b; _vcc_bit = (_b > _a);\n"; break;
                     case 0x30F: os << "        _r = _b - _a; _vcc_bit = (_a > _b);\n"; break;
                     case 0x311: os << "        _r = (_a & 0xFFFFu) | ((_b & 0xFFFFu) << 16u);\n"; break;
-                    case 0x312: os << "        _r = ((_a & 0xFFFFu) * (_b & 0xFFFFu)) & 0xFFFFu;\n"; break;
+                    // Avoid ((_a & 0xFFFFu) * (_b & 0xFFFFu)) & 0xFFFFu: AMD RDNA2 drivers (RX 6750 XT, 32.0.21045.16010)
+                    // elide the outer & 0xFFFFu mask on that pattern in both D3D12 and Vulkan (#2).
+                    // Mod 2^16, (_a * _b) & 0xFFFFu is algebraically identical for all 32-bit inputs.
+                    case 0x312: os << "        _r = (_a * _b) & 0xFFFFu;\n"; break;
                     case 0x313: os << "        _r = asuint(asint(_sv_sext16(_b)) >> (_a & 15u)) & 0xFFFFu;\n"; break;
                     case 0x314: os << "        _r = ((_b & 0xFFFFu) << (_a & 15u)) & 0xFFFFu;\n"; break;
                     case 0x315: os << "        _r = (_b & 0xFFFFu) >> (_a & 15u);\n"; break;
@@ -5856,7 +5859,9 @@ public:
                         case 0x30E: r = BinU32(130u, a, b); Emit(sec_fn_, 62u, {var_vcc_bit, BinBool(172u, b, a)}); break;
                         case 0x30F: r = BinU32(130u, b, a); Emit(sec_fn_, 62u, {var_vcc_bit, BinBool(172u, a, b)}); break;
                         case 0x311: r = BinU32(197u, BinU32(199u, a, ConstU32(0xFFFFu)), BinU32(196u, BinU32(199u, b, ConstU32(0xFFFFu)), ConstU32(16u))); break;
-                        case 0x312: r = BinU32(199u, BinU32(132u, BinU32(199u, a, ConstU32(0xFFFFu)), BinU32(199u, b, ConstU32(0xFFFFu))), ConstU32(0xFFFFu)); break;
+                        // Algebraically identical mod 2^16 without redundant input masks that trigger
+                        // AMD RDNA2 (RX 6750 XT) outer-mask elision in both D3D12 and Vulkan (#2).
+                        case 0x312: r = BinU32(199u, BinU32(132u, a, b), ConstU32(0xFFFFu)); break;
                         case 0x313: r = BinU32(199u, Bitcast(t_u32_, BinI32(195u, Bitcast(t_i32_, SextN(b, 16u)), BinU32(199u, a, ConstU32(15u)))), ConstU32(0xFFFFu)); break;
                         case 0x314: r = BinU32(199u, BinU32(196u, BinU32(199u, b, ConstU32(0xFFFFu)), BinU32(199u, a, ConstU32(15u))), ConstU32(0xFFFFu)); break;
                         case 0x315: r = BinU32(194u, BinU32(199u, b, ConstU32(0xFFFFu)), BinU32(199u, a, ConstU32(15u))); break;
