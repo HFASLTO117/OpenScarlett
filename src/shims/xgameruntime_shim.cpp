@@ -1,6 +1,7 @@
 #define OPENSCARLETT_BUILDING_XGAMERUNTIME 1
 #include "openscarlett/gdk/xgameruntime_abi.h"
 #include "openscarlett/core/telemetry.h"
+#include "openscarlett/kernel/console_lsa_policy.h"
 #include "openscarlett/kernel/plm_notifications.h"
 
 #include <algorithm>
@@ -659,6 +660,13 @@ enum RegFamily : uint32_t {
 
 thread_local bool g_thread_time_sensitive = false;
 
+struct UserChangeListenerEntry {
+    uint64_t token = 0;
+    XTaskQueueHandle queue = nullptr;
+    void* context = nullptr;
+    XUserChangeEventCallback callback = nullptr;
+};
+
 struct RuntimeState {
     std::mutex mutex;
     std::atomic<int32_t> init_count{0};
@@ -718,6 +726,7 @@ struct RuntimeState {
     std::mutex reg_mutex;
     uint64_t next_reg_token = 1;
     std::unordered_map<uint64_t, uint32_t> live_reg_tokens;
+    std::vector<UserChangeListenerEntry> user_change_listeners;
 
     // XStore handles
     std::mutex store_mutex;
@@ -1452,10 +1461,15 @@ bool ReleaseRegToken(uint32_t family, XTaskQueueRegistrationToken token) {
 
 std::string CurrentPackageIdentifier() {
     std::string pkg_id = GetEnvString("OPENSCARLETT_PACKAGE_ID");
-    if (pkg_id.empty()) {
-        pkg_id = "OpenScarlett.Title_1.0.0.0_x64__openscarlett0";
+    if (!pkg_id.empty()) {
+        return pkg_id;
     }
-    return pkg_id;
+    const auto lsa_pkg = openscarlett::ConsoleLsaPolicy::Global().GetPackageIdentity();
+    if (!lsa_pkg.package_full_name.empty() &&
+        lsa_pkg.package_name != "OpenScarlett.DefaultTitle") {
+        return lsa_pkg.package_full_name;
+    }
+    return "OpenScarlett.Title_1.0.0.0_x64__openscarlett0";
 }
 
 std::string CurrentPackageMountPath() {
@@ -1661,6 +1675,236 @@ GameConfigMetadata LoadGameConfigMetadata() {
     meta.identity_name = ExtractXmlAttribute(stripped, "Identity", "Name");
     meta.display_name = ExtractXmlAttribute(stripped, "ShellVisuals", "DefaultDisplayName");
     return meta;
+}
+
+void SyncConsoleLsaPolicyFromConfig() {
+    fs::path cfg_path;
+    std::error_code ec;
+
+    const std::string env_cfg = TrimAscii(GetEnvString("OPENSCARLETT_GAME_CONFIG"));
+    if (!env_cfg.empty()) {
+        const fs::path p(env_cfg);
+        if (fs::is_regular_file(p, ec)) {
+            cfg_path = p;
+        } else {
+            ec.clear();
+            if (fs::is_directory(p, ec)) {
+                (void)TryFindGameConfigInDir(p, cfg_path);
+            }
+        }
+    }
+    if (cfg_path.empty()) {
+        const fs::path cwd = fs::current_path(ec);
+        if (!ec && !cwd.empty()) {
+            (void)TryFindGameConfigInDir(cwd, cfg_path);
+        }
+    }
+#if defined(_WIN32)
+    if (cfg_path.empty()) {
+        wchar_t exe_buf[MAX_PATH]{};
+        const DWORD len = ::GetModuleFileNameW(nullptr, exe_buf, MAX_PATH);
+        if (len > 0 && len < MAX_PATH) {
+            fs::path cur = fs::path(exe_buf).parent_path();
+            for (int depth = 0; depth < 3 && !cur.empty(); ++depth) {
+                if (TryFindGameConfigInDir(cur, cfg_path)) {
+                    break;
+                }
+                const fs::path parent = cur.parent_path();
+                if (parent == cur) break;
+                cur = parent;
+            }
+        }
+    }
+#endif
+
+    auto& lsa = openscarlett::ConsoleLsaPolicy::Global();
+    if (!cfg_path.empty()) {
+        (void)lsa.LoadFromMicrosoftGameConfigFile(cfg_path.string());
+    }
+    const std::string env_sandbox = TrimAscii(GetEnvString("OPENSCARLETT_SANDBOX_ID"));
+    if (!env_sandbox.empty()) {
+        lsa.SetSandboxId(env_sandbox);
+    }
+    const std::string env_store = TrimAscii(GetEnvString("OPENSCARLETT_STORE_ID"));
+    if (!env_store.empty()) {
+        lsa.SetStoreId(env_store);
+    }
+    const std::string env_content = TrimAscii(GetEnvString("OPENSCARLETT_CONTENT_ID"));
+    if (!env_content.empty()) {
+        lsa.SetContentId(env_content);
+    }
+    const std::string env_tid = TrimAscii(GetEnvString("OPENSCARLETT_TITLE_ID"));
+    if (!env_tid.empty() && env_tid[0] != '-') {
+        char* end_ptr = nullptr;
+        errno = 0;
+        const unsigned long long parsed = std::strtoull(env_tid.c_str(), &end_ptr, 16);
+        if (errno == 0 && end_ptr && *end_ptr == '\0' && parsed <= 0xFFFFFFFFULL) {
+            lsa.SetTitleId(static_cast<uint32_t>(parsed));
+        }
+    }
+}
+
+std::string ToLowerAsciiStr(std::string_view s) {
+    std::string out(s);
+    for (char& c : out) {
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
+    }
+    return out;
+}
+
+std::vector<std::string> SplitDelimitedTokens(std::string_view input, char delim) {
+    std::vector<std::string> out;
+    size_t pos = 0;
+    while (pos <= input.size()) {
+        size_t sep = input.find(delim, pos);
+        if (sep == std::string_view::npos) {
+            sep = input.size();
+        }
+        std::string tok = TrimAscii(std::string(input.substr(pos, sep - pos)));
+        if (!tok.empty()) {
+            out.push_back(std::move(tok));
+        }
+        if (sep == input.size()) {
+            break;
+        }
+        pos = sep + 1;
+    }
+    return out;
+}
+
+std::vector<std::string> ActiveInstalledLanguagesLower() {
+    std::vector<std::string> langs;
+    const std::string env_langs = GetEnvString("OPENSCARLETT_INSTALLED_LANGUAGES");
+    if (!env_langs.empty()) {
+        std::string normalized = env_langs;
+        for (char& c : normalized) {
+            if (c == ',') c = ';';
+        }
+        for (const auto& tok : SplitDelimitedTokens(normalized, ';')) {
+            langs.push_back(ToLowerAsciiStr(tok));
+        }
+    }
+    if (langs.empty()) {
+        std::string loc = TrimAscii(GetEnvString("OPENSCARLETT_LOCALE"));
+        if (loc.empty()) {
+            loc = "en-US";
+        }
+        langs.push_back(ToLowerAsciiStr(loc));
+    }
+    return langs;
+}
+
+bool LanguageTokenMatchesInstalled(std::string_view token,
+                                   const std::vector<std::string>& installed_lower) {
+    const std::string tlo = ToLowerAsciiStr(TrimAscii(std::string(token)));
+    if (tlo.empty()) {
+        return false;
+    }
+    const size_t t_dash = tlo.find('-');
+    const std::string t_primary = (t_dash == std::string::npos) ? tlo : tlo.substr(0, t_dash);
+
+    for (const auto& inst : installed_lower) {
+        if (inst == tlo) {
+            return true;
+        }
+        // Match primary language tag when either side specifies base language only (e.g. "en" <-> "en-us").
+        const size_t i_dash = inst.find('-');
+        const std::string i_primary = (i_dash == std::string::npos) ? inst : inst.substr(0, i_dash);
+        if ((t_dash == std::string::npos || i_dash == std::string::npos) && t_primary == i_primary) {
+            return true;
+        }
+    }
+    return false;
+}
+
+XGameResult ValidateAndEvaluateSelectors(uint32_t selectorCount,
+                                         const XPackageChunkSelector* selectors,
+                                         XPackageChunkAvailability& out_availability) {
+    out_availability = XPackageChunkAvailability_Ready;
+    if (selectorCount > 0u && !selectors) {
+        return XGR_E_INVALIDARG;
+    }
+    if (selectorCount == 0u || !selectors) {
+        return XGR_S_OK;
+    }
+
+    const std::vector<std::string> installed = ActiveInstalledLanguagesLower();
+    bool any_unavailable = false;
+    for (uint32_t i = 0u; i < selectorCount; ++i) {
+        const XPackageChunkSelector& sel = selectors[i];
+        switch (sel.type) {
+            case XPackageChunkSelectorType_Language: {
+                if (!sel.language || !*sel.language) {
+                    return XGR_E_INVALIDARG;
+                }
+                const auto tokens = SplitDelimitedTokens(sel.language, ';');
+                if (tokens.empty()) {
+                    return XGR_E_INVALIDARG;
+                }
+                bool any_lang_matched = false;
+                for (const auto& tok : tokens) {
+                    if (LanguageTokenMatchesInstalled(tok, installed)) {
+                        any_lang_matched = true;
+                        break;
+                    }
+                }
+                if (!any_lang_matched) {
+                    any_unavailable = true;
+                }
+                break;
+            }
+            case XPackageChunkSelectorType_Tag:
+                if (!sel.tag || !*sel.tag) {
+                    return XGR_E_INVALIDARG;
+                }
+                break;
+            case XPackageChunkSelectorType_Feature:
+                if (!sel.feature || !*sel.feature) {
+                    return XGR_E_INVALIDARG;
+                }
+                break;
+            case XPackageChunkSelectorType_Chunk:
+                break;
+            default:
+                return XGR_E_INVALIDARG;
+        }
+    }
+
+    out_availability = any_unavailable ? XPackageChunkAvailability_Unavailable
+                                       : XPackageChunkAvailability_Ready;
+    return XGR_S_OK;
+}
+
+bool IsValidOfflineIdentifier(const char* raw, size_t max_len) {
+    if (!raw || !*raw) {
+        return false;
+    }
+    const std::string trimmed = TrimAscii(raw);
+    if (trimmed.empty() || trimmed.size() > max_len) {
+        return false;
+    }
+    for (char c : trimmed) {
+        const unsigned char uc = static_cast<unsigned char>(c);
+        if (uc < 0x20u || uc >= 0x7Fu) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::vector<std::string> ConfiguredOwnedPackages() {
+    std::vector<std::string> out;
+    const std::string env = GetEnvString("OPENSCARLETT_STORE_OWNED_PACKAGES");
+    if (env.empty()) {
+        return out;
+    }
+    std::string norm = env;
+    for (char& c : norm) {
+        if (c == ',') c = ';';
+    }
+    return SplitDelimitedTokens(norm, ';');
 }
 
 std::string CurrentStoreId() {
@@ -2319,6 +2563,7 @@ extern "C" {
 XGameResult OPENSCARLETT_GDK_CALL XGameRuntimeInitialize(void) {
     auto& rt = GetRuntime();
     rt.init_count.fetch_add(1, std::memory_order_acq_rel);
+    SyncConsoleLsaPolicyFromConfig();
     return RecordHr("XGameRuntimeInitialize", XGR_S_OK);
 }
 
@@ -3636,14 +3881,26 @@ void OPENSCARLETT_GDK_CALL XUserCloseSignOutDeferralHandle(XUserSignOutDeferralH
 }
 
 XGameResult OPENSCARLETT_GDK_CALL XUserRegisterForChangeEvent(
-    XTaskQueueHandle /*queue*/,
-    void* /*context*/,
+    XTaskQueueHandle queue,
+    void* context,
     XUserChangeEventCallback callback,
     XTaskQueueRegistrationToken* token) {
+    if (token) {
+        token->token = 0ull;
+    }
     if (!callback || !token) {
         return RecordHr("XUserRegisterForChangeEvent", XGR_E_INVALIDARG);
     }
-    *token = AllocateRegToken(kRegUserChange);
+    if (queue != nullptr && !LookupQueue(queue)) {
+        return RecordHr("XUserRegisterForChangeEvent", XGR_E_HANDLE);
+    }
+    const XTaskQueueRegistrationToken reg = AllocateRegToken(kRegUserChange);
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.reg_mutex);
+        rt.user_change_listeners.push_back(UserChangeListenerEntry{reg.token, queue, context, callback});
+    }
+    *token = reg;
     return RecordHr("XUserRegisterForChangeEvent", XGR_S_OK);
 }
 
@@ -3651,16 +3908,39 @@ bool OPENSCARLETT_GDK_CALL XUserUnregisterForChangeEvent(
     XTaskQueueRegistrationToken token,
     bool /*wait*/) {
     RecordOk("XUserUnregisterForChangeEvent");
-    return ReleaseRegToken(kRegUserChange, token);
+    const bool removed = ReleaseRegToken(kRegUserChange, token);
+    if (removed) {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.reg_mutex);
+        rt.user_change_listeners.erase(
+            std::remove_if(rt.user_change_listeners.begin(), rt.user_change_listeners.end(),
+                           [&](const UserChangeListenerEntry& e) { return e.token == token.token; }),
+            rt.user_change_listeners.end());
+    }
+    return removed;
+}
+
+OPENSCARLETT_GDK_API bool OPENSCARLETT_GDK_CALL XUserIsStoreUser(XUserHandle user) {
+    RecordOk("XUserIsStoreUser");
+    if (!user) {
+        return false;
+    }
+    return LookupUser(user) != nullptr;
 }
 
 XGameResult OPENSCARLETT_GDK_CALL XUserRegisterForDefaultAudioEndpointUtf16Changed(
-    XTaskQueueHandle /*queue*/,
+    XTaskQueueHandle queue,
     void* /*context*/,
     XUserDefaultAudioEndpointUtf16ChangedCallback callback,
     XTaskQueueRegistrationToken* token) {
+    if (token) {
+        token->token = 0ull;
+    }
     if (!callback || !token) {
         return RecordHr("XUserRegisterForDefaultAudioEndpointUtf16Changed", XGR_E_INVALIDARG);
+    }
+    if (queue != nullptr && !LookupQueue(queue)) {
+        return RecordHr("XUserRegisterForDefaultAudioEndpointUtf16Changed", XGR_E_HANDLE);
     }
     *token = AllocateRegToken(kRegUserAudioEndpoint);
     return RecordHr("XUserRegisterForDefaultAudioEndpointUtf16Changed", XGR_S_OK);
@@ -3674,12 +3954,18 @@ bool OPENSCARLETT_GDK_CALL XUserUnregisterForDefaultAudioEndpointUtf16Changed(
 }
 
 XGameResult OPENSCARLETT_GDK_CALL XUserRegisterForDeviceAssociationChanged(
-    XTaskQueueHandle /*queue*/,
+    XTaskQueueHandle queue,
     void* /*context*/,
     XUserDeviceAssociationChangedCallback callback,
     XTaskQueueRegistrationToken* token) {
+    if (token) {
+        token->token = 0ull;
+    }
     if (!callback || !token) {
         return RecordHr("XUserRegisterForDeviceAssociationChanged", XGR_E_INVALIDARG);
+    }
+    if (queue != nullptr && !LookupQueue(queue)) {
+        return RecordHr("XUserRegisterForDeviceAssociationChanged", XGR_E_HANDLE);
     }
     *token = AllocateRegToken(kRegUserDeviceAssoc);
     return RecordHr("XUserRegisterForDeviceAssociationChanged", XGR_S_OK);
@@ -4862,10 +5148,7 @@ XGameResult OPENSCARLETT_GDK_CALL XMemSetAllocationHooks(
 XGameResult OPENSCARLETT_GDK_CALL XPackageGetCurrentProcessPackageIdentifier(
     size_t bufferSize,
     char* buffer) {
-    std::string pkg_id = GetEnvString("OPENSCARLETT_PACKAGE_ID");
-    if (pkg_id.empty()) {
-        pkg_id = "OpenScarlett.Title_1.0.0.0_x64__openscarlett0";
-    }
+    const std::string pkg_id = CurrentPackageIdentifier();
     return RecordHr("XPackageGetCurrentProcessPackageIdentifier",
                     CopyStringResult(pkg_id, bufferSize, buffer, nullptr));
 }
@@ -4876,18 +5159,47 @@ bool OPENSCARLETT_GDK_CALL XPackageIsPackagedProcess(void) {
 }
 
 XGameResult OPENSCARLETT_GDK_CALL XPackageEnumerateChunkAvailability(
-    const char* /*packageIdentifier*/,
+    const char* packageIdentifier,
     uint32_t selectorCount,
     const XPackageChunkSelector* selectors,
     void* context,
     XPackageChunkAvailabilityCallback callback) {
-    if (!callback) {
+    if (!callback || (selectorCount > 0u && !selectors)) {
         return RecordHr("XPackageEnumerateChunkAvailability", XGR_E_INVALIDARG);
     }
-    if (selectors && selectorCount > 0) {
-        for (uint32_t i = 0; i < selectorCount; ++i) {
-            if (!callback(context, &selectors[i], XPackageChunkAvailability_Ready)) {
-                break;
+    (void)packageIdentifier;
+    if (selectors && selectorCount > 0u) {
+        XPackageChunkAvailability overall = XPackageChunkAvailability_Ready;
+        const XGameResult val_hr = ValidateAndEvaluateSelectors(selectorCount, selectors, overall);
+        if (val_hr < 0) {
+            return RecordHr("XPackageEnumerateChunkAvailability", val_hr);
+        }
+        const std::vector<std::string> installed = ActiveInstalledLanguagesLower();
+        for (uint32_t i = 0u; i < selectorCount; ++i) {
+            const XPackageChunkSelector& sel = selectors[i];
+            if (sel.type == XPackageChunkSelectorType_Language) {
+                const auto langs = SplitDelimitedTokens(sel.language, ';');
+                bool keep_going = true;
+                for (const auto& lang : langs) {
+                    XPackageChunkSelector single{};
+                    single.type = XPackageChunkSelectorType_Language;
+                    single.language = lang.c_str();
+                    const XPackageChunkAvailability avail =
+                        LanguageTokenMatchesInstalled(lang, installed)
+                            ? XPackageChunkAvailability_Ready
+                            : XPackageChunkAvailability_Unavailable;
+                    if (!callback(context, &single, avail)) {
+                        keep_going = false;
+                        break;
+                    }
+                }
+                if (!keep_going) {
+                    break;
+                }
+            } else {
+                if (!callback(context, &sel, XPackageChunkAvailability_Ready)) {
+                    break;
+                }
             }
         }
     } else {
@@ -5136,24 +5448,34 @@ XGameResult OPENSCARLETT_GDK_CALL XPackageEnumerateFeatures(
 
 XGameResult OPENSCARLETT_GDK_CALL XPackageFindChunkAvailability(
     const char* packageIdentifier,
-    uint32_t /*selectorCount*/,
-    const XPackageChunkSelector* /*selectors*/,
+    uint32_t selectorCount,
+    const XPackageChunkSelector* selectors,
     XPackageChunkAvailability* availability) {
     if (!packageIdentifier || !*packageIdentifier || !availability) {
         return RecordHr("XPackageFindChunkAvailability", XGR_E_INVALIDARG);
     }
-    *availability = XPackageChunkAvailability_Ready;
+    XPackageChunkAvailability computed = XPackageChunkAvailability_Ready;
+    const XGameResult hr = ValidateAndEvaluateSelectors(selectorCount, selectors, computed);
+    if (hr < 0) {
+        return RecordHr("XPackageFindChunkAvailability", hr);
+    }
+    *availability = computed;
     return RecordHr("XPackageFindChunkAvailability", XGR_S_OK);
 }
 
 XGameResult OPENSCARLETT_GDK_CALL XPackageEstimateDownloadSize(
     const char* packageIdentifier,
-    uint32_t /*selectorCount*/,
-    const XPackageChunkSelector* /*selectors*/,
+    uint32_t selectorCount,
+    const XPackageChunkSelector* selectors,
     uint64_t* downloadSize,
     bool* shouldPresentUserConfirmation) {
     if (!packageIdentifier || !*packageIdentifier || !downloadSize) {
         return RecordHr("XPackageEstimateDownloadSize", XGR_E_INVALIDARG);
+    }
+    XPackageChunkAvailability avail = XPackageChunkAvailability_Ready;
+    const XGameResult hr = ValidateAndEvaluateSelectors(selectorCount, selectors, avail);
+    if (hr < 0) {
+        return RecordHr("XPackageEstimateDownloadSize", hr);
     }
     *downloadSize = 0ULL;
     if (shouldPresentUserConfirmation) {
@@ -7234,15 +7556,39 @@ XGameResult OPENSCARLETT_GDK_CALL XStoreCanAcquireLicenseForPackageAsync(
     XStoreContextHandle storeContextHandle,
     const char* packageIdentifier,
     XAsyncBlock* async) {
-    if (!storeContextHandle || !packageIdentifier || !*packageIdentifier || !async) {
+    if (!storeContextHandle || !IsValidOfflineIdentifier(packageIdentifier, 256u) ||
+        !async) {
         return RecordHr("XStoreCanAcquireLicenseForPackageAsync", XGR_E_INVALIDARG);
     }
     if (!LookupStoreContext(storeContextHandle)) {
         return RecordHr("XStoreCanAcquireLicenseForPackageAsync", XGR_E_HANDLE);
     }
+    const std::string req_lo = ToLowerAsciiStr(TrimAscii(packageIdentifier));
+    const std::string cur_pkg_lo = ToLowerAsciiStr(CurrentPackageIdentifier());
+    const auto lsa_pkg = openscarlett::ConsoleLsaPolicy::Global().GetPackageIdentity();
+    const std::string lsa_full_lo = ToLowerAsciiStr(lsa_pkg.package_full_name);
+    const std::string lsa_pfn_lo = ToLowerAsciiStr(lsa_pkg.package_family_name);
+
+    bool owned = (req_lo == cur_pkg_lo) ||
+                 (!lsa_full_lo.empty() && req_lo == lsa_full_lo) ||
+                 (!lsa_pfn_lo.empty() && req_lo == lsa_pfn_lo);
+    if (!owned) {
+        for (const auto& p : ConfiguredOwnedPackages()) {
+            if (ToLowerAsciiStr(p) == req_lo) {
+                owned = true;
+                break;
+            }
+        }
+    }
+
     XStoreCanAcquireLicenseResult res{};
-    std::snprintf(res.licensableSku, sizeof(res.licensableSku), "%s", "0001");
-    res.status = XStoreCanLicenseStatus_Licensable;
+    if (owned) {
+        std::snprintf(res.licensableSku, sizeof(res.licensableSku), "%s", "0001");
+        res.status = XStoreCanLicenseStatus_Licensable;
+    } else {
+        res.licensableSku[0] = '\0';
+        res.status = XStoreCanLicenseStatus_NotLicensableToUser;
+    }
     return RecordHr(
         "XStoreCanAcquireLicenseForPackageAsync",
         StartPodAsync<XStoreCanAcquireLicenseResult>(
@@ -7269,15 +7615,36 @@ XGameResult OPENSCARLETT_GDK_CALL XStoreCanAcquireLicenseForStoreIdAsync(
     XStoreContextHandle storeContextHandle,
     const char* storeProductId,
     XAsyncBlock* async) {
-    if (!storeContextHandle || !storeProductId || !*storeProductId || !async) {
+    if (!storeContextHandle || !IsValidOfflineIdentifier(storeProductId, 64u) || !async) {
         return RecordHr("XStoreCanAcquireLicenseForStoreIdAsync", XGR_E_INVALIDARG);
     }
     if (!LookupStoreContext(storeContextHandle)) {
         return RecordHr("XStoreCanAcquireLicenseForStoreIdAsync", XGR_E_HANDLE);
     }
+    const std::string req_lo = ToLowerAsciiStr(TrimAscii(storeProductId));
+    const std::string cur_sid_lo = ToLowerAsciiStr(CurrentStoreId());
+    const std::string lsa_sid_lo =
+        ToLowerAsciiStr(openscarlett::ConsoleLsaPolicy::Global().GetPackageIdentity().store_id);
+
+    bool owned = (req_lo == cur_sid_lo) ||
+                 (!lsa_sid_lo.empty() && req_lo == lsa_sid_lo);
+    if (!owned) {
+        for (const auto& addon : ConfiguredAddOnStoreIds()) {
+            if (ToLowerAsciiStr(addon) == req_lo) {
+                owned = true;
+                break;
+            }
+        }
+    }
+
     XStoreCanAcquireLicenseResult res{};
-    std::snprintf(res.licensableSku, sizeof(res.licensableSku), "%s", "0001");
-    res.status = XStoreCanLicenseStatus_Licensable;
+    if (owned) {
+        std::snprintf(res.licensableSku, sizeof(res.licensableSku), "%s", "0001");
+        res.status = XStoreCanLicenseStatus_Licensable;
+    } else {
+        res.licensableSku[0] = '\0';
+        res.status = XStoreCanLicenseStatus_NotLicensableToUser;
+    }
     return RecordHr(
         "XStoreCanAcquireLicenseForStoreIdAsync",
         StartPodAsync<XStoreCanAcquireLicenseResult>(
@@ -9833,6 +10200,7 @@ extern "C" {
 XGameResult OPENSCARLETT_GDK_CALL InitializeApiImpl(void) {
     auto& rt = GetRuntime();
     rt.api_impl_init_count.fetch_add(1, std::memory_order_acq_rel);
+    SyncConsoleLsaPolicyFromConfig();
     return RecordHr("InitializeApiImpl", XGR_S_OK);
 }
 
@@ -9842,6 +10210,7 @@ XGameResult OPENSCARLETT_GDK_CALL InitializeApiImplEx(
     uint64_t /*options*/) {
     auto& rt = GetRuntime();
     rt.api_impl_init_count.fetch_add(1, std::memory_order_acq_rel);
+    SyncConsoleLsaPolicyFromConfig();
     return RecordHr("InitializeApiImplEx", XGR_S_OK);
 }
 
@@ -10017,6 +10386,20 @@ OPENSCARLETT_GDK_API uint32_t OPENSCARLETT_GDK_CALL XgrDispatchAppStateChange(ui
 
 OPENSCARLETT_GDK_API uint32_t OPENSCARLETT_GDK_CALL XgrDispatchAppConstrainedChange(uint8_t Constrained) {
     return GetXgrPlmRegistry().DispatchConstrainedChange(Constrained);
+}
+
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XgrGetConsoleLsaIdentityForTest(
+    char* pfnBuf,
+    size_t pfnSize,
+    uint32_t* outTitleId) {
+    const auto pkg = openscarlett::ConsoleLsaPolicy::Global().GetPackageIdentity();
+    if (outTitleId) {
+        *outTitleId = pkg.title_id;
+    }
+    if (pfnBuf && pfnSize > 0u) {
+        return CopyStringResult(pkg.package_family_name, pfnSize, pfnBuf, nullptr);
+    }
+    return XGR_S_OK;
 }
 
 }  // extern "C"
