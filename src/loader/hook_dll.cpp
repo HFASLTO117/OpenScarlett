@@ -142,6 +142,7 @@ using PfnCreateProcessW = BOOL(WINAPI*)(LPCWSTR,
                                         LPSTARTUPINFOW,
                                         LPPROCESS_INFORMATION);
 using PfnExitProcess = VOID(WINAPI*)(UINT);
+using PfnOutputDebugStringA = VOID(WINAPI*)(LPCSTR);
 
 PfnLoadLibraryA g_real_LoadLibraryA = nullptr;
 PfnLoadLibraryW g_real_LoadLibraryW = nullptr;
@@ -168,6 +169,8 @@ PfnCreateProcessW g_real_CreateProcessW = nullptr;
 PfnCreateProcessA g_kernelbase_CreateProcessA = nullptr;
 PfnCreateProcessW g_kernelbase_CreateProcessW = nullptr;
 PfnExitProcess g_real_ExitProcess = nullptr;
+PfnOutputDebugStringA g_real_OutputDebugStringA = nullptr;
+bool g_trace_ods = false;
 PfnNtCreateFile g_real_NtCreateFile = nullptr;
 PfnNtOpenFile g_real_NtOpenFile = nullptr;
 PfnNtQueryAttributesFile g_real_NtQueryAttributesFile = nullptr;
@@ -2347,7 +2350,27 @@ BOOL WINAPI Hook_CreateProcessA(LPCSTR lpApplicationName,
     return TRUE;
 }
 
+VOID WINAPI Hook_OutputDebugStringA(LPCSTR lpOutputString) {
+    if (g_trace_ods && lpOutputString != nullptr && *lpOutputString != '\0') {
+        std::fprintf(stderr, "[guest:ODS] %s", lpOutputString);
+        const size_t len = std::strlen(lpOutputString);
+        if (len > 0 && lpOutputString[len - 1] != '\n') {
+            std::fputc('\n', stderr);
+        }
+        std::fflush(stderr);
+    }
+    if (g_real_OutputDebugStringA != nullptr) {
+        g_real_OutputDebugStringA(lpOutputString);
+    }
+}
+
 VOID WINAPI Hook_ExitProcess(UINT uExitCode) {
+    if (g_trace_ods && uExitCode != 0u) {
+        const DWORD last_err = ::GetLastError();
+        std::fprintf(stderr, "[guest:ExitProcess] code=%u last_error=%lu\n",
+                     static_cast<unsigned>(uExitCode), static_cast<unsigned long>(last_err));
+        std::fflush(stderr);
+    }
     FlushTelemetryInternal(true);
     g_shutting_down.store(true, std::memory_order_release);
     g_real_ExitProcess(uExitCode);
@@ -2413,6 +2436,8 @@ void* ResolveHookForSymbol(const char* name) {
          reinterpret_cast<void**>(&g_real_CreateProcessW)},
         {"ExitProcess", reinterpret_cast<void*>(&Hook_ExitProcess),
          reinterpret_cast<void**>(&g_real_ExitProcess)},
+        {"OutputDebugStringA", reinterpret_cast<void*>(&Hook_OutputDebugStringA),
+         reinterpret_cast<void**>(&g_real_OutputDebugStringA)},
         {"NtCreateFile", reinterpret_cast<void*>(&Hook_NtCreateFile),
          reinterpret_cast<void**>(&g_real_NtCreateFile)},
         {"NtOpenFile", reinterpret_cast<void*>(&Hook_NtOpenFile),
@@ -2463,6 +2488,7 @@ void* ResolveHookForRealAddress(ULONGLONG addr) {
     if (void* p = match(g_kernelbase_CreateProcessA, &Hook_CreateProcessA)) return p;
     if (void* p = match(g_kernelbase_CreateProcessW, &Hook_CreateProcessW)) return p;
     if (void* p = match(g_real_ExitProcess, &Hook_ExitProcess)) return p;
+    if (void* p = match(g_real_OutputDebugStringA, &Hook_OutputDebugStringA)) return p;
     if (void* p = match(g_real_NtCreateFile, &Hook_NtCreateFile)) return p;
     if (void* p = match(g_real_NtOpenFile, &Hook_NtOpenFile)) return p;
     if (void* p = match(g_real_NtQueryAttributesFile, &Hook_NtQueryAttributesFile)) return p;
@@ -2879,6 +2905,9 @@ bool InitializeHookRuntime(HMODULE self_mod) {
             reinterpret_cast<PfnCreateProcessW>(::GetProcAddress(g_kernelbase_mod, "CreateProcessW"));
     }
     g_real_ExitProcess = reinterpret_cast<PfnExitProcess>(::GetProcAddress(k32, "ExitProcess"));
+    g_real_OutputDebugStringA =
+        reinterpret_cast<PfnOutputDebugStringA>(::GetProcAddress(k32, "OutputDebugStringA"));
+    g_trace_ods = (ReadEnvW(L"OPENSCARLETT_TRACE_ODS") == L"1");
     if (g_ntdll_mod != nullptr) {
         g_real_NtCreateFile =
             reinterpret_cast<PfnNtCreateFile>(::GetProcAddress(g_ntdll_mod, "NtCreateFile"));

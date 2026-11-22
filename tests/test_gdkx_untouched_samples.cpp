@@ -864,6 +864,7 @@ void RunSampleEndToEnd(const fs::path& bin_dir, const SampleSpec& spec, bool pre
     ScopedEnv env_headless("OPENSCARLETT_PRESENTX_HEADLESS", prefer_warp ? "1" : "0");
     ScopedEnv env_frames("OPENSCARLETT_PRESENTX_EXIT_AFTER_FRAMES", "12");
     ScopedEnv env_png("OPENSCARLETT_PRESENTX_CAPTURE_PNG", capture_png.string().c_str());
+    ScopedEnv env_ods("OPENSCARLETT_TRACE_ODS", "1");
 
     const DWORD rc = LaunchViaOpenScarlettCli(cli_exe, pkg_dir, bin_dir, vfs_t, telemetry_json);
     EXPECT_MSG(rc == 0u, tag + ": openscarlett.exe run exited 0 (got " + std::to_string(rc) + ")");
