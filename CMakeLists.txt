@@ -115,6 +115,7 @@ foreach(_os_module_cmake
     cmake/sprint7_launcher.cmake
     cmake/sprint8_rdna2.cmake
     cmake/sprint9_10_compat.cmake
+    cmake/gdkx_bringup_targets.cmake
 )
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_os_module_cmake}")
         include("${CMAKE_CURRENT_SOURCE_DIR}/${_os_module_cmake}")

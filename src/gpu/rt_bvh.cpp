@@ -154,6 +154,128 @@ Status FrameBufferRgba8::WritePpm(const std::string& file_path) const {
     return Status::Ok();
 }
 
+namespace {
+
+uint32_t PngCrc32(const uint8_t* data, size_t len) noexcept {
+    static const auto kTable = []() {
+        std::array<uint32_t, 256> t{};
+        for (uint32_t n = 0; n < 256u; ++n) {
+            uint32_t c = n;
+            for (int k = 0; k < 8; ++k) {
+                c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
+            }
+            t[n] = c;
+        }
+        return t;
+    }();
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; ++i) {
+        crc = kTable[(crc ^ data[i]) & 0xFFu] ^ (crc >> 8);
+    }
+    return ~crc;
+}
+
+void AppendBe32(std::vector<uint8_t>& out, uint32_t v) {
+    out.push_back(static_cast<uint8_t>((v >> 24) & 0xFFu));
+    out.push_back(static_cast<uint8_t>((v >> 16) & 0xFFu));
+    out.push_back(static_cast<uint8_t>((v >> 8) & 0xFFu));
+    out.push_back(static_cast<uint8_t>(v & 0xFFu));
+}
+
+void AppendPngChunk(std::vector<uint8_t>& out, const char type[4],
+                    const uint8_t* payload, size_t payload_size) {
+    AppendBe32(out, static_cast<uint32_t>(payload_size));
+    const size_t type_start = out.size();
+    out.insert(out.end(), type, type + 4);
+    if (payload && payload_size > 0u) {
+        out.insert(out.end(), payload, payload + payload_size);
+    }
+    const uint32_t crc = PngCrc32(out.data() + type_start, 4u + payload_size);
+    AppendBe32(out, crc);
+}
+
+}  // namespace
+
+Status FrameBufferRgba8::WritePng(const std::string& file_path) const {
+    if (width == 0 || height == 0 ||
+        pixels.size() < static_cast<size_t>(width) * static_cast<size_t>(height) * 4u) {
+        return Status::Error(StatusCode::InvalidArgument, "FrameBufferRgba8 dimensions/buffer invalid");
+    }
+
+    const size_t row_bytes = static_cast<size_t>(width) * 4u;
+    const size_t raw_size = static_cast<size_t>(height) * (1u + row_bytes);
+
+    std::vector<uint8_t> raw;
+    raw.reserve(raw_size);
+    uint32_t s1 = 1u;
+    uint32_t s2 = 0u;
+    for (uint32_t y = 0; y < height; ++y) {
+        raw.push_back(0u);
+        s2 += s1;
+        if (s2 >= 65521u) s2 -= 65521u;
+        const uint8_t* src_row = pixels.data() + static_cast<size_t>(y) * row_bytes;
+        raw.insert(raw.end(), src_row, src_row + row_bytes);
+        for (size_t x = 0; x < row_bytes; ++x) {
+            s1 += src_row[x];
+            if (s1 >= 65521u) s1 -= 65521u;
+            s2 += s1;
+            if (s2 >= 65521u) s2 -= 65521u;
+        }
+    }
+    const uint32_t adler32 = (s2 << 16) | s1;
+
+    constexpr size_t kMaxBlock = 65535u;
+    const size_t num_blocks = (raw.size() + kMaxBlock - 1u) / kMaxBlock;
+    std::vector<uint8_t> idat;
+    idat.reserve(2u + num_blocks * 5u + raw.size() + 4u);
+    idat.push_back(0x78u);
+    idat.push_back(0x01u);
+
+    size_t offset = 0u;
+    while (offset < raw.size()) {
+        const size_t chunk_len = std::min<size_t>(kMaxBlock, raw.size() - offset);
+        const bool is_final = (offset + chunk_len >= raw.size());
+        const uint16_t len16 = static_cast<uint16_t>(chunk_len);
+        const uint16_t nlen16 = static_cast<uint16_t>(~len16);
+        idat.push_back(is_final ? 0x01u : 0x00u);
+        idat.push_back(static_cast<uint8_t>(len16 & 0xFFu));
+        idat.push_back(static_cast<uint8_t>((len16 >> 8) & 0xFFu));
+        idat.push_back(static_cast<uint8_t>(nlen16 & 0xFFu));
+        idat.push_back(static_cast<uint8_t>((nlen16 >> 8) & 0xFFu));
+        idat.insert(idat.end(), raw.data() + offset, raw.data() + offset + chunk_len);
+        offset += chunk_len;
+    }
+    AppendBe32(idat, adler32);
+
+    std::vector<uint8_t> png;
+    png.reserve(64u + idat.size());
+    const uint8_t sig[8] = {0x89u, 'P', 'N', 'G', 0x0Du, 0x0Au, 0x1Au, 0x0Au};
+    png.insert(png.end(), sig, sig + 8);
+
+    std::vector<uint8_t> ihdr;
+    ihdr.reserve(13u);
+    AppendBe32(ihdr, width);
+    AppendBe32(ihdr, height);
+    ihdr.push_back(8u);
+    ihdr.push_back(6u);
+    ihdr.push_back(0u);
+    ihdr.push_back(0u);
+    ihdr.push_back(0u);
+    AppendPngChunk(png, "IHDR", ihdr.data(), ihdr.size());
+    AppendPngChunk(png, "IDAT", idat.data(), idat.size());
+    AppendPngChunk(png, "IEND", nullptr, 0u);
+
+    std::ofstream ofs(file_path, std::ios::binary | std::ios::trunc);
+    if (!ofs) {
+        return Status::Error(StatusCode::IoError, "Failed to open PNG output path: " + file_path);
+    }
+    ofs.write(reinterpret_cast<const char*>(png.data()), static_cast<std::streamsize>(png.size()));
+    if (!ofs.good()) {
+        return Status::Error(StatusCode::IoError, "Failed writing PNG image: " + file_path);
+    }
+    return Status::Ok();
+}
+
 void RtAabb::Expand(Vec3 p) noexcept {
     min.x = std::min(min.x, p.x);
     min.y = std::min(min.y, p.y);

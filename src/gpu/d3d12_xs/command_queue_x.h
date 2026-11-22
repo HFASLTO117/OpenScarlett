@@ -95,12 +95,11 @@ public:
     D3D12_COMMAND_QUEUE_DESC STDMETHODCALLTYPE GetDesc() override;
 #endif
 
-    // ID3D12CommandQueueX (slots 19..24)
+    // ID3D12CommandQueueX (slots 19..24; slots 19..21 match real GDKX ID3D12CommandQueue)
     HRESULT STDMETHODCALLTYPE PresentX(
         UINT PlaneCount,
         const D3D12XBOX_PRESENT_PLANE_PARAMETERS* pPlaneParameters,
-        const D3D12XBOX_PRESENT_PARAMETERS* pPresentParameters,
-        void* pPresentToken) override;
+        const D3D12XBOX_PRESENT_PARAMETERS* pPresentParameters) override;
     HRESULT STDMETHODCALLTYPE SuspendX(uint32_t Flags) override;
     HRESULT STDMETHODCALLTYPE ResumeX() override;
     HRESULT STDMETHODCALLTYPE KickoffX() override;
@@ -237,6 +236,9 @@ private:
     HANDLE pacing_timer_ = nullptr;
 
     uint64_t present_count_ = 0;
+    uint64_t non_blank_present_count_ = 0;
+    bool auto_exit_posted_ = false;
+    bool capture_png_written_ = false;
     uint64_t latency_waits_ = 0;
     double last_frame_ms_ = 0.0;
     uint64_t last_present_hash_ = 0;

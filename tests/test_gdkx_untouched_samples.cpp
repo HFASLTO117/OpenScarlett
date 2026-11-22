@@ -1,0 +1,615 @@
+// OpenScarlett — Real Untouched Microsoft _GAMING_XBOX_SCARLETT (GDKX) Bring-Up Harness
+//
+// Proves end-to-end execution of 100% untouched MIT Microsoft Xbox-GDK-Samples:
+//   1. SimpleTriangle_GDKX.exe (direct GDKX ID3D12Device8 + PresentX + DXGI output + PLM + PIX)
+//   2. SimpleLighting_GDKX.exe (GDKX ID3D12Device + D32_FLOAT depth + 2 PSOs + CBVs + 3D lit cube)
+//
+// Each sample is staged into an isolated ZERO-DLL directory (proving real suspended-process
+// APC hook injection), launched via `openscarlett.exe run` on BOTH default host GPU and WARP,
+// verified for 100% wrapped Telemetry JSON (zero raw-host escape, 0 errors, 0 not_impl), and
+// verified pixel-by-pixel from the real GPU readback PNG captured after >= 12 PresentX frames.
+
+#include <windows.h>
+
+#include <algorithm>
+#include <cctype>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <set>
+#include <sstream>
+#include <string>
+#include <vector>
+
+#include "openscarlett/loader/pe_inspector.h"
+
+namespace fs = std::filesystem;
+
+namespace {
+
+int g_failures = 0;
+
+void Check(bool cond, const char* expr, const std::string& detail = {}) {
+    if (!cond) {
+        ++g_failures;
+        std::cerr << "[FAIL] " << expr;
+        if (!detail.empty()) std::cerr << " :: " << detail;
+        std::cerr << "\n";
+    }
+}
+
+#define EXPECT(c) Check((c), #c)
+#define EXPECT_MSG(c, m) Check((c), #c, (m))
+
+struct ScopedEnv {
+    std::string name;
+    bool had_old = false;
+    std::string old_val;
+
+    ScopedEnv(const char* k, const char* v) : name(k) {
+        char buf[1024]{};
+        const DWORD n = ::GetEnvironmentVariableA(k, buf, sizeof(buf));
+        if (n > 0 && n < sizeof(buf)) {
+            had_old = true;
+            old_val.assign(buf, n);
+        }
+        ::SetEnvironmentVariableA(k, v);
+    }
+    ~ScopedEnv() {
+        ::SetEnvironmentVariableA(name.c_str(), had_old ? old_val.c_str() : nullptr);
+    }
+};
+
+struct TelemetryRow {
+    std::string module;
+    std::string symbol;
+    int32_t slot = -1;
+    uint64_t total = 0;
+    uint64_t ok = 0;
+    uint64_t stub = 0;
+    uint64_t not_impl = 0;
+    uint64_t errors = 0;
+};
+
+struct TelemetrySummary {
+    std::vector<TelemetryRow> rows;
+    uint64_t total_calls = 0;
+    uint64_t total_not_impl = 0;
+    uint64_t total_errors = 0;
+
+    uint64_t OkCount(const std::string& mod, const std::string& sym) const {
+        uint64_t sum = 0;
+        for (const auto& r : rows) {
+            if ((mod.empty() || r.module == mod) && r.symbol == sym) {
+                sum += r.ok;
+            }
+        }
+        return sum;
+    }
+};
+
+std::string ReadAllText(const fs::path& p) {
+    std::ifstream f(p, std::ios::binary);
+    if (!f) return {};
+    std::ostringstream oss;
+    oss << f.rdbuf();
+    return oss.str();
+}
+
+bool ExtractJsonString(const std::string& line, const std::string& key, std::string& out) {
+    const std::string pat = "\"" + key + "\": \"";
+    size_t pos = line.find(pat);
+    if (pos == std::string::npos) return false;
+    pos += pat.size();
+    const size_t end = line.find('"', pos);
+    if (end == std::string::npos) return false;
+    out = line.substr(pos, end - pos);
+    return true;
+}
+
+bool ExtractJsonInt(const std::string& line, const std::string& key, int64_t& out) {
+    const std::string pat = "\"" + key + "\": ";
+    size_t pos = line.find(pat);
+    if (pos == std::string::npos) return false;
+    pos += pat.size();
+    char* end_ptr = nullptr;
+    const long long v = std::strtoll(line.c_str() + pos, &end_ptr, 10);
+    if (end_ptr == line.c_str() + pos) return false;
+    out = static_cast<int64_t>(v);
+    return true;
+}
+
+TelemetrySummary ParseTelemetryJson(const fs::path& json_path) {
+    TelemetrySummary sum{};
+    std::istringstream iss(ReadAllText(json_path));
+    std::string line;
+    while (std::getline(iss, line)) {
+        TelemetryRow row{};
+        if (!ExtractJsonString(line, "module", row.module) ||
+            !ExtractJsonString(line, "symbol", row.symbol)) {
+            continue;
+        }
+        int64_t v = 0;
+        if (ExtractJsonInt(line, "slot", v)) row.slot = static_cast<int32_t>(v);
+        if (ExtractJsonInt(line, "total", v)) row.total = static_cast<uint64_t>(v);
+        if (ExtractJsonInt(line, "ok", v)) row.ok = static_cast<uint64_t>(v);
+        if (ExtractJsonInt(line, "stub", v)) row.stub = static_cast<uint64_t>(v);
+        if (ExtractJsonInt(line, "not_impl", v)) row.not_impl = static_cast<uint64_t>(v);
+        if (ExtractJsonInt(line, "errors", v)) row.errors = static_cast<uint64_t>(v);
+
+        sum.total_calls += row.total;
+        sum.total_not_impl += row.not_impl;
+        sum.total_errors += row.errors;
+        sum.rows.push_back(std::move(row));
+    }
+    return sum;
+}
+
+// Clean-room stored-DEFLATE RGBA8 PNG decoder (matches FrameBufferRgba8::WritePng output).
+struct DecodedPng {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::vector<uint8_t> rgba;
+
+    void SamplePixel(uint32_t x, uint32_t y, uint8_t& r, uint8_t& g, uint8_t& b, uint8_t& a) const {
+        if (x >= width) x = width - 1;
+        if (y >= height) y = height - 1;
+        const size_t idx = (static_cast<size_t>(y) * width + x) * 4u;
+        r = rgba[idx + 0u];
+        g = rgba[idx + 1u];
+        b = rgba[idx + 2u];
+        a = rgba[idx + 3u];
+    }
+};
+
+uint32_t ReadBe32(const uint8_t* p) {
+    return (static_cast<uint32_t>(p[0]) << 24) |
+           (static_cast<uint32_t>(p[1]) << 16) |
+           (static_cast<uint32_t>(p[2]) << 8) |
+           static_cast<uint32_t>(p[3]);
+}
+
+bool DecodeStoredRgbaPng(const fs::path& png_path, DecodedPng& out, std::string& err) {
+    std::ifstream f(png_path, std::ios::binary | std::ios::ate);
+    if (!f) {
+        err = "cannot open PNG file";
+        return false;
+    }
+    const auto sz = f.tellg();
+    if (sz < 33) {
+        err = "PNG file too small";
+        return false;
+    }
+    f.seekg(0);
+    std::vector<uint8_t> data(static_cast<size_t>(sz));
+    f.read(reinterpret_cast<char*>(data.data()), sz);
+
+    const uint8_t kSig[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
+    if (std::memcmp(data.data(), kSig, 8) != 0) {
+        err = "invalid PNG signature";
+        return false;
+    }
+
+    size_t pos = 8;
+    std::vector<uint8_t> zlib_stream;
+    bool got_ihdr = false;
+
+    while (pos + 12 <= data.size()) {
+        const uint32_t len = ReadBe32(&data[pos]);
+        const char* type = reinterpret_cast<const char*>(&data[pos + 4]);
+        pos += 8;
+        if (pos + len + 4 > data.size()) {
+            err = "truncated PNG chunk";
+            return false;
+        }
+        if (std::memcmp(type, "IHDR", 4) == 0 && len >= 13) {
+            out.width = ReadBe32(&data[pos + 0]);
+            out.height = ReadBe32(&data[pos + 4]);
+            const uint8_t bit_depth = data[pos + 8];
+            const uint8_t color_type = data[pos + 9];
+            if (bit_depth != 8u || color_type != 6u) {
+                err = "expected 8-bit RGBA PNG";
+                return false;
+            }
+            got_ihdr = true;
+        } else if (std::memcmp(type, "IDAT", 4) == 0) {
+            zlib_stream.insert(zlib_stream.end(), data.begin() + static_cast<ptrdiff_t>(pos),
+                               data.begin() + static_cast<ptrdiff_t>(pos + len));
+        } else if (std::memcmp(type, "IEND", 4) == 0) {
+            break;
+        }
+        pos += len + 4;  // payload + CRC
+    }
+
+    if (!got_ihdr || out.width == 0 || out.height == 0 || zlib_stream.size() < 6) {
+        err = "missing IHDR or IDAT";
+        return false;
+    }
+
+    // Parse zlib header (2 bytes) + stored DEFLATE blocks + Adler-32 (4 bytes)
+    const size_t raw_expected =
+        static_cast<size_t>(out.height) * (1u + static_cast<size_t>(out.width) * 4u);
+    std::vector<uint8_t> raw;
+    raw.reserve(raw_expected);
+
+    size_t zpos = 2;
+    const size_t zend = zlib_stream.size() - 4;
+    bool bfinal = false;
+    while (!bfinal && zpos + 5 <= zend) {
+        const uint8_t hdr = zlib_stream[zpos++];
+        bfinal = (hdr & 0x01u) != 0;
+        const uint8_t btype = (hdr >> 1) & 0x03u;
+        if (btype != 0u) {
+            err = "non-stored DEFLATE block";
+            return false;
+        }
+        const uint16_t blen = static_cast<uint16_t>(zlib_stream[zpos] | (zlib_stream[zpos + 1] << 8));
+        const uint16_t nlen = static_cast<uint16_t>(zlib_stream[zpos + 2] | (zlib_stream[zpos + 3] << 8));
+        zpos += 4;
+        if (static_cast<uint16_t>(blen ^ 0xFFFFu) != nlen || zpos + blen > zend) {
+            err = "corrupt stored DEFLATE block";
+            return false;
+        }
+        raw.insert(raw.end(), zlib_stream.begin() + static_cast<ptrdiff_t>(zpos),
+                   zlib_stream.begin() + static_cast<ptrdiff_t>(zpos + blen));
+        zpos += blen;
+    }
+
+    if (raw.size() != raw_expected) {
+        err = "decoded raw byte count mismatch";
+        return false;
+    }
+
+    out.rgba.resize(static_cast<size_t>(out.width) * out.height * 4u);
+    const size_t row_bytes = static_cast<size_t>(out.width) * 4u;
+    for (uint32_t y = 0; y < out.height; ++y) {
+        const uint8_t* src_row = &raw[static_cast<size_t>(y) * (1u + row_bytes)];
+        if (src_row[0] != 0u) {
+            err = "unexpected PNG row filter";
+            return false;
+        }
+        std::memcpy(&out.rgba[static_cast<size_t>(y) * row_bytes], src_row + 1, row_bytes);
+    }
+    return true;
+}
+
+fs::path ResolveRuntimeBinDir() {
+    std::error_code ec;
+    wchar_t self_buf[MAX_PATH]{};
+    const DWORD self_len = ::GetModuleFileNameW(nullptr, self_buf, MAX_PATH);
+    if (self_len > 0 && self_len < MAX_PATH) {
+        const fs::path exe_dir = fs::path(self_buf).parent_path();
+        if (fs::exists(exe_dir / L"openscarlett.exe", ec) &&
+            fs::exists(exe_dir / L"openscarlett_hook.dll", ec)) {
+            return exe_dir;
+        }
+    }
+    return fs::path(OPENSCARLETT_BINARY_DIR);
+}
+
+DWORD LaunchViaOpenScarlettCli(
+    const fs::path& cli_exe,
+    const fs::path& pkg_dir,
+    const fs::path& shim_dir,
+    const fs::path& vfs_t,
+    const fs::path& telemetry_json) {
+    std::wstring cmd =
+        L"\"" + cli_exe.wstring() + L"\" run \"" + pkg_dir.wstring() +
+        L"\" --shim-dir \"" + shim_dir.wstring() +
+        L"\" --vfs-t \"" + vfs_t.wstring() +
+        L"\" --telemetry \"" + telemetry_json.wstring() +
+        L"\" --timeout-ms 75000";
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (!::CreateProcessW(
+            cli_exe.c_str(), cmd.data(), nullptr, nullptr, TRUE,
+            0, nullptr, nullptr, &si, &pi)) {
+        return 998u;
+    }
+    const DWORD wait_rc = ::WaitForSingleObject(pi.hProcess, 80000u);
+    DWORD exit_code = 999u;
+    if (wait_rc == WAIT_OBJECT_0) {
+        ::GetExitCodeProcess(pi.hProcess, &exit_code);
+    } else {
+        ::TerminateProcess(pi.hProcess, 997u);
+        exit_code = 997u;
+    }
+    ::CloseHandle(pi.hThread);
+    ::CloseHandle(pi.hProcess);
+    return exit_code;
+}
+
+void VerifyPeImports(const fs::path& exe_path, const std::string& label) {
+    openscarlett::PeInspectionReport rep{};
+    EXPECT_MSG(openscarlett::InspectPeFile(exe_path.string(), rep).ok(), label + ": InspectPeFile");
+    std::set<std::string> imported;
+    for (const auto& m : rep.imports) {
+        std::string lo = m.dll_name;
+        std::transform(lo.begin(), lo.end(), lo.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        imported.insert(lo);
+    }
+    EXPECT_MSG(imported.count("d3d12_xs.dll") == 1u, label + ": imports d3d12_xs.dll");
+    EXPECT_MSG(imported.count("kernelx.dll") == 1u, label + ": imports kernelx.dll (appnotify PLM)");
+    EXPECT_MSG(imported.count("xgameruntime.dll") == 1u, label + ": imports xgameruntime.dll");
+    EXPECT_MSG(imported.count("pixevt.dll") == 1u, label + ": imports pixevt.dll");
+    EXPECT_MSG(imported.count("openscarlett_hook.dll") == 0u, label + ": does NOT statically import hook DLL");
+}
+
+void VerifyCommonTelemetry(
+    const TelemetrySummary& tel,
+    const std::string& tag,
+    uint64_t min_pso_count) {
+    EXPECT_MSG(tel.total_calls > 0u, tag + ": telemetry recorded calls");
+    EXPECT_MSG(tel.total_not_impl == 0u, tag + ": telemetry not_impl == 0 (got " + std::to_string(tel.total_not_impl) + ")");
+    EXPECT_MSG(tel.total_errors == 0u, tag + ": telemetry errors == 0 (got " + std::to_string(tel.total_errors) + ")");
+
+    // Zero raw-host escape verification: EVERY D3D12 device/queue/frame-pacing call goes through DeviceX/CommandQueueX!
+    EXPECT_MSG(tel.OkCount("d3d12_xs.dll", "D3D12XboxCreateDevice") >= 1u, tag + ": D3D12XboxCreateDevice");
+    EXPECT_MSG(tel.OkCount("d3d12_xs.dll", "ID3D12DeviceX::CreateCommandQueue") >= 1u, tag + ": DeviceX::CreateCommandQueue");
+    EXPECT_MSG(tel.OkCount("d3d12_xs.dll", "ID3D12DeviceX::CreateCommittedResource") >= 3u, tag + ": DeviceX::CreateCommittedResource");
+    EXPECT_MSG(tel.OkCount("d3d12_xs.dll", "ID3D12DeviceX::CreateGraphicsPipelineState") >= min_pso_count,
+               tag + ": DeviceX::CreateGraphicsPipelineState >= " + std::to_string(min_pso_count));
+    EXPECT_MSG(tel.OkCount("d3d12_xs.dll", "ID3D12DeviceX::SetFrameIntervalX") >= 1u, tag + ": DeviceX::SetFrameIntervalX");
+    EXPECT_MSG(tel.OkCount("d3d12_xs.dll", "ID3D12DeviceX::ScheduleFrameEventX") >= 1u, tag + ": DeviceX::ScheduleFrameEventX");
+    EXPECT_MSG(tel.OkCount("d3d12_xs.dll", "ID3D12DeviceX::WaitFrameEventX") >= 12u, tag + ": DeviceX::WaitFrameEventX >= 12");
+    EXPECT_MSG(tel.OkCount("d3d12_xs.dll", "ID3D12CommandQueueX::ExecuteCommandLists") >= 12u, tag + ": CommandQueueX::ExecuteCommandLists >= 12");
+    EXPECT_MSG(tel.OkCount("d3d12_xs.dll", "ID3D12CommandQueueX::PresentX") >= 13u, tag + ": CommandQueueX::PresentX >= 13");
+
+    // PLM appnotify.h lifecycle + GDK runtime + PIX telemetry
+    EXPECT_MSG(tel.OkCount("kernelx.dll", "RegisterAppStateChangeNotification") >= 1u, tag + ": RegisterAppStateChangeNotification");
+    EXPECT_MSG(tel.OkCount("kernelx.dll", "UnregisterAppStateChangeNotification") >= 1u, tag + ": UnregisterAppStateChangeNotification");
+    EXPECT_MSG(tel.OkCount("kernelx.dll", "RegisterAppConstrainedChangeNotification") >= 1u, tag + ": RegisterAppConstrainedChangeNotification");
+    EXPECT_MSG(tel.OkCount("kernelx.dll", "UnregisterAppConstrainedChangeNotification") >= 1u, tag + ": UnregisterAppConstrainedChangeNotification");
+    EXPECT_MSG(tel.OkCount("xgameruntime.dll", "XGameRuntimeInitialize") >= 1u, tag + ": XGameRuntimeInitialize");
+    EXPECT_MSG(tel.OkCount("xgameruntime.dll", "XSystemGetDeviceType") >= 1u, tag + ": XSystemGetDeviceType");
+    EXPECT_MSG(tel.OkCount("xgameruntime.dll", "XGameRuntimeUninitialize") >= 1u, tag + ": XGameRuntimeUninitialize");
+    EXPECT_MSG(tel.OkCount("pixevt.dll", "PIXBeginEventOnCpu") >= 12u, tag + ": PIXBeginEventOnCpu >= 12");
+    EXPECT_MSG(tel.OkCount("pixevt.dll", "PIXEndEventOnCpu") >= 12u, tag + ": PIXEndEventOnCpu >= 12");
+}
+
+bool IsAtgBackground(uint8_t r, uint8_t g, uint8_t b) {
+    // ATG::ColorsLinear::Background (0.05286 linear) -> sRGB ~65 (#414141)
+    return (r >= 55 && r <= 75) && (g >= 55 && g <= 75) && (b >= 55 && b <= 75) &&
+           std::abs(static_cast<int>(r) - static_cast<int>(g)) <= 4 &&
+           std::abs(static_cast<int>(g) - static_cast<int>(b)) <= 4;
+}
+
+void VerifySimpleTrianglePixels(const DecodedPng& img, const std::string& tag) {
+    EXPECT_MSG(img.width == 3840u && img.height == 2160u,
+               tag + ": 4K UHD Scarlett framebuffer (" + std::to_string(img.width) + "x" +
+                   std::to_string(img.height) + ")");
+    if (img.width < 64u || img.height < 64u) return;
+
+    uint8_t r = 0, g = 0, b = 0, a = 0;
+
+    // 1. Corners must be ATG dark-grey background (#414141)
+    img.SamplePixel(16, 16, r, g, b, a);
+    EXPECT_MSG(IsAtgBackground(r, g, b),
+               tag + ": corner(16,16) is ATG #414141 background (got " + std::to_string(r) + "," +
+                   std::to_string(g) + "," + std::to_string(b) + ")");
+
+    img.SamplePixel(img.width - 16, 16, r, g, b, a);
+    EXPECT_MSG(IsAtgBackground(r, g, b),
+               tag + ": corner(w-16,16) is ATG #414141 background");
+
+    // 2. Top vertex (NDC 0, +0.5 -> screen x=0.5, y=0.25): sample slightly inside at y=0.28 -> Red
+    img.SamplePixel(img.width / 2, img.height * 28 / 100, r, g, b, a);
+    EXPECT_MSG(r > 180 && r > g + 100 && r > b + 100,
+               tag + ": top triangle vertex is RED (got " + std::to_string(r) + "," +
+                   std::to_string(g) + "," + std::to_string(b) + ")");
+
+    // 3. Bottom-right vertex (NDC +0.5, -0.5 -> screen x=0.75, y=0.75): sample slightly inside -> Green
+    img.SamplePixel(img.width * 72 / 100, img.height * 73 / 100, r, g, b, a);
+    EXPECT_MSG(g > 180 && g > r + 100 && g > b + 100,
+               tag + ": bottom-right triangle vertex is GREEN (got " + std::to_string(r) + "," +
+                   std::to_string(g) + "," + std::to_string(b) + ")");
+
+    // 4. Bottom-left vertex (NDC -0.5, -0.5 -> screen x=0.25, y=0.75): sample slightly inside -> Blue
+    img.SamplePixel(img.width * 28 / 100, img.height * 73 / 100, r, g, b, a);
+    EXPECT_MSG(b > 180 && b > r + 100 && b > g + 100,
+               tag + ": bottom-left triangle vertex is BLUE (got " + std::to_string(r) + "," +
+                   std::to_string(g) + "," + std::to_string(b) + ")");
+
+    // 5. Center (NDC 0, 0 -> screen x=0.5, y=0.5): RGB-interpolated interior (linear ~0.5,0.25,0.25 -> sRGB ~188,137,137)
+    img.SamplePixel(img.width / 2, img.height / 2, r, g, b, a);
+    EXPECT_MSG(!IsAtgBackground(r, g, b) && r > 140 && g > 100 && b > 100,
+               tag + ": center is RGB-interpolated triangle interior (got " + std::to_string(r) + "," +
+                   std::to_string(g) + "," + std::to_string(b) + ")");
+
+    std::cout << "  [" << tag << "] SimpleTriangle PNG verified: " << img.width << "x" << img.height
+              << " center=(" << int(r) << "," << int(g) << "," << int(b) << ")\n";
+}
+
+void VerifySimpleLightingPixels(const DecodedPng& img, const std::string& tag) {
+    EXPECT_MSG(img.width == 3840u && img.height == 2160u,
+               tag + ": 4K UHD Scarlett framebuffer (" + std::to_string(img.width) + "x" +
+                   std::to_string(img.height) + ")");
+    if (img.width < 64u || img.height < 64u) return;
+
+    uint8_t bg_r = 0, bg_g = 0, bg_b = 0, bg_a = 0;
+    img.SamplePixel(16, 16, bg_r, bg_g, bg_b, bg_a);
+    EXPECT_MSG(IsAtgBackground(bg_r, bg_g, bg_b),
+               tag + ": corner(16,16) is ATG #414141 background (got " + std::to_string(bg_r) + "," +
+                   std::to_string(bg_g) + "," + std::to_string(bg_b) + ")");
+
+    // Sample a dense 160x90 grid across the 4K frame to measure rendered 3D cube + orbiting light cubes
+    uint32_t non_bg_samples = 0;
+    uint32_t bright_samples = 0;
+    uint32_t red_tinted_samples = 0;
+    std::set<uint32_t> distinct_quantized_colors;
+
+    for (uint32_t gy = 0; gy < 90; ++gy) {
+        const uint32_t y = gy * img.height / 90 + img.height / 180;
+        for (uint32_t gx = 0; gx < 160; ++gx) {
+            const uint32_t x = gx * img.width / 160 + img.width / 320;
+            uint8_t r = 0, g = 0, b = 0, a = 0;
+            img.SamplePixel(x, y, r, g, b, a);
+            const int l1 = std::abs(static_cast<int>(r) - static_cast<int>(bg_r)) +
+                           std::abs(static_cast<int>(g) - static_cast<int>(bg_g)) +
+                           std::abs(static_cast<int>(b) - static_cast<int>(bg_b));
+            if (l1 > 20) {
+                ++non_bg_samples;
+                if (r > 120 || g > 120 || b > 120) ++bright_samples;
+                if (r > g + 30 && r > b + 30) ++red_tinted_samples;
+                const uint32_t q = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
+                distinct_quantized_colors.insert(q);
+            }
+        }
+    }
+
+    EXPECT_MSG(non_bg_samples >= 200u,
+               tag + ": substantial rendered 3D geometry pixels (non_bg=" + std::to_string(non_bg_samples) + ")");
+    EXPECT_MSG(bright_samples >= 50u,
+               tag + ": lit 3D faces present (bright=" + std::to_string(bright_samples) + ")");
+    EXPECT_MSG(red_tinted_samples >= 5u,
+               tag + ": red light illumination present (red_tinted=" + std::to_string(red_tinted_samples) + ")");
+    EXPECT_MSG(distinct_quantized_colors.size() >= 3u,
+               tag + ": shaded multi-face color variance (buckets=" +
+                   std::to_string(distinct_quantized_colors.size()) + ")");
+
+    std::cout << "  [" << tag << "] SimpleLighting PNG verified: " << img.width << "x" << img.height
+              << " non_bg=" << non_bg_samples << " bright=" << bright_samples
+              << " red_tinted=" << red_tinted_samples
+              << " color_buckets=" << distinct_quantized_colors.size() << "\n";
+}
+
+struct SampleSpec {
+    std::string name;
+    std::string exe_name;
+    std::vector<std::string> cso_files;
+    uint64_t min_pso_count;
+    bool is_lighting;
+};
+
+void RunSampleEndToEnd(const fs::path& bin_dir, const SampleSpec& spec, bool prefer_warp) {
+    const std::string mode = prefer_warp ? "warp" : "gpu";
+    const std::string tag = spec.name + "_" + mode;
+    std::cout << "[test_gdkx_untouched_samples] Running " << tag << "...\n";
+
+    const fs::path cli_exe = bin_dir / L"openscarlett.exe";
+    const fs::path src_exe = bin_dir / spec.exe_name;
+    const fs::path cso_dir = bin_dir / L"gdkx_shaders" / spec.name;
+
+    EXPECT_MSG(fs::exists(cli_exe), tag + ": openscarlett.exe exists");
+    EXPECT_MSG(fs::exists(src_exe), tag + ": " + spec.exe_name + " exists");
+    if (!fs::exists(cli_exe) || !fs::exists(src_exe)) return;
+
+    VerifyPeImports(src_exe, tag);
+
+    // Stage into a brand-new isolated ZERO-DLL directory under %TEMP% (strictly E:\ under build.cmd)
+    // or fallback to bin_dir when TEMP is unset (safe for hidden-build portable bundle smoke tests).
+    fs::path stage_base = bin_dir / L"gdkx_bringup_stage";
+    {
+        wchar_t tmp_buf[1024]{};
+        const DWORD tlen = ::GetEnvironmentVariableW(L"TEMP", tmp_buf, 1024);
+        if (tlen > 0 && tlen < 1024) {
+            stage_base = fs::path(tmp_buf) / L"gdkx_bringup_stage";
+        }
+    }
+    const fs::path stage_root = stage_base / tag;
+    const fs::path pkg_dir = stage_root / L"pkg";
+    const fs::path vfs_t = stage_root / L"vfs_t";
+    const fs::path telemetry_json = stage_root / L"telemetry.json";
+    const fs::path capture_png = stage_root / (tag + ".png");
+
+    std::error_code ec;
+    fs::remove_all(stage_root, ec);
+    fs::create_directories(pkg_dir, ec);
+    fs::create_directories(vfs_t, ec);
+
+    fs::copy_file(src_exe, pkg_dir / spec.exe_name, fs::copy_options::overwrite_existing, ec);
+    EXPECT_MSG(!ec, tag + ": copy guest exe");
+
+    for (const auto& cso : spec.cso_files) {
+        const fs::path src_cso = cso_dir / cso;
+        EXPECT_MSG(fs::exists(src_cso), tag + ": compiled shader " + cso + " exists");
+        fs::copy_file(src_cso, pkg_dir / cso, fs::copy_options::overwrite_existing, ec);
+        EXPECT_MSG(!ec, tag + ": copy " + cso);
+    }
+
+    // Minimal MicrosoftGame.Config pointing to the untouched *_GDKX.exe
+    {
+        std::ofstream cfg(pkg_dir / L"MicrosoftGame.Config", std::ios::binary);
+        cfg << "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+            << "<Game configVersion=\"1\">\n"
+            << "  <Identity Name=\"OpenScarlett." << spec.name << "\" Publisher=\"CN=OpenScarlett\" Version=\"1.0.0.0\"/>\n"
+            << "  <ExecutableList>\n"
+            << "    <Executable Name=\"" << spec.exe_name << "\" Id=\"Game\"/>\n"
+            << "  </ExecutableList>\n"
+            << "</Game>\n";
+    }
+
+    // STRICT CHECK: ZERO .dll files anywhere inside pkg_dir (proves pure APC hook injection!)
+    size_t dll_count = 0;
+    for (const auto& entry : fs::recursive_directory_iterator(pkg_dir)) {
+        if (entry.is_regular_file()) {
+            std::string ext = entry.path().extension().string();
+            std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) {
+                return static_cast<char>(std::tolower(c));
+            });
+            if (ext == ".dll") ++dll_count;
+        }
+    }
+    EXPECT_MSG(dll_count == 0u, tag + ": isolated package dir has ZERO .dll files");
+
+    // Launch via openscarlett.exe run with 12 PresentX frames + PNG readback capture
+    ScopedEnv env_warp("OPENSCARLETT_PREFER_WARP", prefer_warp ? "1" : "0");
+    ScopedEnv env_headless("OPENSCARLETT_PRESENTX_HEADLESS", prefer_warp ? "1" : "0");
+    ScopedEnv env_frames("OPENSCARLETT_PRESENTX_EXIT_AFTER_FRAMES", "12");
+    ScopedEnv env_png("OPENSCARLETT_PRESENTX_CAPTURE_PNG", capture_png.string().c_str());
+
+    const DWORD rc = LaunchViaOpenScarlettCli(cli_exe, pkg_dir, bin_dir, vfs_t, telemetry_json);
+    EXPECT_MSG(rc == 0u, tag + ": openscarlett.exe run exited 0 (got " + std::to_string(rc) + ")");
+
+    EXPECT_MSG(fs::exists(telemetry_json), tag + ": telemetry.json produced");
+    if (fs::exists(telemetry_json)) {
+        const TelemetrySummary tel = ParseTelemetryJson(telemetry_json);
+        VerifyCommonTelemetry(tel, tag, spec.min_pso_count);
+    }
+
+    EXPECT_MSG(fs::exists(capture_png), tag + ": captured PNG produced at " + capture_png.string());
+    if (fs::exists(capture_png)) {
+        DecodedPng img{};
+        std::string decode_err;
+        EXPECT_MSG(DecodeStoredRgbaPng(capture_png, img, decode_err),
+                   tag + ": DecodeStoredRgbaPng (" + decode_err + ")");
+        if (decode_err.empty()) {
+            if (spec.is_lighting) {
+                VerifySimpleLightingPixels(img, tag);
+            } else {
+                VerifySimpleTrianglePixels(img, tag);
+            }
+        }
+    }
+}
+
+}  // namespace
+
+int main() {
+    const fs::path bin_dir = ResolveRuntimeBinDir();
+    const std::vector<SampleSpec> samples = {
+        {"SimpleTriangle", "SimpleTriangle_GDKX.exe", {"VertexShader.cso", "PixelShader.cso"}, 1u, false},
+        {"SimpleLighting", "SimpleLighting_GDKX.exe", {"TriangleVS.cso", "LambertPS.cso", "SolidColorPS.cso"}, 2u, true},
+    };
+
+    for (const auto& s : samples) {
+        RunSampleEndToEnd(bin_dir, s, /*prefer_warp=*/false);
+        RunSampleEndToEnd(bin_dir, s, /*prefer_warp=*/true);
+    }
+
+    if (g_failures != 0) {
+        std::cerr << "[test_gdkx_untouched_samples] FAILED with " << g_failures << " failure(s).\n";
+        return 1;
+    }
+    std::cout << "[test_gdkx_untouched_samples] ALL PASSED (0 failures).\n";
+    return 0;
+}

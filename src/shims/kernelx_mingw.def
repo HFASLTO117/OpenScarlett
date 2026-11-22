@@ -45,6 +45,13 @@ EXPORTS
     KernelXReserveTiledResource
     KernelXReleaseTiledResource
     KernelXMapTileRange
+    RegisterAppStateChangeNotification
+    UnregisterAppStateChangeNotification
+    RegisterAppConstrainedChangeNotification
+    UnregisterAppConstrainedChangeNotification
+    KernelXDispatchAppStateChange
+    KernelXDispatchAppConstrainedChange
+    KernelXGetAppNotificationCounts
     KernelXResetTelemetry
     KernelXGetTelemetryCallCount
     KernelXWriteTelemetryJson

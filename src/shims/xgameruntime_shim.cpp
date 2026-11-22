@@ -1,6 +1,7 @@
 #define OPENSCARLETT_BUILDING_XGAMERUNTIME 1
 #include "openscarlett/gdk/xgameruntime_abi.h"
 #include "openscarlett/core/telemetry.h"
+#include "openscarlett/kernel/plm_notifications.h"
 
 #include <algorithm>
 #include <atomic>
@@ -9954,6 +9955,68 @@ int32_t OPENSCARLETT_GDK_CALL XgrGetTelemetryCallCountForTest(
     if (outTotalCalls) *outTotalCalls = 0;
     if (outNotImplCalls) *outNotImplCalls = 0;
     return 0;
+}
+
+// ===========================================================================
+// Xbox Game Core PLM Notifications (appnotify.h) exported from xgameruntime.dll
+// ===========================================================================
+}  // extern "C"
+
+namespace {
+
+openscarlett::PlmNotificationRegistry& GetXgrPlmRegistry() {
+    static openscarlett::PlmNotificationRegistry reg;
+    return reg;
+}
+
+}  // namespace
+
+extern "C" {
+
+OPENSCARLETT_GDK_API uint32_t OPENSCARLETT_GDK_CALL RegisterAppStateChangeNotification(
+    openscarlett::PlmStateChangeCallback Routine,
+    void* Context,
+    void** Registration) {
+    const uint32_t err = GetXgrPlmRegistry().RegisterStateChange(Routine, Context, Registration);
+    if (err == 0u) {
+        RecordOk("RegisterAppStateChangeNotification");
+    } else {
+        (void)RecordHr("RegisterAppStateChangeNotification", XGR_E_INVALIDARG);
+    }
+    return err;
+}
+
+OPENSCARLETT_GDK_API void OPENSCARLETT_GDK_CALL UnregisterAppStateChangeNotification(
+    void* Registration) {
+    (void)GetXgrPlmRegistry().UnregisterStateChange(Registration);
+    RecordOk("UnregisterAppStateChangeNotification");
+}
+
+OPENSCARLETT_GDK_API uint32_t OPENSCARLETT_GDK_CALL RegisterAppConstrainedChangeNotification(
+    openscarlett::PlmConstrainedChangeCallback Routine,
+    void* Context,
+    void** Registration) {
+    const uint32_t err = GetXgrPlmRegistry().RegisterConstrainedChange(Routine, Context, Registration);
+    if (err == 0u) {
+        RecordOk("RegisterAppConstrainedChangeNotification");
+    } else {
+        (void)RecordHr("RegisterAppConstrainedChangeNotification", XGR_E_INVALIDARG);
+    }
+    return err;
+}
+
+OPENSCARLETT_GDK_API void OPENSCARLETT_GDK_CALL UnregisterAppConstrainedChangeNotification(
+    void* Registration) {
+    (void)GetXgrPlmRegistry().UnregisterConstrainedChange(Registration);
+    RecordOk("UnregisterAppConstrainedChangeNotification");
+}
+
+OPENSCARLETT_GDK_API uint32_t OPENSCARLETT_GDK_CALL XgrDispatchAppStateChange(uint8_t Quiesced) {
+    return GetXgrPlmRegistry().DispatchStateChange(Quiesced);
+}
+
+OPENSCARLETT_GDK_API uint32_t OPENSCARLETT_GDK_CALL XgrDispatchAppConstrainedChange(uint8_t Constrained) {
+    return GetXgrPlmRegistry().DispatchConstrainedChange(Constrained);
 }
 
 }  // extern "C"

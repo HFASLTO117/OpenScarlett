@@ -1,4 +1,4 @@
-# OpenScarlett — 1-Click Portable Hardware & Self-Test Runner
+﻿# OpenScarlett — 1-Click Portable Hardware & Self-Test Runner
 # Runs host GPU/OS probes + all OpenScarlett live tests, shows clear live results,
 # saves a privacy-sanitized Markdown report, and optionally opens a pre-filled GitHub Issue.
 
@@ -152,6 +152,8 @@ $TestDescriptions = @{
     'test_os_winrt_offline_auth.exe'   = 'Xbox 7-core CPU affinity remap, WinRT lifecycle & non-blocking offline auth/XSTS/XStore/XCurl'
     'test_media_video_gameinput.exe'   = 'MFMediaEngine video decode, 64-voice XAudio2 effects, Bink2 streaming & GameInput hot-plug'
     'test_probe_veh_capture.exe'       = 'First-Boot Probe E_NOTIMPL trampolines, Win32 VEH crash dumper & per-draw PNG/JSON capture'
+    'test_gdkx_abi.exe'                = 'GDKX COM zero-escape (Device..Device12), IDXGIDevice1 virtual output, 5-arg WaitFrameEventX, 3-arg PresentX & appnotify PLM'
+    'test_gdkx_untouched_samples.exe'  = 'Untouched Microsoft _GAMING_XBOX_SCARLETT SimpleTriangle & SimpleLighting end-to-end APC boot + 4K PNG pixel check'
 }
 
 Write-Host ''

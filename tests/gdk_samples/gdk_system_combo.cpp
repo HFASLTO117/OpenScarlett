@@ -773,7 +773,6 @@ int main() {
     {
         D3D12XBOX_CREATE_DEVICE_PARAMETERS dp{};
         dp.Version = 1;
-        dp.PreferWarp = 0;
         ID3D12DeviceX* dev = nullptr;
         HRESULT hr = D3D12XboxCreateDevice(
             nullptr, &dp, IID_ID3D12DeviceX, reinterpret_cast<void**>(&dev));
@@ -782,7 +781,7 @@ int main() {
         }
         hr = dev->GetGpuHardwareInfoX(&gpu_info);
         D3D12XBOX_FRAME_PIPELINE_TOKEN tok = 0;
-        HRESULT hr2 = dev->WaitFrameEventX(D3D12XBOX_FRAME_EVENT_ORIGIN, 1000u, nullptr, &tok);
+        HRESULT hr2 = dev->WaitFrameEventX(D3D12XBOX_FRAME_EVENT_ORIGIN, 1000u, nullptr, 0u, &tok);
         dev->Release();
         if (FAILED(hr) || FAILED(hr2) || tok == 0) {
             return Fail("d3d12_xs GetGpuHardwareInfoX / WaitFrameEventX", hr);

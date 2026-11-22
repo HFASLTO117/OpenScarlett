@@ -19,6 +19,7 @@
 
 #include "openscarlett/core/telemetry.h"
 #include "openscarlett/kernel/gpu_tile_pool.h"
+#include "openscarlett/kernel/plm_notifications.h"
 #include "openscarlett/kernel/xmemory.h"
 
 #if defined(_MSC_VER)
@@ -2552,6 +2553,71 @@ int32_t OPENSCARLETT_KERNELX_CALL KernelXMapTileRange(uint64_t resourceId,
     }
     RecordTelemetry(__func__, CallOutcome::Ok, kHrOk);
     return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Xbox Game Core PLM Notifications (appnotify.h)
+// ---------------------------------------------------------------------------
+}  // extern "C"
+
+namespace {
+
+openscarlett::PlmNotificationRegistry& GetKernelXPlmRegistry() {
+    static openscarlett::PlmNotificationRegistry reg;
+    return reg;
+}
+
+}  // namespace
+
+extern "C" {
+
+uint32_t OPENSCARLETT_KERNELX_CALL RegisterAppStateChangeNotification(
+    PAPPSTATE_CHANGE_ROUTINE Routine,
+    void* Context,
+    PAPPSTATE_REGISTRATION* Registration) {
+    const uint32_t err = GetKernelXPlmRegistry().RegisterStateChange(Routine, Context, Registration);
+    RecordTelemetry("RegisterAppStateChangeNotification",
+                    err == 0u ? CallOutcome::Ok : CallOutcome::Error,
+                    err == 0u ? kHrOk : kHrInvalidArg);
+    return err;
+}
+
+void OPENSCARLETT_KERNELX_CALL UnregisterAppStateChangeNotification(
+    PAPPSTATE_REGISTRATION Registration) {
+    (void)GetKernelXPlmRegistry().UnregisterStateChange(Registration);
+    RecordTelemetry("UnregisterAppStateChangeNotification", CallOutcome::Ok, kHrOk);
+}
+
+uint32_t OPENSCARLETT_KERNELX_CALL RegisterAppConstrainedChangeNotification(
+    PAPPCONSTRAIN_CHANGE_ROUTINE Routine,
+    void* Context,
+    PAPPCONSTRAIN_REGISTRATION* Registration) {
+    const uint32_t err =
+        GetKernelXPlmRegistry().RegisterConstrainedChange(Routine, Context, Registration);
+    RecordTelemetry("RegisterAppConstrainedChangeNotification",
+                    err == 0u ? CallOutcome::Ok : CallOutcome::Error,
+                    err == 0u ? kHrOk : kHrInvalidArg);
+    return err;
+}
+
+void OPENSCARLETT_KERNELX_CALL UnregisterAppConstrainedChangeNotification(
+    PAPPCONSTRAIN_REGISTRATION Registration) {
+    (void)GetKernelXPlmRegistry().UnregisterConstrainedChange(Registration);
+    RecordTelemetry("UnregisterAppConstrainedChangeNotification", CallOutcome::Ok, kHrOk);
+}
+
+uint32_t OPENSCARLETT_KERNELX_CALL KernelXDispatchAppStateChange(uint8_t Quiesced) {
+    return GetKernelXPlmRegistry().DispatchStateChange(Quiesced);
+}
+
+uint32_t OPENSCARLETT_KERNELX_CALL KernelXDispatchAppConstrainedChange(uint8_t Constrained) {
+    return GetKernelXPlmRegistry().DispatchConstrainedChange(Constrained);
+}
+
+void OPENSCARLETT_KERNELX_CALL KernelXGetAppNotificationCounts(
+    uint32_t* outStateCount,
+    uint32_t* outConstrainedCount) {
+    GetKernelXPlmRegistry().GetCounts(outStateCount, outConstrainedCount);
 }
 
 void OPENSCARLETT_KERNELX_CALL KernelXResetTelemetry(void) {
