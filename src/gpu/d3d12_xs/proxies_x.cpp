@@ -1,0 +1,1209 @@
+#include "proxies_x.h"
+
+#include <array>
+#include <cstring>
+#include <shared_mutex>
+#include <unordered_map>
+
+#include "device_x.h"
+
+namespace openscarlett::d3d12_xs {
+
+namespace {
+
+struct ProxyRegistryEntry {
+    D3D12XProxyKind kind = D3D12XProxyKind::Unknown;
+    IUnknown* host_obj = nullptr;
+};
+
+struct ProxyRegistryShard {
+    std::shared_mutex mutex;
+    std::unordered_map<const void*, ProxyRegistryEntry> map;
+};
+
+constexpr size_t kProxyShardCount = 64u;
+
+size_t ShardIndex(const void* ptr) noexcept {
+    const uintptr_t v = reinterpret_cast<uintptr_t>(ptr);
+    return static_cast<size_t>((v >> 4u) ^ (v >> 11u)) & (kProxyShardCount - 1u);
+}
+
+std::array<ProxyRegistryShard, kProxyShardCount>& GetProxyShards() {
+    static std::array<ProxyRegistryShard, kProxyShardCount> shards;
+    return shards;
+}
+
+void RegisterProxy(const void* proxy_ptr, D3D12XProxyKind kind, IUnknown* host_obj) noexcept {
+    if (!proxy_ptr) return;
+    auto& shard = GetProxyShards()[ShardIndex(proxy_ptr)];
+    std::unique_lock<std::shared_mutex> lock(shard.mutex);
+    shard.map[proxy_ptr] = ProxyRegistryEntry{kind, host_obj};
+}
+
+void UnregisterProxy(const void* proxy_ptr) noexcept {
+    if (!proxy_ptr) return;
+    auto& shard = GetProxyShards()[ShardIndex(proxy_ptr)];
+    std::unique_lock<std::shared_mutex> lock(shard.mutex);
+    shard.map.erase(proxy_ptr);
+}
+
+bool LookupProxy(const void* maybe_wrapped, ProxyRegistryEntry& out_entry) noexcept {
+    if (!maybe_wrapped) return false;
+    auto& shard = GetProxyShards()[ShardIndex(maybe_wrapped)];
+    std::shared_lock<std::shared_mutex> lock(shard.mutex);
+    auto it = shard.map.find(maybe_wrapped);
+    if (it == shard.map.end()) return false;
+    out_entry = it->second;
+    return true;
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Thread-safe Unwrap helpers
+// ---------------------------------------------------------------------------
+ID3D12Resource* UnwrapResource(ID3D12Resource* maybe_wrapped) noexcept {
+    if (!maybe_wrapped) return nullptr;
+    ProxyRegistryEntry entry{};
+    if (LookupProxy(static_cast<const void*>(maybe_wrapped), entry) &&
+        entry.kind == D3D12XProxyKind::Resource) {
+        return static_cast<ID3D12Resource*>(entry.host_obj);
+    }
+    return maybe_wrapped;
+}
+
+ID3D12Heap* UnwrapHeap(ID3D12Heap* maybe_wrapped) noexcept {
+    if (!maybe_wrapped) return nullptr;
+    ProxyRegistryEntry entry{};
+    if (LookupProxy(static_cast<const void*>(maybe_wrapped), entry) &&
+        entry.kind == D3D12XProxyKind::Heap) {
+        return static_cast<ID3D12Heap*>(entry.host_obj);
+    }
+    return maybe_wrapped;
+}
+
+ID3D12DescriptorHeap* UnwrapDescriptorHeap(ID3D12DescriptorHeap* maybe_wrapped) noexcept {
+    if (!maybe_wrapped) return nullptr;
+    ProxyRegistryEntry entry{};
+    if (LookupProxy(static_cast<const void*>(maybe_wrapped), entry) &&
+        entry.kind == D3D12XProxyKind::DescriptorHeap) {
+        return static_cast<ID3D12DescriptorHeap*>(entry.host_obj);
+    }
+    return maybe_wrapped;
+}
+
+ID3D12PipelineState* UnwrapPipelineState(ID3D12PipelineState* maybe_wrapped) noexcept {
+    if (!maybe_wrapped) return nullptr;
+    ProxyRegistryEntry entry{};
+    if (LookupProxy(static_cast<const void*>(maybe_wrapped), entry) &&
+        entry.kind == D3D12XProxyKind::PipelineState) {
+        return static_cast<ID3D12PipelineState*>(entry.host_obj);
+    }
+    return maybe_wrapped;
+}
+
+ID3D12RootSignature* UnwrapRootSignature(ID3D12RootSignature* maybe_wrapped) noexcept {
+    if (!maybe_wrapped) return nullptr;
+    ProxyRegistryEntry entry{};
+    if (LookupProxy(static_cast<const void*>(maybe_wrapped), entry) &&
+        entry.kind == D3D12XProxyKind::RootSignature) {
+        return static_cast<ID3D12RootSignature*>(entry.host_obj);
+    }
+    return maybe_wrapped;
+}
+
+ID3D12Fence* UnwrapFence(ID3D12Fence* maybe_wrapped) noexcept {
+    if (!maybe_wrapped) return nullptr;
+    ProxyRegistryEntry entry{};
+    if (LookupProxy(static_cast<const void*>(maybe_wrapped), entry) &&
+        entry.kind == D3D12XProxyKind::Fence) {
+        return static_cast<ID3D12Fence*>(entry.host_obj);
+    }
+    return maybe_wrapped;
+}
+
+ID3D12CommandAllocator* UnwrapCommandAllocator(ID3D12CommandAllocator* maybe_wrapped) noexcept {
+    if (!maybe_wrapped) return nullptr;
+    ProxyRegistryEntry entry{};
+    if (LookupProxy(static_cast<const void*>(maybe_wrapped), entry) &&
+        entry.kind == D3D12XProxyKind::CommandAllocator) {
+        return static_cast<ID3D12CommandAllocator*>(entry.host_obj);
+    }
+    return maybe_wrapped;
+}
+
+ID3D12QueryHeap* UnwrapQueryHeap(ID3D12QueryHeap* maybe_wrapped) noexcept {
+    if (!maybe_wrapped) return nullptr;
+    ProxyRegistryEntry entry{};
+    if (LookupProxy(static_cast<const void*>(maybe_wrapped), entry) &&
+        entry.kind == D3D12XProxyKind::QueryHeap) {
+        return static_cast<ID3D12QueryHeap*>(entry.host_obj);
+    }
+    return maybe_wrapped;
+}
+
+ID3D12CommandSignature* UnwrapCommandSignature(ID3D12CommandSignature* maybe_wrapped) noexcept {
+    if (!maybe_wrapped) return nullptr;
+    ProxyRegistryEntry entry{};
+    if (LookupProxy(static_cast<const void*>(maybe_wrapped), entry) &&
+        entry.kind == D3D12XProxyKind::CommandSignature) {
+        return static_cast<ID3D12CommandSignature*>(entry.host_obj);
+    }
+    return maybe_wrapped;
+}
+
+ID3D12StateObject* UnwrapStateObject(ID3D12StateObject* maybe_wrapped) noexcept {
+    if (!maybe_wrapped) return nullptr;
+    ProxyRegistryEntry entry{};
+    if (LookupProxy(static_cast<const void*>(maybe_wrapped), entry) &&
+        entry.kind == D3D12XProxyKind::StateObject) {
+        return static_cast<ID3D12StateObject*>(entry.host_obj);
+    }
+    return maybe_wrapped;
+}
+
+ID3D12Pageable* UnwrapProxyPageable(ID3D12Pageable* maybe_wrapped) noexcept {
+    if (!maybe_wrapped) return nullptr;
+    ProxyRegistryEntry entry{};
+    if (LookupProxy(static_cast<const void*>(maybe_wrapped), entry) &&
+        entry.host_obj &&
+        entry.kind != D3D12XProxyKind::RootSignature) {
+        return static_cast<ID3D12Pageable*>(entry.host_obj);
+    }
+    return maybe_wrapped;
+}
+
+ID3D12DeviceChild* UnwrapProxyDeviceChild(ID3D12DeviceChild* maybe_wrapped) noexcept {
+    if (!maybe_wrapped) return nullptr;
+    ProxyRegistryEntry entry{};
+    if (LookupProxy(static_cast<const void*>(maybe_wrapped), entry) && entry.host_obj) {
+        return static_cast<ID3D12DeviceChild*>(entry.host_obj);
+    }
+    return maybe_wrapped;
+}
+
+bool IsKnownProxyPointer(const void* ptr) noexcept {
+    ProxyRegistryEntry entry{};
+    return LookupProxy(ptr, entry);
+}
+
+// ---------------------------------------------------------------------------
+// 1. ResourceXProxy
+// ---------------------------------------------------------------------------
+ResourceXProxy::ResourceXProxy(
+    DeviceX* parent_device,
+    ID3D12Resource* host_resource,
+    const D3D12_RESOURCE_DESC* desc_hint,
+    const D3D12_HEAP_PROPERTIES* heap_props_hint,
+    D3D12_HEAP_FLAGS heap_flags_hint,
+    D3D12_GPU_VIRTUAL_ADDRESS xbox_gpu_va_hint)
+    : device_x_(parent_device),
+      host_res_(host_resource),
+      cached_heap_flags_(heap_flags_hint),
+      xbox_gpu_va_(xbox_gpu_va_hint) {
+    if (device_x_) device_x_->AddRef();
+    if (host_res_) {
+        host_res_->AddRef();
+        cached_desc_ = host_res_->GetDesc();
+        if (cached_desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && xbox_gpu_va_ == 0ull) {
+            xbox_gpu_va_ = host_res_->GetGPUVirtualAddress();
+        }
+        D3D12_HEAP_PROPERTIES hp{};
+        D3D12_HEAP_FLAGS hf = D3D12_HEAP_FLAG_NONE;
+        if (SUCCEEDED(host_res_->GetHeapProperties(&hp, &hf))) {
+            cached_heap_props_ = hp;
+            cached_heap_flags_ = hf;
+            has_cached_heap_props_ = true;
+        }
+    } else if (desc_hint) {
+        cached_desc_ = *desc_hint;
+    }
+    if (!has_cached_heap_props_ && heap_props_hint) {
+        cached_heap_props_ = *heap_props_hint;
+        has_cached_heap_props_ = true;
+    }
+    RegisterProxy(static_cast<const ID3D12Resource*>(this), D3D12XProxyKind::Resource, host_res_);
+}
+
+ResourceXProxy::~ResourceXProxy() {
+    UnregisterProxy(static_cast<const ID3D12Resource*>(this));
+    if (device_x_ && host_res_) {
+        device_x_->NotifyResourceDestroyed(host_res_);
+    }
+    if (host_res_) host_res_->Release();
+    if (device_x_) device_x_->Release();
+}
+
+HRESULT STDMETHODCALLTYPE ResourceXProxy::QueryInterface(REFIID riid, void** ppvObject) {
+    if (!ppvObject) return E_POINTER;
+    *ppvObject = nullptr;
+
+    if (IsEqualIID(riid, OS_D3D12_IID(IUnknown)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Object)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12DeviceChild)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Pageable)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Resource)) ||
+        IsEqualIID(riid, IID_ID3D12ResourceX)) {
+        *ppvObject = static_cast<ID3D12Resource*>(this);
+        AddRef();
+        return S_OK;
+    }
+    if (IsEqualIID(riid, IID_IOpenScarlettProxyInspect)) {
+        *ppvObject = static_cast<IOpenScarlettProxyInspect*>(this);
+        AddRef();
+        return S_OK;
+    }
+    return host_res_ ? host_res_->QueryInterface(riid, ppvObject) : E_NOINTERFACE;
+}
+
+ULONG STDMETHODCALLTYPE ResourceXProxy::AddRef() {
+    return ref_count_.fetch_add(1u, std::memory_order_relaxed) + 1u;
+}
+
+ULONG STDMETHODCALLTYPE ResourceXProxy::Release() {
+    const ULONG rem = ref_count_.fetch_sub(1u, std::memory_order_acq_rel) - 1u;
+    if (rem == 0u) delete this;
+    return rem;
+}
+
+HRESULT STDMETHODCALLTYPE ResourceXProxy::GetPrivateData(REFGUID guid, UINT* pDataSize, void* pData) {
+    return host_res_ ? host_res_->GetPrivateData(guid, pDataSize, pData) : DXGI_ERROR_NOT_FOUND;
+}
+
+HRESULT STDMETHODCALLTYPE ResourceXProxy::SetPrivateData(REFGUID guid, UINT DataSize, const void* pData) {
+    return host_res_ ? host_res_->SetPrivateData(guid, DataSize, pData) : S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE ResourceXProxy::SetPrivateDataInterface(REFGUID guid, const IUnknown* pData) {
+    return host_res_ ? host_res_->SetPrivateDataInterface(guid, pData) : S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE ResourceXProxy::SetName(LPCWSTR Name) {
+    return host_res_ ? host_res_->SetName(Name) : S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE ResourceXProxy::GetDevice(REFIID riid, void** ppvDevice) {
+    return device_x_ ? device_x_->QueryInterface(riid, ppvDevice) : E_FAIL;
+}
+
+HRESULT STDMETHODCALLTYPE ResourceXProxy::Map(
+    UINT Subresource, const D3D12_RANGE* pReadRange, void** ppData) {
+    return host_res_ ? host_res_->Map(Subresource, pReadRange, ppData) : E_FAIL;
+}
+
+void STDMETHODCALLTYPE ResourceXProxy::Unmap(
+    UINT Subresource, const D3D12_RANGE* pWrittenRange) {
+    if (host_res_) host_res_->Unmap(Subresource, pWrittenRange);
+}
+
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+D3D12_RESOURCE_DESC* STDMETHODCALLTYPE ResourceXProxy::GetDesc(D3D12_RESOURCE_DESC* pRet) {
+    if (!pRet) return nullptr;
+    if (host_res_) {
+        host_res_->GetDesc(pRet);
+    } else {
+        *pRet = cached_desc_;
+    }
+    return pRet;
+}
+#else
+D3D12_RESOURCE_DESC STDMETHODCALLTYPE ResourceXProxy::GetDesc() {
+    return host_res_ ? host_res_->GetDesc() : cached_desc_;
+}
+#endif
+
+D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE ResourceXProxy::GetGPUVirtualAddress() {
+    if (host_res_) {
+        return host_res_->GetGPUVirtualAddress();
+    }
+    return xbox_gpu_va_;
+}
+
+HRESULT STDMETHODCALLTYPE ResourceXProxy::WriteToSubresource(
+    UINT DstSubresource, const D3D12_BOX* pDstBox,
+    const void* pSrcData, UINT SrcRowPitch, UINT SrcDepthPitch) {
+    return host_res_
+               ? host_res_->WriteToSubresource(
+                     DstSubresource, pDstBox, pSrcData, SrcRowPitch, SrcDepthPitch)
+               : E_FAIL;
+}
+
+HRESULT STDMETHODCALLTYPE ResourceXProxy::ReadFromSubresource(
+    void* pDstData, UINT DstRowPitch, UINT DstDepthPitch,
+    UINT SrcSubresource, const D3D12_BOX* pSrcBox) {
+    return host_res_
+               ? host_res_->ReadFromSubresource(
+                     pDstData, DstRowPitch, DstDepthPitch, SrcSubresource, pSrcBox)
+               : E_FAIL;
+}
+
+HRESULT STDMETHODCALLTYPE ResourceXProxy::GetHeapProperties(
+    D3D12_HEAP_PROPERTIES* pHeapProperties, D3D12_HEAP_FLAGS* pHeapFlags) {
+    if (host_res_) {
+        return host_res_->GetHeapProperties(pHeapProperties, pHeapFlags);
+    }
+    if (!has_cached_heap_props_) return E_FAIL;
+    if (pHeapProperties) *pHeapProperties = cached_heap_props_;
+    if (pHeapFlags) *pHeapFlags = cached_heap_flags_;
+    return S_OK;
+}
+
+// ---------------------------------------------------------------------------
+// 2. HeapXProxy
+// ---------------------------------------------------------------------------
+HeapXProxy::HeapXProxy(DeviceX* parent_device, ID3D12Heap* host_heap, uint64_t xbox_va_hint)
+    : device_x_(parent_device), host_heap_(host_heap), xbox_va_(xbox_va_hint) {
+    if (device_x_) device_x_->AddRef();
+    if (host_heap_) host_heap_->AddRef();
+    RegisterProxy(static_cast<const ID3D12Heap*>(this), D3D12XProxyKind::Heap, host_heap_);
+}
+
+HeapXProxy::~HeapXProxy() {
+    UnregisterProxy(static_cast<const ID3D12Heap*>(this));
+    if (device_x_ && host_heap_) {
+        device_x_->NotifyHeapDestroyed(host_heap_);
+    }
+    if (host_heap_) host_heap_->Release();
+    if (device_x_) device_x_->Release();
+}
+
+HRESULT STDMETHODCALLTYPE HeapXProxy::QueryInterface(REFIID riid, void** ppvObject) {
+    if (!ppvObject) return E_POINTER;
+    *ppvObject = nullptr;
+    if (IsEqualIID(riid, OS_D3D12_IID(IUnknown)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Object)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12DeviceChild)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Pageable)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Heap)) ||
+        IsEqualIID(riid, IID_ID3D12HeapX)) {
+        *ppvObject = static_cast<ID3D12Heap*>(this);
+        AddRef();
+        return S_OK;
+    }
+    if (IsEqualIID(riid, IID_IOpenScarlettProxyInspect)) {
+        *ppvObject = static_cast<IOpenScarlettProxyInspect*>(this);
+        AddRef();
+        return S_OK;
+    }
+    return host_heap_ ? host_heap_->QueryInterface(riid, ppvObject) : E_NOINTERFACE;
+}
+
+ULONG STDMETHODCALLTYPE HeapXProxy::AddRef() {
+    return ref_count_.fetch_add(1u, std::memory_order_relaxed) + 1u;
+}
+
+ULONG STDMETHODCALLTYPE HeapXProxy::Release() {
+    const ULONG rem = ref_count_.fetch_sub(1u, std::memory_order_acq_rel) - 1u;
+    if (rem == 0u) delete this;
+    return rem;
+}
+
+HRESULT STDMETHODCALLTYPE HeapXProxy::GetPrivateData(REFGUID guid, UINT* pDataSize, void* pData) {
+    return host_heap_ ? host_heap_->GetPrivateData(guid, pDataSize, pData) : DXGI_ERROR_NOT_FOUND;
+}
+
+HRESULT STDMETHODCALLTYPE HeapXProxy::SetPrivateData(REFGUID guid, UINT DataSize, const void* pData) {
+    return host_heap_ ? host_heap_->SetPrivateData(guid, DataSize, pData) : S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE HeapXProxy::SetPrivateDataInterface(REFGUID guid, const IUnknown* pData) {
+    return host_heap_ ? host_heap_->SetPrivateDataInterface(guid, pData) : S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE HeapXProxy::SetName(LPCWSTR Name) {
+    return host_heap_ ? host_heap_->SetName(Name) : S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE HeapXProxy::GetDevice(REFIID riid, void** ppvDevice) {
+    return device_x_ ? device_x_->QueryInterface(riid, ppvDevice) : E_FAIL;
+}
+
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+D3D12_HEAP_DESC* STDMETHODCALLTYPE HeapXProxy::GetDesc(D3D12_HEAP_DESC* pRet) {
+    if (!pRet) return nullptr;
+    if (host_heap_) {
+        host_heap_->GetDesc(pRet);
+    } else {
+        std::memset(pRet, 0, sizeof(*pRet));
+    }
+    return pRet;
+}
+#else
+D3D12_HEAP_DESC STDMETHODCALLTYPE HeapXProxy::GetDesc() {
+    D3D12_HEAP_DESC empty{};
+    return host_heap_ ? host_heap_->GetDesc() : empty;
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// 3. DescriptorHeapXProxy
+// ---------------------------------------------------------------------------
+DescriptorHeapXProxy::DescriptorHeapXProxy(DeviceX* parent_device, ID3D12DescriptorHeap* host_heap)
+    : device_x_(parent_device), host_heap_(host_heap) {
+    if (device_x_) device_x_->AddRef();
+    if (host_heap_) {
+        host_heap_->AddRef();
+        cached_desc_ = host_heap_->GetDesc();
+        if ((cached_desc_.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0) {
+            gpu_start_ = host_heap_->GetGPUDescriptorHandleForHeapStart();
+        }
+    }
+    RegisterProxy(
+        static_cast<const ID3D12DescriptorHeap*>(this),
+        D3D12XProxyKind::DescriptorHeap,
+        host_heap_);
+}
+
+DescriptorHeapXProxy::~DescriptorHeapXProxy() {
+    UnregisterProxy(static_cast<const ID3D12DescriptorHeap*>(this));
+    if (host_heap_) host_heap_->Release();
+    if (device_x_) device_x_->Release();
+}
+
+HRESULT STDMETHODCALLTYPE DescriptorHeapXProxy::QueryInterface(REFIID riid, void** ppvObject) {
+    if (!ppvObject) return E_POINTER;
+    *ppvObject = nullptr;
+    if (IsEqualIID(riid, OS_D3D12_IID(IUnknown)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Object)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12DeviceChild)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Pageable)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12DescriptorHeap)) ||
+        IsEqualIID(riid, IID_ID3D12DescriptorHeapX)) {
+        *ppvObject = static_cast<ID3D12DescriptorHeap*>(this);
+        AddRef();
+        return S_OK;
+    }
+    if (IsEqualIID(riid, IID_IOpenScarlettProxyInspect)) {
+        *ppvObject = static_cast<IOpenScarlettProxyInspect*>(this);
+        AddRef();
+        return S_OK;
+    }
+    return host_heap_ ? host_heap_->QueryInterface(riid, ppvObject) : E_NOINTERFACE;
+}
+
+ULONG STDMETHODCALLTYPE DescriptorHeapXProxy::AddRef() {
+    return ref_count_.fetch_add(1u, std::memory_order_relaxed) + 1u;
+}
+
+ULONG STDMETHODCALLTYPE DescriptorHeapXProxy::Release() {
+    const ULONG rem = ref_count_.fetch_sub(1u, std::memory_order_acq_rel) - 1u;
+    if (rem == 0u) delete this;
+    return rem;
+}
+
+HRESULT STDMETHODCALLTYPE DescriptorHeapXProxy::GetPrivateData(REFGUID guid, UINT* pDataSize, void* pData) {
+    return host_heap_ ? host_heap_->GetPrivateData(guid, pDataSize, pData) : DXGI_ERROR_NOT_FOUND;
+}
+
+HRESULT STDMETHODCALLTYPE DescriptorHeapXProxy::SetPrivateData(REFGUID guid, UINT DataSize, const void* pData) {
+    return host_heap_ ? host_heap_->SetPrivateData(guid, DataSize, pData) : S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE DescriptorHeapXProxy::SetPrivateDataInterface(REFGUID guid, const IUnknown* pData) {
+    return host_heap_ ? host_heap_->SetPrivateDataInterface(guid, pData) : S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE DescriptorHeapXProxy::SetName(LPCWSTR Name) {
+    return host_heap_ ? host_heap_->SetName(Name) : S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE DescriptorHeapXProxy::GetDevice(REFIID riid, void** ppvDevice) {
+    return device_x_ ? device_x_->QueryInterface(riid, ppvDevice) : E_FAIL;
+}
+
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+D3D12_DESCRIPTOR_HEAP_DESC* STDMETHODCALLTYPE DescriptorHeapXProxy::GetDesc(
+    D3D12_DESCRIPTOR_HEAP_DESC* pRet) {
+    if (!pRet) return nullptr;
+    if (host_heap_) {
+        host_heap_->GetDesc(pRet);
+    } else {
+        *pRet = cached_desc_;
+    }
+    return pRet;
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE* STDMETHODCALLTYPE DescriptorHeapXProxy::GetCPUDescriptorHandleForHeapStart(
+    D3D12_CPU_DESCRIPTOR_HANDLE* pRet) {
+    if (!pRet) return nullptr;
+    if (host_heap_) {
+        host_heap_->GetCPUDescriptorHandleForHeapStart(pRet);
+    } else {
+        pRet->ptr = 0u;
+    }
+    return pRet;
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE* STDMETHODCALLTYPE DescriptorHeapXProxy::GetGPUDescriptorHandleForHeapStart(
+    D3D12_GPU_DESCRIPTOR_HANDLE* pRet) {
+    if (!pRet) return nullptr;
+    if (host_heap_) {
+        host_heap_->GetGPUDescriptorHandleForHeapStart(pRet);
+    } else {
+        pRet->ptr = 0ull;
+    }
+    return pRet;
+}
+#else
+D3D12_DESCRIPTOR_HEAP_DESC STDMETHODCALLTYPE DescriptorHeapXProxy::GetDesc() {
+    return host_heap_ ? host_heap_->GetDesc() : cached_desc_;
+}
+
+D3D12_CPU_DESCRIPTOR_HANDLE STDMETHODCALLTYPE DescriptorHeapXProxy::GetCPUDescriptorHandleForHeapStart() {
+    D3D12_CPU_DESCRIPTOR_HANDLE h{0u};
+    return host_heap_ ? host_heap_->GetCPUDescriptorHandleForHeapStart() : h;
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE STDMETHODCALLTYPE DescriptorHeapXProxy::GetGPUDescriptorHandleForHeapStart() {
+    D3D12_GPU_DESCRIPTOR_HANDLE h{0ull};
+    return host_heap_ ? host_heap_->GetGPUDescriptorHandleForHeapStart() : h;
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// 4. PipelineStateXProxy
+// ---------------------------------------------------------------------------
+PipelineStateXProxy::PipelineStateXProxy(DeviceX* parent_device, ID3D12PipelineState* host_pso)
+    : device_x_(parent_device), host_pso_(host_pso) {
+    if (device_x_) device_x_->AddRef();
+    if (host_pso_) host_pso_->AddRef();
+    RegisterProxy(
+        static_cast<const ID3D12PipelineState*>(this),
+        D3D12XProxyKind::PipelineState,
+        host_pso_);
+}
+
+PipelineStateXProxy::~PipelineStateXProxy() {
+    UnregisterProxy(static_cast<const ID3D12PipelineState*>(this));
+    if (device_x_) {
+        device_x_->NotifyPipelineDestroyed(static_cast<ID3D12PipelineState*>(this));
+    }
+    if (host_pso_) host_pso_->Release();
+    if (device_x_) device_x_->Release();
+}
+
+HRESULT STDMETHODCALLTYPE PipelineStateXProxy::QueryInterface(REFIID riid, void** ppvObject) {
+    if (!ppvObject) return E_POINTER;
+    *ppvObject = nullptr;
+    if (IsEqualIID(riid, OS_D3D12_IID(IUnknown)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Object)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12DeviceChild)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Pageable)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12PipelineState)) ||
+        IsEqualIID(riid, IID_ID3D12PipelineStateX)) {
+        *ppvObject = static_cast<ID3D12PipelineState*>(this);
+        AddRef();
+        return S_OK;
+    }
+    if (IsEqualIID(riid, IID_IOpenScarlettProxyInspect)) {
+        *ppvObject = static_cast<IOpenScarlettProxyInspect*>(this);
+        AddRef();
+        return S_OK;
+    }
+    return host_pso_ ? host_pso_->QueryInterface(riid, ppvObject) : E_NOINTERFACE;
+}
+
+ULONG STDMETHODCALLTYPE PipelineStateXProxy::AddRef() {
+    return ref_count_.fetch_add(1u, std::memory_order_relaxed) + 1u;
+}
+
+ULONG STDMETHODCALLTYPE PipelineStateXProxy::Release() {
+    const ULONG rem = ref_count_.fetch_sub(1u, std::memory_order_acq_rel) - 1u;
+    if (rem == 0u) delete this;
+    return rem;
+}
+
+HRESULT STDMETHODCALLTYPE PipelineStateXProxy::GetPrivateData(REFGUID guid, UINT* pDataSize, void* pData) {
+    return host_pso_ ? host_pso_->GetPrivateData(guid, pDataSize, pData) : DXGI_ERROR_NOT_FOUND;
+}
+
+HRESULT STDMETHODCALLTYPE PipelineStateXProxy::SetPrivateData(REFGUID guid, UINT DataSize, const void* pData) {
+    return host_pso_ ? host_pso_->SetPrivateData(guid, DataSize, pData) : S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE PipelineStateXProxy::SetPrivateDataInterface(REFGUID guid, const IUnknown* pData) {
+    return host_pso_ ? host_pso_->SetPrivateDataInterface(guid, pData) : S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE PipelineStateXProxy::SetName(LPCWSTR Name) {
+    return host_pso_ ? host_pso_->SetName(Name) : S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE PipelineStateXProxy::GetDevice(REFIID riid, void** ppvDevice) {
+    return device_x_ ? device_x_->QueryInterface(riid, ppvDevice) : E_FAIL;
+}
+
+HRESULT STDMETHODCALLTYPE PipelineStateXProxy::GetCachedBlob(ID3DBlob** ppBlob) {
+    if (host_pso_) return host_pso_->GetCachedBlob(ppBlob);
+    if (ppBlob) *ppBlob = nullptr;
+    return E_NOTIMPL;
+}
+
+// ---------------------------------------------------------------------------
+// 5. RootSignatureXProxy
+// ---------------------------------------------------------------------------
+RootSignatureXProxy::RootSignatureXProxy(DeviceX* parent_device, ID3D12RootSignature* host_rs)
+    : device_x_(parent_device), host_rs_(host_rs) {
+    if (device_x_) device_x_->AddRef();
+    if (host_rs_) host_rs_->AddRef();
+    RegisterProxy(
+        static_cast<const ID3D12RootSignature*>(this),
+        D3D12XProxyKind::RootSignature,
+        host_rs_);
+}
+
+RootSignatureXProxy::~RootSignatureXProxy() {
+    UnregisterProxy(static_cast<const ID3D12RootSignature*>(this));
+    if (host_rs_) host_rs_->Release();
+    if (device_x_) device_x_->Release();
+}
+
+HRESULT STDMETHODCALLTYPE RootSignatureXProxy::QueryInterface(REFIID riid, void** ppvObject) {
+    if (!ppvObject) return E_POINTER;
+    *ppvObject = nullptr;
+    if (IsEqualIID(riid, OS_D3D12_IID(IUnknown)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Object)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12DeviceChild)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12RootSignature)) ||
+        IsEqualIID(riid, IID_ID3D12RootSignatureX)) {
+        *ppvObject = static_cast<ID3D12RootSignature*>(this);
+        AddRef();
+        return S_OK;
+    }
+    if (IsEqualIID(riid, IID_IOpenScarlettProxyInspect)) {
+        *ppvObject = static_cast<IOpenScarlettProxyInspect*>(this);
+        AddRef();
+        return S_OK;
+    }
+    return host_rs_ ? host_rs_->QueryInterface(riid, ppvObject) : E_NOINTERFACE;
+}
+
+ULONG STDMETHODCALLTYPE RootSignatureXProxy::AddRef() {
+    return ref_count_.fetch_add(1u, std::memory_order_relaxed) + 1u;
+}
+
+ULONG STDMETHODCALLTYPE RootSignatureXProxy::Release() {
+    const ULONG rem = ref_count_.fetch_sub(1u, std::memory_order_acq_rel) - 1u;
+    if (rem == 0u) delete this;
+    return rem;
+}
+
+HRESULT STDMETHODCALLTYPE RootSignatureXProxy::GetPrivateData(REFGUID guid, UINT* pDataSize, void* pData) {
+    return host_rs_ ? host_rs_->GetPrivateData(guid, pDataSize, pData) : DXGI_ERROR_NOT_FOUND;
+}
+
+HRESULT STDMETHODCALLTYPE RootSignatureXProxy::SetPrivateData(REFGUID guid, UINT DataSize, const void* pData) {
+    return host_rs_ ? host_rs_->SetPrivateData(guid, DataSize, pData) : S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE RootSignatureXProxy::SetPrivateDataInterface(REFGUID guid, const IUnknown* pData) {
+    return host_rs_ ? host_rs_->SetPrivateDataInterface(guid, pData) : S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE RootSignatureXProxy::SetName(LPCWSTR Name) {
+    return host_rs_ ? host_rs_->SetName(Name) : S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE RootSignatureXProxy::GetDevice(REFIID riid, void** ppvDevice) {
+    return device_x_ ? device_x_->QueryInterface(riid, ppvDevice) : E_FAIL;
+}
+
+// ---------------------------------------------------------------------------
+// 6. FenceXProxy
+// ---------------------------------------------------------------------------
+FenceXProxy::FenceXProxy(
+    DeviceX* parent_device,
+    ID3D12Fence* host_fence,
+    D3D12_FENCE_FLAGS creation_flags)
+    : device_x_(parent_device), host_fence_(host_fence), creation_flags_(creation_flags) {
+    if (device_x_) device_x_->AddRef();
+    if (host_fence_) {
+        host_fence_->AddRef();
+        host_fence_->QueryInterface(OS_D3D12_IID(ID3D12Fence1), reinterpret_cast<void**>(&host_fence1_));
+    }
+    RegisterProxy(static_cast<const ID3D12Fence*>(this), D3D12XProxyKind::Fence, host_fence_);
+}
+
+FenceXProxy::~FenceXProxy() {
+    UnregisterProxy(static_cast<const ID3D12Fence*>(this));
+    if (host_fence1_) host_fence1_->Release();
+    if (host_fence_) host_fence_->Release();
+    if (device_x_) device_x_->Release();
+}
+
+HRESULT STDMETHODCALLTYPE FenceXProxy::QueryInterface(REFIID riid, void** ppvObject) {
+    if (!ppvObject) return E_POINTER;
+    *ppvObject = nullptr;
+    if (IsEqualIID(riid, OS_D3D12_IID(IUnknown)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Object)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12DeviceChild)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Pageable)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Fence)) ||
+        IsEqualIID(riid, IID_ID3D12FenceX)) {
+        *ppvObject = static_cast<ID3D12Fence*>(this);
+        AddRef();
+        return S_OK;
+    }
+    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12Fence1)) && host_fence1_) {
+        *ppvObject = static_cast<ID3D12Fence1*>(this);
+        AddRef();
+        return S_OK;
+    }
+    if (IsEqualIID(riid, IID_IOpenScarlettProxyInspect)) {
+        *ppvObject = static_cast<IOpenScarlettProxyInspect*>(this);
+        AddRef();
+        return S_OK;
+    }
+    return host_fence_ ? host_fence_->QueryInterface(riid, ppvObject) : E_NOINTERFACE;
+}
+
+ULONG STDMETHODCALLTYPE FenceXProxy::AddRef() {
+    return ref_count_.fetch_add(1u, std::memory_order_relaxed) + 1u;
+}
+
+ULONG STDMETHODCALLTYPE FenceXProxy::Release() {
+    const ULONG rem = ref_count_.fetch_sub(1u, std::memory_order_acq_rel) - 1u;
+    if (rem == 0u) delete this;
+    return rem;
+}
+
+HRESULT STDMETHODCALLTYPE FenceXProxy::GetPrivateData(REFGUID guid, UINT* pDataSize, void* pData) {
+    return host_fence_ ? host_fence_->GetPrivateData(guid, pDataSize, pData) : DXGI_ERROR_NOT_FOUND;
+}
+
+HRESULT STDMETHODCALLTYPE FenceXProxy::SetPrivateData(REFGUID guid, UINT DataSize, const void* pData) {
+    return host_fence_ ? host_fence_->SetPrivateData(guid, DataSize, pData) : S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE FenceXProxy::SetPrivateDataInterface(REFGUID guid, const IUnknown* pData) {
+    return host_fence_ ? host_fence_->SetPrivateDataInterface(guid, pData) : S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE FenceXProxy::SetName(LPCWSTR Name) {
+    return host_fence_ ? host_fence_->SetName(Name) : S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE FenceXProxy::GetDevice(REFIID riid, void** ppvDevice) {
+    return device_x_ ? device_x_->QueryInterface(riid, ppvDevice) : E_FAIL;
+}
+
+UINT64 STDMETHODCALLTYPE FenceXProxy::GetCompletedValue() {
+    return host_fence_ ? host_fence_->GetCompletedValue() : UINT64_MAX;
+}
+
+HRESULT STDMETHODCALLTYPE FenceXProxy::SetEventOnCompletion(UINT64 Value, HANDLE hEvent) {
+    return host_fence_ ? host_fence_->SetEventOnCompletion(Value, hEvent) : E_FAIL;
+}
+
+HRESULT STDMETHODCALLTYPE FenceXProxy::Signal(UINT64 Value) {
+    return host_fence_ ? host_fence_->Signal(Value) : E_FAIL;
+}
+
+D3D12_FENCE_FLAGS STDMETHODCALLTYPE FenceXProxy::GetCreationFlags() {
+    return host_fence1_ ? host_fence1_->GetCreationFlags() : creation_flags_;
+}
+
+// ---------------------------------------------------------------------------
+// 7. CommandAllocatorXProxy
+// ---------------------------------------------------------------------------
+CommandAllocatorXProxy::CommandAllocatorXProxy(
+    DeviceX* parent_device,
+    ID3D12CommandAllocator* host_alloc,
+    D3D12_COMMAND_LIST_TYPE type)
+    : device_x_(parent_device), host_alloc_(host_alloc), type_(type) {
+    if (device_x_) device_x_->AddRef();
+    if (host_alloc_) host_alloc_->AddRef();
+    RegisterProxy(
+        static_cast<const ID3D12CommandAllocator*>(this),
+        D3D12XProxyKind::CommandAllocator,
+        host_alloc_);
+}
+
+CommandAllocatorXProxy::~CommandAllocatorXProxy() {
+    UnregisterProxy(static_cast<const ID3D12CommandAllocator*>(this));
+    if (host_alloc_) host_alloc_->Release();
+    if (device_x_) device_x_->Release();
+}
+
+HRESULT STDMETHODCALLTYPE CommandAllocatorXProxy::QueryInterface(REFIID riid, void** ppvObject) {
+    if (!ppvObject) return E_POINTER;
+    *ppvObject = nullptr;
+    if (IsEqualIID(riid, OS_D3D12_IID(IUnknown)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Object)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12DeviceChild)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Pageable)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12CommandAllocator)) ||
+        IsEqualIID(riid, IID_ID3D12CommandAllocatorX)) {
+        *ppvObject = static_cast<ID3D12CommandAllocator*>(this);
+        AddRef();
+        return S_OK;
+    }
+    if (IsEqualIID(riid, IID_IOpenScarlettProxyInspect)) {
+        *ppvObject = static_cast<IOpenScarlettProxyInspect*>(this);
+        AddRef();
+        return S_OK;
+    }
+    return host_alloc_ ? host_alloc_->QueryInterface(riid, ppvObject) : E_NOINTERFACE;
+}
+
+ULONG STDMETHODCALLTYPE CommandAllocatorXProxy::AddRef() {
+    return ref_count_.fetch_add(1u, std::memory_order_relaxed) + 1u;
+}
+
+ULONG STDMETHODCALLTYPE CommandAllocatorXProxy::Release() {
+    const ULONG rem = ref_count_.fetch_sub(1u, std::memory_order_acq_rel) - 1u;
+    if (rem == 0u) delete this;
+    return rem;
+}
+
+HRESULT STDMETHODCALLTYPE CommandAllocatorXProxy::GetPrivateData(REFGUID guid, UINT* pDataSize, void* pData) {
+    return host_alloc_ ? host_alloc_->GetPrivateData(guid, pDataSize, pData) : DXGI_ERROR_NOT_FOUND;
+}
+
+HRESULT STDMETHODCALLTYPE CommandAllocatorXProxy::SetPrivateData(REFGUID guid, UINT DataSize, const void* pData) {
+    return host_alloc_ ? host_alloc_->SetPrivateData(guid, DataSize, pData) : S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE CommandAllocatorXProxy::SetPrivateDataInterface(REFGUID guid, const IUnknown* pData) {
+    return host_alloc_ ? host_alloc_->SetPrivateDataInterface(guid, pData) : S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE CommandAllocatorXProxy::SetName(LPCWSTR Name) {
+    return host_alloc_ ? host_alloc_->SetName(Name) : S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE CommandAllocatorXProxy::GetDevice(REFIID riid, void** ppvDevice) {
+    return device_x_ ? device_x_->QueryInterface(riid, ppvDevice) : E_FAIL;
+}
+
+HRESULT STDMETHODCALLTYPE CommandAllocatorXProxy::Reset() {
+    return host_alloc_ ? host_alloc_->Reset() : E_FAIL;
+}
+
+// ---------------------------------------------------------------------------
+// 8. QueryHeapXProxy
+// ---------------------------------------------------------------------------
+QueryHeapXProxy::QueryHeapXProxy(
+    DeviceX* parent_device,
+    ID3D12QueryHeap* host_qheap,
+    const D3D12_QUERY_HEAP_DESC* desc_hint)
+    : device_x_(parent_device), host_qheap_(host_qheap) {
+    if (device_x_) device_x_->AddRef();
+    if (host_qheap_) host_qheap_->AddRef();
+    if (desc_hint) cached_desc_ = *desc_hint;
+    RegisterProxy(
+        static_cast<const ID3D12QueryHeap*>(this),
+        D3D12XProxyKind::QueryHeap,
+        host_qheap_);
+}
+
+QueryHeapXProxy::~QueryHeapXProxy() {
+    UnregisterProxy(static_cast<const ID3D12QueryHeap*>(this));
+    if (host_qheap_) host_qheap_->Release();
+    if (device_x_) device_x_->Release();
+}
+
+HRESULT STDMETHODCALLTYPE QueryHeapXProxy::QueryInterface(REFIID riid, void** ppvObject) {
+    if (!ppvObject) return E_POINTER;
+    *ppvObject = nullptr;
+    if (IsEqualIID(riid, OS_D3D12_IID(IUnknown)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Object)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12DeviceChild)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Pageable)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12QueryHeap)) ||
+        IsEqualIID(riid, IID_ID3D12QueryHeapX)) {
+        *ppvObject = static_cast<ID3D12QueryHeap*>(this);
+        AddRef();
+        return S_OK;
+    }
+    if (IsEqualIID(riid, IID_IOpenScarlettProxyInspect)) {
+        *ppvObject = static_cast<IOpenScarlettProxyInspect*>(this);
+        AddRef();
+        return S_OK;
+    }
+    return host_qheap_ ? host_qheap_->QueryInterface(riid, ppvObject) : E_NOINTERFACE;
+}
+
+ULONG STDMETHODCALLTYPE QueryHeapXProxy::AddRef() {
+    return ref_count_.fetch_add(1u, std::memory_order_relaxed) + 1u;
+}
+
+ULONG STDMETHODCALLTYPE QueryHeapXProxy::Release() {
+    const ULONG rem = ref_count_.fetch_sub(1u, std::memory_order_acq_rel) - 1u;
+    if (rem == 0u) delete this;
+    return rem;
+}
+
+HRESULT STDMETHODCALLTYPE QueryHeapXProxy::GetPrivateData(REFGUID guid, UINT* pDataSize, void* pData) {
+    return host_qheap_ ? host_qheap_->GetPrivateData(guid, pDataSize, pData) : DXGI_ERROR_NOT_FOUND;
+}
+
+HRESULT STDMETHODCALLTYPE QueryHeapXProxy::SetPrivateData(REFGUID guid, UINT DataSize, const void* pData) {
+    return host_qheap_ ? host_qheap_->SetPrivateData(guid, DataSize, pData) : S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE QueryHeapXProxy::SetPrivateDataInterface(REFGUID guid, const IUnknown* pData) {
+    return host_qheap_ ? host_qheap_->SetPrivateDataInterface(guid, pData) : S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE QueryHeapXProxy::SetName(LPCWSTR Name) {
+    return host_qheap_ ? host_qheap_->SetName(Name) : S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE QueryHeapXProxy::GetDevice(REFIID riid, void** ppvDevice) {
+    return device_x_ ? device_x_->QueryInterface(riid, ppvDevice) : E_FAIL;
+}
+
+// ---------------------------------------------------------------------------
+// 9. CommandSignatureXProxy
+// ---------------------------------------------------------------------------
+CommandSignatureXProxy::CommandSignatureXProxy(
+    DeviceX* parent_device,
+    ID3D12CommandSignature* host_sig,
+    UINT byte_stride,
+    UINT num_arg_descs)
+    : device_x_(parent_device),
+      host_sig_(host_sig),
+      byte_stride_(byte_stride),
+      num_arg_descs_(num_arg_descs) {
+    if (device_x_) device_x_->AddRef();
+    if (host_sig_) host_sig_->AddRef();
+    RegisterProxy(
+        static_cast<const ID3D12CommandSignature*>(this),
+        D3D12XProxyKind::CommandSignature,
+        host_sig_);
+}
+
+CommandSignatureXProxy::~CommandSignatureXProxy() {
+    UnregisterProxy(static_cast<const ID3D12CommandSignature*>(this));
+    if (host_sig_) host_sig_->Release();
+    if (device_x_) device_x_->Release();
+}
+
+HRESULT STDMETHODCALLTYPE CommandSignatureXProxy::QueryInterface(REFIID riid, void** ppvObject) {
+    if (!ppvObject) return E_POINTER;
+    *ppvObject = nullptr;
+    if (IsEqualIID(riid, OS_D3D12_IID(IUnknown)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Object)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12DeviceChild)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Pageable)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12CommandSignature)) ||
+        IsEqualIID(riid, IID_ID3D12CommandSignatureX)) {
+        *ppvObject = static_cast<ID3D12CommandSignature*>(this);
+        AddRef();
+        return S_OK;
+    }
+    if (IsEqualIID(riid, IID_IOpenScarlettProxyInspect)) {
+        *ppvObject = static_cast<IOpenScarlettProxyInspect*>(this);
+        AddRef();
+        return S_OK;
+    }
+    return host_sig_ ? host_sig_->QueryInterface(riid, ppvObject) : E_NOINTERFACE;
+}
+
+ULONG STDMETHODCALLTYPE CommandSignatureXProxy::AddRef() {
+    return ref_count_.fetch_add(1u, std::memory_order_relaxed) + 1u;
+}
+
+ULONG STDMETHODCALLTYPE CommandSignatureXProxy::Release() {
+    const ULONG rem = ref_count_.fetch_sub(1u, std::memory_order_acq_rel) - 1u;
+    if (rem == 0u) delete this;
+    return rem;
+}
+
+HRESULT STDMETHODCALLTYPE CommandSignatureXProxy::GetPrivateData(REFGUID guid, UINT* pDataSize, void* pData) {
+    return host_sig_ ? host_sig_->GetPrivateData(guid, pDataSize, pData) : DXGI_ERROR_NOT_FOUND;
+}
+
+HRESULT STDMETHODCALLTYPE CommandSignatureXProxy::SetPrivateData(REFGUID guid, UINT DataSize, const void* pData) {
+    return host_sig_ ? host_sig_->SetPrivateData(guid, DataSize, pData) : S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE CommandSignatureXProxy::SetPrivateDataInterface(REFGUID guid, const IUnknown* pData) {
+    return host_sig_ ? host_sig_->SetPrivateDataInterface(guid, pData) : S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE CommandSignatureXProxy::SetName(LPCWSTR Name) {
+    return host_sig_ ? host_sig_->SetName(Name) : S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE CommandSignatureXProxy::GetDevice(REFIID riid, void** ppvDevice) {
+    return device_x_ ? device_x_->QueryInterface(riid, ppvDevice) : E_FAIL;
+}
+
+// ---------------------------------------------------------------------------
+// 10. StateObjectXProxy
+// ---------------------------------------------------------------------------
+StateObjectXProxy::StateObjectXProxy(
+    DeviceX* parent_device,
+    ID3D12StateObject* host_so,
+    const D3D12_STATE_OBJECT_DESC* desc_hint)
+    : device_x_(parent_device), host_so_(host_so) {
+    if (device_x_) device_x_->AddRef();
+    if (host_so_) {
+        host_so_->AddRef();
+        host_so_->QueryInterface(
+            OS_D3D12_IID(ID3D12StateObjectProperties),
+            reinterpret_cast<void**>(&host_props_));
+    } else if (desc_hint && desc_hint->pSubobjects && desc_hint->NumSubobjects > 0u) {
+        auto register_export = [&](const wchar_t* name) {
+            if (!name || !name[0]) return;
+            std::wstring key(name);
+            std::array<uint8_t, 32> id{};
+            uint64_t h1 = 0xCBF29CE484222325ull;
+            uint64_t h2 = 0x51A7D3D120000001ull;
+            for (wchar_t ch : key) {
+                h1 = (h1 ^ static_cast<uint64_t>(ch)) * 0x100000001B3ull;
+                h2 = (h2 * 0x100000001B3ull) ^ static_cast<uint64_t>(ch + 0x9Eu);
+            }
+            std::memcpy(id.data() + 0u, &h1, 8u);
+            std::memcpy(id.data() + 8u, &h2, 8u);
+            const uint64_t tag = 0x4F53445852534254ull;  // "OSDXRSBT"
+            std::memcpy(id.data() + 16u, &tag, 8u);
+            const uint64_t len = static_cast<uint64_t>(key.size());
+            std::memcpy(id.data() + 24u, &len, 8u);
+            sw_shader_ids_[std::move(key)] = id;
+        };
+        for (UINT i = 0u; i < desc_hint->NumSubobjects; ++i) {
+            const auto& sub = desc_hint->pSubobjects[i];
+            if (sub.Type == D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY && sub.pDesc) {
+                const auto* lib = static_cast<const D3D12_DXIL_LIBRARY_DESC*>(sub.pDesc);
+                for (UINT e = 0u; e < lib->NumExports; ++e) {
+                    register_export(lib->pExports[e].Name);
+                }
+            } else if (sub.Type == D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP && sub.pDesc) {
+                const auto* hg = static_cast<const D3D12_HIT_GROUP_DESC*>(sub.pDesc);
+                register_export(hg->HitGroupExport);
+            }
+        }
+    }
+    RegisterProxy(
+        static_cast<const ID3D12StateObject*>(this),
+        D3D12XProxyKind::StateObject,
+        host_so_);
+}
+
+StateObjectXProxy::~StateObjectXProxy() {
+    UnregisterProxy(static_cast<const ID3D12StateObject*>(this));
+    if (host_props_) host_props_->Release();
+    if (host_so_) host_so_->Release();
+    if (device_x_) device_x_->Release();
+}
+
+HRESULT STDMETHODCALLTYPE StateObjectXProxy::QueryInterface(REFIID riid, void** ppvObject) {
+    if (!ppvObject) return E_POINTER;
+    *ppvObject = nullptr;
+    if (IsEqualIID(riid, OS_D3D12_IID(IUnknown)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Object)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12DeviceChild)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Pageable)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12StateObject)) ||
+        IsEqualIID(riid, IID_ID3D12StateObjectX)) {
+        *ppvObject = static_cast<ID3D12StateObject*>(this);
+        AddRef();
+        return S_OK;
+    }
+    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12StateObjectProperties)) &&
+        (host_props_ != nullptr || host_so_ == nullptr)) {
+        *ppvObject = static_cast<ID3D12StateObjectProperties*>(this);
+        AddRef();
+        return S_OK;
+    }
+    if (IsEqualIID(riid, IID_IOpenScarlettProxyInspect)) {
+        *ppvObject = static_cast<IOpenScarlettProxyInspect*>(this);
+        AddRef();
+        return S_OK;
+    }
+    return host_so_ ? host_so_->QueryInterface(riid, ppvObject) : E_NOINTERFACE;
+}
+
+ULONG STDMETHODCALLTYPE StateObjectXProxy::AddRef() {
+    return ref_count_.fetch_add(1u, std::memory_order_relaxed) + 1u;
+}
+
+ULONG STDMETHODCALLTYPE StateObjectXProxy::Release() {
+    const ULONG rem = ref_count_.fetch_sub(1u, std::memory_order_acq_rel) - 1u;
+    if (rem == 0u) delete this;
+    return rem;
+}
+
+HRESULT STDMETHODCALLTYPE StateObjectXProxy::GetPrivateData(REFGUID guid, UINT* pDataSize, void* pData) {
+    if (host_so_) return host_so_->GetPrivateData(guid, pDataSize, pData);
+    if (!pDataSize) return E_POINTER;
+    GuidKey key{};
+    std::memcpy(key.bytes, &guid, 16u);
+    std::lock_guard<std::mutex> lock(sw_mutex_);
+    auto it = sw_private_data_.find(key);
+    if (it == sw_private_data_.end()) return DXGI_ERROR_NOT_FOUND;
+    const UINT stored = static_cast<UINT>(it->second.size());
+    if (!pData) {
+        *pDataSize = stored;
+        return S_OK;
+    }
+    if (*pDataSize < stored) {
+        *pDataSize = stored;
+        return DXGI_ERROR_MORE_DATA;
+    }
+    if (stored > 0u) std::memcpy(pData, it->second.data(), stored);
+    *pDataSize = stored;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE StateObjectXProxy::SetPrivateData(REFGUID guid, UINT DataSize, const void* pData) {
+    if (host_so_) return host_so_->SetPrivateData(guid, DataSize, pData);
+    GuidKey key{};
+    std::memcpy(key.bytes, &guid, 16u);
+    std::lock_guard<std::mutex> lock(sw_mutex_);
+    if (!pData || DataSize == 0u) {
+        sw_private_data_.erase(key);
+        return S_OK;
+    }
+    const auto* bytes = static_cast<const uint8_t*>(pData);
+    sw_private_data_[key].assign(bytes, bytes + DataSize);
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE StateObjectXProxy::SetPrivateDataInterface(REFGUID guid, const IUnknown* pData) {
+    return host_so_ ? host_so_->SetPrivateDataInterface(guid, pData) : S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE StateObjectXProxy::SetName(LPCWSTR Name) {
+    if (host_so_) return host_so_->SetName(Name);
+    std::lock_guard<std::mutex> lock(sw_mutex_);
+    sw_name_ = Name ? Name : L"";
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE StateObjectXProxy::GetDevice(REFIID riid, void** ppvDevice) {
+    return device_x_ ? device_x_->QueryInterface(riid, ppvDevice) : E_FAIL;
+}
+
+void* STDMETHODCALLTYPE StateObjectXProxy::GetShaderIdentifier(LPCWSTR pExportName) {
+    if (host_props_) return host_props_->GetShaderIdentifier(pExportName);
+    if (!pExportName || !pExportName[0]) return nullptr;
+    std::lock_guard<std::mutex> lock(sw_mutex_);
+    auto it = sw_shader_ids_.find(pExportName);
+    return (it != sw_shader_ids_.end()) ? static_cast<void*>(it->second.data()) : nullptr;
+}
+
+UINT64 STDMETHODCALLTYPE StateObjectXProxy::GetShaderStackSize(LPCWSTR pExportName) {
+    if (host_props_) return host_props_->GetShaderStackSize(pExportName);
+    if (!pExportName || !pExportName[0]) return 0ull;
+    std::lock_guard<std::mutex> lock(sw_mutex_);
+    return (sw_shader_ids_.find(pExportName) != sw_shader_ids_.end()) ? 256ull : 0ull;
+}
+
+UINT64 STDMETHODCALLTYPE StateObjectXProxy::GetPipelineStackSize() {
+    if (host_props_) return host_props_->GetPipelineStackSize();
+    return sw_pipeline_stack_size_.load(std::memory_order_relaxed);
+}
+
+void STDMETHODCALLTYPE StateObjectXProxy::SetPipelineStackSize(UINT64 PipelineStackSizeInBytes) {
+    if (host_props_) {
+        host_props_->SetPipelineStackSize(PipelineStackSizeInBytes);
+    } else {
+        sw_pipeline_stack_size_.store(PipelineStackSizeInBytes, std::memory_order_relaxed);
+    }
+}
+
+}  // namespace openscarlett::d3d12_xs

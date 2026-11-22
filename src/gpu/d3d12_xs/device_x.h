@@ -89,6 +89,28 @@ public:
     ID3D12Device* HostDevice() const noexcept { return host_dev_; }
     const D3D12AdapterInfo& AdapterInfo() const noexcept { return adapter_info_; }
     HWND DefaultWindow() const noexcept { return default_hwnd_; }
+    bool SupportsDepthBoundsTest() const noexcept { return supports_depth_bounds_test_; }
+    bool SupportsViewInstancing() const noexcept { return supports_view_instancing_; }
+    bool SupportsProgrammableSamplePositions() const noexcept {
+        return supports_programmable_sample_positions_;
+    }
+
+    // Lifecycle cleanup notifications invoked by proxy destructors to prevent stale pointer reuse.
+    void NotifyResourceDestroyed(ID3D12Resource* host_resource) noexcept;
+    void NotifyHeapDestroyed(ID3D12Heap* host_heap) noexcept;
+    void NotifyPipelineDestroyed(ID3D12PipelineState* pso_key) noexcept;
+
+    // Zero-overhead C++ integration hooks for TitleVAMirror & DescriptorSgprBridge.
+    using GuestGpuVaTranslatorFn = D3D12_GPU_VIRTUAL_ADDRESS (*)(
+        D3D12_GPU_VIRTUAL_ADDRESS guest_va, void* user_ctx) noexcept;
+    using DescriptorCreateHookFn = void (*)(
+        D3D12_DESCRIPTOR_HEAP_TYPE heap_type,
+        D3D12_CPU_DESCRIPTOR_HANDLE dest,
+        ID3D12Resource* host_resource,
+        D3D12_GPU_VIRTUAL_ADDRESS gpu_va,
+        void* user_ctx) noexcept;
+    void SetGuestGpuVaTranslatorHook(GuestGpuVaTranslatorFn fn, void* user_ctx) noexcept;
+    void SetDescriptorCreateHook(DescriptorCreateHookFn fn, void* user_ctx) noexcept;
     bool IsR9G9B9E5UavFallbackActive() const noexcept;
     static void SetForceR9G9B9E5UavFallback(bool force) noexcept;
     static void SetGlobalBackendMode(uint32_t backend_mode) noexcept;
@@ -438,11 +460,20 @@ private:
     D3D12AdapterInfo adapter_info_{};
     HWND default_hwnd_ = nullptr;
     bool supports_r9g9b9e5_uav_ = false;
+    bool supports_depth_bounds_test_ = false;
+    bool supports_view_instancing_ = false;
+    bool supports_programmable_sample_positions_ = false;
     std::atomic<uint32_t> frame_interval_us_{16667u};
     std::atomic<uint32_t> max_frame_latency_{2u};
     std::atomic<uint64_t> next_frame_token_{1ull};
     std::atomic<bool> suspended_{false};
+    std::mutex shader_lift_mutex_;
     openscarlett::ShaderCache shader_cache_;
+
+    std::atomic<GuestGpuVaTranslatorFn> va_translator_hook_{nullptr};
+    std::atomic<void*> va_translator_ctx_{nullptr};
+    std::atomic<DescriptorCreateHookFn> descriptor_create_hook_{nullptr};
+    std::atomic<void*> descriptor_create_ctx_{nullptr};
 
     mutable std::mutex fallback_mutex_;
     std::unordered_set<ID3D12Resource*> r9g9b9e5_fallback_resources_;

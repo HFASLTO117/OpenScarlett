@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "openscarlett/gpu/d3d12_xs_abi.h"
+#include "proxies_x.h"
 
 namespace openscarlett::d3d12_xs {
 
@@ -70,7 +71,9 @@ struct VulkanRecordedBatch {
     bool has_host_commands = false;
 };
 
-class CommandListX final : public ID3D12GraphicsCommandListX {
+class CommandListX final
+    : public ID3D12GraphicsCommandListX,
+      public IOpenScarlettCommandListExtState {
 public:
     CommandListX(DeviceX* parent_device, ID3D12GraphicsCommandList* host_list);
     ~CommandListX();
@@ -317,6 +320,10 @@ public:
         float* out_slope_scaled_depth_bias) const noexcept;
     uint64_t KickoffCount() const noexcept { return kickoff_count_.load(std::memory_order_relaxed); }
 
+    // IOpenScarlettCommandListExtState
+    HRESULT STDMETHODCALLTYPE GetCommandListExtState(
+        D3D12XBOX_CMDLIST_EXT_STATE* out_state) const noexcept override;
+
 private:
     std::atomic<ULONG> ref_count_{1};
     DeviceX* device_x_ = nullptr;
@@ -327,11 +334,20 @@ private:
     ID3D12GraphicsCommandList4* host_list4_ = nullptr;
     ID3D12GraphicsCommandList5* host_list5_ = nullptr;
     ID3D12GraphicsCommandList6* host_list6_ = nullptr;
+    D3D12_COMMAND_LIST_TYPE list_type_ = D3D12_COMMAND_LIST_TYPE_DIRECT;
     std::atomic<uint64_t> gpu_va_hint_{0};
     std::atomic<uint64_t> kickoff_count_{0};
     std::atomic<float> depth_bias_{0.0f};
     std::atomic<float> depth_bias_clamp_{0.0f};
     std::atomic<float> slope_scaled_depth_bias_{0.0f};
+    std::atomic<float> depth_bounds_min_{0.0f};
+    std::atomic<float> depth_bounds_max_{1.0f};
+    std::atomic<uint32_t> view_instance_mask_{0u};
+    std::atomic<uint64_t> write_buffer_immediate_calls_{0ull};
+    mutable std::mutex ext_state_mutex_;
+    uint32_t sample_positions_per_pixel_ = 0u;
+    uint32_t sample_positions_pixels_ = 0u;
+    std::vector<D3D12_SAMPLE_POSITION> sample_positions_;
 
     // Vulkan command-list routing recording state (used only when DeviceX::IsVulkanRoutingActive())
     mutable std::mutex vk_rec_mutex_;
