@@ -2,12 +2,73 @@
 
 #include <atomic>
 #include <cstdint>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 
 #include "openscarlett/gpu/d3d12_xs_abi.h"
 
 namespace openscarlett::d3d12_xs {
 
 class DeviceX;
+
+enum class VulkanRecordedOpKind : uint8_t {
+    Barrier = 0,
+    ClearRtv = 1,
+    ClearDsv = 2,
+    CopyBuffer = 3,
+    CopyTexture = 4,
+    CopyResource = 5,
+    DrawInstanced = 6,
+    DrawIndexedInstanced = 7,
+    Dispatch = 8,
+    DispatchMesh = 9,
+};
+
+struct VulkanRecordedOp {
+    VulkanRecordedOpKind kind = VulkanRecordedOpKind::Barrier;
+    ID3D12PipelineState* pso = nullptr;
+    bool is_spirv_direct = false;
+
+    // Draw / Dispatch / Mesh params
+    uint32_t x = 0u;
+    uint32_t y = 0u;
+    uint32_t z = 0u;
+    uint32_t start_location = 0u;
+    int32_t base_vertex = 0;
+
+    // Clear / RT / Viewport state snapshot
+    ID3D12Resource* rtv_resource = nullptr;
+    ID3D12Resource* dsv_resource = nullptr;
+    bool has_clear_color = false;
+    float clear_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    float clear_depth = 1.0f;
+    uint32_t viewport_width = 0u;
+    uint32_t viewport_height = 0u;
+
+    // Geometry & root bindings snapshot
+    D3D12_VERTEX_BUFFER_VIEW vbv{};
+    bool has_vbv = false;
+    D3D12_INDEX_BUFFER_VIEW ibv{};
+    bool has_ibv = false;
+    std::vector<uint32_t> root_constants;
+    std::vector<D3D12_GPU_VIRTUAL_ADDRESS> root_cbvs;
+    std::vector<D3D12_GPU_VIRTUAL_ADDRESS> root_srvs;
+    std::vector<D3D12_GPU_VIRTUAL_ADDRESS> root_uavs;
+
+    // Copy params
+    ID3D12Resource* dst_resource = nullptr;
+    ID3D12Resource* src_resource = nullptr;
+    uint64_t dst_offset = 0ull;
+    uint64_t src_offset = 0ull;
+    uint64_t num_bytes = 0ull;
+    uint32_t barrier_count = 0u;
+};
+
+struct VulkanRecordedBatch {
+    std::vector<VulkanRecordedOp> ops;
+    bool has_host_commands = false;
+};
 
 class CommandListX final : public ID3D12GraphicsCommandListX {
 public:
@@ -24,6 +85,8 @@ public:
     static ID3D12CommandList* UnwrapHostList(ID3D12CommandList* maybe_wrapped) noexcept;
     static ID3D12GraphicsCommandList* UnwrapHostGraphicsList(
         ID3D12GraphicsCommandList* maybe_wrapped) noexcept;
+    static CommandListX* TryFromCommandList(ID3D12CommandList* maybe_wrapped) noexcept;
+    void CopyVulkanRecordedBatch(VulkanRecordedBatch& out_batch) const;
 
     // IUnknown (slots 0..2)
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override;
@@ -269,6 +332,31 @@ private:
     std::atomic<float> depth_bias_{0.0f};
     std::atomic<float> depth_bias_clamp_{0.0f};
     std::atomic<float> slope_scaled_depth_bias_{0.0f};
+
+    // Vulkan command-list routing recording state (used only when DeviceX::IsVulkanRoutingActive())
+    mutable std::mutex vk_rec_mutex_;
+    VulkanRecordedBatch vk_batch_;
+    ID3D12PipelineState* vk_cur_pso_ = nullptr;
+    bool vk_cur_pso_is_spirv_ = false;
+    ID3D12Resource* vk_cur_rtv_ = nullptr;
+    ID3D12Resource* vk_cur_dsv_ = nullptr;
+    bool vk_has_clear_color_ = false;
+    float vk_clear_color_[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    float vk_clear_depth_ = 1.0f;
+    uint32_t vk_vp_width_ = 0u;
+    uint32_t vk_vp_height_ = 0u;
+    D3D12_VERTEX_BUFFER_VIEW vk_cur_vbv_{};
+    bool vk_has_vbv_ = false;
+    D3D12_INDEX_BUFFER_VIEW vk_cur_ibv_{};
+    bool vk_has_ibv_ = false;
+    std::vector<uint32_t> vk_gfx_root_constants_;
+    std::vector<uint32_t> vk_cmp_root_constants_;
+    std::vector<D3D12_GPU_VIRTUAL_ADDRESS> vk_gfx_cbvs_;
+    std::vector<D3D12_GPU_VIRTUAL_ADDRESS> vk_gfx_srvs_;
+    std::vector<D3D12_GPU_VIRTUAL_ADDRESS> vk_gfx_uavs_;
+    std::vector<D3D12_GPU_VIRTUAL_ADDRESS> vk_cmp_cbvs_;
+    std::vector<D3D12_GPU_VIRTUAL_ADDRESS> vk_cmp_srvs_;
+    std::vector<D3D12_GPU_VIRTUAL_ADDRESS> vk_cmp_uavs_;
 };
 
 }  // namespace openscarlett::d3d12_xs

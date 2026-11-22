@@ -600,6 +600,12 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::QueryInterface(REFIID riid, void** ppvO
         RecordQueue("ID3D12CommandQueueX::QueryInterface", 0, S_OK);
         return S_OK;
     }
+    if (IsEqualIID(riid, IID_IOpenScarlettPresentTiming)) {
+        *ppvObject = static_cast<IOpenScarlettPresentTiming*>(this);
+        AddRef();
+        RecordQueue("ID3D12CommandQueueX::QueryInterface", 0, S_OK);
+        return S_OK;
+    }
     RecordQueue("ID3D12CommandQueueX::QueryInterface", 0, E_NOINTERFACE);
     return E_NOINTERFACE;
 }
@@ -716,7 +722,332 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
     }
 
     host_queue_->ExecuteCommandLists(NumCommandLists, raw_lists);
+
+    if (device_x_ && device_x_->IsVulkanRoutingActive()) {
+        for (UINT i = 0; i < NumCommandLists; ++i) {
+            CommandListX* clx = CommandListX::TryFromCommandList(ppCommandLists[i]);
+            if (clx) {
+                VulkanRecordedBatch batch{};
+                clx->CopyVulkanRecordedBatch(batch);
+                ExecuteVulkanRecordedBatch(batch);
+            }
+        }
+    }
+
     RecordQueue("ID3D12CommandQueueX::ExecuteCommandLists", 10, S_OK);
+}
+
+void CommandQueueX::ExecuteVulkanRecordedBatch(const VulkanRecordedBatch& batch) {
+    if (!device_x_ || !device_x_->IsVulkanRoutingActive()) return;
+    openscarlett::VulkanBackend* vk = device_x_->GetVulkanBackend();
+    if (!vk || !vk->IsInitialized()) return;
+
+    openscarlett::VulkanCommandListDesc vk_cl_desc{};
+    vk_cl_desc.submit_empty_fence_sync = true;
+
+    uint64_t draws_cnt = 0ull;
+    uint64_t indexed_draws_cnt = 0ull;
+    uint64_t dispatches_cnt = 0ull;
+    uint64_t mesh_cnt = 0ull;
+    uint64_t copies_cnt = 0ull;
+    uint64_t barriers_cnt = 0ull;
+    uint64_t rtv_clears_cnt = 0ull;
+    uint64_t dsv_clears_cnt = 0ull;
+    uint64_t icd_execs_cnt = 0ull;
+    uint64_t spirv_draws_cnt = 0ull;
+    uint64_t spirv_dispatches_cnt = 0ull;
+    uint64_t spirv_mesh_cnt = 0ull;
+
+    for (const auto& op : batch.ops) {
+        switch (op.kind) {
+            case VulkanRecordedOpKind::Barrier: {
+                const uint32_t n = std::max<uint32_t>(1u, op.barrier_count);
+                barriers_cnt += n;
+                for (uint32_t b = 0; b < n; ++b) {
+                    openscarlett::VulkanCommandItem item{};
+                    item.op = openscarlett::VulkanCommandOp::PipelineBarrier;
+                    vk_cl_desc.commands.push_back(item);
+                }
+                break;
+            }
+            case VulkanRecordedOpKind::ClearRtv: {
+                ++rtv_clears_cnt;
+                openscarlett::VulkanCommandItem item{};
+                item.op = openscarlett::VulkanCommandOp::PipelineBarrier;
+                vk_cl_desc.commands.push_back(item);
+                break;
+            }
+            case VulkanRecordedOpKind::ClearDsv: {
+                ++dsv_clears_cnt;
+                openscarlett::VulkanCommandItem item{};
+                item.op = openscarlett::VulkanCommandOp::PipelineBarrier;
+                vk_cl_desc.commands.push_back(item);
+                break;
+            }
+            case VulkanRecordedOpKind::CopyBuffer: {
+                ++copies_cnt;
+                openscarlett::VulkanCommandItem item{};
+                item.op = openscarlett::VulkanCommandOp::PipelineBarrier;
+                vk_cl_desc.commands.push_back(item);
+                if (op.src_resource && op.dst_resource && op.num_bytes > 0ull) {
+                    std::vector<uint8_t> shadow;
+                    if (device_x_->ReadVulkanBufferData(op.src_resource, op.src_offset, op.num_bytes, shadow) &&
+                        !shadow.empty()) {
+                        // Wait for host queue so host CopyBufferRegion doesn't overwrite Vulkan compute results.
+                        {
+                            std::lock_guard<std::mutex> lk(present_mutex_);
+                            if (SUCCEEDED(EnsurePresentHelperObjectsLocked())) {
+                                WaitForInternalFenceLocked();
+                            }
+                        }
+                        device_x_->WriteVulkanBufferData(
+                            op.dst_resource, op.dst_offset, shadow.data(), shadow.size());
+                    }
+                }
+                break;
+            }
+            case VulkanRecordedOpKind::CopyTexture:
+            case VulkanRecordedOpKind::CopyResource: {
+                ++copies_cnt;
+                openscarlett::VulkanCommandItem item{};
+                item.op = openscarlett::VulkanCommandOp::PipelineBarrier;
+                vk_cl_desc.commands.push_back(item);
+                if (op.src_resource && op.dst_resource) {
+                    openscarlett::FrameBufferRgba8 src_fb{};
+                    if (device_x_->TryGetVulkanRenderTargetFramebuffer(op.src_resource, src_fb)) {
+                        device_x_->StoreVulkanRenderTargetFramebuffer(op.dst_resource, src_fb);
+                    }
+                }
+                break;
+            }
+            case VulkanRecordedOpKind::DrawInstanced:
+            case VulkanRecordedOpKind::DrawIndexedInstanced: {
+                const bool indexed = (op.kind == VulkanRecordedOpKind::DrawIndexedInstanced);
+                if (indexed) ++indexed_draws_cnt;
+                else ++draws_cnt;
+
+                openscarlett::VulkanCommandItem item{};
+                item.op = openscarlett::VulkanCommandOp::Nop;
+                item.x = op.x;
+                item.y = op.y;
+                vk_cl_desc.commands.push_back(item);
+
+                if (op.is_spirv_direct && op.pso) {
+                    VulkanPipelineInfo pi{};
+                    if (device_x_->LookupVulkanPipeline(op.pso, pi) &&
+                        !pi.vs_spirv.empty() && !pi.ps_spirv.empty()) {
+                        openscarlett::VulkanGraphicsDrawDesc gdesc{};
+                        gdesc.vertex_spirv = pi.vs_spirv;
+                        gdesc.fragment_spirv = pi.ps_spirv;
+                        gdesc.vertex_entry = pi.vs_entry;
+                        gdesc.fragment_entry = pi.ps_entry;
+                        gdesc.color_format = pi.color_format;
+                        gdesc.enable_depth = pi.enable_depth;
+                        gdesc.depth_write = pi.depth_write;
+                        if (op.has_clear_color) {
+                            std::memcpy(gdesc.clear_color, op.clear_color, sizeof(gdesc.clear_color));
+                        }
+                        gdesc.clear_depth = op.clear_depth;
+                        if (op.rtv_resource) {
+                            const D3D12_RESOURCE_DESC rdesc = op.rtv_resource->GetDesc();
+                            gdesc.width = static_cast<uint32_t>(std::max<UINT64>(1ull, rdesc.Width));
+                            gdesc.height = std::max<UINT>(1u, rdesc.Height);
+                        } else if (op.viewport_width > 0u && op.viewport_height > 0u) {
+                            gdesc.width = op.viewport_width;
+                            gdesc.height = op.viewport_height;
+                        }
+                        if (op.has_vbv && op.vbv.BufferLocation != 0ull && op.vbv.SizeInBytes > 0u) {
+                            uint64_t vb_off = 0ull;
+                            ID3D12Resource* vb_res =
+                                device_x_->ResolveVulkanBufferByGpuVa(op.vbv.BufferLocation, &vb_off);
+                            if (vb_res) {
+                                device_x_->ReadVulkanBufferData(
+                                    vb_res, vb_off, op.vbv.SizeInBytes, gdesc.vertex_bytes);
+                            }
+                            gdesc.vertex_stride =
+                                (op.vbv.StrideInBytes > 0u) ? op.vbv.StrideInBytes : pi.vertex_stride_hint;
+                            gdesc.vertex_attributes = pi.vertex_attrs;
+                        }
+                        if (indexed && op.has_ibv && op.ibv.BufferLocation != 0ull && op.ibv.SizeInBytes > 0u) {
+                            uint64_t ib_off = 0ull;
+                            ID3D12Resource* ib_res =
+                                device_x_->ResolveVulkanBufferByGpuVa(op.ibv.BufferLocation, &ib_off);
+                            std::vector<uint8_t> raw_ib;
+                            if (ib_res &&
+                                device_x_->ReadVulkanBufferData(ib_res, ib_off, op.ibv.SizeInBytes, raw_ib)) {
+                                if (op.ibv.Format == DXGI_FORMAT_R16_UINT) {
+                                    const size_t cnt = std::min<size_t>(op.x, raw_ib.size() / 2u);
+                                    gdesc.indices.resize(cnt);
+                                    for (size_t k = 0; k < cnt; ++k) {
+                                        uint16_t idx16 = 0u;
+                                        std::memcpy(&idx16, raw_ib.data() + k * 2u, 2u);
+                                        gdesc.indices[k] = static_cast<uint32_t>(idx16);
+                                    }
+                                } else {
+                                    const size_t cnt = std::min<size_t>(op.x, raw_ib.size() / 4u);
+                                    gdesc.indices.resize(cnt);
+                                    std::memcpy(gdesc.indices.data(), raw_ib.data(), cnt * sizeof(uint32_t));
+                                }
+                            }
+                        } else {
+                            gdesc.vertex_count = std::max<uint32_t>(1u, op.x);
+                        }
+                        if (!op.root_constants.empty()) {
+                            gdesc.push_constants.resize(op.root_constants.size() * sizeof(uint32_t));
+                            std::memcpy(gdesc.push_constants.data(), op.root_constants.data(),
+                                        gdesc.push_constants.size());
+                        }
+                        for (uint32_t bi = 0; bi < op.root_cbvs.size(); ++bi) {
+                            if (op.root_cbvs[bi] == 0ull) continue;
+                            uint64_t boff = 0ull;
+                            ID3D12Resource* bres =
+                                device_x_->ResolveVulkanBufferByGpuVa(op.root_cbvs[bi], &boff);
+                            std::vector<uint8_t> bbytes;
+                            if (bres && device_x_->ReadVulkanBufferData(bres, boff, 0ull, bbytes)) {
+                                openscarlett::VulkanDescriptorBinding db{};
+                                db.binding = bi;
+                                db.kind = openscarlett::VulkanDescriptorKind::UniformBuffer;
+                                db.buffer_data = std::move(bbytes);
+                                gdesc.descriptors.push_back(std::move(db));
+                            }
+                        }
+                        openscarlett::VulkanGraphicsDrawResult gres{};
+                        if (vk->ExecuteGraphicsDraw(gdesc, gres).ok()) {
+                            ++spirv_draws_cnt;
+                            if (gres.executed_on_vulkan_icd) ++icd_execs_cnt;
+                            if (op.rtv_resource) {
+                                device_x_->StoreVulkanRenderTargetFramebuffer(op.rtv_resource, gres.framebuffer);
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+            case VulkanRecordedOpKind::Dispatch: {
+                ++dispatches_cnt;
+                openscarlett::VulkanCommandItem item{};
+                item.op = openscarlett::VulkanCommandOp::Dispatch;
+                item.x = std::max<uint32_t>(1u, op.x);
+                item.y = std::max<uint32_t>(1u, op.y);
+                item.z = std::max<uint32_t>(1u, op.z);
+                vk_cl_desc.commands.push_back(item);
+
+                if (op.is_spirv_direct && op.pso) {
+                    VulkanPipelineInfo pi{};
+                    if (device_x_->LookupVulkanPipeline(op.pso, pi) && !pi.cs_spirv.empty()) {
+                        ID3D12Resource* in_res = nullptr;
+                        uint64_t in_off = 0ull;
+                        for (D3D12_GPU_VIRTUAL_ADDRESS va : op.root_srvs) {
+                            if (va != 0ull) {
+                                in_res = device_x_->ResolveVulkanBufferByGpuVa(va, &in_off);
+                                if (in_res) break;
+                            }
+                        }
+                        ID3D12Resource* out_res = nullptr;
+                        uint64_t out_off = 0ull;
+                        for (D3D12_GPU_VIRTUAL_ADDRESS va : op.root_uavs) {
+                            if (va != 0ull) {
+                                out_res = device_x_->ResolveVulkanBufferByGpuVa(va, &out_off);
+                                if (out_res) break;
+                            }
+                        }
+                        std::vector<uint8_t> raw_in;
+                        if (in_res) {
+                            device_x_->ReadVulkanBufferData(in_res, in_off, 0ull, raw_in);
+                        }
+                        std::vector<uint32_t> input_u32;
+                        if (raw_in.size() >= 4u) {
+                            input_u32.resize(raw_in.size() / 4u);
+                            std::memcpy(input_u32.data(), raw_in.data(), input_u32.size() * sizeof(uint32_t));
+                        } else {
+                            input_u32.assign(std::max<uint32_t>(1u, op.x), 0u);
+                        }
+                        std::vector<uint32_t> output_u32;
+                        openscarlett::VulkanComputeDispatchOptions copts{};
+                        openscarlett::VulkanComputeDispatchResult cres{};
+                        if (vk->ExecuteComputeShaderEx(
+                                pi.cs_spirv, input_u32, output_u32,
+                                std::max<uint32_t>(1u, op.x), copts, cres).ok()) {
+                            ++spirv_dispatches_cnt;
+                            if (cres.executed_on_vulkan_icd) ++icd_execs_cnt;
+                            if (out_res && !output_u32.empty()) {
+                                device_x_->WriteVulkanBufferData(
+                                    out_res, out_off, output_u32.data(), output_u32.size() * sizeof(uint32_t));
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+            case VulkanRecordedOpKind::DispatchMesh: {
+                ++mesh_cnt;
+                openscarlett::VulkanCommandItem item{};
+                item.op = openscarlett::VulkanCommandOp::Dispatch;
+                item.x = std::max<uint32_t>(1u, op.x);
+                item.y = std::max<uint32_t>(1u, op.y);
+                item.z = std::max<uint32_t>(1u, op.z);
+                vk_cl_desc.commands.push_back(item);
+
+                if (op.is_spirv_direct && op.pso) {
+                    VulkanPipelineInfo pi{};
+                    if (device_x_->LookupVulkanPipeline(op.pso, pi) &&
+                        !pi.ms_spirv.empty() && !pi.ps_spirv.empty()) {
+                        openscarlett::VulkanMeshDrawDesc mdesc{};
+                        mdesc.task_spirv = pi.as_spirv;
+                        mdesc.mesh_spirv = pi.ms_spirv;
+                        mdesc.fragment_spirv = pi.ps_spirv;
+                        mdesc.task_entry = pi.as_entry;
+                        mdesc.mesh_entry = pi.ms_entry;
+                        mdesc.fragment_entry = pi.ps_entry;
+                        mdesc.group_count_x = std::max<uint32_t>(1u, op.x);
+                        mdesc.group_count_y = std::max<uint32_t>(1u, op.y);
+                        mdesc.group_count_z = std::max<uint32_t>(1u, op.z);
+                        mdesc.color_format = pi.color_format;
+                        mdesc.enable_depth = pi.enable_depth;
+                        if (op.has_clear_color) {
+                            std::memcpy(mdesc.clear_color, op.clear_color, sizeof(mdesc.clear_color));
+                        }
+                        mdesc.clear_depth = op.clear_depth;
+                        if (op.rtv_resource) {
+                            const D3D12_RESOURCE_DESC rdesc = op.rtv_resource->GetDesc();
+                            mdesc.width = static_cast<uint32_t>(std::max<UINT64>(1ull, rdesc.Width));
+                            mdesc.height = std::max<UINT>(1u, rdesc.Height);
+                        } else if (op.viewport_width > 0u && op.viewport_height > 0u) {
+                            mdesc.width = op.viewport_width;
+                            mdesc.height = op.viewport_height;
+                        }
+                        if (!op.root_constants.empty()) {
+                            mdesc.push_constants.resize(op.root_constants.size() * sizeof(uint32_t));
+                            std::memcpy(mdesc.push_constants.data(), op.root_constants.data(),
+                                        mdesc.push_constants.size());
+                        }
+                        openscarlett::VulkanMeshDrawResult mres{};
+                        if (vk->ExecuteMeshShaderDraw(mdesc, mres).ok()) {
+                            ++spirv_mesh_cnt;
+                            if (mres.executed_on_mesh_shader_hw) ++icd_execs_cnt;
+                            if (op.rtv_resource) {
+                                device_x_->StoreVulkanRenderTargetFramebuffer(op.rtv_resource, mres.framebuffer);
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    // Record & submit real VkCommandBuffer on the live Vulkan ICD for every routed command list.
+    openscarlett::VulkanCommandListResult vk_cl_res{};
+    if (vk->RecordCommandList(vk_cl_desc, vk_cl_res).ok()) {
+        if (vk_cl_res.executed_on_vulkan_icd) {
+            ++icd_execs_cnt;
+        }
+    }
+
+    device_x_->RecordVulkanRoutingCounters(
+        1ull, draws_cnt, indexed_draws_cnt, dispatches_cnt, mesh_cnt,
+        copies_cnt, barriers_cnt, rtv_clears_cnt, dsv_clears_cnt,
+        0ull, icd_execs_cnt, spirv_draws_cnt, spirv_dispatches_cnt, spirv_mesh_cnt);
 }
 
 void STDMETHODCALLTYPE CommandQueueX::SetMarker(UINT Metadata, const void* pData, UINT Size) {
@@ -843,7 +1174,54 @@ void CommandQueueX::DetachWindowSubclassLocked() {
     }
 }
 
+void CommandQueueX::ReleaseVulkanSwapChainLocked() {
+    if (vk_swapchain_handle_ != 0ull && device_x_ && device_x_->GetVulkanBackend() &&
+        device_x_->GetVulkanBackend()->IsInitialized()) {
+        device_x_->GetVulkanBackend()->DestroyWin32Swapchain(vk_swapchain_handle_);
+    }
+    vk_swapchain_handle_ = 0ull;
+    vk_swapchain_info_ = openscarlett::VulkanSwapchainInfo{};
+    vk_swapchain_hwnd_ = nullptr;
+    vk_swapchain_width_ = 0u;
+    vk_swapchain_height_ = 0u;
+    vk_swapchain_headless_ = false;
+}
+
+HRESULT CommandQueueX::EnsureVulkanSwapChainLocked(
+    HWND hwnd, uint32_t width, uint32_t height, bool prefer_hdr10, bool headless) {
+    if (!device_x_ || !device_x_->GetVulkanBackend() || !device_x_->GetVulkanBackend()->IsInitialized()) {
+        return E_FAIL;
+    }
+    if (vk_swapchain_handle_ != 0ull &&
+        vk_swapchain_hwnd_ == hwnd &&
+        vk_swapchain_width_ == width &&
+        vk_swapchain_height_ == height &&
+        vk_swapchain_headless_ == headless) {
+        return S_OK;
+    }
+    ReleaseVulkanSwapChainLocked();
+    openscarlett::VulkanSwapchainDesc sc_desc{};
+    sc_desc.hwnd = headless ? nullptr : static_cast<void*>(hwnd);
+    sc_desc.width = std::max<uint32_t>(1u, width);
+    sc_desc.height = std::max<uint32_t>(1u, height);
+    sc_desc.prefer_hdr10 = prefer_hdr10;
+    sc_desc.headless_offscreen = headless;
+    openscarlett::VulkanSwapchainInfo info{};
+    openscarlett::Status st = device_x_->GetVulkanBackend()->CreateWin32Swapchain(sc_desc, info);
+    if (!st.ok()) {
+        return E_FAIL;
+    }
+    vk_swapchain_handle_ = info.handle;
+    vk_swapchain_info_ = info;
+    vk_swapchain_hwnd_ = hwnd;
+    vk_swapchain_width_ = width;
+    vk_swapchain_height_ = height;
+    vk_swapchain_headless_ = headless;
+    return S_OK;
+}
+
 void CommandQueueX::ReleaseSwapChainLocked() {
+    ReleaseVulkanSwapChainLocked();
     if (present_fence_ && host_queue_) {
         WaitForInternalFenceLocked();
     }
@@ -1268,9 +1646,18 @@ void CommandQueueX::PaceFrameLocked(uint32_t frame_interval_us) {
     }
 }
 
-HRESULT CommandQueueX::WaitForInternalFenceLocked() {
-    if (!present_fence_ || !present_fence_event_) return S_OK;
+HRESULT CommandQueueX::WaitForInternalFenceWithTimingLocked(
+    int64_t* out_signal_qpc,
+    double* out_wait_us,
+    uint64_t* out_completed_value) {
+    if (!present_fence_ || !present_fence_event_) {
+        if (out_signal_qpc) *out_signal_qpc = QueryQpcNow();
+        if (out_wait_us) *out_wait_us = 0.0;
+        if (out_completed_value) *out_completed_value = present_fence_val_;
+        return S_OK;
+    }
     const uint64_t target = ++present_fence_val_;
+    const int64_t sig_qpc = QueryQpcNow();
     HRESULT hr = host_queue_->Signal(present_fence_, target);
     if (FAILED(hr)) return hr;
     if (present_fence_->GetCompletedValue() < target) {
@@ -1279,7 +1666,21 @@ HRESULT CommandQueueX::WaitForInternalFenceLocked() {
         const DWORD wr = WaitForSingleObject(present_fence_event_, 15000);
         if (wr != WAIT_OBJECT_0) return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
     }
+    const int64_t done_qpc = QueryQpcNow();
+    if (out_signal_qpc) *out_signal_qpc = sig_qpc;
+    if (out_wait_us) {
+        *out_wait_us = (qpc_freq_ > 0)
+                           ? (static_cast<double>(done_qpc - sig_qpc) * 1000000.0 / static_cast<double>(qpc_freq_))
+                           : 0.0;
+    }
+    if (out_completed_value) {
+        *out_completed_value = present_fence_->GetCompletedValue();
+    }
     return S_OK;
+}
+
+HRESULT CommandQueueX::WaitForInternalFenceLocked() {
+    return WaitForInternalFenceWithTimingLocked(nullptr, nullptr, nullptr);
 }
 
 void CommandQueueX::ReleasePresentObjectsLocked() {
@@ -1303,12 +1704,30 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
     const D3D12XBOX_PRESENT_PARAMETERS* pPresentParameters,
     void* pPresentToken) {
     (void)pPresentToken;
+    const int64_t total_start_qpc = QueryQpcNow();
+
     // Xbox GDK titles (e.g. Xbox-GDK-Samples DeviceResources::~DeviceResources & resize)
     // legitimately call PresentX(0, nullptr, nullptr) to present a blank screen before teardown.
     if (PlaneCount == 0) {
         std::lock_guard<std::mutex> lock(present_mutex_);
-        WaitForInternalFenceLocked();
+        EnsurePresentHelperObjectsLocked();
+        int64_t sig_qpc = 0;
+        double wait_us = 0.0;
+        uint64_t completed_val = 0ull;
+        WaitForInternalFenceWithTimingLocked(&sig_qpc, &wait_us, &completed_val);
+        const int64_t pres_qpc = QueryQpcNow();
         ++present_count_;
+        last_timing_stats_.fence_signal_qpc = sig_qpc;
+        last_timing_stats_.fence_wait_us = wait_us;
+        last_timing_stats_.fence_completed_value = completed_val;
+        last_timing_stats_.present_submit_qpc = pres_qpc;
+        last_timing_stats_.present_complete_qpc = pres_qpc;
+        last_timing_stats_.dxgi_present_us = 0.0;
+        last_timing_stats_.total_presentx_us =
+            (qpc_freq_ > 0)
+                ? (static_cast<double>(pres_qpc - total_start_qpc) * 1000000.0 / static_cast<double>(qpc_freq_))
+                : 0.0;
+        last_timing_stats_.present_count = present_count_;
         RecordQueue("ID3D12CommandQueueX::PresentX", 19, S_OK);
         return S_OK;
     }
@@ -1411,7 +1830,14 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
         }
     }
 
-    bool do_swapchain_present = use_swapchain && !window_minimized;
+    const bool vk_routing_active =
+        device_x_ && device_x_->IsVulkanRoutingActive() &&
+        device_x_->GetVulkanBackend() && device_x_->GetVulkanBackend()->IsInitialized();
+    openscarlett::FrameBufferRgba8 vk_direct_rt_fb{};
+    const bool has_vk_direct_rt_fb =
+        vk_routing_active && device_x_->TryGetVulkanRenderTargetFramebuffer(src_tex, vk_direct_rt_fb);
+
+    bool do_swapchain_present = !vk_routing_active && use_swapchain && !window_minimized;
     if (do_swapchain_present) {
         const bool resize_pending =
             window_state_
@@ -1453,7 +1879,8 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
         (swapchain_format_ == DXGI_FORMAT_R8G8B8A8_UNORM ||
          swapchain_format_ == DXGI_FORMAT_B8G8R8A8_UNORM);
     const bool need_readback =
-        (!use_swapchain) || readback_capture_enabled_ || need_tonemap_bb_upload;
+        !has_vk_direct_rt_fb &&
+        (vk_routing_active || (!use_swapchain) || readback_capture_enabled_ || need_tonemap_bb_upload);
 
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
     UINT num_rows = 0;
@@ -1734,15 +2161,100 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
         last_paced_qpc_ = 0;
     }
 
-    if (do_swapchain_present && swapchain_) {
+    // Phase 1: GPU Fence Signaling & Synchronization (separated from DXGI/Vulkan presentation).
+    int64_t fence_sig_qpc = 0;
+    double fence_wait_us = 0.0;
+    uint64_t fence_completed_val = 0ull;
+    hr = WaitForInternalFenceWithTimingLocked(&fence_sig_qpc, &fence_wait_us, &fence_completed_val);
+    if (FAILED(hr)) {
+        RecordQueue("ID3D12CommandQueueX::PresentX", 19, hr);
+        return hr;
+    }
+
+    if (has_vk_direct_rt_fb) {
+        last_present_pixels_ = vk_direct_rt_fb.pixels;
+        last_present_raw_pixels_ = vk_direct_rt_fb.pixels;
+        last_present_raw_format_ = DXGI_FORMAT_R8G8B8A8_UNORM;
+        last_present_hash_ = openscarlett::ComputeFnv1a64(
+            last_present_pixels_.data(), last_present_pixels_.size());
+        readback_processed = true;
+    } else if (!readback_processed && need_readback && readback_buf_) {
+        hr = process_readback();
+        if (FAILED(hr)) {
+            RecordQueue("ID3D12CommandQueueX::PresentX", 19, hr);
+            return hr;
+        }
+        readback_processed = true;
+    }
+
+    // Phase 2: DXGI or Vulkan Presentation Submission.
+    int64_t present_submit_qpc = QueryQpcNow();
+    int64_t present_complete_qpc = present_submit_qpc;
+    double dxgi_present_us = 0.0;
+
+    if (vk_routing_active) {
+        openscarlett::VulkanBackend* vk = device_x_->GetVulkanBackend();
+        openscarlett::FrameBufferRgba8 present_fb{};
+        present_fb.width = has_vk_direct_rt_fb ? vk_direct_rt_fb.width : width;
+        present_fb.height = has_vk_direct_rt_fb ? vk_direct_rt_fb.height : height;
+        if (last_present_pixels_.size() == static_cast<size_t>(present_fb.width) * present_fb.height * 4u) {
+            present_fb.pixels = last_present_pixels_;
+        } else {
+            present_fb.pixels.assign(static_cast<size_t>(present_fb.width) * present_fb.height * 4u, 0u);
+        }
+
+        const bool headless_vk = !(use_swapchain && !window_minimized);
+        hr = EnsureVulkanSwapChainLocked(
+            headless_vk ? nullptr : target_hwnd,
+            headless_vk ? present_fb.width : target_bb_width,
+            headless_vk ? present_fb.height : target_bb_height,
+            IsHdrSwapChainMode(src_desc.Format, effective_cs),
+            headless_vk);
+        if (SUCCEEDED(hr) && vk_swapchain_handle_ != 0ull) {
+            openscarlett::VulkanPresentResult vk_pres{};
+            present_submit_qpc = QueryQpcNow();
+            openscarlett::Status pst = vk->PresentRgba8ToSwapchain(
+                vk_swapchain_handle_, present_fb, vk_pres, /*readback_frame=*/true);
+            present_complete_qpc = QueryQpcNow();
+            if (pst.ok()) {
+                if (vk_pres.readback_available &&
+                    vk_pres.readback_framebuffer.width == present_fb.width &&
+                    vk_pres.readback_framebuffer.height == present_fb.height &&
+                    !vk_pres.readback_framebuffer.pixels.empty()) {
+                    last_present_pixels_ = std::move(vk_pres.readback_framebuffer.pixels);
+                }
+                last_present_hash_ = openscarlett::ComputeFnv1a64(
+                    last_present_pixels_.data(), last_present_pixels_.size());
+                device_x_->RecordVulkanRoutingCounters(
+                    0ull, 0ull, 0ull, 0ull, 0ull, 0ull, 0ull, 0ull, 0ull,
+                    1ull, vk->is_fallback_mode() ? 0ull : 1ull, 0ull, 0ull, 0ull);
+            } else {
+                hr = S_OK;  // Degrade cleanly if Win32 surface was invalidated mid-frame
+            }
+        } else {
+            hr = S_OK;
+        }
+        dxgi_present_us =
+            (qpc_freq_ > 0)
+                ? (static_cast<double>(present_complete_qpc - present_submit_qpc) * 1000000.0 /
+                   static_cast<double>(qpc_freq_))
+                : 0.0;
+    } else if (do_swapchain_present && swapchain_) {
         const UINT present_flags =
             ((swapchain_flags_ & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0)
                 ? DXGI_PRESENT_ALLOW_TEARING
                 : 0u;
+        present_submit_qpc = QueryQpcNow();
         hr = swapchain_->Present(0u, present_flags);
         if (FAILED(hr) && present_flags != 0u) {
             hr = swapchain_->Present(0u, 0u);
         }
+        present_complete_qpc = QueryQpcNow();
+        dxgi_present_us =
+            (qpc_freq_ > 0)
+                ? (static_cast<double>(present_complete_qpc - present_submit_qpc) * 1000000.0 /
+                   static_cast<double>(qpc_freq_))
+                : 0.0;
         if (hr == DXGI_STATUS_OCCLUDED) {
             swapchain_occluded_ = true;
             hr = S_OK;
@@ -1755,23 +2267,23 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
         }
     }
 
-    hr = WaitForInternalFenceLocked();
-    if (FAILED(hr)) {
-        RecordQueue("ID3D12CommandQueueX::PresentX", 19, hr);
-        return hr;
-    }
-
-    if (!readback_processed && need_readback && readback_buf_) {
-        hr = process_readback();
-        if (FAILED(hr)) {
-            RecordQueue("ID3D12CommandQueueX::PresentX", 19, hr);
-            return hr;
-        }
-    }
-
-    last_present_width_ = width;
-    last_present_height_ = height;
+    last_present_width_ = has_vk_direct_rt_fb ? vk_direct_rt_fb.width : width;
+    last_present_height_ = has_vk_direct_rt_fb ? vk_direct_rt_fb.height : height;
     ++present_count_;
+
+    const int64_t total_end_qpc = QueryQpcNow();
+    last_timing_stats_.fence_signal_qpc = fence_sig_qpc;
+    last_timing_stats_.fence_wait_us = fence_wait_us;
+    last_timing_stats_.fence_completed_value = fence_completed_val;
+    last_timing_stats_.present_submit_qpc = present_submit_qpc;
+    last_timing_stats_.present_complete_qpc = present_complete_qpc;
+    last_timing_stats_.dxgi_present_us = dxgi_present_us;
+    last_timing_stats_.total_presentx_us =
+        (qpc_freq_ > 0)
+            ? (static_cast<double>(total_end_qpc - total_start_qpc) * 1000000.0 /
+               static_cast<double>(qpc_freq_))
+            : 0.0;
+    last_timing_stats_.present_count = present_count_;
 
     RecordQueue("ID3D12CommandQueueX::PresentX", 19, S_OK);
     return S_OK;
@@ -2107,6 +2619,15 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::CopyLastPresentRawPixels(
     return (to_copy == last_present_raw_pixels_.size())
                ? S_OK
                : HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+}
+
+// IOpenScarlettPresentTiming
+HRESULT STDMETHODCALLTYPE CommandQueueX::GetPresentTimingStats(
+    D3D12XBOX_PRESENT_TIMING_STATS* out_stats) {
+    if (!out_stats) return E_POINTER;
+    std::lock_guard<std::mutex> lock(present_mutex_);
+    *out_stats = last_timing_stats_;
+    return S_OK;
 }
 
 }  // namespace openscarlett::d3d12_xs

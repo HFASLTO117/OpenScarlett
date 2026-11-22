@@ -7,17 +7,20 @@
 #include <vector>
 
 #include "openscarlett/gpu/d3d12_xs_abi.h"
+#include "openscarlett/gpu/vulkan_backend.h"
 
 namespace openscarlett::d3d12_xs {
 
 class DeviceX;
 struct WindowCallbackState;
+struct VulkanRecordedBatch;
 
 class CommandQueueX final
     : public ID3D12CommandQueueX,
       public IOpenScarlettPresentCapture,
       public IOpenScarlettPresentWindow,
-      public IOpenScarlettPresentHdr {
+      public IOpenScarlettPresentHdr,
+      public IOpenScarlettPresentTiming {
 public:
     CommandQueueX(DeviceX* parent_device,
                   ID3D12CommandQueue* host_queue,
@@ -136,7 +139,19 @@ public:
         uint32_t* out_copied_bytes,
         DXGI_FORMAT* out_format) override;
 
+    // IOpenScarlettPresentTiming
+    HRESULT STDMETHODCALLTYPE GetPresentTimingStats(
+        D3D12XBOX_PRESENT_TIMING_STATS* out_stats) override;
+
 private:
+    void ExecuteVulkanRecordedBatch(const VulkanRecordedBatch& batch);
+    HRESULT EnsureVulkanSwapChainLocked(
+        HWND hwnd, uint32_t width, uint32_t height, bool prefer_hdr10, bool headless);
+    void ReleaseVulkanSwapChainLocked();
+    HRESULT WaitForInternalFenceWithTimingLocked(
+        int64_t* out_signal_qpc,
+        double* out_wait_us,
+        uint64_t* out_completed_value);
     HRESULT EnsurePresentHelperObjectsLocked();
     HRESULT EnsureSwapChainLocked(
         HWND hwnd,
@@ -218,6 +233,17 @@ private:
     std::vector<uint8_t> last_present_pixels_;
     std::vector<uint8_t> last_present_raw_pixels_;
     DXGI_FORMAT last_present_raw_format_ = DXGI_FORMAT_UNKNOWN;
+
+    // Separated PresentX GPU fence-signal vs DXGI/Vulkan presentation timings
+    D3D12XBOX_PRESENT_TIMING_STATS last_timing_stats_{};
+
+    // Vulkan swapchain state (used when DeviceX::IsVulkanRoutingActive())
+    uint64_t vk_swapchain_handle_ = 0ull;
+    openscarlett::VulkanSwapchainInfo vk_swapchain_info_{};
+    HWND vk_swapchain_hwnd_ = nullptr;
+    uint32_t vk_swapchain_width_ = 0u;
+    uint32_t vk_swapchain_height_ = 0u;
+    bool vk_swapchain_headless_ = false;
 };
 
 }  // namespace openscarlett::d3d12_xs

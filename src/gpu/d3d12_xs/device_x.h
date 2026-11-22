@@ -2,16 +2,49 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
+#include "openscarlett/core/framebuffer.h"
 #include "openscarlett/gpu/d3d12_adapter.h"
 #include "openscarlett/gpu/d3d12_xs_abi.h"
 #include "openscarlett/gpu/shader_cache.h"
+#include "openscarlett/gpu/vulkan_backend.h"
 
 namespace openscarlett::d3d12_xs {
+
+struct VulkanPipelineInfo {
+    bool is_spirv_direct = false;
+    bool is_compute = false;
+    bool is_mesh = false;
+    std::vector<uint32_t> vs_spirv;
+    std::vector<uint32_t> ps_spirv;
+    std::vector<uint32_t> cs_spirv;
+    std::vector<uint32_t> as_spirv;
+    std::vector<uint32_t> ms_spirv;
+    std::string vs_entry = "main";
+    std::string ps_entry = "main";
+    std::string cs_entry = "main";
+    std::string as_entry = "main";
+    std::string ms_entry = "main";
+    std::vector<openscarlett::VulkanVertexAttribute> vertex_attrs;
+    uint32_t vertex_stride_hint = 0u;
+    bool enable_depth = false;
+    bool depth_write = true;
+    openscarlett::VulkanImageFormat color_format = openscarlett::VulkanImageFormat::Rgba8Unorm;
+};
+
+struct VulkanTrackedResource {
+    ID3D12Resource* resource = nullptr;
+    D3D12_HEAP_TYPE heap_type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc{};
+    D3D12_GPU_VIRTUAL_ADDRESS gpu_va = 0ull;
+    std::vector<uint8_t> shadow_bytes;
+};
 
 struct UnifiedTextureMapping {
     ID3D12Resource* resource = nullptr;
@@ -42,7 +75,8 @@ struct XMemAllocationRecord {
 
 class DeviceX final
     : public ID3D12DeviceX,
-      public IOpenScarlettUnifiedMemory {
+      public IOpenScarlettUnifiedMemory,
+      public IOpenScarlettVulkanRouting {
 public:
     DeviceX(ID3D12Device* host_device,
             const D3D12AdapterInfo& adapter_info,
@@ -57,6 +91,40 @@ public:
     HWND DefaultWindow() const noexcept { return default_hwnd_; }
     bool IsR9G9B9E5UavFallbackActive() const noexcept;
     static void SetForceR9G9B9E5UavFallback(bool force) noexcept;
+    static void SetGlobalBackendMode(uint32_t backend_mode) noexcept;
+    static uint32_t ResolveEffectiveBackendMode() noexcept;
+
+    bool IsVulkanRoutingActive() const noexcept { return vulkan_routing_active_; }
+    openscarlett::VulkanBackend* GetVulkanBackend() const noexcept { return vulkan_backend_.get(); }
+    bool LookupVulkanPipeline(ID3D12PipelineState* pso, VulkanPipelineInfo& out_info) const;
+    bool IsSpirvDirectPipeline(ID3D12PipelineState* pso) const;
+    ID3D12Resource* ResolveVulkanRtvResource(D3D12_CPU_DESCRIPTOR_HANDLE rtv) const;
+    ID3D12Resource* ResolveVulkanDsvResource(D3D12_CPU_DESCRIPTOR_HANDLE dsv) const;
+    ID3D12Resource* ResolveVulkanBufferByGpuVa(
+        D3D12_GPU_VIRTUAL_ADDRESS va, uint64_t* out_offset_bytes = nullptr) const;
+    bool ReadVulkanBufferData(
+        ID3D12Resource* res, uint64_t offset, uint64_t size, std::vector<uint8_t>& out_bytes);
+    bool WriteVulkanBufferData(
+        ID3D12Resource* res, uint64_t offset, const void* data, size_t size);
+    void StoreVulkanRenderTargetFramebuffer(
+        ID3D12Resource* rt_res, const openscarlett::FrameBufferRgba8& fb);
+    bool TryGetVulkanRenderTargetFramebuffer(
+        ID3D12Resource* rt_res, openscarlett::FrameBufferRgba8& out_fb) const;
+    void RecordVulkanRoutingCounters(
+        uint64_t cmd_lists,
+        uint64_t draws,
+        uint64_t indexed_draws,
+        uint64_t dispatches,
+        uint64_t mesh_dispatches,
+        uint64_t copies,
+        uint64_t barriers,
+        uint64_t rtv_clears,
+        uint64_t dsv_clears,
+        uint64_t presents,
+        uint64_t icd_execs,
+        uint64_t spirv_draws,
+        uint64_t spirv_dispatches,
+        uint64_t spirv_mesh_dispatches) noexcept;
     D3D12_GPU_VIRTUAL_ADDRESS TranslateGuestGpuVa(D3D12_GPU_VIRTUAL_ADDRESS address) const noexcept;
     uint32_t FrameIntervalMicroseconds() const noexcept {
         return frame_interval_us_.load(std::memory_order_relaxed);
@@ -339,7 +407,14 @@ public:
     HRESULT STDMETHODCALLTYPE GetR9G9B9E5UavFallbackActive(
         int* out_active) override;
 
+    // IOpenScarlettVulkanRouting
+    uint32_t STDMETHODCALLTYPE GetActiveBackendMode() override;
+    HRESULT STDMETHODCALLTYPE GetVulkanRoutingStats(
+        D3D12XBOX_VULKAN_ROUTING_STATS* out_stats) override;
+
 private:
+    void TrackVulkanResource(
+        IUnknown* obj, D3D12_HEAP_TYPE heap_type, const D3D12_RESOURCE_DESC& desc);
     bool ShouldRewriteR9G9B9E5Uav(const D3D12_RESOURCE_DESC& desc) const noexcept;
     void TrackFallbackResource(IUnknown* obj, bool is_fallback);
     bool IsTrackedFallbackResource(ID3D12Resource* resource) const noexcept;
@@ -392,6 +467,30 @@ private:
     uint64_t unified_fence_val_ = 0ull;
     ID3D12Resource* unified_upload_buf_ = nullptr;
     uint64_t unified_upload_capacity_ = 0ull;
+
+    // Direct d3d12_xs -> Vulkan 1.4 routing state (active when OPENSCARLETT_BACKEND=vulkan)
+    bool vulkan_routing_active_ = false;
+    std::unique_ptr<openscarlett::VulkanBackend> vulkan_backend_;
+    mutable std::mutex vk_state_mutex_;
+    std::unordered_map<ID3D12PipelineState*, VulkanPipelineInfo> vk_pipelines_;
+    std::unordered_map<SIZE_T, ID3D12Resource*> vk_rtv_map_;
+    std::unordered_map<SIZE_T, ID3D12Resource*> vk_dsv_map_;
+    std::unordered_map<ID3D12Resource*, VulkanTrackedResource> vk_resources_;
+    std::unordered_map<ID3D12Resource*, openscarlett::FrameBufferRgba8> vk_rt_framebuffers_;
+    std::atomic<uint64_t> vk_routed_cmd_lists_{0ull};
+    std::atomic<uint64_t> vk_routed_draws_{0ull};
+    std::atomic<uint64_t> vk_routed_indexed_draws_{0ull};
+    std::atomic<uint64_t> vk_routed_dispatches_{0ull};
+    std::atomic<uint64_t> vk_routed_mesh_dispatches_{0ull};
+    std::atomic<uint64_t> vk_routed_copies_{0ull};
+    std::atomic<uint64_t> vk_routed_barriers_{0ull};
+    std::atomic<uint64_t> vk_routed_rtv_clears_{0ull};
+    std::atomic<uint64_t> vk_routed_dsv_clears_{0ull};
+    std::atomic<uint64_t> vk_routed_presents_{0ull};
+    std::atomic<uint64_t> vk_icd_executions_{0ull};
+    std::atomic<uint64_t> vk_spirv_direct_draws_{0ull};
+    std::atomic<uint64_t> vk_spirv_direct_dispatches_{0ull};
+    std::atomic<uint64_t> vk_spirv_direct_mesh_dispatches_{0ull};
 };
 
 }  // namespace openscarlett::d3d12_xs

@@ -823,4 +823,53 @@ OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12GetR9G9B9E5UavFallbackAct
     return hr;
 }
 
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12GetPresentTimingStats(
+    ID3D12CommandQueue* queue,
+    D3D12XBOX_PRESENT_TIMING_STATS* out_stats) {
+    if (!queue) return E_INVALIDARG;
+    if (!out_stats) return E_POINTER;
+    IOpenScarlettPresentTiming* timing = nullptr;
+    HRESULT hr = queue->QueryInterface(
+        IID_IOpenScarlettPresentTiming, reinterpret_cast<void**>(&timing));
+    if (FAILED(hr) || !timing) return FAILED(hr) ? hr : E_NOINTERFACE;
+    hr = timing->GetPresentTimingStats(out_stats);
+    timing->Release();
+    return hr;
+}
+
+OPENSCARLETT_D3D12_API void WINAPI OpenScarlettD3D12SetBackendMode(
+    uint32_t backend_mode) {
+    openscarlett::d3d12_xs::DeviceX::SetGlobalBackendMode(backend_mode);
+}
+
+OPENSCARLETT_D3D12_API uint32_t WINAPI OpenScarlettD3D12GetActiveBackend(
+    ID3D12Device* device) {
+    if (!device) {
+        return openscarlett::d3d12_xs::DeviceX::ResolveEffectiveBackendMode();
+    }
+    IOpenScarlettVulkanRouting* routing = nullptr;
+    HRESULT hr = device->QueryInterface(
+        IID_IOpenScarlettVulkanRouting, reinterpret_cast<void**>(&routing));
+    if (FAILED(hr) || !routing) {
+        return D3D12XBOX_BACKEND_D3D12;
+    }
+    const uint32_t mode = routing->GetActiveBackendMode();
+    routing->Release();
+    return mode;
+}
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12GetVulkanRoutingStats(
+    ID3D12Device* device,
+    D3D12XBOX_VULKAN_ROUTING_STATS* out_stats) {
+    if (!device) return E_INVALIDARG;
+    if (!out_stats) return E_POINTER;
+    IOpenScarlettVulkanRouting* routing = nullptr;
+    HRESULT hr = device->QueryInterface(
+        IID_IOpenScarlettVulkanRouting, reinterpret_cast<void**>(&routing));
+    if (FAILED(hr) || !routing) return FAILED(hr) ? hr : E_NOINTERFACE;
+    hr = routing->GetVulkanRoutingStats(out_stats);
+    routing->Release();
+    return hr;
+}
+
 }  // extern "C"
