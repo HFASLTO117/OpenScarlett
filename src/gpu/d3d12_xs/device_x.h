@@ -12,10 +12,16 @@
 #include "openscarlett/core/framebuffer.h"
 #include "openscarlett/gpu/d3d12_adapter.h"
 #include "openscarlett/gpu/d3d12_xs_abi.h"
+#include "openscarlett/gpu/descriptor_sgpr_bridge.h"
+#include "openscarlett/gpu/frame_capture.h"
 #include "openscarlett/gpu/shader_cache.h"
 #include "openscarlett/gpu/vulkan_backend.h"
+#include "openscarlett/kernel/title_va_mirror.h"
 
 namespace openscarlett::d3d12_xs {
+
+class DeviceExtendedProxy;
+class DxgiDeviceProxy;
 
 struct VulkanPipelineInfo {
     bool is_spirv_direct = false;
@@ -111,6 +117,10 @@ public:
         void* user_ctx) noexcept;
     void SetGuestGpuVaTranslatorHook(GuestGpuVaTranslatorFn fn, void* user_ctx) noexcept;
     void SetDescriptorCreateHook(DescriptorCreateHookFn fn, void* user_ctx) noexcept;
+    openscarlett::TitleVAMirror& GetTitleVaMirror() noexcept { return title_va_mirror_; }
+    const openscarlett::TitleVAMirror& GetTitleVaMirror() const noexcept { return title_va_mirror_; }
+    openscarlett::DescriptorSgprBridge& GetDescriptorBridge() noexcept { return descriptor_bridge_; }
+    const openscarlett::DescriptorSgprBridge& GetDescriptorBridge() const noexcept { return descriptor_bridge_; }
     bool IsR9G9B9E5UavFallbackActive() const noexcept;
     static void SetForceR9G9B9E5UavFallback(bool force) noexcept;
     static void SetGlobalBackendMode(uint32_t backend_mode) noexcept;
@@ -384,7 +394,65 @@ public:
         HANDLE hEventToSignalUponCompletion,
         BOOL* pbFurtherMeasurementsDesired) override;
 
-    // ID3D12DeviceX (slots 66..72)
+    // ID3D12Device7 (slots 66..67)
+    HRESULT STDMETHODCALLTYPE AddToStateObject(
+        const D3D12_STATE_OBJECT_DESC* pAddition,
+        ID3D12StateObject* pStateObjectToGrowFrom,
+        REFIID riid,
+        void** ppNewStateObject) override;
+    HRESULT STDMETHODCALLTYPE CreateProtectedResourceSession1(
+        const D3D12_PROTECTED_RESOURCE_SESSION_DESC1* pDesc,
+        REFIID riid,
+        void** ppSession) override;
+
+    // ID3D12Device8 (slots 68..72)
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+    using ID3D12Device8::GetResourceAllocationInfo2;
+    D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE GetResourceAllocationInfo2(
+        D3D12_RESOURCE_ALLOCATION_INFO* pRet,
+        UINT visibleMask,
+        UINT numResourceDescs,
+        const D3D12_RESOURCE_DESC1* pResourceDescs,
+        D3D12_RESOURCE_ALLOCATION_INFO1* pResourceAllocationInfo1) override;
+#else
+    D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE GetResourceAllocationInfo2(
+        UINT visibleMask,
+        UINT numResourceDescs,
+        const D3D12_RESOURCE_DESC1* pResourceDescs,
+        D3D12_RESOURCE_ALLOCATION_INFO1* pResourceAllocationInfo1) override;
+#endif
+    HRESULT STDMETHODCALLTYPE CreateCommittedResource2(
+        const D3D12_HEAP_PROPERTIES* pHeapProperties,
+        D3D12_HEAP_FLAGS HeapFlags,
+        const D3D12_RESOURCE_DESC1* pDesc,
+        D3D12_RESOURCE_STATES InitialResourceState,
+        const D3D12_CLEAR_VALUE* pOptimizedClearValue,
+        ID3D12ProtectedResourceSession* pProtectedSession,
+        REFIID riidResource,
+        void** ppvResource) override;
+    HRESULT STDMETHODCALLTYPE CreatePlacedResource1(
+        ID3D12Heap* pHeap,
+        UINT64 HeapOffset,
+        const D3D12_RESOURCE_DESC1* pDesc,
+        D3D12_RESOURCE_STATES InitialState,
+        const D3D12_CLEAR_VALUE* pOptimizedClearValue,
+        REFIID riid,
+        void** ppvResource) override;
+    void STDMETHODCALLTYPE CreateSamplerFeedbackUnorderedAccessView(
+        ID3D12Resource* pTargetedResource,
+        ID3D12Resource* pFeedbackResource,
+        D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) override;
+    void STDMETHODCALLTYPE GetCopyableFootprints1(
+        const D3D12_RESOURCE_DESC1* pResourceDesc,
+        UINT FirstSubresource,
+        UINT NumSubresources,
+        UINT64 BaseOffset,
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT* pLayouts,
+        UINT* pNumRows,
+        UINT64* pRowSizeInBytes,
+        UINT64* pTotalBytes) override;
+
+    // ID3D12DeviceX (slots 73..79; slots 73..75 match real GDKX ID3D12Device8 Xbox methods)
     HRESULT STDMETHODCALLTYPE SetFrameIntervalX(
         IDXGIOutput* pOutput, uint32_t PeriodMicroseconds,
         uint32_t MaxFrameLatency, uint32_t Flags) override;
@@ -393,7 +461,8 @@ public:
         HANDLE hEvent, uint32_t Flags) override;
     HRESULT STDMETHODCALLTYPE WaitFrameEventX(
         D3D12XBOX_FRAME_EVENT Event, uint32_t TimeoutMilliseconds,
-        void* pReserved, D3D12XBOX_FRAME_PIPELINE_TOKEN* pOutToken) override;
+        void* pReserved, uint32_t Flags,
+        D3D12XBOX_FRAME_PIPELINE_TOKEN* pOutToken) override;
     HRESULT STDMETHODCALLTYPE CreatePlacedResourceX(
         D3D12_GPU_VIRTUAL_ADDRESS VirtualAddress, const D3D12_RESOURCE_DESC* pDesc,
         D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE* pOptimizedClearValue,
@@ -449,6 +518,9 @@ private:
         const D3D12_RESOURCE_DESC& desc,
         D3D12_RESOURCE_STATES initial_state);
 
+    friend class DeviceExtendedProxy;
+    friend class DxgiDeviceProxy;
+
     std::atomic<ULONG> ref_count_{1};
     ID3D12Device* host_dev_ = nullptr;
     ID3D12Device1* host_dev1_ = nullptr;
@@ -457,6 +529,22 @@ private:
     ID3D12Device4* host_dev4_ = nullptr;
     ID3D12Device5* host_dev5_ = nullptr;
     ID3D12Device6* host_dev6_ = nullptr;
+    ID3D12Device7* host_dev7_ = nullptr;
+    ID3D12Device8* host_dev8_ = nullptr;
+#ifdef __ID3D12Device9_INTERFACE_DEFINED__
+    ID3D12Device9* host_dev9_ = nullptr;
+#endif
+#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+    ID3D12Device10* host_dev10_ = nullptr;
+#endif
+#ifdef __ID3D12Device11_INTERFACE_DEFINED__
+    ID3D12Device11* host_dev11_ = nullptr;
+#endif
+#ifdef __ID3D12Device12_INTERFACE_DEFINED__
+    ID3D12Device12* host_dev12_ = nullptr;
+#endif
+    DeviceExtendedProxy* ext_proxy_ = nullptr;
+    DxgiDeviceProxy* dxgi_proxy_ = nullptr;
     D3D12AdapterInfo adapter_info_{};
     HWND default_hwnd_ = nullptr;
     bool supports_r9g9b9e5_uav_ = false;
@@ -474,6 +562,8 @@ private:
     std::atomic<void*> va_translator_ctx_{nullptr};
     std::atomic<DescriptorCreateHookFn> descriptor_create_hook_{nullptr};
     std::atomic<void*> descriptor_create_ctx_{nullptr};
+    openscarlett::TitleVAMirror title_va_mirror_;
+    openscarlett::DescriptorSgprBridge descriptor_bridge_;
 
     mutable std::mutex fallback_mutex_;
     std::unordered_set<ID3D12Resource*> r9g9b9e5_fallback_resources_;

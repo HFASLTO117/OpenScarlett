@@ -190,7 +190,6 @@ void CreateDeviceForMode(
 
     D3D12XBOX_CREATE_DEVICE_PARAMETERS params{};
     params.Version = 1u;
-    params.PreferWarp = use_warp ? 1u : 0u;
 
     HRESULT hr = D3D12XboxCreateDevice(
         use_warp ? nullptr : hw_adapter,

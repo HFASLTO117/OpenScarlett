@@ -445,6 +445,44 @@ OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL KernelXMapTileRange(
     uint32_t flags);
 
 // ---------------------------------------------------------------------------
+// Xbox Game Core PLM Notifications (appnotify.h)
+// ---------------------------------------------------------------------------
+#ifndef OPENSCARLETT_APPNOTIFY_TYPES_DEFINED
+#define OPENSCARLETT_APPNOTIFY_TYPES_DEFINED 1
+typedef void* PAPPSTATE_REGISTRATION;
+typedef void* PAPPCONSTRAIN_REGISTRATION;
+typedef void (OPENSCARLETT_KERNELX_CALL* PAPPSTATE_CHANGE_ROUTINE)(uint8_t Quiesced, void* Context);
+typedef void (OPENSCARLETT_KERNELX_CALL* PAPPCONSTRAIN_CHANGE_ROUTINE)(uint8_t Constrained, void* Context);
+#endif
+
+OPENSCARLETT_KERNELX_API uint32_t OPENSCARLETT_KERNELX_CALL RegisterAppStateChangeNotification(
+    PAPPSTATE_CHANGE_ROUTINE Routine,
+    void* Context,
+    PAPPSTATE_REGISTRATION* Registration);
+
+OPENSCARLETT_KERNELX_API void OPENSCARLETT_KERNELX_CALL UnregisterAppStateChangeNotification(
+    PAPPSTATE_REGISTRATION Registration);
+
+OPENSCARLETT_KERNELX_API uint32_t OPENSCARLETT_KERNELX_CALL RegisterAppConstrainedChangeNotification(
+    PAPPCONSTRAIN_CHANGE_ROUTINE Routine,
+    void* Context,
+    PAPPCONSTRAIN_REGISTRATION* Registration);
+
+OPENSCARLETT_KERNELX_API void OPENSCARLETT_KERNELX_CALL UnregisterAppConstrainedChangeNotification(
+    PAPPCONSTRAIN_REGISTRATION Registration);
+
+// Runtime / test dispatch & inspection helpers for PLM notification callbacks.
+OPENSCARLETT_KERNELX_API uint32_t OPENSCARLETT_KERNELX_CALL KernelXDispatchAppStateChange(
+    uint8_t Quiesced);
+
+OPENSCARLETT_KERNELX_API uint32_t OPENSCARLETT_KERNELX_CALL KernelXDispatchAppConstrainedChange(
+    uint8_t Constrained);
+
+OPENSCARLETT_KERNELX_API void OPENSCARLETT_KERNELX_CALL KernelXGetAppNotificationCounts(
+    uint32_t* outStateCount,
+    uint32_t* outConstrainedCount);
+
+// ---------------------------------------------------------------------------
 // CallTelemetry Inspection Helpers (for verifying DLL-local telemetry)
 // ---------------------------------------------------------------------------
 OPENSCARLETT_KERNELX_API void OPENSCARLETT_KERNELX_CALL KernelXResetTelemetry(void);

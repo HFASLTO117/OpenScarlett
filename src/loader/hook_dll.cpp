@@ -15,6 +15,7 @@
 #include "openscarlett/core/telemetry.h"
 #include "openscarlett/loader/apc_injector.h"
 #include "openscarlett/loader/pe_inspector.h"
+#include "openscarlett/loader/probe_veh.h"
 #include "openscarlett/loader/vfs_mounts.h"
 
 namespace {
@@ -104,6 +105,9 @@ std::wstring g_telemetry_base_w;
 std::string g_telemetry_path_utf8;
 openscarlett::VfsMounts g_vfs;
 openscarlett::DllRoutingTable g_routing_table;
+openscarlett::MissingImportTrampolinePool g_probe_trampoline_pool;
+openscarlett::VehCrashMonitor g_veh_monitor;
+bool g_probe_unknown_imports = false;
 
 std::atomic<bool> g_initialized{false};
 std::atomic<bool> g_shutting_down{false};
@@ -928,6 +932,18 @@ FARPROC WINAPI Hook_GetProcAddress(HMODULE hModule, LPCSTR lpProcName) {
                     openscarlett::CallOutcome::NotImplemented,
                     static_cast<int32_t>(0x80004001u),  // E_NOTIMPL
                     -1);
+                if (g_probe_unknown_imports) {
+                    const bool by_ord = (reinterpret_cast<uintptr_t>(lpProcName) <= 0xFFFFu);
+                    const uint16_t ord = by_ord
+                                             ? static_cast<uint16_t>(reinterpret_cast<uintptr_t>(lpProcName))
+                                             : 0u;
+                    const std::string raw_sym = by_ord ? std::string{} : std::string(lpProcName);
+                    if (void* stub = g_probe_trampoline_pool.GetOrCreateTrampoline(
+                            mod_name, raw_sym, ord, by_ord)) {
+                        ::SetLastError(ERROR_SUCCESS);
+                        return reinterpret_cast<FARPROC>(stub);
+                    }
+                }
             }
         }
     }
@@ -2387,6 +2403,16 @@ bool InitializeHookRuntime(HMODULE self_mod) {
     g_vfs.Configure(openscarlett::VfsMounts::BuildDefaultConfig(main_exe_dir, default_vfs_root));
     g_guest_dir_w = g_vfs.GetGameRoot().empty() ? main_exe_dir : g_vfs.GetGameRoot();
 
+    g_probe_unknown_imports = openscarlett::IsProbeUnknownImportsEnabledByEnv();
+    if (g_probe_unknown_imports) {
+        g_veh_monitor.SetTrampolinePool(&g_probe_trampoline_pool);
+        if (!g_telemetry_path_utf8.empty()) {
+            const std::string veh_json = g_telemetry_path_utf8 + ".veh_bringup.json";
+            g_veh_monitor.SetAutoExportPath(veh_json, {openscarlett::WideToUtf8(g_shim_dir_w)});
+        }
+        (void)g_veh_monitor.Install(1);
+    }
+
     PatchAllLoadedNonSystemModules();
     g_initialized.store(true, std::memory_order_release);
     FlushTelemetryInternal(false);
@@ -2412,6 +2438,13 @@ __declspec(dllexport) void __cdecl OpenScarlettHook_RecordCall(const char* modul
         static_cast<openscarlett::CallOutcome>(clamped),
         hr,
         vtable_slot);
+    if (g_probe_unknown_imports) {
+        openscarlett::RecordProbeApiCall(
+            module_name ? module_name : "",
+            symbol_name ? symbol_name : "",
+            0ull,
+            hr);
+    }
 }
 
 __declspec(dllexport) int __cdecl OpenScarlettHook_FlushTelemetry() {
@@ -2532,6 +2565,9 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
             InitializeHookRuntime(hinstDLL);
             return TRUE;
         case DLL_PROCESS_DETACH:
+            if (g_probe_unknown_imports) {
+                g_veh_monitor.Uninstall();
+            }
             FlushTelemetryInternal(true);
             g_shutting_down.store(true, std::memory_order_release);
             return TRUE;

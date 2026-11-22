@@ -12,6 +12,7 @@
 namespace openscarlett::d3d12_xs {
 
 class DeviceX;
+class CommandListExtendedProxy;
 
 enum class VulkanRecordedOpKind : uint8_t {
     Barrier = 0,
@@ -325,6 +326,8 @@ public:
         D3D12XBOX_CMDLIST_EXT_STATE* out_state) const noexcept override;
 
 private:
+    friend class CommandListExtendedProxy;
+
     std::atomic<ULONG> ref_count_{1};
     DeviceX* device_x_ = nullptr;
     ID3D12GraphicsCommandList* host_list_ = nullptr;
@@ -334,6 +337,19 @@ private:
     ID3D12GraphicsCommandList4* host_list4_ = nullptr;
     ID3D12GraphicsCommandList5* host_list5_ = nullptr;
     ID3D12GraphicsCommandList6* host_list6_ = nullptr;
+#ifdef __ID3D12GraphicsCommandList7_INTERFACE_DEFINED__
+    ID3D12GraphicsCommandList7* host_list7_ = nullptr;
+#endif
+#ifdef __ID3D12GraphicsCommandList8_INTERFACE_DEFINED__
+    ID3D12GraphicsCommandList8* host_list8_ = nullptr;
+#endif
+#ifdef __ID3D12GraphicsCommandList9_INTERFACE_DEFINED__
+    ID3D12GraphicsCommandList9* host_list9_ = nullptr;
+#endif
+#ifdef __ID3D12GraphicsCommandList10_INTERFACE_DEFINED__
+    ID3D12GraphicsCommandList10* host_list10_ = nullptr;
+#endif
+    CommandListExtendedProxy* ext_proxy_ = nullptr;
     D3D12_COMMAND_LIST_TYPE list_type_ = D3D12_COMMAND_LIST_TYPE_DIRECT;
     std::atomic<uint64_t> gpu_va_hint_{0};
     std::atomic<uint64_t> kickoff_count_{0};

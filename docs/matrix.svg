@@ -41,7 +41,7 @@
     <text class="lbl" x="26" y="187">DS (LDS Shared Memory)</text>
     <rect x="224" y="179" width="156" height="9" rx="4.5" fill="#21262d"/>
     <rect x="224" y="179" width="156" height="9" rx="4.5" fill="#2ea043"/>
-    <text class="mono" x="440" y="187" text-anchor="end">124/70</text>
+    <text class="mono" x="440" y="187" text-anchor="end">125/70</text>
     <text class="lbl" x="458" y="187">MUBUF / MTBUF (Buffers)</text>
     <rect x="656" y="179" width="156" height="9" rx="4.5" fill="#21262d"/>
     <rect x="656" y="179" width="156" height="9" rx="4.5" fill="#2ea043"/>
@@ -55,7 +55,7 @@
     <rect x="656" y="211" width="156" height="9" rx="4.5" fill="#2ea043"/>
     <text class="mono" x="872" y="219" text-anchor="end">1/1</text>
     <line x1="26" y1="248" x2="874" y2="248" stroke="#21262d" stroke-width="1"/>
-    <text class="h2" x="26" y="272">2. DirectX 12 (d3d12_xs) &amp; Vulkan 1.4 Translation Items (5 live · 2 partial · 5 pending)</text>
+    <text class="h2" x="26" y="272">2. DirectX 12 (d3d12_xs) &amp; Vulkan 1.4 Translation Items (12 live · 0 partial · 0 pending)</text>
     <rect x="26" y="286" width="274" height="26" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <circle cx="38" cy="299" r="4" fill="#2ea043"/>
     <text class="lbl" x="48" y="303">DeviceX / QueueX / CmdListX</text>
@@ -76,48 +76,48 @@
     <circle cx="324" cy="333" r="4" fill="#2ea043"/>
     <text class="lbl" x="334" y="337">xg_xs CPU Layout + Metadata</text>
     <text class="tiny" x="578" y="336.5" text-anchor="end" fill="#2ea043" font-weight="700">LIVE</text>
-    <rect x="598" y="320" width="274" height="26" rx="6" fill="#261e10" stroke="#30363d" stroke-width="1"/>
-    <circle cx="610" cy="333" r="4" fill="#d29922"/>
+    <rect x="598" y="320" width="274" height="26" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
+    <circle cx="610" cy="333" r="4" fill="#2ea043"/>
     <text class="lbl" x="620" y="337">d3d12_xs -&gt; Vulkan Routing</text>
-    <text class="tiny" x="864" y="336.5" text-anchor="end" fill="#d29922" font-weight="700">PARTIAL</text>
-    <rect x="26" y="354" width="274" height="26" rx="6" fill="#261e10" stroke="#30363d" stroke-width="1"/>
-    <circle cx="38" cy="367" r="4" fill="#d29922"/>
+    <text class="tiny" x="864" y="336.5" text-anchor="end" fill="#2ea043" font-weight="700">LIVE</text>
+    <rect x="26" y="354" width="274" height="26" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
+    <circle cx="38" cy="367" r="4" fill="#2ea043"/>
     <text class="lbl" x="48" y="371">DXR 1.1 + BVH4 Raytracing</text>
-    <text class="tiny" x="292" y="370.5" text-anchor="end" fill="#d29922" font-weight="700">PARTIAL</text>
-    <rect x="312" y="354" width="274" height="26" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
-    <circle cx="324" cy="367" r="4" fill="#6e7681"/>
+    <text class="tiny" x="292" y="370.5" text-anchor="end" fill="#2ea043" font-weight="700">LIVE</text>
+    <rect x="312" y="354" width="274" height="26" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
+    <circle cx="324" cy="367" r="4" fill="#2ea043"/>
     <text class="lbl" x="334" y="371">All 13 D3D12 COM Proxies</text>
-    <text class="tiny" x="578" y="370.5" text-anchor="end" fill="#6e7681" font-weight="700">PENDING</text>
-    <rect x="598" y="354" width="274" height="26" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
-    <circle cx="610" cy="367" r="4" fill="#6e7681"/>
+    <text class="tiny" x="578" y="370.5" text-anchor="end" fill="#2ea043" font-weight="700">LIVE</text>
+    <rect x="598" y="354" width="274" height="26" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
+    <circle cx="610" cy="367" r="4" fill="#2ea043"/>
     <text class="lbl" x="620" y="371">Multi-Queue MT Recording</text>
-    <text class="tiny" x="864" y="370.5" text-anchor="end" fill="#6e7681" font-weight="700">PENDING</text>
-    <rect x="26" y="388" width="274" height="26" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
-    <circle cx="38" cy="401" r="4" fill="#6e7681"/>
+    <text class="tiny" x="864" y="370.5" text-anchor="end" fill="#2ea043" font-weight="700">LIVE</text>
+    <rect x="26" y="388" width="274" height="26" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
+    <circle cx="38" cy="401" r="4" fill="#2ea043"/>
     <text class="lbl" x="48" y="405">Title-VA Unified Mirror</text>
-    <text class="tiny" x="292" y="404.5" text-anchor="end" fill="#6e7681" font-weight="700">PENDING</text>
-    <rect x="312" y="388" width="274" height="26" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
-    <circle cx="324" cy="401" r="4" fill="#6e7681"/>
+    <text class="tiny" x="292" y="404.5" text-anchor="end" fill="#2ea043" font-weight="700">LIVE</text>
+    <rect x="312" y="388" width="274" height="26" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
+    <circle cx="324" cy="401" r="4" fill="#2ea043"/>
     <text class="lbl" x="334" y="405">Raw V#/T#/S# Bindless</text>
-    <text class="tiny" x="578" y="404.5" text-anchor="end" fill="#6e7681" font-weight="700">PENDING</text>
-    <rect x="598" y="388" width="274" height="26" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
-    <circle cx="610" cy="401" r="4" fill="#6e7681"/>
+    <text class="tiny" x="578" y="404.5" text-anchor="end" fill="#2ea043" font-weight="700">LIVE</text>
+    <rect x="598" y="388" width="274" height="26" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
+    <circle cx="610" cy="401" r="4" fill="#2ea043"/>
     <text class="lbl" x="620" y="405">GPU Compute Untiling</text>
-    <text class="tiny" x="864" y="404.5" text-anchor="end" fill="#6e7681" font-weight="700">PENDING</text>
+    <text class="tiny" x="864" y="404.5" text-anchor="end" fill="#2ea043" font-weight="700">LIVE</text>
     <line x1="26" y1="430" x2="874" y2="430" stroke="#21262d" stroke-width="1"/>
-    <text class="h2" x="26" y="454">3. All 30 Shimmed Xbox / GDK DLLs (10 high coverage · 10 partial · 10 stub / telemetry)</text>
+    <text class="h2" x="26" y="454">3. All 30 Shimmed Xbox / GDK DLLs (12 high coverage · 8 partial · 10 stub / telemetry)</text>
     <rect x="26" y="468" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="26" y="468" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="36" y="482">xgameruntime</text>
-    <text class="tiny" x="36" y="493">337 exports · high</text>
+    <text class="tiny" x="36" y="493">343 exports · high</text>
     <rect x="197" y="468" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="197" y="468" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="207" y="482">XSAPI.GDK.C</text>
-    <text class="tiny" x="207" y="493">178 exports · high</text>
+    <text class="tiny" x="207" y="493">186 exports · high</text>
     <rect x="368" y="468" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="368" y="468" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="378" y="482">kernelx</text>
-    <text class="tiny" x="378" y="493">48 exports · high</text>
+    <text class="tiny" x="378" y="493">73 exports · high</text>
     <rect x="539" y="468" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="539" y="468" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="549" y="482">XCurl</text>
@@ -129,7 +129,7 @@
     <rect x="26" y="506" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="26" y="506" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="36" y="520">winrt_xs</text>
-    <text class="tiny" x="36" y="531">18 exports · high</text>
+    <text class="tiny" x="36" y="531">21 exports · high</text>
     <rect x="197" y="506" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="197" y="506" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="207" y="520">xmem</text>
@@ -137,27 +137,27 @@
     <rect x="368" y="506" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="368" y="506" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="378" y="520">XAudio2_9</text>
-    <text class="tiny" x="378" y="531">11 exports · high</text>
+    <text class="tiny" x="378" y="531">17 exports · high</text>
     <rect x="539" y="506" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="539" y="506" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="549" y="520">GameInput</text>
-    <text class="tiny" x="549" y="531">7 exports · high</text>
+    <text class="tiny" x="549" y="531">14 exports · high</text>
     <rect x="710" y="506" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="710" y="506" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="720" y="520">dstorage_xs</text>
     <text class="tiny" x="720" y="531">6 exports · high</text>
-    <rect x="26" y="544" width="163" height="30" rx="6" fill="#261e10" stroke="#30363d" stroke-width="1"/>
-    <rect x="26" y="544" width="3.5" height="30" rx="2" fill="#d29922"/>
+    <rect x="26" y="544" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
+    <rect x="26" y="544" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="36" y="558">d3d12_xs</text>
-    <text class="tiny" x="36" y="569">48 exports · partial</text>
+    <text class="tiny" x="36" y="569">48 exports · high</text>
     <rect x="197" y="544" width="163" height="30" rx="6" fill="#261e10" stroke="#30363d" stroke-width="1"/>
     <rect x="197" y="544" width="3.5" height="30" rx="2" fill="#d29922"/>
     <text class="mono" x="207" y="558">libHttpClient</text>
     <text class="tiny" x="207" y="569">21 exports · partial</text>
-    <rect x="368" y="544" width="163" height="30" rx="6" fill="#261e10" stroke="#30363d" stroke-width="1"/>
-    <rect x="368" y="544" width="3.5" height="30" rx="2" fill="#d29922"/>
+    <rect x="368" y="544" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
+    <rect x="368" y="544" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="378" y="558">mfplat_xs</text>
-    <text class="tiny" x="378" y="569">16 exports · partial</text>
+    <text class="tiny" x="378" y="569">17 exports · high</text>
     <rect x="539" y="544" width="163" height="30" rx="6" fill="#261e10" stroke="#30363d" stroke-width="1"/>
     <rect x="539" y="544" width="3.5" height="30" rx="2" fill="#d29922"/>
     <text class="mono" x="549" y="558">advapi32leg</text>

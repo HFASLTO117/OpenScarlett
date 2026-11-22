@@ -501,6 +501,92 @@ bool EvaluateWaitOp(T current, T reference, T mask, D3D12XBOX_WAIT_VALUE_OP op) 
     }
 }
 
+D3D12XBOX_COLOR_SPACE DxgiToXboxColorSpace(DXGI_COLOR_SPACE_TYPE dxgi_cs) noexcept {
+    switch (dxgi_cs) {
+        case DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020:
+            return D3D12XBOX_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+        case DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709:
+            return D3D12XBOX_COLOR_SPACE_RGB_FULL_G10_NONE_P709;
+        case DXGI_COLOR_SPACE_RGB_STUDIO_G22_NONE_P709:
+            return D3D12XBOX_COLOR_SPACE_RGB_STUDIO_G22_NONE_P709;
+        case DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709:
+        default:
+            return D3D12XBOX_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    }
+}
+
+std::string ReadEnvStringA(const char* name) {
+    char buf[1024]{};
+    const DWORD len = GetEnvironmentVariableA(name, buf, static_cast<DWORD>(sizeof(buf)));
+    if (len == 0u || len >= sizeof(buf)) return {};
+    return std::string(buf, len);
+}
+
+uint64_t ReadEnvUint64A(const char* name) noexcept {
+    char buf[64]{};
+    const DWORD len = GetEnvironmentVariableA(name, buf, static_cast<DWORD>(sizeof(buf)));
+    if (len == 0u || len >= sizeof(buf)) return 0ull;
+    char* end = nullptr;
+    const unsigned long long v = std::strtoull(buf, &end, 10);
+    return (end && end != buf) ? static_cast<uint64_t>(v) : 0ull;
+}
+
+bool EnvFlagTrueA(const char* name) noexcept {
+    char buf[32]{};
+    const DWORD len = GetEnvironmentVariableA(name, buf, static_cast<DWORD>(sizeof(buf)));
+    if (len == 0u || len >= sizeof(buf)) return false;
+    return buf[0] == '1' || buf[0] == 't' || buf[0] == 'T' || buf[0] == 'y' || buf[0] == 'Y';
+}
+
+struct FindMainWindowCtx {
+    DWORD pid = 0;
+    DWORD preferred_tid = 0;
+    HWND best_same_thread = nullptr;
+    HWND best_any_thread = nullptr;
+};
+
+BOOL CALLBACK EnumProcessMainWindowProc(HWND hwnd, LPARAM lParam) {
+    auto* ctx = reinterpret_cast<FindMainWindowCtx*>(lParam);
+    DWORD wpid = 0;
+    const DWORD wtid = GetWindowThreadProcessId(hwnd, &wpid);
+    if (wpid != ctx->pid) return TRUE;
+    if (IsWindowVisible(hwnd) == FALSE) return TRUE;
+    if (GetWindow(hwnd, GW_OWNER) != nullptr) return TRUE;
+    wchar_t cls[64]{};
+    if (GetClassNameW(hwnd, cls, 64) > 0) {
+        if (wcscmp(cls, L"ConsoleWindowClass") == 0 ||
+            wcscmp(cls, L"MSCTFIME UI") == 0 ||
+            wcscmp(cls, L"IME") == 0 ||
+            wcscmp(cls, L"tooltips_class32") == 0) {
+            return TRUE;
+        }
+    }
+    RECT cr{};
+    if (GetClientRect(hwnd, &cr) == FALSE || (cr.right - cr.left) < 64 || (cr.bottom - cr.top) < 64) {
+        return TRUE;
+    }
+    if (wtid == ctx->preferred_tid) {
+        ctx->best_same_thread = hwnd;
+        return FALSE;  // Exact match on calling thread
+    }
+    if (!ctx->best_any_thread) {
+        ctx->best_any_thread = hwnd;
+    }
+    return TRUE;
+}
+
+HWND DiscoverProcessMainWindow() noexcept {
+    FindMainWindowCtx ctx{};
+    ctx.pid = GetCurrentProcessId();
+    ctx.preferred_tid = GetCurrentThreadId();
+    EnumThreadWindows(ctx.preferred_tid, &EnumProcessMainWindowProc, reinterpret_cast<LPARAM>(&ctx));
+    if (ctx.best_same_thread) {
+        return ctx.best_same_thread;
+    }
+    EnumWindows(&EnumProcessMainWindowProc, reinterpret_cast<LPARAM>(&ctx));
+    return ctx.best_same_thread ? ctx.best_same_thread : ctx.best_any_thread;
+}
+
 }  // namespace
 
 CommandQueueX::CommandQueueX(
@@ -1686,8 +1772,12 @@ HRESULT CommandQueueX::WaitForInternalFenceWithTimingLocked(
                            ? (static_cast<double>(done_qpc - sig_qpc) * 1000000.0 / static_cast<double>(qpc_freq_))
                            : 0.0;
     }
+    const uint64_t completed_now = present_fence_->GetCompletedValue();
+    if (device_x_) {
+        (void)device_x_->GetTitleVaMirror().CompleteReadbacksOnFence(completed_now);
+    }
     if (out_completed_value) {
-        *out_completed_value = present_fence_->GetCompletedValue();
+        *out_completed_value = completed_now;
     }
     return S_OK;
 }
@@ -1710,13 +1800,11 @@ void CommandQueueX::ReleasePresentObjectsLocked() {
     tonemap_upload_capacity_ = 0;
 }
 
-// ID3D12CommandQueueX (slots 19..21)
+// ID3D12CommandQueueX (slots 19..21; real GDKX 3-arg PresentX)
 HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
     UINT PlaneCount,
     const D3D12XBOX_PRESENT_PLANE_PARAMETERS* pPlaneParameters,
-    const D3D12XBOX_PRESENT_PARAMETERS* pPresentParameters,
-    void* pPresentToken) {
-    (void)pPresentToken;
+    const D3D12XBOX_PRESENT_PARAMETERS* pPresentParameters) {
     const int64_t total_start_qpc = QueryQpcNow();
 
     // Xbox GDK titles (e.g. Xbox-GDK-Samples DeviceResources::~DeviceResources & resize)
@@ -1765,6 +1853,7 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
     const D3D12_RESOURCE_STATES caller_state = pPlaneParameters[0].ResourceState;
 
     // Ensure window subclass is active and pump pending Win32 messages WITHOUT holding present_mutex_.
+    const bool force_headless = EnvFlagTrueA("OPENSCARLETT_PRESENTX_HEADLESS");
     HWND pump_hwnd = nullptr;
     std::shared_ptr<WindowCallbackState> pump_state;
     {
@@ -1772,6 +1861,13 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
         pump_hwnd = (pPresentParameters && pPresentParameters->OutputWindow)
                         ? pPresentParameters->OutputWindow
                         : (present_config_.OutputWindow ? present_config_.OutputWindow : attached_hwnd_);
+        if (!pump_hwnd && !force_headless) {
+            HWND discovered = DiscoverProcessMainWindow();
+            if (discovered && IsWindow(discovered) != FALSE) {
+                attached_hwnd_ = discovered;
+                pump_hwnd = discovered;
+            }
+        }
         if (pump_hwnd && IsWindow(pump_hwnd) != FALSE) {
             AttachWindowSubclassLocked(pump_hwnd);
             pump_state = window_state_;
@@ -1805,7 +1901,7 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
         return hr;
     }
 
-    D3D12XBOX_COLOR_SPACE effective_cs = pPlaneParameters[0].ColorSpace;
+    D3D12XBOX_COLOR_SPACE effective_cs = DxgiToXboxColorSpace(pPlaneParameters[0].ColorSpace);
     if (effective_cs == D3D12XBOX_COLOR_SPACE_RGB_FULL_G22_NONE_P709) {
         if (present_config_.ColorSpace != D3D12XBOX_COLOR_SPACE_RGB_FULL_G22_NONE_P709) {
             effective_cs = present_config_.ColorSpace;
@@ -1817,9 +1913,19 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
     last_presented_src_format_ = src_desc.Format;
     last_presented_color_space_ = effective_cs;
 
-    HWND target_hwnd = (pPresentParameters && pPresentParameters->OutputWindow)
-                           ? pPresentParameters->OutputWindow
-                           : (present_config_.OutputWindow ? present_config_.OutputWindow : attached_hwnd_);
+    const std::string capture_png_path = ReadEnvStringA("OPENSCARLETT_PRESENTX_CAPTURE_PNG");
+    const uint64_t exit_after_frames = ReadEnvUint64A("OPENSCARLETT_PRESENTX_EXIT_AFTER_FRAMES");
+    const uint64_t this_non_blank_frame = non_blank_present_count_ + 1ull;
+    const bool want_capture_this_frame =
+        !capture_png_path.empty() &&
+        ((exit_after_frames > 0ull && this_non_blank_frame == exit_after_frames) ||
+         (exit_after_frames == 0ull && (this_non_blank_frame == 1ull || this_non_blank_frame == 10ull)));
+
+    HWND target_hwnd = force_headless
+                           ? nullptr
+                           : ((pPresentParameters && pPresentParameters->OutputWindow)
+                                  ? pPresentParameters->OutputWindow
+                                  : (present_config_.OutputWindow ? present_config_.OutputWindow : attached_hwnd_));
     const bool use_swapchain = (target_hwnd != nullptr && IsWindow(target_hwnd) != FALSE);
 
     bool window_minimized = false;
@@ -1891,9 +1997,11 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
         do_swapchain_present && swapchain_ && !direct_bb_copy_compatible &&
         (swapchain_format_ == DXGI_FORMAT_R8G8B8A8_UNORM ||
          swapchain_format_ == DXGI_FORMAT_B8G8R8A8_UNORM);
+    const bool skip_intermediate_readback =
+        (exit_after_frames > 0ull && !want_capture_this_frame && !need_tonemap_bb_upload && !vk_routing_active);
     const bool need_readback =
-        !has_vk_direct_rt_fb &&
-        (vk_routing_active || (!use_swapchain) || readback_capture_enabled_ || need_tonemap_bb_upload);
+        !has_vk_direct_rt_fb && !skip_intermediate_readback &&
+        (vk_routing_active || (!use_swapchain) || readback_capture_enabled_ || need_tonemap_bb_upload || want_capture_this_frame);
 
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
     UINT num_rows = 0;
@@ -2283,6 +2391,31 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
     last_present_width_ = has_vk_direct_rt_fb ? vk_direct_rt_fb.width : width;
     last_present_height_ = has_vk_direct_rt_fb ? vk_direct_rt_fb.height : height;
     ++present_count_;
+    ++non_blank_present_count_;
+
+    if (want_capture_this_frame && !last_present_pixels_.empty() &&
+        last_present_width_ > 0u && last_present_height_ > 0u) {
+        openscarlett::FrameBufferRgba8 fb{};
+        fb.width = last_present_width_;
+        fb.height = last_present_height_;
+        fb.pixels = last_present_pixels_;
+        if (fb.WritePng(capture_png_path).ok()) {
+            capture_png_written_ = true;
+        }
+    }
+
+    if (exit_after_frames > 0ull && non_blank_present_count_ >= exit_after_frames && !auto_exit_posted_) {
+        auto_exit_posted_ = true;
+        const DWORD cur_tid = GetCurrentThreadId();
+        const DWORD win_tid =
+            (target_hwnd && IsWindow(target_hwnd) != FALSE)
+                ? GetWindowThreadProcessId(target_hwnd, nullptr)
+                : cur_tid;
+        PostQuitMessage(0);
+        if (win_tid != 0u && win_tid != cur_tid) {
+            PostThreadMessageW(win_tid, WM_QUIT, 0, 0);
+        }
+    }
 
     const int64_t total_end_qpc = QueryQpcNow();
     last_timing_stats_.fence_signal_qpc = fence_sig_qpc;

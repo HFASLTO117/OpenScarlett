@@ -491,13 +491,697 @@ size_t GetSubobjectStrideBytes(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type) noexcep
     }
 }
 
+D3D12_HEAP_FLAGS SanitizeXboxHeapFlags(D3D12_HEAP_FLAGS flags) noexcept {
+    constexpr uint32_t kMaskOut = static_cast<uint32_t>(D3D12_HEAP_FLAG_ALLOW_DISPLAY);
+    return static_cast<D3D12_HEAP_FLAGS>(static_cast<uint32_t>(flags) & ~kMaskOut);
+}
+
+D3D12_RESOURCE_DESC SanitizeXboxResourceDesc(const D3D12_RESOURCE_DESC& desc) noexcept {
+    D3D12_RESOURCE_DESC out = desc;
+    constexpr uint32_t kDesktopResourceFlagsMask = 0x000000FFu;
+    out.Flags = static_cast<D3D12_RESOURCE_FLAGS>(
+        static_cast<uint32_t>(desc.Flags) & kDesktopResourceFlagsMask);
+    return out;
+}
+
+D3D12_RESOURCE_DESC1 SanitizeXboxResourceDesc1(const D3D12_RESOURCE_DESC1& desc) noexcept {
+    D3D12_RESOURCE_DESC1 out = desc;
+    constexpr uint32_t kDesktopResourceFlagsMask = 0x000000FFu;
+    out.Flags = static_cast<D3D12_RESOURCE_FLAGS>(
+        static_cast<uint32_t>(desc.Flags) & kDesktopResourceFlagsMask);
+    return out;
+}
+
+D3D12_RESOURCE_DESC Desc1ToDesc0(const D3D12_RESOURCE_DESC1& d1) noexcept {
+    D3D12_RESOURCE_DESC d0{};
+    d0.Dimension = d1.Dimension;
+    d0.Alignment = d1.Alignment;
+    d0.Width = d1.Width;
+    d0.Height = d1.Height;
+    d0.DepthOrArraySize = d1.DepthOrArraySize;
+    d0.MipLevels = d1.MipLevels;
+    d0.Format = d1.Format;
+    d0.SampleDesc = d1.SampleDesc;
+    d0.Layout = d1.Layout;
+    d0.Flags = d1.Flags;
+    return d0;
+}
+
+// Guard against raw-host escape for ANY ID3D12DeviceN IID (including future/higher SDK versions
+// like ID3D12Device13/14 that might not be wrapped or supported by the host runtime).
+bool IsKnownD3D12DeviceIid(REFIID riid) noexcept {
+    static constexpr GUID kIidDevice7  = {0x5c014b53u, 0x68a1u, 0x4b9bu, {0x8bu, 0xd1u, 0xddu, 0x60u, 0x46u, 0xb9u, 0x35u, 0x8bu}};
+    static constexpr GUID kIidDevice8  = {0x9218e6bbu, 0xf944u, 0x4f7eu, {0xa7u, 0x5cu, 0xb1u, 0xb2u, 0xc7u, 0xb7u, 0x01u, 0xf3u}};
+    static constexpr GUID kIidDevice9  = {0x4c80e962u, 0xf032u, 0x4f60u, {0xbcu, 0x9eu, 0xebu, 0xc2u, 0xcfu, 0xa1u, 0xd8u, 0x3cu}};
+    static constexpr GUID kIidDevice10 = {0x517f8718u, 0xaa66u, 0x49f9u, {0xb0u, 0x2bu, 0xa7u, 0xabu, 0x89u, 0xc0u, 0x60u, 0x31u}};
+    static constexpr GUID kIidDevice11 = {0x5405c344u, 0xd457u, 0x444eu, {0xb4u, 0xddu, 0x23u, 0x66u, 0xe4u, 0x5au, 0xeeu, 0x39u}};
+    static constexpr GUID kIidDevice12 = {0x5af5c532u, 0x4c91u, 0x4cd0u, {0xb5u, 0x41u, 0x15u, 0xa4u, 0x05u, 0x39u, 0x5fu, 0xc5u}};
+    static constexpr GUID kIidDevice13 = {0x14eecffcu, 0x4df8u, 0x40f7u, {0xa1u, 0x18u, 0x5cu, 0x81u, 0x6fu, 0x45u, 0x69u, 0x5eu}};
+    static constexpr GUID kIidDevice14 = {0x5f6c17beu, 0x6357u, 0x4c58u, {0x8bu, 0x68u, 0x4du, 0xc2u, 0x26u, 0x44u, 0xf8u, 0x92u}};
+    return IsEqualIID(riid, OS_D3D12_IID(ID3D12Device)) ||
+           IsEqualIID(riid, OS_D3D12_IID(ID3D12Device1)) ||
+           IsEqualIID(riid, OS_D3D12_IID(ID3D12Device2)) ||
+           IsEqualIID(riid, OS_D3D12_IID(ID3D12Device3)) ||
+           IsEqualIID(riid, OS_D3D12_IID(ID3D12Device4)) ||
+           IsEqualIID(riid, OS_D3D12_IID(ID3D12Device5)) ||
+           IsEqualIID(riid, OS_D3D12_IID(ID3D12Device6)) ||
+           IsEqualIID(riid, kIidDevice7) ||
+           IsEqualIID(riid, kIidDevice8) ||
+           IsEqualIID(riid, kIidDevice9) ||
+           IsEqualIID(riid, kIidDevice10) ||
+           IsEqualIID(riid, kIidDevice11) ||
+           IsEqualIID(riid, kIidDevice12) ||
+           IsEqualIID(riid, kIidDevice13) ||
+           IsEqualIID(riid, kIidDevice14);
+}
+
+// Synthetic virtual IDXGIOutput returned when the host adapter has no physical display outputs
+// (e.g. Optimus render-only dGPU, WARP, or headless CI runners).
+class VirtualDxgiOutput final : public IDXGIOutput {
+public:
+    explicit VirtualDxgiOutput(IDXGIAdapter* parent_adapter) : parent_adapter_(parent_adapter) {
+        if (parent_adapter_) parent_adapter_->AddRef();
+    }
+    ~VirtualDxgiOutput() {
+        if (parent_adapter_) parent_adapter_->Release();
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override {
+        if (!ppvObject) return E_POINTER;
+        *ppvObject = nullptr;
+        if (IsEqualIID(riid, OS_D3D12_IID(IUnknown)) ||
+            IsEqualIID(riid, OS_D3D12_IID(IDXGIObject)) ||
+            IsEqualIID(riid, OS_D3D12_IID(IDXGIOutput))) {
+            *ppvObject = static_cast<IDXGIOutput*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return ref_count_.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG rem = ref_count_.fetch_sub(1u, std::memory_order_acq_rel) - 1u;
+        if (rem == 0u) delete this;
+        return rem;
+    }
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID, UINT, const void*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID, const IUnknown*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID, UINT*, void*) override { return DXGI_ERROR_NOT_FOUND; }
+    HRESULT STDMETHODCALLTYPE GetParent(REFIID riid, void** ppParent) override {
+        return parent_adapter_ ? parent_adapter_->QueryInterface(riid, ppParent) : E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE GetDesc(DXGI_OUTPUT_DESC* pDesc) override {
+        if (!pDesc) return E_INVALIDARG;
+        std::memset(pDesc, 0, sizeof(*pDesc));
+        const wchar_t kName[] = L"\\\\.\\DISPLAY1";
+        std::memcpy(pDesc->DeviceName, kName, sizeof(kName));
+        pDesc->DesktopCoordinates = {0, 0, 1920, 1080};
+        pDesc->AttachedToDesktop = TRUE;
+        pDesc->Rotation = DXGI_MODE_ROTATION_IDENTITY;
+        pDesc->Monitor = nullptr;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetDisplayModeList(
+        DXGI_FORMAT EnumFormat, UINT, UINT* pNumModes, DXGI_MODE_DESC* pDesc) override {
+        if (!pNumModes) return E_INVALIDARG;
+        if (!pDesc) {
+            *pNumModes = 1u;
+            return S_OK;
+        }
+        if (*pNumModes == 0u) return DXGI_ERROR_MORE_DATA;
+        std::memset(pDesc, 0, sizeof(*pDesc));
+        pDesc[0].Width = 1920u;
+        pDesc[0].Height = 1080u;
+        pDesc[0].RefreshRate = {60u, 1u};
+        pDesc[0].Format = EnumFormat;
+        *pNumModes = 1u;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE FindClosestMatchingMode(
+        const DXGI_MODE_DESC* pModeToMatch, DXGI_MODE_DESC* pClosestMatch, IUnknown*) override {
+        if (!pClosestMatch) return E_INVALIDARG;
+        if (pModeToMatch) {
+            *pClosestMatch = *pModeToMatch;
+        } else {
+            std::memset(pClosestMatch, 0, sizeof(*pClosestMatch));
+        }
+        if (pClosestMatch->Width == 0u) pClosestMatch->Width = 1920u;
+        if (pClosestMatch->Height == 0u) pClosestMatch->Height = 1080u;
+        if (pClosestMatch->RefreshRate.Numerator == 0u) {
+            pClosestMatch->RefreshRate = {60u, 1u};
+        }
+        if (pClosestMatch->Format == DXGI_FORMAT_UNKNOWN) {
+            pClosestMatch->Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        }
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE WaitForVBlank() override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE TakeOwnership(IUnknown*, BOOL) override { return S_OK; }
+    void STDMETHODCALLTYPE ReleaseOwnership() override {}
+    HRESULT STDMETHODCALLTYPE GetGammaControlCapabilities(DXGI_GAMMA_CONTROL_CAPABILITIES* pCaps) override {
+        if (!pCaps) return E_INVALIDARG;
+        std::memset(pCaps, 0, sizeof(*pCaps));
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE SetGammaControl(const DXGI_GAMMA_CONTROL*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetGammaControl(DXGI_GAMMA_CONTROL* pArray) override {
+        if (!pArray) return E_INVALIDARG;
+        std::memset(pArray, 0, sizeof(*pArray));
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE SetDisplaySurface(IDXGISurface*) override { return S_OK; }
+    HRESULT STDMETHODCALLTYPE GetDisplaySurfaceData(IDXGISurface*) override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetFrameStatistics(DXGI_FRAME_STATISTICS* pStats) override {
+        if (!pStats) return E_INVALIDARG;
+        std::memset(pStats, 0, sizeof(*pStats));
+        return S_OK;
+    }
+
+private:
+    std::atomic<ULONG> ref_count_{1u};
+    IDXGIAdapter* parent_adapter_ = nullptr;
+};
+
+class DxgiAdapterProxy final : public IDXGIAdapter1 {
+public:
+    DxgiAdapterProxy(IDXGIAdapter1* real_adapter, const D3D12AdapterInfo& info)
+        : real_adapter_(real_adapter), info_(info) {
+        if (real_adapter_) real_adapter_->AddRef();
+    }
+    ~DxgiAdapterProxy() {
+        if (real_adapter_) real_adapter_->Release();
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override {
+        if (!ppvObject) return E_POINTER;
+        *ppvObject = nullptr;
+        if (IsEqualIID(riid, OS_D3D12_IID(IUnknown)) ||
+            IsEqualIID(riid, OS_D3D12_IID(IDXGIObject)) ||
+            IsEqualIID(riid, OS_D3D12_IID(IDXGIAdapter)) ||
+            IsEqualIID(riid, OS_D3D12_IID(IDXGIAdapter1))) {
+            *ppvObject = static_cast<IDXGIAdapter1*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return real_adapter_ ? real_adapter_->QueryInterface(riid, ppvObject) : E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return ref_count_.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG rem = ref_count_.fetch_sub(1u, std::memory_order_acq_rel) - 1u;
+        if (rem == 0u) delete this;
+        return rem;
+    }
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID Name, UINT DataSize, const void* pData) override {
+        return real_adapter_ ? real_adapter_->SetPrivateData(Name, DataSize, pData) : S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID Name, const IUnknown* pUnknown) override {
+        return real_adapter_ ? real_adapter_->SetPrivateDataInterface(Name, pUnknown) : S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID Name, UINT* pDataSize, void* pData) override {
+        return real_adapter_ ? real_adapter_->GetPrivateData(Name, pDataSize, pData) : DXGI_ERROR_NOT_FOUND;
+    }
+    HRESULT STDMETHODCALLTYPE GetParent(REFIID riid, void** ppParent) override {
+        return real_adapter_ ? real_adapter_->GetParent(riid, ppParent) : E_NOINTERFACE;
+    }
+    HRESULT STDMETHODCALLTYPE EnumOutputs(UINT Output, IDXGIOutput** ppOutput) override {
+        if (!ppOutput) return E_POINTER;
+        *ppOutput = nullptr;
+        if (real_adapter_) {
+            const HRESULT hr = real_adapter_->EnumOutputs(Output, ppOutput);
+            if (SUCCEEDED(hr) && *ppOutput) {
+                return S_OK;
+            }
+        }
+        if (Output == 0u) {
+            auto* vout = new (std::nothrow) VirtualDxgiOutput(this);
+            if (!vout) return E_OUTOFMEMORY;
+            *ppOutput = vout;
+            return S_OK;
+        }
+        return DXGI_ERROR_NOT_FOUND;
+    }
+    HRESULT STDMETHODCALLTYPE GetDesc(DXGI_ADAPTER_DESC* pDesc) override {
+        if (!pDesc) return E_INVALIDARG;
+        if (real_adapter_) return real_adapter_->GetDesc(pDesc);
+        std::memset(pDesc, 0, sizeof(*pDesc));
+        pDesc->VendorId = info_.vendor_id;
+        pDesc->DeviceId = info_.device_id;
+        pDesc->DedicatedVideoMemory = static_cast<SIZE_T>(info_.dedicated_video_memory_bytes);
+        pDesc->AdapterLuid.LowPart = info_.luid_low;
+        pDesc->AdapterLuid.HighPart = info_.luid_high;
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE CheckInterfaceSupport(REFGUID InterfaceName, LARGE_INTEGER* pUMDVersion) override {
+        return real_adapter_
+                   ? real_adapter_->CheckInterfaceSupport(InterfaceName, pUMDVersion)
+                   : DXGI_ERROR_UNSUPPORTED;
+    }
+    HRESULT STDMETHODCALLTYPE GetDesc1(DXGI_ADAPTER_DESC1* pDesc) override {
+        if (!pDesc) return E_INVALIDARG;
+        if (real_adapter_) return real_adapter_->GetDesc1(pDesc);
+        std::memset(pDesc, 0, sizeof(*pDesc));
+        pDesc->VendorId = info_.vendor_id;
+        pDesc->DeviceId = info_.device_id;
+        pDesc->DedicatedVideoMemory = static_cast<SIZE_T>(info_.dedicated_video_memory_bytes);
+        pDesc->AdapterLuid.LowPart = info_.luid_low;
+        pDesc->AdapterLuid.HighPart = info_.luid_high;
+        pDesc->Flags = info_.is_warp ? DXGI_ADAPTER_FLAG_SOFTWARE : DXGI_ADAPTER_FLAG_NONE;
+        return S_OK;
+    }
+
+private:
+    std::atomic<ULONG> ref_count_{1u};
+    IDXGIAdapter1* real_adapter_ = nullptr;
+    D3D12AdapterInfo info_{};
+};
+
 }  // namespace
+
+// Lightweight IDXGIDevice1 sub-interface exposed by DeviceX::QueryInterface so real Xbox
+// DeviceResources.cpp (`m_d3dDevice.As(&dxgiDevice) -> GetAdapter() -> EnumOutputs(0)`) works.
+class DxgiDeviceProxy final : public IDXGIDevice1 {
+public:
+    explicit DxgiDeviceProxy(DeviceX* parent) : parent_(parent) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override {
+        return parent_->QueryInterface(riid, ppvObject);
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return parent_->AddRef(); }
+    ULONG STDMETHODCALLTYPE Release() override { return parent_->Release(); }
+
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID Name, UINT DataSize, const void* pData) override {
+        return parent_->SetPrivateData(Name, DataSize, pData);
+    }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID Name, const IUnknown* pUnknown) override {
+        return parent_->SetPrivateDataInterface(Name, pUnknown);
+    }
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID Name, UINT* pDataSize, void* pData) override {
+        return parent_->GetPrivateData(Name, pDataSize, pData);
+    }
+    HRESULT STDMETHODCALLTYPE GetParent(REFIID riid, void** ppParent) override {
+        if (!ppParent) return E_POINTER;
+        *ppParent = nullptr;
+        IDXGIAdapter* adapter = nullptr;
+        HRESULT hr = GetAdapter(&adapter);
+        if (FAILED(hr) || !adapter) return hr;
+        hr = adapter->QueryInterface(riid, ppParent);
+        if (FAILED(hr)) {
+            hr = adapter->GetParent(riid, ppParent);
+        }
+        adapter->Release();
+        return hr;
+    }
+    HRESULT STDMETHODCALLTYPE GetAdapter(IDXGIAdapter** pAdapter) override {
+        if (!pAdapter) return E_POINTER;
+        *pAdapter = nullptr;
+        IDXGIAdapter1* real_adapter = nullptr;
+        if (parent_->HostDevice()) {
+            const LUID luid = parent_->HostDevice()->GetAdapterLuid();
+            IDXGIFactory4* factory4 = nullptr;
+            if (SUCCEEDED(CreateDXGIFactory1(OS_D3D12_IID(IDXGIFactory4), reinterpret_cast<void**>(&factory4))) &&
+                factory4) {
+                factory4->EnumAdapterByLuid(
+                    luid, OS_D3D12_IID(IDXGIAdapter1), reinterpret_cast<void**>(&real_adapter));
+                factory4->Release();
+            }
+        }
+        auto* proxy = new (std::nothrow) DxgiAdapterProxy(real_adapter, parent_->AdapterInfo());
+        if (real_adapter) real_adapter->Release();
+        if (!proxy) return E_OUTOFMEMORY;
+        *pAdapter = proxy;
+        RecordDev("ID3D12DeviceX::DxgiGetAdapter", -1, S_OK);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE CreateSurface(
+        const DXGI_SURFACE_DESC*, UINT, DXGI_USAGE, const DXGI_SHARED_RESOURCE*, IDXGISurface** ppSurface) override {
+        if (ppSurface) *ppSurface = nullptr;
+        return E_NOTIMPL;
+    }
+    HRESULT STDMETHODCALLTYPE QueryResourceResidency(
+        IUnknown* const*, DXGI_RESIDENCY* pResidencyStatus, UINT NumResources) override {
+        if (pResidencyStatus) {
+            for (UINT i = 0; i < NumResources; ++i) {
+                pResidencyStatus[i] = DXGI_RESIDENCY_FULLY_RESIDENT;
+            }
+        }
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE SetGPUThreadPriority(INT Priority) override {
+        gpu_priority_.store(Priority, std::memory_order_relaxed);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetGPUThreadPriority(INT* pPriority) override {
+        if (!pPriority) return E_POINTER;
+        *pPriority = gpu_priority_.load(std::memory_order_relaxed);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT MaxLatency) override {
+        max_latency_.store(MaxLatency == 0u ? 3u : MaxLatency, std::memory_order_relaxed);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE GetMaximumFrameLatency(UINT* pMaxLatency) override {
+        if (!pMaxLatency) return E_POINTER;
+        *pMaxLatency = max_latency_.load(std::memory_order_relaxed);
+        return S_OK;
+    }
+
+private:
+    DeviceX* parent_ = nullptr;
+    std::atomic<INT> gpu_priority_{0};
+    std::atomic<UINT> max_latency_{3u};
+};
+
+// Secondary COM sub-interface wrapping ID3D12Device9..ID3D12Device12 (when defined by SDK)
+// so DeviceX's primary vtable keeps GDKX ID3D12Device8 Xbox methods at slots 73..75 while
+// QI for ID3D12Device9..12 returns a wrapped DeviceX proxy with zero raw-host escape.
+#if defined(__ID3D12Device12_INTERFACE_DEFINED__)
+using DeviceExtendedBase = ID3D12Device12;
+#elif defined(__ID3D12Device11_INTERFACE_DEFINED__)
+using DeviceExtendedBase = ID3D12Device11;
+#elif defined(__ID3D12Device10_INTERFACE_DEFINED__)
+using DeviceExtendedBase = ID3D12Device10;
+#elif defined(__ID3D12Device9_INTERFACE_DEFINED__)
+using DeviceExtendedBase = ID3D12Device9;
+#endif
+
+#if defined(__ID3D12Device9_INTERFACE_DEFINED__)
+class DeviceExtendedProxy final : public DeviceExtendedBase {
+public:
+    explicit DeviceExtendedProxy(DeviceX* parent) : parent_(parent) {}
+
+    // IUnknown
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override {
+        return parent_->QueryInterface(riid, ppvObject);
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return parent_->AddRef(); }
+    ULONG STDMETHODCALLTYPE Release() override { return parent_->Release(); }
+
+    // ID3D12Object
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID g, UINT* s, void* d) override { return parent_->GetPrivateData(g, s, d); }
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID g, UINT s, const void* d) override { return parent_->SetPrivateData(g, s, d); }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID g, const IUnknown* d) override { return parent_->SetPrivateDataInterface(g, d); }
+    HRESULT STDMETHODCALLTYPE SetName(LPCWSTR n) override { return parent_->SetName(n); }
+
+    // ID3D12Device
+    UINT STDMETHODCALLTYPE GetNodeCount() override { return parent_->GetNodeCount(); }
+    HRESULT STDMETHODCALLTYPE CreateCommandQueue(const D3D12_COMMAND_QUEUE_DESC* d, REFIID r, void** q) override { return parent_->CreateCommandQueue(d, r, q); }
+    HRESULT STDMETHODCALLTYPE CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE t, REFIID r, void** a) override { return parent_->CreateCommandAllocator(t, r, a); }
+    HRESULT STDMETHODCALLTYPE CreateGraphicsPipelineState(const D3D12_GRAPHICS_PIPELINE_STATE_DESC* d, REFIID r, void** p) override { return parent_->CreateGraphicsPipelineState(d, r, p); }
+    HRESULT STDMETHODCALLTYPE CreateComputePipelineState(const D3D12_COMPUTE_PIPELINE_STATE_DESC* d, REFIID r, void** p) override { return parent_->CreateComputePipelineState(d, r, p); }
+    HRESULT STDMETHODCALLTYPE CreateCommandList(UINT m, D3D12_COMMAND_LIST_TYPE t, ID3D12CommandAllocator* a, ID3D12PipelineState* s, REFIID r, void** l) override { return parent_->CreateCommandList(m, t, a, s, r, l); }
+    HRESULT STDMETHODCALLTYPE CheckFeatureSupport(D3D12_FEATURE f, void* d, UINT s) override { return parent_->CheckFeatureSupport(f, d, s); }
+    HRESULT STDMETHODCALLTYPE CreateDescriptorHeap(const D3D12_DESCRIPTOR_HEAP_DESC* d, REFIID r, void** h) override { return parent_->CreateDescriptorHeap(d, r, h); }
+    UINT STDMETHODCALLTYPE GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE t) override { return parent_->GetDescriptorHandleIncrementSize(t); }
+    HRESULT STDMETHODCALLTYPE CreateRootSignature(UINT m, const void* b, SIZE_T s, REFIID r, void** o) override { return parent_->CreateRootSignature(m, b, s, r, o); }
+    void STDMETHODCALLTYPE CreateConstantBufferView(const D3D12_CONSTANT_BUFFER_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h) override { parent_->CreateConstantBufferView(d, h); }
+    void STDMETHODCALLTYPE CreateShaderResourceView(ID3D12Resource* res, const D3D12_SHADER_RESOURCE_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h) override { parent_->CreateShaderResourceView(res, d, h); }
+    void STDMETHODCALLTYPE CreateUnorderedAccessView(ID3D12Resource* res, ID3D12Resource* cnt, const D3D12_UNORDERED_ACCESS_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h) override { parent_->CreateUnorderedAccessView(res, cnt, d, h); }
+    void STDMETHODCALLTYPE CreateRenderTargetView(ID3D12Resource* res, const D3D12_RENDER_TARGET_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h) override { parent_->CreateRenderTargetView(res, d, h); }
+    void STDMETHODCALLTYPE CreateDepthStencilView(ID3D12Resource* res, const D3D12_DEPTH_STENCIL_VIEW_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h) override { parent_->CreateDepthStencilView(res, d, h); }
+    void STDMETHODCALLTYPE CreateSampler(const D3D12_SAMPLER_DESC* d, D3D12_CPU_DESCRIPTOR_HANDLE h) override { parent_->CreateSampler(d, h); }
+    void STDMETHODCALLTYPE CopyDescriptors(UINT nd, const D3D12_CPU_DESCRIPTOR_HANDLE* ds, const UINT* dsz, UINT ns, const D3D12_CPU_DESCRIPTOR_HANDLE* ss, const UINT* ssz, D3D12_DESCRIPTOR_HEAP_TYPE t) override { parent_->CopyDescriptors(nd, ds, dsz, ns, ss, ssz, t); }
+    void STDMETHODCALLTYPE CopyDescriptorsSimple(UINT n, D3D12_CPU_DESCRIPTOR_HANDLE d, D3D12_CPU_DESCRIPTOR_HANDLE s, D3D12_DESCRIPTOR_HEAP_TYPE t) override { parent_->CopyDescriptorsSimple(n, d, s, t); }
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+    using ID3D12Device::GetResourceAllocationInfo;
+    D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE GetResourceAllocationInfo(D3D12_RESOURCE_ALLOCATION_INFO* r, UINT m, UINT n, const D3D12_RESOURCE_DESC* d) override { return parent_->GetResourceAllocationInfo(r, m, n, d); }
+    using ID3D12Device::GetCustomHeapProperties;
+    D3D12_HEAP_PROPERTIES* STDMETHODCALLTYPE GetCustomHeapProperties(D3D12_HEAP_PROPERTIES* r, UINT m, D3D12_HEAP_TYPE t) override { return parent_->GetCustomHeapProperties(r, m, t); }
+#else
+    D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE GetResourceAllocationInfo(UINT m, UINT n, const D3D12_RESOURCE_DESC* d) override { return parent_->GetResourceAllocationInfo(m, n, d); }
+    D3D12_HEAP_PROPERTIES STDMETHODCALLTYPE GetCustomHeapProperties(UINT m, D3D12_HEAP_TYPE t) override { return parent_->GetCustomHeapProperties(m, t); }
+#endif
+    HRESULT STDMETHODCALLTYPE CreateCommittedResource(const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS hf, const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv, REFIID r, void** o) override { return parent_->CreateCommittedResource(hp, hf, d, st, cv, r, o); }
+    HRESULT STDMETHODCALLTYPE CreateHeap(const D3D12_HEAP_DESC* d, REFIID r, void** h) override { return parent_->CreateHeap(d, r, h); }
+    HRESULT STDMETHODCALLTYPE CreatePlacedResource(ID3D12Heap* h, UINT64 off, const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv, REFIID r, void** o) override { return parent_->CreatePlacedResource(h, off, d, st, cv, r, o); }
+    HRESULT STDMETHODCALLTYPE CreateReservedResource(const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv, REFIID r, void** o) override { return parent_->CreateReservedResource(d, st, cv, r, o); }
+    HRESULT STDMETHODCALLTYPE CreateSharedHandle(ID3D12DeviceChild* o, const SECURITY_ATTRIBUTES* sa, DWORD a, LPCWSTR n, HANDLE* h) override { return parent_->CreateSharedHandle(o, sa, a, n, h); }
+    HRESULT STDMETHODCALLTYPE OpenSharedHandle(HANDLE h, REFIID r, void** o) override { return parent_->OpenSharedHandle(h, r, o); }
+    HRESULT STDMETHODCALLTYPE OpenSharedHandleByName(LPCWSTR n, DWORD a, HANDLE* h) override { return parent_->OpenSharedHandleByName(n, a, h); }
+    HRESULT STDMETHODCALLTYPE MakeResident(UINT n, ID3D12Pageable* const* o) override { return parent_->MakeResident(n, o); }
+    HRESULT STDMETHODCALLTYPE Evict(UINT n, ID3D12Pageable* const* o) override { return parent_->Evict(n, o); }
+    HRESULT STDMETHODCALLTYPE CreateFence(UINT64 v, D3D12_FENCE_FLAGS f, REFIID r, void** o) override { return parent_->CreateFence(v, f, r, o); }
+    HRESULT STDMETHODCALLTYPE GetDeviceRemovedReason() override { return parent_->GetDeviceRemovedReason(); }
+    void STDMETHODCALLTYPE GetCopyableFootprints(const D3D12_RESOURCE_DESC* d, UINT f, UINT n, UINT64 b, D3D12_PLACED_SUBRESOURCE_FOOTPRINT* l, UINT* nr, UINT64* rs, UINT64* tb) override { parent_->GetCopyableFootprints(d, f, n, b, l, nr, rs, tb); }
+    HRESULT STDMETHODCALLTYPE CreateQueryHeap(const D3D12_QUERY_HEAP_DESC* d, REFIID r, void** h) override { return parent_->CreateQueryHeap(d, r, h); }
+    HRESULT STDMETHODCALLTYPE SetStablePowerState(BOOL e) override { return parent_->SetStablePowerState(e); }
+    HRESULT STDMETHODCALLTYPE CreateCommandSignature(const D3D12_COMMAND_SIGNATURE_DESC* d, ID3D12RootSignature* rs, REFIID r, void** o) override { return parent_->CreateCommandSignature(d, rs, r, o); }
+    void STDMETHODCALLTYPE GetResourceTiling(ID3D12Resource* res, UINT* nt, D3D12_PACKED_MIP_INFO* pm, D3D12_TILE_SHAPE* ts, UINT* nst, UINT fst, D3D12_SUBRESOURCE_TILING* st) override { parent_->GetResourceTiling(res, nt, pm, ts, nst, fst, st); }
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+    using ID3D12Device::GetAdapterLuid;
+    LUID* STDMETHODCALLTYPE GetAdapterLuid(LUID* r) override { return parent_->GetAdapterLuid(r); }
+#else
+    LUID STDMETHODCALLTYPE GetAdapterLuid() override { return parent_->GetAdapterLuid(); }
+#endif
+
+    // ID3D12Device1..8
+    HRESULT STDMETHODCALLTYPE CreatePipelineLibrary(const void* b, SIZE_T l, REFIID r, void** o) override { return parent_->CreatePipelineLibrary(b, l, r, o); }
+    HRESULT STDMETHODCALLTYPE SetEventOnMultipleFenceCompletion(ID3D12Fence* const* f, const UINT64* v, UINT n, D3D12_MULTIPLE_FENCE_WAIT_FLAGS fl, HANDLE e) override { return parent_->SetEventOnMultipleFenceCompletion(f, v, n, fl, e); }
+    HRESULT STDMETHODCALLTYPE SetResidencyPriority(UINT n, ID3D12Pageable* const* o, const D3D12_RESIDENCY_PRIORITY* p) override { return parent_->SetResidencyPriority(n, o, p); }
+    HRESULT STDMETHODCALLTYPE CreatePipelineState(const D3D12_PIPELINE_STATE_STREAM_DESC* d, REFIID r, void** o) override { return parent_->CreatePipelineState(d, r, o); }
+    HRESULT STDMETHODCALLTYPE OpenExistingHeapFromAddress(const void* a, REFIID r, void** o) override { return parent_->OpenExistingHeapFromAddress(a, r, o); }
+    HRESULT STDMETHODCALLTYPE OpenExistingHeapFromFileMapping(HANDLE h, REFIID r, void** o) override { return parent_->OpenExistingHeapFromFileMapping(h, r, o); }
+    HRESULT STDMETHODCALLTYPE EnqueueMakeResident(D3D12_RESIDENCY_FLAGS f, UINT n, ID3D12Pageable* const* o, ID3D12Fence* fn, UINT64 v) override { return parent_->EnqueueMakeResident(f, n, o, fn, v); }
+    HRESULT STDMETHODCALLTYPE CreateCommandList1(UINT m, D3D12_COMMAND_LIST_TYPE t, D3D12_COMMAND_LIST_FLAGS f, REFIID r, void** o) override { return parent_->CreateCommandList1(m, t, f, r, o); }
+    HRESULT STDMETHODCALLTYPE CreateProtectedResourceSession(const D3D12_PROTECTED_RESOURCE_SESSION_DESC* d, REFIID r, void** o) override { return parent_->CreateProtectedResourceSession(d, r, o); }
+    HRESULT STDMETHODCALLTYPE CreateCommittedResource1(const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS hf, const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv, ID3D12ProtectedResourceSession* ps, REFIID r, void** o) override { return parent_->CreateCommittedResource1(hp, hf, d, st, cv, ps, r, o); }
+    HRESULT STDMETHODCALLTYPE CreateHeap1(const D3D12_HEAP_DESC* d, ID3D12ProtectedResourceSession* ps, REFIID r, void** o) override { return parent_->CreateHeap1(d, ps, r, o); }
+    HRESULT STDMETHODCALLTYPE CreateReservedResource1(const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv, ID3D12ProtectedResourceSession* ps, REFIID r, void** o) override { return parent_->CreateReservedResource1(d, st, cv, ps, r, o); }
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+    using ID3D12Device4::GetResourceAllocationInfo1;
+    D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE GetResourceAllocationInfo1(D3D12_RESOURCE_ALLOCATION_INFO* r, UINT m, UINT n, const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_ALLOCATION_INFO1* i) override { return parent_->GetResourceAllocationInfo1(r, m, n, d, i); }
+#else
+    D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE GetResourceAllocationInfo1(UINT m, UINT n, const D3D12_RESOURCE_DESC* d, D3D12_RESOURCE_ALLOCATION_INFO1* i) override { return parent_->GetResourceAllocationInfo1(m, n, d, i); }
+#endif
+    HRESULT STDMETHODCALLTYPE CreateLifetimeTracker(ID3D12LifetimeOwner* o, REFIID r, void** t) override { return parent_->CreateLifetimeTracker(o, r, t); }
+    void STDMETHODCALLTYPE RemoveDevice() override { parent_->RemoveDevice(); }
+    HRESULT STDMETHODCALLTYPE EnumerateMetaCommands(UINT* n, D3D12_META_COMMAND_DESC* d) override { return parent_->EnumerateMetaCommands(n, d); }
+    HRESULT STDMETHODCALLTYPE EnumerateMetaCommandParameters(REFGUID id, D3D12_META_COMMAND_PARAMETER_STAGE st, UINT* sz, UINT* n, D3D12_META_COMMAND_PARAMETER_DESC* d) override { return parent_->EnumerateMetaCommandParameters(id, st, sz, n, d); }
+    HRESULT STDMETHODCALLTYPE CreateMetaCommand(REFGUID id, UINT m, const void* d, SIZE_T s, REFIID r, void** o) override { return parent_->CreateMetaCommand(id, m, d, s, r, o); }
+    HRESULT STDMETHODCALLTYPE CreateStateObject(const D3D12_STATE_OBJECT_DESC* d, REFIID r, void** o) override { return parent_->CreateStateObject(d, r, o); }
+    void STDMETHODCALLTYPE GetRaytracingAccelerationStructurePrebuildInfo(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* d, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO* i) override { parent_->GetRaytracingAccelerationStructurePrebuildInfo(d, i); }
+    D3D12_DRIVER_MATCHING_IDENTIFIER_STATUS STDMETHODCALLTYPE CheckDriverMatchingIdentifier(D3D12_SERIALIZED_DATA_TYPE t, const D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER* i) override { return parent_->CheckDriverMatchingIdentifier(t, i); }
+    HRESULT STDMETHODCALLTYPE SetBackgroundProcessingMode(D3D12_BACKGROUND_PROCESSING_MODE m, D3D12_MEASUREMENTS_ACTION a, HANDLE e, BOOL* b) override { return parent_->SetBackgroundProcessingMode(m, a, e, b); }
+    HRESULT STDMETHODCALLTYPE AddToStateObject(const D3D12_STATE_OBJECT_DESC* a, ID3D12StateObject* g, REFIID r, void** o) override { return parent_->AddToStateObject(a, g, r, o); }
+    HRESULT STDMETHODCALLTYPE CreateProtectedResourceSession1(const D3D12_PROTECTED_RESOURCE_SESSION_DESC1* d, REFIID r, void** o) override { return parent_->CreateProtectedResourceSession1(d, r, o); }
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+    using ID3D12Device8::GetResourceAllocationInfo2;
+    D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE GetResourceAllocationInfo2(D3D12_RESOURCE_ALLOCATION_INFO* r, UINT m, UINT n, const D3D12_RESOURCE_DESC1* d, D3D12_RESOURCE_ALLOCATION_INFO1* i) override { return parent_->GetResourceAllocationInfo2(r, m, n, d, i); }
+#else
+    D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE GetResourceAllocationInfo2(UINT m, UINT n, const D3D12_RESOURCE_DESC1* d, D3D12_RESOURCE_ALLOCATION_INFO1* i) override { return parent_->GetResourceAllocationInfo2(m, n, d, i); }
+#endif
+    HRESULT STDMETHODCALLTYPE CreateCommittedResource2(const D3D12_HEAP_PROPERTIES* hp, D3D12_HEAP_FLAGS hf, const D3D12_RESOURCE_DESC1* d, D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv, ID3D12ProtectedResourceSession* ps, REFIID r, void** o) override { return parent_->CreateCommittedResource2(hp, hf, d, st, cv, ps, r, o); }
+    HRESULT STDMETHODCALLTYPE CreatePlacedResource1(ID3D12Heap* h, UINT64 off, const D3D12_RESOURCE_DESC1* d, D3D12_RESOURCE_STATES st, const D3D12_CLEAR_VALUE* cv, REFIID r, void** o) override { return parent_->CreatePlacedResource1(h, off, d, st, cv, r, o); }
+    void STDMETHODCALLTYPE CreateSamplerFeedbackUnorderedAccessView(ID3D12Resource* tr, ID3D12Resource* fr, D3D12_CPU_DESCRIPTOR_HANDLE h) override { parent_->CreateSamplerFeedbackUnorderedAccessView(tr, fr, h); }
+    void STDMETHODCALLTYPE GetCopyableFootprints1(const D3D12_RESOURCE_DESC1* d, UINT f, UINT n, UINT64 b, D3D12_PLACED_SUBRESOURCE_FOOTPRINT* l, UINT* nr, UINT64* rs, UINT64* tb) override { parent_->GetCopyableFootprints1(d, f, n, b, l, nr, rs, tb); }
+
+    // ID3D12Device9
+    HRESULT STDMETHODCALLTYPE CreateShaderCacheSession(const D3D12_SHADER_CACHE_SESSION_DESC* pDesc, REFIID riid, void** ppvSession) override {
+        const HRESULT hr = parent_->host_dev9_ ? parent_->host_dev9_->CreateShaderCacheSession(pDesc, riid, ppvSession) : E_NOINTERFACE;
+        RecordDev("ID3D12DeviceX::CreateShaderCacheSession", 73, hr);
+        return hr;
+    }
+    HRESULT STDMETHODCALLTYPE ShaderCacheControl(D3D12_SHADER_CACHE_KIND_FLAGS Kinds, D3D12_SHADER_CACHE_CONTROL_FLAGS Control) override {
+        const HRESULT hr = parent_->host_dev9_ ? parent_->host_dev9_->ShaderCacheControl(Kinds, Control) : E_NOINTERFACE;
+        RecordDev("ID3D12DeviceX::ShaderCacheControl", 74, hr);
+        return hr;
+    }
+    HRESULT STDMETHODCALLTYPE CreateCommandQueue1(const D3D12_COMMAND_QUEUE_DESC* pDesc, REFIID CreatorID, REFIID riid, void** ppCommandQueue) override {
+        if (!ppCommandQueue) {
+            RecordDev("ID3D12DeviceX::CreateCommandQueue1", 75, E_POINTER);
+            return E_POINTER;
+        }
+        *ppCommandQueue = nullptr;
+        if (!parent_->host_dev9_) {
+            RecordDev("ID3D12DeviceX::CreateCommandQueue1", 75, E_NOINTERFACE);
+            return E_NOINTERFACE;
+        }
+        ID3D12CommandQueue* host_q = nullptr;
+        HRESULT hr = parent_->host_dev9_->CreateCommandQueue1(
+            pDesc, CreatorID, OS_D3D12_IID(ID3D12CommandQueue), reinterpret_cast<void**>(&host_q));
+        if (FAILED(hr) || !host_q) {
+            RecordDev("ID3D12DeviceX::CreateCommandQueue1", 75, hr);
+            return hr;
+        }
+        auto* wrapper = new (std::nothrow) CommandQueueX(parent_, host_q, parent_->DefaultWindow());
+        host_q->Release();
+        if (!wrapper) {
+            RecordDev("ID3D12DeviceX::CreateCommandQueue1", 75, E_OUTOFMEMORY);
+            return E_OUTOFMEMORY;
+        }
+        hr = wrapper->QueryInterface(riid, ppCommandQueue);
+        wrapper->Release();
+        RecordDev("ID3D12DeviceX::CreateCommandQueue1", 75, hr);
+        return hr;
+    }
+
+#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+    HRESULT STDMETHODCALLTYPE CreateCommittedResource3(
+        const D3D12_HEAP_PROPERTIES* pHeapProperties, D3D12_HEAP_FLAGS HeapFlags,
+        const D3D12_RESOURCE_DESC1* pDesc, D3D12_BARRIER_LAYOUT InitialLayout,
+        const D3D12_CLEAR_VALUE* pOptimizedClearValue, ID3D12ProtectedResourceSession* pProtectedSession,
+        UINT32 NumCastableFormats, const DXGI_FORMAT* pCastableFormats,
+        REFIID riidResource, void** ppvResource) override {
+        if (!parent_->host_dev10_) {
+            RecordDev("ID3D12DeviceX::CreateCommittedResource3", 76, E_NOINTERFACE);
+            return E_NOINTERFACE;
+        }
+        D3D12_RESOURCE_DESC1 clean_desc{};
+        const D3D12_RESOURCE_DESC1* desc_ptr = pDesc;
+        if (pDesc) {
+            clean_desc = SanitizeXboxResourceDesc1(*pDesc);
+            desc_ptr = &clean_desc;
+        }
+        ID3D12Resource* host_res = nullptr;
+        HRESULT hr = parent_->host_dev10_->CreateCommittedResource3(
+            pHeapProperties, SanitizeXboxHeapFlags(HeapFlags), desc_ptr, InitialLayout,
+            pOptimizedClearValue, pProtectedSession, NumCastableFormats, pCastableFormats,
+            OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
+        if (SUCCEEDED(hr) && host_res && ppvResource) {
+            const D3D12_RESOURCE_DESC d0 = desc_ptr ? Desc1ToDesc0(*desc_ptr) : D3D12_RESOURCE_DESC{};
+            auto* proxy = new (std::nothrow) ResourceXProxy(
+                parent_, host_res, desc_ptr ? &d0 : nullptr, pHeapProperties, SanitizeXboxHeapFlags(HeapFlags));
+            host_res->Release();
+            if (!proxy) {
+                RecordDev("ID3D12DeviceX::CreateCommittedResource3", 76, E_OUTOFMEMORY);
+                return E_OUTOFMEMORY;
+            }
+            hr = proxy->QueryInterface(riidResource, ppvResource);
+            proxy->Release();
+        } else if (host_res) {
+            host_res->Release();
+        }
+        RecordDev("ID3D12DeviceX::CreateCommittedResource3", 76, hr);
+        return hr;
+    }
+    HRESULT STDMETHODCALLTYPE CreatePlacedResource2(
+        ID3D12Heap* pHeap, UINT64 HeapOffset, const D3D12_RESOURCE_DESC1* pDesc,
+        D3D12_BARRIER_LAYOUT InitialLayout, const D3D12_CLEAR_VALUE* pOptimizedClearValue,
+        UINT32 NumCastableFormats, const DXGI_FORMAT* pCastableFormats,
+        REFIID riid, void** ppvResource) override {
+        if (!parent_->host_dev10_) {
+            RecordDev("ID3D12DeviceX::CreatePlacedResource2", 77, E_NOINTERFACE);
+            return E_NOINTERFACE;
+        }
+        D3D12_RESOURCE_DESC1 clean_desc{};
+        const D3D12_RESOURCE_DESC1* desc_ptr = pDesc;
+        if (pDesc) {
+            clean_desc = SanitizeXboxResourceDesc1(*pDesc);
+            desc_ptr = &clean_desc;
+        }
+        ID3D12Resource* host_res = nullptr;
+        HRESULT hr = parent_->host_dev10_->CreatePlacedResource2(
+            UnwrapHeap(pHeap), HeapOffset, desc_ptr, InitialLayout, pOptimizedClearValue,
+            NumCastableFormats, pCastableFormats,
+            OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
+        if (SUCCEEDED(hr) && host_res && ppvResource) {
+            const D3D12_RESOURCE_DESC d0 = desc_ptr ? Desc1ToDesc0(*desc_ptr) : D3D12_RESOURCE_DESC{};
+            auto* proxy = new (std::nothrow) ResourceXProxy(parent_, host_res, desc_ptr ? &d0 : nullptr);
+            host_res->Release();
+            if (!proxy) {
+                RecordDev("ID3D12DeviceX::CreatePlacedResource2", 77, E_OUTOFMEMORY);
+                return E_OUTOFMEMORY;
+            }
+            hr = proxy->QueryInterface(riid, ppvResource);
+            proxy->Release();
+        } else if (host_res) {
+            host_res->Release();
+        }
+        RecordDev("ID3D12DeviceX::CreatePlacedResource2", 77, hr);
+        return hr;
+    }
+    HRESULT STDMETHODCALLTYPE CreateReservedResource2(
+        const D3D12_RESOURCE_DESC* pDesc, D3D12_BARRIER_LAYOUT InitialLayout,
+        const D3D12_CLEAR_VALUE* pOptimizedClearValue, ID3D12ProtectedResourceSession* pProtectedSession,
+        UINT32 NumCastableFormats, const DXGI_FORMAT* pCastableFormats,
+        REFIID riid, void** ppvResource) override {
+        if (!parent_->host_dev10_) {
+            RecordDev("ID3D12DeviceX::CreateReservedResource2", 78, E_NOINTERFACE);
+            return E_NOINTERFACE;
+        }
+        D3D12_RESOURCE_DESC clean_desc{};
+        const D3D12_RESOURCE_DESC* desc_ptr = pDesc;
+        if (pDesc) {
+            clean_desc = SanitizeXboxResourceDesc(*pDesc);
+            desc_ptr = &clean_desc;
+        }
+        ID3D12Resource* host_res = nullptr;
+        HRESULT hr = parent_->host_dev10_->CreateReservedResource2(
+            desc_ptr, InitialLayout, pOptimizedClearValue, pProtectedSession,
+            NumCastableFormats, pCastableFormats,
+            OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
+        if (SUCCEEDED(hr) && host_res && ppvResource) {
+            auto* proxy = new (std::nothrow) ResourceXProxy(parent_, host_res, desc_ptr);
+            host_res->Release();
+            if (!proxy) {
+                RecordDev("ID3D12DeviceX::CreateReservedResource2", 78, E_OUTOFMEMORY);
+                return E_OUTOFMEMORY;
+            }
+            hr = proxy->QueryInterface(riid, ppvResource);
+            proxy->Release();
+        } else if (host_res) {
+            host_res->Release();
+        }
+        RecordDev("ID3D12DeviceX::CreateReservedResource2", 78, hr);
+        return hr;
+    }
+#endif
+
+#ifdef __ID3D12Device11_INTERFACE_DEFINED__
+    void STDMETHODCALLTYPE CreateSampler2(const D3D12_SAMPLER_DESC2* pDesc, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) override {
+        if (parent_->host_dev11_) {
+            parent_->host_dev11_->CreateSampler2(pDesc, DestDescriptor);
+        }
+        RecordDev("ID3D12DeviceX::CreateSampler2", 79, parent_->host_dev11_ ? S_OK : E_NOINTERFACE);
+    }
+#endif
+
+#ifdef __ID3D12Device12_INTERFACE_DEFINED__
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+    using ID3D12Device12::GetResourceAllocationInfo3;
+    D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE GetResourceAllocationInfo3(
+        D3D12_RESOURCE_ALLOCATION_INFO* pRet, UINT visibleMask, UINT numResourceDescs,
+        const D3D12_RESOURCE_DESC1* pResourceDescs, const UINT32* pNumCastableFormats,
+        const DXGI_FORMAT* const* ppCastableFormats, D3D12_RESOURCE_ALLOCATION_INFO1* pResourceAllocationInfo1) override {
+        if (parent_->host_dev12_) {
+            return parent_->host_dev12_->GetResourceAllocationInfo3(
+                pRet, visibleMask, numResourceDescs, pResourceDescs,
+                pNumCastableFormats, ppCastableFormats, pResourceAllocationInfo1);
+        }
+        return parent_->GetResourceAllocationInfo2(pRet, visibleMask, numResourceDescs, pResourceDescs, pResourceAllocationInfo1);
+    }
+#else
+    D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE GetResourceAllocationInfo3(
+        UINT visibleMask, UINT numResourceDescs,
+        const D3D12_RESOURCE_DESC1* pResourceDescs, const UINT32* pNumCastableFormats,
+        const DXGI_FORMAT* const* ppCastableFormats, D3D12_RESOURCE_ALLOCATION_INFO1* pResourceAllocationInfo1) override {
+        if (parent_->host_dev12_) {
+            return parent_->host_dev12_->GetResourceAllocationInfo3(
+                visibleMask, numResourceDescs, pResourceDescs,
+                pNumCastableFormats, ppCastableFormats, pResourceAllocationInfo1);
+        }
+        return parent_->GetResourceAllocationInfo2(visibleMask, numResourceDescs, pResourceDescs, pResourceAllocationInfo1);
+    }
+#endif
+#endif
+
+private:
+    DeviceX* parent_ = nullptr;
+};
+#endif  // __ID3D12Device9_INTERFACE_DEFINED__
 
 DeviceX::DeviceX(
     ID3D12Device* host_device,
     const D3D12AdapterInfo& adapter_info,
     HWND default_hwnd)
     : host_dev_(host_device), adapter_info_(adapter_info), default_hwnd_(default_hwnd) {
+    dxgi_proxy_ = new (std::nothrow) DxgiDeviceProxy(this);
+#ifdef __ID3D12Device9_INTERFACE_DEFINED__
+    ext_proxy_ = new (std::nothrow) DeviceExtendedProxy(this);
+#endif
     if (host_dev_) {
         host_dev_->AddRef();
         host_dev_->QueryInterface(OS_D3D12_IID(ID3D12Device1), reinterpret_cast<void**>(&host_dev1_));
@@ -506,6 +1190,20 @@ DeviceX::DeviceX(
         host_dev_->QueryInterface(OS_D3D12_IID(ID3D12Device4), reinterpret_cast<void**>(&host_dev4_));
         host_dev_->QueryInterface(OS_D3D12_IID(ID3D12Device5), reinterpret_cast<void**>(&host_dev5_));
         host_dev_->QueryInterface(OS_D3D12_IID(ID3D12Device6), reinterpret_cast<void**>(&host_dev6_));
+        host_dev_->QueryInterface(OS_D3D12_IID(ID3D12Device7), reinterpret_cast<void**>(&host_dev7_));
+        host_dev_->QueryInterface(OS_D3D12_IID(ID3D12Device8), reinterpret_cast<void**>(&host_dev8_));
+#ifdef __ID3D12Device9_INTERFACE_DEFINED__
+        host_dev_->QueryInterface(OS_D3D12_IID(ID3D12Device9), reinterpret_cast<void**>(&host_dev9_));
+#endif
+#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+        host_dev_->QueryInterface(OS_D3D12_IID(ID3D12Device10), reinterpret_cast<void**>(&host_dev10_));
+#endif
+#ifdef __ID3D12Device11_INTERFACE_DEFINED__
+        host_dev_->QueryInterface(OS_D3D12_IID(ID3D12Device11), reinterpret_cast<void**>(&host_dev11_));
+#endif
+#ifdef __ID3D12Device12_INTERFACE_DEFINED__
+        host_dev_->QueryInterface(OS_D3D12_IID(ID3D12Device12), reinterpret_cast<void**>(&host_dev12_));
+#endif
 
         D3D12_FEATURE_DATA_FORMAT_SUPPORT fmt_sup{};
         fmt_sup.Format = DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
@@ -532,6 +1230,10 @@ DeviceX::DeviceX(
             supports_view_instancing_ =
                 (opts3.ViewInstancingTier != D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED);
         }
+
+        // Wire Worker 2 bindless descriptor bridge & Worker 6 per-draw capture (zero-overhead when disabled).
+        (void)descriptor_bridge_.InitializeD3D12(host_dev_, 4096u, 256u);
+        (void)openscarlett::FrameCaptureRecorder::Global().InitializeFromEnv();
     }
 
     const uint32_t resolved_mode = ResolveEffectiveBackendMode();
@@ -877,6 +1579,13 @@ D3D12_GPU_VIRTUAL_ADDRESS DeviceX::TranslateGuestGpuVa(
             return hooked;
         }
     }
+    {
+        uint64_t mirrored_va = 0ull;
+        uint64_t mirrored_off = 0ull;
+        if (title_va_mirror_.ResolveTitleVa(address, mirrored_va, mirrored_off) && mirrored_va != 0ull) {
+            return mirrored_va;
+        }
+    }
     if (xmem_allocation_count_.load(std::memory_order_acquire) == 0u) {
         return address;
     }
@@ -892,6 +1601,26 @@ D3D12_GPU_VIRTUAL_ADDRESS DeviceX::TranslateGuestGpuVa(
 DeviceX::~DeviceX() {
     shader_cache_.WaitForPendingCompiles();
     ReleaseUnifiedMemoryObjects();
+#ifdef __ID3D12Device9_INTERFACE_DEFINED__
+    delete ext_proxy_;
+    ext_proxy_ = nullptr;
+#endif
+    delete dxgi_proxy_;
+    dxgi_proxy_ = nullptr;
+#ifdef __ID3D12Device12_INTERFACE_DEFINED__
+    if (host_dev12_) host_dev12_->Release();
+#endif
+#ifdef __ID3D12Device11_INTERFACE_DEFINED__
+    if (host_dev11_) host_dev11_->Release();
+#endif
+#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+    if (host_dev10_) host_dev10_->Release();
+#endif
+#ifdef __ID3D12Device9_INTERFACE_DEFINED__
+    if (host_dev9_) host_dev9_->Release();
+#endif
+    if (host_dev8_) host_dev8_->Release();
+    if (host_dev7_) host_dev7_->Release();
     if (host_dev6_) host_dev6_->Release();
     if (host_dev5_) host_dev5_->Release();
     if (host_dev4_) host_dev4_->Release();
@@ -912,12 +1641,64 @@ HRESULT STDMETHODCALLTYPE DeviceX::QueryInterface(REFIID riid, void** ppvObject)
     if (IsEqualIID(riid, OS_D3D12_IID(IUnknown)) ||
         IsEqualIID(riid, OS_D3D12_IID(ID3D12Object)) ||
         IsEqualIID(riid, OS_D3D12_IID(ID3D12Device)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Device1)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Device2)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Device3)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Device4)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Device5)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Device6)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Device7)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Device8)) ||
         IsEqualIID(riid, IID_ID3D12DeviceX)) {
         *ppvObject = static_cast<ID3D12DeviceX*>(this);
         AddRef();
         RecordDev("ID3D12DeviceX::QueryInterface", 0, S_OK);
         return S_OK;
     }
+    if (IsEqualIID(riid, OS_D3D12_IID(IDXGIObject)) ||
+        IsEqualIID(riid, OS_D3D12_IID(IDXGIDevice)) ||
+        IsEqualIID(riid, OS_D3D12_IID(IDXGIDevice1))) {
+        if (!dxgi_proxy_) {
+            RecordDev("ID3D12DeviceX::QueryInterface", 0, E_OUTOFMEMORY);
+            return E_OUTOFMEMORY;
+        }
+        *ppvObject = static_cast<IDXGIDevice1*>(dxgi_proxy_);
+        AddRef();
+        RecordDev("ID3D12DeviceX::QueryInterface", 0, S_OK);
+        return S_OK;
+    }
+#ifdef __ID3D12Device9_INTERFACE_DEFINED__
+    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12Device9)) && host_dev9_ && ext_proxy_) {
+        *ppvObject = static_cast<ID3D12Device9*>(ext_proxy_);
+        AddRef();
+        RecordDev("ID3D12DeviceX::QueryInterface", 0, S_OK);
+        return S_OK;
+    }
+#endif
+#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12Device10)) && host_dev10_ && ext_proxy_) {
+        *ppvObject = static_cast<ID3D12Device10*>(ext_proxy_);
+        AddRef();
+        RecordDev("ID3D12DeviceX::QueryInterface", 0, S_OK);
+        return S_OK;
+    }
+#endif
+#ifdef __ID3D12Device11_INTERFACE_DEFINED__
+    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12Device11)) && host_dev11_ && ext_proxy_) {
+        *ppvObject = static_cast<ID3D12Device11*>(ext_proxy_);
+        AddRef();
+        RecordDev("ID3D12DeviceX::QueryInterface", 0, S_OK);
+        return S_OK;
+    }
+#endif
+#ifdef __ID3D12Device12_INTERFACE_DEFINED__
+    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12Device12)) && host_dev12_ && ext_proxy_) {
+        *ppvObject = static_cast<ID3D12Device12*>(ext_proxy_);
+        AddRef();
+        RecordDev("ID3D12DeviceX::QueryInterface", 0, S_OK);
+        return S_OK;
+    }
+#endif
     if (IsEqualIID(riid, IID_IOpenScarlettUnifiedMemory)) {
         *ppvObject = static_cast<IOpenScarlettUnifiedMemory*>(this);
         AddRef();
@@ -930,44 +1711,15 @@ HRESULT STDMETHODCALLTYPE DeviceX::QueryInterface(REFIID riid, void** ppvObject)
         RecordDev("ID3D12DeviceX::QueryInterface", 0, S_OK);
         return S_OK;
     }
-    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12Device1)) && host_dev1_) {
-        *ppvObject = static_cast<ID3D12Device1*>(this);
-        AddRef();
-        RecordDev("ID3D12DeviceX::QueryInterface", 0, S_OK);
-        return S_OK;
-    }
-    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12Device2)) && host_dev2_) {
-        *ppvObject = static_cast<ID3D12Device2*>(this);
-        AddRef();
-        RecordDev("ID3D12DeviceX::QueryInterface", 0, S_OK);
-        return S_OK;
-    }
-    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12Device3)) && host_dev3_) {
-        *ppvObject = static_cast<ID3D12Device3*>(this);
-        AddRef();
-        RecordDev("ID3D12DeviceX::QueryInterface", 0, S_OK);
-        return S_OK;
-    }
-    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12Device4)) && host_dev4_) {
-        *ppvObject = static_cast<ID3D12Device4*>(this);
-        AddRef();
-        RecordDev("ID3D12DeviceX::QueryInterface", 0, S_OK);
-        return S_OK;
-    }
-    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12Device5)) && host_dev5_) {
-        *ppvObject = static_cast<ID3D12Device5*>(this);
-        AddRef();
-        RecordDev("ID3D12DeviceX::QueryInterface", 0, S_OK);
-        return S_OK;
-    }
-    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12Device6)) && host_dev6_) {
-        *ppvObject = static_cast<ID3D12Device6*>(this);
-        AddRef();
-        RecordDev("ID3D12DeviceX::QueryInterface", 0, S_OK);
-        return S_OK;
+
+    // NEVER fall through to raw host_dev_->QueryInterface() for any ID3D12Device* IID!
+    if (IsKnownD3D12DeviceIid(riid)) {
+        RecordDev("ID3D12DeviceX::QueryInterface", 0, E_NOINTERFACE);
+        return E_NOINTERFACE;
     }
 
-    // Forward auxiliary diagnostic/newer host interfaces (e.g. ID3D12InfoQueue) to host device.
+    // Forward safe auxiliary diagnostic interfaces (e.g. ID3D12InfoQueue, ID3D12DebugDevice)
+    // to host device.
     const HRESULT hr = host_dev_ ? host_dev_->QueryInterface(riid, ppvObject) : E_NOINTERFACE;
     RecordDev("ID3D12DeviceX::QueryInterface", 0, hr);
     return hr;
@@ -1686,24 +2438,6 @@ D3D12_HEAP_PROPERTIES STDMETHODCALLTYPE DeviceX::GetCustomHeapProperties(
     return props;
 }
 #endif
-
-D3D12_HEAP_FLAGS SanitizeXboxHeapFlags(D3D12_HEAP_FLAGS flags) noexcept {
-    // Xbox GDK titles (e.g. Microsoft Xbox-GDK-Samples DeviceResources) pass
-    // D3D12_HEAP_FLAG_ALLOW_DISPLAY on swapchain/scanout committed textures,
-    // which desktop D3D12 rejects with E_INVALIDARG.
-    constexpr uint32_t kMaskOut = static_cast<uint32_t>(D3D12_HEAP_FLAG_ALLOW_DISPLAY);
-    return static_cast<D3D12_HEAP_FLAGS>(static_cast<uint32_t>(flags) & ~kMaskOut);
-}
-
-D3D12_RESOURCE_DESC SanitizeXboxResourceDesc(const D3D12_RESOURCE_DESC& desc) noexcept {
-    // Strip Xbox-exclusive upper D3D12XBOX_RESOURCE_FLAG_* bits (e.g. ALLOW_DCC = 0x80000000)
-    // while keeping all standard desktop D3D12_RESOURCE_FLAGS intact.
-    D3D12_RESOURCE_DESC out = desc;
-    constexpr uint32_t kDesktopResourceFlagsMask = 0x000000FFu;
-    out.Flags = static_cast<D3D12_RESOURCE_FLAGS>(
-        static_cast<uint32_t>(desc.Flags) & kDesktopResourceFlagsMask);
-    return out;
-}
 
 HRESULT STDMETHODCALLTYPE DeviceX::CreateCommittedResource(
     const D3D12_HEAP_PROPERTIES* pHeapProperties, D3D12_HEAP_FLAGS HeapFlags,
@@ -2961,7 +3695,224 @@ HRESULT STDMETHODCALLTYPE DeviceX::SetBackgroundProcessingMode(
     return hr;
 }
 
-// ID3D12DeviceX Xbox extensions (slots 66..72)
+// ID3D12Device7 (slots 66..67)
+HRESULT STDMETHODCALLTYPE DeviceX::AddToStateObject(
+    const D3D12_STATE_OBJECT_DESC* pAddition,
+    ID3D12StateObject* pStateObjectToGrowFrom,
+    REFIID riid,
+    void** ppNewStateObject) {
+    if (!host_dev7_) {
+        RecordDev("ID3D12DeviceX::AddToStateObject", 66, E_NOINTERFACE);
+        return E_NOINTERFACE;
+    }
+    ID3D12StateObject* host_so = nullptr;
+    HRESULT hr = host_dev7_->AddToStateObject(
+        pAddition, UnwrapStateObject(pStateObjectToGrowFrom),
+        OS_D3D12_IID(ID3D12StateObject), reinterpret_cast<void**>(&host_so));
+    if (SUCCEEDED(hr) && host_so && ppNewStateObject) {
+        auto* proxy = new (std::nothrow) StateObjectXProxy(this, host_so);
+        host_so->Release();
+        if (!proxy) {
+            RecordDev("ID3D12DeviceX::AddToStateObject", 66, E_OUTOFMEMORY);
+            return E_OUTOFMEMORY;
+        }
+        hr = proxy->QueryInterface(riid, ppNewStateObject);
+        proxy->Release();
+    } else if (host_so) {
+        host_so->Release();
+    }
+    RecordDev("ID3D12DeviceX::AddToStateObject", 66, hr);
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE DeviceX::CreateProtectedResourceSession1(
+    const D3D12_PROTECTED_RESOURCE_SESSION_DESC1* pDesc,
+    REFIID riid,
+    void** ppSession) {
+    const HRESULT hr = host_dev7_
+                           ? host_dev7_->CreateProtectedResourceSession1(pDesc, riid, ppSession)
+                           : E_NOINTERFACE;
+    RecordDev("ID3D12DeviceX::CreateProtectedResourceSession1", 67, hr);
+    return hr;
+}
+
+// ID3D12Device8 (slots 68..72)
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE DeviceX::GetResourceAllocationInfo2(
+    D3D12_RESOURCE_ALLOCATION_INFO* pRet,
+    UINT visibleMask,
+    UINT numResourceDescs,
+    const D3D12_RESOURCE_DESC1* pResourceDescs,
+    D3D12_RESOURCE_ALLOCATION_INFO1* pResourceAllocationInfo1) {
+    if (host_dev8_) {
+        D3D12_RESOURCE_ALLOCATION_INFO* info = host_dev8_->GetResourceAllocationInfo2(
+            pRet, visibleMask, numResourceDescs, pResourceDescs, pResourceAllocationInfo1);
+        RecordDev("ID3D12DeviceX::GetResourceAllocationInfo2", 68, S_OK);
+        return info;
+    }
+    std::vector<D3D12_RESOURCE_DESC> d0s;
+    if (pResourceDescs && numResourceDescs > 0u) {
+        d0s.reserve(numResourceDescs);
+        for (UINT i = 0; i < numResourceDescs; ++i) d0s.push_back(Desc1ToDesc0(pResourceDescs[i]));
+    }
+    D3D12_RESOURCE_ALLOCATION_INFO* info = host_dev_->GetResourceAllocationInfo(
+        pRet, visibleMask, numResourceDescs, d0s.empty() ? nullptr : d0s.data());
+    RecordDev("ID3D12DeviceX::GetResourceAllocationInfo2", 68, S_OK);
+    return info;
+}
+#else
+D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE DeviceX::GetResourceAllocationInfo2(
+    UINT visibleMask,
+    UINT numResourceDescs,
+    const D3D12_RESOURCE_DESC1* pResourceDescs,
+    D3D12_RESOURCE_ALLOCATION_INFO1* pResourceAllocationInfo1) {
+    if (host_dev8_) {
+        const D3D12_RESOURCE_ALLOCATION_INFO info = host_dev8_->GetResourceAllocationInfo2(
+            visibleMask, numResourceDescs, pResourceDescs, pResourceAllocationInfo1);
+        RecordDev("ID3D12DeviceX::GetResourceAllocationInfo2", 68, S_OK);
+        return info;
+    }
+    std::vector<D3D12_RESOURCE_DESC> d0s;
+    if (pResourceDescs && numResourceDescs > 0u) {
+        d0s.reserve(numResourceDescs);
+        for (UINT i = 0; i < numResourceDescs; ++i) d0s.push_back(Desc1ToDesc0(pResourceDescs[i]));
+    }
+    const D3D12_RESOURCE_ALLOCATION_INFO info = host_dev_->GetResourceAllocationInfo(
+        visibleMask, numResourceDescs, d0s.empty() ? nullptr : d0s.data());
+    RecordDev("ID3D12DeviceX::GetResourceAllocationInfo2", 68, S_OK);
+    return info;
+}
+#endif
+
+HRESULT STDMETHODCALLTYPE DeviceX::CreateCommittedResource2(
+    const D3D12_HEAP_PROPERTIES* pHeapProperties,
+    D3D12_HEAP_FLAGS HeapFlags,
+    const D3D12_RESOURCE_DESC1* pDesc,
+    D3D12_RESOURCE_STATES InitialResourceState,
+    const D3D12_CLEAR_VALUE* pOptimizedClearValue,
+    ID3D12ProtectedResourceSession* pProtectedSession,
+    REFIID riidResource,
+    void** ppvResource) {
+    D3D12_RESOURCE_DESC1 clean_desc1{};
+    const D3D12_RESOURCE_DESC1* desc1_ptr = pDesc;
+    if (pDesc) {
+        clean_desc1 = SanitizeXboxResourceDesc1(*pDesc);
+        desc1_ptr = &clean_desc1;
+    }
+    const D3D12_HEAP_FLAGS clean_hf = SanitizeXboxHeapFlags(HeapFlags);
+    ID3D12Resource* host_res = nullptr;
+    HRESULT hr = E_NOINTERFACE;
+    if (host_dev8_) {
+        hr = host_dev8_->CreateCommittedResource2(
+            pHeapProperties, clean_hf, desc1_ptr,
+            InitialResourceState, pOptimizedClearValue, pProtectedSession,
+            OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
+    } else if (desc1_ptr) {
+        const D3D12_RESOURCE_DESC d0 = Desc1ToDesc0(*desc1_ptr);
+        hr = host_dev_->CreateCommittedResource(
+            pHeapProperties, clean_hf, &d0,
+            InitialResourceState, pOptimizedClearValue,
+            OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
+    }
+    if (SUCCEEDED(hr) && host_res && ppvResource) {
+        const D3D12_RESOURCE_DESC d0 = desc1_ptr ? Desc1ToDesc0(*desc1_ptr) : D3D12_RESOURCE_DESC{};
+        if (vulkan_routing_active_ && pHeapProperties && desc1_ptr) {
+            TrackVulkanResource(host_res, pHeapProperties->Type, d0);
+        }
+        auto* proxy = new (std::nothrow) ResourceXProxy(
+            this, host_res, desc1_ptr ? &d0 : nullptr, pHeapProperties, clean_hf);
+        host_res->Release();
+        if (!proxy) {
+            RecordDev("ID3D12DeviceX::CreateCommittedResource2", 69, E_OUTOFMEMORY);
+            return E_OUTOFMEMORY;
+        }
+        hr = proxy->QueryInterface(riidResource, ppvResource);
+        proxy->Release();
+    } else if (host_res) {
+        host_res->Release();
+    }
+    RecordDev("ID3D12DeviceX::CreateCommittedResource2", 69, hr);
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResource1(
+    ID3D12Heap* pHeap,
+    UINT64 HeapOffset,
+    const D3D12_RESOURCE_DESC1* pDesc,
+    D3D12_RESOURCE_STATES InitialState,
+    const D3D12_CLEAR_VALUE* pOptimizedClearValue,
+    REFIID riid,
+    void** ppvResource) {
+    D3D12_RESOURCE_DESC1 clean_desc1{};
+    const D3D12_RESOURCE_DESC1* desc1_ptr = pDesc;
+    if (pDesc) {
+        clean_desc1 = SanitizeXboxResourceDesc1(*pDesc);
+        desc1_ptr = &clean_desc1;
+    }
+    ID3D12Resource* host_res = nullptr;
+    HRESULT hr = E_NOINTERFACE;
+    if (host_dev8_) {
+        hr = host_dev8_->CreatePlacedResource1(
+            UnwrapHeap(pHeap), HeapOffset, desc1_ptr, InitialState, pOptimizedClearValue,
+            OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
+    } else if (desc1_ptr) {
+        const D3D12_RESOURCE_DESC d0 = Desc1ToDesc0(*desc1_ptr);
+        hr = host_dev_->CreatePlacedResource(
+            UnwrapHeap(pHeap), HeapOffset, &d0, InitialState, pOptimizedClearValue,
+            OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
+    }
+    if (SUCCEEDED(hr) && host_res && ppvResource) {
+        const D3D12_RESOURCE_DESC d0 = desc1_ptr ? Desc1ToDesc0(*desc1_ptr) : D3D12_RESOURCE_DESC{};
+        auto* proxy = new (std::nothrow) ResourceXProxy(this, host_res, desc1_ptr ? &d0 : nullptr);
+        host_res->Release();
+        if (!proxy) {
+            RecordDev("ID3D12DeviceX::CreatePlacedResource1", 70, E_OUTOFMEMORY);
+            return E_OUTOFMEMORY;
+        }
+        hr = proxy->QueryInterface(riid, ppvResource);
+        proxy->Release();
+    } else if (host_res) {
+        host_res->Release();
+    }
+    RecordDev("ID3D12DeviceX::CreatePlacedResource1", 70, hr);
+    return hr;
+}
+
+void STDMETHODCALLTYPE DeviceX::CreateSamplerFeedbackUnorderedAccessView(
+    ID3D12Resource* pTargetedResource,
+    ID3D12Resource* pFeedbackResource,
+    D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
+    if (host_dev8_) {
+        host_dev8_->CreateSamplerFeedbackUnorderedAccessView(
+            UnwrapResource(pTargetedResource), UnwrapResource(pFeedbackResource), DestDescriptor);
+    }
+    RecordDev("ID3D12DeviceX::CreateSamplerFeedbackUnorderedAccessView",
+              71, host_dev8_ ? S_OK : E_NOINTERFACE);
+}
+
+void STDMETHODCALLTYPE DeviceX::GetCopyableFootprints1(
+    const D3D12_RESOURCE_DESC1* pResourceDesc,
+    UINT FirstSubresource,
+    UINT NumSubresources,
+    UINT64 BaseOffset,
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT* pLayouts,
+    UINT* pNumRows,
+    UINT64* pRowSizeInBytes,
+    UINT64* pTotalBytes) {
+    if (host_dev8_) {
+        host_dev8_->GetCopyableFootprints1(
+            pResourceDesc, FirstSubresource, NumSubresources, BaseOffset,
+            pLayouts, pNumRows, pRowSizeInBytes, pTotalBytes);
+    } else if (pResourceDesc) {
+        const D3D12_RESOURCE_DESC d0 = Desc1ToDesc0(*pResourceDesc);
+        host_dev_->GetCopyableFootprints(
+            &d0, FirstSubresource, NumSubresources, BaseOffset,
+            pLayouts, pNumRows, pRowSizeInBytes, pTotalBytes);
+    }
+    RecordDev("ID3D12DeviceX::GetCopyableFootprints1", 72, S_OK);
+}
+
+// ID3D12DeviceX Xbox extensions (slots 73..79; slots 73..75 match real GDKX ID3D12Device8)
 HRESULT STDMETHODCALLTYPE DeviceX::SetFrameIntervalX(
     IDXGIOutput* pOutput, uint32_t PeriodMicroseconds,
     uint32_t MaxFrameLatency, uint32_t Flags) {
@@ -2969,7 +3920,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::SetFrameIntervalX(
     (void)Flags;
     frame_interval_us_.store(PeriodMicroseconds, std::memory_order_relaxed);
     max_frame_latency_.store(MaxFrameLatency == 0 ? 1u : MaxFrameLatency, std::memory_order_relaxed);
-    RecordDev("ID3D12DeviceX::SetFrameIntervalX", 66, S_OK);
+    RecordDev("ID3D12DeviceX::SetFrameIntervalX", 73, S_OK);
     return S_OK;
 }
 
@@ -2982,21 +3933,23 @@ HRESULT STDMETHODCALLTYPE DeviceX::ScheduleFrameEventX(
     if (hEvent) {
         SetEvent(hEvent);
     }
-    RecordDev("ID3D12DeviceX::ScheduleFrameEventX", 67, S_OK);
+    RecordDev("ID3D12DeviceX::ScheduleFrameEventX", 74, S_OK);
     return S_OK;
 }
 
 HRESULT STDMETHODCALLTYPE DeviceX::WaitFrameEventX(
     D3D12XBOX_FRAME_EVENT Event, uint32_t TimeoutMilliseconds,
-    void* pReserved, D3D12XBOX_FRAME_PIPELINE_TOKEN* pOutToken) {
+    void* pReserved, uint32_t Flags,
+    D3D12XBOX_FRAME_PIPELINE_TOKEN* pOutToken) {
     (void)Event;
     (void)TimeoutMilliseconds;
     (void)pReserved;
+    (void)Flags;
     const uint64_t token = next_frame_token_.fetch_add(1ull, std::memory_order_relaxed);
     if (pOutToken) {
         *pOutToken = token;
     }
-    RecordDev("ID3D12DeviceX::WaitFrameEventX", 68, S_OK);
+    RecordDev("ID3D12DeviceX::WaitFrameEventX", 75, S_OK);
     return S_OK;
 }
 
@@ -3005,7 +3958,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResourceX(
     D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE* pOptimizedClearValue,
     REFIID riid, void** ppvResource) {
     if (!pDesc || !ppvResource) {
-        RecordDev("ID3D12DeviceX::CreatePlacedResourceX", 69, E_INVALIDARG);
+        RecordDev("ID3D12DeviceX::CreatePlacedResourceX", 76, E_INVALIDARG);
         return E_INVALIDARG;
     }
     *ppvResource = nullptr;
@@ -3071,7 +4024,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResourceX(
     }
 
     if (FAILED(hr) || !host_res) {
-        RecordDev("ID3D12DeviceX::CreatePlacedResourceX", 69, hr);
+        RecordDev("ID3D12DeviceX::CreatePlacedResourceX", 76, hr);
         return hr;
     }
 
@@ -3080,40 +4033,51 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResourceX(
         TrackVulkanResource(host_res, D3D12_HEAP_TYPE_DEFAULT, clean_desc);
     }
     if (did_r9g9b9e5_fallback) {
-        RecordDev("ID3D12DeviceX::R9G9B9E5UavFallback", 69, S_OK);
+        RecordDev("ID3D12DeviceX::R9G9B9E5UavFallback", 76, S_OK);
     }
     if (VirtualAddress != 0ull) {
         AutoRegisterUnifiedResource(host_res, VirtualAddress, clean_desc, InitialState);
+        openscarlett::TitleVaMappingDesc mdesc{};
+        mdesc.title_va = VirtualAddress;
+        mdesc.size_bytes = clean_desc.Width;
+        mdesc.kind = (clean_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+                         ? openscarlett::TitleVaResourceKind::Buffer
+                         : openscarlett::TitleVaResourceKind::Texture;
+        mdesc.existing_write_watch_cpu_ptr = reinterpret_cast<void*>(VirtualAddress);
+        mdesc.gpu_shadow_resource = host_res;
+        mdesc.initial_state = InitialState;
+        openscarlett::TitleVaRegionInfo reg_info{};
+        (void)title_va_mirror_.RegisterRegion(mdesc, host_dev_, reg_info);
     }
     auto* proxy = new (std::nothrow) ResourceXProxy(
         this, host_res, &clean_desc, &default_heap_props, D3D12_HEAP_FLAG_NONE, VirtualAddress);
     host_res->Release();
     if (!proxy) {
-        RecordDev("ID3D12DeviceX::CreatePlacedResourceX", 69, E_OUTOFMEMORY);
+        RecordDev("ID3D12DeviceX::CreatePlacedResourceX", 76, E_OUTOFMEMORY);
         return E_OUTOFMEMORY;
     }
     hr = proxy->QueryInterface(riid, ppvResource);
     proxy->Release();
-    RecordDev("ID3D12DeviceX::CreatePlacedResourceX", 69, hr);
+    RecordDev("ID3D12DeviceX::CreatePlacedResourceX", 76, hr);
     return hr;
 }
 
 HRESULT STDMETHODCALLTYPE DeviceX::SuspendX(uint32_t Flags) {
     (void)Flags;
     suspended_.store(true, std::memory_order_release);
-    RecordDev("ID3D12DeviceX::SuspendX", 70, S_OK);
+    RecordDev("ID3D12DeviceX::SuspendX", 77, S_OK);
     return S_OK;
 }
 
 HRESULT STDMETHODCALLTYPE DeviceX::ResumeX() {
     suspended_.store(false, std::memory_order_release);
-    RecordDev("ID3D12DeviceX::ResumeX", 71, S_OK);
+    RecordDev("ID3D12DeviceX::ResumeX", 78, S_OK);
     return S_OK;
 }
 
 HRESULT STDMETHODCALLTYPE DeviceX::GetGpuHardwareInfoX(D3D12XBOX_GPU_HARDWARE_INFO* pOutInfo) {
     if (!pOutInfo) {
-        RecordDev("ID3D12DeviceX::GetGpuHardwareInfoX", 72, E_POINTER);
+        RecordDev("ID3D12DeviceX::GetGpuHardwareInfoX", 79, E_POINTER);
         return E_POINTER;
     }
     std::memset(pOutInfo, 0, sizeof(*pOutInfo));
@@ -3134,7 +4098,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::GetGpuHardwareInfoX(D3D12XBOX_GPU_HARDWARE_IN
         std::memcpy(pOutInfo->AdapterName, adapter_info_.description.data(), copy_len);
     }
     pOutInfo->AdapterName[copy_len] = '\0';
-    RecordDev("ID3D12DeviceX::GetGpuHardwareInfoX", 72, S_OK);
+    RecordDev("ID3D12DeviceX::GetGpuHardwareInfoX", 79, S_OK);
     return S_OK;
 }
 

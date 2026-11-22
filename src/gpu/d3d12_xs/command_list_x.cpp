@@ -42,9 +42,156 @@ CommandListRegistry& GetCommandListRegistry() {
 
 }  // namespace
 
+#if defined(__ID3D12GraphicsCommandList10_INTERFACE_DEFINED__)
+using CommandListExtendedBase = ID3D12GraphicsCommandList10;
+#elif defined(__ID3D12GraphicsCommandList9_INTERFACE_DEFINED__)
+using CommandListExtendedBase = ID3D12GraphicsCommandList9;
+#elif defined(__ID3D12GraphicsCommandList8_INTERFACE_DEFINED__)
+using CommandListExtendedBase = ID3D12GraphicsCommandList8;
+#elif defined(__ID3D12GraphicsCommandList7_INTERFACE_DEFINED__)
+using CommandListExtendedBase = ID3D12GraphicsCommandList7;
+#endif
+
+#if defined(__ID3D12GraphicsCommandList7_INTERFACE_DEFINED__)
+class CommandListExtendedProxy final : public CommandListExtendedBase {
+public:
+    explicit CommandListExtendedProxy(CommandListX* parent) : parent_(parent) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override { return parent_->QueryInterface(riid, ppvObject); }
+    ULONG STDMETHODCALLTYPE AddRef() override { return parent_->AddRef(); }
+    ULONG STDMETHODCALLTYPE Release() override { return parent_->Release(); }
+    HRESULT STDMETHODCALLTYPE GetPrivateData(REFGUID g, UINT* s, void* d) override { return parent_->GetPrivateData(g, s, d); }
+    HRESULT STDMETHODCALLTYPE SetPrivateData(REFGUID g, UINT s, const void* d) override { return parent_->SetPrivateData(g, s, d); }
+    HRESULT STDMETHODCALLTYPE SetPrivateDataInterface(REFGUID g, const IUnknown* d) override { return parent_->SetPrivateDataInterface(g, d); }
+    HRESULT STDMETHODCALLTYPE SetName(LPCWSTR n) override { return parent_->SetName(n); }
+    HRESULT STDMETHODCALLTYPE GetDevice(REFIID r, void** d) override { return parent_->GetDevice(r, d); }
+    D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE GetType() override { return parent_->GetType(); }
+    HRESULT STDMETHODCALLTYPE Close() override { return parent_->Close(); }
+    HRESULT STDMETHODCALLTYPE Reset(ID3D12CommandAllocator* a, ID3D12PipelineState* s) override { return parent_->Reset(a, s); }
+    void STDMETHODCALLTYPE ClearState(ID3D12PipelineState* s) override { parent_->ClearState(s); }
+    void STDMETHODCALLTYPE DrawInstanced(UINT vc, UINT ic, UINT sv, UINT si) override { parent_->DrawInstanced(vc, ic, sv, si); }
+    void STDMETHODCALLTYPE DrawIndexedInstanced(UINT ix, UINT ic, UINT si, INT bv, UINT st) override { parent_->DrawIndexedInstanced(ix, ic, si, bv, st); }
+    void STDMETHODCALLTYPE Dispatch(UINT x, UINT y, UINT z) override { parent_->Dispatch(x, y, z); }
+    void STDMETHODCALLTYPE CopyBufferRegion(ID3D12Resource* d, UINT64 dof, ID3D12Resource* s, UINT64 sof, UINT64 nb) override { parent_->CopyBufferRegion(d, dof, s, sof, nb); }
+    void STDMETHODCALLTYPE CopyTextureRegion(const D3D12_TEXTURE_COPY_LOCATION* d, UINT x, UINT y, UINT z, const D3D12_TEXTURE_COPY_LOCATION* s, const D3D12_BOX* b) override { parent_->CopyTextureRegion(d, x, y, z, s, b); }
+    void STDMETHODCALLTYPE CopyResource(ID3D12Resource* d, ID3D12Resource* s) override { parent_->CopyResource(d, s); }
+    void STDMETHODCALLTYPE CopyTiles(ID3D12Resource* r, const D3D12_TILED_RESOURCE_COORDINATE* c, const D3D12_TILE_REGION_SIZE* sz, ID3D12Resource* b, UINT64 off, D3D12_TILE_COPY_FLAGS f) override { parent_->CopyTiles(r, c, sz, b, off, f); }
+    void STDMETHODCALLTYPE ResolveSubresource(ID3D12Resource* d, UINT ds, ID3D12Resource* s, UINT ss, DXGI_FORMAT f) override { parent_->ResolveSubresource(d, ds, s, ss, f); }
+    void STDMETHODCALLTYPE IASetPrimitiveTopology(D3D12_PRIMITIVE_TOPOLOGY t) override { parent_->IASetPrimitiveTopology(t); }
+    void STDMETHODCALLTYPE RSSetViewports(UINT n, const D3D12_VIEWPORT* v) override { parent_->RSSetViewports(n, v); }
+    void STDMETHODCALLTYPE RSSetScissorRects(UINT n, const D3D12_RECT* r) override { parent_->RSSetScissorRects(n, r); }
+    void STDMETHODCALLTYPE OMSetBlendFactor(const FLOAT b[4]) override { parent_->OMSetBlendFactor(b); }
+    void STDMETHODCALLTYPE OMSetStencilRef(UINT r) override { parent_->OMSetStencilRef(r); }
+    void STDMETHODCALLTYPE SetPipelineState(ID3D12PipelineState* p) override { parent_->SetPipelineState(p); }
+    void STDMETHODCALLTYPE ResourceBarrier(UINT n, const D3D12_RESOURCE_BARRIER* b) override { parent_->ResourceBarrier(n, b); }
+    void STDMETHODCALLTYPE ExecuteBundle(ID3D12GraphicsCommandList* l) override { parent_->ExecuteBundle(l); }
+    void STDMETHODCALLTYPE SetDescriptorHeaps(UINT n, ID3D12DescriptorHeap* const* h) override { parent_->SetDescriptorHeaps(n, h); }
+    void STDMETHODCALLTYPE SetComputeRootSignature(ID3D12RootSignature* r) override { parent_->SetComputeRootSignature(r); }
+    void STDMETHODCALLTYPE SetGraphicsRootSignature(ID3D12RootSignature* r) override { parent_->SetGraphicsRootSignature(r); }
+    void STDMETHODCALLTYPE SetComputeRootDescriptorTable(UINT i, D3D12_GPU_DESCRIPTOR_HANDLE h) override { parent_->SetComputeRootDescriptorTable(i, h); }
+    void STDMETHODCALLTYPE SetGraphicsRootDescriptorTable(UINT i, D3D12_GPU_DESCRIPTOR_HANDLE h) override { parent_->SetGraphicsRootDescriptorTable(i, h); }
+    void STDMETHODCALLTYPE SetComputeRoot32BitConstant(UINT i, UINT v, UINT o) override { parent_->SetComputeRoot32BitConstant(i, v, o); }
+    void STDMETHODCALLTYPE SetGraphicsRoot32BitConstant(UINT i, UINT v, UINT o) override { parent_->SetGraphicsRoot32BitConstant(i, v, o); }
+    void STDMETHODCALLTYPE SetComputeRoot32BitConstants(UINT i, UINT n, const void* d, UINT o) override { parent_->SetComputeRoot32BitConstants(i, n, d, o); }
+    void STDMETHODCALLTYPE SetGraphicsRoot32BitConstants(UINT i, UINT n, const void* d, UINT o) override { parent_->SetGraphicsRoot32BitConstants(i, n, d, o); }
+    void STDMETHODCALLTYPE SetComputeRootConstantBufferView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) override { parent_->SetComputeRootConstantBufferView(i, a); }
+    void STDMETHODCALLTYPE SetGraphicsRootConstantBufferView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) override { parent_->SetGraphicsRootConstantBufferView(i, a); }
+    void STDMETHODCALLTYPE SetComputeRootShaderResourceView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) override { parent_->SetComputeRootShaderResourceView(i, a); }
+    void STDMETHODCALLTYPE SetGraphicsRootShaderResourceView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) override { parent_->SetGraphicsRootShaderResourceView(i, a); }
+    void STDMETHODCALLTYPE SetComputeRootUnorderedAccessView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) override { parent_->SetComputeRootUnorderedAccessView(i, a); }
+    void STDMETHODCALLTYPE SetGraphicsRootUnorderedAccessView(UINT i, D3D12_GPU_VIRTUAL_ADDRESS a) override { parent_->SetGraphicsRootUnorderedAccessView(i, a); }
+    void STDMETHODCALLTYPE IASetIndexBuffer(const D3D12_INDEX_BUFFER_VIEW* v) override { parent_->IASetIndexBuffer(v); }
+    void STDMETHODCALLTYPE IASetVertexBuffers(UINT s, UINT n, const D3D12_VERTEX_BUFFER_VIEW* v) override { parent_->IASetVertexBuffers(s, n, v); }
+    void STDMETHODCALLTYPE SOSetTargets(UINT s, UINT n, const D3D12_STREAM_OUTPUT_BUFFER_VIEW* v) override { parent_->SOSetTargets(s, n, v); }
+    void STDMETHODCALLTYPE OMSetRenderTargets(UINT n, const D3D12_CPU_DESCRIPTOR_HANDLE* r, BOOL s, const D3D12_CPU_DESCRIPTOR_HANDLE* d) override { parent_->OMSetRenderTargets(n, r, s, d); }
+    void STDMETHODCALLTYPE ClearDepthStencilView(D3D12_CPU_DESCRIPTOR_HANDLE h, D3D12_CLEAR_FLAGS f, FLOAT d, UINT8 s, UINT n, const D3D12_RECT* r) override { parent_->ClearDepthStencilView(h, f, d, s, n, r); }
+    void STDMETHODCALLTYPE ClearRenderTargetView(D3D12_CPU_DESCRIPTOR_HANDLE h, const FLOAT c[4], UINT n, const D3D12_RECT* r) override { parent_->ClearRenderTargetView(h, c, n, r); }
+    void STDMETHODCALLTYPE ClearUnorderedAccessViewUint(D3D12_GPU_DESCRIPTOR_HANDLE g, D3D12_CPU_DESCRIPTOR_HANDLE c, ID3D12Resource* res, const UINT v[4], UINT n, const D3D12_RECT* r) override { parent_->ClearUnorderedAccessViewUint(g, c, res, v, n, r); }
+    void STDMETHODCALLTYPE ClearUnorderedAccessViewFloat(D3D12_GPU_DESCRIPTOR_HANDLE g, D3D12_CPU_DESCRIPTOR_HANDLE c, ID3D12Resource* res, const FLOAT v[4], UINT n, const D3D12_RECT* r) override { parent_->ClearUnorderedAccessViewFloat(g, c, res, v, n, r); }
+    void STDMETHODCALLTYPE DiscardResource(ID3D12Resource* res, const D3D12_DISCARD_REGION* r) override { parent_->DiscardResource(res, r); }
+    void STDMETHODCALLTYPE BeginQuery(ID3D12QueryHeap* h, D3D12_QUERY_TYPE t, UINT i) override { parent_->BeginQuery(h, t, i); }
+    void STDMETHODCALLTYPE EndQuery(ID3D12QueryHeap* h, D3D12_QUERY_TYPE t, UINT i) override { parent_->EndQuery(h, t, i); }
+    void STDMETHODCALLTYPE ResolveQueryData(ID3D12QueryHeap* h, D3D12_QUERY_TYPE t, UINT s, UINT n, ID3D12Resource* d, UINT64 o) override { parent_->ResolveQueryData(h, t, s, n, d, o); }
+    void STDMETHODCALLTYPE SetPredication(ID3D12Resource* b, UINT64 o, D3D12_PREDICATION_OP op) override { parent_->SetPredication(b, o, op); }
+    void STDMETHODCALLTYPE SetMarker(UINT m, const void* d, UINT s) override { parent_->SetMarker(m, d, s); }
+    void STDMETHODCALLTYPE BeginEvent(UINT m, const void* d, UINT s) override { parent_->BeginEvent(m, d, s); }
+    void STDMETHODCALLTYPE EndEvent() override { parent_->EndEvent(); }
+    void STDMETHODCALLTYPE ExecuteIndirect(ID3D12CommandSignature* cs, UINT mc, ID3D12Resource* ab, UINT64 ao, ID3D12Resource* cb, UINT64 co) override { parent_->ExecuteIndirect(cs, mc, ab, ao, cb, co); }
+    void STDMETHODCALLTYPE AtomicCopyBufferUINT(ID3D12Resource* d, UINT64 dof, ID3D12Resource* s, UINT64 sof, UINT dep, ID3D12Resource* const* dr, const D3D12_SUBRESOURCE_RANGE_UINT64* sr) override { parent_->AtomicCopyBufferUINT(d, dof, s, sof, dep, dr, sr); }
+    void STDMETHODCALLTYPE AtomicCopyBufferUINT64(ID3D12Resource* d, UINT64 dof, ID3D12Resource* s, UINT64 sof, UINT dep, ID3D12Resource* const* dr, const D3D12_SUBRESOURCE_RANGE_UINT64* sr) override { parent_->AtomicCopyBufferUINT64(d, dof, s, sof, dep, dr, sr); }
+    void STDMETHODCALLTYPE OMSetDepthBounds(FLOAT mn, FLOAT mx) override { parent_->OMSetDepthBounds(mn, mx); }
+    void STDMETHODCALLTYPE SetSamplePositions(UINT ns, UINT np, D3D12_SAMPLE_POSITION* sp) override { parent_->SetSamplePositions(ns, np, sp); }
+    void STDMETHODCALLTYPE ResolveSubresourceRegion(ID3D12Resource* d, UINT ds, UINT x, UINT y, ID3D12Resource* s, UINT ss, D3D12_RECT* sr, DXGI_FORMAT f, D3D12_RESOLVE_MODE rm) override { parent_->ResolveSubresourceRegion(d, ds, x, y, s, ss, sr, f, rm); }
+    void STDMETHODCALLTYPE SetViewInstanceMask(UINT m) override { parent_->SetViewInstanceMask(m); }
+    void STDMETHODCALLTYPE WriteBufferImmediate(UINT c, const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER* p, const D3D12_WRITEBUFFERIMMEDIATE_MODE* m) override { parent_->WriteBufferImmediate(c, p, m); }
+    void STDMETHODCALLTYPE SetProtectedResourceSession(ID3D12ProtectedResourceSession* ps) override { parent_->SetProtectedResourceSession(ps); }
+    void STDMETHODCALLTYPE BeginRenderPass(UINT n, const D3D12_RENDER_PASS_RENDER_TARGET_DESC* r, const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC* d, D3D12_RENDER_PASS_FLAGS f) override { parent_->BeginRenderPass(n, r, d, f); }
+    void STDMETHODCALLTYPE EndRenderPass() override { parent_->EndRenderPass(); }
+    void STDMETHODCALLTYPE InitializeMetaCommand(ID3D12MetaCommand* mc, const void* d, SIZE_T s) override { parent_->InitializeMetaCommand(mc, d, s); }
+    void STDMETHODCALLTYPE ExecuteMetaCommand(ID3D12MetaCommand* mc, const void* d, SIZE_T s) override { parent_->ExecuteMetaCommand(mc, d, s); }
+    void STDMETHODCALLTYPE BuildRaytracingAccelerationStructure(const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* d, UINT n, const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* p) override { parent_->BuildRaytracingAccelerationStructure(d, n, p); }
+    void STDMETHODCALLTYPE EmitRaytracingAccelerationStructurePostbuildInfo(const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* d, UINT n, const D3D12_GPU_VIRTUAL_ADDRESS* s) override { parent_->EmitRaytracingAccelerationStructurePostbuildInfo(d, n, s); }
+    void STDMETHODCALLTYPE CopyRaytracingAccelerationStructure(D3D12_GPU_VIRTUAL_ADDRESS d, D3D12_GPU_VIRTUAL_ADDRESS s, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE m) override { parent_->CopyRaytracingAccelerationStructure(d, s, m); }
+    void STDMETHODCALLTYPE SetPipelineState1(ID3D12StateObject* so) override { parent_->SetPipelineState1(so); }
+    void STDMETHODCALLTYPE DispatchRays(const D3D12_DISPATCH_RAYS_DESC* d) override { parent_->DispatchRays(d); }
+    void STDMETHODCALLTYPE RSSetShadingRate(D3D12_SHADING_RATE r, const D3D12_SHADING_RATE_COMBINER* c) override { parent_->RSSetShadingRate(r, c); }
+    void STDMETHODCALLTYPE RSSetShadingRateImage(ID3D12Resource* r) override { parent_->RSSetShadingRateImage(r); }
+    void STDMETHODCALLTYPE DispatchMesh(UINT x, UINT y, UINT z) override { parent_->DispatchMesh(x, y, z); }
+
+    void STDMETHODCALLTYPE Barrier(UINT32 NumBarrierGroups, const D3D12_BARRIER_GROUP* pBarrierGroups) override {
+        if (parent_->host_list7_) {
+            parent_->host_list7_->Barrier(NumBarrierGroups, pBarrierGroups);
+        }
+        RecordList("ID3D12GraphicsCommandListX::Barrier", 80, parent_->host_list7_ ? S_OK : E_NOINTERFACE);
+    }
+#ifdef __ID3D12GraphicsCommandList8_INTERFACE_DEFINED__
+    void STDMETHODCALLTYPE OMSetFrontAndBackStencilRef(UINT FrontStencilRef, UINT BackStencilRef) override {
+        if (parent_->host_list8_) {
+            parent_->host_list8_->OMSetFrontAndBackStencilRef(FrontStencilRef, BackStencilRef);
+        }
+        RecordList("ID3D12GraphicsCommandListX::OMSetFrontAndBackStencilRef", 81, parent_->host_list8_ ? S_OK : E_NOINTERFACE);
+    }
+#endif
+#ifdef __ID3D12GraphicsCommandList9_INTERFACE_DEFINED__
+    void STDMETHODCALLTYPE RSSetDepthBias(FLOAT DepthBias, FLOAT DepthBiasClamp, FLOAT SlopeScaledDepthBias) override {
+        if (parent_->host_list9_) {
+            parent_->host_list9_->RSSetDepthBias(DepthBias, DepthBiasClamp, SlopeScaledDepthBias);
+        }
+        RecordList("ID3D12GraphicsCommandListX::RSSetDepthBias", 82, parent_->host_list9_ ? S_OK : E_NOINTERFACE);
+    }
+    void STDMETHODCALLTYPE IASetIndexBufferStripCutValue(D3D12_INDEX_BUFFER_STRIP_CUT_VALUE IBStripCutValue) override {
+        if (parent_->host_list9_) {
+            parent_->host_list9_->IASetIndexBufferStripCutValue(IBStripCutValue);
+        }
+        RecordList("ID3D12GraphicsCommandListX::IASetIndexBufferStripCutValue", 83, parent_->host_list9_ ? S_OK : E_NOINTERFACE);
+    }
+#endif
+#ifdef __ID3D12GraphicsCommandList10_INTERFACE_DEFINED__
+    void STDMETHODCALLTYPE SetProgram(const D3D12_SET_PROGRAM_DESC* pDesc) override {
+        if (parent_->host_list10_) {
+            parent_->host_list10_->SetProgram(pDesc);
+        }
+        RecordList("ID3D12GraphicsCommandListX::SetProgram", 84, parent_->host_list10_ ? S_OK : E_NOINTERFACE);
+    }
+    void STDMETHODCALLTYPE DispatchGraph(const D3D12_DISPATCH_GRAPH_DESC* pDesc) override {
+        if (parent_->host_list10_) {
+            parent_->host_list10_->DispatchGraph(pDesc);
+        }
+        RecordList("ID3D12GraphicsCommandListX::DispatchGraph", 85, parent_->host_list10_ ? S_OK : E_NOINTERFACE);
+    }
+#endif
+
+private:
+    CommandListX* parent_ = nullptr;
+};
+#endif  // __ID3D12GraphicsCommandList7_INTERFACE_DEFINED__
+
 CommandListX::CommandListX(DeviceX* parent_device, ID3D12GraphicsCommandList* host_list)
     : device_x_(parent_device), host_list_(host_list) {
     if (device_x_) device_x_->AddRef();
+#ifdef __ID3D12GraphicsCommandList7_INTERFACE_DEFINED__
+    ext_proxy_ = new (std::nothrow) CommandListExtendedProxy(this);
+#endif
     if (host_list_) {
         host_list_->AddRef();
         list_type_ = host_list_->GetType();
@@ -54,11 +201,29 @@ CommandListX::CommandListX(DeviceX* parent_device, ID3D12GraphicsCommandList* ho
         host_list_->QueryInterface(OS_D3D12_IID(ID3D12GraphicsCommandList4), reinterpret_cast<void**>(&host_list4_));
         host_list_->QueryInterface(OS_D3D12_IID(ID3D12GraphicsCommandList5), reinterpret_cast<void**>(&host_list5_));
         host_list_->QueryInterface(OS_D3D12_IID(ID3D12GraphicsCommandList6), reinterpret_cast<void**>(&host_list6_));
+#ifdef __ID3D12GraphicsCommandList7_INTERFACE_DEFINED__
+        host_list_->QueryInterface(OS_D3D12_IID(ID3D12GraphicsCommandList7), reinterpret_cast<void**>(&host_list7_));
+#endif
+#ifdef __ID3D12GraphicsCommandList8_INTERFACE_DEFINED__
+        host_list_->QueryInterface(OS_D3D12_IID(ID3D12GraphicsCommandList8), reinterpret_cast<void**>(&host_list8_));
+#endif
+#ifdef __ID3D12GraphicsCommandList9_INTERFACE_DEFINED__
+        host_list_->QueryInterface(OS_D3D12_IID(ID3D12GraphicsCommandList9), reinterpret_cast<void**>(&host_list9_));
+#endif
+#ifdef __ID3D12GraphicsCommandList10_INTERFACE_DEFINED__
+        host_list_->QueryInterface(OS_D3D12_IID(ID3D12GraphicsCommandList10), reinterpret_cast<void**>(&host_list10_));
+#endif
     }
     auto& reg = GetCommandListRegistry();
     std::unique_lock<std::shared_mutex> lock(reg.mutex);
     reg.map[static_cast<const ID3D12CommandList*>(this)] = host_list_;
     reg.wrapper_map[static_cast<const ID3D12CommandList*>(this)] = this;
+#ifdef __ID3D12GraphicsCommandList7_INTERFACE_DEFINED__
+    if (ext_proxy_) {
+        reg.map[static_cast<const ID3D12CommandList*>(ext_proxy_)] = host_list_;
+        reg.wrapper_map[static_cast<const ID3D12CommandList*>(ext_proxy_)] = this;
+    }
+#endif
 }
 
 CommandListX::~CommandListX() {
@@ -67,7 +232,29 @@ CommandListX::~CommandListX() {
         std::unique_lock<std::shared_mutex> lock(reg.mutex);
         reg.map.erase(static_cast<const ID3D12CommandList*>(this));
         reg.wrapper_map.erase(static_cast<const ID3D12CommandList*>(this));
+#ifdef __ID3D12GraphicsCommandList7_INTERFACE_DEFINED__
+        if (ext_proxy_) {
+            reg.map.erase(static_cast<const ID3D12CommandList*>(ext_proxy_));
+            reg.wrapper_map.erase(static_cast<const ID3D12CommandList*>(ext_proxy_));
+        }
+#endif
     }
+#ifdef __ID3D12GraphicsCommandList7_INTERFACE_DEFINED__
+    delete ext_proxy_;
+    ext_proxy_ = nullptr;
+#endif
+#ifdef __ID3D12GraphicsCommandList10_INTERFACE_DEFINED__
+    if (host_list10_) host_list10_->Release();
+#endif
+#ifdef __ID3D12GraphicsCommandList9_INTERFACE_DEFINED__
+    if (host_list9_) host_list9_->Release();
+#endif
+#ifdef __ID3D12GraphicsCommandList8_INTERFACE_DEFINED__
+    if (host_list8_) host_list8_->Release();
+#endif
+#ifdef __ID3D12GraphicsCommandList7_INTERFACE_DEFINED__
+    if (host_list7_) host_list7_->Release();
+#endif
     if (host_list6_) host_list6_->Release();
     if (host_list5_) host_list5_->Release();
     if (host_list4_) host_list4_->Release();
@@ -127,6 +314,12 @@ HRESULT STDMETHODCALLTYPE CommandListX::QueryInterface(REFIID riid, void** ppvOb
         IsEqualIID(riid, OS_D3D12_IID(ID3D12DeviceChild)) ||
         IsEqualIID(riid, OS_D3D12_IID(ID3D12CommandList)) ||
         IsEqualIID(riid, OS_D3D12_IID(ID3D12GraphicsCommandList)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12GraphicsCommandList1)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12GraphicsCommandList2)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12GraphicsCommandList3)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12GraphicsCommandList4)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12GraphicsCommandList5)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12GraphicsCommandList6)) ||
         IsEqualIID(riid, IID_ID3D12GraphicsCommandListX)) {
         *ppvObject = static_cast<ID3D12GraphicsCommandListX*>(this);
         AddRef();
@@ -139,42 +332,38 @@ HRESULT STDMETHODCALLTYPE CommandListX::QueryInterface(REFIID riid, void** ppvOb
         RecordList("ID3D12GraphicsCommandListX::QueryInterface", 0, S_OK);
         return S_OK;
     }
-    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12GraphicsCommandList1)) && host_list1_) {
-        *ppvObject = static_cast<ID3D12GraphicsCommandList1*>(this);
+#ifdef __ID3D12GraphicsCommandList7_INTERFACE_DEFINED__
+    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12GraphicsCommandList7)) && host_list7_ && ext_proxy_) {
+        *ppvObject = static_cast<ID3D12GraphicsCommandList7*>(ext_proxy_);
         AddRef();
         RecordList("ID3D12GraphicsCommandListX::QueryInterface", 0, S_OK);
         return S_OK;
     }
-    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12GraphicsCommandList2)) && host_list2_) {
-        *ppvObject = static_cast<ID3D12GraphicsCommandList2*>(this);
+#endif
+#ifdef __ID3D12GraphicsCommandList8_INTERFACE_DEFINED__
+    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12GraphicsCommandList8)) && host_list8_ && ext_proxy_) {
+        *ppvObject = static_cast<ID3D12GraphicsCommandList8*>(ext_proxy_);
         AddRef();
         RecordList("ID3D12GraphicsCommandListX::QueryInterface", 0, S_OK);
         return S_OK;
     }
-    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12GraphicsCommandList3)) && host_list3_) {
-        *ppvObject = static_cast<ID3D12GraphicsCommandList3*>(this);
+#endif
+#ifdef __ID3D12GraphicsCommandList9_INTERFACE_DEFINED__
+    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12GraphicsCommandList9)) && host_list9_ && ext_proxy_) {
+        *ppvObject = static_cast<ID3D12GraphicsCommandList9*>(ext_proxy_);
         AddRef();
         RecordList("ID3D12GraphicsCommandListX::QueryInterface", 0, S_OK);
         return S_OK;
     }
-    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12GraphicsCommandList4)) && host_list4_) {
-        *ppvObject = static_cast<ID3D12GraphicsCommandList4*>(this);
+#endif
+#ifdef __ID3D12GraphicsCommandList10_INTERFACE_DEFINED__
+    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12GraphicsCommandList10)) && host_list10_ && ext_proxy_) {
+        *ppvObject = static_cast<ID3D12GraphicsCommandList10*>(ext_proxy_);
         AddRef();
         RecordList("ID3D12GraphicsCommandListX::QueryInterface", 0, S_OK);
         return S_OK;
     }
-    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12GraphicsCommandList5)) && host_list5_) {
-        *ppvObject = static_cast<ID3D12GraphicsCommandList5*>(this);
-        AddRef();
-        RecordList("ID3D12GraphicsCommandListX::QueryInterface", 0, S_OK);
-        return S_OK;
-    }
-    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12GraphicsCommandList6)) && host_list6_) {
-        *ppvObject = static_cast<ID3D12GraphicsCommandList6*>(this);
-        AddRef();
-        RecordList("ID3D12GraphicsCommandListX::QueryInterface", 0, S_OK);
-        return S_OK;
-    }
+#endif
 
     RecordList("ID3D12GraphicsCommandListX::QueryInterface", 0, E_NOINTERFACE);
     return E_NOINTERFACE;

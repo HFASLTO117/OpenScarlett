@@ -32,6 +32,31 @@ enum D3D12XBOX_PROCESS_DEBUG_FLAGS : uint32_t {
     D3D12XBOX_PROCESS_DEBUG_FLAG_INSTRUMENTED = 0x4u,
 };
 
+enum D3D12XBOX_CREATE_DEVICE_FLAGS : uint32_t {
+    D3D12XBOX_CREATE_DEVICE_FLAG_NONE = 0x0u,
+};
+
+enum D3D12XBOX_FRAME_INTERVAL_FLAGS : uint32_t {
+    D3D12XBOX_FRAME_INTERVAL_FLAG_NONE = 0x0u,
+};
+
+enum D3D12XBOX_SCHEDULE_FRAME_EVENT_FLAGS : uint32_t {
+    D3D12XBOX_SCHEDULE_FRAME_EVENT_FLAG_NONE = 0x0u,
+};
+
+enum D3D12XBOX_WAIT_FRAME_EVENT_FLAGS : uint32_t {
+    D3D12XBOX_WAIT_FRAME_EVENT_FLAG_NONE = 0x0u,
+};
+
+constexpr SIZE_T D3D12XBOX_DEFAULT_SIZE_BYTES = 0u;
+constexpr uint32_t D3D12XBOX_FRAME_INTERVAL_60_HZ = 16667u;
+constexpr D3D12_RESOURCE_FLAGS D3D12XBOX_RESOURCE_FLAG_ALLOW_DCC =
+    static_cast<D3D12_RESOURCE_FLAGS>(0x80000000u);
+constexpr D3D12_RESOURCE_FLAGS D3D12XBOX_RESOURCE_FLAG_FORCE_TEXTURE_COMPATIBILITY =
+    static_cast<D3D12_RESOURCE_FLAGS>(0x40000000u);
+constexpr D3D12_RESOURCE_FLAGS D3D12XBOX_RESOURCE_FLAG_ALLOW_AUTOMATIC_GAMEDVR_TONE_MAP =
+    static_cast<D3D12_RESOURCE_FLAGS>(0x20000000u);
+
 enum D3D12XBOX_FRAME_EVENT : uint32_t {
     D3D12XBOX_FRAME_EVENT_ORIGIN = 0u,
     D3D12XBOX_FRAME_EVENT_DISPLAY = 1u,
@@ -120,19 +145,20 @@ struct D3D12XBOX_UNIFIED_TEXTURE_STATS {
     uint64_t TotalBytesUploaded = 0ull;
 };
 
+// Real GXDK 221000+ D3D12XBOX_CREATE_DEVICE_PARAMETERS layout.
 struct D3D12XBOX_CREATE_DEVICE_PARAMETERS {
     uint32_t Version;
     uint32_t ProcessDebugFlags;
     uint32_t GraphicsCommandQueueRingSizeBytes;
     uint32_t GraphicsScratchMemorySizeBytes;
     uint32_t ComputeScratchMemorySizeBytes;
-    uint32_t DisableGeometryShaderAllocations;
-    uint32_t DisableTessellationShaderAllocations;
-    uint32_t DisableDXR;
+    BOOL DisableGeometryShaderAllocations;
+    BOOL DisableTessellationShaderAllocations;
+    BOOL DisableDXR;
     uint32_t CreateDeviceFlags;
     uint32_t AutoAttachPix;
-    HWND OutputWindow;
-    uint32_t PreferWarp;
+    uint32_t AmplificationShaderIndirectArgsBufferSize;
+    uint32_t AmplificationShaderPayloadBufferSize;
 };
 
 struct D3D12XBOX_GPU_HARDWARE_INFO {
@@ -148,11 +174,12 @@ struct D3D12XBOX_GPU_HARDWARE_INFO {
     char AdapterName[128];
 };
 
+// Real GDKX PresentX plane parameters (standard DXGI_COLOR_SPACE_TYPE).
 struct D3D12XBOX_PRESENT_PLANE_PARAMETERS {
     D3D12XBOX_FRAME_PIPELINE_TOKEN Token;
     uint32_t ResourceCount;
     ID3D12Resource* const* ppResources;
-    D3D12XBOX_COLOR_SPACE ColorSpace;
+    DXGI_COLOR_SPACE_TYPE ColorSpace;
     D3D12_RECT SourceRect;
     D3D12_RECT DestRect;
     uint32_t Flags;
@@ -270,7 +297,10 @@ inline constexpr GUID IID_IOpenScarlettVulkanRouting = {
 #define OPENSCARLETT_COM_UUID(guid_str)
 #endif
 
-struct OPENSCARLETT_COM_UUID("4F534431-3258-4445-5600-000000000001") ID3D12DeviceX : public ID3D12Device6 {
+// Primary COM interface for DeviceX: inherits ID3D12Device8 so GDKX binaries querying
+// IID_ID3D12Device8 receive the exact vtable with SetFrameIntervalX / ScheduleFrameEventX /
+// WaitFrameEventX immediately following ID3D12Device8 (slots 73..75).
+struct OPENSCARLETT_COM_UUID("4F534431-3258-4445-5600-000000000001") ID3D12DeviceX : public ID3D12Device8 {
     virtual HRESULT STDMETHODCALLTYPE SetFrameIntervalX(
         IDXGIOutput* pOutput,
         uint32_t PeriodMicroseconds,
@@ -287,6 +317,7 @@ struct OPENSCARLETT_COM_UUID("4F534431-3258-4445-5600-000000000001") ID3D12Devic
         D3D12XBOX_FRAME_EVENT Event,
         uint32_t TimeoutMilliseconds,
         void* pReserved,
+        uint32_t Flags,
         D3D12XBOX_FRAME_PIPELINE_TOKEN* pOutToken) = 0;
 
     virtual HRESULT STDMETHODCALLTYPE CreatePlacedResourceX(
@@ -305,12 +336,13 @@ struct OPENSCARLETT_COM_UUID("4F534431-3258-4445-5600-000000000001") ID3D12Devic
 __CRT_UUID_DECL(ID3D12DeviceX, 0x4F534431, 0x3258, 0x4445, 0x56, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01)
 #endif
 
+// Primary COM interface for CommandQueueX: inherits ID3D12CommandQueue so GDKX binaries
+// calling PresentX / SuspendX / ResumeX on ID3D12CommandQueue hit exact slots 19..21.
 struct OPENSCARLETT_COM_UUID("4F534431-3258-434D-5100-000000000002") ID3D12CommandQueueX : public ID3D12CommandQueue {
     virtual HRESULT STDMETHODCALLTYPE PresentX(
         UINT PlaneCount,
         const D3D12XBOX_PRESENT_PLANE_PARAMETERS* pPlaneParameters,
-        const D3D12XBOX_PRESENT_PARAMETERS* pPresentParameters,
-        void* pPresentToken) = 0;
+        const D3D12XBOX_PRESENT_PARAMETERS* pPresentParameters) = 0;
 
     virtual HRESULT STDMETHODCALLTYPE SuspendX(uint32_t Flags) = 0;
     virtual HRESULT STDMETHODCALLTYPE ResumeX() = 0;

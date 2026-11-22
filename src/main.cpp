@@ -326,6 +326,7 @@ int RunGuestExecutable(int argc, char** argv) {
     openscarlett::LaunchOptions opts{};
     std::vector<std::string> guest_args;
     std::string gpu_backend_override;
+    bool probe_unknown_imports = false;
     bool in_guest_args = false;
 
     auto normalize_backend = [](std::string raw) -> std::string {
@@ -383,6 +384,8 @@ int RunGuestExecutable(int argc, char** argv) {
                 return 1;
             }
             gpu_backend_override = norm;
+        } else if (arg == "--probe-unknown-imports") {
+            probe_unknown_imports = true;
         } else if (arg == "--timeout-ms") {
             std::string raw;
             if (!take_value("--timeout-ms", raw)) return 1;
@@ -430,11 +433,13 @@ int RunGuestExecutable(int argc, char** argv) {
         opts.telemetry_output_path = (tel_base / (stem + "_telemetry.json")).string();
     }
 
-    // Save/set/restore OPENSCARLETT_GPU_BACKEND & OPENSCARLETT_BACKEND around LaunchWithApcHook
+    // Save/set/restore OPENSCARLETT_GPU_BACKEND, OPENSCARLETT_BACKEND & OPENSCARLETT_PROBE_UNKNOWN_IMPORTS around LaunchWithApcHook
     bool had_prev_gpu_backend_env = false;
     std::string prev_gpu_backend_env;
     bool had_prev_backend_env = false;
     std::string prev_backend_env;
+    bool had_prev_probe_env = false;
+    std::string prev_probe_env;
 #if defined(_WIN32)
     {
         auto read_env_var = [](const char* name, bool& had, std::string& val) {
@@ -450,9 +455,13 @@ int RunGuestExecutable(int argc, char** argv) {
         };
         read_env_var("OPENSCARLETT_GPU_BACKEND", had_prev_gpu_backend_env, prev_gpu_backend_env);
         read_env_var("OPENSCARLETT_BACKEND", had_prev_backend_env, prev_backend_env);
+        read_env_var("OPENSCARLETT_PROBE_UNKNOWN_IMPORTS", had_prev_probe_env, prev_probe_env);
         if (!gpu_backend_override.empty()) {
             SetEnvironmentVariableA("OPENSCARLETT_GPU_BACKEND", gpu_backend_override.c_str());
             SetEnvironmentVariableA("OPENSCARLETT_BACKEND", gpu_backend_override.c_str());
+        }
+        if (probe_unknown_imports) {
+            SetEnvironmentVariableA("OPENSCARLETT_PROBE_UNKNOWN_IMPORTS", "1");
         }
     }
 #else
@@ -464,9 +473,16 @@ int RunGuestExecutable(int argc, char** argv) {
         had_prev_backend_env = true;
         prev_backend_env = prev;
     }
+    if (const char* prev = std::getenv("OPENSCARLETT_PROBE_UNKNOWN_IMPORTS")) {
+        had_prev_probe_env = true;
+        prev_probe_env = prev;
+    }
     if (!gpu_backend_override.empty()) {
         setenv("OPENSCARLETT_GPU_BACKEND", gpu_backend_override.c_str(), 1);
         setenv("OPENSCARLETT_BACKEND", gpu_backend_override.c_str(), 1);
+    }
+    if (probe_unknown_imports) {
+        setenv("OPENSCARLETT_PROBE_UNKNOWN_IMPORTS", "1", 1);
     }
 #endif
 
@@ -497,6 +513,18 @@ int RunGuestExecutable(int argc, char** argv) {
             setenv("OPENSCARLETT_BACKEND", prev_backend_env.c_str(), 1);
         } else {
             unsetenv("OPENSCARLETT_BACKEND");
+        }
+#endif
+    }
+    if (probe_unknown_imports) {
+#if defined(_WIN32)
+        SetEnvironmentVariableA("OPENSCARLETT_PROBE_UNKNOWN_IMPORTS",
+                                had_prev_probe_env ? prev_probe_env.c_str() : nullptr);
+#else
+        if (had_prev_probe_env) {
+            setenv("OPENSCARLETT_PROBE_UNKNOWN_IMPORTS", prev_probe_env.c_str(), 1);
+        } else {
+            unsetenv("OPENSCARLETT_PROBE_UNKNOWN_IMPORTS");
         }
 #endif
     }
@@ -557,6 +585,7 @@ void PrintUsage() {
         "      --vfs-s <dir>                    Backing directory for virtual S:\\ (persistent saves)\n"
         "      --telemetry <json>               Output path for unified CallTelemetry JSON report\n"
         "      --backend <d3d12|vulkan>         Select GPU backend via OPENSCARLETT_GPU_BACKEND\n"
+        "      --probe-unknown-imports          Synthesize E_NOTIMPL trampolines & install VEH crash monitor\n"
         "      --timeout-ms <ms>                Maximum runtime in milliseconds (0 = infinite)\n");
 }
 
