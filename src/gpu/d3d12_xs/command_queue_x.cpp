@@ -1686,8 +1686,12 @@ HRESULT CommandQueueX::WaitForInternalFenceWithTimingLocked(
                            ? (static_cast<double>(done_qpc - sig_qpc) * 1000000.0 / static_cast<double>(qpc_freq_))
                            : 0.0;
     }
+    const uint64_t completed_now = present_fence_->GetCompletedValue();
+    if (device_x_) {
+        (void)device_x_->GetTitleVaMirror().CompleteReadbacksOnFence(completed_now);
+    }
     if (out_completed_value) {
-        *out_completed_value = present_fence_->GetCompletedValue();
+        *out_completed_value = completed_now;
     }
     return S_OK;
 }

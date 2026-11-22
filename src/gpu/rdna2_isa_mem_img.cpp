@@ -2949,8 +2949,16 @@ Status EmitMemImgHlsl(
         os << "    uint _scratch[64];\n";
         os << "    [unroll] for (uint _s = 0u; _s < 64u; ++_s) _scratch[_s] = 0u;\n";
     }
-    if (is_compute && u.uses_ds_counter) {
-        os << "    if (gidx == 0u) _ds_counter = 0u;\n";
+    if (is_compute && (u.uses_lds || u.uses_ds_counter)) {
+        if (u.uses_lds) {
+            const uint32_t tg_total = std::max(1u, container.threadgroup_x) *
+                                      std::max(1u, container.threadgroup_y) *
+                                      std::max(1u, container.threadgroup_z);
+            os << "    for (uint _li = gidx; _li < 4096u; _li += " << tg_total << "u) _lds[_li] = 0u;\n";
+        }
+        if (u.uses_ds_counter) {
+            os << "    if (gidx == 0u) _ds_counter = 0u;\n";
+        }
         os << "    GroupMemoryBarrierWithGroupSync();\n";
     }
 

@@ -532,6 +532,10 @@ DeviceX::DeviceX(
             supports_view_instancing_ =
                 (opts3.ViewInstancingTier != D3D12_VIEW_INSTANCING_TIER_NOT_SUPPORTED);
         }
+
+        // Wire Worker 2 bindless descriptor bridge & Worker 6 per-draw capture (zero-overhead when disabled).
+        (void)descriptor_bridge_.InitializeD3D12(host_dev_, 4096u, 256u);
+        (void)openscarlett::FrameCaptureRecorder::Global().InitializeFromEnv();
     }
 
     const uint32_t resolved_mode = ResolveEffectiveBackendMode();
@@ -875,6 +879,13 @@ D3D12_GPU_VIRTUAL_ADDRESS DeviceX::TranslateGuestGpuVa(
             hook(address, va_translator_ctx_.load(std::memory_order_acquire));
         if (hooked != address && hooked != 0ull) {
             return hooked;
+        }
+    }
+    {
+        uint64_t mirrored_va = 0ull;
+        uint64_t mirrored_off = 0ull;
+        if (title_va_mirror_.ResolveTitleVa(address, mirrored_va, mirrored_off) && mirrored_va != 0ull) {
+            return mirrored_va;
         }
     }
     if (xmem_allocation_count_.load(std::memory_order_acquire) == 0u) {
@@ -3084,6 +3095,17 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResourceX(
     }
     if (VirtualAddress != 0ull) {
         AutoRegisterUnifiedResource(host_res, VirtualAddress, clean_desc, InitialState);
+        openscarlett::TitleVaMappingDesc mdesc{};
+        mdesc.title_va = VirtualAddress;
+        mdesc.size_bytes = clean_desc.Width;
+        mdesc.kind = (clean_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+                         ? openscarlett::TitleVaResourceKind::Buffer
+                         : openscarlett::TitleVaResourceKind::Texture;
+        mdesc.existing_write_watch_cpu_ptr = reinterpret_cast<void*>(VirtualAddress);
+        mdesc.gpu_shadow_resource = host_res;
+        mdesc.initial_state = InitialState;
+        openscarlett::TitleVaRegionInfo reg_info{};
+        (void)title_va_mirror_.RegisterRegion(mdesc, host_dev_, reg_info);
     }
     auto* proxy = new (std::nothrow) ResourceXProxy(
         this, host_res, &clean_desc, &default_heap_props, D3D12_HEAP_FLAG_NONE, VirtualAddress);

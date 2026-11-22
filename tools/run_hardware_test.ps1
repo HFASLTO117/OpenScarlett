@@ -146,6 +146,12 @@ $TestDescriptions = @{
     'test_rdna2_isa_scalar_vector.exe' = 'GFX10.3 scalar & vector ISA (SOP/SMEM/VOP1-3P/SDWA/DPP16/DPP8) CPU-vs-live-GPU parity'
     'test_rdna2_isa_mem_img.exe'       = 'GFX10.3 MUBUF/MTBUF/MIMG/DS/FLAT/GLOBAL/SCRATCH/EXP ISA CPU-vs-live-GPU parity'
     'test_rdna2_corpus_bench.exe'      = 'GFX10.3 779-opcode ISA coverage auditor & 5-stage AAA shader corpus benchmark'
+    'test_d3d12_xs_proxies_multiqueue.exe' = 'd3d12_xs 10 COM object proxies, Xbox extensions & 6-thread multi-queue FenceX sync'
+    'test_unified_mem_bindless.exe'    = '64-bit TitleVAMirror (MEM_WRITE_WATCH dirty-page flush/readback) & RDNA2 V#/T#/S# bindless bridge'
+    'test_xg_gpu_untile_and_stages.exe' = 'GPU compute GFX10 untiler/retiler, HS/DS/GS, DXR SBT, Wave64-on-32 & async PSO pool'
+    'test_os_winrt_offline_auth.exe'   = 'Xbox 7-core CPU affinity remap, WinRT lifecycle & non-blocking offline auth/XSTS/XStore/XCurl'
+    'test_media_video_gameinput.exe'   = 'MFMediaEngine video decode, 64-voice XAudio2 effects, Bink2 streaming & GameInput hot-plug'
+    'test_probe_veh_capture.exe'       = 'First-Boot Probe E_NOTIMPL trampolines, Win32 VEH crash dumper & per-draw PNG/JSON capture'
 }
 
 Write-Host ''

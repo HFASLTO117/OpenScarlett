@@ -1074,9 +1074,12 @@ void TestDsFlatGlobalScratchExpCpuAndLiveGpu(
             MemImgEncodeParams p{}; p.vdst = 13; p.vaddr = 1; p.data0 = 11;
             OS_REQUIRE(EncodeMemImgInst("ds_bpermute_b32", p, code));
         }
-        // 5. ds_add_u32 all 16 lanes' v[10] into lds[1024], barrier, ds_read_b32 v[14] = lds[1024]
+        // 5. Clear lds[1024] = 0, barrier, ds_add_u32 all 16 lanes' v[10] into lds[1024], barrier, ds_read_b32 v[14] = lds[1024]
         {
-            MemImgEncodeParams p{}; p.vaddr = 60; p.data0 = 10; p.offset = 1024;  // v[60] == 0
+            MemImgEncodeParams p{}; p.vaddr = 60; p.data0 = 60; p.offset = 1024;  // v[60] == 0
+            OS_REQUIRE(EncodeMemImgInst("ds_write_b32", p, code));
+            EmitSoppWord(code, 0x0Au);  // s_barrier
+            p.data0 = 10;
             OS_REQUIRE(EncodeMemImgInst("ds_add_u32", p, code));
             EmitSoppWord(code, 0x0Au);  // s_barrier
             p.vdst = 14;

@@ -48,3 +48,21 @@ EXPORTS
     KernelXResetTelemetry
     KernelXGetTelemetryCallCount
     KernelXWriteTelemetryJson
+    OpenScarlettRemapXboxAffinityMask
+    OpenScarlettRemapXboxIdealProcessor
+    KernelXSetThreadAffinityMask
+    KernelXSetThreadIdealProcessor
+    KernelXSetThreadIdealProcessorEx
+    KernelXSetThreadGroupAffinity
+    KernelXSetProcessAffinityMask
+    KernelXGetProcessAffinityMask
+    KernelXGetSystemInfo
+    KernelXGetCurrentProcessorNumber
+    SetThreadAffinityMask = KernelXSetThreadAffinityMask
+    SetThreadIdealProcessor = KernelXSetThreadIdealProcessor
+    SetThreadIdealProcessorEx = KernelXSetThreadIdealProcessorEx
+    SetThreadGroupAffinity = KernelXSetThreadGroupAffinity
+    SetProcessAffinityMask = KernelXSetProcessAffinityMask
+    GetProcessAffinityMask = KernelXGetProcessAffinityMask
+    GetSystemInfo = KernelXGetSystemInfo
+    GetCurrentProcessorNumber = KernelXGetCurrentProcessorNumber

@@ -12,8 +12,11 @@
 #include "openscarlett/core/framebuffer.h"
 #include "openscarlett/gpu/d3d12_adapter.h"
 #include "openscarlett/gpu/d3d12_xs_abi.h"
+#include "openscarlett/gpu/descriptor_sgpr_bridge.h"
+#include "openscarlett/gpu/frame_capture.h"
 #include "openscarlett/gpu/shader_cache.h"
 #include "openscarlett/gpu/vulkan_backend.h"
+#include "openscarlett/kernel/title_va_mirror.h"
 
 namespace openscarlett::d3d12_xs {
 
@@ -111,6 +114,10 @@ public:
         void* user_ctx) noexcept;
     void SetGuestGpuVaTranslatorHook(GuestGpuVaTranslatorFn fn, void* user_ctx) noexcept;
     void SetDescriptorCreateHook(DescriptorCreateHookFn fn, void* user_ctx) noexcept;
+    openscarlett::TitleVAMirror& GetTitleVaMirror() noexcept { return title_va_mirror_; }
+    const openscarlett::TitleVAMirror& GetTitleVaMirror() const noexcept { return title_va_mirror_; }
+    openscarlett::DescriptorSgprBridge& GetDescriptorBridge() noexcept { return descriptor_bridge_; }
+    const openscarlett::DescriptorSgprBridge& GetDescriptorBridge() const noexcept { return descriptor_bridge_; }
     bool IsR9G9B9E5UavFallbackActive() const noexcept;
     static void SetForceR9G9B9E5UavFallback(bool force) noexcept;
     static void SetGlobalBackendMode(uint32_t backend_mode) noexcept;
@@ -474,6 +481,8 @@ private:
     std::atomic<void*> va_translator_ctx_{nullptr};
     std::atomic<DescriptorCreateHookFn> descriptor_create_hook_{nullptr};
     std::atomic<void*> descriptor_create_ctx_{nullptr};
+    openscarlett::TitleVAMirror title_va_mirror_;
+    openscarlett::DescriptorSgprBridge descriptor_bridge_;
 
     mutable std::mutex fallback_mutex_;
     std::unordered_set<ID3D12Resource*> r9g9b9e5_fallback_resources_;

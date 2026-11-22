@@ -47,11 +47,20 @@ void Check(bool cond, const char* expr, const std::string& detail = {}) {
 
 std::string FindOptionalSpirvVal() {
     std::error_code ec;
+#if defined(_WIN32)
+    char env_buf[1024]{};
+    const DWORD env_len = GetEnvironmentVariableA(
+        "OPENSCARLETT_SPIRV_VAL", env_buf, static_cast<DWORD>(sizeof(env_buf)));
+    if (env_len > 0 && env_len < sizeof(env_buf) && std::filesystem::exists(env_buf, ec)) {
+        return std::string(env_buf, env_len);
+    }
+#else
     if (const char* env_p = std::getenv("OPENSCARLETT_SPIRV_VAL")) {
         if (*env_p && std::filesystem::exists(env_p, ec)) {
             return env_p;
         }
     }
+#endif
     // Walk up from current working directory looking for .tools/spirv-val.exe (portable, no hardcoded drive).
     std::filesystem::path cur = std::filesystem::current_path(ec);
     for (int depth = 0; depth < 6 && !cur.empty(); ++depth) {

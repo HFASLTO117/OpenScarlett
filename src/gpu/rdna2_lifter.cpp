@@ -6,6 +6,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
@@ -489,44 +490,97 @@ Status RunExternalProcess(const std::string& cmdline, uint32_t& out_exit_code, s
     out_exit_code = 1;
     out_output.clear();
 
-    SECURITY_ATTRIBUTES sa{};
-    sa.nLength = sizeof(sa);
-    sa.bInheritHandle = TRUE;
-
+    // Guard CreatePipe + CreateProcessA and restrict handle inheritance strictly to h_write
+    // via PROC_THREAD_ATTRIBUTE_HANDLE_LIST so concurrent worker threads (e.g. AsyncPsoCompilePool)
+    // never inherit another thread's open temp .hlsl/.dxil or pipe handles.
+    static std::mutex g_spawn_mutex;
     HANDLE h_read = nullptr;
     HANDLE h_write = nullptr;
-    if (!CreatePipe(&h_read, &h_write, &sa, 0)) {
-        return Status::Error(StatusCode::IoError, "CreatePipe failed for external shader tool");
-    }
-    SetHandleInformation(h_read, HANDLE_FLAG_INHERIT, 0);
-
-    STARTUPINFOA si{};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = h_write;
-    si.hStdError = h_write;
-    si.hStdInput = nullptr;
-
     PROCESS_INFORMATION pi{};
-    std::string mutable_cmd = cmdline;
-    const BOOL ok = CreateProcessA(
-        nullptr,
-        mutable_cmd.data(),
-        nullptr,
-        nullptr,
-        TRUE,
-        CREATE_NO_WINDOW,
-        nullptr,
-        nullptr,
-        &si,
-        &pi);
+    BOOL ok = FALSE;
+    DWORD spawn_err = 0;
 
-    CloseHandle(h_write);
+    {
+        std::lock_guard<std::mutex> spawn_lock(g_spawn_mutex);
+
+        SECURITY_ATTRIBUTES sa{};
+        sa.nLength = sizeof(sa);
+        sa.bInheritHandle = TRUE;
+        if (!CreatePipe(&h_read, &h_write, &sa, 0)) {
+            return Status::Error(StatusCode::IoError, "CreatePipe failed for external shader tool");
+        }
+        SetHandleInformation(h_read, HANDLE_FLAG_INHERIT, 0);
+
+        STARTUPINFOEXA si_ex{};
+        si_ex.StartupInfo.cb = sizeof(si_ex);
+        si_ex.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        si_ex.StartupInfo.hStdOutput = h_write;
+        si_ex.StartupInfo.hStdError = h_write;
+        si_ex.StartupInfo.hStdInput = nullptr;
+
+        SIZE_T attr_size = 0;
+        InitializeProcThreadAttributeList(nullptr, 1, 0, &attr_size);
+        std::vector<uint8_t> attr_buf(attr_size);
+        bool has_attr_list = false;
+        if (attr_size > 0 &&
+            InitializeProcThreadAttributeList(
+                reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_buf.data()), 1, 0, &attr_size)) {
+            HANDLE inherit_list[1] = {h_write};
+            if (UpdateProcThreadAttribute(
+                    reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_buf.data()),
+                    0,
+                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                    inherit_list,
+                    sizeof(inherit_list),
+                    nullptr,
+                    nullptr)) {
+                si_ex.lpAttributeList =
+                    reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_buf.data());
+                has_attr_list = true;
+            } else {
+                DeleteProcThreadAttributeList(
+                    reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attr_buf.data()));
+            }
+        }
+
+        std::string mutable_cmd = cmdline;
+        if (has_attr_list) {
+            ok = CreateProcessA(
+                nullptr,
+                mutable_cmd.data(),
+                nullptr,
+                nullptr,
+                TRUE,
+                CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
+                nullptr,
+                nullptr,
+                &si_ex.StartupInfo,
+                &pi);
+            spawn_err = ok ? 0 : GetLastError();
+            DeleteProcThreadAttributeList(si_ex.lpAttributeList);
+        } else {
+            si_ex.StartupInfo.cb = sizeof(STARTUPINFOA);
+            ok = CreateProcessA(
+                nullptr,
+                mutable_cmd.data(),
+                nullptr,
+                nullptr,
+                TRUE,
+                CREATE_NO_WINDOW,
+                nullptr,
+                nullptr,
+                &si_ex.StartupInfo,
+                &pi);
+            spawn_err = ok ? 0 : GetLastError();
+        }
+
+        CloseHandle(h_write);
+    }
+
     if (!ok) {
-        const DWORD err = GetLastError();
         CloseHandle(h_read);
         return Status::Error(StatusCode::IoError,
-                             "CreateProcessA failed (err=" + std::to_string(err) + ") for: " + cmdline);
+                             "CreateProcessA failed (err=" + std::to_string(spawn_err) + ") for: " + cmdline);
     }
 
     char buf[4096];

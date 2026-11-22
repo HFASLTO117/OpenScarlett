@@ -11,7 +11,7 @@
 
 namespace openscarlett::launcher {
 
-inline constexpr const char* kOpenScarlettAppVersion = "v0.4.0-alpha";
+inline constexpr const char* kOpenScarlettAppVersion = "v0.5.0-alpha";
 inline constexpr const char* kOpenScarlettDefaultRepoOwner = "californiaAlmonds";
 inline constexpr const char* kOpenScarlettDefaultRepoName = "OpenScarlett";
 
