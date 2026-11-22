@@ -1,15 +1,22 @@
 // OpenScarlett — Real Untouched Microsoft _GAMING_XBOX_SCARLETT (GDKX) Bring-Up Harness
 //
 // Proves end-to-end execution of 100% untouched MIT Microsoft Xbox-GDK-Samples:
-//   1. SimpleTriangle_GDKX.exe (direct GDKX ID3D12Device8 + PresentX + DXGI output + PLM + PIX)
-//   2. SimpleLighting_GDKX.exe (GDKX ID3D12Device + D32_FLOAT depth + 2 PSOs + CBVs + 3D lit cube)
+//   1. SimpleTriangle_GDKX.exe   (direct GDKX ID3D12Device8 + PresentX + DXGI output + PLM + PIX)
+//   2. SimpleLighting_GDKX.exe   (GDKX ID3D12Device + D32_FLOAT depth + 2 PSOs + CBVs + 3D lit cube)
+//   3. SimpleTexture_GDKX.exe    (WIC JPEG decode + UpdateSubresources + SRV table + static sampler)
+//   4. SimpleInstancing_GDKX.exe (5,000 instanced 3D cubes + 3 vertex streams + 25 lights + Fence ring)
 //
 // Each sample is staged into an isolated ZERO-DLL directory (proving real suspended-process
 // APC hook injection), launched via `openscarlett.exe run` on BOTH default host GPU and WARP,
-// verified for 100% wrapped Telemetry JSON (zero raw-host escape, 0 errors, 0 not_impl), and
-// verified pixel-by-pixel from the real GPU readback PNG captured after >= 12 PresentX frames.
+// verified for 100% wrapped Telemetry JSON (zero raw-host escape, 0 errors, 0 stubs, 0 not_impl),
+// and verified pixel-by-pixel from the real GPU readback PNG captured after >= 12 PresentX frames.
 
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <windows.h>
+#include <wincodec.h>
+#include <wrl/client.h>
 
 #include <algorithm>
 #include <cctype>
@@ -79,6 +86,8 @@ struct TelemetryRow {
 struct TelemetrySummary {
     std::vector<TelemetryRow> rows;
     uint64_t total_calls = 0;
+    uint64_t total_ok = 0;
+    uint64_t total_stubs = 0;
     uint64_t total_not_impl = 0;
     uint64_t total_errors = 0;
 
@@ -143,6 +152,8 @@ TelemetrySummary ParseTelemetryJson(const fs::path& json_path) {
         if (ExtractJsonInt(line, "errors", v)) row.errors = static_cast<uint64_t>(v);
 
         sum.total_calls += row.total;
+        sum.total_ok += row.ok;
+        sum.total_stubs += row.stub;
         sum.total_not_impl += row.not_impl;
         sum.total_errors += row.errors;
         sum.rows.push_back(std::move(row));
@@ -349,8 +360,16 @@ void VerifyCommonTelemetry(
     const std::string& tag,
     uint64_t min_pso_count) {
     EXPECT_MSG(tel.total_calls > 0u, tag + ": telemetry recorded calls");
+    EXPECT_MSG(tel.total_stubs == 0u, tag + ": telemetry stubs == 0 (got " + std::to_string(tel.total_stubs) + ")");
     EXPECT_MSG(tel.total_not_impl == 0u, tag + ": telemetry not_impl == 0 (got " + std::to_string(tel.total_not_impl) + ")");
     EXPECT_MSG(tel.total_errors == 0u, tag + ": telemetry errors == 0 (got " + std::to_string(tel.total_errors) + ")");
+
+    std::cout << "  [" << tag << "] Telemetry: total=" << tel.total_calls
+              << " ok=" << tel.total_ok
+              << " stubs=" << tel.total_stubs
+              << " not_impl=" << tel.total_not_impl
+              << " errors=" << tel.total_errors
+              << " symbols=" << tel.rows.size() << "\n";
 
     // Zero raw-host escape verification: EVERY D3D12 device/queue/frame-pacing call goes through DeviceX/CommandQueueX!
     EXPECT_MSG(tel.OkCount("d3d12_xs.dll", "D3D12XboxCreateDevice") >= 1u, tag + ": D3D12XboxCreateDevice");
@@ -482,12 +501,285 @@ void VerifySimpleLightingPixels(const DecodedPng& img, const std::string& tag) {
               << " color_buckets=" << distinct_quantized_colors.size() << "\n";
 }
 
+// Clean-room procedural sunset JPEG generator via host Windows WIC so SimpleTexture_GDKX
+// runs with zero external copyrighted asset dependencies (works identically in portable bundles).
+bool WriteProceduralSunsetJpeg(const fs::path& dst_path, std::string& err) {
+    using Microsoft::WRL::ComPtr;
+    constexpr UINT kW = 256u;
+    constexpr UINT kH = 256u;
+    constexpr UINT kStride = kW * 3u;
+    std::vector<uint8_t> bgr(static_cast<size_t>(kStride) * kH, 0u);
+
+    for (UINT y = 0u; y < kH; ++y) {
+        const float v = static_cast<float>(y) / static_cast<float>(kH - 1u);
+        for (UINT x = 0u; x < kW; ++x) {
+            const float u = static_cast<float>(x) / static_cast<float>(kW - 1u);
+            float r = 0.0f;
+            float g = 0.0f;
+            float b = 0.0f;
+
+            if (v < 0.58f) {
+                // Sky: deep cobalt blue -> crimson -> golden orange horizon
+                const float t = v / 0.58f;
+                if (t < 0.55f) {
+                    const float k = t / 0.55f;
+                    r = 20.0f + k * 140.0f;
+                    g = 42.0f + k * 48.0f;
+                    b = 185.0f - k * 45.0f;
+                } else {
+                    const float k = (t - 0.55f) / 0.45f;
+                    r = 160.0f + k * 95.0f;
+                    g = 90.0f + k * 85.0f;
+                    b = 140.0f - k * 105.0f;
+                }
+                // Glowing sun disc centered at (0.50, 0.40)
+                const float dx = u - 0.50f;
+                const float dy = v - 0.40f;
+                const float dist = std::sqrt(dx * dx + dy * dy);
+                if (dist < 0.13f) {
+                    r = 255.0f;
+                    g = 240.0f;
+                    b = 115.0f;
+                } else if (dist < 0.24f) {
+                    const float glow = 1.0f - (dist - 0.13f) / 0.11f;
+                    r = std::min(255.0f, r + glow * 90.0f);
+                    g = std::min(255.0f, g + glow * 75.0f);
+                    b = std::min(255.0f, b + glow * 25.0f);
+                }
+            } else {
+                // Ocean reflection: deep navy with warm golden sun shimmer path
+                const float t = (v - 0.58f) / 0.42f;
+                r = 22.0f * (1.0f - 0.5f * t);
+                g = 52.0f * (1.0f - 0.35f * t);
+                b = 128.0f * (1.0f - 0.25f * t);
+                const float shimmer = std::exp(-std::pow((u - 0.50f) / (0.07f + 0.14f * t), 2.0f));
+                const float wave = 0.65f + 0.35f * std::sin(v * 95.0f + u * 18.0f);
+                r = std::min(255.0f, r + shimmer * wave * 230.0f);
+                g = std::min(255.0f, g + shimmer * wave * 155.0f);
+                b = std::min(255.0f, b + shimmer * wave * 45.0f);
+            }
+
+            const size_t idx = static_cast<size_t>(y) * kStride + static_cast<size_t>(x) * 3u;
+            bgr[idx + 0u] = static_cast<uint8_t>(std::clamp(b, 0.0f, 255.0f));
+            bgr[idx + 1u] = static_cast<uint8_t>(std::clamp(g, 0.0f, 255.0f));
+            bgr[idx + 2u] = static_cast<uint8_t>(std::clamp(r, 0.0f, 255.0f));
+        }
+    }
+
+    ComPtr<IWICImagingFactory> factory;
+    HRESULT hr = ::CoCreateInstance(
+        CLSID_WICImagingFactory2, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&factory));
+    if (FAILED(hr) || !factory) {
+        err = "CoCreateInstance(CLSID_WICImagingFactory2) failed";
+        return false;
+    }
+
+    ComPtr<IWICStream> stream;
+    hr = factory->CreateStream(&stream);
+    if (FAILED(hr) || !stream) {
+        err = "CreateStream failed";
+        return false;
+    }
+    hr = stream->InitializeFromFilename(dst_path.c_str(), GENERIC_WRITE);
+    if (FAILED(hr)) {
+        err = "IWICStream::InitializeFromFilename failed";
+        return false;
+    }
+
+    ComPtr<IWICBitmapEncoder> encoder;
+    hr = factory->CreateEncoder(GUID_ContainerFormatJpeg, nullptr, &encoder);
+    if (FAILED(hr) || !encoder) {
+        err = "CreateEncoder(JPEG) failed";
+        return false;
+    }
+    hr = encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache);
+    if (FAILED(hr)) {
+        err = "IWICBitmapEncoder::Initialize failed";
+        return false;
+    }
+
+    ComPtr<IWICBitmapFrameEncode> frame;
+    hr = encoder->CreateNewFrame(&frame, nullptr);
+    if (FAILED(hr) || !frame) {
+        err = "CreateNewFrame failed";
+        return false;
+    }
+    hr = frame->Initialize(nullptr);
+    if (FAILED(hr)) {
+        err = "IWICBitmapFrameEncode::Initialize failed";
+        return false;
+    }
+    hr = frame->SetSize(kW, kH);
+    if (FAILED(hr)) {
+        err = "IWICBitmapFrameEncode::SetSize failed";
+        return false;
+    }
+    WICPixelFormatGUID fmt = GUID_WICPixelFormat24bppBGR;
+    hr = frame->SetPixelFormat(&fmt);
+    if (FAILED(hr)) {
+        err = "IWICBitmapFrameEncode::SetPixelFormat failed";
+        return false;
+    }
+    hr = frame->WritePixels(kH, kStride, static_cast<UINT>(bgr.size()), bgr.data());
+    if (FAILED(hr)) {
+        err = "IWICBitmapFrameEncode::WritePixels failed";
+        return false;
+    }
+    hr = frame->Commit();
+    if (FAILED(hr)) {
+        err = "IWICBitmapFrameEncode::Commit failed";
+        return false;
+    }
+    hr = encoder->Commit();
+    if (FAILED(hr)) {
+        err = "IWICBitmapEncoder::Commit failed";
+        return false;
+    }
+    return true;
+}
+
+void VerifySimpleTexturePixels(const DecodedPng& img, const std::string& tag) {
+    EXPECT_MSG(img.width == 3840u && img.height == 2160u,
+               tag + ": 4K UHD Scarlett framebuffer (" + std::to_string(img.width) + "x" +
+                   std::to_string(img.height) + ")");
+    if (img.width < 64u || img.height < 64u) return;
+
+    uint8_t r = 0, g = 0, b = 0, a = 0;
+
+    // 1. Corners outside the centered [-0.5,+0.5] quad must be ATG #414141 background
+    img.SamplePixel(16, 16, r, g, b, a);
+    EXPECT_MSG(IsAtgBackground(r, g, b),
+               tag + ": corner(16,16) is ATG #414141 background (got " + std::to_string(r) + "," +
+                   std::to_string(g) + "," + std::to_string(b) + ")");
+
+    img.SamplePixel(img.width - 16, 16, r, g, b, a);
+    EXPECT_MSG(IsAtgBackground(r, g, b),
+               tag + ": corner(w-16,16) is ATG #414141 background");
+
+    // 2. Top of quad (u=0.5, v=0.10 -> screen x=0.50, y=0.30): blue sky
+    uint8_t sky_r = 0, sky_g = 0, sky_b = 0;
+    img.SamplePixel(img.width / 2, img.height * 30 / 100, sky_r, sky_g, sky_b, a);
+    EXPECT_MSG(sky_b > 120 && sky_b > sky_r + 50,
+               tag + ": textured quad top sky is BLUE (got " + std::to_string(sky_r) + "," +
+                   std::to_string(sky_g) + "," + std::to_string(sky_b) + ")");
+
+    // 3. Sun disc (u=0.5, v=0.40 -> screen x=0.50, y=0.45): bright golden yellow
+    uint8_t sun_r = 0, sun_g = 0, sun_b = 0;
+    img.SamplePixel(img.width / 2, img.height * 45 / 100, sun_r, sun_g, sun_b, a);
+    EXPECT_MSG(sun_r > 200 && sun_g > 180 && sun_r > sun_b + 50,
+               tag + ": textured quad sun disc is BRIGHT YELLOW (got " + std::to_string(sun_r) + "," +
+                   std::to_string(sun_g) + "," + std::to_string(sun_b) + ")");
+
+    // 4. Dense sampling inside the textured quad [28%..72%] x [28%..72%]
+    uint32_t non_bg_samples = 0;
+    uint32_t blue_samples = 0;
+    uint32_t warm_samples = 0;
+    std::set<uint32_t> distinct_quantized_colors;
+
+    for (uint32_t gy = 0; gy < 64; ++gy) {
+        const uint32_t y = img.height * (28u + gy * 44u / 63u) / 100u;
+        for (uint32_t gx = 0; gx < 64; ++gx) {
+            const uint32_t x = img.width * (28u + gx * 44u / 63u) / 100u;
+            img.SamplePixel(x, y, r, g, b, a);
+            if (!IsAtgBackground(r, g, b)) {
+                ++non_bg_samples;
+                if (b > r + 40 && b > 80) ++blue_samples;
+                if (r > b + 40 && r > 140) ++warm_samples;
+                const uint32_t q = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
+                distinct_quantized_colors.insert(q);
+            }
+        }
+    }
+
+    EXPECT_MSG(non_bg_samples >= 3500u,
+               tag + ": textured quad fills interior (non_bg=" + std::to_string(non_bg_samples) + "/4096)");
+    EXPECT_MSG(blue_samples >= 500u,
+               tag + ": sky/ocean blue texture pixels present (blue=" + std::to_string(blue_samples) + ")");
+    EXPECT_MSG(warm_samples >= 500u,
+               tag + ": sunset orange/gold texture pixels present (warm=" + std::to_string(warm_samples) + ")");
+    EXPECT_MSG(distinct_quantized_colors.size() >= 15u,
+               tag + ": rich textured gradient color variance (buckets=" +
+                   std::to_string(distinct_quantized_colors.size()) + ")");
+
+    std::cout << "  [" << tag << "] SimpleTexture PNG verified: " << img.width << "x" << img.height
+              << " sky=(" << int(sky_r) << "," << int(sky_g) << "," << int(sky_b) << ")"
+              << " sun=(" << int(sun_r) << "," << int(sun_g) << "," << int(sun_b) << ")"
+              << " non_bg=" << non_bg_samples << " blue=" << blue_samples
+              << " warm=" << warm_samples
+              << " color_buckets=" << distinct_quantized_colors.size() << "\n";
+}
+
+void VerifySimpleInstancingPixels(const DecodedPng& img, const std::string& tag) {
+    EXPECT_MSG(img.width == 3840u && img.height == 2160u,
+               tag + ": 4K UHD Scarlett framebuffer (" + std::to_string(img.width) + "x" +
+                   std::to_string(img.height) + ")");
+    if (img.width < 64u || img.height < 64u) return;
+
+    // Sample a dense 160x90 grid across the 4K frame (14,400 samples).
+    // SimpleInstancing renders a huge lit enclosing room (instance 0) + 25 moving point lights
+    // + 4,974 colorful tumbling 3D cubes exploding around the center of the viewport.
+    uint32_t non_black_samples = 0;
+    uint32_t non_atg_bg_samples = 0;
+    uint32_t bright_samples = 0;
+    uint32_t chromatic_samples = 0;
+    std::set<uint32_t> distinct_quantized_colors;
+
+    for (uint32_t gy = 0; gy < 90; ++gy) {
+        const uint32_t y = gy * img.height / 90 + img.height / 180;
+        for (uint32_t gx = 0; gx < 160; ++gx) {
+            const uint32_t x = gx * img.width / 160 + img.width / 320;
+            uint8_t r = 0, g = 0, b = 0, a = 0;
+            img.SamplePixel(x, y, r, g, b, a);
+            if (r > 8 || g > 8 || b > 8) ++non_black_samples;
+            if (!IsAtgBackground(r, g, b)) ++non_atg_bg_samples;
+            if (r > 100 || g > 100 || b > 100) ++bright_samples;
+            const uint8_t cmax = std::max({r, g, b});
+            const uint8_t cmin = std::min({r, g, b});
+            if (cmax - cmin > 25u) ++chromatic_samples;
+            const uint32_t q = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
+            distinct_quantized_colors.insert(q);
+        }
+    }
+
+    uint8_t cr = 0, cg = 0, cb = 0, ca = 0;
+    img.SamplePixel(img.width / 2, img.height / 2, cr, cg, cb, ca);
+
+    EXPECT_MSG(non_black_samples >= 5000u,
+               tag + ": 4K viewport rendered (non_black=" + std::to_string(non_black_samples) + "/14400)");
+    EXPECT_MSG(non_atg_bg_samples >= 5000u,
+               tag + ": enclosing room + instanced cubes overwrite clear color (non_atg_bg=" +
+                   std::to_string(non_atg_bg_samples) + ")");
+    EXPECT_MSG(bright_samples >= 200u,
+               tag + ": directional + 25 point lights illuminate cubes (bright=" +
+                   std::to_string(bright_samples) + ")");
+    EXPECT_MSG(chromatic_samples >= 50u,
+               tag + ": colorful per-instance I_COLOR cubes rendered (chromatic=" +
+                   std::to_string(chromatic_samples) + ")");
+    EXPECT_MSG(distinct_quantized_colors.size() >= 10u,
+               tag + ": rich multi-instance lit color variance (buckets=" +
+                   std::to_string(distinct_quantized_colors.size()) + ")");
+
+    std::cout << "  [" << tag << "] SimpleInstancing PNG verified: " << img.width << "x" << img.height
+              << " center=(" << int(cr) << "," << int(cg) << "," << int(cb) << ")"
+              << " non_black=" << non_black_samples << " bright=" << bright_samples
+              << " chromatic=" << chromatic_samples
+              << " color_buckets=" << distinct_quantized_colors.size() << "\n";
+}
+
+enum class SampleKind {
+    Triangle,
+    Lighting,
+    Texture,
+    Instancing,
+};
+
 struct SampleSpec {
     std::string name;
     std::string exe_name;
     std::vector<std::string> cso_files;
     uint64_t min_pso_count;
-    bool is_lighting;
+    SampleKind kind;
+    bool needs_sunset_jpg = false;
 };
 
 void RunSampleEndToEnd(const fs::path& bin_dir, const SampleSpec& spec, bool prefer_warp) {
@@ -536,6 +828,12 @@ void RunSampleEndToEnd(const fs::path& bin_dir, const SampleSpec& spec, bool pre
         EXPECT_MSG(!ec, tag + ": copy " + cso);
     }
 
+    if (spec.needs_sunset_jpg) {
+        std::string jpg_err;
+        EXPECT_MSG(WriteProceduralSunsetJpeg(pkg_dir / L"sunset.jpg", jpg_err),
+                   tag + ": generate clean-room sunset.jpg (" + jpg_err + ")");
+    }
+
     // Minimal MicrosoftGame.Config pointing to the untouched *_GDKX.exe
     {
         std::ofstream cfg(pkg_dir / L"MicrosoftGame.Config", std::ios::binary);
@@ -574,6 +872,15 @@ void RunSampleEndToEnd(const fs::path& bin_dir, const SampleSpec& spec, bool pre
     if (fs::exists(telemetry_json)) {
         const TelemetrySummary tel = ParseTelemetryJson(telemetry_json);
         VerifyCommonTelemetry(tel, tag, spec.min_pso_count);
+        if (spec.kind == SampleKind::Texture) {
+            EXPECT_MSG(tel.OkCount("d3d12_xs.dll", "ID3D12DeviceX::CreateShaderResourceView") >= 1u,
+                       tag + ": DeviceX::CreateShaderResourceView >= 1");
+            EXPECT_MSG(tel.OkCount("d3d12_xs.dll", "ID3D12DeviceX::GetCopyableFootprints") >= 1u,
+                       tag + ": DeviceX::GetCopyableFootprints >= 1");
+        } else if (spec.kind == SampleKind::Instancing) {
+            EXPECT_MSG(tel.OkCount("d3d12_xs.dll", "ID3D12DeviceX::CreateFence") >= 2u,
+                       tag + ": DeviceX::CreateFence >= 2");
+        }
     }
 
     EXPECT_MSG(fs::exists(capture_png), tag + ": captured PNG produced at " + capture_png.string());
@@ -583,10 +890,19 @@ void RunSampleEndToEnd(const fs::path& bin_dir, const SampleSpec& spec, bool pre
         EXPECT_MSG(DecodeStoredRgbaPng(capture_png, img, decode_err),
                    tag + ": DecodeStoredRgbaPng (" + decode_err + ")");
         if (decode_err.empty()) {
-            if (spec.is_lighting) {
-                VerifySimpleLightingPixels(img, tag);
-            } else {
-                VerifySimpleTrianglePixels(img, tag);
+            switch (spec.kind) {
+                case SampleKind::Triangle:
+                    VerifySimpleTrianglePixels(img, tag);
+                    break;
+                case SampleKind::Lighting:
+                    VerifySimpleLightingPixels(img, tag);
+                    break;
+                case SampleKind::Texture:
+                    VerifySimpleTexturePixels(img, tag);
+                    break;
+                case SampleKind::Instancing:
+                    VerifySimpleInstancingPixels(img, tag);
+                    break;
             }
         }
     }
@@ -595,15 +911,22 @@ void RunSampleEndToEnd(const fs::path& bin_dir, const SampleSpec& spec, bool pre
 }  // namespace
 
 int main() {
+    const HRESULT com_hr = ::CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     const fs::path bin_dir = ResolveRuntimeBinDir();
     const std::vector<SampleSpec> samples = {
-        {"SimpleTriangle", "SimpleTriangle_GDKX.exe", {"VertexShader.cso", "PixelShader.cso"}, 1u, false},
-        {"SimpleLighting", "SimpleLighting_GDKX.exe", {"TriangleVS.cso", "LambertPS.cso", "SolidColorPS.cso"}, 2u, true},
+        {"SimpleTriangle", "SimpleTriangle_GDKX.exe", {"VertexShader.cso", "PixelShader.cso"}, 1u, SampleKind::Triangle, false},
+        {"SimpleLighting", "SimpleLighting_GDKX.exe", {"TriangleVS.cso", "LambertPS.cso", "SolidColorPS.cso"}, 2u, SampleKind::Lighting, false},
+        {"SimpleTexture", "SimpleTexture_GDKX.exe", {"VertexShader.cso", "PixelShader.cso"}, 1u, SampleKind::Texture, true},
+        {"SimpleInstancing", "SimpleInstancing_GDKX.exe", {"VertexShader.cso", "PixelShader.cso"}, 1u, SampleKind::Instancing, false},
     };
 
     for (const auto& s : samples) {
         RunSampleEndToEnd(bin_dir, s, /*prefer_warp=*/false);
         RunSampleEndToEnd(bin_dir, s, /*prefer_warp=*/true);
+    }
+
+    if (SUCCEEDED(com_hr)) {
+        ::CoUninitialize();
     }
 
     if (g_failures != 0) {

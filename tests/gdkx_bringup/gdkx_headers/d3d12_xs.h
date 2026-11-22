@@ -1,6 +1,7 @@
 #pragma once
 #include <d3d12.h>
 #include <dxgi1_6.h>
+#include <dcommon.h>
 #include <cstdint>
 
 // Clean-room MIT GDKX public D3D12.XS declarations for compiling untouched
