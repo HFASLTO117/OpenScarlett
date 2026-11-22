@@ -475,6 +475,85 @@ std::string ComposeFullUrl(const XCurlU& u, uint32_t flags) {
     return out;
 }
 
+std::string Base64UrlEncode(const std::string& input) {
+    static constexpr char kTable[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    std::string out;
+    out.reserve(((input.size() + 2u) / 3u) * 4u);
+    size_t i = 0;
+    while (i + 3u <= input.size()) {
+        const uint32_t v = (static_cast<uint32_t>(static_cast<unsigned char>(input[i])) << 16) |
+                           (static_cast<uint32_t>(static_cast<unsigned char>(input[i + 1u])) << 8) |
+                           static_cast<uint32_t>(static_cast<unsigned char>(input[i + 2u]));
+        out.push_back(kTable[(v >> 18) & 0x3Fu]);
+        out.push_back(kTable[(v >> 12) & 0x3Fu]);
+        out.push_back(kTable[(v >> 6) & 0x3Fu]);
+        out.push_back(kTable[v & 0x3Fu]);
+        i += 3u;
+    }
+    const size_t rem = input.size() - i;
+    if (rem == 1u) {
+        const uint32_t v = static_cast<uint32_t>(static_cast<unsigned char>(input[i])) << 16;
+        out.push_back(kTable[(v >> 18) & 0x3Fu]);
+        out.push_back(kTable[(v >> 12) & 0x3Fu]);
+    } else if (rem == 2u) {
+        const uint32_t v = (static_cast<uint32_t>(static_cast<unsigned char>(input[i])) << 16) |
+                           (static_cast<uint32_t>(static_cast<unsigned char>(input[i + 1u])) << 8);
+        out.push_back(kTable[(v >> 18) & 0x3Fu]);
+        out.push_back(kTable[(v >> 12) & 0x3Fu]);
+        out.push_back(kTable[(v >> 6) & 0x3Fu]);
+    }
+    return out;
+}
+
+bool IsOfflineModeEnvEnabled() {
+#if defined(_MSC_VER)
+    char* buf = nullptr;
+    size_t len = 0;
+    if (_dupenv_s(&buf, &len, "OPENSCARLETT_OFFLINE") != 0 || !buf) {
+        return false;
+    }
+    const std::string val(buf);
+    std::free(buf);
+    return val == "1" || val == "true" || val == "TRUE";
+#else
+    const char* v = std::getenv("OPENSCARLETT_OFFLINE");
+    if (!v) return false;
+    const std::string val(v);
+    return val == "1" || val == "true" || val == "TRUE";
+#endif
+}
+
+std::string ExtractUrlHostLower(const std::string& url) {
+    XCurlU parsed{};
+    if (ParseFullUrl(url, XCURLU_NON_SUPPORT_SCHEME, parsed) != XCURLUE_OK) {
+        return {};
+    }
+    return ToLowerAscii(parsed.host);
+}
+
+bool IsXboxLiveAuthHost(const std::string& host_lower) {
+    return host_lower == "xsts.auth.xboxlive.com" ||
+           host_lower == "user.auth.xboxlive.com" ||
+           host_lower == "device.auth.xboxlive.com" ||
+           host_lower == "title.auth.xboxlive.com" ||
+           host_lower == "sisu.xboxlive.com";
+}
+
+bool IsXboxLiveTitleMgtHost(const std::string& host_lower) {
+    return host_lower == "title.mgt.xboxlive.com";
+}
+
+std::string BuildOfflineXstsJwt() {
+    const std::string hdr = "{\"alg\":\"ES256\",\"typ\":\"JWT\"}";
+    const std::string body =
+        "{\"xuid\":\"2533274790396727\",\"uhs\":\"0000000000000001\","
+        "\"gtg\":\"ScarlettPlayer\",\"agg\":\"Adult\","
+        "\"iss\":\"https://xsts.auth.xboxlive.com\",\"offline\":true}";
+    const std::string sig = "OpenScarlett-XCurl-Offline-XSTS-Sig-V1";
+    return Base64UrlEncode(hdr) + "." + Base64UrlEncode(body) + "." + Base64UrlEncode(sig);
+}
+
 int32_t PerformOfflineTransfer(EasyObject& easy) {
     if (easy.url.empty()) {
         return XCURLE_URL_MALFORMAT;
@@ -482,6 +561,11 @@ int32_t PerformOfflineTransfer(EasyObject& easy) {
     if (!HasSupportedScheme(easy.url)) {
         return XCURLE_UNSUPPORTED_PROTOCOL;
     }
+
+    const std::string host_lower = ExtractUrlHostLower(easy.url);
+    const bool is_xsts_auth = IsXboxLiveAuthHost(host_lower);
+    const bool is_title_mgt = IsXboxLiveTitleMgtHost(host_lower);
+    const bool offline_forced = IsOfflineModeEnvEnabled();
 
     easy.effective_url = easy.url;
     easy.effective_scheme = (easy.url.rfind("http://", 0) == 0) ? "http" : "https";
@@ -494,10 +578,34 @@ int32_t PerformOfflineTransfer(EasyObject& easy) {
     std::string payload;
     if (!easy.nobody) {
         std::ostringstream oss;
-        oss << "{\"service\":\"openscarlett-xcurl\",\"status\":200,\"method\":\""
-            << EscapeJson(easy.method) << "\",\"url\":\""
-            << EscapeJson(easy.url) << "\",\"postBytes\":"
-            << easy.post_body.size() << "}";
+        if (is_xsts_auth) {
+            const std::string jwt = BuildOfflineXstsJwt();
+            oss << "{\"IssueInstant\":\"2026-01-01T00:00:00.0000000Z\","
+                << "\"NotAfter\":\"2099-01-01T00:00:00.0000000Z\","
+                << "\"Token\":\"" << jwt << "\","
+                << "\"DisplayClaims\":{\"xui\":[{\"uhs\":\"0000000000000001\","
+                << "\"xid\":\"2533274790396727\",\"gtg\":\"ScarlettPlayer\","
+                << "\"agg\":\"Adult\",\"usr\":\"191\",\"prv\":\"191\"}]},"
+                << "\"service\":\"openscarlett-xcurl\",\"offline\":true,\"status\":200,"
+                << "\"method\":\"" << EscapeJson(easy.method) << "\","
+                << "\"url\":\"" << EscapeJson(easy.url) << "\","
+                << "\"postBytes\":" << easy.post_body.size() << "}";
+        } else if (is_title_mgt) {
+            oss << "{\"titleId\":\"5CA00001\","
+                << "\"scid\":\"00000000-0000-0000-0000-00005ca00001\","
+                << "\"service\":\"openscarlett-xcurl\",\"offline\":true,\"status\":200,"
+                << "\"method\":\"" << EscapeJson(easy.method) << "\","
+                << "\"url\":\"" << EscapeJson(easy.url) << "\","
+                << "\"postBytes\":" << easy.post_body.size() << "}";
+        } else {
+            oss << "{\"service\":\"openscarlett-xcurl\",\"status\":200";
+            if (offline_forced) {
+                oss << ",\"offline\":true";
+            }
+            oss << ",\"method\":\"" << EscapeJson(easy.method) << "\",\"url\":\""
+                << EscapeJson(easy.url) << "\",\"postBytes\":"
+                << easy.post_body.size() << "}";
+        }
         payload = oss.str();
     }
 
@@ -505,6 +613,7 @@ int32_t PerformOfflineTransfer(EasyObject& easy) {
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: application/json\r\n"
         "Server: OpenScarlett-XCurl/1.0\r\n"
+        "X-OpenScarlett-Offline: 1\r\n"
         "Content-Length: " + std::to_string(payload.size()) + "\r\n\r\n";
     easy.header_size = static_cast<long>(hdrs.size());
 

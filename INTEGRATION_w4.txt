@@ -1,0 +1,82 @@
+OpenScarlett Sprint 9 + Sprint 10 — Worker 4 Integration Notes
+Worktree / Branch: swarm/s910-os-winrt-auth
+Scope: kernelx.dll, winrt_xs.dll, xgameruntime.dll, Microsoft.Xbox.Services.GDK.C.dll (XSAPI), XCurl.dll
+
+===============================================================================
+1. NEW CTest TARGET TO ADD (in CMakeLists.txt or modular sprint9/10 cmake file)
+===============================================================================
+openscarlett_add_test(test_os_winrt_offline_auth tests/test_os_winrt_offline_auth.cpp)
+target_link_libraries(test_os_winrt_offline_auth PRIVATE
+    kernelx
+    winrt_xs
+    xgameruntime
+    Microsoft.Xbox.Services.GDK.C
+    XCurl
+)
+# Also add `test_os_winrt_offline_auth` to `_openscarlett_known_targets` in
+# `cmake/wave3_portability.cmake` for Clang-CL / MinGW-w64 CI portability.
+
+===============================================================================
+2. NEW EXPORTED SYMBOLS (FOR MinGW-w64 .def FILES IF APPLICABLE)
+===============================================================================
+
+A. kernelx.dll (`src/shims/kernelx_mingw.def` additions):
+   Direct exports:
+     OpenScarlettRemapXboxAffinityMask
+     OpenScarlettRemapXboxIdealProcessor
+     KernelXSetThreadAffinityMask
+     KernelXSetThreadIdealProcessor
+     KernelXSetThreadIdealProcessorEx
+     KernelXSetThreadGroupAffinity
+     KernelXSetProcessAffinityMask
+     KernelXGetProcessAffinityMask
+     KernelXGetSystemInfo
+     KernelXGetCurrentProcessorNumber
+   Unprefixed Win32 export aliases (already exported via MSVC #pragma comment(linker)):
+     SetThreadAffinityMask = KernelXSetThreadAffinityMask
+     SetThreadIdealProcessor = KernelXSetThreadIdealProcessor
+     SetThreadIdealProcessorEx = KernelXSetThreadIdealProcessorEx
+     SetThreadGroupAffinity = KernelXSetThreadGroupAffinity
+     SetProcessAffinityMask = KernelXSetProcessAffinityMask
+     GetProcessAffinityMask = KernelXGetProcessAffinityMask
+     GetSystemInfo = KernelXGetSystemInfo
+     GetCurrentProcessorNumber = KernelXGetCurrentProcessorNumber
+
+B. winrt_xs.dll (exported via __declspec(dllexport) — works automatically on MSVC, Clang-CL, and MinGW-w64):
+     OpenScarlettTriggerWinRtLifecycleEvent
+     OpenScarlettGetWinRtConstrainedMode
+     GetGamingDeviceModelInformation
+   New built-in WinRT classes in RoGetActivationFactory / RoActivateInstance:
+     Windows.ApplicationModel.Core.CoreApplication (ICoreApplication, ICoreApplication2, ICoreApplicationExit, ICoreApplicationUseCount, ICoreApplicationView)
+     Windows.UI.Core.CoreWindow (ICoreWindowStatic, ICoreWindow, ICoreDispatcher)
+     Windows.UI.ViewManagement.ApplicationView (IApplicationViewStatics2, IApplicationView, IApplicationView2, IApplicationView3)
+     Windows.Graphics.Display.DisplayInformation (IDisplayInformationStatics, IDisplayInformation, IDisplayInformation2)
+     Windows.System.Profile.GamingDeviceInformation (IGamingDeviceInformationStatics)
+     Windows.Gaming.Preview.GamesEnumeration.GameList (IGameListStatics)
+   Explicit E_NOINTERFACE (*ppv == nullptr) refusal on ALL WinRT objects for:
+     IID_IReferenceTracker       {11D3B13A-180E-4789-A8BE-7712882893E6}
+     IID_IReferenceTrackerTarget {64BD43F8-BFEE-4EC4-B7EB-2935158DAE21}
+     IID_IReferenceTrackerHost   {29A71C6A-3C42-4416-A39D-E2825A07A773}
+
+C. xgameruntime.dll (no new exports; 100% ABI-compatible with existing exports):
+   - Default offline profile: XUID 0x0009000000001337, gamertag "ScarlettPlayer" (env overrides OPENSCARLETT_XUID / OPENSCARLETT_GAMERTAG preserved).
+   - XUserGetTokenAndSignatureAsync & XUserGetTokenAndSignatureUtf16Async emit well-formed XSTS/JWT tokens:
+       "XBL3.0 x=0000000000000001;<b64url_header>.<b64url_payload>.<b64url_sig>" + non-empty Base64URL signature.
+   - XStoreCanAcquireLicenseForStoreIdAsync returns XStoreCanLicenseStatus_Licensable offline for all valid store IDs.
+   - XTaskQueueDispatch handles INFINITE (0xFFFFFFFF) timeouts safely and wakes all waiters cleanly.
+
+D. Microsoft.Xbox.Services.GDK.C.dll (XSAPI — exported via __declspec(dllexport)):
+     XblMultiplayerActivityUpdateRecentPlayers
+     XblMultiplayerActivityFlushRecentPlayersAsync
+     XblMultiplayerActivitySetActivityAsync
+     XblMultiplayerActivityGetActivityAsync
+     XblMultiplayerActivityGetActivityResultSize
+     XblMultiplayerActivityGetActivityResult
+     XblMultiplayerActivityDeleteActivityAsync
+     XblMultiplayerActivitySendInvitesAsync
+
+E. XCurl.dll (no new exports; all existing exports preserved):
+   - Offline HTTP 200 XSTS JSON synthesis (with 3-segment Base64URL JWT Token & DisplayClaims) for:
+       xsts.auth.xboxlive.com, user.auth.xboxlive.com, device.auth.xboxlive.com,
+       title.auth.xboxlive.com, sisu.xboxlive.com, and title.mgt.xboxlive.com
+     plus OPENSCARLETT_OFFLINE=1 support with zero network stalls.

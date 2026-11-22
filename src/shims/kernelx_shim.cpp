@@ -29,6 +29,14 @@
 #pragma comment(linker, "/export:VirtualProtectFromApp=KernelXVirtualProtectFromApp")
 #pragma comment(linker, "/export:CreateWaitableTimerExW=KernelXCreateWaitableTimerExW")
 #pragma comment(linker, "/export:QueryUnbiasedInterruptTime=KernelXQueryUnbiasedInterruptTime")
+#pragma comment(linker, "/export:SetThreadAffinityMask=KernelXSetThreadAffinityMask")
+#pragma comment(linker, "/export:SetThreadIdealProcessor=KernelXSetThreadIdealProcessor")
+#pragma comment(linker, "/export:SetThreadIdealProcessorEx=KernelXSetThreadIdealProcessorEx")
+#pragma comment(linker, "/export:SetThreadGroupAffinity=KernelXSetThreadGroupAffinity")
+#pragma comment(linker, "/export:SetProcessAffinityMask=KernelXSetProcessAffinityMask")
+#pragma comment(linker, "/export:GetProcessAffinityMask=KernelXGetProcessAffinityMask")
+#pragma comment(linker, "/export:GetSystemInfo=KernelXGetSystemInfo")
+#pragma comment(linker, "/export:GetCurrentProcessorNumber=KernelXGetCurrentProcessorNumber")
 #endif
 
 namespace {
@@ -69,6 +77,64 @@ constexpr int32_t kHrInsufficientBuffer = static_cast<int32_t>(0x8007007Au);
 constexpr int32_t kHrFail = static_cast<int32_t>(0x80004005u);
 
 constexpr uint64_t kScarlettAllCoresMask = (1ull << kScarlettTitleProcessorCount) - 1ull;
+
+// Deterministic Xbox Series X|S (7 cores / 14 logical processors, bits 0..13) to
+// host PC CPU affinity remapping helpers. Prevents ERROR_INVALID_PARAMETER (0) or
+// thread starvation on 2/4/6/8-core PCs while preserving round-robin thread spread.
+uint64_t RemapXboxAffinityMaskToHost(uint64_t guest_mask, uint64_t host_process_mask) noexcept {
+    if (guest_mask == 0ull || host_process_mask == 0ull) {
+        return 0ull;
+    }
+    uint32_t host_bits[64]{};
+    uint32_t host_count = 0u;
+    for (uint32_t b = 0u; b < 64u; ++b) {
+        if ((host_process_mask & (1ull << b)) != 0ull) {
+            host_bits[host_count++] = b;
+        }
+    }
+    if (host_count == 0u) {
+        return 0ull;
+    }
+    uint64_t out_mask = 0ull;
+    for (uint32_t b = 0u; b < 64u; ++b) {
+        if ((guest_mask & (1ull << b)) != 0ull) {
+            const uint32_t mapped_bit = host_bits[b % host_count];
+            out_mask |= (1ull << mapped_bit);
+        }
+    }
+    return out_mask != 0ull ? out_mask : (1ull << host_bits[0]);
+}
+
+uint32_t RemapXboxIdealProcessorToHost(uint32_t guest_proc, uint32_t host_cpu_count) noexcept {
+    if (host_cpu_count == 0u) {
+        return 0u;
+    }
+    return guest_proc % host_cpu_count;
+}
+
+uint32_t QueryHostLogicalProcessorCount() noexcept {
+#if defined(_WIN32)
+    DWORD_PTR proc_mask = 0;
+    DWORD_PTR sys_mask = 0;
+    if (::GetProcessAffinityMask(::GetCurrentProcess(), &proc_mask, &sys_mask) && proc_mask != 0u) {
+        uint32_t count = 0u;
+        const uint64_t m = static_cast<uint64_t>(proc_mask);
+        for (uint32_t b = 0u; b < 64u; ++b) {
+            if ((m & (1ull << b)) != 0ull) {
+                ++count;
+            }
+        }
+        if (count > 0u) {
+            return count;
+        }
+    }
+    SYSTEM_INFO si{};
+    ::GetSystemInfo(&si);
+    return si.dwNumberOfProcessors > 0u ? static_cast<uint32_t>(si.dwNumberOfProcessors) : 1u;
+#else
+    return kScarlettTitleProcessorCount;
+#endif
+}
 
 bool IsPowerOfTwo(size_t v) noexcept {
     return v != 0u && (v & (v - 1u)) == 0u;
@@ -1567,30 +1633,17 @@ public:
             proc_mask = 1u;
         }
         const uint64_t allowed_guest_bits = kScarlettAllCoresMask | static_cast<uint64_t>(proc_mask);
-        if ((dwThreadAffinityMask & allowed_guest_bits) == 0ull) {
+        const uint64_t valid_guest_mask = dwThreadAffinityMask & allowed_guest_bits;
+        if (valid_guest_mask == 0ull) {
             SetHostLastError(87u);  // ERROR_INVALID_PARAMETER
             return 0ull;
         }
 
-        DWORD_PTR host_mask = static_cast<DWORD_PTR>(dwThreadAffinityMask & static_cast<uint64_t>(proc_mask));
+        const uint64_t remapped = RemapXboxAffinityMaskToHost(
+            valid_guest_mask, static_cast<uint64_t>(proc_mask));
+        DWORD_PTR host_mask = static_cast<DWORD_PTR>(remapped);
         if (host_mask == 0u) {
-            // Fold higher Scarlett logical cores (e.g. cores 8..13 on an 8-core host)
-            // deterministically onto the host process affinity mask.
-            std::vector<uint32_t> host_bits;
-            for (uint32_t b = 0u; b < 64u; ++b) {
-                if ((static_cast<uint64_t>(proc_mask) & (1ull << b)) != 0ull) {
-                    host_bits.push_back(b);
-                }
-            }
-            for (uint32_t b = 0u; b < kScarlettTitleProcessorCount; ++b) {
-                if ((dwThreadAffinityMask & (1ull << b)) != 0ull && !host_bits.empty()) {
-                    const uint32_t mapped = host_bits[b % host_bits.size()];
-                    host_mask |= (static_cast<DWORD_PTR>(1u) << mapped);
-                }
-            }
-            if (host_mask == 0u) {
-                host_mask = proc_mask;
-            }
+            host_mask = proc_mask;
         }
 
         const DWORD_PTR os_prev = ::SetThreadAffinityMask(target, host_mask);
@@ -1603,13 +1656,213 @@ public:
         const uint64_t prev_logical = (it != thread_affinities_.end())
                                           ? it->second
                                           : (kScarlettAllCoresMask & allowed_guest_bits);
-        thread_affinities_[tid] = dwThreadAffinityMask & allowed_guest_bits;
+        thread_affinities_[tid] = valid_guest_mask;
         return prev_logical;
 #else
         if (!hThread || dwThreadAffinityMask == 0ull) {
             return 0ull;
         }
         return kScarlettAllCoresMask;
+#endif
+    }
+
+    uint32_t SetThreadIdealProcessorImpl(void* hThread, uint32_t dwIdealProcessor) {
+#if defined(_WIN32)
+        if (!hThread || hThread == INVALID_HANDLE_VALUE) {
+            SetHostLastError(6u);
+            return static_cast<uint32_t>(-1);
+        }
+        HANDLE target = static_cast<HANDLE>(hThread);
+        const DWORD tid = GetThreadId(target);
+        if (tid == 0u) {
+            SetHostLastError(6u);
+            return static_cast<uint32_t>(-1);
+        }
+        if (dwIdealProcessor == MAXIMUM_PROCESSORS) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto it = thread_ideal_procs_.find(tid);
+            if (it != thread_ideal_procs_.end()) {
+                return it->second;
+            }
+            return ::GetCurrentProcessorNumber() % kScarlettTitleProcessorCount;
+        }
+        const uint32_t host_cpus = QueryHostLogicalProcessorCount();
+        const uint32_t mapped_host_proc = RemapXboxIdealProcessorToHost(dwIdealProcessor, host_cpus);
+        const DWORD os_prev = ::SetThreadIdealProcessor(target, static_cast<DWORD>(mapped_host_proc));
+        if (os_prev == static_cast<DWORD>(-1)) {
+            return static_cast<uint32_t>(-1);
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = thread_ideal_procs_.find(tid);
+        const uint32_t prev_logical = (it != thread_ideal_procs_.end())
+                                          ? it->second
+                                          : (static_cast<uint32_t>(os_prev) % kScarlettTitleProcessorCount);
+        thread_ideal_procs_[tid] = dwIdealProcessor % kScarlettTitleProcessorCount;
+        return prev_logical;
+#else
+        if (!hThread) {
+            return static_cast<uint32_t>(-1);
+        }
+        return dwIdealProcessor % kScarlettTitleProcessorCount;
+#endif
+    }
+
+    int32_t SetThreadIdealProcessorExImpl(void* hThread,
+                                          const void* lpIdealProcessor,
+                                          void* lpPreviousIdealProcessor) {
+#if defined(_WIN32)
+        if (!hThread || hThread == INVALID_HANDLE_VALUE) {
+            SetHostLastError(6u);
+            return 0;
+        }
+        if (!lpIdealProcessor) {
+            SetHostLastError(87u);
+            return 0;
+        }
+        HANDLE target = static_cast<HANDLE>(hThread);
+        const DWORD tid = GetThreadId(target);
+        if (tid == 0u) {
+            SetHostLastError(6u);
+            return 0;
+        }
+        const auto* req = static_cast<const PROCESSOR_NUMBER*>(lpIdealProcessor);
+        const uint32_t host_cpus = QueryHostLogicalProcessorCount();
+        PROCESSOR_NUMBER host_req{};
+        host_req.Group = 0;
+        host_req.Number = static_cast<BYTE>(RemapXboxIdealProcessorToHost(req->Number, host_cpus));
+        host_req.Reserved = 0;
+
+        PROCESSOR_NUMBER host_prev{};
+        if (!::SetThreadIdealProcessorEx(target, &host_req, &host_prev)) {
+            return 0;
+        }
+        uint32_t prev_logical = static_cast<uint32_t>(host_prev.Number) % kScarlettTitleProcessorCount;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto it = thread_ideal_procs_.find(tid);
+            if (it != thread_ideal_procs_.end()) {
+                prev_logical = it->second;
+            }
+            thread_ideal_procs_[tid] = static_cast<uint32_t>(req->Number) % kScarlettTitleProcessorCount;
+        }
+        if (lpPreviousIdealProcessor) {
+            auto* prev_out = static_cast<PROCESSOR_NUMBER*>(lpPreviousIdealProcessor);
+            prev_out->Group = 0;
+            prev_out->Number = static_cast<BYTE>(prev_logical);
+            prev_out->Reserved = 0;
+        }
+        return 1;
+#else
+        (void)lpPreviousIdealProcessor;
+        return (hThread && lpIdealProcessor) ? 1 : 0;
+#endif
+    }
+
+    int32_t SetThreadGroupAffinityImpl(void* hThread,
+                                       const void* groupAffinity,
+                                       void* previousGroupAffinity) {
+#if defined(_WIN32)
+        if (!hThread || hThread == INVALID_HANDLE_VALUE) {
+            SetHostLastError(6u);
+            return 0;
+        }
+        if (!groupAffinity) {
+            SetHostLastError(87u);
+            return 0;
+        }
+        const auto* req = static_cast<const GROUP_AFFINITY*>(groupAffinity);
+        const uint64_t prev = SetThreadAffinityMaskImpl(hThread, static_cast<uint64_t>(req->Mask));
+        if (prev == 0ull) {
+            return 0;
+        }
+        if (previousGroupAffinity) {
+            auto* out = static_cast<GROUP_AFFINITY*>(previousGroupAffinity);
+            std::memset(out, 0, sizeof(GROUP_AFFINITY));
+            out->Mask = static_cast<KAFFINITY>(prev);
+            out->Group = 0;
+        }
+        return 1;
+#else
+        (void)previousGroupAffinity;
+        return (hThread && groupAffinity) ? 1 : 0;
+#endif
+    }
+
+    int32_t SetProcessAffinityMaskImpl(void* hProcess, uint64_t dwProcessAffinityMask) {
+#if defined(_WIN32)
+        if (!hProcess) {
+            SetHostLastError(6u);
+            return 0;
+        }
+        HANDLE target = static_cast<HANDLE>(hProcess);
+        if (target != ::GetCurrentProcess() && ::GetProcessId(target) == 0u) {
+            SetHostLastError(6u);
+            return 0;
+        }
+        if (dwProcessAffinityMask == 0ull) {
+            SetHostLastError(87u);
+            return 0;
+        }
+        DWORD_PTR proc_mask = 0;
+        DWORD_PTR sys_mask = 0;
+        if (!::GetProcessAffinityMask(::GetCurrentProcess(), &proc_mask, &sys_mask) || sys_mask == 0u) {
+            sys_mask = 1u;
+        }
+        const uint64_t allowed = kScarlettAllCoresMask | static_cast<uint64_t>(sys_mask);
+        const uint64_t valid_guest = dwProcessAffinityMask & allowed;
+        if (valid_guest == 0ull) {
+            SetHostLastError(87u);
+            return 0;
+        }
+        const uint64_t remapped = RemapXboxAffinityMaskToHost(valid_guest, static_cast<uint64_t>(sys_mask));
+        if (remapped == 0ull) {
+            SetHostLastError(87u);
+            return 0;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        guest_process_affinity_mask_ = valid_guest;
+        return 1;
+#else
+        return (hProcess && dwProcessAffinityMask != 0ull) ? 1 : 0;
+#endif
+    }
+
+    int32_t GetProcessAffinityMaskImpl(void* hProcess,
+                                       uint64_t* lpProcessAffinityMask,
+                                       uint64_t* lpSystemAffinityMask) {
+        if (!hProcess) {
+            SetHostLastError(6u);
+            return 0;
+        }
+        if (!lpProcessAffinityMask || !lpSystemAffinityMask) {
+            SetHostLastError(87u);
+            return 0;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        *lpProcessAffinityMask = guest_process_affinity_mask_;
+        *lpSystemAffinityMask = kScarlettAllCoresMask;
+        return 1;
+    }
+
+    void GetSystemInfoImpl(void* lpSystemInfo) const {
+        if (!lpSystemInfo) {
+            return;
+        }
+#if defined(_WIN32)
+        auto* si = static_cast<SYSTEM_INFO*>(lpSystemInfo);
+        ::GetSystemInfo(si);
+        si->dwNumberOfProcessors = kScarlettTitleProcessorCount;
+        si->dwActiveProcessorMask = static_cast<DWORD_PTR>(kScarlettAllCoresMask);
+#else
+        (void)lpSystemInfo;
+#endif
+    }
+
+    uint32_t GetCurrentProcessorNumberImpl() const {
+#if defined(_WIN32)
+        return static_cast<uint32_t>(::GetCurrentProcessorNumber()) % kScarlettTitleProcessorCount;
+#else
+        return 0u;
 #endif
     }
 
@@ -1720,6 +1973,8 @@ private:
     std::unordered_map<uintptr_t, size_t> aux_allocs_;
     std::unordered_map<uint32_t, std::wstring> thread_names_;
     std::unordered_map<uint32_t, uint64_t> thread_affinities_;
+    std::unordered_map<uint32_t, uint32_t> thread_ideal_procs_;
+    uint64_t guest_process_affinity_mask_ = kScarlettAllCoresMask;
 };
 
 }  // namespace
@@ -2050,6 +2305,100 @@ uint64_t OPENSCARLETT_KERNELX_CALL XThreadSetAffinityMask(void* hThread,
     RecordTelemetry(__func__, prev != 0ull ? CallOutcome::Ok : CallOutcome::Error,
                     prev != 0ull ? kHrOk : kHrInvalidArg);
     return prev;
+}
+
+OPENSCARLETT_KERNELX_API uint64_t OPENSCARLETT_KERNELX_CALL OpenScarlettRemapXboxAffinityMask(
+    uint64_t guestMask,
+    uint64_t hostProcessMask) {
+    const uint64_t mapped = RemapXboxAffinityMaskToHost(guestMask, hostProcessMask);
+    RecordTelemetry(__func__, mapped != 0ull ? CallOutcome::Ok : CallOutcome::Error,
+                    mapped != 0ull ? kHrOk : kHrInvalidArg);
+    return mapped;
+}
+
+OPENSCARLETT_KERNELX_API uint32_t OPENSCARLETT_KERNELX_CALL OpenScarlettRemapXboxIdealProcessor(
+    uint32_t guestProc,
+    uint32_t hostCpuCount) {
+    const uint32_t mapped = RemapXboxIdealProcessorToHost(guestProc, hostCpuCount);
+    RecordTelemetry(__func__, hostCpuCount != 0u ? CallOutcome::Ok : CallOutcome::Error,
+                    hostCpuCount != 0u ? kHrOk : kHrInvalidArg);
+    return mapped;
+}
+
+OPENSCARLETT_KERNELX_API uint64_t OPENSCARLETT_KERNELX_CALL KernelXSetThreadAffinityMask(
+    void* hThread,
+    uint64_t dwThreadAffinityMask) {
+    const uint64_t prev =
+        KernelXState::Instance().SetThreadAffinityMaskImpl(hThread, dwThreadAffinityMask);
+    RecordTelemetry("SetThreadAffinityMask", prev != 0ull ? CallOutcome::Ok : CallOutcome::Error,
+                    prev != 0ull ? kHrOk : kHrInvalidArg);
+    return prev;
+}
+
+OPENSCARLETT_KERNELX_API uint32_t OPENSCARLETT_KERNELX_CALL KernelXSetThreadIdealProcessor(
+    void* hThread,
+    uint32_t dwIdealProcessor) {
+    const uint32_t prev =
+        KernelXState::Instance().SetThreadIdealProcessorImpl(hThread, dwIdealProcessor);
+    const bool ok = (prev != static_cast<uint32_t>(-1));
+    RecordTelemetry("SetThreadIdealProcessor", ok ? CallOutcome::Ok : CallOutcome::Error,
+                    ok ? kHrOk : kHrInvalidArg);
+    return prev;
+}
+
+OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL KernelXSetThreadIdealProcessorEx(
+    void* hThread,
+    const void* lpIdealProcessor,
+    void* lpPreviousIdealProcessor) {
+    const int32_t ok = KernelXState::Instance().SetThreadIdealProcessorExImpl(
+        hThread, lpIdealProcessor, lpPreviousIdealProcessor);
+    RecordTelemetry("SetThreadIdealProcessorEx", ok != 0 ? CallOutcome::Ok : CallOutcome::Error,
+                    ok != 0 ? kHrOk : kHrInvalidArg);
+    return ok;
+}
+
+OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL KernelXSetThreadGroupAffinity(
+    void* hThread,
+    const void* groupAffinity,
+    void* previousGroupAffinity) {
+    const int32_t ok = KernelXState::Instance().SetThreadGroupAffinityImpl(
+        hThread, groupAffinity, previousGroupAffinity);
+    RecordTelemetry("SetThreadGroupAffinity", ok != 0 ? CallOutcome::Ok : CallOutcome::Error,
+                    ok != 0 ? kHrOk : kHrInvalidArg);
+    return ok;
+}
+
+OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL KernelXSetProcessAffinityMask(
+    void* hProcess,
+    uint64_t dwProcessAffinityMask) {
+    const int32_t ok =
+        KernelXState::Instance().SetProcessAffinityMaskImpl(hProcess, dwProcessAffinityMask);
+    RecordTelemetry("SetProcessAffinityMask", ok != 0 ? CallOutcome::Ok : CallOutcome::Error,
+                    ok != 0 ? kHrOk : kHrInvalidArg);
+    return ok;
+}
+
+OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL KernelXGetProcessAffinityMask(
+    void* hProcess,
+    uint64_t* lpProcessAffinityMask,
+    uint64_t* lpSystemAffinityMask) {
+    const int32_t ok = KernelXState::Instance().GetProcessAffinityMaskImpl(
+        hProcess, lpProcessAffinityMask, lpSystemAffinityMask);
+    RecordTelemetry("GetProcessAffinityMask", ok != 0 ? CallOutcome::Ok : CallOutcome::Error,
+                    ok != 0 ? kHrOk : kHrInvalidArg);
+    return ok;
+}
+
+OPENSCARLETT_KERNELX_API void OPENSCARLETT_KERNELX_CALL KernelXGetSystemInfo(void* lpSystemInfo) {
+    KernelXState::Instance().GetSystemInfoImpl(lpSystemInfo);
+    RecordTelemetry("GetSystemInfo", lpSystemInfo ? CallOutcome::Ok : CallOutcome::Error,
+                    lpSystemInfo ? kHrOk : kHrInvalidArg);
+}
+
+OPENSCARLETT_KERNELX_API uint32_t OPENSCARLETT_KERNELX_CALL KernelXGetCurrentProcessorNumber(void) {
+    const uint32_t proc = KernelXState::Instance().GetCurrentProcessorNumberImpl();
+    RecordTelemetry("GetCurrentProcessorNumber", CallOutcome::Ok, kHrOk);
+    return proc;
 }
 
 int32_t OPENSCARLETT_KERNELX_CALL XThreadSetPriority(void* hThread, int32_t nPriority) {

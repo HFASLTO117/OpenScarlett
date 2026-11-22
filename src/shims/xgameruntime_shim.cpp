@@ -86,7 +86,12 @@ fs::path ResolveSaveRoot() {
     if (!env_temp.empty()) {
         return fs::path(env_temp) / "saves";
     }
-    return fs::path("E:\\OpenScarlett\\.tmp\\saves");
+    std::error_code ec;
+    fs::path tmp = fs::temp_directory_path(ec);
+    if (!ec && !tmp.empty()) {
+        return tmp / "openscarlett_saves";
+    }
+    return fs::path("openscarlett_saves");
 }
 
 std::string EncodePathToken(const std::string& raw) {
@@ -926,7 +931,7 @@ uint64_t DefaultUserXuid() {
         } catch (...) {
         }
     }
-    return 0x0009000012345678ULL;
+    return 0x0009000000001337ULL;
 }
 
 std::shared_ptr<XUser> CreateDefaultUserObj() {
@@ -938,12 +943,70 @@ std::shared_ptr<XUser> CreateDefaultUserObj() {
         u->gamertag_classic = env_gt;
         u->gamertag_modern = env_gt;
     } else {
-        u->gamertag_classic = "OpenScarlettUser";
-        u->gamertag_modern = "OpenScarlett";
+        u->gamertag_classic = "ScarlettPlayer";
+        u->gamertag_modern = "ScarlettPlayer";
     }
-    u->gamertag_suffix = "1001";
+    u->gamertag_suffix = "1337";
     u->gamertag_unique = u->gamertag_modern + "#" + u->gamertag_suffix;
     return u;
+}
+
+std::string Base64UrlEncode(const std::string& input) {
+    static constexpr char kTable[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    std::string out;
+    out.reserve(((input.size() + 2u) / 3u) * 4u);
+    size_t i = 0;
+    while (i + 3u <= input.size()) {
+        const uint32_t v = (static_cast<uint32_t>(static_cast<unsigned char>(input[i])) << 16) |
+                           (static_cast<uint32_t>(static_cast<unsigned char>(input[i + 1u])) << 8) |
+                           static_cast<uint32_t>(static_cast<unsigned char>(input[i + 2u]));
+        out.push_back(kTable[(v >> 18) & 0x3Fu]);
+        out.push_back(kTable[(v >> 12) & 0x3Fu]);
+        out.push_back(kTable[(v >> 6) & 0x3Fu]);
+        out.push_back(kTable[v & 0x3Fu]);
+        i += 3u;
+    }
+    const size_t rem = input.size() - i;
+    if (rem == 1u) {
+        const uint32_t v = static_cast<uint32_t>(static_cast<unsigned char>(input[i])) << 16;
+        out.push_back(kTable[(v >> 18) & 0x3Fu]);
+        out.push_back(kTable[(v >> 12) & 0x3Fu]);
+    } else if (rem == 2u) {
+        const uint32_t v = (static_cast<uint32_t>(static_cast<unsigned char>(input[i])) << 16) |
+                           (static_cast<uint32_t>(static_cast<unsigned char>(input[i + 1u])) << 8);
+        out.push_back(kTable[(v >> 18) & 0x3Fu]);
+        out.push_back(kTable[(v >> 12) & 0x3Fu]);
+        out.push_back(kTable[(v >> 6) & 0x3Fu]);
+    }
+    return out;
+}
+
+void BuildOfflineXstsTokenAndSig(
+    const XUser& user,
+    const std::string& method,
+    const std::string& url,
+    std::string& out_token,
+    std::string& out_sig) {
+    const int64_t now = NowUnixSeconds();
+    const int64_t exp = now + 86400;
+    const std::string hdr_json = "{\"alg\":\"ES256\",\"typ\":\"JWT\"}";
+    std::ostringstream payload;
+    payload << "{\"xuid\":\"" << user.xuid
+            << "\",\"uhs\":\"0000000000000001\""
+            << ",\"gtg\":\"" << user.gamertag_classic
+            << "\",\"agg\":\"Adult\""
+            << ",\"iat\":" << now
+            << ",\"exp\":" << exp
+            << ",\"iss\":\"https://xsts.auth.xboxlive.com\",\"offline\":true}";
+    const std::string sig_material =
+        "OpenScarlett-Offline-XSTS-Sig-V1:" + FormatXuidHex(user.xuid);
+    const std::string jwt =
+        Base64UrlEncode(hdr_json) + "." +
+        Base64UrlEncode(payload.str()) + "." +
+        Base64UrlEncode(sig_material);
+    out_token = "XBL3.0 x=0000000000000001;" + jwt;
+    out_sig = Base64UrlEncode("XBL3.0-SIG:" + method + ":" + url + ":" + FormatXuidHex(user.xuid));
 }
 
 // ===========================================================================
@@ -2534,7 +2597,7 @@ XGameResult OPENSCARLETT_GDK_CALL XTaskQueueSubmitDelayedCallback(
         item.callback = callback;
         item.context = callbackContext;
         p.items.push_back(item);
-        p.cv.notify_one();
+        p.cv.notify_all();
     }
 
     NotifyMonitors(obj.get(), port);
@@ -2565,7 +2628,10 @@ bool OPENSCARLETT_GDK_CALL XTaskQueueDispatch(
     }
 
     PortState& p = *obj->ports[static_cast<uint32_t>(port)];
-    const auto deadline = SteadyClock::now() + std::chrono::milliseconds(timeoutInMs);
+    const bool infinite_wait = (timeoutInMs == 0xFFFFFFFFu);
+    const auto deadline = infinite_wait
+                              ? SteadyClock::time_point::max()
+                              : (SteadyClock::now() + std::chrono::milliseconds(timeoutInMs));
 
     ScheduledCallback item{};
     bool has_item = false;
@@ -2585,17 +2651,23 @@ bool OPENSCARLETT_GDK_CALL XTaskQueueDispatch(
                     ++p.active_callbacks;
                     break;
                 }
-                if (timeoutInMs == 0 || now >= deadline) {
+                if (timeoutInMs == 0 || (!infinite_wait && now >= deadline)) {
                     break;
                 }
-                const auto wait_until_tp = std::min(deadline, p.items[idx].ready_time);
+                const auto wait_until_tp =
+                    infinite_wait ? p.items[idx].ready_time
+                                  : std::min(deadline, p.items[idx].ready_time);
                 p.cv.wait_until(lk, wait_until_tp);
                 continue;
             }
-            if (p.terminating || timeoutInMs == 0 || SteadyClock::now() >= deadline) {
+            if (p.terminating || timeoutInMs == 0 || (!infinite_wait && SteadyClock::now() >= deadline)) {
                 break;
             }
-            p.cv.wait_until(lk, deadline);
+            if (infinite_wait) {
+                p.cv.wait(lk);
+            } else {
+                p.cv.wait_until(lk, deadline);
+            }
         }
     }
 
@@ -3399,8 +3471,7 @@ XGameResult OPENSCARLETT_GDK_CALL XUserGetTokenAndSignatureAsync(
     if (!ctx) {
         return RecordHr("XUserGetTokenAndSignatureAsync", XGR_E_OUTOFMEMORY);
     }
-    ctx->token = "XBL3.0 x=" + FormatXuidHex(u->xuid) + ";openscarlett-offline-token";
-    ctx->signature = "openscarlett-offline-sig";
+    BuildOfflineXstsTokenAndSig(*u, method, url, ctx->token, ctx->signature);
     XGameResult hr = XAsyncBegin(async, ctx, kIdUserTokenSig, kIdUserTokenSig, &TokenSigProvider);
     if (hr < 0) {
         delete ctx;
@@ -3469,13 +3540,19 @@ XGameResult OPENSCARLETT_GDK_CALL XUserGetTokenAndSignatureUtf16Async(
     if (!ctx) {
         return RecordHr("XUserGetTokenAndSignatureUtf16Async", XGR_E_OUTOFMEMORY);
     }
-    const std::string hex = FormatXuidHex(u->xuid);
-    ctx->token = L"XBL3.0 x=";
-    for (char c : hex) {
-        ctx->token.push_back(static_cast<wchar_t>(c));
+    std::string narrow_method;
+    for (const wchar_t* p = method; *p; ++p) {
+        narrow_method.push_back((*p < 0x80) ? static_cast<char>(*p) : '?');
     }
-    ctx->token += L";openscarlett-offline-token";
-    ctx->signature = L"openscarlett-offline-sig";
+    std::string narrow_url;
+    for (const wchar_t* p = url; *p; ++p) {
+        narrow_url.push_back((*p < 0x80) ? static_cast<char>(*p) : '?');
+    }
+    std::string tok_utf8;
+    std::string sig_utf8;
+    BuildOfflineXstsTokenAndSig(*u, narrow_method, narrow_url, tok_utf8, sig_utf8);
+    ctx->token.assign(tok_utf8.begin(), tok_utf8.end());
+    ctx->signature.assign(sig_utf8.begin(), sig_utf8.end());
     XGameResult hr = XAsyncBegin(
         async, ctx, kIdUserTokenSigUtf16, kIdUserTokenSigUtf16, &TokenSigUtf16Provider);
     if (hr < 0) {
@@ -7198,14 +7275,8 @@ XGameResult OPENSCARLETT_GDK_CALL XStoreCanAcquireLicenseForStoreIdAsync(
         return RecordHr("XStoreCanAcquireLicenseForStoreIdAsync", XGR_E_HANDLE);
     }
     XStoreCanAcquireLicenseResult res{};
-    const std::string cur_store_id = CurrentStoreId();
-    if (std::strcmp(storeProductId, kDefaultStoreId) == 0 || cur_store_id == storeProductId) {
-        std::snprintf(res.licensableSku, sizeof(res.licensableSku), "%s", "0001");
-        res.status = XStoreCanLicenseStatus_Licensable;
-    } else {
-        res.licensableSku[0] = '\0';
-        res.status = XStoreCanLicenseStatus_NotLicensableToUser;
-    }
+    std::snprintf(res.licensableSku, sizeof(res.licensableSku), "%s", "0001");
+    res.status = XStoreCanLicenseStatus_Licensable;
     return RecordHr(
         "XStoreCanAcquireLicenseForStoreIdAsync",
         StartPodAsync<XStoreCanAcquireLicenseResult>(
