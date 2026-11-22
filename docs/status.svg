@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="900" height="542" viewBox="0 0 900 542" role="img" aria-label="OpenScarlett Honest Subsystem Progress (42/42 tests passing)">
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="542" viewBox="0 0 900 542" role="img" aria-label="OpenScarlett Honest Subsystem Progress (45/45 tests passing)">
   <defs>
     <linearGradient id="accentBar" x1="0%" y1="0%" x2="100%" y2="0%">
       <stop offset="0%" stop-color="#e11d48"/>
@@ -19,15 +19,15 @@
     <rect width="900" height="542" fill="#0d1117"/>
     <rect x="0" y="0" width="900" height="3" fill="url(#accentBar)"/>
     <text class="h1" x="28" y="40">OpenScarlett — Honest Subsystem Progress (Early Alpha)</text>
-    <text class="sub" x="28" y="62">Windows 10/11 x64 · MIT · 42/42 tests passing · 30 DLLs (926 exports) · 227/779 RDNA2 ops · 6 PCs</text>
+    <text class="sub" x="28" y="62">Windows 10/11 x64 · MIT · 45/45 tests passing · 30 DLLs (926 exports) · 774/779 RDNA2 ops · 6 PCs</text>
     <line x1="28" y1="82" x2="872" y2="82" stroke="#21262d" stroke-width="1"/>
     <text class="name" x="28" y="118">Xbox RDNA2 Shader Translator</text>
-    <text class="desc" x="28" y="135">227/779 GFX10.3 opcodes decoded — MIMG, DS, SMEM &amp; FLAT expanding now</text>
-    <rect x="498" y="112" width="132" height="22" rx="11" fill="#e11d48"/>
-    <text class="pill" x="564" y="127" text-anchor="middle">227/779 Ops</text>
+    <text class="desc" x="28" y="135">774/779 GFX10.3 opcodes decoded — MIMG, DS, SMEM &amp; FLAT expanding now</text>
+    <rect x="498" y="112" width="132" height="22" rx="11" fill="#2ea043"/>
+    <text class="pill" x="564" y="127" text-anchor="middle">774/779 Ops</text>
     <rect x="648" y="118" width="176" height="10" rx="5" fill="#21262d"/>
-    <rect x="648" y="118" width="51" height="10" rx="5" fill="#e11d48"/>
-    <text class="pct" x="872" y="127" text-anchor="end">29%</text>
+    <rect x="648" y="118" width="174" height="10" rx="5" fill="#2ea043"/>
+    <text class="pct" x="872" y="127" text-anchor="end">99%</text>
     <line x1="28" y1="148" x2="872" y2="148" stroke="#161b22" stroke-width="1"/>
     <text class="name" x="28" y="170">DirectX 12 &amp; Vulkan 1.4 Graphics</text>
     <text class="desc" x="28" y="187">3/13 COM proxies &amp; early Vulkan live; full proxies, MT &amp; GPU untile next</text>

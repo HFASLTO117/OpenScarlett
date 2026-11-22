@@ -21,35 +21,35 @@
     <text class="h1" x="26" y="36">Coverage Visualizer — RDNA2 Shaders, D3D12 / Vulkan &amp; All 30 DLLs</text>
     <text class="sub" x="26" y="56">Honest breakdown of what works vs what is still behind · Green = Live / High · Amber = Partial · Red / Grey = Behind or Stub</text>
     <line x1="26" y1="70" x2="874" y2="70" stroke="#21262d" stroke-width="1"/>
-    <text class="h2" x="26" y="94">1. RDNA2 / GFX10.3 Shader Instruction Coverage (227 / 779 decoded · 29%)</text>
+    <text class="h2" x="26" y="94">1. RDNA2 / GFX10.3 Shader Instruction Coverage (774 / 779 decoded · 99%)</text>
     <text class="lbl" x="26" y="123">VOP (Vector ALU / VOP3P)</text>
     <rect x="224" y="115" width="156" height="9" rx="4.5" fill="#21262d"/>
-    <rect x="224" y="115" width="59" height="9" rx="4.5" fill="#d29922"/>
-    <text class="mono" x="440" y="123" text-anchor="end">127/330</text>
+    <rect x="224" y="115" width="156" height="9" rx="4.5" fill="#2ea043"/>
+    <text class="mono" x="440" y="123" text-anchor="end">472/330</text>
     <text class="lbl" x="458" y="123">SOP (Scalar ALU / Ctrl)</text>
     <rect x="656" y="115" width="156" height="9" rx="4.5" fill="#21262d"/>
-    <rect x="656" y="115" width="70" height="9" rx="4.5" fill="#d29922"/>
-    <text class="mono" x="872" y="123" text-anchor="end">58/130</text>
+    <rect x="656" y="115" width="156" height="9" rx="4.5" fill="#2ea043"/>
+    <text class="mono" x="872" y="123" text-anchor="end">206/130</text>
     <text class="lbl" x="26" y="155">MIMG (Images / Samplers / BVH)</text>
     <rect x="224" y="147" width="156" height="9" rx="4.5" fill="#21262d"/>
-    <rect x="224" y="147" width="14" height="9" rx="4.5" fill="#e11d48"/>
-    <text class="mono" x="440" y="155" text-anchor="end">8/85</text>
+    <rect x="224" y="147" width="156" height="9" rx="4.5" fill="#2ea043"/>
+    <text class="mono" x="440" y="155" text-anchor="end">96/85</text>
     <text class="lbl" x="458" y="155">FLAT / GLOBAL / SCRATCH</text>
     <rect x="656" y="147" width="156" height="9" rx="4.5" fill="#21262d"/>
-    <rect x="656" y="147" width="17" height="9" rx="4.5" fill="#e11d48"/>
-    <text class="mono" x="872" y="155" text-anchor="end">8/70</text>
+    <rect x="656" y="147" width="156" height="9" rx="4.5" fill="#2ea043"/>
+    <text class="mono" x="872" y="155" text-anchor="end">138/70</text>
     <text class="lbl" x="26" y="187">DS (LDS Shared Memory)</text>
     <rect x="224" y="179" width="156" height="9" rx="4.5" fill="#21262d"/>
-    <rect x="224" y="179" width="11" height="9" rx="4.5" fill="#e11d48"/>
-    <text class="mono" x="440" y="187" text-anchor="end">5/70</text>
+    <rect x="224" y="179" width="156" height="9" rx="4.5" fill="#2ea043"/>
+    <text class="mono" x="440" y="187" text-anchor="end">124/70</text>
     <text class="lbl" x="458" y="187">MUBUF / MTBUF (Buffers)</text>
     <rect x="656" y="179" width="156" height="9" rx="4.5" fill="#21262d"/>
-    <rect x="656" y="179" width="44" height="9" rx="4.5" fill="#d29922"/>
-    <text class="mono" x="872" y="187" text-anchor="end">18/65</text>
+    <rect x="656" y="179" width="156" height="9" rx="4.5" fill="#2ea043"/>
+    <text class="mono" x="872" y="187" text-anchor="end">95/65</text>
     <text class="lbl" x="26" y="219">SMEM (Scalar Memory)</text>
     <rect x="224" y="211" width="156" height="9" rx="4.5" fill="#21262d"/>
-    <rect x="224" y="211" width="11" height="9" rx="4.5" fill="#e11d48"/>
-    <text class="mono" x="440" y="219" text-anchor="end">2/28</text>
+    <rect x="224" y="211" width="156" height="9" rx="4.5" fill="#2ea043"/>
+    <text class="mono" x="440" y="219" text-anchor="end">71/28</text>
     <text class="lbl" x="458" y="219">EXP (Shader Exports)</text>
     <rect x="656" y="211" width="156" height="9" rx="4.5" fill="#21262d"/>
     <rect x="656" y="211" width="156" height="9" rx="4.5" fill="#2ea043"/>
