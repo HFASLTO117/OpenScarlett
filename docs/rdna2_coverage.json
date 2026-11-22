@@ -28,7 +28,7 @@
   "has_vulkan_hw": true,
   "d3d12_hw_adapter": "NVIDIA GeForce GTX 1650 Ti",
   "vulkan_adapter": "NVIDIA GeForce GTX 1650 Ti",
-  "elapsed_seconds": 19.287,
+  "elapsed_seconds": 27.373,
   "families": {
     "SOP1": {"total": 58, "decoded": 58, "lifted_spirv": 58, "lifted_dxil": 58, "cpu_ref": 58, "gpu_verified": 28},
     "SOP2": {"total": 43, "decoded": 43, "lifted_spirv": 43, "lifted_dxil": 43, "cpu_ref": 43, "gpu_verified": 42},

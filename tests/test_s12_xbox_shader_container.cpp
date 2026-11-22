@@ -1029,9 +1029,14 @@ void Test6_ShaderCacheInProcDxcScaleAndSelfHeal() {
     OS_REQUIRE(exe_dxil.size() >= 32u);
     const std::vector<uint8_t>& sample_dxil = inproc_dxil.empty() ? exe_dxil : inproc_dxil;
 
-    // Isolated repo-local temp cache directory (strictly inside OPENSCARLETT_BINARY_DIR, never C:\)
-    const std::filesystem::path cache_dir =
-        std::filesystem::path(OPENSCARLETT_BINARY_DIR) / ".tmp_s12_shader_cache";
+    // Isolated portable temp cache directory next to the running executable (never hardcoded C:\ or build/)
+    wchar_t exe_buf[MAX_PATH]{};
+    const DWORD exe_len = ::GetModuleFileNameW(nullptr, exe_buf, MAX_PATH);
+    const std::filesystem::path base_dir =
+        (exe_len > 0u && exe_len < MAX_PATH)
+            ? std::filesystem::path(exe_buf).parent_path()
+            : std::filesystem::path(OPENSCARLETT_BINARY_DIR);
+    const std::filesystem::path cache_dir = base_dir / ".tmp_s12_shader_cache";
     std::error_code ec;
     std::filesystem::remove_all(cache_dir, ec);
     std::filesystem::create_directories(cache_dir, ec);

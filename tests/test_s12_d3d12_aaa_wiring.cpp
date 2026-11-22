@@ -886,9 +886,17 @@ bool CompileShaderWithDxc(
         }
     }
 
-    // Write scratch HLSL/DXIL strictly under OPENSCARLETT_BINARY_DIR on E:\ (never C:\).
-    const std::filesystem::path scratch_dir =
-        std::filesystem::path(OPENSCARLETT_BINARY_DIR) / "s12_dxc_scratch";
+    // Write scratch HLSL/DXIL next to the running test executable (portable in dist/ & strictly on E:\ during builds).
+    wchar_t exe_buf[MAX_PATH]{};
+    const DWORD exe_len = ::GetModuleFileNameW(nullptr, exe_buf, MAX_PATH);
+    std::filesystem::path base_dir =
+        (exe_len > 0u && exe_len < MAX_PATH)
+            ? std::filesystem::path(exe_buf).parent_path()
+            : std::filesystem::path(OPENSCARLETT_BINARY_DIR);
+    if (std::filesystem::exists(base_dir / L"dxc.exe")) {
+        dxc_path = (base_dir / L"dxc.exe").wstring();
+    }
+    const std::filesystem::path scratch_dir = base_dir / "s12_dxc_scratch";
     std::error_code ec;
     std::filesystem::create_directories(scratch_dir, ec);
 

@@ -7623,17 +7623,35 @@ XGameResult OPENSCARLETT_GDK_CALL XStoreCanAcquireLicenseForStoreIdAsync(
     }
     const std::string req_lo = ToLowerAsciiStr(TrimAscii(storeProductId));
     const std::string cur_sid_lo = ToLowerAsciiStr(CurrentStoreId());
+    const std::string default_sid_lo = ToLowerAsciiStr(kDefaultStoreId);
+    const auto lsa_pkg = openscarlett::ConsoleLsaPolicy::Global().GetPackageIdentity();
+    const bool lsa_is_explicit =
+        !lsa_pkg.package_name.empty() &&
+        lsa_pkg.package_name != "OpenScarlett.DefaultTitle";
     const std::string lsa_sid_lo =
-        ToLowerAsciiStr(openscarlett::ConsoleLsaPolicy::Global().GetPackageIdentity().store_id);
+        lsa_is_explicit ? ToLowerAsciiStr(lsa_pkg.store_id) : std::string();
+    const std::vector<std::string> addons = ConfiguredAddOnStoreIds();
 
     bool owned = (req_lo == cur_sid_lo) ||
                  (!lsa_sid_lo.empty() && req_lo == lsa_sid_lo);
     if (!owned) {
-        for (const auto& addon : ConfiguredAddOnStoreIds()) {
+        for (const auto& addon : addons) {
             if (ToLowerAsciiStr(addon) == req_lo) {
                 owned = true;
                 break;
             }
+        }
+    }
+    if (!owned) {
+        // When no title-specific StoreId or add-on catalog is configured (standalone offline
+        // mode without MicrosoftGame.Config StoreId), allow valid non-empty store product IDs
+        // so unpacked titles and offline tests are not blocked.
+        const bool has_explicit_catalog =
+            (cur_sid_lo != default_sid_lo) ||
+            (!lsa_sid_lo.empty() && lsa_sid_lo != default_sid_lo) ||
+            !addons.empty();
+        if (!has_explicit_catalog) {
+            owned = true;
         }
     }
 

@@ -62,7 +62,13 @@ void WriteLe32(uint8_t* p, uint32_t v) noexcept {
 
 fs::path GetRepoLocalTempDir() {
     std::error_code ec;
-    fs::path dir = fs::path(OPENSCARLETT_BINARY_DIR) / ".tmp" / "s12_streaming_vram";
+    wchar_t exe_buf[MAX_PATH]{};
+    const DWORD exe_len = ::GetModuleFileNameW(nullptr, exe_buf, MAX_PATH);
+    fs::path base_dir =
+        (exe_len > 0u && exe_len < MAX_PATH)
+            ? fs::path(exe_buf).parent_path()
+            : fs::path(OPENSCARLETT_BINARY_DIR);
+    fs::path dir = base_dir / ".tmp" / "s12_streaming_vram";
     fs::create_directories(dir, ec);
     return dir;
 }

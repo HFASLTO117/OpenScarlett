@@ -109,7 +109,7 @@
     <rect x="26" y="468" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="26" y="468" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="36" y="482">xgameruntime</text>
-    <text class="tiny" x="36" y="493">343 exports · high</text>
+    <text class="tiny" x="36" y="493">345 exports · high</text>
     <rect x="197" y="468" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="197" y="468" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="207" y="482">XSAPI.GDK.C</text>
@@ -137,15 +137,15 @@
     <rect x="368" y="506" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="368" y="506" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="378" y="520">XAudio2_9</text>
-    <text class="tiny" x="378" y="531">17 exports · high</text>
+    <text class="tiny" x="378" y="531">19 exports · high</text>
     <rect x="539" y="506" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="539" y="506" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="549" y="520">GameInput</text>
-    <text class="tiny" x="549" y="531">14 exports · high</text>
+    <text class="tiny" x="549" y="531">18 exports · high</text>
     <rect x="710" y="506" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="710" y="506" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="720" y="520">dstorage_xs</text>
-    <text class="tiny" x="720" y="531">6 exports · high</text>
+    <text class="tiny" x="720" y="531">9 exports · high</text>
     <rect x="26" y="544" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="26" y="544" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="36" y="558">d3d12_xs</text>
