@@ -736,7 +736,52 @@ OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XSystemGetAppSpecificDevi
     char* appSpecificDeviceId,
     size_t* appSpecificDeviceIdUsed);
 OPENSCARLETT_GDK_API XSystemRuntimeInfo OPENSCARLETT_GDK_CALL XSystemGetRuntimeInfo(void);
-OPENSCARLETT_GDK_API bool OPENSCARLETT_GDK_CALL XSystemIsHandleValid(void* handle);
+
+/// Opaque GDK handle.
+typedef void* XSystemHandle;
+
+/// What kind of GDK object a handle points at. Values match the Microsoft
+/// GDK `XSystem.h` enum so real GDK clients see the expected constants.
+enum XSystemHandleType : uint32_t {
+    XSystemHandleType_AppCaptureScreenshotStream = 0x00,
+    XSystemHandleType_DisplayTimeoutDeferral     = 0x01,
+    XSystemHandleType_GameSaveContainer          = 0x02,
+    XSystemHandleType_GameSaveProvider           = 0x03,
+    XSystemHandleType_GameSaveUpdate             = 0x04,
+    XSystemHandleType_PackageInstallationMonitor = 0x05,
+    XSystemHandleType_PackageMount               = 0x06,
+    XSystemHandleType_SpeechSynthesizer          = 0x07,
+    XSystemHandleType_SpeechSynthesizerStream    = 0x08,
+    XSystemHandleType_StoreContext               = 0x09,
+    XSystemHandleType_StoreLicense               = 0x0a,
+    XSystemHandleType_StoreProductQuery          = 0x0b,
+    XSystemHandleType_TaskQueue                  = 0x0c,
+    XSystemHandleType_User                       = 0x0d,
+    XSystemHandleType_UserSignOutDeferral        = 0x0e,
+    XSystemHandleType_GameUiTextEntry            = 0x0f,
+    XSystemHandleType_PFXGameSaveConfig          = 0x10,
+};
+
+/// Why a handle lifecycle callback fired.
+enum XSystemHandleCallbackReason : uint32_t {
+    XSystemHandleCallbackReason_Created   = 0x00,
+    XSystemHandleCallbackReason_Destroyed = 0x01,
+};
+
+/// Process-wide handle lifecycle observer, registered via
+/// `XSystemHandleTrack` and fired for every tracked handle.
+typedef void(OPENSCARLETT_GDK_CALL* XSystemHandleCallback)(
+    XSystemHandle handle,
+    XSystemHandleType type,
+    XSystemHandleCallbackReason reason,
+    void* context);
+
+OPENSCARLETT_GDK_API bool OPENSCARLETT_GDK_CALL XSystemIsHandleValid(XSystemHandle handle);
+/// Registers the process-wide handle lifecycle observer. Passing `nullptr`
+/// clears/disables it — the real GDK has no `XSystemHandleUntrack` export.
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XSystemHandleTrack(
+    XSystemHandleCallback callback,
+    void* context);
 
 // ---------------------------------------------------------------------------
 // XGameStreaming (local-PC compatibility surface)
@@ -2631,13 +2676,17 @@ struct IXgrSystemApiVtable {
         size_t* sandboxIdUsed);
     XSystemAnalyticsInfo(OPENSCARLETT_GDK_CALL* XSystemGetAnalyticsInfo)(void);
     XSystemRuntimeInfo(OPENSCARLETT_GDK_CALL* XSystemGetRuntimeInfo)(void);
-    bool(OPENSCARLETT_GDK_CALL* XSystemIsHandleValid)(void* handle);
+    bool(OPENSCARLETT_GDK_CALL* XSystemIsHandleValid)(XSystemHandle handle);
     // Extended System entries
     bool(OPENSCARLETT_GDK_CALL* XGameRuntimeIsFeatureAvailable)(XGameRuntimeFeature feature);
     XGameResult(OPENSCARLETT_GDK_CALL* XSystemGetAppSpecificDeviceId)(
         size_t appSpecificDeviceIdSize,
         char* appSpecificDeviceId,
         size_t* appSpecificDeviceIdUsed);
+    // Appended last so existing slot indices stay ABI-stable.
+    XGameResult(OPENSCARLETT_GDK_CALL* XSystemHandleTrack)(
+        XSystemHandleCallback callback,
+        void* context);
 };
 
 struct IXgrMemApiVtable {

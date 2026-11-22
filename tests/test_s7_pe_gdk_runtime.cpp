@@ -779,6 +779,7 @@ void TestMinecraftGdkSurface() {
     OS_REQUIRE(rt_info.runtimeVersion.major == 10u);
     OS_REQUIRE(XSystemIsHandleValid(reinterpret_cast<void*>(0x1234u)));
     OS_REQUIRE(!XSystemIsHandleValid(nullptr));
+    OS_REQUIRE(XSystemHandleTrack(nullptr, nullptr) == XGR_S_OK);
 
     void* sys_vtbl_raw = nullptr;
     OS_REQUIRE(QueryApiImpl(&XGR_API_GUID_SYSTEM, &sys_vtbl_raw) == XGR_S_OK);
@@ -816,6 +817,7 @@ void TestMinecraftGdkSurface() {
         "XSystemGetAppSpecificDeviceId",
         "XSystemGetRuntimeInfo",
         "XSystemIsHandleValid",
+        "XSystemHandleTrack",
     };
     for (const char* sym : kVerifiedXgrSyms) {
         uint64_t total = 0u, not_impl = 99u;

@@ -927,6 +927,17 @@ struct RuntimeState {
     std::unordered_map<uint64_t, uint32_t> live_reg_tokens;
     std::vector<UserChangeListenerEntry> user_change_listeners;
 
+    // XSystem handle registry (XSystemHandleTrack / XSystemIsHandleValid)
+    std::mutex handle_mutex;
+    struct TrackedHandle {
+        XSystemHandleType type = XSystemHandleType_User;
+        bool closed = false;
+    };
+    std::unordered_map<void*, TrackedHandle> tracked_handles;
+    // Process-wide lifecycle observer (2-arg XSystemHandleTrack ABI).
+    XSystemHandleCallback handle_callback = nullptr;
+    void* handle_callback_context = nullptr;
+
     // XStore handles
     std::mutex store_mutex;
     std::unordered_map<XStoreContext*, std::shared_ptr<XStoreContext>> live_store_contexts;
@@ -974,6 +985,51 @@ struct RuntimeState {
 RuntimeState& GetRuntime() {
     static RuntimeState* s = new RuntimeState();
     return *s;
+}
+
+/// Registers `handle` in the XSystem handle registry if it is not tracked yet
+/// and fires the process-wide observer with `Created` (outside the registry
+/// lock). GDK handle creation paths call this so the handle can be validated
+/// later.
+void RegisterHandleIfNeeded(void* handle, XSystemHandleType type) {
+    if (!handle) return;
+    auto& rt = GetRuntime();
+    XSystemHandleCallback cb = nullptr;
+    void* ctx = nullptr;
+    bool created = false;
+    {
+        std::lock_guard<std::mutex> lk(rt.handle_mutex);
+        auto it = rt.tracked_handles.find(handle);
+        if (it == rt.tracked_handles.end() || it->second.closed) {
+            rt.tracked_handles[handle] = RuntimeState::TrackedHandle{type, false};
+            created = true;
+        } else {
+            it->second.type = type;
+        }
+        cb = rt.handle_callback;
+        ctx = rt.handle_callback_context;
+    }
+    if (created && cb) cb(handle, type, XSystemHandleCallbackReason_Created, ctx);
+}
+
+/// Marks a tracked handle closed and fires the process-wide observer with
+/// `Destroyed` (outside the registry lock). Called from GDK handle close paths.
+void MarkHandleClosed(void* handle) {
+    if (!handle) return;
+    XSystemHandleCallback cb = nullptr;
+    void* ctx = nullptr;
+    XSystemHandleType type = XSystemHandleType_User;
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.handle_mutex);
+        auto it = rt.tracked_handles.find(handle);
+        if (it == rt.tracked_handles.end() || it->second.closed) return;
+        it->second.closed = true;
+        type = it->second.type;
+        cb = rt.handle_callback;
+        ctx = rt.handle_callback_context;
+    }
+    if (cb) cb(handle, type, XSystemHandleCallbackReason_Destroyed, ctx);
 }
 
 std::shared_ptr<XTaskQueueObject> LookupQueue(XTaskQueueHandle handle) {
@@ -1243,6 +1299,10 @@ XGameResult OPENSCARLETT_GDK_CALL UserAddProvider(
                 std::lock_guard<std::mutex> lk(rt.user_mutex);
                 rt.live_users[raw] = std::move(u);
             }
+            // Outside user_mutex: RegisterHandleIfNeeded takes handle_mutex,
+            // which must never be nested under user_mutex, and the Created
+            // callback fires outside all locks.
+            RegisterHandleIfNeeded(raw, XSystemHandleType_User);
             ctx->user = raw;
             XAsyncComplete(data->async, XGR_S_OK, sizeof(XUserHandle));
             return XGR_E_PENDING;
@@ -2898,6 +2958,7 @@ XGameResult OPENSCARLETT_GDK_CALL XTaskQueueCreate(
         std::lock_guard<std::mutex> lk(rt.mutex);
         rt.live_queues[raw] = obj;
     }
+    RegisterHandleIfNeeded(raw, XSystemHandleType_TaskQueue);
 
     StartPortWorkersIfNeeded(raw, 0);
     StartPortWorkersIfNeeded(raw, 1);
@@ -2938,6 +2999,9 @@ void OPENSCARLETT_GDK_CALL XTaskQueueCloseHandle(XTaskQueueHandle queue) {
             dropped = std::move(it->second);
             rt.live_queues.erase(it);
         }
+    }
+    if (dropped) {
+        MarkHandleClosed(queue);
     }
     if (dropped) {
         ShutdownQueueInternal(dropped.get(), true);
@@ -3700,12 +3764,19 @@ XGameResult OPENSCARLETT_GDK_CALL XUserDuplicateHandle(
 void OPENSCARLETT_GDK_CALL XUserCloseHandle(XUserHandle user) {
     RecordOk("XUserCloseHandle");
     if (!user) return;
-    auto& rt = GetRuntime();
-    std::lock_guard<std::mutex> lk(rt.user_mutex);
-    auto it = rt.live_users.find(user);
-    if (it == rt.live_users.end()) return;
-    if (it->second->ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-        rt.live_users.erase(it);
+    bool last_ref = false;
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.user_mutex);
+        auto it = rt.live_users.find(user);
+        if (it == rt.live_users.end()) return;
+        if (it->second->ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            rt.live_users.erase(it);
+            last_ref = true;
+        }
+    }
+    if (last_ref) {
+        MarkHandleClosed(user);
     }
 }
 
@@ -5203,7 +5274,31 @@ XGameResult OPENSCARLETT_GDK_CALL XSystemGetAppSpecificDeviceId(
 
 bool OPENSCARLETT_GDK_CALL XSystemIsHandleValid(void* handle) {
     RecordOk("XSystemIsHandleValid");
-    return handle != nullptr && handle != reinterpret_cast<void*>(static_cast<intptr_t>(-1));
+    if (!handle || handle == reinterpret_cast<void*>(static_cast<intptr_t>(-1))) {
+        return false;
+    }
+    // Tracked handles are valid until they are closed; untracked non-null
+    // handles stay valid (legacy behaviour relied on by existing callers).
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.handle_mutex);
+    auto it = rt.tracked_handles.find(handle);
+    if (it != rt.tracked_handles.end()) {
+        return !it->second.closed;
+    }
+    return true;
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XSystemHandleTrack(
+    XSystemHandleCallback callback,
+    void* context) {
+    // 2-argument Microsoft GDK ABI: registers the process-wide handle
+    // lifecycle observer; passing nullptr clears/disables it. There is no
+    // XSystemHandleUntrack export.
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.handle_mutex);
+    rt.handle_callback = callback;
+    rt.handle_callback_context = context;
+    return RecordHr("XSystemHandleTrack", XGR_S_OK);
 }
 
 // ===========================================================================
@@ -7418,6 +7513,7 @@ XGameResult OPENSCARLETT_GDK_CALL XStoreCreateContext(
         std::lock_guard<std::mutex> lk(rt.store_mutex);
         rt.live_store_contexts[raw] = std::move(ctx);
     }
+    RegisterHandleIfNeeded(raw, XSystemHandleType_StoreContext);
     *storeContextHandle = raw;
     return RecordHr("XStoreCreateContext", XGR_S_OK);
 }
@@ -7425,9 +7521,12 @@ XGameResult OPENSCARLETT_GDK_CALL XStoreCreateContext(
 void OPENSCARLETT_GDK_CALL XStoreCloseContextHandle(XStoreContextHandle storeContextHandle) {
     RecordOk("XStoreCloseContextHandle");
     if (!storeContextHandle) return;
-    auto& rt = GetRuntime();
-    std::lock_guard<std::mutex> lk(rt.store_mutex);
-    rt.live_store_contexts.erase(storeContextHandle);
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.store_mutex);
+        rt.live_store_contexts.erase(storeContextHandle);
+    }
+    MarkHandleClosed(storeContextHandle);
 }
 
 void OPENSCARLETT_GDK_CALL XStoreCloseLicenseHandle(XStoreLicenseHandle storeLicenseHandle) {
@@ -9589,6 +9688,8 @@ const IXgrSystemApiVtable g_system_vtable = {
     &XSystemIsHandleValid,
     &XGameRuntimeIsFeatureAvailable,
     &XSystemGetAppSpecificDeviceId,
+    // Appended last so existing slot indices stay ABI-stable.
+    &XSystemHandleTrack,
 };
 
 const IXgrMemApiVtable g_mem_vtable = {
