@@ -160,6 +160,29 @@ uint32_t EvalAlignByteB32(uint32_t hi, uint32_t lo, uint32_t byte_sel) noexcept 
     return lo_part | hi_part;
 }
 
+float RoundNearestEvenF32(float x) noexcept {
+    const float fl = std::floor(x);
+    const float diff = x - fl;
+    if (diff < 0.5f) return fl;
+    if (diff > 0.5f) return fl + 1.0f;
+    const float half_fl = fl * 0.5f;
+    return (std::floor(half_fl) == half_fl) ? fl : (fl + 1.0f);
+}
+
+uint16_t CvtSnorm16F32(float x) noexcept {
+    if (std::isnan(x)) return 0u;
+    const float c = (x >= 1.0f) ? 1.0f : ((x <= -1.0f) ? -1.0f : x);
+    const int32_t v = static_cast<int32_t>(RoundNearestEvenF32(c * 32767.0f));
+    return static_cast<uint16_t>(static_cast<int16_t>(std::clamp(v, -32767, 32767)));
+}
+
+uint16_t CvtUnorm16F32(float x) noexcept {
+    if (std::isnan(x)) return 0u;
+    const float c = (x >= 1.0f) ? 1.0f : ((x <= 0.0f) ? 0.0f : x);
+    const int32_t v = static_cast<int32_t>(RoundNearestEvenF32(c * 65535.0f));
+    return static_cast<uint16_t>(std::clamp(v, 0, 65535));
+}
+
 uint8_t EncodeF16CmpPred(Rdna2Opcode op) noexcept {
     switch (op) {
         case Rdna2Opcode::V_CMP_LT_F16:
@@ -387,6 +410,10 @@ const char* IrOpName(IrOp op) noexcept {
         case IrOp::F2I:           return "f2i";
         case IrOp::U2F:           return "u2f";
         case IrOp::F2U:           return "f2u";
+        case IrOp::CvtPkNormI16F32: return "cvt_pknorm.i16.f32";
+        case IrOp::CvtPkNormU16F32: return "cvt_pknorm.u16.f32";
+        case IrOp::CvtNormI16F16:   return "cvt_norm.i16.f16";
+        case IrOp::CvtNormU16F16:   return "cvt_norm.u16.f16";
         case IrOp::CmpEq:         return "cmp.eq";
         case IrOp::CmpNe:         return "cmp.ne";
         case IrOp::CmpLt:         return "cmp.lt";
@@ -479,6 +506,7 @@ Status BuildRdna2Ir(
         1u, out_module.threadgroup_x * out_module.threadgroup_y * out_module.threadgroup_z);
     if (stage_contract != nullptr) {
         out_module.stage_contract = *stage_contract;
+        out_module.texture_srv_format = stage_contract->texture_srv_format;
         for (const auto& entry : stage_contract->pixel_inputs) {
             if (entry.semantic_location >= out_module.input_interp_modes.size()) {
                 out_module.input_interp_modes.resize(entry.semantic_location + 1u, Rdna2InterpMode::Perspective);
@@ -521,7 +549,17 @@ Status BuildRdna2Ir(
             }
         } else if (inst.opcode == Rdna2Opcode::S_ENDPGM) {
             if (i + 1 < instructions.size()) {
-                leader_set.insert(i + 1);
+                bool has_non_pad = false;
+                for (size_t k = i + 1; k < instructions.size(); ++k) {
+                    if (instructions[k].opcode != Rdna2Opcode::S_CODE_END &&
+                        instructions[k].opcode != Rdna2Opcode::S_NOP) {
+                        has_non_pad = true;
+                        break;
+                    }
+                }
+                if (has_non_pad) {
+                    leader_set.insert(i + 1);
+                }
             }
         }
     }
@@ -968,6 +1006,24 @@ Status BuildRdna2Ir(
                 case Rdna2Opcode::S_ASHR_I32:
                     write_dst(inst.dst, emit_in_bb(IrOp::Shr, IrType::I32, {eval_operand(inst.src[0], false), eval_operand(inst.src[1], false)}));
                     break;
+                case Rdna2Opcode::S_BFE_U32:
+                case Rdna2Opcode::S_BFE_I32: {
+                    IrValueId s0 = eval_operand(inst.src[0], false);
+                    IrValueId s1 = eval_operand(inst.src[1], false);
+                    IrValueId c_m31 = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, 31u, 0.0f);
+                    IrValueId c_sh16 = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, 16u, 0.0f);
+                    IrValueId c_m7f = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, 0x7Fu, 0.0f);
+                    IrValueId off = emit_in_bb(IrOp::BitAnd, IrType::U32, {s1, c_m31});
+                    IrValueId s1_hi = emit_in_bb(IrOp::Shr, IrType::U32, {s1, c_sh16});
+                    IrValueId wid = emit_in_bb(IrOp::BitAnd, IrType::U32, {s1_hi, c_m7f});
+                    const bool is_signed = (inst.opcode == Rdna2Opcode::S_BFE_I32);
+                    IrValueId r = emit_in_bb(is_signed ? IrOp::BfeI32 : IrOp::BfeU32,
+                                             is_signed ? IrType::I32 : IrType::U32,
+                                             {s0, off, wid}, 1u);
+                    write_dst(inst.dst, r);
+                    state.scc = emit_in_bb(IrOp::CmpNe, IrType::Bool, {r, get_zero_u32()});
+                    break;
+                }
                 case Rdna2Opcode::S_MUL_I32:
                     write_dst(inst.dst, emit_in_bb(IrOp::IMul, IrType::I32, {eval_operand(inst.src[0], false), eval_operand(inst.src[1], false)}));
                     break;
@@ -1116,6 +1172,8 @@ Status BuildRdna2Ir(
                     write_dst(inst.dst, emit_in_bb(IrOp::ConstU32, IrType::I32, {}, imm, 0.0f));
                     break;
                 }
+                case Rdna2Opcode::S_VERSION:
+                    break;
                 case Rdna2Opcode::S_ADDK_I32: {
                     const uint32_t imm = static_cast<uint32_t>(static_cast<int32_t>(inst.simm16));
                     IrValueId cur = read_sgpr(static_cast<uint8_t>(inst.dst.reg_index));
@@ -1134,6 +1192,10 @@ Status BuildRdna2Ir(
                 // ----- SOPP -----
                 case Rdna2Opcode::S_NOP:
                 case Rdna2Opcode::S_WAITCNT:
+                case Rdna2Opcode::S_ICACHE_INV:
+                case Rdna2Opcode::S_TTRACEDATA:
+                case Rdna2Opcode::S_TTRACEDATA_IMM:
+                case Rdna2Opcode::S_CODE_END:
                     break;
                 case Rdna2Opcode::S_BARRIER:
                     emit_in_bb(IrOp::Barrier, IrType::Void);
@@ -1403,6 +1465,17 @@ Status BuildRdna2Ir(
                 case Rdna2Opcode::V_FRACT_F32:
                     write_dst(inst.dst, apply_clamp(emit_in_bb(IrOp::FFract, IrType::F32, {eval_operand(inst.src[0], true)}), inst.clamp));
                     break;
+                case Rdna2Opcode::V_CVT_NORM_I16_F16:
+                case Rdna2Opcode::V_CVT_NORM_U16_F16: {
+                    const uint32_t imm = static_cast<uint32_t>(inst.vop3_op_sel & 1u) |
+                                         (inst.src[0].neg ? (1u << 8) : 0u) |
+                                         (inst.src[0].abs ? (1u << 12) : 0u);
+                    const IrOp iop = (inst.opcode == Rdna2Opcode::V_CVT_NORM_I16_F16)
+                                         ? IrOp::CvtNormI16F16
+                                         : IrOp::CvtNormU16F16;
+                    write_dst(inst.dst, emit_in_bb(iop, IrType::U32, {eval_operand(inst.src[0], false)}, imm));
+                    break;
+                }
 
                 // ----- VOPC & GFX10 V_CMPX & split-range F16 compares -----
                 case Rdna2Opcode::V_CMP_LT_F32:
@@ -1668,6 +1741,17 @@ Status BuildRdna2Ir(
                     write_dst(inst.dst, emit_in_bb(IrOp::WaveReadLaneAt, t, {val, lane}));
                     break;
                 }
+                case Rdna2Opcode::V_CVT_PKNORM_I16_F32:
+                case Rdna2Opcode::V_CVT_PKNORM_U16_F32: {
+                    const IrOp iop = (inst.opcode == Rdna2Opcode::V_CVT_PKNORM_I16_F32)
+                                         ? IrOp::CvtPkNormI16F32
+                                         : IrOp::CvtPkNormU16F32;
+                    write_dst(inst.dst, emit_in_bb(iop, IrType::U32, {
+                        eval_operand(inst.src[0], true),
+                        eval_operand(inst.src[1], true),
+                    }));
+                    break;
+                }
                 case Rdna2Opcode::V_ADD3_U32: {
                     IrValueId ab = emit_in_bb(IrOp::IAdd, IrType::U32, {eval_operand(inst.src[0], false), eval_operand(inst.src[1], false)});
                     write_dst(inst.dst, emit_in_bb(IrOp::IAdd, IrType::U32, {ab, eval_operand(inst.src[2], false)}));
@@ -1893,10 +1977,13 @@ Status BuildRdna2Ir(
                     IrValueId x = read_vgpr(vaddr_base, false);
                     IrValueId y = read_vgpr(static_cast<uint8_t>(vaddr_base + 1u), false);
                     const uint8_t dmask = inst.mimg_dmask ? inst.mimg_dmask : 0xFu;
+                    const IrType load_ty = (out_module.texture_srv_format == Rdna2TextureFormat::Uint4)
+                                               ? IrType::U32
+                                               : IrType::F32;
                     uint8_t out_reg = vdata_base;
                     for (uint32_t ch = 0; ch < 4u; ++ch) {
                         if ((dmask & (1u << ch)) != 0u) {
-                            state.vgpr[out_reg++] = emit_in_bb(IrOp::ImageLoad, IrType::F32, {x, y}, ch);
+                            state.vgpr[out_reg++] = emit_in_bb(IrOp::ImageLoad, load_ty, {x, y}, ch);
                         }
                     }
                     break;
@@ -1924,11 +2011,15 @@ Status BuildRdna2Ir(
                         mip = read_vgpr(static_cast<uint8_t>(vaddr_base + 2u), false);
                     }
                     const uint8_t dmask = inst.mimg_dmask ? inst.mimg_dmask : 0xFu;
+                    const IrType load_ty = (dim != 2u && dim != 3u &&
+                                            out_module.texture_srv_format == Rdna2TextureFormat::Uint4)
+                                               ? IrType::U32
+                                               : IrType::F32;
                     uint8_t out_reg = vdata_base;
                     for (uint32_t ch = 0; ch < 4u; ++ch) {
                         if ((dmask & (1u << ch)) != 0u) {
                             const uint32_t imm = (ch & 3u) | (static_cast<uint32_t>(dim & 7u) << 4);
-                            state.vgpr[out_reg++] = emit_in_bb(IrOp::ImageLoadMip, IrType::F32, {x, y, z, mip}, imm);
+                            state.vgpr[out_reg++] = emit_in_bb(IrOp::ImageLoadMip, load_ty, {x, y, z, mip}, imm);
                         }
                     }
                     break;
@@ -2246,6 +2337,9 @@ Status BuildRdna2Ir(
                     return Status::Error(
                         StatusCode::NotImplemented,
                         std::string("Unhandled RDNA2 opcode in IR builder: ") + Rdna2OpcodeName(inst.opcode));
+            }
+            if (terminated) {
+                break;
             }
         }
 
@@ -2717,9 +2811,16 @@ Status OptimizeRdna2Ir(Rdna2IrModule& module, Rdna2IrOptStats* out_stats) {
                             get_const_u32(inst.operands[1], ub) &&
                             get_const_u32(inst.operands[2], uc)) {
                             const uint32_t off = ub & 31u;
-                            const uint32_t wid = uc & 31u;
-                            const uint32_t mask = (wid == 0u) ? 0u : ((1u << wid) - 1u);
-                            fold_to_u32((ua >> off) & mask, IrType::U32);
+                            const uint32_t wid = (inst.imm_u32 != 0u) ? (uc & 0x7Fu) : (uc & 31u);
+                            uint32_t res = 0u;
+                            if (wid == 0u) {
+                                res = 0u;
+                            } else if (off + wid < 32u) {
+                                res = (ua >> off) & ((1u << wid) - 1u);
+                            } else {
+                                res = ua >> off;
+                            }
+                            fold_to_u32(res, IrType::U32);
                         }
                         break;
                     }
@@ -2729,7 +2830,7 @@ Status OptimizeRdna2Ir(Rdna2IrModule& module, Rdna2IrOptStats* out_stats) {
                             get_const_u32(inst.operands[1], ub) &&
                             get_const_u32(inst.operands[2], uc)) {
                             const uint32_t off = ub & 31u;
-                            const uint32_t wid = uc & 31u;
+                            const uint32_t wid = (inst.imm_u32 != 0u) ? (uc & 0x7Fu) : (uc & 31u);
                             int32_t res = 0;
                             if (wid == 0u) {
                                 res = 0;
@@ -2826,6 +2927,33 @@ Status OptimizeRdna2Ir(Rdna2IrModule& module, Rdna2IrOptStats* out_stats) {
                         break;
                     case IrOp::F2U:
                         if (get_const_f32(inst.operands[0], fa)) fold_to_u32(static_cast<uint32_t>(fa), IrType::U32);
+                        break;
+                    case IrOp::CvtPkNormI16F32:
+                        if (get_const_f32(inst.operands[0], fa) && get_const_f32(inst.operands[1], fb)) {
+                            const uint32_t lo = CvtSnorm16F32(fa);
+                            const uint32_t hi = CvtSnorm16F32(fb);
+                            fold_to_u32(lo | (hi << 16), IrType::U32);
+                        }
+                        break;
+                    case IrOp::CvtPkNormU16F32:
+                        if (get_const_f32(inst.operands[0], fa) && get_const_f32(inst.operands[1], fb)) {
+                            const uint32_t lo = CvtUnorm16F32(fa);
+                            const uint32_t hi = CvtUnorm16F32(fb);
+                            fold_to_u32(lo | (hi << 16), IrType::U32);
+                        }
+                        break;
+                    case IrOp::CvtNormI16F16:
+                    case IrOp::CvtNormU16F16:
+                        if (get_const_u32(inst.operands[0], ua)) {
+                            const bool hi = (inst.imm_u32 & 1u) != 0u;
+                            float f = HalfBitsToFloat(SelectHalf16(ua, hi));
+                            if (((inst.imm_u32 >> 12) & 1u) != 0u) f = std::fabs(f);
+                            if (((inst.imm_u32 >> 8) & 1u) != 0u) f = -f;
+                            const uint16_t out16 = (inst.op == IrOp::CvtNormI16F16)
+                                                       ? CvtSnorm16F32(f)
+                                                       : CvtUnorm16F32(f);
+                            fold_to_u32(static_cast<uint32_t>(out16), IrType::U32);
+                        }
                         break;
                     case IrOp::CmpEq:
                     case IrOp::CmpNe:
@@ -2986,6 +3114,10 @@ Status OptimizeRdna2Ir(Rdna2IrModule& module, Rdna2IrOptStats* out_stats) {
         bb.instructions = std::move(kept);
     }
 
+    // Pass 3: Single-wave lockstep LDS barrier insertion for 1-wave (<= 64 threads) shaders
+    InsertSingleWaveLockstepLdsBarriers(module);
+    stats.inserted_lockstep_lds_barriers = module.inserted_lockstep_lds_barriers;
+
     for (const auto& bb : module.blocks) {
         stats.final_ops += static_cast<uint32_t>(bb.instructions.size());
     }
@@ -2995,6 +3127,197 @@ Status OptimizeRdna2Ir(Rdna2IrModule& module, Rdna2IrOptStats* out_stats) {
         *out_stats = stats;
     }
     return Status::Ok();
+}
+
+// ---------------------------------------------------------------------------
+// Single-Wave Lockstep LDS Barrier Insertion Pass
+// ---------------------------------------------------------------------------
+uint32_t InsertSingleWaveLockstepLdsBarriers(Rdna2IrModule& module) {
+    if (!module.uses_lds) return 0u;
+    if (module.stage != ShaderStage::Compute &&
+        module.stage != ShaderStage::Mesh &&
+        module.stage != ShaderStage::Amplification) {
+        return 0u;
+    }
+
+    const uint64_t total_threads =
+        static_cast<uint64_t>(module.threadgroup_x ? module.threadgroup_x : 1u) *
+        static_cast<uint64_t>(module.threadgroup_y ? module.threadgroup_y : 1u) *
+        static_cast<uint64_t>(module.threadgroup_z ? module.threadgroup_z : 1u);
+    // Console single-wave groups (<= 64 threads) execute in lockstep on AMD Wave64 hardware
+    // without requiring s_barrier, whereas 32-lane NVIDIA / 16-lane Intel / WARP GPUs split
+    // them into independent waves that race on LDS unless explicit group barriers are inserted.
+    if (total_threads <= 1u || total_threads > 64u) {
+        return 0u;
+    }
+
+    auto make_barrier = []() -> IrInstruction {
+        IrInstruction bar{};
+        bar.op = IrOp::Barrier;
+        bar.type = IrType::Void;
+        return bar;
+    };
+
+    uint32_t inserted = 0u;
+
+    // 1. Intra-block LDS hazard detection & barrier insertion
+    for (auto& bb : module.blocks) {
+        bool written = false;
+        bool read = false;
+        bool atomic_written = false;
+        std::vector<IrInstruction> rewritten;
+        rewritten.reserve(bb.instructions.size() + 4u);
+
+        for (auto& inst : bb.instructions) {
+            if (inst.op == IrOp::Barrier) {
+                written = false;
+                read = false;
+                atomic_written = false;
+            } else if (inst.op == IrOp::LdsLoad) {
+                if (written || atomic_written) {
+                    rewritten.push_back(make_barrier());
+                    ++inserted;
+                    written = false;
+                    read = false;
+                    atomic_written = false;
+                }
+                read = true;
+            } else if (inst.op == IrOp::LdsStore) {
+                if (read || atomic_written) {
+                    rewritten.push_back(make_barrier());
+                    ++inserted;
+                    written = false;
+                    read = false;
+                    atomic_written = false;
+                }
+                written = true;
+            } else if (inst.op == IrOp::LdsAtomicAdd) {
+                if (written || read) {
+                    rewritten.push_back(make_barrier());
+                    ++inserted;
+                    written = false;
+                    read = false;
+                    atomic_written = false;
+                }
+                atomic_written = true;
+            }
+            rewritten.push_back(std::move(inst));
+        }
+        bb.instructions = std::move(rewritten);
+    }
+
+    // 2. Cross-block LDS hazard propagation across CFG edges (e.g. write in bb0 -> read in bb1)
+    const size_t n = module.blocks.size();
+    if (n > 1u) {
+        struct BlockLdsSummary {
+            bool has_barrier = false;
+            uint8_t first_op = 0;  // 0=none, 1=load, 2=store, 3=atomic
+            size_t first_op_idx = 0;
+            bool out_written = false;
+            bool out_read = false;
+            bool out_atomic = false;
+        };
+        std::vector<BlockLdsSummary> sum(n);
+        for (size_t b = 0; b < n; ++b) {
+            const auto& ins = module.blocks[b].instructions;
+            bool w = false, r = false, a = false;
+            for (size_t i = 0; i < ins.size(); ++i) {
+                const IrOp op = ins[i].op;
+                if (op == IrOp::Barrier) {
+                    sum[b].has_barrier = true;
+                    w = r = a = false;
+                } else if (op == IrOp::LdsLoad) {
+                    if (!sum[b].has_barrier && sum[b].first_op == 0u) {
+                        sum[b].first_op = 1u;
+                        sum[b].first_op_idx = i;
+                    }
+                    r = true;
+                } else if (op == IrOp::LdsStore) {
+                    if (!sum[b].has_barrier && sum[b].first_op == 0u) {
+                        sum[b].first_op = 2u;
+                        sum[b].first_op_idx = i;
+                    }
+                    w = true;
+                } else if (op == IrOp::LdsAtomicAdd) {
+                    if (!sum[b].has_barrier && sum[b].first_op == 0u) {
+                        sum[b].first_op = 3u;
+                        sum[b].first_op_idx = i;
+                    }
+                    a = true;
+                }
+            }
+            sum[b].out_written = w;
+            sum[b].out_read = r;
+            sum[b].out_atomic = a;
+        }
+
+        std::vector<uint8_t> in_w(n, 0), in_r(n, 0), in_a(n, 0);
+        std::vector<uint8_t> out_w(n, 0), out_r(n, 0), out_a(n, 0);
+        for (size_t b = 0; b < n; ++b) {
+            out_w[b] = sum[b].out_written ? 1u : 0u;
+            out_r[b] = sum[b].out_read ? 1u : 0u;
+            out_a[b] = sum[b].out_atomic ? 1u : 0u;
+        }
+        bool changed = true;
+        for (size_t iter = 0; changed && iter < n * 4u; ++iter) {
+            changed = false;
+            for (size_t b = 0; b < n; ++b) {
+                uint8_t nw = 0, nr = 0, na = 0;
+                for (uint32_t p : module.blocks[b].predecessors) {
+                    if (p < n) {
+                        nw |= out_w[p];
+                        nr |= out_r[p];
+                        na |= out_a[p];
+                    }
+                }
+                if (nw != in_w[b] || nr != in_r[b] || na != in_a[b]) {
+                    in_w[b] = nw;
+                    in_r[b] = nr;
+                    in_a[b] = na;
+                    changed = true;
+                }
+                const uint8_t ew = sum[b].has_barrier ? (sum[b].out_written ? 1u : 0u) : (nw | (sum[b].out_written ? 1u : 0u));
+                const uint8_t er = sum[b].has_barrier ? (sum[b].out_read ? 1u : 0u) : (nr | (sum[b].out_read ? 1u : 0u));
+                const uint8_t ea = sum[b].has_barrier ? (sum[b].out_atomic ? 1u : 0u) : (na | (sum[b].out_atomic ? 1u : 0u));
+                if (ew != out_w[b] || er != out_r[b] || ea != out_a[b]) {
+                    out_w[b] = ew;
+                    out_r[b] = er;
+                    out_a[b] = ea;
+                    changed = true;
+                }
+            }
+        }
+
+        std::unordered_set<uint32_t> barrier_before_term_blocks;
+        for (size_t b = 0; b < n; ++b) {
+            const bool hazard =
+                (sum[b].first_op == 1u && (in_w[b] || in_a[b])) ||
+                (sum[b].first_op == 2u && (in_r[b] || in_a[b])) ||
+                (sum[b].first_op == 3u && (in_w[b] || in_r[b]));
+            if (!hazard) continue;
+
+            // If entered solely from a conditional branch, place barrier uniformly before pred's CondBranch
+            if (module.blocks[b].predecessors.size() == 1u) {
+                const uint32_t p = module.blocks[b].predecessors[0];
+                if (p < n && !module.blocks[p].instructions.empty() &&
+                    module.blocks[p].instructions.back().op == IrOp::CondBranch) {
+                    if (barrier_before_term_blocks.insert(p).second) {
+                        auto& pins = module.blocks[p].instructions;
+                        pins.insert(pins.end() - 1, make_barrier());
+                        ++inserted;
+                    }
+                    continue;
+                }
+            }
+            auto& ins = module.blocks[b].instructions;
+            ins.insert(ins.begin() + static_cast<std::ptrdiff_t>(sum[b].first_op_idx), make_barrier());
+            ++inserted;
+        }
+    }
+
+    module.inserted_lockstep_lds_barriers += inserted;
+    module.opt_stats.inserted_lockstep_lds_barriers = module.inserted_lockstep_lds_barriers;
+    return inserted;
 }
 
 std::string DumpRdna2Ir(const Rdna2IrModule& module) {
