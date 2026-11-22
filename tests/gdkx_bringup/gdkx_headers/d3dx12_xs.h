@@ -1,6 +1,10 @@
 #pragma once
 #include <d3d12_xs.h>
 
+#include <cstddef>
+#include <cstring>
+#include <vector>
+
 // Clean-room MIT D3DX12 helper subset for untouched Xbox-GDK-Samples.
 
 struct CD3DX12_DEFAULT {};
@@ -156,4 +160,106 @@ struct CD3DX12_RANGE : public D3D12_RANGE {
 template <typename T>
 inline ID3D12CommandList* const* CommandListCast(T* const* pp) noexcept {
     return reinterpret_cast<ID3D12CommandList* const*>(pp);
+}
+
+inline UINT64 GetRequiredIntermediateSize(
+    ID3D12Resource* pDestinationResource,
+    UINT FirstSubresource,
+    UINT NumSubresources) noexcept {
+    if (!pDestinationResource || NumSubresources == 0u) return 0u;
+    const D3D12_RESOURCE_DESC desc = pDestinationResource->GetDesc();
+    ID3D12Device* pDevice = nullptr;
+    if (FAILED(pDestinationResource->GetDevice(__uuidof(*pDevice), reinterpret_cast<void**>(&pDevice))) || !pDevice) {
+        return 0u;
+    }
+    UINT64 requiredSize = 0u;
+    pDevice->GetCopyableFootprints(
+        &desc, FirstSubresource, NumSubresources, 0u, nullptr, nullptr, nullptr, &requiredSize);
+    pDevice->Release();
+    return requiredSize;
+}
+
+inline UINT64 UpdateSubresources(
+    ID3D12GraphicsCommandList* pCmdList,
+    ID3D12Resource* pDestinationResource,
+    ID3D12Resource* pIntermediate,
+    UINT64 IntermediateOffset,
+    UINT FirstSubresource,
+    UINT NumSubresources,
+    const D3D12_SUBRESOURCE_DATA* pSrcData) noexcept {
+    if (!pCmdList || !pDestinationResource || !pIntermediate || !pSrcData || NumSubresources == 0u) {
+        return 0u;
+    }
+
+    const D3D12_RESOURCE_DESC dstDesc = pDestinationResource->GetDesc();
+    const D3D12_RESOURCE_DESC intermediateDesc = pIntermediate->GetDesc();
+    if (intermediateDesc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+        return 0u;
+    }
+
+    ID3D12Device* pDevice = nullptr;
+    if (FAILED(pDestinationResource->GetDevice(__uuidof(*pDevice), reinterpret_cast<void**>(&pDevice))) || !pDevice) {
+        return 0u;
+    }
+
+    std::vector<D3D12_PLACED_SUBRESOURCE_FOOTPRINT> layouts(NumSubresources);
+    std::vector<UINT> numRows(NumSubresources, 0u);
+    std::vector<UINT64> rowSizesInBytes(NumSubresources, 0u);
+    UINT64 requiredSize = 0u;
+    pDevice->GetCopyableFootprints(
+        &dstDesc, FirstSubresource, NumSubresources, IntermediateOffset,
+        layouts.data(), numRows.data(), rowSizesInBytes.data(), &requiredSize);
+    pDevice->Release();
+
+    if (requiredSize == 0u || intermediateDesc.Width < requiredSize + IntermediateOffset) {
+        return 0u;
+    }
+
+    BYTE* pData = nullptr;
+    if (FAILED(pIntermediate->Map(0u, nullptr, reinterpret_cast<void**>(&pData))) || !pData) {
+        return 0u;
+    }
+
+    for (UINT i = 0u; i < NumSubresources; ++i) {
+        if (rowSizesInBytes[i] > static_cast<UINT64>(SIZE_MAX)) {
+            pIntermediate->Unmap(0u, nullptr);
+            return 0u;
+        }
+        const UINT64 dstSlicePitch =
+            static_cast<UINT64>(layouts[i].Footprint.RowPitch) * static_cast<UINT64>(numRows[i]);
+        const auto srcRowPitch = static_cast<ptrdiff_t>(pSrcData[i].RowPitch);
+        const auto srcSlicePitch = static_cast<ptrdiff_t>(pSrcData[i].SlicePitch);
+        const auto* srcBase = static_cast<const BYTE*>(pSrcData[i].pData);
+        for (UINT z = 0u; z < layouts[i].Footprint.Depth; ++z) {
+            BYTE* dstSlice = pData + layouts[i].Offset + dstSlicePitch * static_cast<UINT64>(z);
+            const BYTE* srcSlice = srcBase + srcSlicePitch * static_cast<ptrdiff_t>(z);
+            for (UINT y = 0u; y < numRows[i]; ++y) {
+                std::memcpy(
+                    dstSlice + static_cast<UINT64>(layouts[i].Footprint.RowPitch) * static_cast<UINT64>(y),
+                    srcSlice + srcRowPitch * static_cast<ptrdiff_t>(y),
+                    static_cast<size_t>(rowSizesInBytes[i]));
+            }
+        }
+    }
+    pIntermediate->Unmap(0u, nullptr);
+
+    if (dstDesc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        pCmdList->CopyBufferRegion(
+            pDestinationResource, 0u, pIntermediate, layouts[0].Offset, layouts[0].Footprint.Width);
+    } else {
+        for (UINT i = 0u; i < NumSubresources; ++i) {
+            D3D12_TEXTURE_COPY_LOCATION dstLoc = {};
+            dstLoc.pResource = pDestinationResource;
+            dstLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+            dstLoc.SubresourceIndex = FirstSubresource + i;
+
+            D3D12_TEXTURE_COPY_LOCATION srcLoc = {};
+            srcLoc.pResource = pIntermediate;
+            srcLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+            srcLoc.PlacedFootprint = layouts[i];
+
+            pCmdList->CopyTextureRegion(&dstLoc, 0u, 0u, 0u, &srcLoc, nullptr);
+        }
+    }
+    return requiredSize;
 }

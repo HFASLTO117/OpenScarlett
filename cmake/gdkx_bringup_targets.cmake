@@ -1,5 +1,6 @@
 # OpenScarlett Real Untouched _GAMING_XBOX_SCARLETT (GDKX) Bring-Up & ABI Suite
-# Compiles 100% untouched MIT Microsoft Xbox-GDK-Samples (SimpleTriangle + SimpleLighting)
+# Compiles 100% untouched MIT Microsoft Xbox-GDK-Samples
+# (SimpleTriangle + SimpleLighting + SimpleTexture + SimpleInstancing)
 # under /D_GAMING_XBOX_SCARLETT linking ONLY OpenScarlett's shims, and verifies
 # zero raw-host escape + real rendered PNG pixels via openscarlett.exe APC injection.
 
@@ -39,11 +40,12 @@ if(WIN32 AND MSVC)
 
         function(openscarlett_compile_hlsl out_var hlsl_path cso_path profile include_dir)
             get_filename_component(_cso_dir "${cso_path}" DIRECTORY)
+            set(_extra_deps ${ARGN})
             add_custom_command(
                 OUTPUT "${cso_path}"
                 COMMAND ${CMAKE_COMMAND} -E make_directory "${_cso_dir}"
                 COMMAND "${OPENSCARLETT_DXC_EXE}" -nologo -T ${profile} -E main -I "${include_dir}" -Fo "${cso_path}" "${hlsl_path}"
-                DEPENDS "${hlsl_path}"
+                DEPENDS "${hlsl_path}" ${_extra_deps}
                 COMMENT "DXC compiling untouched GDKX shader ${hlsl_path} (${profile})"
                 VERBATIM
             )
@@ -117,14 +119,36 @@ if(WIN32 AND MSVC)
         openscarlett_add_untouched_gdkx_sample(SimpleLighting_GDKX "${_lit_dir}"
             "pch.cpp;DeviceResources.cpp;SimpleLighting.cpp;Main.cpp"
         )
-        openscarlett_compile_hlsl(_lit_vs_cso "${_lit_dir}/TriangleVS.hlsl" "${_os_gdkx_cso_root}/SimpleLighting/TriangleVS.cso" vs_6_0 "${_lit_dir}")
-        openscarlett_compile_hlsl(_lit_lambert_cso "${_lit_dir}/LambertPS.hlsl" "${_os_gdkx_cso_root}/SimpleLighting/LambertPS.cso" ps_6_0 "${_lit_dir}")
-        openscarlett_compile_hlsl(_lit_solid_cso "${_lit_dir}/SolidColorPS.hlsl" "${_os_gdkx_cso_root}/SimpleLighting/SolidColorPS.cso" ps_6_0 "${_lit_dir}")
+        openscarlett_compile_hlsl(_lit_vs_cso "${_lit_dir}/TriangleVS.hlsl" "${_os_gdkx_cso_root}/SimpleLighting/TriangleVS.cso" vs_6_0 "${_lit_dir}" "${_lit_dir}/SimpleLighting.hlsli")
+        openscarlett_compile_hlsl(_lit_lambert_cso "${_lit_dir}/LambertPS.hlsl" "${_os_gdkx_cso_root}/SimpleLighting/LambertPS.cso" ps_6_0 "${_lit_dir}" "${_lit_dir}/SimpleLighting.hlsli")
+        openscarlett_compile_hlsl(_lit_solid_cso "${_lit_dir}/SolidColorPS.hlsl" "${_os_gdkx_cso_root}/SimpleLighting/SolidColorPS.cso" ps_6_0 "${_lit_dir}" "${_lit_dir}/SimpleLighting.hlsli")
         add_custom_target(SimpleLighting_GDKX_shaders ALL DEPENDS "${_lit_vs_cso}" "${_lit_lambert_cso}" "${_lit_solid_cso}")
         add_dependencies(SimpleLighting_GDKX SimpleLighting_GDKX_shaders)
 
+        # --- Sample 3: Untouched MIT SimpleTexture ---
+        set(_tex_dir "${CMAKE_CURRENT_SOURCE_DIR}/tests/gdkx_bringup/samples/SimpleTexture")
+        openscarlett_add_untouched_gdkx_sample(SimpleTexture_GDKX "${_tex_dir}"
+            "pch.cpp;DeviceResources.cpp;SimpleTexture.cpp;Main.cpp"
+        )
+        target_link_libraries(SimpleTexture_GDKX PRIVATE ole32 windowscodecs)
+        openscarlett_compile_hlsl(_tex_vs_cso "${_tex_dir}/VertexShader.hlsl" "${_os_gdkx_cso_root}/SimpleTexture/VertexShader.cso" vs_6_0 "${_tex_dir}")
+        openscarlett_compile_hlsl(_tex_ps_cso "${_tex_dir}/PixelShader.hlsl" "${_os_gdkx_cso_root}/SimpleTexture/PixelShader.cso" ps_6_0 "${_tex_dir}")
+        add_custom_target(SimpleTexture_GDKX_shaders ALL DEPENDS "${_tex_vs_cso}" "${_tex_ps_cso}")
+        add_dependencies(SimpleTexture_GDKX SimpleTexture_GDKX_shaders)
+
+        # --- Sample 4: Untouched MIT SimpleInstancing ---
+        set(_inst_dir "${CMAKE_CURRENT_SOURCE_DIR}/tests/gdkx_bringup/samples/SimpleInstancing")
+        openscarlett_add_untouched_gdkx_sample(SimpleInstancing_GDKX "${_inst_dir}"
+            "pch.cpp;DeviceResources.cpp;SimpleInstancing.cpp;Main.cpp"
+        )
+        openscarlett_compile_hlsl(_inst_vs_cso "${_inst_dir}/VertexShader.hlsl" "${_os_gdkx_cso_root}/SimpleInstancing/VertexShader.cso" vs_6_0 "${_inst_dir}" "${_inst_dir}/SimpleInstancing.hlsli" "${_inst_dir}/Shared.h")
+        openscarlett_compile_hlsl(_inst_ps_cso "${_inst_dir}/PixelShader.hlsl" "${_os_gdkx_cso_root}/SimpleInstancing/PixelShader.cso" ps_6_0 "${_inst_dir}" "${_inst_dir}/SimpleInstancing.hlsli" "${_inst_dir}/Shared.h")
+        add_custom_target(SimpleInstancing_GDKX_shaders ALL DEPENDS "${_inst_vs_cso}" "${_inst_ps_cso}")
+        add_dependencies(SimpleInstancing_GDKX SimpleInstancing_GDKX_shaders)
+
         # --- End-to-End CTest Harness (Isolated Zero-DLL APC Run + Telemetry + PNG Pixel Check) ---
         openscarlett_add_test(test_gdkx_untouched_samples tests/test_gdkx_untouched_samples.cpp)
+        target_link_libraries(test_gdkx_untouched_samples PRIVATE ole32 windowscodecs)
         add_dependencies(test_gdkx_untouched_samples
             openscarlett
             openscarlett_hook
@@ -136,9 +160,13 @@ if(WIN32 AND MSVC)
             SimpleTriangle_GDKX_shaders
             SimpleLighting_GDKX
             SimpleLighting_GDKX_shaders
+            SimpleTexture_GDKX
+            SimpleTexture_GDKX_shaders
+            SimpleInstancing_GDKX
+            SimpleInstancing_GDKX_shaders
         )
         set_tests_properties(test_gdkx_untouched_samples PROPERTIES
-            TIMEOUT 300
+            TIMEOUT 480
         )
     else()
         message(STATUS "OpenScarlett GDKX bring-up: dxc.exe not found; skipping untouched HLSL sample builds")
