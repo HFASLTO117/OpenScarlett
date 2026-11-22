@@ -2662,4 +2662,982 @@ Status BcGenerateSyntheticSurface(
     return Status::Ok();
 }
 
+// ---------------------------------------------------------------------------
+// Public Xbox Hardware BCPack Raw Bitstream Codec (BC1..BC7)
+// Bit-level entropy layer with explicit flush bit, spatial predictors,
+// RGB565 / 8-bit delta coding, LRU endpoint & selector palettes, and CRC32.
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr uint32_t kBcPackHwMagic = 0x31484342u;  // 'BCH1' little-endian
+constexpr size_t kBcPackHwHeaderBytes = 16u;
+constexpr uint32_t kBcPackHwMaxBlocks = (kBcPackMaxDimension / 4u) * (kBcPackMaxDimension / 4u);
+
+class HwBitWriter {
+public:
+    void WriteBits(uint32_t value, uint32_t count) {
+        if (count == 0u) return;
+        const uint64_t masked =
+            (count >= 32u) ? static_cast<uint64_t>(value)
+                           : (static_cast<uint64_t>(value) & ((1ull << count) - 1ull));
+        bit_buf_ |= (masked << bit_count_);
+        bit_count_ += count;
+        while (bit_count_ >= 8u) {
+            bytes_.push_back(static_cast<uint8_t>(bit_buf_ & 0xFFu));
+            bit_buf_ >>= 8u;
+            bit_count_ -= 8u;
+        }
+    }
+
+    void WriteRice(uint32_t value, uint32_t k) {
+        const uint32_t q = value >> k;
+        if (q < 31u) {
+            if (q > 0u) {
+                WriteBits((1u << q) - 1u, q);
+            }
+            WriteBits(0u, 1u);
+            if (k > 0u) {
+                WriteBits(value, k);
+            }
+        } else {
+            // Escape: 31 ones + 0 + raw 16-bit value
+            WriteBits(0x7FFFFFFFu, 31u);
+            WriteBits(0u, 1u);
+            WriteBits(value & 0xFFFFu, 16u);
+        }
+    }
+
+    // Appends the mandatory trailing flush bit '1' and zero-pads to byte boundary.
+    void FlushWithStopBit() {
+        WriteBits(1u, 1u);
+        if (bit_count_ > 0u) {
+            bytes_.push_back(static_cast<uint8_t>(bit_buf_ & 0xFFu));
+            bit_buf_ = 0ull;
+            bit_count_ = 0u;
+        }
+    }
+
+    const std::vector<uint8_t>& Bytes() const noexcept { return bytes_; }
+
+private:
+    std::vector<uint8_t> bytes_;
+    uint64_t bit_buf_ = 0ull;
+    uint32_t bit_count_ = 0u;
+};
+
+class HwBitReader {
+public:
+    bool Init(const uint8_t* data, size_t size) noexcept {
+        if (!data || size == 0u) return false;
+        const uint8_t last = data[size - 1u];
+        if (last == 0u) {
+            // Mandatory flush bit missing!
+            return false;
+        }
+        // Find highest set bit in final byte: that bit is the flush bit.
+        uint32_t highest = 7u;
+        while (highest > 0u && ((last >> highest) & 1u) == 0u) {
+            --highest;
+        }
+        data_ = data;
+        byte_size_ = size;
+        total_bits_ = (size - 1u) * 8u + static_cast<size_t>(highest);
+        bit_pos_ = 0u;
+        return true;
+    }
+
+    bool ReadBits(uint32_t count, uint32_t& out) noexcept {
+        if (count == 0u) {
+            out = 0u;
+            return true;
+        }
+        if (count > 32u || count > total_bits_ - bit_pos_) {
+            return false;
+        }
+        uint32_t result = 0u;
+        uint32_t filled = 0u;
+        while (filled < count) {
+            const size_t byte_idx = bit_pos_ >> 3u;
+            const uint32_t bit_off = static_cast<uint32_t>(bit_pos_ & 7u);
+            const uint32_t take = std::min<uint32_t>(count - filled, 8u - bit_off);
+            const uint32_t chunk = (static_cast<uint32_t>(data_[byte_idx]) >> bit_off) & ((1u << take) - 1u);
+            result |= (chunk << filled);
+            bit_pos_ += take;
+            filled += take;
+        }
+        out = result;
+        return true;
+    }
+
+    bool ReadRice(uint32_t k, uint32_t& out) noexcept {
+        uint32_t q = 0u;
+        while (q < 31u) {
+            uint32_t bit = 0u;
+            if (!ReadBits(1u, bit)) return false;
+            if (bit == 0u) break;
+            ++q;
+        }
+        if (q == 31u) {
+            uint32_t term = 0u;
+            if (!ReadBits(1u, term) || term != 0u) return false;
+            return ReadBits(16u, out);
+        }
+        uint32_t rem = 0u;
+        if (k > 0u && !ReadBits(k, rem)) return false;
+        out = (q << k) | rem;
+        return true;
+    }
+
+    bool AtExactEnd() const noexcept { return bit_pos_ == total_bits_; }
+
+private:
+    const uint8_t* data_ = nullptr;
+    size_t byte_size_ = 0u;
+    size_t total_bits_ = 0u;
+    size_t bit_pos_ = 0u;
+};
+
+constexpr uint32_t ZigZagEncodeI32(int32_t v) noexcept {
+    return static_cast<uint32_t>((v << 1) ^ (v >> 31));
+}
+
+constexpr int32_t ZigZagDecodeU32(uint32_t u) noexcept {
+    return static_cast<int32_t>((u >> 1u) ^ (~(u & 1u) + 1u));
+}
+
+int32_t WrapSignedDelta(int32_t cur, int32_t pred, int32_t modulus) noexcept {
+    int32_t d = (cur - pred) % modulus;
+    if (d > modulus / 2) d -= modulus;
+    if (d <= -modulus / 2) d += modulus;
+    return d;
+}
+
+template <typename T, size_t N>
+class HwLruCache {
+public:
+    HwLruCache() { entries_.fill(T{}); }
+
+    int Find(const T& val) const noexcept {
+        for (size_t i = 0u; i < count_; ++i) {
+            if (entries_[i] == val) return static_cast<int>(i);
+        }
+        return -1;
+    }
+
+    bool Get(size_t idx, T& out) const noexcept {
+        if (idx >= count_) return false;
+        out = entries_[idx];
+        return true;
+    }
+
+    void PushOrPromote(const T& val) noexcept {
+        const int pos = Find(val);
+        if (pos == 0) return;
+        size_t limit = (pos > 0) ? static_cast<size_t>(pos) : std::min(count_, N - 1u);
+        for (size_t i = limit; i > 0u; --i) {
+            entries_[i] = entries_[i - 1u];
+        }
+        entries_[0] = val;
+        if (pos < 0 && count_ < N) {
+            ++count_;
+        }
+    }
+
+private:
+    std::array<T, N> entries_{};
+    size_t count_ = 0u;
+};
+
+struct Bc1ColorState {
+    HwLruCache<uint32_t, 8u> ep_cache;
+    HwLruCache<uint32_t, 16u> sel_cache;
+
+    static void Encode(
+        HwBitWriter& bw,
+        const uint8_t* blk,
+        const uint8_t* pred,
+        Bc1ColorState& st) {
+        const uint32_t ep_cur = ReadLe32(blk);
+        const uint32_t ep_pred = pred ? ReadLe32(pred) : 0u;
+        if (ep_cur == ep_pred) {
+            bw.WriteBits(0u, 2u);
+        } else {
+            const int hit = st.ep_cache.Find(ep_cur);
+            if (hit >= 0) {
+                bw.WriteBits(1u, 2u);
+                bw.WriteBits(static_cast<uint32_t>(hit), 3u);
+            } else {
+                // Compare RGB565 signed delta cost vs raw 32-bit endpoints.
+                const uint16_t c0 = static_cast<uint16_t>(ep_cur & 0xFFFFu);
+                const uint16_t c1 = static_cast<uint16_t>((ep_cur >> 16u) & 0xFFFFu);
+                const uint16_t p0 = static_cast<uint16_t>(ep_pred & 0xFFFFu);
+                const uint16_t p1 = static_cast<uint16_t>((ep_pred >> 16u) & 0xFFFFu);
+                const int32_t dr0 = WrapSignedDelta((c0 >> 11u) & 31, (p0 >> 11u) & 31, 32);
+                const int32_t dg0 = WrapSignedDelta((c0 >> 5u) & 63, (p0 >> 5u) & 63, 64);
+                const int32_t db0 = WrapSignedDelta(c0 & 31, p0 & 31, 32);
+                const int32_t dr1 = WrapSignedDelta((c1 >> 11u) & 31, (p1 >> 11u) & 31, 32);
+                const int32_t dg1 = WrapSignedDelta((c1 >> 5u) & 63, (p1 >> 5u) & 63, 64);
+                const int32_t db1 = WrapSignedDelta(c1 & 31, p1 & 31, 32);
+                const uint32_t mag =
+                    ZigZagEncodeI32(dr0) + ZigZagEncodeI32(dg0) + ZigZagEncodeI32(db0) +
+                    ZigZagEncodeI32(dr1) + ZigZagEncodeI32(dg1) + ZigZagEncodeI32(db1);
+                if (mag < 28u) {
+                    bw.WriteBits(2u, 2u);
+                    bw.WriteRice(ZigZagEncodeI32(dr0), 1u);
+                    bw.WriteRice(ZigZagEncodeI32(dg0), 1u);
+                    bw.WriteRice(ZigZagEncodeI32(db0), 1u);
+                    bw.WriteRice(ZigZagEncodeI32(dr1), 1u);
+                    bw.WriteRice(ZigZagEncodeI32(dg1), 1u);
+                    bw.WriteRice(ZigZagEncodeI32(db1), 1u);
+                } else {
+                    bw.WriteBits(3u, 2u);
+                    bw.WriteBits(ep_cur, 32u);
+                }
+            }
+        }
+        st.ep_cache.PushOrPromote(ep_cur);
+
+        const uint32_t sel_cur = ReadLe32(blk + 4u);
+        const uint32_t sel_pred = pred ? ReadLe32(pred + 4u) : 0u;
+        if (sel_cur == sel_pred) {
+            bw.WriteBits(0u, 2u);
+        } else {
+            const int hit = st.sel_cache.Find(sel_cur);
+            if (hit >= 0) {
+                bw.WriteBits(1u, 2u);
+                bw.WriteBits(static_cast<uint32_t>(hit), 4u);
+            } else {
+                const uint32_t x = sel_cur ^ sel_pred;
+                uint32_t mask = 0u;
+                uint32_t nz = 0u;
+                for (uint32_t n = 0u; n < 8u; ++n) {
+                    if (((x >> (n * 4u)) & 0xFu) != 0u) {
+                        mask |= (1u << n);
+                        ++nz;
+                    }
+                }
+                if (nz <= 5u) {
+                    bw.WriteBits(2u, 2u);
+                    bw.WriteBits(mask, 8u);
+                    for (uint32_t n = 0u; n < 8u; ++n) {
+                        if ((mask & (1u << n)) != 0u) {
+                            bw.WriteBits((x >> (n * 4u)) & 0xFu, 4u);
+                        }
+                    }
+                } else {
+                    bw.WriteBits(3u, 2u);
+                    bw.WriteBits(sel_cur, 32u);
+                }
+            }
+        }
+        st.sel_cache.PushOrPromote(sel_cur);
+    }
+
+    static bool Decode(
+        HwBitReader& br,
+        uint8_t* out_blk,
+        const uint8_t* pred,
+        Bc1ColorState& st) noexcept {
+        const uint32_t ep_pred = pred ? ReadLe32(pred) : 0u;
+        uint32_t ep_mode = 0u;
+        if (!br.ReadBits(2u, ep_mode)) return false;
+        uint32_t ep_cur = ep_pred;
+        if (ep_mode == 1u) {
+            uint32_t idx = 0u;
+            if (!br.ReadBits(3u, idx) || !st.ep_cache.Get(idx, ep_cur)) return false;
+        } else if (ep_mode == 2u) {
+            uint32_t u[6]{};
+            for (size_t i = 0u; i < 6u; ++i) {
+                if (!br.ReadRice(1u, u[i])) return false;
+            }
+            const uint16_t p0 = static_cast<uint16_t>(ep_pred & 0xFFFFu);
+            const uint16_t p1 = static_cast<uint16_t>((ep_pred >> 16u) & 0xFFFFu);
+            const uint32_t r0 = static_cast<uint32_t>((((p0 >> 11u) & 31) + ZigZagDecodeU32(u[0])) & 31);
+            const uint32_t g0 = static_cast<uint32_t>((((p0 >> 5u) & 63) + ZigZagDecodeU32(u[1])) & 63);
+            const uint32_t b0 = static_cast<uint32_t>(((p0 & 31) + ZigZagDecodeU32(u[2])) & 31);
+            const uint32_t r1 = static_cast<uint32_t>((((p1 >> 11u) & 31) + ZigZagDecodeU32(u[3])) & 31);
+            const uint32_t g1 = static_cast<uint32_t>((((p1 >> 5u) & 63) + ZigZagDecodeU32(u[4])) & 63);
+            const uint32_t b1 = static_cast<uint32_t>(((p1 & 31) + ZigZagDecodeU32(u[5])) & 31);
+            const uint16_t c0 = static_cast<uint16_t>((r0 << 11u) | (g0 << 5u) | b0);
+            const uint16_t c1 = static_cast<uint16_t>((r1 << 11u) | (g1 << 5u) | b1);
+            ep_cur = static_cast<uint32_t>(c0) | (static_cast<uint32_t>(c1) << 16u);
+        } else if (ep_mode == 3u) {
+            if (!br.ReadBits(32u, ep_cur)) return false;
+        }
+        st.ep_cache.PushOrPromote(ep_cur);
+
+        const uint32_t sel_pred = pred ? ReadLe32(pred + 4u) : 0u;
+        uint32_t sel_mode = 0u;
+        if (!br.ReadBits(2u, sel_mode)) return false;
+        uint32_t sel_cur = sel_pred;
+        if (sel_mode == 1u) {
+            uint32_t idx = 0u;
+            if (!br.ReadBits(4u, idx) || !st.sel_cache.Get(idx, sel_cur)) return false;
+        } else if (sel_mode == 2u) {
+            uint32_t mask = 0u;
+            if (!br.ReadBits(8u, mask)) return false;
+            uint32_t x = 0u;
+            for (uint32_t n = 0u; n < 8u; ++n) {
+                if ((mask & (1u << n)) != 0u) {
+                    uint32_t nib = 0u;
+                    if (!br.ReadBits(4u, nib)) return false;
+                    x |= (nib << (n * 4u));
+                }
+            }
+            sel_cur = sel_pred ^ x;
+        } else if (sel_mode == 3u) {
+            if (!br.ReadBits(32u, sel_cur)) return false;
+        }
+        st.sel_cache.PushOrPromote(sel_cur);
+
+        out_blk[0] = static_cast<uint8_t>(ep_cur & 0xFFu);
+        out_blk[1] = static_cast<uint8_t>((ep_cur >> 8u) & 0xFFu);
+        out_blk[2] = static_cast<uint8_t>((ep_cur >> 16u) & 0xFFu);
+        out_blk[3] = static_cast<uint8_t>((ep_cur >> 24u) & 0xFFu);
+        out_blk[4] = static_cast<uint8_t>(sel_cur & 0xFFu);
+        out_blk[5] = static_cast<uint8_t>((sel_cur >> 8u) & 0xFFu);
+        out_blk[6] = static_cast<uint8_t>((sel_cur >> 16u) & 0xFFu);
+        out_blk[7] = static_cast<uint8_t>((sel_cur >> 24u) & 0xFFu);
+        return true;
+    }
+};
+
+struct Bc4ChannelState {
+    HwLruCache<uint16_t, 8u> ep_cache;
+    HwLruCache<uint64_t, 16u> idx_cache;
+
+    static uint64_t Read48(const uint8_t* p) noexcept {
+        uint64_t v = 0ull;
+        for (size_t i = 0u; i < 6u; ++i) {
+            v |= (static_cast<uint64_t>(p[i]) << (i * 8u));
+        }
+        return v;
+    }
+
+    static void Write48(uint8_t* p, uint64_t v) noexcept {
+        for (size_t i = 0u; i < 6u; ++i) {
+            p[i] = static_cast<uint8_t>((v >> (i * 8u)) & 0xFFu);
+        }
+    }
+
+    static void Encode(
+        HwBitWriter& bw,
+        const uint8_t* blk,
+        const uint8_t* pred,
+        Bc4ChannelState& st) {
+        const uint16_t ep_cur = ReadLe16(blk);
+        const uint16_t ep_pred = pred ? ReadLe16(pred) : 0u;
+        if (ep_cur == ep_pred) {
+            bw.WriteBits(0u, 2u);
+        } else {
+            const int hit = st.ep_cache.Find(ep_cur);
+            if (hit >= 0) {
+                bw.WriteBits(1u, 2u);
+                bw.WriteBits(static_cast<uint32_t>(hit), 3u);
+            } else {
+                const int32_t d0 = WrapSignedDelta(blk[0], pred ? pred[0] : 0, 256);
+                const int32_t d1 = WrapSignedDelta(blk[1], pred ? pred[1] : 0, 256);
+                if (ZigZagEncodeI32(d0) + ZigZagEncodeI32(d1) < 24u) {
+                    bw.WriteBits(2u, 2u);
+                    bw.WriteRice(ZigZagEncodeI32(d0), 2u);
+                    bw.WriteRice(ZigZagEncodeI32(d1), 2u);
+                } else {
+                    bw.WriteBits(3u, 2u);
+                    bw.WriteBits(ep_cur, 16u);
+                }
+            }
+        }
+        st.ep_cache.PushOrPromote(ep_cur);
+
+        const uint64_t idx_cur = Read48(blk + 2u);
+        const uint64_t idx_pred = pred ? Read48(pred + 2u) : 0ull;
+        if (idx_cur == idx_pred) {
+            bw.WriteBits(0u, 2u);
+        } else {
+            const int hit = st.idx_cache.Find(idx_cur);
+            if (hit >= 0) {
+                bw.WriteBits(1u, 2u);
+                bw.WriteBits(static_cast<uint32_t>(hit), 4u);
+            } else {
+                uint32_t delta_bits = 0u;
+                std::array<uint32_t, 6> zz{};
+                for (uint32_t i = 0u; i < 6u; ++i) {
+                    const int32_t p = pred ? static_cast<int32_t>(pred[2u + i]) : 0;
+                    const int32_t d = WrapSignedDelta(static_cast<int32_t>(blk[2u + i]), p, 256);
+                    zz[i] = ZigZagEncodeI32(d);
+                    const uint32_t q = zz[i] >> 2u;
+                    delta_bits += (q < 31u) ? (q + 1u + 2u) : (32u + 16u);
+                }
+                if (delta_bits < 48u) {
+                    bw.WriteBits(2u, 2u);
+                    for (uint32_t i = 0u; i < 6u; ++i) {
+                        bw.WriteRice(zz[i], 2u);
+                    }
+                } else {
+                    bw.WriteBits(3u, 2u);
+                    bw.WriteBits(static_cast<uint32_t>(idx_cur & 0xFFFFFFFFull), 32u);
+                    bw.WriteBits(static_cast<uint32_t>((idx_cur >> 32u) & 0xFFFFull), 16u);
+                }
+            }
+        }
+        st.idx_cache.PushOrPromote(idx_cur);
+    }
+
+    static bool Decode(
+        HwBitReader& br,
+        uint8_t* out_blk,
+        const uint8_t* pred,
+        Bc4ChannelState& st) noexcept {
+        const uint16_t ep_pred = pred ? ReadLe16(pred) : 0u;
+        uint32_t ep_mode = 0u;
+        if (!br.ReadBits(2u, ep_mode)) return false;
+        uint16_t ep_cur = ep_pred;
+        if (ep_mode == 1u) {
+            uint32_t idx = 0u;
+            if (!br.ReadBits(3u, idx) || !st.ep_cache.Get(idx, ep_cur)) return false;
+        } else if (ep_mode == 2u) {
+            uint32_t u0 = 0u, u1 = 0u;
+            if (!br.ReadRice(2u, u0) || !br.ReadRice(2u, u1)) return false;
+            const uint8_t b0 = static_cast<uint8_t>(((pred ? pred[0] : 0) + ZigZagDecodeU32(u0)) & 0xFF);
+            const uint8_t b1 = static_cast<uint8_t>(((pred ? pred[1] : 0) + ZigZagDecodeU32(u1)) & 0xFF);
+            ep_cur = static_cast<uint16_t>(b0) | static_cast<uint16_t>(static_cast<uint16_t>(b1) << 8u);
+        } else if (ep_mode == 3u) {
+            uint32_t raw = 0u;
+            if (!br.ReadBits(16u, raw)) return false;
+            ep_cur = static_cast<uint16_t>(raw);
+        }
+        st.ep_cache.PushOrPromote(ep_cur);
+
+        const uint64_t idx_pred = pred ? Read48(pred + 2u) : 0ull;
+        uint32_t idx_mode = 0u;
+        if (!br.ReadBits(2u, idx_mode)) return false;
+        uint64_t idx_cur = idx_pred;
+        if (idx_mode == 1u) {
+            uint32_t idx = 0u;
+            if (!br.ReadBits(4u, idx) || !st.idx_cache.Get(idx, idx_cur)) return false;
+        } else if (idx_mode == 2u) {
+            uint8_t dec[6]{};
+            for (uint32_t i = 0u; i < 6u; ++i) {
+                uint32_t u = 0u;
+                if (!br.ReadRice(2u, u)) return false;
+                const int32_t p = pred ? static_cast<int32_t>(pred[2u + i]) : 0;
+                dec[i] = static_cast<uint8_t>((p + ZigZagDecodeU32(u)) & 0xFF);
+            }
+            idx_cur = Read48(dec);
+        } else if (idx_mode == 3u) {
+            uint32_t lo = 0u, hi = 0u;
+            if (!br.ReadBits(32u, lo) || !br.ReadBits(16u, hi)) return false;
+            idx_cur = static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32u);
+        }
+        st.idx_cache.PushOrPromote(idx_cur);
+
+        WriteLe16(out_blk, ep_cur);
+        Write48(out_blk + 2u, idx_cur);
+        return true;
+    }
+};
+
+struct Bc67State {
+    HwLruCache<uint8_t, 4u> mode_cache;
+    HwLruCache<std::array<uint8_t, 11>, 8u> ep_cache;
+    HwLruCache<uint32_t, 16u> sel_cache;
+
+    static void Encode(
+        HwBitWriter& bw,
+        const uint8_t* blk,
+        const uint8_t* pred,
+        Bc67State& st) {
+        // 1. Mode header byte (BC6H 2/5-bit mode prefix or BC7 unary mode prefix).
+        const uint8_t m_cur = blk[0];
+        const uint8_t m_pred = pred ? pred[0] : 0u;
+        if (m_cur == m_pred) {
+            bw.WriteBits(0u, 2u);
+        } else {
+            const int hit = st.mode_cache.Find(m_cur);
+            if (hit >= 0) {
+                bw.WriteBits(1u, 2u);
+                bw.WriteBits(static_cast<uint32_t>(hit), 2u);
+            } else {
+                bw.WriteBits(3u, 2u);
+                bw.WriteBits(m_cur, 8u);
+            }
+        }
+        st.mode_cache.PushOrPromote(m_cur);
+
+        // 2. Partition/Rotation/Endpoint payload (11 bytes).
+        std::array<uint8_t, 11> ep_cur{};
+        std::array<uint8_t, 11> ep_pred{};
+        std::memcpy(ep_cur.data(), blk + 1u, 11u);
+        if (pred) std::memcpy(ep_pred.data(), pred + 1u, 11u);
+
+        if (ep_cur == ep_pred) {
+            bw.WriteBits(0u, 2u);
+        } else {
+            const int hit = st.ep_cache.Find(ep_cur);
+            if (hit >= 0) {
+                bw.WriteBits(1u, 2u);
+                bw.WriteBits(static_cast<uint32_t>(hit), 3u);
+            } else {
+                uint32_t mask = 0u;
+                uint32_t small_sum = 0u;
+                uint32_t nz = 0u;
+                for (uint32_t i = 0u; i < 11u; ++i) {
+                    if (ep_cur[i] != ep_pred[i]) {
+                        mask |= (1u << i);
+                        ++nz;
+                        const int32_t d = WrapSignedDelta(ep_cur[i], ep_pred[i], 256);
+                        small_sum += ZigZagEncodeI32(d);
+                    }
+                }
+                if (nz <= 7u || small_sum < 90u) {
+                    bw.WriteBits(2u, 2u);
+                    bw.WriteBits(mask, 11u);
+                    for (uint32_t i = 0u; i < 11u; ++i) {
+                        if ((mask & (1u << i)) != 0u) {
+                            const int32_t d = WrapSignedDelta(ep_cur[i], ep_pred[i], 256);
+                            bw.WriteRice(ZigZagEncodeI32(d), 3u);
+                        }
+                    }
+                } else {
+                    bw.WriteBits(3u, 2u);
+                    for (uint32_t i = 0u; i < 11u; ++i) {
+                        bw.WriteBits(ep_cur[i], 8u);
+                    }
+                }
+            }
+        }
+        st.ep_cache.PushOrPromote(ep_cur);
+
+        // 3. Selector index word (32-bit).
+        const uint32_t sel_cur = ReadLe32(blk + 12u);
+        const uint32_t sel_pred = pred ? ReadLe32(pred + 12u) : 0u;
+        if (sel_cur == sel_pred) {
+            bw.WriteBits(0u, 2u);
+        } else {
+            const int hit = st.sel_cache.Find(sel_cur);
+            if (hit >= 0) {
+                bw.WriteBits(1u, 2u);
+                bw.WriteBits(static_cast<uint32_t>(hit), 4u);
+            } else {
+                const uint32_t x = sel_cur ^ sel_pred;
+                uint32_t mask = 0u;
+                uint32_t nz = 0u;
+                for (uint32_t i = 0u; i < 4u; ++i) {
+                    if (((x >> (i * 8u)) & 0xFFu) != 0u) {
+                        mask |= (1u << i);
+                        ++nz;
+                    }
+                }
+                if (nz <= 2u) {
+                    bw.WriteBits(2u, 2u);
+                    bw.WriteBits(mask, 4u);
+                    for (uint32_t i = 0u; i < 4u; ++i) {
+                        if ((mask & (1u << i)) != 0u) {
+                            bw.WriteBits((x >> (i * 8u)) & 0xFFu, 8u);
+                        }
+                    }
+                } else {
+                    bw.WriteBits(3u, 2u);
+                    bw.WriteBits(sel_cur, 32u);
+                }
+            }
+        }
+        st.sel_cache.PushOrPromote(sel_cur);
+    }
+
+    static bool Decode(
+        HwBitReader& br,
+        uint8_t* out_blk,
+        const uint8_t* pred,
+        Bc67State& st) noexcept {
+        const uint8_t m_pred = pred ? pred[0] : 0u;
+        uint32_t m_mode = 0u;
+        if (!br.ReadBits(2u, m_mode)) return false;
+        uint8_t m_cur = m_pred;
+        if (m_mode == 1u) {
+            uint32_t idx = 0u;
+            if (!br.ReadBits(2u, idx) || !st.mode_cache.Get(idx, m_cur)) return false;
+        } else if (m_mode == 2u) {
+            return false;
+        } else if (m_mode == 3u) {
+            uint32_t raw = 0u;
+            if (!br.ReadBits(8u, raw)) return false;
+            m_cur = static_cast<uint8_t>(raw);
+        }
+        st.mode_cache.PushOrPromote(m_cur);
+        out_blk[0] = m_cur;
+
+        std::array<uint8_t, 11> ep_pred{};
+        if (pred) std::memcpy(ep_pred.data(), pred + 1u, 11u);
+        std::array<uint8_t, 11> ep_cur = ep_pred;
+        uint32_t ep_mode = 0u;
+        if (!br.ReadBits(2u, ep_mode)) return false;
+        if (ep_mode == 1u) {
+            uint32_t idx = 0u;
+            if (!br.ReadBits(3u, idx) || !st.ep_cache.Get(idx, ep_cur)) return false;
+        } else if (ep_mode == 2u) {
+            uint32_t mask = 0u;
+            if (!br.ReadBits(11u, mask)) return false;
+            for (uint32_t i = 0u; i < 11u; ++i) {
+                if ((mask & (1u << i)) != 0u) {
+                    uint32_t u = 0u;
+                    if (!br.ReadRice(3u, u)) return false;
+                    ep_cur[i] = static_cast<uint8_t>((static_cast<int32_t>(ep_pred[i]) + ZigZagDecodeU32(u)) & 0xFF);
+                }
+            }
+        } else if (ep_mode == 3u) {
+            for (uint32_t i = 0u; i < 11u; ++i) {
+                uint32_t raw = 0u;
+                if (!br.ReadBits(8u, raw)) return false;
+                ep_cur[i] = static_cast<uint8_t>(raw);
+            }
+        }
+        st.ep_cache.PushOrPromote(ep_cur);
+        std::memcpy(out_blk + 1u, ep_cur.data(), 11u);
+
+        const uint32_t sel_pred = pred ? ReadLe32(pred + 12u) : 0u;
+        uint32_t sel_mode = 0u;
+        if (!br.ReadBits(2u, sel_mode)) return false;
+        uint32_t sel_cur = sel_pred;
+        if (sel_mode == 1u) {
+            uint32_t idx = 0u;
+            if (!br.ReadBits(4u, idx) || !st.sel_cache.Get(idx, sel_cur)) return false;
+        } else if (sel_mode == 2u) {
+            uint32_t mask = 0u;
+            if (!br.ReadBits(4u, mask)) return false;
+            uint32_t x = 0u;
+            for (uint32_t i = 0u; i < 4u; ++i) {
+                if ((mask & (1u << i)) != 0u) {
+                    uint32_t b = 0u;
+                    if (!br.ReadBits(8u, b)) return false;
+                    x |= (b << (i * 8u));
+                }
+            }
+            sel_cur = sel_pred ^ x;
+        } else if (sel_mode == 3u) {
+            if (!br.ReadBits(32u, sel_cur)) return false;
+        }
+        st.sel_cache.PushOrPromote(sel_cur);
+        out_blk[12] = static_cast<uint8_t>(sel_cur & 0xFFu);
+        out_blk[13] = static_cast<uint8_t>((sel_cur >> 8u) & 0xFFu);
+        out_blk[14] = static_cast<uint8_t>((sel_cur >> 16u) & 0xFFu);
+        out_blk[15] = static_cast<uint8_t>((sel_cur >> 24u) & 0xFFu);
+        return true;
+    }
+};
+
+void EncodeBc2Alpha(HwBitWriter& bw, const uint8_t* blk, const uint8_t* pred) {
+    if (pred && std::memcmp(blk, pred, 8u) == 0) {
+        bw.WriteBits(0u, 2u);
+        return;
+    }
+    const uint8_t nib0 = blk[0] & 0x0Fu;
+    const uint8_t rep = static_cast<uint8_t>(nib0 | (nib0 << 4u));
+    bool is_const = true;
+    for (size_t i = 0u; i < 8u; ++i) {
+        if (blk[i] != rep) {
+            is_const = false;
+            break;
+        }
+    }
+    if (is_const) {
+        bw.WriteBits(1u, 2u);
+        bw.WriteBits(nib0, 4u);
+        return;
+    }
+    // Nibble-level spatial delta coding (2-bit mode=2: 16-bit changed-nibble mask + 4-bit signed delta).
+    uint32_t nib_mask = 0u;
+    uint32_t changed_nibs = 0u;
+    for (uint32_t i = 0u; i < 8u; ++i) {
+        const uint8_t p = pred ? pred[i] : 0u;
+        if ((blk[i] & 0x0Fu) != (p & 0x0Fu)) {
+            nib_mask |= (1u << (i * 2u));
+            ++changed_nibs;
+        }
+        if (((blk[i] >> 4u) & 0x0Fu) != ((p >> 4u) & 0x0Fu)) {
+            nib_mask |= (1u << (i * 2u + 1u));
+            ++changed_nibs;
+        }
+    }
+    if (changed_nibs <= 10u) {
+        bw.WriteBits(2u, 2u);
+        bw.WriteBits(nib_mask, 16u);
+        for (uint32_t i = 0u; i < 8u; ++i) {
+            const uint8_t p = pred ? pred[i] : 0u;
+            if ((nib_mask & (1u << (i * 2u))) != 0u) {
+                bw.WriteBits((blk[i] - p) & 0x0Fu, 4u);
+            }
+            if ((nib_mask & (1u << (i * 2u + 1u))) != 0u) {
+                bw.WriteBits(((blk[i] >> 4u) - (p >> 4u)) & 0x0Fu, 4u);
+            }
+        }
+    } else {
+        bw.WriteBits(3u, 2u);
+        bw.WriteBits(ReadLe32(blk), 32u);
+        bw.WriteBits(ReadLe32(blk + 4u), 32u);
+    }
+}
+
+bool DecodeBc2Alpha(HwBitReader& br, uint8_t* out_blk, const uint8_t* pred) noexcept {
+    uint32_t mode = 0u;
+    if (!br.ReadBits(2u, mode)) return false;
+    if (mode == 0u) {
+        if (pred) std::memcpy(out_blk, pred, 8u);
+        else std::memset(out_blk, 0, 8u);
+        return true;
+    }
+    if (mode == 1u) {
+        uint32_t nib = 0u;
+        if (!br.ReadBits(4u, nib)) return false;
+        const uint8_t rep = static_cast<uint8_t>((nib & 0x0Fu) | ((nib & 0x0Fu) << 4u));
+        std::memset(out_blk, rep, 8u);
+        return true;
+    }
+    if (mode == 2u) {
+        uint32_t nib_mask = 0u;
+        if (!br.ReadBits(16u, nib_mask)) return false;
+        for (uint32_t i = 0u; i < 8u; ++i) {
+            const uint8_t p = pred ? pred[i] : 0u;
+            uint32_t lo = p & 0x0Fu;
+            uint32_t hi = (p >> 4u) & 0x0Fu;
+            if ((nib_mask & (1u << (i * 2u))) != 0u) {
+                uint32_t d = 0u;
+                if (!br.ReadBits(4u, d)) return false;
+                lo = (lo + d) & 0x0Fu;
+            }
+            if ((nib_mask & (1u << (i * 2u + 1u))) != 0u) {
+                uint32_t d = 0u;
+                if (!br.ReadBits(4u, d)) return false;
+                hi = (hi + d) & 0x0Fu;
+            }
+            out_blk[i] = static_cast<uint8_t>(lo | (hi << 4u));
+        }
+        return true;
+    }
+    uint32_t lo = 0u, hi = 0u;
+    if (!br.ReadBits(32u, lo) || !br.ReadBits(32u, hi)) return false;
+    out_blk[0] = static_cast<uint8_t>(lo & 0xFFu);
+    out_blk[1] = static_cast<uint8_t>((lo >> 8u) & 0xFFu);
+    out_blk[2] = static_cast<uint8_t>((lo >> 16u) & 0xFFu);
+    out_blk[3] = static_cast<uint8_t>((lo >> 24u) & 0xFFu);
+    out_blk[4] = static_cast<uint8_t>(hi & 0xFFu);
+    out_blk[5] = static_cast<uint8_t>((hi >> 8u) & 0xFFu);
+    out_blk[6] = static_cast<uint8_t>((hi >> 16u) & 0xFFu);
+    out_blk[7] = static_cast<uint8_t>((hi >> 24u) & 0xFFu);
+    return true;
+}
+
+}  // namespace
+
+bool BcPackHwIsValidBitstreamHeader(
+    BcFormat expected_format,
+    const uint8_t* src_bitstream,
+    size_t src_size,
+    uint32_t* out_block_count) noexcept {
+    if (out_block_count) *out_block_count = 0u;
+    const uint32_t block_bytes = BcFormatBlockBytes(expected_format);
+    if (block_bytes == 0u || !src_bitstream || src_size < kBcPackHwHeaderBytes + 1u) {
+        return false;
+    }
+    if (ReadLe32(src_bitstream + 0u) != kBcPackHwMagic) {
+        return false;
+    }
+    const BcFormat stream_fmt = static_cast<BcFormat>(src_bitstream[4u]);
+    const uint8_t flags = src_bitstream[5u];
+    const uint16_t tile_w = ReadLe16(src_bitstream + 6u);
+    const uint32_t block_count = ReadLe32(src_bitstream + 8u);
+    if (stream_fmt != expected_format || flags != 0u || tile_w == 0u ||
+        block_count == 0u || block_count > kBcPackHwMaxBlocks) {
+        return false;
+    }
+    if (out_block_count) *out_block_count = block_count;
+    return true;
+}
+
+Status BcPackHwEncodeBitstream(
+    BcFormat format,
+    const uint8_t* src_blocks,
+    size_t src_size,
+    std::vector<uint8_t>& out_bitstream,
+    uint32_t tile_width_blocks) {
+    out_bitstream.clear();
+    const uint32_t block_bytes = BcFormatBlockBytes(format);
+    if (block_bytes == 0u || !src_blocks || src_size == 0u || (src_size % block_bytes) != 0u) {
+        return Status::Error(StatusCode::InvalidArgument, "Invalid BC format or source buffer for hardware BCPack");
+    }
+    const uint64_t block_count_64 = src_size / block_bytes;
+    if (block_count_64 == 0ull || block_count_64 > kBcPackHwMaxBlocks) {
+        return Status::Error(StatusCode::InvalidArgument, "Hardware BCPack block count out of bounds");
+    }
+    const uint32_t block_count = static_cast<uint32_t>(block_count_64);
+    uint32_t tw = tile_width_blocks;
+    if (tw == 0u) {
+        tw = (block_count >= 64u) ? 64u : block_count;
+    }
+    if (tw > 65535u) tw = 65535u;
+
+    HwBitWriter bw;
+    Bc1ColorState bc1_st{};
+    Bc4ChannelState bc4_r_st{};
+    Bc4ChannelState bc4_g_st{};
+    Bc67State bc67_st{};
+
+    for (uint32_t b = 0u; b < block_count; ++b) {
+        const uint8_t* cur = src_blocks + static_cast<size_t>(b) * block_bytes;
+        const uint8_t* left = ((b % tw) != 0u) ? (cur - block_bytes) : nullptr;
+        const uint8_t* up = (b >= tw) ? (cur - static_cast<size_t>(tw) * block_bytes) : nullptr;
+
+        // 1-bit spatial predictor selector (0 = Left, 1 = Up when available)
+        uint32_t use_up = 0u;
+        if (!left && up) {
+            use_up = 1u;
+        } else if (left && up) {
+            uint32_t diff_l = 0u;
+            uint32_t diff_u = 0u;
+            for (uint32_t k = 0u; k < block_bytes; ++k) {
+                if (cur[k] != left[k]) ++diff_l;
+                if (cur[k] != up[k]) ++diff_u;
+            }
+            if (diff_u < diff_l) use_up = 1u;
+        }
+        const uint8_t* pred = (use_up != 0u) ? up : left;
+        if (left && up) {
+            bw.WriteBits(use_up, 1u);
+        }
+
+        switch (format) {
+            case BcFormat::BC1:
+                Bc1ColorState::Encode(bw, cur, pred, bc1_st);
+                break;
+            case BcFormat::BC2:
+                EncodeBc2Alpha(bw, cur, pred);
+                Bc1ColorState::Encode(bw, cur + 8u, pred ? (pred + 8u) : nullptr, bc1_st);
+                break;
+            case BcFormat::BC3:
+                Bc4ChannelState::Encode(bw, cur, pred, bc4_r_st);
+                Bc1ColorState::Encode(bw, cur + 8u, pred ? (pred + 8u) : nullptr, bc1_st);
+                break;
+            case BcFormat::BC4:
+                Bc4ChannelState::Encode(bw, cur, pred, bc4_r_st);
+                break;
+            case BcFormat::BC5:
+                Bc4ChannelState::Encode(bw, cur, pred, bc4_r_st);
+                Bc4ChannelState::Encode(bw, cur + 8u, pred ? (pred + 8u) : nullptr, bc4_g_st);
+                break;
+            case BcFormat::BC6H:
+            case BcFormat::BC7:
+                Bc67State::Encode(bw, cur, pred, bc67_st);
+                break;
+            default:
+                return Status::Error(StatusCode::UnsupportedFormat, "Unsupported BC format");
+        }
+    }
+    bw.FlushWithStopBit();
+
+    const uint32_t crc = BcPackCrc32(src_blocks, src_size);
+    const auto& payload = bw.Bytes();
+    out_bitstream.reserve(kBcPackHwHeaderBytes + payload.size());
+    AppendLe32(out_bitstream, kBcPackHwMagic);
+    out_bitstream.push_back(static_cast<uint8_t>(format));
+    out_bitstream.push_back(0u);  // flags
+    AppendLe16(out_bitstream, static_cast<uint16_t>(tw));
+    AppendLe32(out_bitstream, block_count);
+    AppendLe32(out_bitstream, crc);
+    out_bitstream.insert(out_bitstream.end(), payload.begin(), payload.end());
+    return Status::Ok();
+}
+
+Status BcPackHwDecodeBitstream(
+    BcFormat format,
+    const uint8_t* src_bitstream,
+    size_t src_size,
+    uint8_t* dst_blocks,
+    size_t dst_size,
+    size_t* out_written) {
+    if (out_written) *out_written = 0u;
+    uint32_t block_count = 0u;
+    if (!BcPackHwIsValidBitstreamHeader(format, src_bitstream, src_size, &block_count)) {
+        return Status::Error(StatusCode::ParseError, "Invalid hardware BCPack bitstream header");
+    }
+    const uint32_t block_bytes = BcFormatBlockBytes(format);
+    const uint64_t expected_bytes_64 = static_cast<uint64_t>(block_count) * static_cast<uint64_t>(block_bytes);
+    if (!dst_blocks || expected_bytes_64 == 0ull || expected_bytes_64 > static_cast<uint64_t>(dst_size)) {
+        return Status::Error(StatusCode::InvalidArgument, "Hardware BCPack destination buffer too small");
+    }
+
+    const uint32_t tw = ReadLe16(src_bitstream + 6u);
+    const uint32_t expected_crc = ReadLe32(src_bitstream + 12u);
+
+    HwBitReader br;
+    if (!br.Init(src_bitstream + kBcPackHwHeaderBytes, src_size - kBcPackHwHeaderBytes)) {
+        return Status::Error(StatusCode::ParseError, "Hardware BCPack bitstream missing flush bit");
+    }
+
+    std::vector<uint8_t> staged(static_cast<size_t>(expected_bytes_64), 0u);
+    Bc1ColorState bc1_st{};
+    Bc4ChannelState bc4_r_st{};
+    Bc4ChannelState bc4_g_st{};
+    Bc67State bc67_st{};
+
+    for (uint32_t b = 0u; b < block_count; ++b) {
+        uint8_t* cur = staged.data() + static_cast<size_t>(b) * block_bytes;
+        const uint8_t* left = ((b % tw) != 0u) ? (cur - block_bytes) : nullptr;
+        const uint8_t* up = (b >= tw) ? (cur - static_cast<size_t>(tw) * block_bytes) : nullptr;
+
+        uint32_t use_up = (!left && up) ? 1u : 0u;
+        if (left && up) {
+            if (!br.ReadBits(1u, use_up)) {
+                return Status::Error(StatusCode::ParseError, "Hardware BCPack predictor bit truncated");
+            }
+        }
+        const uint8_t* pred = (use_up != 0u) ? up : left;
+
+        bool ok = false;
+        switch (format) {
+            case BcFormat::BC1:
+                ok = Bc1ColorState::Decode(br, cur, pred, bc1_st);
+                break;
+            case BcFormat::BC2:
+                ok = DecodeBc2Alpha(br, cur, pred) &&
+                     Bc1ColorState::Decode(br, cur + 8u, pred ? (pred + 8u) : nullptr, bc1_st);
+                break;
+            case BcFormat::BC3:
+                ok = Bc4ChannelState::Decode(br, cur, pred, bc4_r_st) &&
+                     Bc1ColorState::Decode(br, cur + 8u, pred ? (pred + 8u) : nullptr, bc1_st);
+                break;
+            case BcFormat::BC4:
+                ok = Bc4ChannelState::Decode(br, cur, pred, bc4_r_st);
+                break;
+            case BcFormat::BC5:
+                ok = Bc4ChannelState::Decode(br, cur, pred, bc4_r_st) &&
+                     Bc4ChannelState::Decode(br, cur + 8u, pred ? (pred + 8u) : nullptr, bc4_g_st);
+                break;
+            case BcFormat::BC6H:
+            case BcFormat::BC7:
+                ok = Bc67State::Decode(br, cur, pred, bc67_st);
+                break;
+            default:
+                return Status::Error(StatusCode::UnsupportedFormat, "Unsupported BC format");
+        }
+        if (!ok) {
+            return Status::Error(StatusCode::ParseError, "Hardware BCPack bitstream truncated or corrupt");
+        }
+    }
+
+    if (!br.AtExactEnd()) {
+        return Status::Error(StatusCode::ParseError, "Hardware BCPack trailing garbage before flush bit");
+    }
+
+    const uint32_t actual_crc = BcPackCrc32(staged.data(), staged.size());
+    if (actual_crc != expected_crc) {
+        return Status::Error(StatusCode::ParseError, "Hardware BCPack payload CRC32 mismatch");
+    }
+
+    std::memcpy(dst_blocks, staged.data(), staged.size());
+    if (out_written) {
+        *out_written = staged.size();
+    }
+    return Status::Ok();
+}
+
 }  // namespace openscarlett

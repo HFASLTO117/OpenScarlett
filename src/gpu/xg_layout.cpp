@@ -329,7 +329,50 @@ uint32_t ComputeMaxMips3D(uint32_t width, uint32_t height, uint32_t depth) noexc
     return mips;
 }
 
-// Lays out a single 2D plane (mip chain + optional GFX10 mip tail) starting at `start_offset`.
+constexpr bool IsValidSampleCount(uint32_t sample_count) noexcept {
+    return sample_count == 1u || sample_count == 2u || sample_count == 4u || sample_count == 8u;
+}
+
+// Adjusts a 2D GFX10 tile geometry for MSAA (2x, 4x, 8x) so the invariant
+// tile_w_elems * tile_h_elems * sample_count * bpe == tile_size_bytes holds exactly.
+bool ApplyMsaaToTileGeometry(TileGeometry& geom, uint32_t bpe, uint32_t sample_count) noexcept {
+    if (!IsValidSampleCount(sample_count)) {
+        return false;
+    }
+    if (sample_count == 1u) {
+        return true;
+    }
+    if (geom.is_3d || geom.family == SwizzleFamily::Linear) {
+        return false;
+    }
+    uint32_t s = sample_count;
+    while (s > 1u) {
+        if (geom.tile_w_elems > geom.tile_h_elems && geom.tile_w_elems > 1u) {
+            geom.tile_w_elems >>= 1u;
+            if (geom.micro_w_elems > 1u) geom.micro_w_elems >>= 1u;
+        } else if (geom.tile_h_elems > 1u) {
+            geom.tile_h_elems >>= 1u;
+            if (geom.micro_h_elems > 1u) geom.micro_h_elems >>= 1u;
+        } else if (geom.tile_w_elems > 1u) {
+            geom.tile_w_elems >>= 1u;
+            if (geom.micro_w_elems > 1u) geom.micro_w_elems >>= 1u;
+        } else {
+            return false;
+        }
+        s >>= 1u;
+    }
+    if (geom.micro_w_elems > geom.tile_w_elems) geom.micro_w_elems = geom.tile_w_elems;
+    if (geom.micro_h_elems > geom.tile_h_elems) geom.micro_h_elems = geom.tile_h_elems;
+    geom.supports_mip_tail = false;
+    const uint64_t tile_bytes =
+        static_cast<uint64_t>(geom.tile_w_elems) *
+        static_cast<uint64_t>(geom.tile_h_elems) *
+        static_cast<uint64_t>(sample_count) *
+        static_cast<uint64_t>(bpe);
+    return tile_bytes == static_cast<uint64_t>(geom.tile_size_bytes);
+}
+
+// Lays out a single 2D plane (mip chain + optional GFX10 mip tail, or MSAA 2x/4x/8x) starting at `start_offset`.
 bool LayoutPlane2D(
     uint32_t width,
     uint32_t height,
@@ -342,9 +385,13 @@ bool LayoutPlane2D(
     uint32_t& out_mip_tail_start,
     uint64_t& out_mip_tail_offset,
     uint64_t& out_mip_tail_slice_pitch,
-    uint64_t& out_plane_size) noexcept {
+    uint64_t& out_plane_size,
+    uint32_t sample_count = 1u) noexcept {
     TileGeometry geom{};
     if (!GetTileGeometry(tile_mode, fmt.bytes_per_block, geom) || geom.is_3d) {
+        return false;
+    }
+    if (!ApplyMsaaToTileGeometry(geom, fmt.bytes_per_block, sample_count)) {
         return false;
     }
 
@@ -854,8 +901,16 @@ bool ComputeTexture2DLayout(const XG_TEXTURE2D_DESC& desc, XG_RESOURCE_LAYOUT& o
     }
 
     const uint32_t array_size = (desc.ArraySize == 0u) ? 1u : desc.ArraySize;
+    const uint32_t sample_count = (desc.SampleCount == 0u) ? 1u : desc.SampleCount;
+    if (!IsValidSampleCount(sample_count)) {
+        return false;
+    }
+
     const bool is_cube = (desc.BindFlags & XG_BIND_CUBE_MAP) != 0u;
     if (is_cube && (desc.Width != desc.Height || (array_size % 6u) != 0u)) {
+        return false;
+    }
+    if (sample_count > 1u && is_cube) {
         return false;
     }
 
@@ -869,12 +924,20 @@ bool ComputeTexture2DLayout(const XG_TEXTURE2D_DESC& desc, XG_RESOURCE_LAYOUT& o
     }
     fmt0.dxgi_format = desc.Format;
 
+    if (sample_count > 1u) {
+        // GFX10 hardware MSAA (2x/4x/8x) requires tiled, non-compressed surfaces (mip count clamped to 1).
+        if (desc.TileMode == XG_TILE_MODE_LINEAR || fmt0.is_compressed != 0u) {
+            return false;
+        }
+    }
+
     TileGeometry geom0{};
-    if (!GetTileGeometry(desc.TileMode, fmt0.bytes_per_block, geom0) || geom0.is_3d) {
+    if (!GetTileGeometry(desc.TileMode, fmt0.bytes_per_block, geom0) || geom0.is_3d ||
+        !ApplyMsaaToTileGeometry(geom0, fmt0.bytes_per_block, sample_count)) {
         return false;
     }
 
-    const uint32_t max_mips = ComputeMaxMips2D(desc.Width, desc.Height);
+    const uint32_t max_mips = (sample_count > 1u) ? 1u : ComputeMaxMips2D(desc.Width, desc.Height);
     const uint32_t mip_levels = (desc.MipLevels == 0u) ? max_mips : std::min(desc.MipLevels, max_mips);
     const uint32_t plane_count = GetFormatPlaneCount(planar_format);
 
@@ -897,7 +960,8 @@ bool ComputeTexture2DLayout(const XG_TEXTURE2D_DESC& desc, XG_RESOURCE_LAYOUT& o
             out_layout.MipTailStartLevel,
             out_layout.MipTailOffsetBytes,
             out_layout.MipTailSlicePitchBytes,
-            out_layout.PlaneSizes[0])) {
+            out_layout.PlaneSizes[0],
+            sample_count)) {
         return false;
     }
 
@@ -917,7 +981,8 @@ bool ComputeTexture2DLayout(const XG_TEXTURE2D_DESC& desc, XG_RESOURCE_LAYOUT& o
                 out_layout.Plane1MipTailStartLevel,
                 out_layout.Plane1MipTailOffsetBytes,
                 out_layout.Plane1MipTailSlicePitchBytes,
-                out_layout.PlaneSizes[1])) {
+                out_layout.PlaneSizes[1],
+                sample_count)) {
             return false;
         }
         total_size = out_layout.PlaneOffsets[1] + out_layout.PlaneSizes[1];
@@ -1671,9 +1736,10 @@ bool ComputeTexture2DMetadataLayout(
         const uint64_t dcc_align = std::max<uint64_t>(
             pipe_align,
             (base_layout.BaseAlignmentBytes >= 65536ull) ? 65536ull : 4096ull);
-        // Per-slice color payload scales with sample_count; DCC stores 1B per 256B block.
+        // Base PlaneSizes[0] already scales with sample_count for MSAA (2x/4x/8x);
+        // DCC stores 1 byte per 256-byte color block.
         const uint64_t per_slice_color_bytes =
-            (base_layout.PlaneSizes[0] / std::max(1u, array_size)) * sample_count;
+            base_layout.PlaneSizes[0] / std::max(1u, array_size);
         const uint64_t raw_dcc_slice =
             (per_slice_color_bytes + pipe_cfg.DccBlockSizeBytes - 1ull) / pipe_cfg.DccBlockSizeBytes;
         const uint64_t dcc_slice_bytes = AlignUpU64(
@@ -2100,6 +2166,237 @@ bool VerifyDccMetadata(
         out_result->BlockCountY = blocks_y;
         out_result->TotalBlocks = static_cast<uint32_t>(std::min<uint64_t>(total_blocks_64, UINT32_MAX));
         out_result->EncodedKeyByte = expected_key;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// MSAA (2x / 4x / 8x) Tiled Texture Placement, Sample-Count Alignment &
+// Bijective Sample-Indexed Tile Addressing (xcl #43)
+// ---------------------------------------------------------------------------
+struct XgMsaaPlacementInfo {
+    uint32_t sample_count = 1u;
+    uint32_t bytes_per_sample = 0u;
+    uint32_t tile_width_pixels = 0u;
+    uint32_t tile_height_pixels = 0u;
+    uint32_t tile_size_bytes = 0u;
+    uint32_t padded_width_pixels = 0u;
+    uint32_t padded_height_pixels = 0u;
+    uint32_t tiles_x = 0u;
+    uint32_t tiles_y = 0u;
+    uint32_t plane_count = 1u;
+    uint64_t slice_pitch_bytes = 0ull;
+    uint64_t base_alignment_bytes = 0ull;
+    uint64_t total_size_bytes = 0ull;
+    uint64_t fmask_size_bytes = 0ull;
+    uint64_t fmask_alignment_bytes = 0ull;
+};
+
+bool ComputeMsaaTexture2DPlacement(
+    const XG_TEXTURE2D_DESC& desc,
+    XgMsaaPlacementInfo& out_info) noexcept {
+    out_info = XgMsaaPlacementInfo{};
+    const uint32_t sc = (desc.SampleCount == 0u) ? 1u : desc.SampleCount;
+    if (!IsValidSampleCount(sc)) {
+        return false;
+    }
+    XG_RESOURCE_LAYOUT layout{};
+    if (!ComputeTexture2DLayout(desc, layout) || layout.MipLevels == 0u) {
+        return false;
+    }
+    const XG_MIPLEVEL_LAYOUT& ml0 = layout.Mips[0];
+    out_info.sample_count = sc;
+    out_info.bytes_per_sample = layout.FormatInfo.bytes_per_block;
+    out_info.tile_width_pixels = ml0.TileWidthElements;
+    out_info.tile_height_pixels = ml0.TileHeightElements;
+    out_info.tile_size_bytes = ml0.TileSizeBytes;
+    out_info.padded_width_pixels = ml0.PaddedWidthElements;
+    out_info.padded_height_pixels = ml0.PaddedHeightElements;
+    out_info.tiles_x = ml0.TilesX;
+    out_info.tiles_y = ml0.TilesY;
+    out_info.plane_count = layout.PlaneCount;
+    out_info.slice_pitch_bytes = ml0.SlicePitchBytes;
+    out_info.base_alignment_bytes = layout.BaseAlignmentBytes;
+    out_info.total_size_bytes = layout.SizeBytes;
+
+    // GFX10 FMASK surface sizing for color MSAA (2x -> 1B/px, 4x -> 1B/px, 8x -> 4B/px).
+    if (sc > 1u && !IsDepthFormat(desc.Format)) {
+        const uint32_t fmask_bpe = (sc == 8u) ? 4u : 1u;
+        TileGeometry fmask_geom{};
+        if (GetTileGeometry(desc.TileMode, fmask_bpe, fmask_geom) && !fmask_geom.is_3d) {
+            const uint32_t fw = AlignUpU32(desc.Width, fmask_geom.tile_w_elems);
+            const uint32_t fh = AlignUpU32(desc.Height, fmask_geom.tile_h_elems);
+            const uint64_t f_tiles =
+                static_cast<uint64_t>(fw / fmask_geom.tile_w_elems) *
+                static_cast<uint64_t>(fh / fmask_geom.tile_h_elems);
+            out_info.fmask_alignment_bytes = fmask_geom.tile_size_bytes;
+            out_info.fmask_size_bytes = f_tiles * fmask_geom.tile_size_bytes * layout.ArraySize;
+        }
+    }
+    return true;
+}
+
+uint64_t ComputeMsaaElementByteOffset2D(
+    const XG_TEXTURE2D_DESC& desc,
+    uint32_t plane,
+    uint32_t slice_index,
+    uint32_t element_x,
+    uint32_t element_y,
+    uint32_t sample_index) noexcept {
+    const uint32_t sc = (desc.SampleCount == 0u) ? 1u : desc.SampleCount;
+    if (!IsValidSampleCount(sc) || sample_index >= sc) {
+        return UINT64_MAX;
+    }
+    XG_RESOURCE_LAYOUT layout{};
+    if (!ComputeTexture2DLayout(desc, layout)) {
+        return UINT64_MAX;
+    }
+    if (plane >= layout.PlaneCount || slice_index >= layout.ArraySize) {
+        return UINT64_MAX;
+    }
+    if (sc == 1u) {
+        return ComputeElementByteOffsetPlane(layout, plane, 0u, slice_index, element_x, element_y);
+    }
+
+    const XG_MIPLEVEL_LAYOUT& ml = (plane == 0u) ? layout.Mips[0] : layout.Plane1Mips[0];
+    const uint32_t bpe = (plane == 0u) ? layout.FormatInfo.bytes_per_block
+                                       : layout.PlaneFormatInfo[1].bytes_per_block;
+    if (element_x >= ml.PaddedWidthElements || element_y >= ml.PaddedHeightElements) {
+        return UINT64_MAX;
+    }
+
+    TileGeometry geom{};
+    if (!GetTileGeometry(layout.TileMode, bpe, geom) || geom.is_3d ||
+        !ApplyMsaaToTileGeometry(geom, bpe, sc)) {
+        return UINT64_MAX;
+    }
+
+    const uint64_t slice_base =
+        ml.OffsetBytes + static_cast<uint64_t>(slice_index) * ml.SlicePitchBytes;
+    const uint32_t tile_x = element_x / geom.tile_w_elems;
+    const uint32_t tile_y = element_y / geom.tile_h_elems;
+    const uint32_t in_tile_x = element_x % geom.tile_w_elems;
+    const uint32_t in_tile_y = element_y % geom.tile_h_elems;
+    const uint64_t tile_index = static_cast<uint64_t>(tile_y) * ml.TilesX + tile_x;
+
+    // Bijective intra-tile pixel index * sample_count + sample_index, with optional GFX10 _X XOR.
+    const uint32_t bits_x = Log2Pow2(geom.tile_w_elems);
+    const uint32_t bits_y = Log2Pow2(geom.tile_h_elems);
+    const bool y_first =
+        (geom.family == SwizzleFamily::Displayable || geom.family == SwizzleFamily::Rotated);
+    const uint32_t pixel_idx = MortonEncode2D(in_tile_x, in_tile_y, bits_x, bits_y, y_first);
+    uint32_t offset_in_tile = (pixel_idx * sc + sample_index) * bpe;
+
+    if (geom.has_xor && geom.tile_size_bytes >= 65536u) {
+        uint32_t xor_nibble = 0u;
+        switch (layout.TileMode) {
+            case XG_TILE_MODE_2D_THIN_64KB_R_X:
+                xor_nibble = (tile_x ^ (tile_y << 1u) ^ (slice_index << 2u)) & 0xFu;
+                break;
+            case XG_TILE_MODE_2D_THIN_64KB_S_X:
+                xor_nibble = ((tile_x << 1u) ^ tile_y ^ slice_index) & 0xFu;
+                break;
+            case XG_TILE_MODE_2D_THIN_64KB_D_X:
+                xor_nibble = (tile_x ^ tile_y ^ (slice_index << 1u)) & 0xFu;
+                break;
+            case XG_TILE_MODE_2D_THIN_64KB_Z_X:
+                xor_nibble = (tile_x ^ (tile_y * 3u) ^ (slice_index << 2u)) & 0xFu;
+                break;
+            default:
+                break;
+        }
+        offset_in_tile ^= (xor_nibble << 12u);
+    }
+
+    return slice_base + tile_index * geom.tile_size_bytes + offset_in_tile;
+}
+
+bool TileMsaaSurface2D(
+    const XG_TEXTURE2D_DESC& desc,
+    uint32_t plane,
+    uint32_t slice_index,
+    uint32_t sample_index,
+    const void* src_linear,
+    uint32_t src_row_pitch_bytes,
+    void* dst_tiled,
+    uint64_t dst_tiled_size_bytes) noexcept {
+    if (!src_linear || !dst_tiled) return false;
+    const uint32_t sc = (desc.SampleCount == 0u) ? 1u : desc.SampleCount;
+    if (!IsValidSampleCount(sc) || sample_index >= sc) return false;
+    if (sc == 1u) {
+        return TileSurface2DPlane(desc, plane, 0u, slice_index, src_linear, src_row_pitch_bytes,
+                                  dst_tiled, dst_tiled_size_bytes);
+    }
+    XG_RESOURCE_LAYOUT layout{};
+    if (!ComputeTexture2DLayout(desc, layout)) return false;
+    if (plane >= layout.PlaneCount || slice_index >= layout.ArraySize) return false;
+
+    const XG_MIPLEVEL_LAYOUT& ml = (plane == 0u) ? layout.Mips[0] : layout.Plane1Mips[0];
+    const uint32_t bpe = (plane == 0u) ? layout.FormatInfo.bytes_per_block
+                                       : layout.PlaneFormatInfo[1].bytes_per_block;
+    const uint32_t min_row_bytes = ml.WidthElements * bpe;
+    if (src_row_pitch_bytes == 0u) src_row_pitch_bytes = min_row_bytes;
+    if (src_row_pitch_bytes < min_row_bytes) return false;
+
+    const uint64_t slice_base =
+        ml.OffsetBytes + static_cast<uint64_t>(slice_index) * ml.SlicePitchBytes;
+    if (slice_base + ml.SlicePitchBytes > dst_tiled_size_bytes) return false;
+
+    const auto* src_bytes = static_cast<const uint8_t*>(src_linear);
+    auto* dst_bytes = static_cast<uint8_t*>(dst_tiled);
+    for (uint32_t y = 0u; y < ml.HeightElements; ++y) {
+        const uint8_t* src_row = src_bytes + static_cast<uint64_t>(y) * src_row_pitch_bytes;
+        for (uint32_t x = 0u; x < ml.WidthElements; ++x) {
+            const uint64_t dst_off =
+                ComputeMsaaElementByteOffset2D(desc, plane, slice_index, x, y, sample_index);
+            if (dst_off == UINT64_MAX || dst_off + bpe > dst_tiled_size_bytes) return false;
+            std::memcpy(dst_bytes + dst_off, src_row + static_cast<uint64_t>(x) * bpe, bpe);
+        }
+    }
+    return true;
+}
+
+bool UntileMsaaSurface2D(
+    const XG_TEXTURE2D_DESC& desc,
+    uint32_t plane,
+    uint32_t slice_index,
+    uint32_t sample_index,
+    const void* src_tiled,
+    uint64_t src_tiled_size_bytes,
+    void* dst_linear,
+    uint32_t dst_row_pitch_bytes) noexcept {
+    if (!src_tiled || !dst_linear) return false;
+    const uint32_t sc = (desc.SampleCount == 0u) ? 1u : desc.SampleCount;
+    if (!IsValidSampleCount(sc) || sample_index >= sc) return false;
+    if (sc == 1u) {
+        return UntileSurface2DPlane(desc, plane, 0u, slice_index, src_tiled, src_tiled_size_bytes,
+                                    dst_linear, dst_row_pitch_bytes);
+    }
+    XG_RESOURCE_LAYOUT layout{};
+    if (!ComputeTexture2DLayout(desc, layout)) return false;
+    if (plane >= layout.PlaneCount || slice_index >= layout.ArraySize) return false;
+
+    const XG_MIPLEVEL_LAYOUT& ml = (plane == 0u) ? layout.Mips[0] : layout.Plane1Mips[0];
+    const uint32_t bpe = (plane == 0u) ? layout.FormatInfo.bytes_per_block
+                                       : layout.PlaneFormatInfo[1].bytes_per_block;
+    const uint32_t min_row_bytes = ml.WidthElements * bpe;
+    if (dst_row_pitch_bytes == 0u) dst_row_pitch_bytes = min_row_bytes;
+    if (dst_row_pitch_bytes < min_row_bytes) return false;
+
+    const uint64_t slice_base =
+        ml.OffsetBytes + static_cast<uint64_t>(slice_index) * ml.SlicePitchBytes;
+    if (slice_base + ml.SlicePitchBytes > src_tiled_size_bytes) return false;
+
+    const auto* src_bytes = static_cast<const uint8_t*>(src_tiled);
+    auto* dst_bytes = static_cast<uint8_t*>(dst_linear);
+    for (uint32_t y = 0u; y < ml.HeightElements; ++y) {
+        uint8_t* dst_row = dst_bytes + static_cast<uint64_t>(y) * dst_row_pitch_bytes;
+        for (uint32_t x = 0u; x < ml.WidthElements; ++x) {
+            const uint64_t src_off =
+                ComputeMsaaElementByteOffset2D(desc, plane, slice_index, x, y, sample_index);
+            if (src_off == UINT64_MAX || src_off + bpe > src_tiled_size_bytes) return false;
+            std::memcpy(dst_row + static_cast<uint64_t>(x) * bpe, src_bytes + src_off, bpe);
+        }
     }
     return true;
 }
