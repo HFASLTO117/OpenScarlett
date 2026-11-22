@@ -1,10 +1,17 @@
 #pragma once
+#include <Windows.h>
 // Clean-room MIT DirectXTK12 GamePad subset for untouched Xbox-GDK-Samples.
 
 namespace DirectX {
 
 class GamePad {
 public:
+    GamePad() noexcept {
+        char buf[4]{};
+        if (::GetEnvironmentVariableA("OPENSCARLETT_TRACE_ODS", buf, sizeof(buf)) == 1u && buf[0] == '1') {
+            ::OutputDebugStringA("TRACE: GamePad::GamePad reached\n");
+        }
+    }
     static constexpr int c_MergedInput = -1;
 
     struct ThumbSticks {
