@@ -48,3 +48,34 @@ EXPORTS
     OpenScarlettD3D12SetBackendMode
     OpenScarlettD3D12GetActiveBackend
     OpenScarlettD3D12GetVulkanRoutingStats
+    IID_ID3D12Device = OS_IID_ID3D12Device DATA
+    IID_ID3D12Device1 = OS_IID_ID3D12Device1 DATA
+    IID_ID3D12Device2 = OS_IID_ID3D12Device2 DATA
+    IID_ID3D12Device3 = OS_IID_ID3D12Device3 DATA
+    IID_ID3D12Device4 = OS_IID_ID3D12Device4 DATA
+    IID_ID3D12Device5 = OS_IID_ID3D12Device5 DATA
+    IID_ID3D12Device6 = OS_IID_ID3D12Device6 DATA
+    IID_ID3D12Device7 = OS_IID_ID3D12Device7 DATA
+    IID_ID3D12Device8 = OS_IID_ID3D12Device8 DATA
+    IID_ID3D12CommandQueue = OS_IID_ID3D12CommandQueue DATA
+    IID_ID3D12CommandAllocator = OS_IID_ID3D12CommandAllocator DATA
+    IID_ID3D12GraphicsCommandList = OS_IID_ID3D12GraphicsCommandList DATA
+    IID_ID3D12GraphicsCommandList1 = OS_IID_ID3D12GraphicsCommandList1 DATA
+    IID_ID3D12GraphicsCommandList2 = OS_IID_ID3D12GraphicsCommandList2 DATA
+    IID_ID3D12GraphicsCommandList3 = OS_IID_ID3D12GraphicsCommandList3 DATA
+    IID_ID3D12GraphicsCommandList4 = OS_IID_ID3D12GraphicsCommandList4 DATA
+    IID_ID3D12GraphicsCommandList5 = OS_IID_ID3D12GraphicsCommandList5 DATA
+    IID_ID3D12GraphicsCommandList6 = OS_IID_ID3D12GraphicsCommandList6 DATA
+    IID_ID3D12Resource = OS_IID_ID3D12Resource DATA
+    IID_ID3D12Resource1 = OS_IID_ID3D12Resource1 DATA
+    IID_ID3D12Resource2 = OS_IID_ID3D12Resource2 DATA
+    IID_ID3D12Heap = OS_IID_ID3D12Heap DATA
+    IID_ID3D12Heap1 = OS_IID_ID3D12Heap1 DATA
+    IID_ID3D12Fence = OS_IID_ID3D12Fence DATA
+    IID_ID3D12Fence1 = OS_IID_ID3D12Fence1 DATA
+    IID_ID3D12PipelineState = OS_IID_ID3D12PipelineState DATA
+    IID_ID3D12RootSignature = OS_IID_ID3D12RootSignature DATA
+    IID_ID3D12DescriptorHeap = OS_IID_ID3D12DescriptorHeap DATA
+    IID_ID3D12QueryHeap = OS_IID_ID3D12QueryHeap DATA
+    IID_ID3D12CommandSignature = OS_IID_ID3D12CommandSignature DATA
+    IID_ID3D12StateObject = OS_IID_ID3D12StateObject DATA
