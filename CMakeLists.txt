@@ -118,9 +118,8 @@ foreach(_os_module_cmake
     cmake/gdkx_bringup_targets.cmake
     cmake/sprint11_as_spirv.cmake
     cmake/sprint11_d3d12_feedback_queries.cmake
-
     cmake/sprint11_xvd_loader_lsa.cmake
-
+    cmake/sprint11_rdna2_gpu_verify.cmake
 )
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_os_module_cmake}")
         include("${CMAKE_CURRENT_SOURCE_DIR}/${_os_module_cmake}")

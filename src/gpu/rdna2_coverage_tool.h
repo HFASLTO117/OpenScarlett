@@ -17,7 +17,7 @@ inline constexpr uint32_t kRdna2CoverageSchemaVersion = 1u;
 struct Rdna2BenchOptions {
     bool full_corpus = false;
     uint32_t corpus_count = 3120u;
-    uint32_t external_val_sample = 60u;
+    uint32_t external_val_sample = 432u;
     bool run_live_gpu = true;
     bool run_external_validators = true;
     bool validate_all_external = false;
