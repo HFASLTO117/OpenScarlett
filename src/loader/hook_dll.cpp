@@ -1188,25 +1188,12 @@ bool ShouldPassThroughHostDDriveW(std::wstring_view raw_path) {
         if (lo_in.rfind(lo_shim, 0) == 0) {
             return true;
         }
-        // Also avoid hijacking an existing host file on D:\ when the virtual translation does not exist.
-        if (g_real_GetFileAttributesW != nullptr) {
-            std::wstring host_candidate(stripped);
-            if (g_real_GetFileAttributesW(host_candidate.c_str()) != INVALID_FILE_ATTRIBUTES) {
-                std::wstring vfs_candidate;
-                if (g_vfs.TranslateForAccessW(raw_path, openscarlett::VfsAccessMode::ReadOnly,
-                                              vfs_candidate, nullptr, false) !=
-                    openscarlett::VfsTranslateStatus::Translated) {
-                    return true;
-                }
-                std::wstring vfs_plain = vfs_candidate;
-                if (vfs_plain.size() >= 4 && vfs_plain.compare(0, 4, L"\\??\\") == 0) {
-                    vfs_plain.erase(0, 4);
-                }
-                if (g_real_GetFileAttributesW(vfs_plain.c_str()) == INVALID_FILE_ATTRIBUTES) {
-                    return true;
-                }
-            }
-        }
+    }
+    std::wstring dummy_vfs;
+    const auto st = g_vfs.TranslateForAccessW(
+        raw_path, openscarlett::VfsAccessMode::ReadOnly, dummy_vfs, nullptr, false);
+    if (st == openscarlett::VfsTranslateStatus::NotVirtual) {
+        return true;
     }
     return false;
 }
@@ -1554,6 +1541,16 @@ HANDLE CreateVirtualFileW(std::wstring_view virtual_path,
         ::SetLastError(ERROR_FILE_NOT_FOUND);
         return INVALID_HANDLE_VALUE;
     }
+    if (st == openscarlett::VfsTranslateStatus::NotVirtual) {
+        const std::wstring passthrough_path(virtual_path);
+        return g_real_CreateFileW(passthrough_path.c_str(),
+                                  dwDesiredAccess,
+                                  dwShareMode,
+                                  lpSecurityAttributes,
+                                  dwCreationDisposition,
+                                  dwFlagsAndAttributes,
+                                  hTemplateFile);
+    }
     if (st != openscarlett::VfsTranslateStatus::Translated) {
         ::SetLastError(ERROR_PATH_NOT_FOUND);
         return INVALID_HANDLE_VALUE;
@@ -1617,14 +1614,16 @@ HANDLE WINAPI Hook_CreateFileA(LPCSTR lpFileName,
         lpFileName != nullptr &&
         openscarlett::VfsMounts::DetectVirtualDriveA(lpFileName) != openscarlett::VfsDrive::None) {
         std::wstring wide_in = AnsiToWide(lpFileName);
-        return CreateVirtualFileW(wide_in,
-                                  "CreateFileA",
-                                  dwDesiredAccess,
-                                  dwShareMode,
-                                  lpSecurityAttributes,
-                                  dwCreationDisposition,
-                                  dwFlagsAndAttributes,
-                                  hTemplateFile);
+        if (!ShouldPassThroughHostDDriveW(wide_in)) {
+            return CreateVirtualFileW(wide_in,
+                                      "CreateFileA",
+                                      dwDesiredAccess,
+                                      dwShareMode,
+                                      lpSecurityAttributes,
+                                      dwCreationDisposition,
+                                      dwFlagsAndAttributes,
+                                      hTemplateFile);
+        }
     }
     return g_real_CreateFileA(lpFileName,
                               dwDesiredAccess,
@@ -1806,7 +1805,8 @@ BOOL WINAPI Hook_CreateDirectoryW(LPCWSTR lpPathName, LPSECURITY_ATTRIBUTES lpSe
 BOOL WINAPI Hook_DeleteFileW(LPCWSTR lpFileName) {
     if (!g_shutting_down.load(std::memory_order_acquire) &&
         lpFileName != nullptr &&
-        openscarlett::VfsMounts::DetectVirtualDriveW(lpFileName) != openscarlett::VfsDrive::None) {
+        openscarlett::VfsMounts::DetectVirtualDriveW(lpFileName) != openscarlett::VfsDrive::None &&
+        !ShouldPassThroughHostDDriveW(lpFileName)) {
         uint32_t err = 0;
         bool ok = g_vfs.DeleteVirtualFileW(lpFileName, err);
         openscarlett::CallTelemetry::Global().Record(
@@ -1826,16 +1826,18 @@ BOOL WINAPI Hook_DeleteFileA(LPCSTR lpFileName) {
         lpFileName != nullptr &&
         openscarlett::VfsMounts::DetectVirtualDriveA(lpFileName) != openscarlett::VfsDrive::None) {
         std::wstring wide_in = AnsiToWide(lpFileName);
-        uint32_t err = 0;
-        bool ok = g_vfs.DeleteVirtualFileW(wide_in, err);
-        openscarlett::CallTelemetry::Global().Record(
-            "vfs",
-            "DeleteFileA",
-            ok ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error,
-            ok ? 0 : static_cast<int32_t>(err),
-            -1);
-        ::SetLastError(ok ? ERROR_SUCCESS : static_cast<DWORD>(err));
-        return ok ? TRUE : FALSE;
+        if (!ShouldPassThroughHostDDriveW(wide_in)) {
+            uint32_t err = 0;
+            bool ok = g_vfs.DeleteVirtualFileW(wide_in, err);
+            openscarlett::CallTelemetry::Global().Record(
+                "vfs",
+                "DeleteFileA",
+                ok ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error,
+                ok ? 0 : static_cast<int32_t>(err),
+                -1);
+            ::SetLastError(ok ? ERROR_SUCCESS : static_cast<DWORD>(err));
+            return ok ? TRUE : FALSE;
+        }
     }
     return g_real_DeleteFileA(lpFileName);
 }
@@ -1843,7 +1845,8 @@ BOOL WINAPI Hook_DeleteFileA(LPCSTR lpFileName) {
 BOOL WINAPI Hook_RemoveDirectoryW(LPCWSTR lpPathName) {
     if (!g_shutting_down.load(std::memory_order_acquire) &&
         lpPathName != nullptr &&
-        openscarlett::VfsMounts::DetectVirtualDriveW(lpPathName) != openscarlett::VfsDrive::None) {
+        openscarlett::VfsMounts::DetectVirtualDriveW(lpPathName) != openscarlett::VfsDrive::None &&
+        !ShouldPassThroughHostDDriveW(lpPathName)) {
         uint32_t err = 0;
         bool ok = g_vfs.RemoveVirtualDirectoryW(lpPathName, err);
         openscarlett::CallTelemetry::Global().Record(
@@ -1861,8 +1864,10 @@ BOOL WINAPI Hook_RemoveDirectoryW(LPCWSTR lpPathName) {
 BOOL WINAPI Hook_MoveFileExW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName, DWORD dwFlags) {
     if (!g_shutting_down.load(std::memory_order_acquire) &&
         lpExistingFileName != nullptr && lpNewFileName != nullptr &&
-        (openscarlett::VfsMounts::DetectVirtualDriveW(lpExistingFileName) != openscarlett::VfsDrive::None ||
-         openscarlett::VfsMounts::DetectVirtualDriveW(lpNewFileName) != openscarlett::VfsDrive::None)) {
+        ((openscarlett::VfsMounts::DetectVirtualDriveW(lpExistingFileName) != openscarlett::VfsDrive::None &&
+          !ShouldPassThroughHostDDriveW(lpExistingFileName)) ||
+         (openscarlett::VfsMounts::DetectVirtualDriveW(lpNewFileName) != openscarlett::VfsDrive::None &&
+          !ShouldPassThroughHostDDriveW(lpNewFileName)))) {
         uint32_t err = 0;
         bool ok = g_vfs.MoveVirtualPathW(lpExistingFileName, lpNewFileName, dwFlags, err);
         openscarlett::CallTelemetry::Global().Record(
@@ -1880,7 +1885,8 @@ BOOL WINAPI Hook_MoveFileExW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName, 
 HANDLE WINAPI Hook_FindFirstFileW(LPCWSTR lpFileName, LPWIN32_FIND_DATAW lpFindFileData) {
     if (!g_shutting_down.load(std::memory_order_acquire) &&
         lpFileName != nullptr &&
-        openscarlett::VfsMounts::DetectVirtualDriveW(lpFileName) != openscarlett::VfsDrive::None) {
+        openscarlett::VfsMounts::DetectVirtualDriveW(lpFileName) != openscarlett::VfsDrive::None &&
+        !ShouldPassThroughHostDDriveW(lpFileName)) {
         const std::wstring_view in_view(lpFileName);
         const auto drive = openscarlett::VfsMounts::DetectVirtualDriveW(in_view);
         const bool has_wildcards = (in_view.find_first_of(L"*?") != std::wstring_view::npos);

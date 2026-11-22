@@ -870,6 +870,11 @@ void RunSampleEndToEnd(const fs::path& bin_dir, const SampleSpec& spec, bool pre
 
     EXPECT_MSG(fs::exists(telemetry_json), tag + ": telemetry.json produced");
     if (fs::exists(telemetry_json)) {
+        if (rc != 0u) {
+            std::ifstream dbg_ifs(telemetry_json, std::ios::binary);
+            std::string raw((std::istreambuf_iterator<char>(dbg_ifs)), std::istreambuf_iterator<char>());
+            std::cerr << "  [" << tag << "] telemetry.json dump (rc=" << rc << "):\n" << raw << "\n";
+        }
         const TelemetrySummary tel = ParseTelemetryJson(telemetry_json);
         VerifyCommonTelemetry(tel, tag, spec.min_pso_count);
         if (spec.kind == SampleKind::Texture) {

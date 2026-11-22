@@ -782,6 +782,74 @@ bool MatchesHostRootPrefixW(std::wstring_view stripped_raw, const std::wstring& 
     return norm_in.size() == norm_hr.size() || norm_in[norm_hr.size()] == L'\\';
 }
 
+bool IsRealHostDDrivePathW(const ParsedVirtualPath& parsed,
+                           const std::wstring& g_root,
+                           const std::wstring& g_overlay_root,
+                           const std::wstring& t_root,
+                           const std::wstring& s_root,
+                           const std::vector<VfsSubMount>& sub_mounts) {
+    if (!parsed.is_d_drive) {
+        return false;
+    }
+    if (MatchesHostRootPrefixW(parsed.stripped_raw, g_root) ||
+        MatchesHostRootPrefixW(parsed.stripped_raw, t_root) ||
+        MatchesHostRootPrefixW(parsed.stripped_raw, s_root) ||
+        MatchesHostRootPrefixW(parsed.stripped_raw, g_overlay_root)) {
+        return true;
+    }
+    for (const auto& sub : sub_mounts) {
+        if (MatchesHostRootPrefixW(parsed.stripped_raw, sub.host_root)) {
+            return true;
+        }
+    }
+#if defined(_WIN32)
+    if (!parsed.parts.empty()) {
+        // If the virtual relative path matches a configured nested sub-mount or an existing
+        // entry/top-level directory in G: base or CoW overlay, treat it as an Xbox virtual D:\ path.
+        for (const auto& sub : sub_mounts) {
+            const auto prefix_parts = SplitCanonicalPartsView(sub.virtual_prefix);
+            if (!prefix_parts.empty() && parsed.parts.size() >= prefix_parts.size()) {
+                bool match = true;
+                for (size_t i = 0; i < prefix_parts.size(); ++i) {
+                    if (!EqualsIgnoreCaseAsciiW(parsed.parts[i], prefix_parts[i])) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match) {
+                    return false;
+                }
+            }
+        }
+        if (!g_root.empty()) {
+            const std::wstring base_plain = JoinRootAndParts(g_root, parsed.parts, PathPrefixKind::None);
+            if (HostPathExistsW(base_plain)) {
+                return false;
+            }
+            std::vector<std::wstring_view> top_part{parsed.parts[0]};
+            const std::wstring top_base = JoinRootAndParts(g_root, top_part, PathPrefixKind::None);
+            if (HostPathExistsW(top_base)) {
+                return false;
+            }
+        }
+        if (!g_overlay_root.empty()) {
+            const std::wstring ovl_plain = JoinRootAndParts(g_overlay_root, parsed.parts, PathPrefixKind::None);
+            if (HostPathExistsW(ovl_plain)) {
+                return false;
+            }
+        }
+        // Otherwise, if D:\<top-component> exists on the real physical D:\ drive (e.g. D:\a on
+        // GitHub Actions runners or D:\Games on a user PC), never hijack real host D:\ files!
+        std::wstring host_top = L"D:\\";
+        host_top.append(parsed.parts[0]);
+        if (HostPathExistsW(host_top)) {
+            return true;
+        }
+    }
+#endif
+    return false;
+}
+
 void ResolveGameBaseTarget(const std::wstring& g_root,
                            const std::vector<VfsSubMount>& sub_mounts,
                            const std::vector<std::wstring_view>& parts,
@@ -1216,19 +1284,9 @@ VfsTranslateStatus VfsMounts::TranslateForAccessW(std::wstring_view virtual_path
         return parse_st;
     }
 
-    // Avoid double-translating real host paths when a backing mount itself resides on D:\ (e.g. CI runners).
-    if (parsed.is_d_drive) {
-        if (MatchesHostRootPrefixW(parsed.stripped_raw, g_root_) ||
-            MatchesHostRootPrefixW(parsed.stripped_raw, t_root_) ||
-            MatchesHostRootPrefixW(parsed.stripped_raw, s_root_) ||
-            MatchesHostRootPrefixW(parsed.stripped_raw, g_overlay_root_)) {
-            return VfsTranslateStatus::NotVirtual;
-        }
-        for (const auto& sub : g_sub_mounts_) {
-            if (MatchesHostRootPrefixW(parsed.stripped_raw, sub.host_root)) {
-                return VfsTranslateStatus::NotVirtual;
-            }
-        }
+    // Avoid hijacking real host paths on D:\ (e.g. GitHub Actions D:\a\... or host data drives).
+    if (IsRealHostDDrivePathW(parsed, g_root_, g_overlay_root_, t_root_, s_root_, g_sub_mounts_)) {
+        return VfsTranslateStatus::NotVirtual;
     }
 
     // T:\ and S:\ are directly writable mounts (no CoW overlay needed).
@@ -1443,7 +1501,8 @@ bool VfsMounts::IsWhiteoutedW(std::wstring_view virtual_path) const {
     }
     ParsedVirtualPath parsed;
     if (ParseVirtualPathW(virtual_path, parsed) != VfsTranslateStatus::Translated ||
-        parsed.drive != VfsDrive::Game) {
+        parsed.drive != VfsDrive::Game ||
+        IsRealHostDDrivePathW(parsed, g_root_, g_overlay_root_, t_root_, s_root_, g_sub_mounts_)) {
         return false;
     }
     return HasAnyWhiteoutInOverlay(g_overlay_root_, parsed.parts);
@@ -1458,7 +1517,8 @@ bool VfsMounts::IsVisibleGamePathW(std::wstring_view virtual_path, bool* out_is_
 #else
     ParsedVirtualPath parsed;
     if (ParseVirtualPathW(virtual_path, parsed) != VfsTranslateStatus::Translated ||
-        parsed.drive != VfsDrive::Game || (g_root_.empty() && g_sub_mounts_.empty())) {
+        parsed.drive != VfsDrive::Game || (g_root_.empty() && g_sub_mounts_.empty()) ||
+        IsRealHostDDrivePathW(parsed, g_root_, g_overlay_root_, t_root_, s_root_, g_sub_mounts_)) {
         return false;
     }
     if (!g_overlay_root_.empty() && HasAnyWhiteoutInOverlay(g_overlay_root_, parsed.parts)) {
@@ -1869,7 +1929,8 @@ VfsTranslateStatus VfsMounts::ResolveGamePairW(std::wstring_view virtual_path,
     if (st != VfsTranslateStatus::Translated) {
         return st;
     }
-    if (parsed.drive != VfsDrive::Game) {
+    if (parsed.drive != VfsDrive::Game ||
+        IsRealHostDDrivePathW(parsed, g_root_, g_overlay_root_, t_root_, s_root_, g_sub_mounts_)) {
         return VfsTranslateStatus::NotVirtual;
     }
     if (g_root_.empty() && g_sub_mounts_.empty()) {
