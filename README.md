@@ -101,7 +101,7 @@ We are actively looking for testers and contributors on **[Discord](https://disc
 <br/>
 
 <!-- OPENSCARLETT_STATUS_START -->
-**Automated Tests:** `6/6` passing · **Shimmed DLLs:** `30` (`1012` PE exports) · **Shipping GDK Thunks:** `292/292` · **RDNA2 Opcodes Decoded:** `774/779` · **Validated Shader Corpus:** `3120/3120` · **Verified Hardware:** `7 PCs` (`NVIDIA` + `AMD`)
+**Automated Tests:** `67/67` passing · **Shimmed DLLs:** `30` (`1012` PE exports) · **Shipping GDK Thunks:** `292/292` · **RDNA2 Opcodes Decoded:** `774/779` · **Validated Shader Corpus:** `3120/3120` · **Verified Hardware:** `7 PCs` (`NVIDIA` + `AMD`)
 
 | Subsystem | Area | Status | Honest Progress | Technical Coverage | Verified On |
 | :--- | :--- | :--- | :---: | :--- | :--- |
