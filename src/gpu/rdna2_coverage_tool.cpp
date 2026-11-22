@@ -2981,6 +2981,146 @@ struct D3D12BenchContext {
         rb->Unmap(0, nullptr);
         return true;
     }
+
+    bool RunMeshDrawQuad(const std::vector<uint8_t>& as_dxil,
+                         const std::vector<uint8_t>& ms_dxil,
+                         const std::vector<uint8_t>& ps_dxil,
+                         std::vector<float>& out_rgba32f_4x4) {
+        if (!device || warp_hung || mesh_tier < 10u || device->GetDeviceRemovedReason() != S_OK) {
+            return false;
+        }
+        ComRef<ID3D12Device2> dev2;
+        ComRef<ID3D12GraphicsCommandList6> cl6;
+        if (FAILED(device->QueryInterface(OS_BENCH_IID(ID3D12Device2), dev2.PutVoid())) ||
+            FAILED(cmd_list->QueryInterface(OS_BENCH_IID(ID3D12GraphicsCommandList6), cl6.PutVoid()))) {
+            return false;
+        }
+
+        constexpr uint32_t kW = 4u;
+        constexpr uint32_t kH = 4u;
+        constexpr uint32_t kPitch = 256u;
+        out_rgba32f_4x4.assign(kW * kH * 4u, 0.0f);
+
+        D3D12_ROOT_SIGNATURE_DESC rsd{};
+        ComRef<ID3DBlob> sig_blob;
+        ComRef<ID3DBlob> err_blob;
+        if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, sig_blob.Put(), err_blob.Put()))) {
+            return false;
+        }
+        ComRef<ID3D12RootSignature> root_sig;
+        if (FAILED(device->CreateRootSignature(
+                0, sig_blob->GetBufferPointer(), sig_blob->GetBufferSize(),
+                OS_BENCH_IID(ID3D12RootSignature), root_sig.PutVoid()))) {
+            return false;
+        }
+
+        std::vector<uint8_t> stream_buf;
+        stream_buf.reserve(512u);
+        auto push_subobj = [&](D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type, const auto& val) {
+            constexpr size_t kPtrAlign = alignof(void*);
+            const size_t pad = (kPtrAlign - (stream_buf.size() % kPtrAlign)) % kPtrAlign;
+            stream_buf.insert(stream_buf.end(), pad, 0u);
+            const size_t t_off = stream_buf.size();
+            stream_buf.resize(t_off + sizeof(type));
+            std::memcpy(stream_buf.data() + t_off, &type, sizeof(type));
+            const size_t v_align = alignof(std::decay_t<decltype(val)>);
+            const size_t v_pad = (v_align - (stream_buf.size() % v_align)) % v_align;
+            stream_buf.insert(stream_buf.end(), v_pad, 0u);
+            const size_t v_off = stream_buf.size();
+            stream_buf.resize(v_off + sizeof(val));
+            std::memcpy(stream_buf.data() + v_off, &val, sizeof(val));
+        };
+
+        ID3D12RootSignature* rs_ptr = root_sig.Get();
+        D3D12_SHADER_BYTECODE bc_as{as_dxil.data(), as_dxil.size()};
+        D3D12_SHADER_BYTECODE bc_ms{ms_dxil.data(), ms_dxil.size()};
+        D3D12_SHADER_BYTECODE bc_ps{ps_dxil.data(), ps_dxil.size()};
+        D3D12_BLEND_DESC blend{};
+        blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        UINT sample_mask = 0xFFFFFFFFu;
+        D3D12_RASTERIZER_DESC rast{};
+        rast.FillMode = D3D12_FILL_MODE_SOLID;
+        rast.CullMode = D3D12_CULL_MODE_NONE;
+        rast.DepthClipEnable = TRUE;
+        D3D12_RT_FORMAT_ARRAY rtvs{};
+        rtvs.NumRenderTargets = 1u;
+        rtvs.RTFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+        DXGI_SAMPLE_DESC samp{1u, 0u};
+
+        push_subobj(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, rs_ptr);
+        push_subobj(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, bc_as);
+        push_subobj(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, bc_ms);
+        push_subobj(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, bc_ps);
+        push_subobj(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, blend);
+        push_subobj(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, sample_mask);
+        push_subobj(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, rast);
+        push_subobj(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, rtvs);
+        push_subobj(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, samp);
+
+        D3D12_PIPELINE_STATE_STREAM_DESC sd{};
+        sd.SizeInBytes = stream_buf.size();
+        sd.pPipelineStateSubobjectStream = stream_buf.data();
+        ComRef<ID3D12PipelineState> pso;
+        if (FAILED(dev2->CreatePipelineState(&sd, OS_BENCH_IID(ID3D12PipelineState), pso.PutVoid()))) {
+            return false;
+        }
+
+        auto rt = CreateTex2D(kW, kH, 1u, DXGI_FORMAT_R32G32B32A32_FLOAT,
+                              D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        auto rb = CreateBuffer(kPitch * kH, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST);
+        if (!rt || !rb) return false;
+
+        D3D12_DESCRIPTOR_HEAP_DESC rhd{};
+        rhd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        rhd.NumDescriptors = 1u;
+        ComRef<ID3D12DescriptorHeap> rtv_heap;
+        if (FAILED(device->CreateDescriptorHeap(&rhd, OS_BENCH_IID(ID3D12DescriptorHeap), rtv_heap.PutVoid()))) {
+            return false;
+        }
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv_h = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        device->CreateRenderTargetView(rt.Get(), nullptr, rtv_h);
+
+        if (FAILED(allocator->Reset())) return false;
+        if (FAILED(cmd_list->Reset(allocator.Get(), pso.Get()))) return false;
+        const float clear_col[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        cmd_list->ClearRenderTargetView(rtv_h, clear_col, 0, nullptr);
+        D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(kW), static_cast<float>(kH), 0.0f, 1.0f};
+        D3D12_RECT sc{0, 0, static_cast<LONG>(kW), static_cast<LONG>(kH)};
+        cmd_list->RSSetViewports(1, &vp);
+        cmd_list->RSSetScissorRects(1, &sc);
+        cmd_list->OMSetRenderTargets(1, &rtv_h, FALSE, nullptr);
+        cmd_list->SetGraphicsRootSignature(root_sig.Get());
+        cl6->DispatchMesh(1u, 1u, 1u);
+
+        D3D12_RESOURCE_BARRIER to_copy{};
+        to_copy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        to_copy.Transition = {rt.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                              D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE};
+        cmd_list->ResourceBarrier(1, &to_copy);
+
+        D3D12_TEXTURE_COPY_LOCATION dst_loc{};
+        dst_loc.pResource = rb.Get();
+        dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        dst_loc.PlacedFootprint.Footprint = {DXGI_FORMAT_R32G32B32A32_FLOAT, kW, kH, 1u, kPitch};
+        D3D12_TEXTURE_COPY_LOCATION src_loc{};
+        src_loc.pResource = rt.Get();
+        src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        src_loc.SubresourceIndex = 0u;
+        cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
+
+        if (FAILED(cmd_list->Close())) return false;
+        ID3D12CommandList* lists[] = {cmd_list.Get()};
+        queue->ExecuteCommandLists(1, lists);
+        if (!WaitGpu()) return false;
+
+        void* mapped = nullptr;
+        if (FAILED(rb->Map(0, nullptr, &mapped))) return false;
+        for (uint32_t y = 0; y < kH; ++y) {
+            std::memcpy(&out_rgba32f_4x4[y * kW * 4u], static_cast<const uint8_t*>(mapped) + y * kPitch, kW * 16u);
+        }
+        rb->Unmap(0, nullptr);
+        return true;
+    }
 };
 #endif
 
@@ -3676,7 +3816,7 @@ void BuildExtendedSvGpuKernels(std::vector<PreparedExtKernel>& kernels, std::str
                        ExtKernelKind::DualUav, ExtParityMode::ExactU32, true, first_error);
     }
 
-    // 4. SMEM (12 opcodes via root CBV b0 on D3D12 HW + WARP)
+    // 4. SMEM (all 18 non-time SMEM opcodes incl. s_scratch_load_dword/x2/x4 & s_get_waveid_in_workgroup)
     {
         std::vector<uint32_t> code;
         uint16_t slot = 0u;
@@ -3701,11 +3841,16 @@ void BuildExtendedSvGpuKernels(std::vector<PreparedExtKernel>& kernels, std::str
         for (uint8_t k = 0; k < 8u; ++k) store_s(code, static_cast<uint8_t>(8u + k), slot);
         enc(code, "s_buffer_load_dwordx16", 16u, {Rdna2Operand::Sgpr(0)}, 0);
         for (uint8_t k = 0; k < 16u; ++k) store_s(code, static_cast<uint8_t>(16u + k), slot);
+        enc(code, "s_scratch_load_dword", 4u, {Rdna2Operand::Sgpr(0)}, 4); store_s(code, 4u, slot);
+        enc(code, "s_scratch_load_dwordx2", 4u, {Rdna2Operand::Sgpr(0)}, 8); store_s64(code, 4u, slot);
+        enc(code, "s_scratch_load_dwordx4", 4u, {Rdna2Operand::Sgpr(0)}, 16);
+        for (uint8_t k = 0; k < 4u; ++k) store_s(code, static_cast<uint8_t>(4u + k), slot);
+        enc(code, "s_get_waveid_in_workgroup", 4u, {}, 0); store_s(code, 4u, slot);
         enc(code, "s_endpgm", 0u, {});
 
         std::vector<uint32_t> rc(16u, 0u);
         for (uint32_t i = 0; i < 16u; ++i) rc[i] = 0x51A00000u | (i * 0x111u + 7u);
-        AppendSvKernel(kernels, "sv_smem_all", 5u, 32u, code, std::vector<uint32_t>(64u, 1u), 64u, rc,
+        AppendSvKernel(kernels, "sv_smem_all", 5u, 32u, code, std::vector<uint32_t>(96u, 1u), 96u, rc,
                        ExtKernelKind::CbvAndDualUav, ExtParityMode::ExactU32, false, first_error);
     }
 
@@ -3874,7 +4019,7 @@ void BuildExtendedSvGpuKernels(std::vector<PreparedExtKernel>& kernels, std::str
         enc(code, "v_subrev_f32", 5u, {Rdna2Operand::Vgpr(2), Rdna2Operand::Vgpr(3)}); store_v(code, 5u, slot);
         enc(code, "v_mov_b32", 5u, {Rdna2Operand::InlineFloat(1.0f)});
         enc(code, "v_fmac_legacy_f32", 5u, {Rdna2Operand::Vgpr(2), Rdna2Operand::Vgpr(3)}); store_v(code, 5u, slot);
-        enc(code, "v_mul_legacy_f32", 5u, {Rdna2Operand::Vgpr(2), Rdna2Operand::Vgpr(3)}); store_v(code, 5u, slot);
+        enc(code, "v_mul_dx9_zero_f32", 5u, {Rdna2Operand::Vgpr(2), Rdna2Operand::Vgpr(3)}); store_v(code, 5u, slot);
         enc(code, "v_mul_f32", 5u, {Rdna2Operand::Vgpr(2), Rdna2Operand::Vgpr(3)}); store_v(code, 5u, slot);
         enc(code, "v_min_f32", 5u, {Rdna2Operand::Vgpr(2), Rdna2Operand::Vgpr(3)}); store_v(code, 5u, slot);
         enc(code, "v_max_f32", 5u, {Rdna2Operand::Vgpr(2), Rdna2Operand::Vgpr(3)}); store_v(code, 5u, slot);
@@ -4340,7 +4485,9 @@ void BuildExtendedSvGpuKernels(std::vector<PreparedExtKernel>& kernels, std::str
            << "RWByteAddressBuffer _uav0 : register(u0);\n"
            << "RWByteAddressBuffer _uav1 : register(u1);\n";
         if (uses_vopc) {
-            os << "groupshared uint _wm_shared;\n";
+            // Atomic-free per-lane ballot array (fixes AMD RDNA4 RX 9070 XT Issue #29
+            // single-wave scalar-store vs InterlockedOr hazard on groupshared _wm_shared)
+            os << "groupshared uint _wm_lanes[" << std::max<uint32_t>(32u, tg_x) << "];\n";
         }
         os << "uint _ff1_64(uint2 x) {\n"
            << "    if (x.x != 0u) return firstbitlow(x.x);\n"
@@ -4591,10 +4738,18 @@ void BuildExtendedSvGpuKernels(std::vector<PreparedExtKernel>& kernels, std::str
            << "    if (_f64_is_zero(u)) return u;\n"
            << "    return uint2(u.x, (u.y & 0x800FFFFFu) | 0x3FE00000u);\n"
            << "}\n"
-           << "bool _fclass_f32(float x, uint mask) {\n"
-           << "    uint b = asuint(x); bool neg = (b >> 31u) != 0u; uint ex = (b >> 23u) & 0xFFu; uint fr = b & 0x7FFFFFu;\n"
+           << "bool _fclass_f32_bits(uint b, uint mask) {\n"
+           << "    bool neg = (b >> 31u) != 0u; uint ex = (b >> 23u) & 0xFFu; uint fr = b & 0x7FFFFFu;\n"
            << "    uint bit_i = 0u;\n"
            << "    if (ex == 0xFFu) bit_i = (fr == 0u) ? (neg ? 2u : 9u) : (((fr & 0x400000u) != 0u) ? 1u : 0u);\n"
+           << "    else if (ex == 0u) bit_i = (fr == 0u) ? (neg ? 5u : 6u) : (neg ? 4u : 7u);\n"
+           << "    else bit_i = neg ? 3u : 8u;\n"
+           << "    return ((mask >> bit_i) & 1u) != 0u;\n"
+           << "}\n"
+           << "bool _fclass_f16_bits(uint h, uint mask) {\n"
+           << "    h &= 0xFFFFu; bool neg = (h >> 15u) != 0u; uint ex = (h >> 10u) & 0x1Fu; uint fr = h & 0x3FFu;\n"
+           << "    uint bit_i = 0u;\n"
+           << "    if (ex == 0x1Fu) bit_i = (fr == 0u) ? (neg ? 2u : 9u) : (((fr & 0x200u) != 0u) ? 1u : 0u);\n"
            << "    else if (ex == 0u) bit_i = (fr == 0u) ? (neg ? 5u : 6u) : (neg ? 4u : 7u);\n"
            << "    else bit_i = neg ? 3u : 8u;\n"
            << "    return ((mask >> bit_i) & 1u) != 0u;\n"
@@ -4643,24 +4798,36 @@ void BuildExtendedSvGpuKernels(std::vector<PreparedExtKernel>& kernels, std::str
            << "    if (cc == 14u) return un || gt || eq;\n"
            << "    return true;\n"
            << "}\n"
-           << "bool _cmp_f32(float a, float b, uint cc) {\n"
-           << "    bool un = ((asuint(a) & 0x7FFFFFFFu) > 0x7F800000u) || ((asuint(b) & 0x7FFFFFFFu) > 0x7F800000u);\n"
+           << "bool _cmp_f32_bits(uint a, uint b, uint cc) {\n"
+           << "    bool na = (a & 0x7FFFFFFFu) > 0x7F800000u; bool nb = (b & 0x7FFFFFFFu) > 0x7F800000u;\n"
+           << "    bool un = na || nb;\n"
            << "    if (cc == 0u) return false;\n"
-           << "    if (cc == 1u) return !un && (a < b);\n"
-           << "    if (cc == 2u) return !un && (a == b);\n"
-           << "    if (cc == 3u) return !un && (a <= b);\n"
-           << "    if (cc == 4u) return !un && (a > b);\n"
-           << "    if (cc == 5u) return !un && (a != b);\n"
-           << "    if (cc == 6u) return !un && (a >= b);\n"
+           << "    if (cc == 15u) return true;\n"
            << "    if (cc == 7u) return !un;\n"
            << "    if (cc == 8u) return un;\n"
-           << "    if (cc == 9u) return un || (a < b);\n"
-           << "    if (cc == 10u) return un || (a == b);\n"
-           << "    if (cc == 11u) return un || (a <= b);\n"
-           << "    if (cc == 12u) return un || (a > b);\n"
-           << "    if (cc == 13u) return un || (a != b);\n"
-           << "    if (cc == 14u) return un || (a >= b);\n"
-           << "    return true;\n"
+           << "    uint aa = ((a & 0x7FFFFFFFu) == 0u) ? 0u : a;\n"
+           << "    uint bb = ((b & 0x7FFFFFFFu) == 0u) ? 0u : b;\n"
+           << "    uint oa = ((aa & 0x80000000u) != 0u) ? ~aa : (aa | 0x80000000u);\n"
+           << "    uint ob = ((bb & 0x80000000u) != 0u) ? ~bb : (bb | 0x80000000u);\n"
+           << "    bool lt = (!un) && (oa < ob); bool eq = (!un) && (oa == ob); bool gt = (!un) && (oa > ob);\n"
+           << "    bool ord_res = (((cc & 1u) != 0u) && lt) || (((cc & 2u) != 0u) && eq) || (((cc & 4u) != 0u) && gt);\n"
+           << "    return ((cc & 8u) != 0u) ? (un || ord_res) : ord_res;\n"
+           << "}\n"
+           << "bool _cmp_f16_bits(uint a, uint b, uint cc) {\n"
+           << "    a &= 0xFFFFu; b &= 0xFFFFu;\n"
+           << "    bool na = (a & 0x7FFFu) > 0x7C00u; bool nb = (b & 0x7FFFu) > 0x7C00u;\n"
+           << "    bool un = na || nb;\n"
+           << "    if (cc == 0u) return false;\n"
+           << "    if (cc == 15u) return true;\n"
+           << "    if (cc == 7u) return !un;\n"
+           << "    if (cc == 8u) return un;\n"
+           << "    uint aa = ((a & 0x7FFFu) == 0u) ? 0u : a;\n"
+           << "    uint bb = ((b & 0x7FFFu) == 0u) ? 0u : b;\n"
+           << "    uint oa = ((aa & 0x8000u) != 0u) ? (0xFFFFu - aa) : (aa | 0x8000u);\n"
+           << "    uint ob = ((bb & 0x8000u) != 0u) ? (0xFFFFu - bb) : (bb | 0x8000u);\n"
+           << "    bool lt = (!un) && (oa < ob); bool eq = (!un) && (oa == ob); bool gt = (!un) && (oa > ob);\n"
+           << "    bool ord_res = (((cc & 1u) != 0u) && lt) || (((cc & 2u) != 0u) && eq) || (((cc & 4u) != 0u) && gt);\n"
+           << "    return ((cc & 8u) != 0u) ? (un || ord_res) : ord_res;\n"
            << "}\n"
            << "uint _sad_u8(uint s0, uint s1, uint s2) {\n"
            << "    uint r = s2;\n"
@@ -4685,11 +4852,10 @@ void BuildExtendedSvGpuKernels(std::vector<PreparedExtKernel>& kernels, std::str
         auto emit_wave_mask = [&](const std::string& cond_expr, bool to_exec) {
             os << "    { bool _act = ((_exec_lo >> _lid) & 1u) != 0u;\n"
                << "      bool _cr = _act && (" << cond_expr << ");\n"
-               << "      if (_lid == 0u) _wm_shared = 0u;\n"
+               << "      _wm_lanes[_lid] = _cr ? (1u << _lid) : 0u;\n"
                << "      GroupMemoryBarrierWithGroupSync();\n"
-               << "      if (_cr) InterlockedOr(_wm_shared, 1u << _lid);\n"
-               << "      GroupMemoryBarrierWithGroupSync();\n"
-               << "      uint _wm = _wm_shared;\n"
+               << "      uint _wm = 0u;\n"
+               << "      [unroll] for (uint _wi = 0u; _wi < " << tg_x << "u; ++_wi) _wm |= _wm_lanes[_wi];\n"
                << "      GroupMemoryBarrierWithGroupSync();\n";
             if (to_exec) {
                 os << "      _exec_lo = _wm; _exec_hi = 0u; }\n";
@@ -4716,7 +4882,11 @@ void BuildExtendedSvGpuKernels(std::vector<PreparedExtKernel>& kernels, std::str
                 if (inst.opcode == Rdna2Opcode::BUFFER_LOAD_DWORD) {
                     os << "    if (((_exec_lo >> _lid) & 1u) != 0u) v[" << vd << "] = " << buf << ".Load(" << addr << ");\n";
                 } else if (inst.opcode == Rdna2Opcode::BUFFER_STORE_DWORD) {
-                    os << "    if (((_exec_lo >> _lid) & 1u) != 0u) " << buf << ".Store(" << addr << ", v[" << vd << "]);\n";
+                    if (inst.offen) {
+                        os << "    if (((_exec_lo >> _lid) & 1u) != 0u) " << buf << ".Store(" << addr << ", v[" << vd << "]);\n";
+                    } else {
+                        os << "    if (_exec_lo != 0u && _lid == firstbitlow(_exec_lo)) " << buf << ".Store(" << addr << ", v[" << vd << "]);\n";
+                    }
                 }
                 continue;
             }
@@ -4895,21 +5065,40 @@ void BuildExtendedSvGpuKernels(std::vector<PreparedExtKernel>& kernels, std::str
             if (enc == Rdna2Encoding::VOPC) {
                 const uint16_t cop = raw;
                 const bool to_exec = e->writes_exec;
+                auto apply_mod32 = [](std::string x, const Rdna2Operand& op) {
+                    if (op.abs) x = "(" + x + " & 0x7FFFFFFFu)";
+                    if (op.neg) x = "(" + x + " ^ 0x80000000u)";
+                    return x;
+                };
+                auto apply_mod16 = [](std::string x, const Rdna2Operand& op) {
+                    x = "(" + x + " & 0xFFFFu)";
+                    if (op.abs) x = "(" + x + " & 0x7FFFu)";
+                    if (op.neg) x = "(" + x + " ^ 0x8000u)";
+                    return x;
+                };
+                auto apply_mod64 = [](std::string x, const Rdna2Operand& op) {
+                    if (op.abs) x = "uint2((" + x + ").x, (" + x + ").y & 0x7FFFFFFFu)";
+                    if (op.neg) x = "uint2((" + x + ").x, (" + x + ").y ^ 0x80000000u)";
+                    return x;
+                };
                 std::string cond = "false";
                 if (cop == 0x88u || cop == 0x98u) {
-                    cond = "_fclass_f32(asfloat(" + read_v32(inst.src[0]) + "), " + read_v32(inst.src[1]) + ")";
+                    cond = "_fclass_f32_bits(" + apply_mod32(read_v32(inst.src[0]), inst.src[0]) + ", " + read_v32(inst.src[1]) + ")";
                 } else if (cop == 0xA8u || cop == 0xB8u) {
-                    cond = "_fclass_f64(" + read_v64(inst.src[0]) + ", " + read_v32(inst.src[1]) + ")";
+                    cond = "_fclass_f64(" + apply_mod64(read_v64(inst.src[0]), inst.src[0]) + ", " + read_v32(inst.src[1]) + ")";
                 } else if (cop == 0x8Fu || cop == 0x9Fu) {
-                    cond = "_fclass_f32(f16tof32(" + read_v32(inst.src[0]) + " & 0xFFFFu), " + read_v32(inst.src[1]) + ")";
+                    cond = "_fclass_f16_bits(" + apply_mod16(read_v32(inst.src[0]), inst.src[0]) + ", " + read_v32(inst.src[1]) + ")";
                 } else if ((cop >= 0x10u && cop <= 0x1Fu) || (cop >= 0x30u && cop <= 0x3Fu)) {
-                    cond = "_cmp_f32(asfloat(" + read_v32(inst.src[0]) + "), asfloat(" + read_v32(inst.src[1]) + "), " + std::to_string(cop & 15u) + "u)";
+                    cond = "_cmp_f32_bits(" + apply_mod32(read_v32(inst.src[0]), inst.src[0]) + ", " +
+                           apply_mod32(read_v32(inst.src[1]), inst.src[1]) + ", " + std::to_string(cop & 15u) + "u)";
                 } else if ((cop >= 0x20u && cop <= 0x2Fu) || (cop >= 0x40u && cop <= 0x4Fu)) {
-                    cond = "_cmp_f64(" + read_v64(inst.src[0]) + ", " + read_v64(inst.src[1]) + ", " + std::to_string(cop & 15u) + "u)";
+                    cond = "_cmp_f64(" + apply_mod64(read_v64(inst.src[0]), inst.src[0]) + ", " +
+                           apply_mod64(read_v64(inst.src[1]), inst.src[1]) + ", " + std::to_string(cop & 15u) + "u)";
                 } else if ((cop >= 0xC8u && cop <= 0xCFu) || (cop >= 0xD8u && cop <= 0xDFu) ||
                            (cop >= 0xE8u && cop <= 0xEFu) || (cop >= 0xF8u && cop <= 0xFFu)) {
                     const uint32_t cc = ((cop & 0x10u) ? 8u : 0u) | (cop & 7u);
-                    cond = "_cmp_f32(f16tof32(" + read_v32(inst.src[0]) + " & 0xFFFFu), f16tof32(" + read_v32(inst.src[1]) + " & 0xFFFFu), " + std::to_string(cc) + "u)";
+                    cond = "_cmp_f16_bits(" + apply_mod16(read_v32(inst.src[0]), inst.src[0]) + ", " +
+                           apply_mod16(read_v32(inst.src[1]), inst.src[1]) + ", " + std::to_string(cc) + "u)";
                 } else if ((cop >= 0x50u && cop <= 0x57u) || (cop >= 0x70u && cop <= 0x77u)) {
                     const uint32_t c = cop & 7u;
                     const std::string a = "(asint((" + read_v32(inst.src[0]) + " & 0xFFFFu) << 16u) >> 16)";
@@ -6489,6 +6678,84 @@ void RunExtendedGpuOpcodeVerification(
                     ++out_report.workloads[0u].gpu_passed;
                     audit.MarkGpuOpcodes(vs_lift.instructions);
                     audit.MarkGpuOpcodes(ps_lift.instructions);
+                }
+
+                // 6. Real D3D12 Amplification + Mesh + Pixel Shader Draw (MeshTier >= 10) on HW + WARP!
+                const bool hw_mesh = (d3d_hw_opt && d3d_hw_opt->mesh_tier >= 10u);
+                const bool warp_mesh = (d3d_warp_opt && d3d_warp_opt->mesh_tier >= 10u);
+                if (hw_mesh || warp_mesh) {
+                    Rdna2Assembler as_a;
+                    as_a.EmitSopk(Rdna2Opcode::S_MOVK_I32, 0, 1);
+                    as_a.EmitSopk(Rdna2Opcode::S_MOVK_I32, 1, 1);
+                    as_a.EmitSopk(Rdna2Opcode::S_MOVK_I32, 2, 1);
+                    as_a.EmitSopp(Rdna2Opcode::S_SENDMSG, static_cast<int16_t>(kRdna2SendMsgDispatchMesh));
+                    as_a.EmitSopp(Rdna2Opcode::S_ENDPGM);
+
+                    Rdna2Assembler ms_a;
+                    ms_a.EmitSop1(Rdna2Opcode::S_MOV_B32, 124u /*M0*/, Rdna2Operand::LiteralU32(PackGsAllocReqM0(3u, 1u)));
+                    ms_a.EmitSopp(Rdna2Opcode::S_SENDMSG, static_cast<int16_t>(kRdna2SendMsgGsAllocReq));
+                    ms_a.EmitVop2(Rdna2Opcode::V_AND_B32, 1, Rdna2Operand::InlineInt(1), 0);
+                    ms_a.EmitVop2(Rdna2Opcode::V_LSHRREV_B32, 2, Rdna2Operand::InlineInt(1), 0);
+                    ms_a.EmitVop1(Rdna2Opcode::V_CVT_F32_U32, 3, Rdna2Operand::Vgpr(1));
+                    ms_a.EmitVop1(Rdna2Opcode::V_CVT_F32_U32, 4, Rdna2Operand::Vgpr(2));
+                    ms_a.EmitVop3(Rdna2Opcode::V_FMA_F32, 5, Rdna2Operand::Vgpr(3), Rdna2Operand::LiteralF32(4.0f), Rdna2Operand::InlineFloat(-1.0f));
+                    ms_a.EmitVop3(Rdna2Opcode::V_FMA_F32, 6, Rdna2Operand::Vgpr(4), Rdna2Operand::LiteralF32(4.0f), Rdna2Operand::InlineFloat(-1.0f));
+                    ms_a.EmitVop1(Rdna2Opcode::V_MOV_B32, 7, Rdna2Operand::InlineFloat(0.0f));
+                    ms_a.EmitVop1(Rdna2Opcode::V_MOV_B32, 8, Rdna2Operand::InlineFloat(1.0f));
+                    ms_a.EmitVop1(Rdna2Opcode::V_MOV_B32, 10, Rdna2Operand::LiteralF32(0.25f));
+                    ms_a.EmitVop1(Rdna2Opcode::V_MOV_B32, 11, Rdna2Operand::InlineFloat(0.5f));
+                    ms_a.EmitVop1(Rdna2Opcode::V_MOV_B32, 12, Rdna2Operand::LiteralF32(0.75f));
+                    ms_a.EmitVop1(Rdna2Opcode::V_MOV_B32, 13, Rdna2Operand::InlineFloat(1.0f));
+                    ms_a.EmitExp(static_cast<uint8_t>(Rdna2ExportTarget::Pos0), 5, 6, 7, 8, 0xFu, false);
+                    ms_a.EmitExp(static_cast<uint8_t>(Rdna2ExportTarget::Param0), 10, 11, 12, 13, 0xFu, false);
+                    const uint32_t packed_prim = (2u << 20) | (1u << 10) | 0u;
+                    ms_a.EmitVop1(Rdna2Opcode::V_MOV_B32, 14, Rdna2Operand::LiteralU32(packed_prim));
+                    ms_a.EmitExp(static_cast<uint8_t>(Rdna2ExportTarget::Prim), 14, 0, 0, 0, 0x1u, true, true);
+                    ms_a.EmitSopp(Rdna2Opcode::S_ENDPGM);
+
+                    Rdna2LiftOptions mopts = gopts;
+                    mopts.mesh_has_payload = true;
+                    Rdna2LiftResult as_lift{};
+                    Rdna2LiftResult ms_lift{};
+                    if (LiftRdna2Xs2Shader(as_a.BuildXs2(ShaderStage::Amplification, 1, 1, 1, 16, 16, 32), as_lift, gopts).ok() &&
+                        LiftRdna2Xs2Shader(ms_a.BuildXs2(ShaderStage::Mesh, 32, 1, 1, 16, 16, 32), ms_lift, mopts).ok()) {
+                        bool mesh_any = false;
+                        bool mesh_ok = true;
+                        auto run_mesh = [&](D3D12BenchContext* ctx, const char* tag, uint32_t& counter) {
+                            if (!ctx || ctx->mesh_tier < 10u) return;
+                            std::vector<float> fb;
+                            bool ok = !as_lift.pc_dxil.empty() && !ms_lift.pc_dxil.empty() && !ps_lift.pc_dxil.empty() &&
+                                      ctx->RunMeshDrawQuad(as_lift.pc_dxil, ms_lift.pc_dxil, ps_lift.pc_dxil, fb);
+                            if (ok) {
+                                for (size_t px = 0; px < 16u; ++px) {
+                                    for (size_t c = 0; c < 4u; ++c) {
+                                        if (std::fabs(fb[px * 4u + c] - expected_rgba[c]) > 1e-4f) {
+                                            ok = false;
+                                            break;
+                                        }
+                                    }
+                                    if (!ok) break;
+                                }
+                            }
+                            if (ok) {
+                                ++counter;
+                                mesh_any = true;
+                            } else {
+                                mesh_ok = false;
+                                std::fprintf(stderr, "[EXT-GPU-FAIL] %s (as_ms_ps_draw): mesh draw parity mismatch\n", tag);
+                            }
+                        };
+                        run_mesh(d3d_hw_opt, "D3D12 HW", out_report.corpus_gpu_hw_executed);
+                        run_mesh(d3d_warp_opt, "D3D12 WARP", out_report.corpus_gpu_warp_executed);
+                        if (mesh_any && mesh_ok) {
+                            ++out_report.corpus_gpu_executed;
+                            ++out_report.stages[static_cast<size_t>(StageSlot::AS)].gpu_passed;
+                            ++out_report.stages[static_cast<size_t>(StageSlot::MS)].gpu_passed;
+                            ++out_report.workloads[4u].gpu_passed;
+                            audit.MarkGpuOpcodes(as_lift.instructions);
+                            audit.MarkGpuOpcodes(ms_lift.instructions);
+                        }
+                    }
                 }
             }
         }

@@ -1,4 +1,5 @@
 #include "openscarlett/gpu/rdna2_lifter.h"
+#include "openscarlett/gpu/rdna2_rayquery_bridge.h"
 #include "openscarlett/gpu/rdna2_xbox_container.h"
 
 #include <algorithm>
@@ -9,6 +10,7 @@
 #include <fstream>
 #include <mutex>
 #include <sstream>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -208,6 +210,7 @@ constexpr uint32_t kSpvDecSample = 17u;
 constexpr uint32_t kSpvDecNonWritable = 24u;
 constexpr uint32_t kSpvDecNonReadable = 25u;
 constexpr uint32_t kSpvDecLocation = 30u;
+constexpr uint32_t kSpvDecComponent = 31u;
 constexpr uint32_t kSpvDecBinding = 33u;
 constexpr uint32_t kSpvDecDescriptorSet = 34u;
 constexpr uint32_t kSpvDecOffset = 35u;
@@ -366,6 +369,34 @@ uint32_t ModuleCullDistanceCount(const Rdna2IrModule& ir) noexcept {
         }
     }
     return count;
+}
+
+bool ModuleUsesViewportArrayIndex(const Rdna2IrModule& ir) noexcept {
+    for (const auto& bb : ir.blocks) {
+        for (const auto& inst : bb.instructions) {
+            if (inst.op != IrOp::Export) continue;
+            if (inst.export_target != static_cast<uint8_t>(Rdna2ExportTarget::Pos1)) continue;
+            if (inst.imm_u32 == 0xFFFFFFFFu) continue;
+            if (inst.operands.size() < 3u) continue;
+            if (const auto* z_def = ir.FindDef(inst.operands[2])) {
+                if (z_def->op == IrOp::ConstU32 && z_def->imm_u32 == 0u) continue;
+                if (z_def->op == IrOp::ConstF32 && FloatToBits(z_def->imm_f32) == 0u) continue;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ModuleUsesComparisonSample(const Rdna2IrModule& ir) noexcept {
+    for (const auto& bb : ir.blocks) {
+        for (const auto& inst : bb.instructions) {
+            if (inst.op == IrOp::ImageSample && (inst.imm_u32 & 0x80u) != 0u) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 enum class SpvValKind : uint8_t {
@@ -730,6 +761,11 @@ public:
             ModuleUsesOp(ir_, IrOp::FFloor) || ModuleUsesOp(ir_, IrOp::FCeil) ||
             ModuleUsesOp(ir_, IrOp::FFract) || ModuleUsesOp(ir_, IrOp::FMin) ||
             ModuleUsesOp(ir_, IrOp::FMax);
+        const bool uses_exact_trans =
+            ModuleUsesOp(ir_, IrOp::FRcp) || ModuleUsesOp(ir_, IrOp::FRsq) ||
+            ModuleUsesOp(ir_, IrOp::FSqrt);
+        const bool uses_cmp_f16 = ModuleUsesOp(ir_, IrOp::CmpF16);
+        const bool uses_cmp_sample = ModuleUsesComparisonSample(ir_);
         const bool uses_ps_quad_deriv =
             (ir_.stage == ShaderStage::Pixel) &&
             (ir_.uses_pixel_quad_derivatives || ModuleUsesOp(ir_, IrOp::ImageSampleImplicit));
@@ -743,11 +779,19 @@ public:
         hoisted_mesh_counts_ = false;
 
         const uint32_t orig_tg = std::max(1u, ir_.threadgroup_x * ir_.threadgroup_y * ir_.threadgroup_z);
-        const uint32_t hw_tg_x = (bounded_wave64_dispatcher_ && is_group_stage)
-                                     ? ((orig_tg <= 64u) ? 32u : std::max(32u, (orig_tg + 1u) / 2u))
-                                     : ir_.threadgroup_x;
-        const uint32_t hw_tg_y = (bounded_wave64_dispatcher_ && is_group_stage) ? 1u : ir_.threadgroup_y;
-        const uint32_t hw_tg_z = (bounded_wave64_dispatcher_ && is_group_stage) ? 1u : ir_.threadgroup_z;
+        // Wave32 split execution for >128-thread console mesh shaders (e.g. 256-thread Xbox mesh shaders
+        // on D3D12 where max mesh threadgroup size is 128; xcl #39 / xbox-emulator #172).
+        mesh_wave32_split_ =
+            (ir_.stage == ShaderStage::Mesh) && !bounded_wave64_dispatcher_ && (orig_tg > 128u);
+        mesh_split_passes_ = mesh_wave32_split_ ? ((orig_tg + 127u) / 128u) : 1u;
+        orig_tg_total_ = orig_tg;
+        const uint32_t hw_tg_x = mesh_wave32_split_
+                                     ? 128u
+                                     : ((bounded_wave64_dispatcher_ && is_group_stage)
+                                            ? ((orig_tg <= 64u) ? 32u : std::max(32u, (orig_tg + 1u) / 2u))
+                                            : ir_.threadgroup_x);
+        const uint32_t hw_tg_y = ((bounded_wave64_dispatcher_ || mesh_wave32_split_) && is_group_stage) ? 1u : ir_.threadgroup_y;
+        const uint32_t hw_tg_z = ((bounded_wave64_dispatcher_ || mesh_wave32_split_) && is_group_stage) ? 1u : ir_.threadgroup_z;
         const uint32_t hw_tg_total = std::max(1u, hw_tg_x * hw_tg_y * hw_tg_z);
 
         std::ostringstream hdr;
@@ -800,6 +844,9 @@ public:
         }
         if (ir_.uses_texture_sample) {
             hdr << "SamplerState _samp0 : register(s0);\n";
+        }
+        if (uses_cmp_sample) {
+            hdr << "SamplerComparisonState _samp_cmp0 : register(s1);\n";
         }
         uint32_t next_rw_u = uses_dual_uav ? 2u : 1u;
         if (ir_.uses_texture_uav) {
@@ -1005,17 +1052,69 @@ public:
                    "    return r;\n"
                    "}\n";
         }
+        if (uses_exact_trans) {
+            hdr << "// Bit-exact RDNA2 f32 rcp / rsq / sqrt helpers (xbox-emulator #180)\n";
+            hdr << "float _os_rcp_f32(float x) {\n"
+                   "    uint b = asuint(x); uint s = b & 0x80000000u; uint a = b & 0x7FFFFFFFu;\n"
+                   "    if (a > 0x7F800000u) return asfloat(b | 0x00400000u);\n"
+                   "    if (a == 0u) return asfloat(s | 0x7F800000u);\n"
+                   "    if (a == 0x7F800000u) return asfloat(s);\n"
+                   "    return 1.0 / x;\n"
+                   "}\n"
+                   "float _os_rsq_f32(float x) {\n"
+                   "    uint b = asuint(x); uint s = b & 0x80000000u; uint a = b & 0x7FFFFFFFu;\n"
+                   "    if (a > 0x7F800000u) return asfloat(b | 0x00400000u);\n"
+                   "    if (a == 0u) return asfloat(s | 0x7F800000u);\n"
+                   "    if (s != 0u) return asfloat(0x7FC00000u);\n"
+                   "    if (a == 0x7F800000u) return 0.0;\n"
+                   "    return rsqrt(x);\n"
+                   "}\n"
+                   "float _os_sqrt_f32(float x) {\n"
+                   "    uint b = asuint(x); uint s = b & 0x80000000u; uint a = b & 0x7FFFFFFFu;\n"
+                   "    if (a > 0x7F800000u) return asfloat(b | 0x00400000u);\n"
+                   "    if (a == 0u) return x;\n"
+                   "    if (s != 0u) return asfloat(0x7FC00000u);\n"
+                   "    if (a == 0x7F800000u) return x;\n"
+                   "    return sqrt(x);\n"
+                   "}\n";
+        }
+        if (uses_cmp_f16) {
+            hdr << "// Bit-exact integer IEEE-754 f16 comparison helper (immune to DXIL fast-math NaN elision)\n";
+            hdr << "bool _os_cmp_f16_bits(uint pred, uint ah, uint bh) {\n"
+                   "    ah &= 0xFFFFu; bh &= 0xFFFFu;\n"
+                   "    bool na = (ah & 0x7FFFu) > 0x7C00u; bool nb = (bh & 0x7FFFu) > 0x7C00u;\n"
+                   "    bool un = na || nb;\n"
+                   "    if (pred == 0u) return false;\n"
+                   "    if (pred == 15u) return true;\n"
+                   "    if (pred == 7u) return !un;\n"
+                   "    if (pred == 8u) return un;\n"
+                   "    uint aa = ((ah & 0x7FFFu) == 0u) ? 0u : ah;\n"
+                   "    uint bb = ((bh & 0x7FFFu) == 0u) ? 0u : bh;\n"
+                   "    uint oa = ((aa & 0x8000u) != 0u) ? (0xFFFFu - aa) : (aa | 0x8000u);\n"
+                   "    uint ob = ((bb & 0x8000u) != 0u) ? (0xFFFFu - bb) : (bb | 0x8000u);\n"
+                   "    bool lt = (!un) && (oa < ob); bool eq = (!un) && (oa == ob); bool gt = (!un) && (oa > ob);\n"
+                   "    bool ord_res = (((pred & 1u) != 0u) && lt) || (((pred & 2u) != 0u) && eq) || (((pred & 4u) != 0u) && gt);\n"
+                   "    return ((pred & 8u) != 0u) ? (un || ord_res) : ord_res;\n"
+                   "}\n";
+        }
         if (uses_ps_quad_deriv) {
-            hdr << "// Pixel shader helper-lane-aware 2x2 quad affine derivative tracking\n";
+            hdr << "// Pixel shader helper-lane-aware 2x2 quad affine derivative tracking (xcl 550d979)\n";
             if (use_sm65_) {
-                hdr << "float4 _os_sample_affine_quad(float2 uv) {\n"
+                hdr << "float2 _os_sanitize_grad(float2 g) {\n"
+                       "    float gx = ((asuint(g.x) & 0x7F800000u) == 0x7F800000u) ? 0.0 : g.x;\n"
+                       "    float gy = ((asuint(g.y) & 0x7F800000u) == 0x7F800000u) ? 0.0 : g.y;\n"
+                       "    return float2(gx, gy);\n"
+                       "}\n"
+                       "float4 _os_sample_affine_quad(float2 uv) {\n"
                        "    float2 _q_uv_x = QuadReadAcrossX(uv);\n"
                        "    float2 _q_uv_y = QuadReadAcrossY(uv);\n"
-                       "    float2 _quad_dx = abs(_q_uv_x - uv);\n"
-                       "    float2 _quad_dy = abs(_q_uv_y - uv);\n"
-                       "    float2 _ddx = ddx_fine(uv);\n"
-                       "    float2 _ddy = ddy_fine(uv);\n"
-                       "    float2 _grad_x = (dot(_ddx, _ddx) > 0.0) ? _ddx : _quad_dx;\n"
+                       "    float2 _q_uv_d = QuadReadAcrossDiagonal(uv);\n"
+                       "    float2 _quad_dx = _os_sanitize_grad(abs(_q_uv_x - uv));\n"
+                       "    float2 _quad_dy = _os_sanitize_grad(abs(_q_uv_y - uv));\n"
+                       "    float2 _quad_dd = _os_sanitize_grad(abs(_q_uv_d - _q_uv_y));\n"
+                       "    float2 _ddx = _os_sanitize_grad(ddx_fine(uv));\n"
+                       "    float2 _ddy = _os_sanitize_grad(ddy_fine(uv));\n"
+                       "    float2 _grad_x = (dot(_ddx, _ddx) > 0.0) ? _ddx : ((dot(_quad_dx, _quad_dx) > 0.0) ? _quad_dx : _quad_dd);\n"
                        "    float2 _grad_y = (dot(_ddy, _ddy) > 0.0) ? _ddy : _quad_dy;\n"
                        "    return _tex0.SampleGrad(_samp0, uv, _grad_x, _grad_y);\n"
                        "}\n";
@@ -1091,6 +1190,11 @@ public:
 
         const uint32_t param_out_count = ModuleParamOutputCount(ir_);
         const uint32_t param_in_count = uses_stage_in ? std::max(1u, ModuleParamInputCount(ir_)) : 0u;
+        param_in_count_ = param_in_count;
+        uses_viewport_idx_ =
+            (ir_.stage == ShaderStage::Vertex || ir_.stage == ShaderStage::Geometry || ir_.stage == ShaderStage::Mesh)
+                ? ModuleUsesViewportArrayIndex(ir_)
+                : false;
         cull_dist_count_ =
             (ir_.stage == ShaderStage::Vertex || ir_.stage == ShaderStage::Geometry || ir_.stage == ShaderStage::Mesh)
                 ? ModuleCullDistanceCount(ir_)
@@ -1114,6 +1218,9 @@ public:
                 out_target = use_sm65_ ? "vs_6_5" : "vs_5_0";
                 hdr << "struct VSOut {\n";
                 hdr << "    float4 pos : SV_POSITION;\n";
+                if (uses_viewport_idx_) {
+                    hdr << "    uint viewport_index : SV_ViewportArrayIndex;\n";
+                }
                 for (uint32_t p = 0u; p < param_out_count; ++p) {
                     hdr << "    " << HlslInterpModifier(SafeInterpMode(ir_.output_interp_modes, p))
                         << "float4 param" << p << " : TEXCOORD" << p << ";\n";
@@ -1128,6 +1235,9 @@ public:
                 hdr << "VSOut main(uint _vid : SV_VertexID) {\n";
                 hdr << "    VSOut _out;\n";
                 hdr << "    _out.pos = float4(0.0, 0.0, 0.0, 1.0);\n";
+                if (uses_viewport_idx_) {
+                    hdr << "    _out.viewport_index = 0u;\n";
+                }
                 for (uint32_t p = 0u; p < param_out_count; ++p) {
                     hdr << "    _out.param" << p << " = float4(0.0, 0.0, 0.0, 1.0);\n";
                 }
@@ -1157,6 +1267,9 @@ public:
                 hdr << "};\n";
                 hdr << "struct GSOut {\n";
                 hdr << "    float4 pos : SV_POSITION;\n";
+                if (uses_viewport_idx_) {
+                    hdr << "    uint viewport_index : SV_ViewportArrayIndex;\n";
+                }
                 for (uint32_t p = 0u; p < param_out_count; ++p) {
                     hdr << "    " << HlslInterpModifier(SafeInterpMode(ir_.output_interp_modes, p))
                         << "float4 param" << p << " : TEXCOORD" << p << ";\n";
@@ -1172,6 +1285,9 @@ public:
                 hdr << "void main(triangle GSIn _gs_in[3], inout TriangleStream<GSOut> _gs_stream) {\n";
                 hdr << "    GSOut _gs_out;\n";
                 hdr << "    _gs_out.pos = float4(0.0, 0.0, 0.0, 1.0);\n";
+                if (uses_viewport_idx_) {
+                    hdr << "    _gs_out.viewport_index = 0u;\n";
+                }
                 for (uint32_t p = 0u; p < param_out_count; ++p) {
                     hdr << "    _gs_out.param" << p << " = float4(0.0, 0.0, 0.0, 1.0);\n";
                 }
@@ -1199,6 +1315,9 @@ public:
                 }
                 hdr << "struct MeshVert {\n";
                 hdr << "    float4 pos : SV_POSITION;\n";
+                if (uses_viewport_idx_) {
+                    hdr << "    uint viewport_index : SV_ViewportArrayIndex;\n";
+                }
                 for (uint32_t p = 0u; p < param_out_count; ++p) {
                     hdr << "    " << HlslInterpModifier(SafeInterpMode(ir_.output_interp_modes, p))
                         << "float4 param" << p << " : TEXCOORD" << p << ";\n";
@@ -1305,14 +1424,14 @@ public:
             }
         }
 
-        // Bounded wave64-on-wave32 two-half execution wrapper for Mesh / Amplification / Geometry shaders
-        if (bounded_wave64_dispatcher_) {
-            if (is_group_stage) {
+        // Bounded wave64-on-wave32 two-half execution OR wave32 >128-thread mesh split execution
+        if (bounded_wave64_dispatcher_ || mesh_wave32_split_) {
+            if (bounded_wave64_dispatcher_ && is_group_stage) {
                 hdr << "    if (_gtid == 0u) { _w64_ballot[0] = 0u; _w64_ballot[1] = 0u; }\n";
                 hdr << "    GroupMemoryBarrierWithGroupSync();\n";
             }
             if (ir_.stage == ShaderStage::Mesh) {
-                // Hoist uniform SetMeshOutputCounts before the two-half loop so DXC validates single call
+                // Hoist uniform SetMeshOutputCounts before the split loop so DXC validates single call
                 for (const auto& inst : ir_.blocks[0].instructions) {
                     if (inst.op == IrOp::SetMeshOutputCounts) {
                         auto resolve_uniform_u32 = [&](IrValueId id, uint32_t fallback) -> std::string {
@@ -1331,24 +1450,34 @@ public:
                     }
                 }
             }
-            hdr << "    // Bounded wave64-on-wave32 two-half execution dispatcher (half = 0..1)\n";
-            hdr << "    [unroll]\n";
-            hdr << "    for (uint _w64_half = 0u; _w64_half < 2u; ++_w64_half) {\n";
-            if (is_group_stage) {
-                hdr << "        uint _hw_lane = (WaveGetLaneCount() >= 32u) ? (WaveGetLaneIndex() & 31u) : (_gtid & 31u);\n";
-                hdr << "        uint _w64_lane = (_w64_half * 32u) + _hw_lane;\n";
-                hdr << "        uint _w64_gtid = ((_gtid & ~31u) * 2u) + _w64_lane;\n";
-                hdr << "        InterlockedOr(_w64_ballot[_w64_half], 1u << (_w64_lane & 31u));\n";
+            if (mesh_wave32_split_) {
+                hdr << "    // Wave32 split execution for " << orig_tg << "-thread console mesh shader ("
+                    << mesh_split_passes_ << " passes x 128 hw threads; xcl #39 / xbox-emulator #172)\n";
+                hdr << "    [unroll]\n";
+                hdr << "    for (uint _ms_pass = 0u; _ms_pass < " << mesh_split_passes_ << "u; ++_ms_pass) {\n";
+                hdr << "        uint _w64_gtid = (_ms_pass * 128u) + _gtid;\n";
+                hdr << "        if (_w64_gtid >= " << orig_tg << "u) { continue; }\n";
             } else {
-                hdr << "        uint _w64_lane = (_w64_half * 32u) + (WaveGetLaneIndex() & 31u);\n";
-                hdr << "        uint _w64_gtid = _w64_lane;\n";
-                hdr << "        _w64_ballot[_w64_half] = WaveActiveBallot(true).x;\n";
+                hdr << "    // Bounded wave64-on-wave32 two-half execution dispatcher (half = 0..1)\n";
+                hdr << "    [unroll]\n";
+                hdr << "    for (uint _w64_half = 0u; _w64_half < 2u; ++_w64_half) {\n";
+                if (is_group_stage) {
+                    hdr << "        uint _hw_lane = (WaveGetLaneCount() >= 32u) ? (WaveGetLaneIndex() & 31u) : (_gtid & 31u);\n";
+                    hdr << "        uint _w64_lane = (_w64_half * 32u) + _hw_lane;\n";
+                    hdr << "        uint _w64_gtid = ((_gtid & ~31u) * 2u) + _w64_lane;\n";
+                    hdr << "        InterlockedOr(_w64_ballot[_w64_half], 1u << (_w64_lane & 31u));\n";
+                } else {
+                    hdr << "        uint _w64_lane = (_w64_half * 32u) + (WaveGetLaneIndex() & 31u);\n";
+                    hdr << "        uint _w64_gtid = _w64_lane;\n";
+                    hdr << "        _w64_ballot[_w64_half] = WaveActiveBallot(true).x;\n";
+                }
             }
         }
 
+        const bool wrap_split_loop = bounded_wave64_dispatcher_ || mesh_wave32_split_;
         const bool wrap_as_single_dispatch =
-            (!bounded_wave64_dispatcher_ && ir_.stage == ShaderStage::Amplification);
-        const int base_depth = (bounded_wave64_dispatcher_ || wrap_as_single_dispatch) ? 2 : 1;
+            (!wrap_split_loop && ir_.stage == ShaderStage::Amplification);
+        const int base_depth = (wrap_split_loop || wrap_as_single_dispatch) ? 2 : 1;
         Rdna2CfgAnalysis cfg_info{};
         AnalyzeRdna2Cfg(ir_, cfg_info);
         std::ostringstream body;
@@ -1363,8 +1492,8 @@ public:
                 hdr << body.str();
             }
         } else {
-            EmitStateMachine(hdr, bounded_wave64_dispatcher_ ? 2 : 1);
-            if (!bounded_wave64_dispatcher_) {
+            EmitStateMachine(hdr, wrap_split_loop ? 2 : 1);
+            if (!wrap_split_loop) {
                 if (ir_.stage == ShaderStage::Vertex) {
                     hdr << "    return _out;\n";
                 } else if (ir_.stage == ShaderStage::Pixel) {
@@ -1372,7 +1501,7 @@ public:
                 }
             }
         }
-        if (bounded_wave64_dispatcher_) {
+        if (wrap_split_loop) {
             hdr << "    }\n";
         }
         if (ir_.stage == ShaderStage::Amplification) {
@@ -1428,7 +1557,7 @@ private:
     }
 
     std::string EmitReturnStmt() const {
-        if (bounded_wave64_dispatcher_) return "continue;";
+        if (bounded_wave64_dispatcher_ || mesh_wave32_split_) return "continue;";
         if (ir_.stage == ShaderStage::Vertex) return "return _out;";
         if (ir_.stage == ShaderStage::Pixel) return "return _mrt0;";
         if (ir_.stage == ShaderStage::Amplification) return "break;";
@@ -1516,7 +1645,7 @@ private:
                 case IrOp::ThreadIdX:
                     if (ir_.stage == ShaderStage::Vertex) {
                         os << ind << "_v" << inst.id << " = _vid;\n";
-                    } else if (bounded_wave64_dispatcher_) {
+                    } else if (bounded_wave64_dispatcher_ || mesh_wave32_split_) {
                         os << ind << "_v" << inst.id << " = _w64_gtid;\n";
                     } else if (ir_.stage == ShaderStage::Geometry) {
                         os << ind << "_v" << inst.id << " = 0u;\n";
@@ -1527,7 +1656,7 @@ private:
                     }
                     break;
                 case IrOp::MeshGlobalThreadId: {
-                    const char* lidx = bounded_wave64_dispatcher_ ? "_w64_gtid" : "_gtid";
+                    const char* lidx = (bounded_wave64_dispatcher_ || mesh_wave32_split_) ? "_w64_gtid" : "_gtid";
                     const uint32_t nt = inst.imm_u32 ? inst.imm_u32 : ir_.mesh_num_threads;
                     os << ind << "_v" << inst.id << " = (_gid.x * " << nt << "u + " << lidx << ");\n";
                     break;
@@ -1537,7 +1666,7 @@ private:
                     const uint32_t ws = (ir_.wave_size == 64u) ? 64u : 32u;
                     const uint32_t nwaves = std::min(15u, std::max(1u, (tg_total + ws - 1u) / ws));
                     if (ir_.stage == ShaderStage::Mesh) {
-                        const char* lidx = bounded_wave64_dispatcher_ ? "_w64_gtid" : "_gtid";
+                        const char* lidx = (bounded_wave64_dispatcher_ || mesh_wave32_split_) ? "_w64_gtid" : "_gtid";
                         const uint32_t wshift = (ws == 64u) ? 6u : 5u;
                         os << ind << "{\n";
                         os << ind << "    uint _mwi_w = (" << lidx << " >> " << wshift << "u);\n";
@@ -1558,7 +1687,13 @@ private:
                 }
                 case IrOp::StageInput: {
                     const uint32_t pslot = (inst.imm_u32 >> 2) & 3u;
-                    os << ind << "_v" << inst.id << " = _in.param" << pslot << "." << kSwiz[inst.imm_u32 & 3u] << ";\n";
+                    const uint32_t comp = inst.imm_u32 & 3u;
+                    // Default unmapped PS input attributes to (0, 0, 0, 1) (xbox-emulator #181)
+                    if (pslot >= param_in_count_) {
+                        os << ind << "_v" << inst.id << " = " << ((comp == 3u) ? "1.0" : "0.0") << ";\n";
+                    } else {
+                        os << ind << "_v" << inst.id << " = _in.param" << pslot << "." << kSwiz[comp] << ";\n";
+                    }
                     break;
                 }
                 case IrOp::LoadRootConst:
@@ -1630,9 +1765,15 @@ private:
                     break;
                 }
                 case IrOp::ImageSample:
-                    os << ind << "_v" << inst.id << " = _tex0.SampleLevel(_samp0, float2("
-                       << AsF32(inst.operands[0]) << ", " << AsF32(inst.operands[1]) << "), "
-                       << AsF32(inst.operands[2]) << ")." << kSwiz[inst.imm_u32 & 3u] << ";\n";
+                    if ((inst.imm_u32 & 0x80u) != 0u) {
+                        os << ind << "_v" << inst.id << " = _tex0.SampleCmpLevelZero(_samp_cmp0, float2("
+                           << AsF32(inst.operands[0]) << ", " << AsF32(inst.operands[1]) << "), "
+                           << AsF32(inst.operands[2]) << ");\n";
+                    } else {
+                        os << ind << "_v" << inst.id << " = _tex0.SampleLevel(_samp0, float2("
+                           << AsF32(inst.operands[0]) << ", " << AsF32(inst.operands[1]) << "), "
+                           << AsF32(inst.operands[2]) << ")." << kSwiz[inst.imm_u32 & 3u] << ";\n";
+                    }
                     break;
                 case IrOp::ImageSampleImplicit:
                     os << ind << "_v" << inst.id << " = _os_sample_affine_quad(float2("
@@ -1761,14 +1902,25 @@ private:
                         os << ind << "GroupMemoryBarrierWithGroupSync();\n";
                         os << ind << "_v" << inst.id << " = _w64_ballot[" << word_idx << "];\n";
                     } else {
-                        // Per-guest-wave isolated ballot (prevents Wave32 lanes from colliding across halves on 64-lane AMD host waves)
+                        // Atomic-free per-guest-wave isolated ballot via _w64_lanes (immune to AMD RDNA4
+                        // single-wave InterlockedOr / scalar-store barrier elision hazards; Issue #29)
+                        const uint32_t w_mask = ComputeWaveLanesCapacity(ir_) - 1u;
+                        const uint32_t lane_end = (word_idx == 0u)
+                                                      ? std::min(32u, orig_tg_total_)
+                                                      : ((orig_tg_total_ > 32u) ? std::min(32u, orig_tg_total_ - 32u) : 0u);
                         os << ind << "GroupMemoryBarrierWithGroupSync();\n";
-                        os << ind << "if (_w64_lane == 0u) { _w64_ballot[_gw_id * 2u] = 0u; _w64_ballot[_gw_id * 2u + 1u] = 0u; }\n";
+                        os << ind << "_w64_lanes[(_gw_base + _w64_lane) & " << w_mask << "u] = ("
+                           << AsBool(inst.operands[0]) << " ? (1u << (_w64_lane & 31u)) : 0u);\n";
                         os << ind << "GroupMemoryBarrierWithGroupSync();\n";
-                        os << ind << "InterlockedOr(_w64_ballot[_gw_id * 2u + (_w64_lane >> 5u)], (" << AsBool(inst.operands[0])
-                           << " ? (1u << (_w64_lane & 31u)) : 0u));\n";
+                        os << ind << "{ uint _wb = 0u;\n";
+                        if (lane_end > 0u) {
+                            os << ind << "  [unroll] for (uint _wi = 0u; _wi < " << lane_end << "u; ++_wi) {\n";
+                            os << ind << "      _wb |= _w64_lanes[(_gw_base + " << (word_idx * 32u)
+                               << "u + _wi) & " << w_mask << "u];\n";
+                            os << ind << "  }\n";
+                        }
+                        os << ind << "  _v" << inst.id << " = _wb; }\n";
                         os << ind << "GroupMemoryBarrierWithGroupSync();\n";
-                        os << ind << "_v" << inst.id << " = _w64_ballot[_gw_id * 2u + " << word_idx << "u];\n";
                     }
                     break;
                 }
@@ -1839,7 +1991,7 @@ private:
                     }
                     break;
                 case IrOp::ExportMeshPrim: {
-                    const char* idx_var = bounded_wave64_dispatcher_ ? "_w64_gtid" : "_gtid";
+                    const char* idx_var = (bounded_wave64_dispatcher_ || mesh_wave32_split_) ? "_w64_gtid" : "_gtid";
                     if (inst.imm_u32 == 1u) {
                         const std::string p = AsU32(inst.operands[0]);
                         os << ind << "if (" << idx_var << " < _mesh_pcnt) { _prims[" << idx_var
@@ -1853,7 +2005,7 @@ private:
                     break;
                 }
                 case IrOp::ExportMeshCull: {
-                    const char* idx_var = bounded_wave64_dispatcher_ ? "_w64_gtid" : "_gtid";
+                    const char* idx_var = (bounded_wave64_dispatcher_ || mesh_wave32_split_) ? "_w64_gtid" : "_gtid";
                     os << ind << "if (" << idx_var << " < _mesh_pcnt) { _prim_attrs[" << idx_var
                        << "].cull = " << AsBool(inst.operands[0]) << "; }\n";
                     break;
@@ -1909,13 +2061,13 @@ private:
                     os << ind << "_v" << inst.id << " = _os_fmax_f32(" << AsF32(inst.operands[0]) << ", " << AsF32(inst.operands[1]) << ");\n";
                     break;
                 case IrOp::FRcp:
-                    os << ind << "_v" << inst.id << " = rcp(" << AsF32(inst.operands[0]) << ");\n";
+                    os << ind << "_v" << inst.id << " = _os_rcp_f32(" << AsF32(inst.operands[0]) << ");\n";
                     break;
                 case IrOp::FRsq:
-                    os << ind << "_v" << inst.id << " = rsqrt(" << AsF32(inst.operands[0]) << ");\n";
+                    os << ind << "_v" << inst.id << " = _os_rsq_f32(" << AsF32(inst.operands[0]) << ");\n";
                     break;
                 case IrOp::FSqrt:
-                    os << ind << "_v" << inst.id << " = sqrt(" << AsF32(inst.operands[0]) << ");\n";
+                    os << ind << "_v" << inst.id << " = _os_sqrt_f32(" << AsF32(inst.operands[0]) << ");\n";
                     break;
                 case IrOp::FFloor:
                     os << ind << "_v" << inst.id << " = _os_floor_f32(" << AsF32(inst.operands[0]) << ");\n";
@@ -2153,40 +2305,17 @@ private:
                     const uint32_t op_sel = (imm >> 8) & 3u;
                     const uint32_t neg_m = (imm >> 12) & 3u;
                     const uint32_t abs_m = (imm >> 16) & 3u;
-                    auto f16_op = [&](IrValueId v, uint32_t bit) -> std::string {
+                    auto f16_bits_op = [&](IrValueId v, uint32_t bit) -> std::string {
                         std::string ex = ((op_sel & bit) != 0u)
-                                             ? ("f16tof32((" + AsU32(v) + " >> 16u) & 0xFFFFu)")
-                                             : ("f16tof32(" + AsU32(v) + " & 0xFFFFu)");
-                        if ((abs_m & bit) != 0u) ex = "abs(" + ex + ")";
-                        if ((neg_m & bit) != 0u) ex = "(-" + ex + ")";
+                                             ? ("((" + AsU32(v) + " >> 16u) & 0xFFFFu)")
+                                             : ("(" + AsU32(v) + " & 0xFFFFu)");
+                        if ((abs_m & bit) != 0u) ex = "(" + ex + " & 0x7FFFu)";
+                        if ((neg_m & bit) != 0u) ex = "(" + ex + " ^ 0x8000u)";
                         return ex;
                     };
-                    os << ind << "{\n";
-                    os << ind << "    float _fa16 = " << f16_op(inst.operands[0], 1u) << ";\n";
-                    os << ind << "    float _fb16 = " << f16_op(inst.operands[1], 2u) << ";\n";
-                    os << ind << "    bool _unord16 = isnan(_fa16) || isnan(_fb16);\n";
-                    os << ind << "    _v" << inst.id << " = ";
-                    switch (pred) {
-                        case 0u:  os << "false"; break;
-                        case 1u:  os << "(!_unord16 && (_fa16 < _fb16))"; break;
-                        case 2u:  os << "(!_unord16 && (_fa16 == _fb16))"; break;
-                        case 3u:  os << "(!_unord16 && (_fa16 <= _fb16))"; break;
-                        case 4u:  os << "(!_unord16 && (_fa16 > _fb16))"; break;
-                        case 5u:  os << "(!_unord16 && (_fa16 != _fb16))"; break;
-                        case 6u:  os << "(!_unord16 && (_fa16 >= _fb16))"; break;
-                        case 7u:  os << "(!_unord16)"; break;
-                        case 8u:  os << "_unord16"; break;
-                        case 9u:  os << "(_unord16 || (_fa16 < _fb16))"; break;
-                        case 10u: os << "(_unord16 || (_fa16 == _fb16))"; break;
-                        case 11u: os << "(_unord16 || (_fa16 <= _fb16))"; break;
-                        case 12u: os << "(_unord16 || (_fa16 > _fb16))"; break;
-                        case 13u: os << "(_unord16 || (_fa16 != _fb16))"; break;
-                        case 14u: os << "(_unord16 || (_fa16 >= _fb16))"; break;
-                        case 15u: os << "true"; break;
-                        default:  os << "false"; break;
-                    }
-                    os << ";\n";
-                    os << ind << "}\n";
+                    os << ind << "_v" << inst.id << " = _os_cmp_f16_bits(" << pred << "u, "
+                       << f16_bits_op(inst.operands[0], 1u) << ", "
+                       << f16_bits_op(inst.operands[1], 2u) << ");\n";
                     break;
                 }
                 case IrOp::LogicalAnd:
@@ -2226,7 +2355,7 @@ private:
                     }
                     const std::string vec = "float4(" + AsF32(inst.operands[0]) + ", " + AsF32(inst.operands[1]) +
                                             ", " + AsF32(inst.operands[2]) + ", " + AsF32(inst.operands[3]) + ")";
-                    const char* mesh_idx = bounded_wave64_dispatcher_ ? "_w64_gtid" : "_gtid";
+                    const char* mesh_idx = (bounded_wave64_dispatcher_ || mesh_wave32_split_) ? "_w64_gtid" : "_gtid";
                     if (inst.export_target == static_cast<uint8_t>(Rdna2ExportTarget::Pos0)) {
                         if (ir_.stage == ShaderStage::Vertex) {
                             os << ind << "_out.pos = " << vec << ";\n";
@@ -2236,6 +2365,20 @@ private:
                         } else if (ir_.stage == ShaderStage::Geometry) {
                             os << ind << "_gs_out.pos = " << vec << ";\n";
                             os << ind << "_gs_stream.Append(_gs_out);\n";
+                        }
+                    } else if (inst.export_target == static_cast<uint8_t>(Rdna2ExportTarget::Pos1)) {
+                        // Unpack RDNA2 SV_ViewportArrayIndex from layer bits [19:16] (xbox-emulator #156);
+                        // ignore unmapped Pos1 exports cleanly (xbox-emulator #181).
+                        if (uses_viewport_idx_ && inst.imm_u32 != 0xFFFFFFFFu && inst.operands.size() >= 3u) {
+                            const std::string vp_expr = "((" + AsU32(inst.operands[2]) + " >> 16u) & 0xFu)";
+                            if (ir_.stage == ShaderStage::Vertex) {
+                                os << ind << "_out.viewport_index = " << vp_expr << ";\n";
+                            } else if (ir_.stage == ShaderStage::Mesh) {
+                                os << ind << "if (" << mesh_idx << " < _mesh_vcnt) { _verts["
+                                   << mesh_idx << "].viewport_index = " << vp_expr << "; }\n";
+                            } else if (ir_.stage == ShaderStage::Geometry) {
+                                os << ind << "_gs_out.viewport_index = " << vp_expr << ";\n";
+                            }
                         }
                     } else if (inst.export_target >= static_cast<uint8_t>(Rdna2ExportTarget::Param0) &&
                                inst.export_target <= static_cast<uint8_t>(Rdna2ExportTarget::Param3)) {
@@ -2453,7 +2596,12 @@ private:
     const Rdna2IrModule& ir_;
     bool use_sm65_ = true;
     bool bounded_wave64_dispatcher_ = false;
+    bool mesh_wave32_split_ = false;
+    uint32_t mesh_split_passes_ = 1u;
+    uint32_t orig_tg_total_ = 1u;
     bool hoisted_mesh_counts_ = false;
+    bool uses_viewport_idx_ = false;
+    uint32_t param_in_count_ = 0u;
     uint32_t cull_dist_count_ = 0u;
     std::unordered_map<IrValueId, const IrInstruction*> defs_;
 };
@@ -3669,10 +3817,16 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                 }
                 case IrOp::StageInput: {
                     const uint32_t pslot = (inst.imm_u32 >> 2) & 3u;
-                    const uint32_t vin = (var_param_in[pslot] != 0u) ? var_param_in[pslot] : var_param_in[0];
-                    uint32_t v4 = alloc_id();
-                    EmitSpvInst(sec_fn, SpvOpLoad, {t_v4f32, v4, vin});
-                    EmitSpvInst(sec_fn, SpvOpCompositeExtract, {t_f32, res, v4, inst.imm_u32 & 3u});
+                    const uint32_t comp = inst.imm_u32 & 3u;
+                    const uint32_t vin = (pslot < 4u) ? var_param_in[pslot] : 0u;
+                    if (vin == 0u) {
+                        // Default unmapped PS input attributes to (0, 0, 0, 1) (xbox-emulator #181)
+                        EmitSpvInst(sec_fn, SpvOpFAdd, {t_f32, res, (comp == 3u) ? c_f32_1 : c_f32_0, c_f32_0});
+                    } else {
+                        uint32_t v4 = alloc_id();
+                        EmitSpvInst(sec_fn, SpvOpLoad, {t_v4f32, v4, vin});
+                        EmitSpvInst(sec_fn, SpvOpCompositeExtract, {t_f32, res, v4, comp});
+                    }
                     break;
                 }
                 case IrOp::LoadRootConst: {
@@ -4770,15 +4924,93 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                     EmitSpvInst(sec_fn, SpvOpSelect, {t_f32, res, both_n, qa_f, s2});
                     break;
                 }
-                case IrOp::FRcp:
-                    EmitSpvInst(sec_fn, SpvOpFDiv, {t_f32, res, c_f32_1, get_as_f32(inst.operands[0])});
+                case IrOp::FRcp: {
+                    // Bit-exact RDNA2 f32 rcp: ±0 -> ±inf, ±inf -> ±0, NaN -> QNaN (xbox-emulator #180)
+                    const uint32_t fx = get_as_f32(inst.operands[0]);
+                    const uint32_t c_abs_m = get_const_u32(0x7FFFFFFFu);
+                    const uint32_t c_inf_u = get_const_u32(0x7F800000u);
+                    const uint32_t c_qn_b = get_const_u32(0x00400000u);
+                    uint32_t bx = alloc_id(), sgn = alloc_id(), ax = alloc_id();
+                    uint32_t is_nan = alloc_id(), is_z = alloc_id(), is_inf = alloc_id();
+                    uint32_t qn_u = alloc_id(), qn_f = alloc_id();
+                    uint32_t inf_u = alloc_id(), inf_f = alloc_id(), z_f = alloc_id();
+                    uint32_t norm = alloc_id(), s1 = alloc_id(), s2 = alloc_id();
+                    EmitSpvInst(sec_fn, SpvOpBitcast, {t_u32, bx, fx});
+                    EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, sgn, bx, c_u32_sign_mask});
+                    EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, ax, bx, c_abs_m});
+                    EmitSpvInst(sec_fn, SpvOpUGreaterThan, {t_bool, is_nan, ax, c_inf_u});
+                    EmitSpvInst(sec_fn, SpvOpIEqual, {t_bool, is_z, ax, c_u32_0});
+                    EmitSpvInst(sec_fn, SpvOpIEqual, {t_bool, is_inf, ax, c_inf_u});
+                    EmitSpvInst(sec_fn, SpvOpBitwiseOr, {t_u32, qn_u, bx, c_qn_b});
+                    EmitSpvInst(sec_fn, SpvOpBitcast, {t_f32, qn_f, qn_u});
+                    EmitSpvInst(sec_fn, SpvOpBitwiseOr, {t_u32, inf_u, sgn, c_inf_u});
+                    EmitSpvInst(sec_fn, SpvOpBitcast, {t_f32, inf_f, inf_u});
+                    EmitSpvInst(sec_fn, SpvOpBitcast, {t_f32, z_f, sgn});
+                    EmitSpvInst(sec_fn, SpvOpFDiv, {t_f32, norm, c_f32_1, fx});
+                    EmitSpvInst(sec_fn, SpvOpSelect, {t_f32, s1, is_inf, z_f, norm});
+                    EmitSpvInst(sec_fn, SpvOpSelect, {t_f32, s2, is_z, inf_f, s1});
+                    EmitSpvInst(sec_fn, SpvOpSelect, {t_f32, res, is_nan, qn_f, s2});
                     break;
-                case IrOp::FRsq:
-                    EmitSpvInst(sec_fn, SpvOpExtInst, {t_f32, res, glsl_ext_id, GlslInverseSqrt, get_as_f32(inst.operands[0])});
+                }
+                case IrOp::FRsq: {
+                    // Bit-exact RDNA2 f32 rsq: ±0 -> ±inf, <0 -> QNaN, +inf -> +0, NaN -> QNaN
+                    const uint32_t fx = get_as_f32(inst.operands[0]);
+                    const uint32_t c_abs_m = get_const_u32(0x7FFFFFFFu);
+                    const uint32_t c_inf_u = get_const_u32(0x7F800000u);
+                    const uint32_t c_qn_b = get_const_u32(0x00400000u);
+                    const uint32_t c_qnan_u = get_const_u32(0x7FC00000u);
+                    uint32_t bx = alloc_id(), sgn = alloc_id(), ax = alloc_id();
+                    uint32_t is_nan = alloc_id(), is_z = alloc_id(), is_neg = alloc_id(), is_inf = alloc_id();
+                    uint32_t qn_u = alloc_id(), qn_f = alloc_id(), canon_q = alloc_id();
+                    uint32_t inf_u = alloc_id(), inf_f = alloc_id();
+                    uint32_t norm = alloc_id(), s1 = alloc_id(), s2 = alloc_id(), s3 = alloc_id();
+                    EmitSpvInst(sec_fn, SpvOpBitcast, {t_u32, bx, fx});
+                    EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, sgn, bx, c_u32_sign_mask});
+                    EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, ax, bx, c_abs_m});
+                    EmitSpvInst(sec_fn, SpvOpUGreaterThan, {t_bool, is_nan, ax, c_inf_u});
+                    EmitSpvInst(sec_fn, SpvOpIEqual, {t_bool, is_z, ax, c_u32_0});
+                    EmitSpvInst(sec_fn, SpvOpINotEqual, {t_bool, is_neg, sgn, c_u32_0});
+                    EmitSpvInst(sec_fn, SpvOpIEqual, {t_bool, is_inf, ax, c_inf_u});
+                    EmitSpvInst(sec_fn, SpvOpBitwiseOr, {t_u32, qn_u, bx, c_qn_b});
+                    EmitSpvInst(sec_fn, SpvOpBitcast, {t_f32, qn_f, qn_u});
+                    EmitSpvInst(sec_fn, SpvOpBitcast, {t_f32, canon_q, c_qnan_u});
+                    EmitSpvInst(sec_fn, SpvOpBitwiseOr, {t_u32, inf_u, sgn, c_inf_u});
+                    EmitSpvInst(sec_fn, SpvOpBitcast, {t_f32, inf_f, inf_u});
+                    EmitSpvInst(sec_fn, SpvOpExtInst, {t_f32, norm, glsl_ext_id, GlslInverseSqrt, fx});
+                    EmitSpvInst(sec_fn, SpvOpSelect, {t_f32, s1, is_inf, c_f32_0, norm});
+                    EmitSpvInst(sec_fn, SpvOpSelect, {t_f32, s2, is_neg, canon_q, s1});
+                    EmitSpvInst(sec_fn, SpvOpSelect, {t_f32, s3, is_z, inf_f, s2});
+                    EmitSpvInst(sec_fn, SpvOpSelect, {t_f32, res, is_nan, qn_f, s3});
                     break;
-                case IrOp::FSqrt:
-                    EmitSpvInst(sec_fn, SpvOpExtInst, {t_f32, res, glsl_ext_id, GlslSqrt, get_as_f32(inst.operands[0])});
+                }
+                case IrOp::FSqrt: {
+                    // Bit-exact RDNA2 f32 sqrt: ±0 -> ±0, <0 -> QNaN, +inf -> +inf, NaN -> QNaN
+                    const uint32_t fx = get_as_f32(inst.operands[0]);
+                    const uint32_t c_abs_m = get_const_u32(0x7FFFFFFFu);
+                    const uint32_t c_inf_u = get_const_u32(0x7F800000u);
+                    const uint32_t c_qn_b = get_const_u32(0x00400000u);
+                    const uint32_t c_qnan_u = get_const_u32(0x7FC00000u);
+                    uint32_t bx = alloc_id(), sgn = alloc_id(), ax = alloc_id();
+                    uint32_t is_nan = alloc_id(), is_z = alloc_id(), is_neg = alloc_id(), is_inf = alloc_id();
+                    uint32_t qn_u = alloc_id(), qn_f = alloc_id(), canon_q = alloc_id();
+                    uint32_t norm = alloc_id(), s1 = alloc_id(), s2 = alloc_id(), s3 = alloc_id();
+                    EmitSpvInst(sec_fn, SpvOpBitcast, {t_u32, bx, fx});
+                    EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, sgn, bx, c_u32_sign_mask});
+                    EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, ax, bx, c_abs_m});
+                    EmitSpvInst(sec_fn, SpvOpUGreaterThan, {t_bool, is_nan, ax, c_inf_u});
+                    EmitSpvInst(sec_fn, SpvOpIEqual, {t_bool, is_z, ax, c_u32_0});
+                    EmitSpvInst(sec_fn, SpvOpINotEqual, {t_bool, is_neg, sgn, c_u32_0});
+                    EmitSpvInst(sec_fn, SpvOpIEqual, {t_bool, is_inf, ax, c_inf_u});
+                    EmitSpvInst(sec_fn, SpvOpBitwiseOr, {t_u32, qn_u, bx, c_qn_b});
+                    EmitSpvInst(sec_fn, SpvOpBitcast, {t_f32, qn_f, qn_u});
+                    EmitSpvInst(sec_fn, SpvOpBitcast, {t_f32, canon_q, c_qnan_u});
+                    EmitSpvInst(sec_fn, SpvOpExtInst, {t_f32, norm, glsl_ext_id, GlslSqrt, fx});
+                    EmitSpvInst(sec_fn, SpvOpSelect, {t_f32, s1, is_inf, fx, norm});
+                    EmitSpvInst(sec_fn, SpvOpSelect, {t_f32, s2, is_neg, canon_q, s1});
+                    EmitSpvInst(sec_fn, SpvOpSelect, {t_f32, s3, is_z, fx, s2});
+                    EmitSpvInst(sec_fn, SpvOpSelect, {t_f32, res, is_nan, qn_f, s3});
                     break;
+                }
                 case IrOp::FFloor:
                 case IrOp::FCeil: {
                     // IEEE/ISA-exact NaN quieting + denormal floor/ceil
@@ -5639,6 +5871,15 @@ Status ValidateSpirvBinary(const std::vector<uint32_t>& spirv) {
     int fn_depth = 0;
     bool allow_phi = false;
 
+    // Track 64-bit vector types and Component decorations to reject invalid 64-bit vec2 at Component >= 2 (Leonida #1909)
+    std::unordered_map<uint32_t, uint32_t> scalar_width;
+    std::unordered_map<uint32_t, std::pair<uint32_t, uint32_t>> vec_types;
+    std::unordered_map<uint32_t, std::vector<uint32_t>> struct_members;
+    std::unordered_map<uint32_t, uint32_t> ptr_pointee;
+    std::unordered_map<uint32_t, uint32_t> var_type;
+    std::vector<std::pair<uint32_t, uint32_t>> comp_decors;
+    std::vector<std::tuple<uint32_t, uint32_t, uint32_t>> member_comp_decors;
+
     size_t pos = 5u;
     while (pos < spirv.size()) {
         const uint32_t header = spirv[pos];
@@ -5667,14 +5908,41 @@ Status ValidateSpirvBinary(const std::vector<uint32_t>& spirv) {
                 }
                 saw_entry_point = true;
                 break;
+            case SpvOpTypeInt:
+                if (word_count >= 4u) scalar_width[spirv[pos + 1]] = spirv[pos + 2];
+                break;
+            case SpvOpTypeFloat:
+                if (word_count >= 3u) scalar_width[spirv[pos + 1]] = spirv[pos + 2];
+                break;
+            case SpvOpTypeVector:
+                if (word_count >= 4u) vec_types[spirv[pos + 1]] = {spirv[pos + 2], spirv[pos + 3]};
+                break;
+            case SpvOpTypeStruct:
+                if (word_count >= 2u) {
+                    auto& mems = struct_members[spirv[pos + 1]];
+                    for (uint16_t k = 2u; k < word_count; ++k) mems.push_back(spirv[pos + k]);
+                }
+                break;
+            case SpvOpTypePointer:
+                if (word_count >= 4u) ptr_pointee[spirv[pos + 1]] = spirv[pos + 3];
+                break;
+            case SpvOpVariable:
+                if (word_count >= 4u) var_type[spirv[pos + 2]] = spirv[pos + 1];
+                break;
             case SpvOpDecorate:
                 if (word_count < 3u || spirv[pos + 1] == 0u || spirv[pos + 1] >= bound) {
                     return Status::Error(StatusCode::ShaderError, "Malformed OpDecorate");
+                }
+                if (spirv[pos + 2] == kSpvDecComponent && word_count >= 4u) {
+                    comp_decors.emplace_back(spirv[pos + 1], spirv[pos + 3]);
                 }
                 break;
             case SpvOpMemberDecorate:
                 if (word_count < 4u || spirv[pos + 1] == 0u || spirv[pos + 1] >= bound) {
                     return Status::Error(StatusCode::ShaderError, "Malformed OpMemberDecorate");
+                }
+                if (spirv[pos + 3] == kSpvDecComponent && word_count >= 5u) {
+                    member_comp_decors.emplace_back(spirv[pos + 1], spirv[pos + 2], spirv[pos + 4]);
                 }
                 break;
             case SpvOpFunction:
@@ -5756,6 +6024,36 @@ Status ValidateSpirvBinary(const std::vector<uint32_t>& spirv) {
     if (!saw_capability || !saw_memory_model || !saw_entry_point ||
         !saw_function || !saw_return || !saw_function_end || fn_depth != 0) {
         return Status::Error(StatusCode::ShaderError, "SPIR-V module missing required sections or unbalanced function");
+    }
+
+    // Enforce SPIR-V / Vulkan 64-bit component alignment (Leonida #1909):
+    // 64-bit vec2 occupies 4 32-bit component slots and cannot be placed at Component >= 2 (or odd component).
+    auto check_64bit_vec_component = [&](uint32_t ty_id, uint32_t comp) -> Status {
+        auto vit = vec_types.find(ty_id);
+        if (vit == vec_types.end()) return Status::Ok();
+        auto wit = scalar_width.find(vit->second.first);
+        if (wit == scalar_width.end() || wit->second != 64u) return Status::Ok();
+        const uint32_t elem_cnt = vit->second.second;
+        if (elem_cnt >= 2u && (comp >= 2u || (comp & 1u) != 0u)) {
+            return Status::Error(
+                StatusCode::ShaderError,
+                "SPIR-V 64-bit vec2 cannot be placed at Component >= 2 (exceeds 4-component location slot)");
+        }
+        return Status::Ok();
+    };
+    for (const auto& kv : comp_decors) {
+        uint32_t ty = kv.first;
+        if (auto it = var_type.find(ty); it != var_type.end()) ty = it->second;
+        if (auto it = ptr_pointee.find(ty); it != ptr_pointee.end()) ty = it->second;
+        if (auto st = check_64bit_vec_component(ty, kv.second); !st.ok()) return st;
+    }
+    for (const auto& md : member_comp_decors) {
+        auto sit = struct_members.find(std::get<0>(md));
+        if (sit != struct_members.end() && std::get<1>(md) < sit->second.size()) {
+            if (auto st = check_64bit_vec_component(sit->second[std::get<1>(md)], std::get<2>(md)); !st.ok()) {
+                return st;
+            }
+        }
     }
     return Status::Ok();
 }
@@ -5956,6 +6254,68 @@ Status LiftRdna2Xs2Shader(
         return st;
     }
     out_result.inserted_lockstep_lds_barriers = out_result.ir.inserted_lockstep_lds_barriers;
+
+    // Wire TranslateRdna2BvhIntersectToRayQuery directly into standard RDNA2 lifting
+    // for image_bvh_intersect_ray / image_bvh64_intersect_ray shaders.
+    if (out_result.ir.uses_bvh_ray) {
+        bool is_bvh64 = false;
+        for (const auto& inst : out_result.instructions) {
+            if (inst.encoding == Rdna2Encoding::MIMG && inst.raw_opcode == 0xE7u) {
+                is_bvh64 = true;
+                break;
+            }
+        }
+        const bool request_rayquery =
+            (options.target_profile_override.find("rayquery") != std::string::npos) ||
+            (options.target_profile_override.find("RayQuery") != std::string::npos);
+        Rdna2BvhIntersectDesc rq_desc{};
+        rq_desc.op = is_bvh64 ? Rdna2BvhIntersectOp::ImageBvh64IntersectRay
+                              : Rdna2BvhIntersectOp::ImageBvhIntersectRay32;
+        rq_desc.threadgroup_x = std::max(1u, out_result.ir.threadgroup_x);
+        rq_desc.emit_dxr11_hlsl = options.emit_hlsl;
+        rq_desc.emit_compute_bvh4_fallback_hlsl = !request_rayquery;
+        rq_desc.emit_spirv_ray_query = options.emit_spirv;
+        Rdna2RayQueryTranslationResult rq_res{};
+        if (auto rq_st = TranslateRdna2BvhIntersectToRayQuery(rq_desc, rq_res); rq_st.ok() && request_rayquery) {
+            if (options.emit_spirv) {
+                out_result.spirv_words = std::move(rq_res.spirv_ray_query_words);
+                if (auto st = ValidateSpirvBinary(out_result.spirv_words); !st.ok()) {
+                    CallTelemetry::Global().Record("rdna2_lifter", "LiftRdna2Xs2Shader", CallOutcome::Error, -6);
+                    return st;
+                }
+                if (options.validate_spirv_external) {
+                    if (auto st = ValidateSpirvExternal(out_result.spirv_words, out_result.spirv_val_diagnostics,
+                                                        options.spirv_val_path, options.spirv_target_env);
+                        !st.ok()) {
+                        CallTelemetry::Global().Record("rdna2_lifter", "LiftRdna2Xs2Shader", CallOutcome::Error, -7);
+                        return st;
+                    }
+                }
+            }
+            if (options.emit_hlsl) {
+                out_result.hlsl_source = std::move(rq_res.dxr11_hlsl);
+                out_result.hlsl_target = (options.target_profile_override.find("6_6") != std::string::npos)
+                                             ? "cs_6_6" : "cs_6_5";
+                if (options.compile_dxil_with_dxc) {
+                    if (auto st = CompileHlslWithDxc(out_result.hlsl_source, out_result.hlsl_target, "main",
+                                                     out_result.pc_dxil, out_result.dxc_diagnostics, options.dxc_path);
+                        !st.ok()) {
+                        CallTelemetry::Global().Record("rdna2_lifter", "LiftRdna2Xs2Shader", CallOutcome::Error, -9);
+                        return st;
+                    }
+                    if (options.resign_dxil && !VerifyDxbcContainerHash(out_result.pc_dxil.data(), out_result.pc_dxil.size())) {
+                        if (auto rs = ResignDxilContainer(out_result.pc_dxil); !rs.ok()) {
+                            CallTelemetry::Global().Record("rdna2_lifter", "LiftRdna2Xs2Shader", CallOutcome::Error, -10);
+                            return rs;
+                        }
+                    }
+                    out_result.pc_dxil_hash = HashBytesFnv1a(out_result.pc_dxil.data(), out_result.pc_dxil.size());
+                }
+            }
+            CallTelemetry::Global().Record("rdna2_lifter", "LiftRdna2Xs2Shader", CallOutcome::Ok, 0);
+            return Status::Ok();
+        }
+    }
 
     const bool stage_supports_spirv =
         (out_result.ir.stage == ShaderStage::Compute ||

@@ -337,6 +337,40 @@ float EvalMadF32(float a, float b, float c) noexcept {
     return FlushDenormF32(prod + fc);
 }
 
+// Bit-exact RDNA2 f32 v_rcp_f32 / v_rcp_iflag_f32 / v_rsq_f32 / v_sqrt_f32 helpers
+// handling +/-0, +/-inf, negative inputs, and sNaN/qNaN per AMD GFX10.3 ISA.
+float ExactRcpF32(float x) noexcept {
+    const uint32_t b = FloatToBits(x);
+    const uint32_t sign = b & 0x80000000u;
+    const uint32_t mag = b & 0x7FFFFFFFu;
+    if (mag > 0x7F800000u) return BitsToFloat(0x7FC00000u);  // NaN -> canonical qNaN
+    if (mag == 0u) return BitsToFloat(sign | 0x7F800000u);   // +/-0 -> +/-Inf
+    if (mag == 0x7F800000u) return BitsToFloat(sign);        // +/-Inf -> +/-0
+    return 1.0f / x;
+}
+
+float ExactRsqF32(float x) noexcept {
+    const uint32_t b = FloatToBits(x);
+    const uint32_t sign = b & 0x80000000u;
+    const uint32_t mag = b & 0x7FFFFFFFu;
+    if (mag > 0x7F800000u) return BitsToFloat(0x7FC00000u);  // NaN -> canonical qNaN
+    if (mag == 0u) return BitsToFloat(sign | 0x7F800000u);   // +/-0 -> +/-Inf
+    if (sign != 0u) return BitsToFloat(0x7FC00000u);         // negative (incl. -Inf) -> qNaN
+    if (mag == 0x7F800000u) return 0.0f;                     // +Inf -> +0.0
+    return 1.0f / std::sqrt(x);
+}
+
+float ExactSqrtF32(float x) noexcept {
+    const uint32_t b = FloatToBits(x);
+    const uint32_t sign = b & 0x80000000u;
+    const uint32_t mag = b & 0x7FFFFFFFu;
+    if (mag > 0x7F800000u) return BitsToFloat(0x7FC00000u);  // NaN -> canonical qNaN
+    if (mag == 0u) return BitsToFloat(sign);                 // +/-0 -> +/-0
+    if (sign != 0u) return BitsToFloat(0x7FC00000u);         // negative (incl. -Inf) -> qNaN
+    if (mag == 0x7F800000u) return BitsToFloat(0x7F800000u); // +Inf -> +Inf
+    return std::sqrt(x);
+}
+
 bool IsBranchOp(Rdna2Opcode op) noexcept {
     switch (op) {
         case Rdna2Opcode::S_BRANCH:
@@ -1459,19 +1493,19 @@ Status ExecuteRdna2Cpu(
                                 case Rdna2Opcode::V_RCP_F32:
                                     for (uint32_t l = 0; l < wv.lane_count; ++l) {
                                         if (!lane_active(l)) continue;
-                                        wv.vgpr[l][inst.dst.reg_index] = FloatToBits(clamp_f32(1.0f / read_op_f32(inst.src[0], l)));
+                                        wv.vgpr[l][inst.dst.reg_index] = FloatToBits(clamp_f32(ExactRcpF32(read_op_f32(inst.src[0], l))));
                                     }
                                     break;
                                 case Rdna2Opcode::V_RSQ_F32:
                                     for (uint32_t l = 0; l < wv.lane_count; ++l) {
                                         if (!lane_active(l)) continue;
-                                        wv.vgpr[l][inst.dst.reg_index] = FloatToBits(clamp_f32(1.0f / std::sqrt(read_op_f32(inst.src[0], l))));
+                                        wv.vgpr[l][inst.dst.reg_index] = FloatToBits(clamp_f32(ExactRsqF32(read_op_f32(inst.src[0], l))));
                                     }
                                     break;
                                 case Rdna2Opcode::V_SQRT_F32:
                                     for (uint32_t l = 0; l < wv.lane_count; ++l) {
                                         if (!lane_active(l)) continue;
-                                        wv.vgpr[l][inst.dst.reg_index] = FloatToBits(clamp_f32(std::sqrt(read_op_f32(inst.src[0], l))));
+                                        wv.vgpr[l][inst.dst.reg_index] = FloatToBits(clamp_f32(ExactSqrtF32(read_op_f32(inst.src[0], l))));
                                     }
                                     break;
                                 case Rdna2Opcode::V_FLOOR_F32:
@@ -2245,9 +2279,11 @@ Status ExecuteRdna2Cpu(
                                     for (uint32_t l = 0; l < wv.lane_count; ++l) {
                                         if (!lane_active(l)) continue;
                                         const uint32_t gid_l = wv.global_thread_ids[l];
-                                        float val = 0.0f;
-                                        if (gid_l < state.stage_inputs.size()) {
-                                            val = state.stage_inputs[gid_l][inst.vintrp_chan & 3u];
+                                        const uint32_t ch = inst.vintrp_chan & 3u;
+                                        // Unmapped PS input attributes default to (0, 0, 0, 1) (xbox-emulator #181).
+                                        float val = (ch == 3u) ? 1.0f : 0.0f;
+                                        if (inst.vintrp_attr == 0u && gid_l < state.stage_inputs.size()) {
+                                            val = state.stage_inputs[gid_l][ch];
                                         }
                                         wv.vgpr[l][inst.dst.reg_index] = FloatToBits(val);
                                     }

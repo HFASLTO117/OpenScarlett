@@ -256,6 +256,8 @@ Rdna2Opcode DecodeVop2Opcode(uint16_t raw) {
         case 0x25: return Rdna2Opcode::V_ADD_NC_U32;
         case 0x26: return Rdna2Opcode::V_SUB_NC_U32;
         case 0x2B: return Rdna2Opcode::V_FMAC_F32;
+        case 0x2C: return Rdna2Opcode::V_MADMK_F32;  // GFX10.3 v_fmamk_f32 (mandatory 32-bit literal K)
+        case 0x2D: return Rdna2Opcode::V_MADAK_F32;  // GFX10.3 v_fmaak_f32 (mandatory 32-bit literal K)
         case 0x36: return Rdna2Opcode::V_FMAC_F16;
         case 0x37: return Rdna2Opcode::V_FMAMK_F16;
         case 0x38: return Rdna2Opcode::V_FMAAK_F16;
@@ -2548,14 +2550,14 @@ Status DisassembleRdna2(
             }
             inst.dst = Rdna2Operand::Vgpr(vdst);
             if (inst.opcode == Rdna2Opcode::V_FMAMK_F16 || inst.opcode == Rdna2Opcode::V_MADMK_F32) {
-                // D = S0 * K + VSRC1
-                inst.src[0] = DecodeRdna2SourceOperand(src0, 0u);
+                // D = S0 * K + VSRC1 (share mandatory literal K if src0 == 255)
+                inst.src[0] = DecodeRdna2SourceOperand(src0, lit);
                 inst.src[1] = Rdna2Operand::LiteralU32(lit);
                 inst.src[2] = Rdna2Operand::Vgpr(vsrc1);
                 inst.src_count = 3;
             } else if (inst.opcode == Rdna2Opcode::V_FMAAK_F16 || inst.opcode == Rdna2Opcode::V_MADAK_F32) {
-                // D = S0 * VSRC1 + K
-                inst.src[0] = DecodeRdna2SourceOperand(src0, 0u);
+                // D = S0 * VSRC1 + K (share mandatory literal K if src0 == 255)
+                inst.src[0] = DecodeRdna2SourceOperand(src0, lit);
                 inst.src[1] = Rdna2Operand::Vgpr(vsrc1);
                 inst.src[2] = Rdna2Operand::LiteralU32(lit);
                 inst.src_count = 3;
