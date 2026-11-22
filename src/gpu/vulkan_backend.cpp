@@ -4256,7 +4256,22 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
 
     std::string failure_reason;
     const std::string device_filter = ReadEnvStringTrimmed("OPENSCARLETT_VK_DEVICE");
+    const std::string force_sw = ReadEnvStringTrimmed("OPENSCARLETT_VK_FORCE_SOFTWARE");
     bool matched_filter = false;
+
+    if (!force_sw.empty() && (force_sw[0] == '1' || force_sw[0] == 't' || force_sw[0] == 'T' ||
+                              force_sw[0] == 'y' || force_sw[0] == 'Y')) {
+        failure_reason = "OPENSCARLETT_VK_FORCE_SOFTWARE enabled";
+        if (!allow_software_fallback) {
+            device_info_.selected_device_filter = device_filter;
+            device_info_.matched_device_filter = false;
+            return Status::Error(StatusCode::DeviceError, failure_reason);
+        }
+        Status fb_st = InitializeSoftwareFallback();
+        device_info_.selected_device_filter = device_filter;
+        device_info_.matched_device_filter = false;
+        return fb_st;
+    }
 
 #if defined(_WIN32)
     {

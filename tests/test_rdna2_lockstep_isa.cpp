@@ -184,7 +184,9 @@ void RunOnVulkanSpirv(const std::vector<uint32_t>& spv,
                       uint32_t group_x,
                       const char* label) {
     VulkanBackend vk;
-    OS_REQUIRE(vk.Initialize(true).ok());
+    if (!vk.Initialize(/*allow_software_fallback=*/false).ok() || vk.is_fallback_mode()) {
+        return;  // Hardware Vulkan ICD unavailable on this host (headless CI / software fallback)
+    }
     std::vector<uint32_t> out_u32;
     auto st = vk.ExecuteComputeShader(spv, input_u32, out_u32, group_x);
     if (!st.ok()) {
@@ -231,18 +233,19 @@ struct D3D12DiffContext {
     }
 
     bool Init(bool use_warp) {
-        is_warp = use_warp;
         if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) return false;
         if (use_warp) {
             if (FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)))) return false;
         } else {
             if (FAILED(factory->EnumAdapterByGpuPreference(
                     0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&adapter)))) {
-                return false;
+                if (FAILED(factory->EnumWarpAdapter(IID_PPV_ARGS(&adapter)))) return false;
             }
         }
         DXGI_ADAPTER_DESC1 desc{};
         adapter->GetDesc1(&desc);
+        is_warp = use_warp || ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0) ||
+                  (desc.VendorId == 0x1414u && (desc.DeviceId == 0x008Cu || desc.DedicatedVideoMemory == 0));
         char name_buf[256]{};
         WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name_buf, sizeof(name_buf), nullptr, nullptr);
         adapter_name = name_buf;
