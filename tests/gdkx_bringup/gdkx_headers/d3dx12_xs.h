@@ -62,6 +62,25 @@ struct CD3DX12_RESOURCE_DESC : public D3D12_RESOURCE_DESC {
         d.Flags = flags;
         return CD3DX12_RESOURCE_DESC(d);
     }
+
+    static CD3DX12_RESOURCE_DESC Buffer(
+        const D3D12_RESOURCE_ALLOCATION_INFO& resAllocInfo,
+        D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_NONE) noexcept {
+        return Buffer(resAllocInfo.SizeInBytes, flags, resAllocInfo.Alignment);
+    }
+};
+
+struct CD3DX12_SUBRESOURCE_FOOTPRINT : public D3D12_SUBRESOURCE_FOOTPRINT {
+    CD3DX12_SUBRESOURCE_FOOTPRINT() = default;
+    explicit CD3DX12_SUBRESOURCE_FOOTPRINT(const D3D12_SUBRESOURCE_FOOTPRINT& o) noexcept
+        : D3D12_SUBRESOURCE_FOOTPRINT(o) {}
+    CD3DX12_SUBRESOURCE_FOOTPRINT(const D3D12_RESOURCE_DESC& resDesc, UINT rowPitch) noexcept {
+        Format = resDesc.Format;
+        Width = static_cast<UINT>(resDesc.Width);
+        Height = resDesc.Height;
+        Depth = (resDesc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D) ? resDesc.DepthOrArraySize : 1u;
+        RowPitch = rowPitch;
+    }
 };
 
 struct CD3DX12_CLEAR_VALUE : public D3D12_CLEAR_VALUE {
