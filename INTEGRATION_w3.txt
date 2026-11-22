@@ -1,0 +1,36 @@
+Worker 3 Integration Notes — Sprint 9 + Sprint 10 (v0.5.0-alpha)
+Branch: swarm/s910-gpu-untile-stages
+
+1. New Public Headers:
+   - include/openscarlett/gpu/xg_gpu_untile.h
+   - include/openscarlett/gpu/rdna2_stages_ext.h
+
+2. New Source Files (add to `openscarlett_core` library in CMakeLists.txt):
+   - src/gpu/xg_gpu_untile.cpp
+   - src/gpu/rdna2_stages_ext.cpp
+   Portability notes:
+   - Uses OS_UUIDOF(T) macro (no bare MSVC __uuidof) and clean RAII ComPtr (no <wrl/client.h>).
+   - Strictly rejects WARP/software adapters during D3D12 HW init and gracefully guards missing Vulkan ICDs on headless CI.
+   - Zero warnings at /W4 /WX on MSVC C++20; Clang-CL & MinGW-w64 compatible.
+
+3. New Unit + Live GPU Test Target (add to CMakeLists.txt & CTest):
+   add_executable(test_xg_gpu_untile_and_stages tests/test_xg_gpu_untile_and_stages.cpp)
+   target_link_libraries(test_xg_gpu_untile_and_stages PRIVATE openscarlett_core d3d12 dxgi d3dcompiler ole32 uuid)
+   add_test(NAME xg_gpu_untile_and_stages COMMAND test_xg_gpu_untile_and_stages)
+   (Use platform-conditional Windows libs matching existing GPU test targets in CMakeLists.txt.)
+
+4. Key Capabilities Delivered:
+   - XgGpuUntiler: GPU compute GFX10 untile & retile (DXIL cs_6_5/cs_6_2 + SPIR-V 1.3),
+     bit-exact vs src/gpu/xg_layout.cpp across 64KB_S, 64KB_D, 64KB_R_X, 3D thick,
+     mip-tails, BC1/BC3/BC7, R8/R16/RGBA8/RGBA16F/RGBA32F, plus DCC/HTILE/CMASK fast-clear passthrough.
+   - LiftRdna2HullShader / LiftRdna2DomainShader / LiftRdna2GeometryShader:
+     HS/DS/GS lifting to SM 6.5 DXIL (hs_6_5/ds_6_5/gs_6_5, MD5 re-signed & verified)
+     and SPIR-V 1.3 (TessellationControl/TessellationEvaluation/Geometry, spirv-val clean),
+     including S_SENDMSG GS_EMIT / GS_CUT decoding.
+   - DxrSbtMapper: 64B table / 32B record aligned PC SBT builder with D3D12_DISPATCH_RAYS_DESC,
+     in-place shader identifier patching, and DXR hit-group lookup.
+   - Wave64On32Emulator: exact cross-half 64-lane emulation on Wave32 HW (GTX 1650 Ti), WARP,
+     and Vulkan SPIR-V 1.3 for v_permlane16_b32, v_permlanex16_b32, cross-half v_readlane_b32,
+     s_wqm_b64, and v_mbcnt_lo + v_mbcnt_hi.
+   - AsyncPsoCompilePool: bounded C++20 multi-threaded priority worker pool with content-hash
+     completed + in-flight deduplication, cancellation, telemetry, and free-threaded D3D12 PSO creation.
