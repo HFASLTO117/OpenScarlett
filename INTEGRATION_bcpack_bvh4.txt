@@ -1,0 +1,24 @@
+OpenScarlett Worker 6 (wt-bcpack-bvh4) Integration Manifest
+Branch: feat/bcpack-bvh4-codecs
+
+Modified files:
+- include/openscarlett/io/bcpack.h
+- src/io/bcpack.cpp
+- include/openscarlett/gpu/rt_bvh.h
+- src/gpu/rt_bvh.cpp
+
+New files:
+- include/openscarlett/gpu/bvh4_decoder.h
+- src/gpu/bvh4_decoder.cpp
+- tests/test_bcpack_bvh4.cpp
+- cmake/worker_bcpack_bvh4.cmake
+- INTEGRATION_bcpack_bvh4.txt
+
+CMake integration (add to CMakeLists.txt module list):
+- cmake/worker_bcpack_bvh4.cmake
+
+CTest targets:
+- test_bcpack_bvh4 (new)
+- test_codecs (verified passing, 0 regressions)
+- test_dxr_live (verified passing, 0 regressions)
+- test_gdk_shims (verified passing, 0 regressions)
