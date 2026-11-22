@@ -14,8 +14,11 @@
 #include "openscarlett/gpu/d3d12_xs_abi.h"
 #include "openscarlett/gpu/descriptor_sgpr_bridge.h"
 #include "openscarlett/gpu/frame_capture.h"
+#include "openscarlett/gpu/query_accumulator_x.h"
+#include "openscarlett/gpu/sampler_feedback_x.h"
 #include "openscarlett/gpu/shader_cache.h"
 #include "openscarlett/gpu/vulkan_backend.h"
+#include "openscarlett/gpu/xg_gpu_untile.h"
 #include "openscarlett/kernel/title_va_mirror.h"
 
 namespace openscarlett::d3d12_xs {
@@ -82,7 +85,8 @@ struct XMemAllocationRecord {
 class DeviceX final
     : public ID3D12DeviceX,
       public IOpenScarlettUnifiedMemory,
-      public IOpenScarlettVulkanRouting {
+      public IOpenScarlettVulkanRouting,
+      public IOpenScarlettAaaRuntime {
 public:
     DeviceX(ID3D12Device* host_device,
             const D3D12AdapterInfo& adapter_info,
@@ -121,6 +125,74 @@ public:
     const openscarlett::TitleVAMirror& GetTitleVaMirror() const noexcept { return title_va_mirror_; }
     openscarlett::DescriptorSgprBridge& GetDescriptorBridge() noexcept { return descriptor_bridge_; }
     const openscarlett::DescriptorSgprBridge& GetDescriptorBridge() const noexcept { return descriptor_bridge_; }
+    SamplerFeedbackManager& GetSamplerFeedbackManager() noexcept { return sampler_feedback_mgr_; }
+    const SamplerFeedbackManager& GetSamplerFeedbackManager() const noexcept { return sampler_feedback_mgr_; }
+    QueryAccumulatorX& GetQueryAccumulator() noexcept { return query_accumulator_; }
+    const QueryAccumulatorX& GetQueryAccumulator() const noexcept { return query_accumulator_; }
+
+    bool IsDeviceRemoved() const noexcept {
+        return FAILED(device_removed_reason_.load(std::memory_order_acquire));
+    }
+    bool HasMirroredTitleVaRegions() const noexcept {
+        return mirrored_va_count_.load(std::memory_order_acquire) > 0u;
+    }
+    bool LookupMirroredTitleVaForResource(
+        ID3D12Resource* host_resource, uint64_t& out_title_va) const noexcept;
+    HRESULT FlushMirroredTitleVaPagesOnQueue(
+        ID3D12CommandQueue* host_queue,
+        D3D12_COMMAND_LIST_TYPE queue_type,
+        uint64_t* out_bytes_uploaded = nullptr);
+    ID3D12Resource* ResolveBufferResourceByGpuVa(
+        D3D12_GPU_VIRTUAL_ADDRESS va, uint64_t* out_offset_bytes = nullptr) const;
+    XG_TILE_MODE GetTrackedResourceTileMode(ID3D12Resource* host_resource) const noexcept;
+    void SetTrackedResourceTileMode(ID3D12Resource* host_resource, XG_TILE_MODE mode);
+    bool EnsureXgGpuUntilerReady();
+    openscarlett::XgGpuUntiler* GetXgGpuUntiler() noexcept { return xg_untiler_.get(); }
+    HRESULT RecordUntileUploadOnCommandList(
+        ID3D12GraphicsCommandList* host_list,
+        D3D12_COMMAND_LIST_TYPE list_type,
+        const D3D12_TEXTURE_COPY_LOCATION& dst_loc,
+        UINT dst_x,
+        UINT dst_y,
+        UINT dst_z,
+        const D3D12_TEXTURE_COPY_LOCATION& src_loc,
+        const D3D12_BOX* src_box,
+        XG_TILE_MODE tile_mode);
+    HRESULT RecordFeedbackFallbackDecode(
+        ID3D12GraphicsCommandList* host_list,
+        ID3D12Resource* host_feedback_src,
+        ID3D12Resource* host_dst_tex,
+        UINT dst_subresource,
+        UINT dst_x,
+        UINT dst_y);
+    HRESULT RecordFeedbackFallbackEncode(
+        ID3D12GraphicsCommandList* host_list,
+        ID3D12Resource* host_src_tex,
+        UINT src_subresource,
+        ID3D12Resource* host_feedback_dst);
+
+    void RecordCommandListQueryBegin() noexcept { qa_cl_begin_count_.fetch_add(1ull, std::memory_order_relaxed); }
+    void RecordCommandListQueryEnd() noexcept { qa_cl_end_count_.fetch_add(1ull, std::memory_order_relaxed); }
+    void RecordCommandListQueryResolve() noexcept { qa_cl_resolve_count_.fetch_add(1ull, std::memory_order_relaxed); }
+    void RecordBridgeHeapBind() noexcept { db_heap_binds_.fetch_add(1ull, std::memory_order_relaxed); }
+    void RecordBridgeTableBind() noexcept { db_table_binds_.fetch_add(1ull, std::memory_order_relaxed); }
+    void RecordBridgeRootConstUpdate() noexcept { db_root_const_updates_.fetch_add(1ull, std::memory_order_relaxed); }
+    void RecordBridgeRootCbvUpdate() noexcept { db_root_cbv_updates_.fetch_add(1ull, std::memory_order_relaxed); }
+    void RecordIndirectMirrorFlush() noexcept { va_indirect_flushes_.fetch_add(1ull, std::memory_order_relaxed); }
+    void RecordFeedbackDecodeIntercept() noexcept { sf_decode_intercepts_.fetch_add(1ull, std::memory_order_relaxed); }
+    void RecordFeedbackEncodeIntercept() noexcept { sf_encode_intercepts_.fetch_add(1ull, std::memory_order_relaxed); }
+    void RecordCmdListKickoff() noexcept { cmdlist_kickoffs_.fetch_add(1ull, std::memory_order_relaxed); }
+    void RecordCmdListWrite32() noexcept { cmdlist_write32_calls_.fetch_add(1ull, std::memory_order_relaxed); }
+    void RecordCmdListPredicationX() noexcept { cmdlist_predicationx_calls_.fetch_add(1ull, std::memory_order_relaxed); }
+    void RecordCmdListFlushCache() noexcept { cmdlist_flush_cache_calls_.fetch_add(1ull, std::memory_order_relaxed); }
+    void RecordCmdListDispatchMesh(UINT x, UINT y, UINT z) noexcept {
+        cmdlist_dispatch_mesh_calls_.fetch_add(1ull, std::memory_order_relaxed);
+        last_mesh_x_.store(x, std::memory_order_relaxed);
+        last_mesh_y_.store(y, std::memory_order_relaxed);
+        last_mesh_z_.store(z, std::memory_order_relaxed);
+        const uint64_t groups = static_cast<uint64_t>(x) * static_cast<uint64_t>(y) * static_cast<uint64_t>(z);
+        total_mesh_groups_.fetch_add(groups, std::memory_order_relaxed);
+    }
     bool IsR9G9B9E5UavFallbackActive() const noexcept;
     static void SetForceR9G9B9E5UavFallback(bool force) noexcept;
     static void SetGlobalBackendMode(uint32_t backend_mode) noexcept;
@@ -503,7 +575,70 @@ public:
     HRESULT STDMETHODCALLTYPE GetVulkanRoutingStats(
         D3D12XBOX_VULKAN_ROUTING_STATS* out_stats) override;
 
+    // IOpenScarlettAaaRuntime
+    HRESULT STDMETHODCALLTYPE GetAaaWiringStats(
+        D3D12XBOX_AAA_WIRING_STATS* out_stats) override;
+    HRESULT STDMETHODCALLTYPE SetResourceTileMode(
+        ID3D12Resource* resource,
+        uint32_t xg_tile_mode) override;
+    HRESULT STDMETHODCALLTYPE GetResourceTileMode(
+        ID3D12Resource* resource,
+        uint32_t* out_xg_tile_mode) override;
+    HRESULT STDMETHODCALLTYPE GetQueryAccumulatorHeap(
+        uint32_t query_kind,
+        ID3D12QueryHeap** out_heap) override;
+    HRESULT STDMETHODCALLTYPE FlushTitleVaMirrorOnQueue(
+        ID3D12CommandQueue* queue,
+        uint64_t* out_bytes_uploaded) override;
+    HRESULT STDMETHODCALLTYPE ScheduleTitleVaWriteback(
+        ID3D12GraphicsCommandList* cmd_list,
+        uint64_t title_va,
+        uint64_t fence_value,
+        uint64_t offset,
+        uint64_t size_bytes) override;
+    HRESULT STDMETHODCALLTYPE CompleteTitleVaWritebacks(
+        uint64_t completed_fence_value,
+        uint64_t* out_completed_count) override;
+    HRESULT STDMETHODCALLTYPE ClearFeedbackMap(
+        ID3D12GraphicsCommandList* cmd_list,
+        ID3D12Resource* feedback_resource) override;
+    HRESULT STDMETHODCALLTYPE WriteFeedbackSamples(
+        ID3D12GraphicsCommandList* cmd_list,
+        ID3D12Resource* feedback_resource,
+        const uint32_t* packed_xy_slice_mip_quads,
+        uint32_t sample_count) override;
+    HRESULT STDMETHODCALLTYPE ReadbackFeedbackMinMip(
+        ID3D12CommandQueue* queue,
+        ID3D12Resource* feedback_resource,
+        uint8_t* out_tiles,
+        uint32_t max_tiles,
+        uint32_t* out_tiles_x,
+        uint32_t* out_tiles_y) override;
+    HRESULT STDMETHODCALLTYPE CalibrateQueueClock(
+        ID3D12CommandQueue* queue,
+        D3D12XBOX_CLOCK_CALIBRATION_SUMMARY* out_summary) override;
+    HRESULT STDMETHODCALLTYPE BindBridgeBufferSrv(
+        ID3D12Resource* resource,
+        uint32_t num_elements,
+        uint32_t stride_bytes,
+        uint32_t* out_bindless_index) override;
+    HRESULT STDMETHODCALLTYPE BindBridgeHeaps(
+        ID3D12GraphicsCommandList* cmd_list) override;
+
 private:
+    struct TrackedBufferVa {
+        uint64_t gpu_va = 0ull;
+        uint64_t size_bytes = 0ull;
+        uint64_t guest_va = 0ull;
+    };
+
+    void TrackBufferVaResource(
+        ID3D12Resource* host_res,
+        const D3D12_RESOURCE_DESC& desc,
+        uint64_t guest_va = 0ull);
+    HRESULT EnsureFeedbackCodecPipelinesLocked();
+    void TrackTransientGpuResource(ID3D12Resource* res);
+    void ReleaseAaaRuntimeObjects();
     void TrackVulkanResource(
         IUnknown* obj, D3D12_HEAP_TYPE heap_type, const D3D12_RESOURCE_DESC& desc);
     bool ShouldRewriteR9G9B9E5Uav(const D3D12_RESOURCE_DESC& desc) const noexcept;
@@ -564,6 +699,53 @@ private:
     std::atomic<void*> descriptor_create_ctx_{nullptr};
     openscarlett::TitleVAMirror title_va_mirror_;
     openscarlett::DescriptorSgprBridge descriptor_bridge_;
+    SamplerFeedbackManager sampler_feedback_mgr_;
+    QueryAccumulatorX query_accumulator_;
+    std::unique_ptr<openscarlett::XgGpuUntiler> xg_untiler_;
+    std::mutex xg_untiler_mutex_;
+    bool xg_untiler_attempted_ = false;
+
+    mutable std::mutex buffer_va_mutex_;
+    std::unordered_map<ID3D12Resource*, TrackedBufferVa> buffer_va_map_;
+    mutable std::mutex tile_mode_mutex_;
+    std::unordered_map<ID3D12Resource*, XG_TILE_MODE> resource_tile_modes_;
+    mutable std::mutex mirrored_res_mutex_;
+    std::unordered_map<ID3D12Resource*, uint64_t> mirrored_res_to_va_;
+    std::atomic<uint32_t> mirrored_va_count_{0u};
+    std::atomic<HRESULT> device_removed_reason_{S_OK};
+
+    std::mutex feedback_codec_mutex_;
+    ID3D12RootSignature* fb_codec_rs_ = nullptr;
+    ID3D12PipelineState* fb_decode_pso_ = nullptr;
+    ID3D12PipelineState* fb_encode_pso_ = nullptr;
+
+    std::mutex transient_res_mutex_;
+    std::vector<ID3D12Resource*> transient_gpu_resources_;
+
+    // Sprint 12 live wiring counters
+    std::atomic<uint64_t> sf_decode_intercepts_{0ull};
+    std::atomic<uint64_t> sf_encode_intercepts_{0ull};
+    std::atomic<uint64_t> qa_cl_begin_count_{0ull};
+    std::atomic<uint64_t> qa_cl_end_count_{0ull};
+    std::atomic<uint64_t> qa_cl_resolve_count_{0ull};
+    std::atomic<uint64_t> va_queue_flushes_{0ull};
+    std::atomic<uint64_t> va_indirect_flushes_{0ull};
+    std::atomic<uint64_t> db_heap_binds_{0ull};
+    std::atomic<uint64_t> db_table_binds_{0ull};
+    std::atomic<uint64_t> db_root_const_updates_{0ull};
+    std::atomic<uint64_t> db_root_cbv_updates_{0ull};
+    std::atomic<uint64_t> xg_gpu_untile_dispatches_{0ull};
+    std::atomic<uint64_t> xg_gpu_retile_dispatches_{0ull};
+    std::atomic<uint64_t> xg_cpu_fallbacks_{0ull};
+    std::atomic<uint64_t> cmdlist_kickoffs_{0ull};
+    std::atomic<uint64_t> cmdlist_write32_calls_{0ull};
+    std::atomic<uint64_t> cmdlist_predicationx_calls_{0ull};
+    std::atomic<uint64_t> cmdlist_flush_cache_calls_{0ull};
+    std::atomic<uint64_t> cmdlist_dispatch_mesh_calls_{0ull};
+    std::atomic<uint32_t> last_mesh_x_{0u};
+    std::atomic<uint32_t> last_mesh_y_{0u};
+    std::atomic<uint32_t> last_mesh_z_{0u};
+    std::atomic<uint64_t> total_mesh_groups_{0ull};
 
     mutable std::mutex fallback_mutex_;
     std::unordered_set<ID3D12Resource*> r9g9b9e5_fallback_resources_;

@@ -72,6 +72,19 @@ struct VulkanRecordedBatch {
     bool has_host_commands = false;
 };
 
+struct DeferredCpuWrite32 {
+    uint64_t address = 0ull;
+    uint32_t value = 0u;
+};
+
+struct DeferredCpuWait {
+    uint64_t address = 0ull;
+    uint64_t value = 0ull;
+    uint64_t mask = 0ull;
+    D3D12XBOX_WAIT_VALUE_OP op = D3D12XBOX_WAIT_VALUE_OP_ALWAYS;
+    bool is_64bit = false;
+};
+
 class CommandListX final
     : public ID3D12GraphicsCommandListX,
       public IOpenScarlettCommandListExtState {
@@ -91,6 +104,10 @@ public:
         ID3D12GraphicsCommandList* maybe_wrapped) noexcept;
     static CommandListX* TryFromCommandList(ID3D12CommandList* maybe_wrapped) noexcept;
     void CopyVulkanRecordedBatch(VulkanRecordedBatch& out_batch) const;
+    void ExtractPendingMirrorWritebacks(std::vector<uint64_t>& out_vas) const;
+    void ExtractDeferredCpuOps(
+        std::vector<DeferredCpuWrite32>& out_writes,
+        std::vector<DeferredCpuWait>& out_waits) const;
 
     // IUnknown (slots 0..2)
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override;
@@ -313,6 +330,18 @@ public:
         FLOAT DepthBias,
         FLOAT DepthBiasClamp,
         FLOAT SlopeScaledDepthBias) override;
+    void STDMETHODCALLTYPE Write32BitValueX(
+        D3D12_GPU_VIRTUAL_ADDRESS Address,
+        uint32_t Value,
+        uint32_t Flags) override;
+    void STDMETHODCALLTYPE SetPredicationX(
+        D3D12_GPU_VIRTUAL_ADDRESS BufferAddress,
+        D3D12_PREDICATION_OP Operation,
+        uint32_t Flags) override;
+    void STDMETHODCALLTYPE FlushGpuCacheRange(
+        uint32_t Flags,
+        D3D12_GPU_VIRTUAL_ADDRESS BaseAddress,
+        SIZE_T SizeInBytes) override;
 
     // Inspection helper for tests/runtime diagnostics.
     void GetDepthBiasXState(
@@ -389,6 +418,17 @@ private:
     std::vector<D3D12_GPU_VIRTUAL_ADDRESS> vk_cmp_cbvs_;
     std::vector<D3D12_GPU_VIRTUAL_ADDRESS> vk_cmp_srvs_;
     std::vector<D3D12_GPU_VIRTUAL_ADDRESS> vk_cmp_uavs_;
+
+    // Sprint 12 live AAA island state (tracked per command list)
+    ID3D12RootSignature* last_host_compute_rs_ = nullptr;
+    ID3D12PipelineState* last_host_pso_ = nullptr;
+    ID3D12DescriptorHeap* bound_cbv_srv_uav_heap_ = nullptr;
+    ID3D12DescriptorHeap* bound_sampler_heap_ = nullptr;
+    mutable std::mutex aaa_rec_mutex_;
+    std::vector<uint64_t> written_mirrored_vas_;
+    std::vector<DeferredCpuWrite32> deferred_cpu_writes_;
+    std::vector<DeferredCpuWait> deferred_cpu_waits_;
+    void RecordMirroredResourceGpuWrite(ID3D12Resource* host_resource);
 };
 
 }  // namespace openscarlett::d3d12_xs

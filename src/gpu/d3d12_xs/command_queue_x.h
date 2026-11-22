@@ -20,7 +20,8 @@ class CommandQueueX final
       public IOpenScarlettPresentCapture,
       public IOpenScarlettPresentWindow,
       public IOpenScarlettPresentHdr,
-      public IOpenScarlettPresentTiming {
+      public IOpenScarlettPresentTiming,
+      public IOpenScarlettPresentPacing {
 public:
     CommandQueueX(DeviceX* parent_device,
                   ID3D12CommandQueue* host_queue,
@@ -113,6 +114,10 @@ public:
         uint64_t Value,
         uint64_t Mask,
         D3D12XBOX_WAIT_VALUE_OP Operation) override;
+    HRESULT STDMETHODCALLTYPE Write32BitValueX(
+        D3D12_GPU_VIRTUAL_ADDRESS Address,
+        uint32_t Value,
+        uint32_t Flags) override;
 
     // IOpenScarlettPresentCapture
     HRESULT STDMETHODCALLTYPE SetOutputWindow(HWND hwnd) override;
@@ -151,7 +156,18 @@ public:
     HRESULT STDMETHODCALLTYPE GetPresentTimingStats(
         D3D12XBOX_PRESENT_TIMING_STATS* out_stats) override;
 
+    // IOpenScarlettPresentPacing
+    HRESULT STDMETHODCALLTYPE SetFrameCapFps(
+        uint32_t fps_or_zero_for_uncapped,
+        BOOL override_active) override;
+    HRESULT STDMETHODCALLTYPE GetPresentPacingState(
+        D3D12XBOX_PRESENT_PACING_STATE* out_state) override;
+
 private:
+    uint32_t ResolveEffectiveFrameIntervalUsLocked(
+        bool& out_override_active,
+        uint32_t& out_fcap_fps) const noexcept;
+    void PumpMirrorReadbackCompletionLocked() noexcept;
     void ExecuteVulkanRecordedBatch(const VulkanRecordedBatch& batch);
     HRESULT EnsureVulkanSwapChainLocked(
         HWND hwnd, uint32_t width, uint32_t height, bool prefer_hdr10, bool headless);
@@ -234,6 +250,11 @@ private:
     int64_t last_paced_qpc_ = 0;
     int64_t last_present_qpc_ = 0;
     HANDLE pacing_timer_ = nullptr;
+    uint32_t fcap_override_fps_ = 0u;
+    bool fcap_override_active_ = false;
+    uint32_t last_effective_interval_us_ = 0u;
+    uint64_t paced_frame_count_ = 0ull;
+    std::atomic<uint64_t> cached_gpu_ts_freq_{0ull};
 
     uint64_t present_count_ = 0;
     uint64_t non_blank_present_count_ = 0;
