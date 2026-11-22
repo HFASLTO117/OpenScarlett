@@ -2,7 +2,7 @@
 #include <DirectXMath.h>
 #include <DirectXPackedVector.h>
 
-// Clean-room MIT DirectXTK12 SimpleMath subset for untouched Xbox-GDK-Samples.
+// MIT DirectXTK12 SimpleMath subset for untouched Xbox-GDK-Samples.
 
 namespace DirectX {
 namespace SimpleMath {

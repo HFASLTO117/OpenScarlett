@@ -2982,7 +2982,7 @@ XGameResult OPENSCARLETT_XSAPI_CALL XblProfileGetUserProfilesForSocialGroupResul
 }
 
 // ===========================================================================
-// Title Storage (Clean-Room Local + Persistent Blob Store)
+// Title Storage (Local + Persistent Blob Store)
 // ===========================================================================
 XGameResult OPENSCARLETT_XSAPI_CALL XblTitleStorageGetQuotaAsync(
     XblContextHandle xboxLiveContext,

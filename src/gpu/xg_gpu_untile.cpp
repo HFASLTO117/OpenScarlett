@@ -1782,7 +1782,7 @@ Status BuildXgGpuUntileParams3D(
 
 std::string GenerateXgGpuUntileHlsl() {
     return R"HLSL(
-// Clean-room OpenScarlett GFX10 / RDNA2 GPU Compute Untiler & Retiler (cs_6_2 / cs_6_5)
+// OpenScarlett GFX10 / RDNA2 GPU Compute Untiler & Retiler (cs_6_2 / cs_6_5)
 cbuffer UntileParams : register(b0) {
     uint g_direction;
     uint g_tile_mode;

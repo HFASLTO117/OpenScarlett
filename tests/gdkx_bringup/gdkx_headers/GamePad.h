@@ -1,5 +1,5 @@
 #pragma once
-// Clean-room MIT DirectXTK12 GamePad subset for untouched Xbox-GDK-Samples.
+// MIT DirectXTK12 GamePad subset for untouched Xbox-GDK-Samples.
 
 namespace DirectX {
 

@@ -1,4 +1,4 @@
-// Clean-room MIT Console Diagnostic & Legacy Compatibility Shims for OpenScarlett.
+// MIT Console Diagnostic & Legacy Compatibility Shims for OpenScarlett.
 // Compiled into standalone DLL targets via preprocessor target macros:
 //   - OPENSCARLETT_DIAG_TARGET_ADVAPI32LEGACY     -> advapi32legacy.dll
 //   - OPENSCARLETT_DIAG_TARGET_KERNELTRACECONTROL -> KernelTraceControl.dll

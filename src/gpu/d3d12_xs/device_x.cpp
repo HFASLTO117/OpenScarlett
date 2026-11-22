@@ -531,7 +531,7 @@ D3D12_RESOURCE_DESC1 SanitizeXboxResourceDesc1(const D3D12_RESOURCE_DESC1& desc)
     return out;
 }
 
-// Clean-room OpenScarlett software raytracing serialization driver GUID.
+// OpenScarlett software raytracing serialization driver GUID.
 inline constexpr GUID kOpenScarlettSwAsDriverGuid = {
     0x4F534431u, 0x3258u, 0x4458u, {0x52u, 0x53u, 0x57u, 0x41u, 0x53u, 0x00u, 0x00u, 0x01u}};
 
@@ -4549,7 +4549,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateStateObject(
         pDesc->NumSubobjects > 0u &&
         (pDesc->Type == D3D12_STATE_OBJECT_TYPE_COLLECTION ||
          pDesc->Type == D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE)) {
-        // Non-DXR adapter (e.g. GTX 1650 Ti / Win10 WARP): provide clean-room software StateObjectXProxy
+        // Non-DXR adapter (e.g. GTX 1650 Ti / Win10 WARP): provide software StateObjectXProxy
         // supporting ID3D12StateObject + ID3D12StateObjectProperties shader identifier queries.
         auto* sw_proxy = new (std::nothrow) StateObjectXProxy(this, nullptr, pDesc);
         if (!sw_proxy) {

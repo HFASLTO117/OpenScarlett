@@ -15,8 +15,6 @@
   Because Xbox Series X|S uses an <strong>AMD x86-64 processor</strong> like a gaming PC, <strong>OpenScarlett</strong> runs game CPU code natively on Windows 10 &amp; 11 instead of slow emulation — translating only the Xbox-specific graphics, RDNA2 shaders, audio, input, and OS calls to native <strong>DirectX 12</strong> &amp; <strong>Vulkan 1.4</strong>.
 </p>
 
-> **Disclaimer:** OpenScarlett is strictly for legally obtained, unencrypted apps and SDK samples. We do not support, include, or encourage DRM bypass or retail package decryption.
-
 ---
 
 ## Where Do We Stand Right Now?
@@ -78,9 +76,9 @@ OpenScarlett is **early alpha** — the charts below show honest progress across
 
 ## Join Discord & Help Test Real GDKs, Software & GPUs
 
-We are actively looking for testers and contributors on **[Discord](https://discord.gg/sShMY2fjR)**! Whether you have a different GPU or legally obtained, unencrypted Xbox GDK builds/software to test, your telemetry logs directly drive what gets implemented next:
+We are actively looking for testers and contributors on **[Discord](https://discord.gg/sShMY2fjR)**! Whether you have a different GPU or Xbox GDK builds/software to test, your telemetry logs directly drive what gets implemented next:
 
-* **Test real unpacked GDKs & software:** Run your own legal unencrypted GDK binaries or open-source samples through `OpenScarlettLauncher.exe` (or `openscarlett run --telemetry report.json`) and share the sanitized telemetry (`missing exports`, `not_impl COM slots`, `shader opcodes`) in **[Discord](https://discord.gg/sShMY2fjR)** or GitHub Issues — no game files ever need to be shared.
+* **Test real unpacked GDKs & software:** Run unpacked GDK binaries or open-source samples through `OpenScarlettLauncher.exe` (or `openscarlett run --telemetry report.json`) and share the sanitized telemetry (`missing exports`, `not_impl COM slots`, `shader opcodes`) in **[Discord](https://discord.gg/sShMY2fjR)** or GitHub Issues — no game files ever need to be shared.
 * **Run the 60-second GPU hardware test (no coding needed):**
   1. **[Download the latest `OpenScarlett-*-win64.zip`](https://github.com/californiaAlmonds/OpenScarlett/releases/latest)** and extract anywhere *(everything — including `OpenScarlettLauncher.exe` and open-source `dxc.exe` — is bundled; no Visual Studio or SDK required)*.
   2. **Double-click `OpenScarlettLauncher.exe`** → open the **60s Hardware Self-Test** tab → click **Run 60s Hardware Test** *(or run `powershell -ExecutionPolicy Bypass -File .\run_hardware_test.ps1`)* — probes your GPU, runs all tests, and strips usernames & local folder paths automatically.

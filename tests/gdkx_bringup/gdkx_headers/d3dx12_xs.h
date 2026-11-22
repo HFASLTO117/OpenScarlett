@@ -5,7 +5,7 @@
 #include <cstring>
 #include <vector>
 
-// Clean-room MIT D3DX12 helper subset for untouched Xbox-GDK-Samples.
+// MIT D3DX12 helper subset for untouched Xbox-GDK-Samples.
 
 struct CD3DX12_DEFAULT {};
 extern const DECLSPEC_SELECTANY CD3DX12_DEFAULT D3D12_DEFAULT;

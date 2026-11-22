@@ -123,7 +123,7 @@ Status DisassembleRdna2Extended(
     std::vector<Rdna2Instruction>& out_instructions);
 
 // ---------------------------------------------------------------------------
-// Clean-room DXBC Header, Signature (ISGN/OSGN/PSGN), & RTS0 Root Signature
+// DXBC Header, Signature (ISGN/OSGN/PSGN), & RTS0 Root Signature
 // ---------------------------------------------------------------------------
 struct XboxDxbcHeaderInfo {
     uint8_t md5_digest[16] = {};
@@ -247,7 +247,7 @@ struct Rdna2PgmRegisterSetup {
 
 // Parses PM4 Type-3 SET_SH_REG / SET_CONTEXT_REG packet streams OR structured (reg, val) pair blocks.
 Status ParsePm4RegisterBlock(const uint8_t* data, size_t size, Rdna2PgmRegisterSetup& out_setup);
-// Builds a clean-room PM4 Type-3 packet stream encoding the register setup.
+// Builds a PM4 Type-3 packet stream encoding the register setup.
 std::vector<uint8_t> BuildPm4RegisterBlock(const Rdna2PgmRegisterSetup& setup, ShaderStage stage);
 
 // ---------------------------------------------------------------------------

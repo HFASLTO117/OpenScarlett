@@ -472,7 +472,7 @@ struct VulkanMeshDrawDesc {
     uint32_t push_constant_budget_override = 0;
     std::vector<VulkanDescriptorBinding> descriptors;
 
-    // If true, transparently falls back to deterministic clean-room SPIR-V mesh emulation
+    // If true, transparently falls back to deterministic SPIR-V mesh emulation
     // when the host GPU / CI runner does not expose VK_EXT_mesh_shader.
     bool allow_fallback_emulation = true;
 };
@@ -584,11 +584,11 @@ struct VulkanReservedResourceHandle {
     bool executed_on_vulkan_icd = false;
 };
 
-// Clean-room Dynamic Vulkan 1.2/1.3/1.4 backend with zero Vulkan SDK header dependencies.
+// Dynamic Vulkan 1.2/1.3/1.4 backend with zero Vulkan SDK header dependencies.
 // Dynamically loads vulkan-1.dll at runtime via LoadLibraryA + vkGetInstanceProcAddr,
 // executes real hardware/ICD compute, graphics rasterization, VK_EXT_mesh_shader,
 // 2D/3D mipmapped texture copies, and Win32 swapchain presentation when available,
-// and provides deterministic clean-room SPIR-V software fallbacks when no ICD is present.
+// and provides deterministic SPIR-V software fallbacks when no ICD is present.
 class VulkanBackend {
 public:
     VulkanBackend();

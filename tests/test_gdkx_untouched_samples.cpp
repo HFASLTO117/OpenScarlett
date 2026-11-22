@@ -163,7 +163,7 @@ TelemetrySummary ParseTelemetryJson(const fs::path& json_path) {
     return sum;
 }
 
-// Clean-room stored-DEFLATE RGBA8 PNG decoder (matches FrameBufferRgba8::WritePng output).
+// Stored-DEFLATE RGBA8 PNG decoder (matches FrameBufferRgba8::WritePng output).
 struct DecodedPng {
     uint32_t width = 0;
     uint32_t height = 0;
@@ -506,8 +506,8 @@ void VerifySimpleLightingPixels(const DecodedPng& img, const std::string& tag) {
               << " color_buckets=" << distinct_quantized_colors.size() << "\n";
 }
 
-// Clean-room procedural sunset JPEG generator via host Windows WIC so SimpleTexture_GDKX
-// runs with zero external copyrighted asset dependencies (works identically in portable bundles).
+// Procedural sunset JPEG generator via host Windows WIC so SimpleTexture_GDKX
+// runs self-contained with zero external asset dependencies (works identically in portable bundles).
 bool WriteProceduralSunsetJpeg(const fs::path& dst_path, std::string& err) {
     using Microsoft::WRL::ComPtr;
     constexpr UINT kW = 256u;
@@ -969,7 +969,7 @@ void RunSampleEndToEnd(const fs::path& bin_dir, const SampleSpec& spec, bool pre
     if (spec.needs_sunset_jpg) {
         std::string jpg_err;
         EXPECT_MSG(WriteProceduralSunsetJpeg(pkg_dir / L"sunset.jpg", jpg_err),
-                   tag + ": generate clean-room sunset.jpg (" + jpg_err + ")");
+                   tag + ": generate sunset.jpg (" + jpg_err + ")");
     }
 
     // Minimal MicrosoftGame.Config pointing to the untouched *_GDKX.exe

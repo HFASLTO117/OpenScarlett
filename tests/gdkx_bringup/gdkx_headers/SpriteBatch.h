@@ -12,7 +12,7 @@
 #include "SpriteBatchBlitPS.inc.h"
 #endif
 
-// Clean-room MIT DirectXTK12 SpriteBatch subset for untouched Xbox-GDK-Samples.
+// MIT DirectXTK12 SpriteBatch subset for untouched Xbox-GDK-Samples.
 // Supports both HUD pass-through (SpriteFont) and real GPU textured-quad Draw() blits
 // routed 100% through OpenScarlett's d3d12_xs DeviceX / CommandListX.
 

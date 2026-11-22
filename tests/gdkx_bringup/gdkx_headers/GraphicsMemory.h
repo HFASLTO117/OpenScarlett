@@ -10,7 +10,7 @@
 #include <stdexcept>
 #include <thread>
 
-// Clean-room MIT DirectXTK12 GraphicsMemory subset for untouched Xbox-GDK-Samples.
+// MIT DirectXTK12 GraphicsMemory subset for untouched Xbox-GDK-Samples.
 // Lazily allocates a 256-byte-aligned GPU upload ring on first Allocate/AllocateConstant call.
 
 namespace DirectX {

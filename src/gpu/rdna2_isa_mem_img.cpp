@@ -1508,7 +1508,7 @@ void SeedDefaultComputeVgprs(MemImgExecState& state) noexcept {
 }
 
 // ---------------------------------------------------------------------------
-// Clean-Room CPU Reference Execution Engine (ExecuteMemImgCpu)
+// CPU Reference Execution Engine (ExecuteMemImgCpu)
 // ---------------------------------------------------------------------------
 namespace {
 
@@ -2571,7 +2571,7 @@ Status ExecuteMemImgCpu(
 }
 
 // ---------------------------------------------------------------------------
-// Clean-Room SM 6.5 HLSL Emitter for MemImg / DS / FLAT / EXP Shaders
+// SM 6.5 HLSL Emitter for MemImg / DS / FLAT / EXP Shaders
 // ---------------------------------------------------------------------------
 namespace {
 
@@ -3642,7 +3642,7 @@ Status EmitMemImgHlsl(
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// Clean-Room SPIR-V 1.3 Binary Emitter (spirv-val & Vulkan 1.2/1.4 Verified)
+// SPIR-V 1.3 Binary Emitter (spirv-val & Vulkan 1.2/1.4 Verified)
 // ---------------------------------------------------------------------------
 namespace {
 

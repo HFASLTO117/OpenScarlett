@@ -164,7 +164,7 @@ float BitsToFloat(uint32_t bits) {
     return f;
 }
 
-// Clean-room IEEE-754 binary16 <-> float32 conversion helpers (round-to-nearest-even)
+// IEEE-754 binary16 <-> float32 conversion helpers (round-to-nearest-even)
 float HalfBitsToFloat(uint16_t h) noexcept {
     const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
     const uint32_t exp = (h >> 10) & 0x1Fu;

@@ -22,7 +22,7 @@ namespace openscarlett {
 namespace {
 
 // ---------------------------------------------------------------------------
-// Clean-room minimal Vulkan 1.2/1.3/1.4 C ABI declarations (zero SDK headers).
+// Minimal Vulkan 1.2/1.3/1.4 C ABI declarations (zero SDK headers).
 // Follows the public Khronos Vulkan 1.2/1.3/1.4 Specification ABI for x86-64.
 // ---------------------------------------------------------------------------
 using VkFlags = uint32_t;
@@ -1706,7 +1706,7 @@ bool ReadSpirvString(const std::vector<uint32_t>& words,
     return false;
 }
 
-// Deterministic clean-room SPIR-V compute interpreter (fallback when no ICD is present).
+// Deterministic SPIR-V compute interpreter (fallback when no ICD is present).
 Status ExecuteSpirvComputeSoftware(const std::vector<uint32_t>& spirv,
                                    const SpirvValidationInfo& val_info,
                                    const std::vector<uint32_t>& input_u32,
@@ -1947,7 +1947,7 @@ Status ExecuteSpirvComputeSoftware(const std::vector<uint32_t>& spirv,
 }
 
 // ---------------------------------------------------------------------------
-// Clean-room SPIR-V Graphics & Mesh Shader Software Fallback Evaluator
+// SPIR-V Graphics & Mesh Shader Software Fallback Evaluator
 // Executes real SPIR-V VS+PS and TaskEXT+MeshEXT+PS shaders deterministically
 // when no Vulkan ICD or VK_EXT_mesh_shader hardware is available (e.g. CI).
 // ---------------------------------------------------------------------------

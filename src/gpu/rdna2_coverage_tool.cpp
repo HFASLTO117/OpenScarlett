@@ -1,5 +1,5 @@
 // OpenScarlett - MIT License
-// Clean-room GFX10.3 (RDNA2) 779-opcode ISA coverage auditor & 3,000+ shader corpus benchmark.
+// GFX10.3 (RDNA2) 779-opcode ISA coverage auditor & 3,000+ shader corpus benchmark.
 
 #include "rdna2_coverage_tool.h"
 
@@ -57,7 +57,7 @@ namespace openscarlett {
 namespace {
 
 // ---------------------------------------------------------------------------
-// Portable Clean-Room Helpers (MSVC / Clang-CL / MinGW-w64)
+// Portable Helpers (MSVC / Clang-CL / MinGW-w64)
 // ---------------------------------------------------------------------------
 uint32_t FloatToBits(float f) noexcept {
     uint32_t b = 0u;
@@ -2131,7 +2131,7 @@ GeneratedCorpusShader GenerateCorpusShader(uint32_t workload_idx, uint32_t varia
 }
 
 // ---------------------------------------------------------------------------
-// Portable Clean-Room COM RAII Pointer (Zero WRL Dependency -> MSVC/Clang/MinGW)
+// Portable COM RAII Pointer (Zero WRL Dependency -> MSVC/Clang/MinGW)
 // ---------------------------------------------------------------------------
 #if defined(_WIN32)
 template <typename T>

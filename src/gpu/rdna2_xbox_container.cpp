@@ -144,7 +144,7 @@ bool TryParseSignatureChunkWithStride(
         const uint32_t masks = ReadLe32(rec + off + 20u);
         e.mask = static_cast<uint8_t>(masks & 0xFFu);
         e.rw_mask = static_cast<uint8_t>((masks >> 8) & 0xFFu);
-        // Optional clean-room extension: upper byte of masks can encode explicit interp mode when non-zero
+        // Optional extension: upper byte of masks can encode explicit interp mode when non-zero
         const uint8_t interp_hint = static_cast<uint8_t>((masks >> 16) & 0xFFu);
         if (interp_hint >= 1u && interp_hint <= 5u) {
             e.interp_mode = static_cast<Rdna2InterpMode>(interp_hint - 1u);
@@ -297,7 +297,7 @@ void ApplyRegisterWrite(uint32_t reg_dw, uint32_t val, Rdna2PgmRegisterSetup& se
 
     auto decode_rsrc3 = [&](uint32_t v) {
         setup.pgm_rsrc3 = v;
-        // Clean-room wave32/wave64 indicator bit in RSRC3[31] (1 = Wave64, 0 = native RDNA2 Wave32)
+        // Wave32/wave64 indicator bit in RSRC3[31] (1 = Wave64, 0 = native RDNA2 Wave32)
         if (((v >> 31) & 1u) != 0u) {
             setup.wave_size = 64u;
             // Recompute VGPR count using wave64 granularity if RSRC1 was already seen
@@ -1285,7 +1285,7 @@ bool TryExtractPm4AndIsaFromRdnaChunk(
         }
     }
 
-    // 2. Clean-room "RDNA" structured payload:
+    // 2. "RDNA" structured payload:
     //    [0..3]: "RDNA" magic
     //    [4..7]: stage (ShaderStage uint32)
     //    [8..11]: pm4_byte_size

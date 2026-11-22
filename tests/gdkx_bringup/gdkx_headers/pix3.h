@@ -2,7 +2,7 @@
 #include <cstdint>
 #include <Windows.h>
 
-// Clean-room MIT pix3.h importing real PIX exports from OpenScarlett's pixevt.dll.
+// MIT pix3.h importing real PIX exports from OpenScarlett's pixevt.dll.
 
 #ifndef PIX_COLOR_DEFAULT
 #define PIX_COLOR_DEFAULT 0u

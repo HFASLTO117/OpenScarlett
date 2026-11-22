@@ -1379,7 +1379,7 @@ void AppendPngChunk(std::vector<uint8_t>& out, const char type[4], const std::ve
     AppendBe32(out, crc);
 }
 
-std::vector<uint8_t> BuildCleanRoomGamerPicPng(uint32_t dim) {
+std::vector<uint8_t> BuildDefaultGamerPicPng(uint32_t dim) {
     // Uncompressed zlib-stored RGBA PNG (100% valid RFC 2083 + RFC 1950).
     std::vector<uint8_t> png = {0x89u, 'P', 'N', 'G', 0x0Du, 0x0Au, 0x1Au, 0x0Au};
     std::vector<uint8_t> ihdr;
@@ -1446,7 +1446,7 @@ XGameResult OPENSCARLETT_GDK_CALL UserGamerPicProvider(
             if (ctx->size_enum == XUserGamerPictureSize_Small) dim = 4u;
             else if (ctx->size_enum == XUserGamerPictureSize_Large) dim = 16u;
             else if (ctx->size_enum == XUserGamerPictureSize_ExtraLarge) dim = 16u;
-            ctx->png_bytes = BuildCleanRoomGamerPicPng(dim);
+            ctx->png_bytes = BuildDefaultGamerPicPng(dim);
             XAsyncComplete(data->async, XGR_S_OK, ctx->png_bytes.size());
             return XGR_E_PENDING;
         }
@@ -2173,7 +2173,7 @@ XStoreProductQueryHandle CreateStoreProductQueryHandle(bool include_current_game
         XStoreProductBacking& b = q->products.back();
         b.store_id = cur_store_id;
         b.title = cfg.display_name.empty() ? "OpenScarlett Title" : cfg.display_name;
-        b.description = "Clean-room local OpenScarlett title";
+        b.description = "Local OpenScarlett title";
         b.language = "en-US";
         b.offer_token = "";
         b.link_uri = "ms-windows-store://pdp/?productid=" + cur_store_id;
@@ -2259,7 +2259,7 @@ XPackageInstallationMonitorHandle CreateInstallMonitorHandle(const char* pkg_id)
 }
 
 // ===========================================================================
-// Reusable Clean-Room Async Providers
+// Reusable Async Providers
 // ===========================================================================
 struct VoidAsyncCtx {
     XGameResult result = XGR_S_OK;
@@ -5194,7 +5194,7 @@ XGameResult OPENSCARLETT_GDK_CALL XSystemGetAppSpecificDeviceId(
     size_t appSpecificDeviceIdSize,
     char* appSpecificDeviceId,
     size_t* appSpecificDeviceIdUsed) {
-    // Clean-room deterministic 44-character base64 app-specific device ID (+ null = 45 bytes).
+    // Deterministic 44-character base64 app-specific device ID (+ null = 45 bytes).
     const std::string asid = "T3BlblNjYXJsZXR0QXBwU3BlY2lmaWNEZXZpY2VJZA==";
     return RecordHr("XSystemGetAppSpecificDeviceId",
                     CopyStringResult(asid, appSpecificDeviceIdSize, appSpecificDeviceId,
@@ -5207,7 +5207,7 @@ bool OPENSCARLETT_GDK_CALL XSystemIsHandleValid(void* handle) {
 }
 
 // ===========================================================================
-// XGameStreaming (Clean-Room Local-PC Compatibility Surface)
+// XGameStreaming (Local-PC Compatibility Surface)
 // ===========================================================================
 XGameResult OPENSCARLETT_GDK_CALL XGameStreamingInitialize(void) {
     auto& rt = GetRuntime();
@@ -5685,7 +5685,7 @@ XGameResult OPENSCARLETT_GDK_CALL XPackageEnumeratePackages(
         details.version.revision = 0;
         details.kind = XPackageKind_Game;
         details.displayName = disp_name.c_str();
-        details.description = "Clean-room local OpenScarlett title";
+        details.description = "Local OpenScarlett title";
         details.publisher = "OpenScarlett";
         details.storeId = cur_store_id.c_str();
         details.installing = false;
@@ -6951,7 +6951,7 @@ XGameResult OPENSCARLETT_GDK_CALL XSpeechSynthesizerCloseStreamHandle(
 }
 
 // ===========================================================================
-// XSpeechToText (XAccessibility clean-room local defaults)
+// XSpeechToText (XAccessibility local defaults)
 // ===========================================================================
 XGameResult OPENSCARLETT_GDK_CALL XSpeechToTextSetPositionHint(
     XSpeechToTextPositionHint position) {
@@ -7035,7 +7035,7 @@ XGameResult OPENSCARLETT_GDK_CALL XSpeechToTextCancelHypothesisString(uint32_t h
 }
 
 // ===========================================================================
-// XAppBroadcast & XAppCapture (clean-room offline/local defaults)
+// XAppBroadcast & XAppCapture (offline/local defaults)
 // ===========================================================================
 XGameResult OPENSCARLETT_GDK_CALL XAppBroadcastGetStatus(
     XUserHandle requestingUser,
@@ -7236,7 +7236,7 @@ XGameResult OPENSCARLETT_GDK_CALL XAppCaptureTakeDiagnosticScreenshot(
     }
     const std::string prefix = (filenamePrefix && *filenamePrefix) ? filenamePrefix : "diag";
     const fs::path out_path = cap_dir / (prefix + "_" + std::to_string(seq) + ".png");
-    const std::vector<uint8_t> png = BuildCleanRoomGamerPicPng(16u);
+    const std::vector<uint8_t> png = BuildDefaultGamerPicPng(16u);
     (void)WriteBinaryFileAtomic(out_path, png.data(), png.size());
 
     result->fileCount = 1u;
@@ -7296,7 +7296,7 @@ XGameResult OPENSCARLETT_GDK_CALL XAppCaptureTakeScreenshot(
     }
     std::memset(result, 0, sizeof(*result));
     std::string local_id;
-    std::vector<uint8_t> png = BuildCleanRoomGamerPicPng(16u);
+    std::vector<uint8_t> png = BuildDefaultGamerPicPng(16u);
     {
         auto& rt = GetRuntime();
         std::lock_guard<std::mutex> lk(rt.capture_mutex);
@@ -7328,7 +7328,7 @@ XGameResult OPENSCARLETT_GDK_CALL XAppCaptureOpenScreenshotStream(
         if (it != rt.capture_screenshots.end()) {
             stream->bytes = it->second;
         } else {
-            stream->bytes = BuildCleanRoomGamerPicPng(16u);
+            stream->bytes = BuildDefaultGamerPicPng(16u);
         }
         XAppCaptureScreenshotStreamHandle raw = stream.get();
         *totalBytes = static_cast<uint64_t>(stream->bytes.size());
@@ -7393,7 +7393,7 @@ XGameResult OPENSCARLETT_GDK_CALL XAppCaptureDisableRecord(void) {
 }
 
 // ===========================================================================
-// XStore (clean-room offline/owned-title defaults)
+// XStore (offline/owned-title defaults)
 // ===========================================================================
 XGameResult OPENSCARLETT_GDK_CALL XStoreCreateContext(
     XUserHandle user,
@@ -8904,7 +8904,7 @@ XGameResult OPENSCARLETT_GDK_CALL XGameUiShowWebAuthenticationResult(
 }
 
 // ===========================================================================
-// XNetworking (clean-room PC/local connectivity & TLS info)
+// XNetworking (PC/local connectivity & TLS info)
 // ===========================================================================
 XGameResult OPENSCARLETT_GDK_CALL XNetworkingGetConnectivityHint(
     XNetworkingConnectivityHint* connectivityHint) {

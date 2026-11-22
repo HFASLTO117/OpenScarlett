@@ -97,7 +97,7 @@ if(WIN32 AND MSVC)
                 CXX_STANDARD_REQUIRED ON
                 CXX_EXTENSIONS OFF
             )
-            # Strictly ONLY clean-room GDKX headers + generated SpriteBatch shaders + untouched sample dir
+            # Strictly ONLY GDKX headers + generated SpriteBatch shaders + untouched sample dir
             # (NO OpenScarlett internal include/ headers!)
             target_include_directories(${target_name} PRIVATE
                 "${_os_gdkx_headers}"

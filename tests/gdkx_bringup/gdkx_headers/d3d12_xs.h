@@ -4,7 +4,7 @@
 #include <dcommon.h>
 #include <cstdint>
 
-// Clean-room MIT GDKX public D3D12.XS declarations for compiling untouched
+// MIT GDKX public D3D12.XS declarations for compiling untouched
 // _GAMING_XBOX_SCARLETT workloads against OpenScarlett's d3d12_xs.dll.
 // Struct layouts and COM vtable slots match GXDK 221000+ / OpenScarlett d3d12_xs_abi.h.
 
