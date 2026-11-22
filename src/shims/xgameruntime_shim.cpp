@@ -580,6 +580,10 @@ struct XSpeechSynthesizerStream {
     std::vector<uint8_t> wav_bytes;
 };
 
+struct XAppCaptureScreenshotStream {
+    std::vector<uint8_t> bytes;
+};
+
 struct XUserSignOutDeferral {
     std::atomic<uint32_t> active{1};
 };
@@ -642,6 +646,8 @@ enum RegFamily : uint32_t {
     kRegPackageProgress = 8,
     kRegPackageInstalled = 9,
     kRegGameInvite = 10,
+    kRegAppBroadcast = 11,
+    kRegAppCaptureMetadataPurged = 12,
 };
 
 thread_local bool g_thread_time_sensitive = false;
@@ -727,6 +733,22 @@ struct RuntimeState {
     void* error_callback_ctx = nullptr;
     XErrorOptions error_opts_debugger = XErrorOptions_None;
     XErrorOptions error_opts_no_debugger = XErrorOptions_None;
+
+    // XAppBroadcast / XAppCapture state
+    std::mutex capture_mutex;
+    std::atomic<bool> capture_record_enabled{true};
+    uint64_t next_screenshot_id = 1;
+    std::unordered_map<std::string, std::vector<uint8_t>> capture_screenshots;
+    std::unordered_map<XAppCaptureScreenshotStream*, std::shared_ptr<XAppCaptureScreenshotStream>>
+        live_capture_streams;
+    std::unordered_map<std::string, std::string> capture_metadata_states;
+    uint64_t capture_metadata_bytes_used = 0;
+
+    // XSpeechToText state
+    std::mutex stt_mutex;
+    XSpeechToTextPositionHint stt_position_hint = XSpeechToTextPositionHint_BottomCenter;
+    uint32_t next_stt_hypothesis_id = 1;
+    std::unordered_map<uint32_t, std::string> active_stt_hypotheses;
 };
 
 RuntimeState& GetRuntime() {
@@ -1382,6 +1404,229 @@ std::string CurrentPackageMountPath() {
 constexpr const char* kDefaultStoreId = "9OS000000001";
 constexpr const char* kDefaultSkuStoreId = "9OS000000001/0001";
 
+struct GameConfigMetadata {
+    bool found = false;
+    bool has_title_id = false;
+    uint32_t title_id = 0;
+    std::string store_id;
+    std::string identity_name;
+    std::string display_name;
+};
+
+std::string TrimAscii(const std::string& s) {
+    const size_t first = s.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return {};
+    const size_t last = s.find_last_not_of(" \t\r\n");
+    return s.substr(first, last - first + 1);
+}
+
+std::string StripXmlComments(const std::string& xml) {
+    std::string out;
+    out.reserve(xml.size());
+    size_t pos = 0;
+    while (pos < xml.size()) {
+        const size_t start = xml.find("<!--", pos);
+        if (start == std::string::npos) {
+            out.append(xml, pos, std::string::npos);
+            break;
+        }
+        out.append(xml, pos, start - pos);
+        const size_t end = xml.find("-->", start + 4);
+        if (end == std::string::npos) {
+            break;
+        }
+        pos = end + 3;
+    }
+    return out;
+}
+
+std::string ExtractXmlElementText(const std::string& xml, const char* tag) {
+    const std::string open_prefix = std::string("<") + tag;
+    const std::string close_tag = std::string("</") + tag + ">";
+    std::string lower_xml = xml;
+    for (char& c : lower_xml) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    std::string lower_open = open_prefix;
+    for (char& c : lower_open) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    std::string lower_close = close_tag;
+    for (char& c : lower_close) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    size_t pos = 0;
+    while ((pos = lower_xml.find(lower_open, pos)) != std::string::npos) {
+        const size_t after = pos + lower_open.size();
+        if (after < lower_xml.size() &&
+            lower_xml[after] != '>' && lower_xml[after] != ' ' &&
+            lower_xml[after] != '\t' && lower_xml[after] != '\r' &&
+            lower_xml[after] != '\n' && lower_xml[after] != '/') {
+            pos = after;
+            continue;
+        }
+        const size_t gt = lower_xml.find('>', after);
+        if (gt == std::string::npos) break;
+        if (gt > pos && lower_xml[gt - 1] == '/') {
+            pos = gt + 1;
+            continue;
+        }
+        const size_t close_pos = lower_xml.find(lower_close, gt + 1);
+        if (close_pos == std::string::npos) break;
+        return TrimAscii(xml.substr(gt + 1, close_pos - (gt + 1)));
+    }
+    return {};
+}
+
+std::string ExtractXmlAttribute(const std::string& xml, const char* tag, const char* attr) {
+    std::string lower_xml = xml;
+    for (char& c : lower_xml) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    std::string lower_open = std::string("<") + tag;
+    for (char& c : lower_open) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    std::string lower_attr = std::string(attr) + "=\"";
+    for (char& c : lower_attr) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    const size_t pos = lower_xml.find(lower_open);
+    if (pos == std::string::npos) return {};
+    const size_t gt = lower_xml.find('>', pos);
+    if (gt == std::string::npos) return {};
+    const size_t ap = lower_xml.find(lower_attr, pos);
+    if (ap == std::string::npos || ap >= gt) return {};
+    const size_t val_start = ap + lower_attr.size();
+    const size_t val_end = xml.find('"', val_start);
+    if (val_end == std::string::npos || val_end > gt) return {};
+    return TrimAscii(xml.substr(val_start, val_end - val_start));
+}
+
+bool TryFindGameConfigInDir(const fs::path& dir, fs::path& out_path) {
+    if (dir.empty()) return false;
+    std::error_code ec;
+    const fs::path p1 = dir / "MicrosoftGame.Config";
+    if (fs::is_regular_file(p1, ec)) {
+        out_path = p1;
+        return true;
+    }
+    ec.clear();
+    const fs::path p2 = dir / "MicrosoftGame.config";
+    if (fs::is_regular_file(p2, ec)) {
+        out_path = p2;
+        return true;
+    }
+    return false;
+}
+
+GameConfigMetadata LoadGameConfigMetadata() {
+    GameConfigMetadata meta{};
+    fs::path cfg_path;
+    std::error_code ec;
+
+    const std::string env_cfg = TrimAscii(GetEnvString("OPENSCARLETT_GAME_CONFIG"));
+    if (!env_cfg.empty()) {
+        const fs::path p(env_cfg);
+        if (fs::is_regular_file(p, ec)) {
+            cfg_path = p;
+        } else {
+            ec.clear();
+            if (fs::is_directory(p, ec)) {
+                (void)TryFindGameConfigInDir(p, cfg_path);
+            }
+        }
+    }
+
+    if (cfg_path.empty()) {
+        const fs::path cwd = fs::current_path(ec);
+        if (!ec && !cwd.empty()) {
+            (void)TryFindGameConfigInDir(cwd, cfg_path);
+        }
+    }
+
+#if defined(_WIN32)
+    if (cfg_path.empty()) {
+        wchar_t exe_buf[MAX_PATH]{};
+        const DWORD len = ::GetModuleFileNameW(nullptr, exe_buf, MAX_PATH);
+        if (len > 0 && len < MAX_PATH) {
+            fs::path cur = fs::path(exe_buf).parent_path();
+            for (int depth = 0; depth < 3 && !cur.empty(); ++depth) {
+                if (TryFindGameConfigInDir(cur, cfg_path)) {
+                    break;
+                }
+                const fs::path parent = cur.parent_path();
+                if (parent == cur) break;
+                cur = parent;
+            }
+        }
+    }
+#endif
+
+    if (cfg_path.empty()) {
+        return meta;
+    }
+
+    std::ifstream ifs(cfg_path, std::ios::binary);
+    if (!ifs) {
+        return meta;
+    }
+    std::ostringstream oss;
+    oss << ifs.rdbuf();
+    const std::string stripped = StripXmlComments(oss.str());
+    meta.found = true;
+
+    const std::string tid_str = ExtractXmlElementText(stripped, "TitleId");
+    if (!tid_str.empty() && tid_str[0] != '-') {
+        char* end_ptr = nullptr;
+        errno = 0;
+        const unsigned long long parsed = std::strtoull(tid_str.c_str(), &end_ptr, 16);
+        if (errno == 0 && end_ptr && *end_ptr == '\0' && parsed <= 0xFFFFFFFFULL) {
+            meta.has_title_id = true;
+            meta.title_id = static_cast<uint32_t>(parsed);
+        }
+    }
+
+    meta.store_id = ExtractXmlElementText(stripped, "StoreId");
+    meta.identity_name = ExtractXmlAttribute(stripped, "Identity", "Name");
+    meta.display_name = ExtractXmlAttribute(stripped, "ShellVisuals", "DefaultDisplayName");
+    return meta;
+}
+
+std::string CurrentStoreId() {
+    const std::string env = TrimAscii(GetEnvString("OPENSCARLETT_STORE_ID"));
+    if (!env.empty()) {
+        return env;
+    }
+    const GameConfigMetadata cfg = LoadGameConfigMetadata();
+    if (!cfg.store_id.empty()) {
+        return cfg.store_id;
+    }
+    return kDefaultStoreId;
+}
+
+std::string CurrentSkuStoreId() {
+    return CurrentStoreId() + "/0001";
+}
+
+std::vector<std::string> ConfiguredAddOnStoreIds() {
+    std::vector<std::string> out;
+    const std::string env = GetEnvString("OPENSCARLETT_STORE_ADDON_IDS");
+    if (env.empty()) return out;
+    size_t pos = 0;
+    while (pos < env.size()) {
+        const size_t comma = env.find(',', pos);
+        const std::string tok = TrimAscii(
+            comma == std::string::npos ? env.substr(pos) : env.substr(pos, comma - pos));
+        if (!tok.empty()) {
+            out.push_back(tok);
+        }
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+    }
+    return out;
+}
+
 std::shared_ptr<XStoreContext> LookupStoreContext(XStoreContextHandle h) {
     if (!h) return nullptr;
     auto& rt = GetRuntime();
@@ -1409,14 +1654,16 @@ std::shared_ptr<XStoreProductQuery> LookupStoreQuery(XStoreProductQueryHandle h)
 XStoreProductQueryHandle CreateStoreProductQueryHandle(bool include_current_game) {
     auto q = std::make_shared<XStoreProductQuery>();
     if (include_current_game) {
+        const std::string cur_store_id = CurrentStoreId();
+        const GameConfigMetadata cfg = LoadGameConfigMetadata();
         q->products.emplace_back();
         XStoreProductBacking& b = q->products.back();
-        b.store_id = kDefaultStoreId;
-        b.title = "OpenScarlett Title";
+        b.store_id = cur_store_id;
+        b.title = cfg.display_name.empty() ? "OpenScarlett Title" : cfg.display_name;
         b.description = "Clean-room local OpenScarlett title";
         b.language = "en-US";
         b.offer_token = "";
-        b.link_uri = "ms-windows-store://pdp/?productid=9OS000000001";
+        b.link_uri = "ms-windows-store://pdp/?productid=" + cur_store_id;
         b.currency_code = "USD";
         b.sku_id = "0001";
         b.availability_id = "AVAIL0000001";
@@ -2046,6 +2293,7 @@ XGameResult OPENSCARLETT_GDK_CALL XGameGetXboxTitleId(uint32_t* titleId) {
         return RecordHr("XGameGetXboxTitleId", XGR_E_INVALIDARG);
     }
     uint32_t tid = 0x5CA00001u;
+    bool from_env = false;
     std::string env = GetEnvString("OPENSCARLETT_TITLE_ID");
     // Trim leading/trailing ASCII whitespace.
     const size_t first = env.find_first_not_of(" \t\r\n");
@@ -2076,7 +2324,14 @@ XGameResult OPENSCARLETT_GDK_CALL XGameGetXboxTitleId(uint32_t* titleId) {
             }
             if (parsed_ok) {
                 tid = static_cast<uint32_t>(parsed);
+                from_env = true;
             }
+        }
+    }
+    if (!from_env) {
+        const GameConfigMetadata cfg = LoadGameConfigMetadata();
+        if (cfg.has_title_id) {
+            tid = cfg.title_id;
         }
     }
     *titleId = tid;
@@ -2775,7 +3030,13 @@ void OPENSCARLETT_GDK_CALL XAsyncCancel(XAsyncBlock* asyncBlock) {
     RecordOk("XAsyncCancel");
     auto rec = LookupAsync(asyncBlock);
     if (!rec) return;
-    rec->canceled.store(true, std::memory_order_release);
+    if (rec->canceled.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+    if (rec->complete_called.load(std::memory_order_acquire) ||
+        rec->cleaned_up.load(std::memory_order_acquire)) {
+        return;
+    }
     if (rec->provider) {
         XAsyncProviderData data{};
         data.async = asyncBlock;
@@ -4588,6 +4849,10 @@ XGameResult OPENSCARLETT_GDK_CALL XPackageEnumeratePackages(
     }
     if (kind == XPackageKind_Game) {
         const std::string pkg_id = CurrentPackageIdentifier();
+        const std::string cur_store_id = CurrentStoreId();
+        const GameConfigMetadata cfg = LoadGameConfigMetadata();
+        const std::string disp_name =
+            cfg.display_name.empty() ? "OpenScarlett Title" : cfg.display_name;
         uint32_t tid = 0x5CA00001u;
         (void)XGameGetXboxTitleId(&tid);
         char tid_buf[16]{};
@@ -4600,10 +4865,10 @@ XGameResult OPENSCARLETT_GDK_CALL XPackageEnumeratePackages(
         details.version.build = 0;
         details.version.revision = 0;
         details.kind = XPackageKind_Game;
-        details.displayName = "OpenScarlett Title";
+        details.displayName = disp_name.c_str();
         details.description = "Clean-room local OpenScarlett title";
         details.publisher = "OpenScarlett";
-        details.storeId = kDefaultStoreId;
+        details.storeId = cur_store_id.c_str();
         details.installing = false;
         details.index = 0;
         details.count = 1;
@@ -5774,6 +6039,54 @@ XGameResult OPENSCARLETT_GDK_CALL XSpeechSynthesizerGetStreamData(
     return RecordHr("XSpeechSynthesizerGetStreamData", XGR_S_OK);
 }
 
+XGameResult OPENSCARLETT_GDK_CALL XSpeechSynthesizerCreateStreamFromSsml(
+    XSpeechSynthesizerHandle speechSynthesizer,
+    const char* ssml,
+    XSpeechSynthesizerStreamHandle* speechSynthesisStream) {
+    if (!speechSynthesizer || !ssml || !speechSynthesisStream) {
+        return RecordHr("XSpeechSynthesizerCreateStreamFromSsml", XGR_E_INVALIDARG);
+    }
+    *speechSynthesisStream = nullptr;
+    bool is_male = false;
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.speech_mutex);
+        auto it = rt.live_synths.find(speechSynthesizer);
+        if (it == rt.live_synths.end()) {
+            return RecordHr("XSpeechSynthesizerCreateStreamFromSsml", XGR_E_HANDLE);
+        }
+        is_male = it->second->is_male;
+    }
+
+    // Extract plain text from SSML markup cleanly.
+    std::string plain;
+    bool in_tag = false;
+    for (const char* p = ssml; *p; ++p) {
+        if (*p == '<') {
+            in_tag = true;
+        } else if (*p == '>') {
+            in_tag = false;
+        } else if (!in_tag) {
+            plain.push_back(*p);
+        }
+    }
+    plain = TrimAscii(plain);
+    if (plain.empty()) {
+        plain = " ";
+    }
+
+    auto stream = std::make_shared<XSpeechSynthesizerStream>();
+    stream->wav_bytes = SynthesizeDeterministicWav(plain.c_str(), is_male);
+    XSpeechSynthesizerStreamHandle raw = stream.get();
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.speech_mutex);
+        rt.live_streams[raw] = std::move(stream);
+    }
+    *speechSynthesisStream = raw;
+    return RecordHr("XSpeechSynthesizerCreateStreamFromSsml", XGR_S_OK);
+}
+
 XGameResult OPENSCARLETT_GDK_CALL XSpeechSynthesizerCloseStreamHandle(
     XSpeechSynthesizerStreamHandle speechSynthesisStream) {
     if (!speechSynthesisStream) {
@@ -5783,6 +6096,448 @@ XGameResult OPENSCARLETT_GDK_CALL XSpeechSynthesizerCloseStreamHandle(
     std::lock_guard<std::mutex> lk(rt.speech_mutex);
     const size_t erased = rt.live_streams.erase(speechSynthesisStream);
     return RecordHr("XSpeechSynthesizerCloseStreamHandle", erased > 0 ? XGR_S_OK : XGR_E_HANDLE);
+}
+
+// ===========================================================================
+// XSpeechToText (XAccessibility clean-room local defaults)
+// ===========================================================================
+XGameResult OPENSCARLETT_GDK_CALL XSpeechToTextSetPositionHint(
+    XSpeechToTextPositionHint position) {
+    if (static_cast<uint32_t>(position) >
+        static_cast<uint32_t>(XSpeechToTextPositionHint_TopRight)) {
+        return RecordHr("XSpeechToTextSetPositionHint", XGR_E_INVALIDARG);
+    }
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.stt_mutex);
+    rt.stt_position_hint = position;
+    return RecordHr("XSpeechToTextSetPositionHint", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XSpeechToTextSendString(
+    const char* speakerName,
+    const char* content,
+    XSpeechToTextType /*type*/) {
+    if (!speakerName || !content) {
+        return RecordHr("XSpeechToTextSendString", XGR_E_INVALIDARG);
+    }
+    return RecordHr("XSpeechToTextSendString", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XSpeechToTextBeginHypothesisString(
+    const char* speakerName,
+    const char* content,
+    XSpeechToTextType /*type*/,
+    uint32_t* hypothesisId) {
+    if (!speakerName || !content || !hypothesisId) {
+        return RecordHr("XSpeechToTextBeginHypothesisString", XGR_E_INVALIDARG);
+    }
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.stt_mutex);
+    const uint32_t id = rt.next_stt_hypothesis_id++;
+    rt.active_stt_hypotheses[id] = std::string(speakerName) + ": " + content;
+    *hypothesisId = id;
+    return RecordHr("XSpeechToTextBeginHypothesisString", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XSpeechToTextUpdateHypothesisString(
+    uint32_t hypothesisId,
+    const char* content) {
+    if (hypothesisId == 0 || !content) {
+        return RecordHr("XSpeechToTextUpdateHypothesisString", XGR_E_INVALIDARG);
+    }
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.stt_mutex);
+    auto it = rt.active_stt_hypotheses.find(hypothesisId);
+    if (it == rt.active_stt_hypotheses.end()) {
+        return RecordHr("XSpeechToTextUpdateHypothesisString", XGR_E_NOT_FOUND);
+    }
+    it->second = content;
+    return RecordHr("XSpeechToTextUpdateHypothesisString", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XSpeechToTextFinalizeHypothesisString(
+    uint32_t hypothesisId,
+    const char* content) {
+    if (hypothesisId == 0 || !content) {
+        return RecordHr("XSpeechToTextFinalizeHypothesisString", XGR_E_INVALIDARG);
+    }
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.stt_mutex);
+    auto it = rt.active_stt_hypotheses.find(hypothesisId);
+    if (it == rt.active_stt_hypotheses.end()) {
+        return RecordHr("XSpeechToTextFinalizeHypothesisString", XGR_E_NOT_FOUND);
+    }
+    rt.active_stt_hypotheses.erase(it);
+    return RecordHr("XSpeechToTextFinalizeHypothesisString", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XSpeechToTextCancelHypothesisString(uint32_t hypothesisId) {
+    if (hypothesisId == 0) {
+        return RecordHr("XSpeechToTextCancelHypothesisString", XGR_E_INVALIDARG);
+    }
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.stt_mutex);
+    const size_t erased = rt.active_stt_hypotheses.erase(hypothesisId);
+    return RecordHr(
+        "XSpeechToTextCancelHypothesisString", erased > 0 ? XGR_S_OK : XGR_E_NOT_FOUND);
+}
+
+// ===========================================================================
+// XAppBroadcast & XAppCapture (clean-room offline/local defaults)
+// ===========================================================================
+XGameResult OPENSCARLETT_GDK_CALL XAppBroadcastGetStatus(
+    XUserHandle requestingUser,
+    XAppBroadcastStatus* appBroadcastStatus) {
+    if (!appBroadcastStatus) {
+        return RecordHr("XAppBroadcastGetStatus", XGR_E_INVALIDARG);
+    }
+    if (requestingUser && !LookupUser(requestingUser)) {
+        return RecordHr("XAppBroadcastGetStatus", XGR_E_HANDLE);
+    }
+    std::memset(appBroadcastStatus, 0, sizeof(*appBroadcastStatus));
+    appBroadcastStatus->canStartBroadcast = false;
+    appBroadcastStatus->isAnyAppBroadcasting = false;
+    appBroadcastStatus->isDisabledBySystem = true;
+    return RecordHr("XAppBroadcastGetStatus", XGR_S_OK);
+}
+
+bool OPENSCARLETT_GDK_CALL XAppBroadcastIsAppBroadcasting(void) {
+    RecordOk("XAppBroadcastIsAppBroadcasting");
+    return false;
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XAppBroadcastShowUI(XUserHandle requestingUser) {
+    if (requestingUser && !LookupUser(requestingUser)) {
+        return RecordHr("XAppBroadcastShowUI", XGR_E_HANDLE);
+    }
+    return RecordHr("XAppBroadcastShowUI", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XAppBroadcastRegisterIsAppBroadcastingChanged(
+    XTaskQueueHandle /*queue*/,
+    void* /*context*/,
+    XAppBroadcastMonitorCallback appBroadcastMonitorCallback,
+    XTaskQueueRegistrationToken* token) {
+    if (!appBroadcastMonitorCallback || !token) {
+        return RecordHr("XAppBroadcastRegisterIsAppBroadcastingChanged", XGR_E_INVALIDARG);
+    }
+    *token = AllocateRegToken(kRegAppBroadcast);
+    return RecordHr("XAppBroadcastRegisterIsAppBroadcastingChanged", XGR_S_OK);
+}
+
+bool OPENSCARLETT_GDK_CALL XAppBroadcastUnregisterIsAppBroadcastingChanged(
+    XTaskQueueRegistrationToken token,
+    bool /*wait*/) {
+    RecordOk("XAppBroadcastUnregisterIsAppBroadcastingChanged");
+    return ReleaseRegToken(kRegAppBroadcast, token);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XAppCaptureMetadataAddStringEvent(
+    const char* name,
+    const char* value,
+    XAppCaptureMetadataPriority /*priority*/) {
+    if (!name || !*name || !value) {
+        return RecordHr("XAppCaptureMetadataAddStringEvent", XGR_E_INVALIDARG);
+    }
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.capture_mutex);
+    rt.capture_metadata_bytes_used += std::strlen(name) + std::strlen(value) + 16u;
+    return RecordHr("XAppCaptureMetadataAddStringEvent", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XAppCaptureMetadataAddInt32Event(
+    const char* name,
+    int32_t /*value*/,
+    XAppCaptureMetadataPriority /*priority*/) {
+    if (!name || !*name) {
+        return RecordHr("XAppCaptureMetadataAddInt32Event", XGR_E_INVALIDARG);
+    }
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.capture_mutex);
+    rt.capture_metadata_bytes_used += std::strlen(name) + 20u;
+    return RecordHr("XAppCaptureMetadataAddInt32Event", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XAppCaptureMetadataAddDoubleEvent(
+    const char* name,
+    double /*value*/,
+    XAppCaptureMetadataPriority /*priority*/) {
+    if (!name || !*name) {
+        return RecordHr("XAppCaptureMetadataAddDoubleEvent", XGR_E_INVALIDARG);
+    }
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.capture_mutex);
+    rt.capture_metadata_bytes_used += std::strlen(name) + 24u;
+    return RecordHr("XAppCaptureMetadataAddDoubleEvent", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XAppCaptureMetadataStartStringState(
+    const char* name,
+    const char* value,
+    XAppCaptureMetadataPriority /*priority*/) {
+    if (!name || !*name || !value) {
+        return RecordHr("XAppCaptureMetadataStartStringState", XGR_E_INVALIDARG);
+    }
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.capture_mutex);
+    rt.capture_metadata_states[name] = value;
+    rt.capture_metadata_bytes_used += std::strlen(name) + std::strlen(value) + 16u;
+    return RecordHr("XAppCaptureMetadataStartStringState", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XAppCaptureMetadataStartInt32State(
+    const char* name,
+    int32_t value,
+    XAppCaptureMetadataPriority /*priority*/) {
+    if (!name || !*name) {
+        return RecordHr("XAppCaptureMetadataStartInt32State", XGR_E_INVALIDARG);
+    }
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.capture_mutex);
+    rt.capture_metadata_states[name] = std::to_string(value);
+    rt.capture_metadata_bytes_used += std::strlen(name) + 20u;
+    return RecordHr("XAppCaptureMetadataStartInt32State", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XAppCaptureMetadataStartDoubleState(
+    const char* name,
+    double value,
+    XAppCaptureMetadataPriority /*priority*/) {
+    if (!name || !*name) {
+        return RecordHr("XAppCaptureMetadataStartDoubleState", XGR_E_INVALIDARG);
+    }
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.capture_mutex);
+    rt.capture_metadata_states[name] = std::to_string(value);
+    rt.capture_metadata_bytes_used += std::strlen(name) + 24u;
+    return RecordHr("XAppCaptureMetadataStartDoubleState", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XAppCaptureMetadataStopState(const char* name) {
+    if (!name || !*name) {
+        return RecordHr("XAppCaptureMetadataStopState", XGR_E_INVALIDARG);
+    }
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.capture_mutex);
+    rt.capture_metadata_states.erase(name);
+    return RecordHr("XAppCaptureMetadataStopState", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XAppCaptureMetadataStopAllStates(void) {
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.capture_mutex);
+    rt.capture_metadata_states.clear();
+    return RecordHr("XAppCaptureMetadataStopAllStates", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XAppCaptureMetadataRemainingStorageBytesAvailable(
+    uint64_t* value) {
+    if (!value) {
+        return RecordHr("XAppCaptureMetadataRemainingStorageBytesAvailable", XGR_E_INVALIDARG);
+    }
+    constexpr uint64_t kMaxMetadataBytes = 64ULL * 1024ULL * 1024ULL;
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.capture_mutex);
+    *value = (rt.capture_metadata_bytes_used < kMaxMetadataBytes)
+                 ? (kMaxMetadataBytes - rt.capture_metadata_bytes_used)
+                 : 0ULL;
+    return RecordHr("XAppCaptureMetadataRemainingStorageBytesAvailable", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XAppCaptureRegisterMetadataPurged(
+    XTaskQueueHandle /*queue*/,
+    void* /*context*/,
+    XAppCaptureMetadataPurgedCallback callback,
+    XTaskQueueRegistrationToken* token) {
+    if (!callback || !token) {
+        return RecordHr("XAppCaptureRegisterMetadataPurged", XGR_E_INVALIDARG);
+    }
+    *token = AllocateRegToken(kRegAppCaptureMetadataPurged);
+    return RecordHr("XAppCaptureRegisterMetadataPurged", XGR_S_OK);
+}
+
+bool OPENSCARLETT_GDK_CALL XAppCaptureUnRegisterMetadataPurged(
+    XTaskQueueRegistrationToken token,
+    bool /*wait*/) {
+    RecordOk("XAppCaptureUnRegisterMetadataPurged");
+    return ReleaseRegToken(kRegAppCaptureMetadataPurged, token);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XAppCaptureTakeDiagnosticScreenshot(
+    bool /*gameDvrShouldBeShutDown*/,
+    XAppCaptureScreenshotFormatFlag /*screenshotFormat*/,
+    const char* filenamePrefix,
+    XAppCaptureDiagnosticScreenshotResult* result) {
+    if (!result) {
+        return RecordHr("XAppCaptureTakeDiagnosticScreenshot", XGR_E_INVALIDARG);
+    }
+    std::memset(result, 0, sizeof(*result));
+    const fs::path cap_dir = ResolveSaveRoot() / "captures";
+    std::error_code ec;
+    fs::create_directories(cap_dir, ec);
+
+    uint64_t seq = 0;
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.capture_mutex);
+        seq = rt.next_screenshot_id++;
+    }
+    const std::string prefix = (filenamePrefix && *filenamePrefix) ? filenamePrefix : "diag";
+    const fs::path out_path = cap_dir / (prefix + "_" + std::to_string(seq) + ".png");
+    const std::vector<uint8_t> png = BuildCleanRoomGamerPicPng(16u);
+    (void)WriteBinaryFileAtomic(out_path, png.data(), png.size());
+
+    result->fileCount = 1u;
+    const std::string path_str = out_path.string();
+    std::snprintf(result->files[0].path, sizeof(result->files[0].path), "%s", path_str.c_str());
+    result->files[0].fileSize = png.size();
+    result->files[0].width = 16u;
+    result->files[0].height = 16u;
+    return RecordHr("XAppCaptureTakeDiagnosticScreenshot", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XAppCaptureRecordDiagnosticClip(
+    int64_t startTime,
+    uint32_t durationInMs,
+    const char* filenamePrefix,
+    XAppCaptureRecordClipResult* result) {
+    if (!result) {
+        return RecordHr("XAppCaptureRecordDiagnosticClip", XGR_E_INVALIDARG);
+    }
+    std::memset(result, 0, sizeof(*result));
+    const fs::path cap_dir = ResolveSaveRoot() / "captures";
+    std::error_code ec;
+    fs::create_directories(cap_dir, ec);
+
+    uint64_t seq = 0;
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.capture_mutex);
+        seq = rt.next_screenshot_id++;
+    }
+    const std::string prefix = (filenamePrefix && *filenamePrefix) ? filenamePrefix : "clip";
+    const fs::path out_path = cap_dir / (prefix + "_" + std::to_string(seq) + ".mp4");
+    static constexpr uint8_t kStubClipHeader[16] = {
+        0x00, 0x00, 0x00, 0x10, 'f', 't', 'y', 'p', 'i', 's', 'o', 'm', 0x00, 0x00, 0x02, 0x00};
+    (void)WriteBinaryFileAtomic(out_path, kStubClipHeader, sizeof(kStubClipHeader));
+
+    const std::string path_str = out_path.string();
+    std::snprintf(result->path, sizeof(result->path), "%s", path_str.c_str());
+    result->fileSize = sizeof(kStubClipHeader);
+    result->startTime = startTime;
+    result->durationInMs = durationInMs;
+    result->width = 1920u;
+    result->height = 1080u;
+    result->encoding = 0u;
+    result->startTimePreciseOffsetHns = 0u;
+    return RecordHr("XAppCaptureRecordDiagnosticClip", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XAppCaptureTakeScreenshot(
+    XUserHandle requestingUser,
+    XAppCaptureTakeScreenshotResult* result) {
+    if (!result) {
+        return RecordHr("XAppCaptureTakeScreenshot", XGR_E_INVALIDARG);
+    }
+    if (requestingUser && !LookupUser(requestingUser)) {
+        return RecordHr("XAppCaptureTakeScreenshot", XGR_E_HANDLE);
+    }
+    std::memset(result, 0, sizeof(*result));
+    std::string local_id;
+    std::vector<uint8_t> png = BuildCleanRoomGamerPicPng(16u);
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.capture_mutex);
+        const uint64_t seq = rt.next_screenshot_id++;
+        local_id = "openscarlett-screenshot-" + std::to_string(seq);
+        rt.capture_screenshots[local_id] = std::move(png);
+    }
+    std::snprintf(result->localId, sizeof(result->localId), "%s", local_id.c_str());
+    result->availableScreenshotFormats = XAppCaptureScreenshotFormatFlag_SDR;
+    return RecordHr("XAppCaptureTakeScreenshot", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XAppCaptureOpenScreenshotStream(
+    const char* localId,
+    XAppCaptureScreenshotFormatFlag /*screenshotFormat*/,
+    XAppCaptureScreenshotStreamHandle* handle,
+    uint64_t* totalBytes) {
+    if (!localId || !*localId || !handle || !totalBytes) {
+        return RecordHr("XAppCaptureOpenScreenshotStream", XGR_E_INVALIDARG);
+    }
+    *handle = nullptr;
+    *totalBytes = 0u;
+
+    auto stream = std::make_shared<XAppCaptureScreenshotStream>();
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.capture_mutex);
+        auto it = rt.capture_screenshots.find(localId);
+        if (it != rt.capture_screenshots.end()) {
+            stream->bytes = it->second;
+        } else {
+            stream->bytes = BuildCleanRoomGamerPicPng(16u);
+        }
+        XAppCaptureScreenshotStreamHandle raw = stream.get();
+        *totalBytes = static_cast<uint64_t>(stream->bytes.size());
+        rt.live_capture_streams[raw] = std::move(stream);
+        *handle = raw;
+    }
+    return RecordHr("XAppCaptureOpenScreenshotStream", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XAppCaptureReadScreenshotStream(
+    XAppCaptureScreenshotStreamHandle handle,
+    uint64_t startPosition,
+    uint32_t bytesToRead,
+    uint8_t* buffer,
+    uint32_t* bytesWritten) {
+    if (!handle || !bytesWritten || (bytesToRead > 0u && !buffer)) {
+        return RecordHr("XAppCaptureReadScreenshotStream", XGR_E_INVALIDARG);
+    }
+    *bytesWritten = 0u;
+    std::shared_ptr<XAppCaptureScreenshotStream> stream;
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.capture_mutex);
+        auto it = rt.live_capture_streams.find(handle);
+        if (it == rt.live_capture_streams.end()) {
+            return RecordHr("XAppCaptureReadScreenshotStream", XGR_E_HANDLE);
+        }
+        stream = it->second;
+    }
+    if (startPosition >= stream->bytes.size()) {
+        return RecordHr("XAppCaptureReadScreenshotStream", XGR_S_OK);
+    }
+    const uint64_t avail = static_cast<uint64_t>(stream->bytes.size()) - startPosition;
+    const uint32_t to_copy = static_cast<uint32_t>(
+        std::min<uint64_t>(static_cast<uint64_t>(bytesToRead), avail));
+    if (to_copy > 0u) {
+        std::memcpy(buffer, stream->bytes.data() + startPosition, to_copy);
+    }
+    *bytesWritten = to_copy;
+    return RecordHr("XAppCaptureReadScreenshotStream", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XAppCaptureCloseScreenshotStream(
+    XAppCaptureScreenshotStreamHandle handle) {
+    if (!handle) {
+        return RecordHr("XAppCaptureCloseScreenshotStream", XGR_S_OK);
+    }
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.capture_mutex);
+    const size_t erased = rt.live_capture_streams.erase(handle);
+    return RecordHr("XAppCaptureCloseScreenshotStream", erased > 0 ? XGR_S_OK : XGR_E_HANDLE);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XAppCaptureEnableRecord(void) {
+    GetRuntime().capture_record_enabled.store(true, std::memory_order_release);
+    return RecordHr("XAppCaptureEnableRecord", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XAppCaptureDisableRecord(void) {
+    GetRuntime().capture_record_enabled.store(false, std::memory_order_release);
+    return RecordHr("XAppCaptureDisableRecord", XGR_S_OK);
 }
 
 // ===========================================================================
@@ -5856,7 +6611,8 @@ XGameResult OPENSCARLETT_GDK_CALL XStoreQueryGameLicenseAsync(
         return RecordHr("XStoreQueryGameLicenseAsync", XGR_E_HANDLE);
     }
     XStoreGameLicense lic{};
-    std::snprintf(lic.skuStoreId, sizeof(lic.skuStoreId), "%s", kDefaultSkuStoreId);
+    const std::string sku_store_id = CurrentSkuStoreId();
+    std::snprintf(lic.skuStoreId, sizeof(lic.skuStoreId), "%s", sku_store_id.c_str());
     lic.isActive = true;
     lic.isTrialOwnedByThisUser = false;
     lic.isDiscLicense = false;
@@ -5961,19 +6717,39 @@ XGameResult OPENSCARLETT_GDK_CALL XStoreQueryAddOnLicensesResultCount(
     if (hr < 0) {
         return RecordHr("XStoreQueryAddOnLicensesResultCount", hr);
     }
-    *count = 0u;
+    *count = static_cast<uint32_t>(ConfiguredAddOnStoreIds().size());
     return RecordHr("XStoreQueryAddOnLicensesResultCount", XGR_S_OK);
 }
 
 XGameResult OPENSCARLETT_GDK_CALL XStoreQueryAddOnLicensesResult(
     XAsyncBlock* async,
-    uint32_t /*count*/,
-    XStoreAddonLicense* /*addOnLicenses*/) {
+    uint32_t count,
+    XStoreAddonLicense* addOnLicenses) {
     if (!async) {
         return RecordHr("XStoreQueryAddOnLicensesResult", XGR_E_INVALIDARG);
     }
     const XGameResult hr = XAsyncGetStatus(async, true);
-    return RecordHr("XStoreQueryAddOnLicensesResult", hr);
+    if (hr < 0) {
+        return RecordHr("XStoreQueryAddOnLicensesResult", hr);
+    }
+    const auto addons = ConfiguredAddOnStoreIds();
+    if (!addons.empty() && count > 0u && addOnLicenses) {
+        const uint32_t n = std::min<uint32_t>(count, static_cast<uint32_t>(addons.size()));
+        for (uint32_t i = 0; i < n; ++i) {
+            std::memset(&addOnLicenses[i], 0, sizeof(XStoreAddonLicense));
+            const std::string sku = addons[i] + "/0001";
+            std::snprintf(
+                addOnLicenses[i].skuStoreId, sizeof(addOnLicenses[i].skuStoreId), "%s", sku.c_str());
+            std::snprintf(
+                addOnLicenses[i].inAppOfferToken,
+                sizeof(addOnLicenses[i].inAppOfferToken),
+                "%s",
+                addons[i].c_str());
+            addOnLicenses[i].isActive = true;
+            addOnLicenses[i].expirationDate = 0;
+        }
+    }
+    return RecordHr("XStoreQueryAddOnLicensesResult", XGR_S_OK);
 }
 
 XGameResult OPENSCARLETT_GDK_CALL XStoreQueryProductForCurrentGameAsync(
@@ -6126,10 +6902,13 @@ XGameResult OPENSCARLETT_GDK_CALL XStoreQueryProductsAsync(
     if (!LookupStoreContext(storeContextHandle)) {
         return RecordHr("XStoreQueryProductsAsync", XGR_E_HANDLE);
     }
+    const std::string cur_store_id = CurrentStoreId();
     bool include_game = false;
     if (storeIds && storeIdsCount > 0) {
         for (size_t i = 0; i < storeIdsCount; ++i) {
-            if (storeIds[i] && std::strcmp(storeIds[i], kDefaultStoreId) == 0) {
+            if (storeIds[i] &&
+                (std::strcmp(storeIds[i], kDefaultStoreId) == 0 ||
+                 cur_store_id == storeIds[i])) {
                 include_game = true;
                 break;
             }
@@ -6260,7 +7039,8 @@ XGameResult OPENSCARLETT_GDK_CALL XStoreCanAcquireLicenseForStoreIdAsync(
         return RecordHr("XStoreCanAcquireLicenseForStoreIdAsync", XGR_E_HANDLE);
     }
     XStoreCanAcquireLicenseResult res{};
-    if (std::strcmp(storeProductId, kDefaultStoreId) == 0) {
+    const std::string cur_store_id = CurrentStoreId();
+    if (std::strcmp(storeProductId, kDefaultStoreId) == 0 || cur_store_id == storeProductId) {
         std::snprintf(res.licensableSku, sizeof(res.licensableSku), "%s", "0001");
         res.status = XStoreCanLicenseStatus_Licensable;
     } else {
@@ -7432,6 +8212,55 @@ XGameResult OPENSCARLETT_GDK_CALL XPersistentLocalStorageGetPath(
         CopyStringResult(pls_str, pathSize, path, pathUsed));
 }
 
+XGameResult OPENSCARLETT_GDK_CALL XPersistentLocalStorageGetSpaceInfo(
+    XPersistentLocalStorageSpaceInfo* spaceInfo) {
+    if (!spaceInfo) {
+        return RecordHr("XPersistentLocalStorageGetSpaceInfo", XGR_E_INVALIDARG);
+    }
+    const fs::path pls_dir = ResolveSaveRoot() / "pls";
+    std::error_code ec;
+    fs::create_directories(pls_dir, ec);
+    const auto sp = fs::space(pls_dir, ec);
+    if (!ec && sp.capacity > 0u) {
+        spaceInfo->availableFreeBytes = static_cast<uint64_t>(sp.available);
+        spaceInfo->totalFreeBytes = static_cast<uint64_t>(sp.free);
+        spaceInfo->totalBytes = static_cast<uint64_t>(sp.capacity);
+        spaceInfo->usedBytes = (sp.capacity >= sp.free)
+                                   ? static_cast<uint64_t>(sp.capacity - sp.free)
+                                   : 0ULL;
+    } else {
+        constexpr uint64_t kFallbackFree = 4ULL * 1024ULL * 1024ULL * 1024ULL;
+        spaceInfo->availableFreeBytes = kFallbackFree;
+        spaceInfo->totalFreeBytes = kFallbackFree;
+        spaceInfo->usedBytes = 0ULL;
+        spaceInfo->totalBytes = kFallbackFree;
+    }
+    return RecordHr("XPersistentLocalStorageGetSpaceInfo", XGR_S_OK);
+}
+
+static const char kIdPlsPromptSpace[] = "XPersistentLocalStoragePromptUserForSpaceAsync";
+
+XGameResult OPENSCARLETT_GDK_CALL XPersistentLocalStoragePromptUserForSpaceAsync(
+    uint64_t /*requestedBytes*/,
+    XAsyncBlock* asyncBlock) {
+    if (!asyncBlock) {
+        return RecordHr("XPersistentLocalStoragePromptUserForSpaceAsync", XGR_E_INVALIDARG);
+    }
+    // Headless PC mode: succeed cleanly without blocking on a modal UI prompt.
+    return RecordHr(
+        "XPersistentLocalStoragePromptUserForSpaceAsync",
+        StartVoidAsync(asyncBlock, kIdPlsPromptSpace, kIdPlsPromptSpace, XGR_S_OK));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XPersistentLocalStoragePromptUserForSpaceResult(
+    XAsyncBlock* asyncBlock) {
+    if (!asyncBlock) {
+        return RecordHr("XPersistentLocalStoragePromptUserForSpaceResult", XGR_E_INVALIDARG);
+    }
+    return RecordHr(
+        "XPersistentLocalStoragePromptUserForSpaceResult", XAsyncGetStatus(asyncBlock, true));
+}
+
 bool OPENSCARLETT_GDK_CALL XThreadIsTimeSensitive(void) {
     RecordOk("XThreadIsTimeSensitive");
     return g_thread_time_sensitive;
@@ -8005,6 +8834,738 @@ const IXgrCoreRuntimeApiVtable g_core_runtime_vtable = {
     &XClosedCaptionSetEnabled,
 };
 
+// ===========================================================================
+// Real Microsoft XGamingRuntimeThunks.dll 3-arg QueryApiImpl COM ABI Tables
+// All 24 (CLSID, IID) interfaces & 288 COM vtable slots verified against
+// shipping XGamingRuntimeThunks.dll.
+// ===========================================================================
+using ComVtableSlot = void (*)(void);
+
+template <auto Fn>
+struct ComThunk;
+
+template <typename Ret, typename... Args, Ret(OPENSCARLETT_GDK_CALL* Fn)(Args...)>
+struct ComThunk<Fn> {
+    static Ret OPENSCARLETT_GDK_CALL Call(void* /*self*/, Args... args) {
+        return Fn(args...);
+    }
+};
+
+XGameResult OPENSCARLETT_GDK_CALL ComThunk_Unimpl(void* /*self*/) {
+    return RecordHr("IXgrComApi::UnimplSlot", XGR_E_NOTIMPL);
+}
+
+// Win64 COM virtual method ABI for >8-byte struct return (XSystemAnalyticsInfo = 144 bytes):
+// RCX = this, RDX = hidden return buffer, returns RDX in RAX.
+XSystemAnalyticsInfo* OPENSCARLETT_GDK_CALL ComThunk_XSystemGetAnalyticsInfo(
+    void* /*self*/,
+    XSystemAnalyticsInfo* outRet) {
+    if (outRet) {
+        *outRet = XSystemGetAnalyticsInfo();
+    }
+    return outRet;
+}
+
+#define OS_COM_SLOT(fn) reinterpret_cast<ComVtableSlot>(&ComThunk<&fn>::Call)
+#define OS_COM_UNIMPL() reinterpret_cast<ComVtableSlot>(&ComThunk_Unimpl)
+
+struct XgrRealComObject {
+    const ComVtableSlot* lpVtbl;
+    uint32_t com_index;
+};
+
+enum RealComObjIndex : uint32_t {
+    kComUser = 0,
+    kComUserGamertag = 1,
+    kComDisplayHdr = 2,
+    kComGameInvite = 3,
+    kComAsyncTaskQueue = 4,
+    kComStore = 5,
+    kComAppBroadcastMeta = 6,
+    kComLaunchDisplay = 7,
+    kComNetworking = 8,
+    kComAccessibilitySpeech = 9,
+    kComGameSave = 10,
+    kComUserDeviceAudio = 11,
+    kComRuntimeFeature = 12,
+    kComError = 13,
+    kComGameTitle = 14,
+    kComAppCapture = 15,
+    kComPackage = 16,
+    kComSystemAnalytics = 17,
+    kComGameEvent = 18,
+    kComGameUi = 19,
+    kComSystemConsole = 20,
+    kComPls = 21,
+    kComObjCount = 22,
+};
+
+// Forward declare COM lookup so RealComQueryInterface can cross-QI on multi-IID classes.
+XgrRealComObject* LookupRealComInterface(const XgrGuid& clsid, const XgrGuid& iid) noexcept;
+const XgrGuid& GetRealComClsidByIndex(uint32_t idx) noexcept;
+
+std::atomic<uint32_t> g_real_com_refs[kComObjCount]{
+    1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u,
+    1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u};
+
+uint32_t OPENSCARLETT_GDK_CALL RealComAddRef(void* self) {
+    RecordOk("IXgrComApi::AddRef");
+    const auto* obj = static_cast<const XgrRealComObject*>(self);
+    if (!obj || obj->com_index >= kComObjCount) {
+        return 1u;
+    }
+    return g_real_com_refs[obj->com_index].fetch_add(1u, std::memory_order_acq_rel) + 1u;
+}
+
+uint32_t OPENSCARLETT_GDK_CALL RealComRelease(void* self) {
+    RecordOk("IXgrComApi::Release");
+    const auto* obj = static_cast<const XgrRealComObject*>(self);
+    if (!obj || obj->com_index >= kComObjCount) {
+        return 1u;
+    }
+    auto& ref = g_real_com_refs[obj->com_index];
+    uint32_t cur = ref.load(std::memory_order_acquire);
+    while (cur > 1u) {
+        if (ref.compare_exchange_weak(cur, cur - 1u, std::memory_order_acq_rel)) {
+            return cur - 1u;
+        }
+    }
+    return 1u;
+}
+
+XGameResult OPENSCARLETT_GDK_CALL RealComQueryInterface(
+    void* self,
+    const XgrGuid* riid,
+    void** ppvObject) {
+    if (!ppvObject) {
+        return RecordHr("IXgrComApi::QueryInterface", XGR_E_POINTER);
+    }
+    *ppvObject = nullptr;
+    const auto* obj = static_cast<const XgrRealComObject*>(self);
+    if (!obj || obj->com_index >= kComObjCount || !riid) {
+        return RecordHr("IXgrComApi::QueryInterface", XGR_E_INVALIDARG);
+    }
+    if (XgrGuidEquals(*riid, XGR_IID_IUNKNOWN)) {
+        RealComAddRef(self);
+        *ppvObject = self;
+        return RecordHr("IXgrComApi::QueryInterface", XGR_S_OK);
+    }
+    XgrRealComObject* target = LookupRealComInterface(GetRealComClsidByIndex(obj->com_index), *riid);
+    if (!target) {
+        return RecordHr("IXgrComApi::QueryInterface", XGR_E_NOINTERFACE);
+    }
+    RealComAddRef(target);
+    *ppvObject = target;
+    return RecordHr("IXgrComApi::QueryInterface", XGR_S_OK);
+}
+
+#define OS_COM_IUNKNOWN_SLOTS \
+    reinterpret_cast<ComVtableSlot>(&RealComQueryInterface), \
+    reinterpret_cast<ComVtableSlot>(&RealComAddRef), \
+    reinterpret_cast<ComVtableSlot>(&RealComRelease)
+
+// 1. CLSID={01ACD177-91F9-4763-A38E-CCBB55CE32E0} IID={1BF2F8C5-D507-4E52-BB05-F726D0E71161}
+const ComVtableSlot g_com_vtbl_user[] = {
+    OS_COM_IUNKNOWN_SLOTS,
+    /*  3 */ OS_COM_SLOT(XUserDuplicateHandle),
+    /*  4 */ OS_COM_SLOT(XUserCloseHandle),
+    /*  5 */ OS_COM_SLOT(XUserCompare),
+    /*  6 */ OS_COM_SLOT(XUserGetMaxUsers),
+    /*  7 */ OS_COM_SLOT(XUserAddAsync),
+    /*  8 */ OS_COM_SLOT(XUserAddResult),
+    /*  9 */ OS_COM_SLOT(XUserGetLocalId),
+    /* 10 */ OS_COM_SLOT(XUserFindUserByLocalId),
+    /* 11 */ OS_COM_SLOT(XUserGetId),
+    /* 12 */ OS_COM_SLOT(XUserFindUserById),
+    /* 13 */ OS_COM_SLOT(XUserGetIsGuest),
+    /* 14 */ OS_COM_SLOT(XUserGetState),
+    /* 15 */ OS_COM_UNIMPL(),
+    /* 16 */ OS_COM_SLOT(XUserGetGamerPictureAsync),
+    /* 17 */ OS_COM_SLOT(XUserGetGamerPictureResultSize),
+    /* 18 */ OS_COM_SLOT(XUserGetGamerPictureResult),
+    /* 19 */ OS_COM_SLOT(XUserGetAgeGroup),
+    /* 20 */ OS_COM_SLOT(XUserCheckPrivilege),
+    /* 21 */ OS_COM_SLOT(XUserResolvePrivilegeWithUiAsync),
+    /* 22 */ OS_COM_SLOT(XUserResolvePrivilegeWithUiResult),
+    /* 23 */ OS_COM_SLOT(XUserGetTokenAndSignatureAsync),
+    /* 24 */ OS_COM_SLOT(XUserGetTokenAndSignatureResultSize),
+    /* 25 */ OS_COM_SLOT(XUserGetTokenAndSignatureResult),
+    /* 26 */ OS_COM_SLOT(XUserGetTokenAndSignatureUtf16Async),
+    /* 27 */ OS_COM_SLOT(XUserGetTokenAndSignatureUtf16ResultSize),
+    /* 28 */ OS_COM_SLOT(XUserGetTokenAndSignatureUtf16Result),
+    /* 29 */ OS_COM_SLOT(XUserResolveIssueWithUiAsync),
+    /* 30 */ OS_COM_SLOT(XUserResolveIssueWithUiResult),
+    /* 31 */ OS_COM_SLOT(XUserResolveIssueWithUiUtf16Async),
+    /* 32 */ OS_COM_SLOT(XUserResolveIssueWithUiUtf16Result),
+    /* 33 */ OS_COM_SLOT(XUserRegisterForChangeEvent),
+    /* 34 */ OS_COM_SLOT(XUserUnregisterForChangeEvent),
+    /* 35 */ OS_COM_SLOT(XUserGetSignOutDeferral),
+    /* 36 */ OS_COM_SLOT(XUserCloseSignOutDeferralHandle),
+};
+
+// 2. CLSID={01ACD177-91F9-4763-A38E-CCBB55CE32E0} IID={CEF4FAC0-7676-4A94-A119-4C43F9EB5B74}
+const ComVtableSlot g_com_vtbl_user_gamertag[] = {
+    OS_COM_IUNKNOWN_SLOTS,
+    /*  3 */ OS_COM_SLOT(XUserGetGamertag),
+};
+
+// 3. CLSID={03F0FE74-FDD9-4E5C-B630-F9339C47ACC5} IID={35F07670-706E-4BFB-9476-090798C5EBF3}
+const ComVtableSlot g_com_vtbl_display_hdr[] = {
+    OS_COM_IUNKNOWN_SLOTS,
+    /*  3 */ OS_COM_UNIMPL(),
+    /*  4 */ OS_COM_SLOT(XDisplayTryEnableHdrMode),
+};
+
+// 4. CLSID={0651AAE2-4012-4077-BF84-8B9097090E2C} IID={0651AAE2-4012-4077-BF84-8B9097090E2C}
+const ComVtableSlot g_com_vtbl_game_invite[] = {
+    OS_COM_IUNKNOWN_SLOTS,
+    /*  3 */ OS_COM_SLOT(XGameInviteRegisterForEvent),
+    /*  4 */ OS_COM_SLOT(XGameInviteUnregisterForEvent),
+};
+
+// 5. CLSID={073B7DCB-1FCF-4030-94BE-E3C9EB623428} IID={073B7DCB-1FCF-4030-94BE-E3C9EB623428}
+const ComVtableSlot g_com_vtbl_async_taskqueue[] = {
+    OS_COM_IUNKNOWN_SLOTS,
+    /*  3 */ OS_COM_SLOT(XAsyncGetStatus),
+    /*  4 */ OS_COM_SLOT(XAsyncGetResultSize),
+    /*  5 */ OS_COM_SLOT(XAsyncCancel),
+    /*  6 */ OS_COM_SLOT(XAsyncRun),
+    /*  7 */ OS_COM_SLOT(XAsyncBegin),
+    /*  8 */ OS_COM_UNIMPL(),
+    /*  9 */ OS_COM_SLOT(XAsyncSchedule),
+    /* 10 */ OS_COM_SLOT(XAsyncComplete),
+    /* 11 */ OS_COM_SLOT(XAsyncGetResult),
+    /* 12 */ OS_COM_SLOT(XTaskQueueCreate),
+    /* 13 */ OS_COM_SLOT(XTaskQueueCreateComposite),
+    /* 14 */ OS_COM_SLOT(XTaskQueueGetPort),
+    /* 15 */ OS_COM_SLOT(XTaskQueueDuplicateHandle),
+    /* 16 */ OS_COM_SLOT(XTaskQueueDispatch),
+    /* 17 */ OS_COM_SLOT(XTaskQueueCloseHandle),
+    /* 18 */ OS_COM_SLOT(XTaskQueueSubmitCallback),
+    /* 19 */ OS_COM_SLOT(XTaskQueueSubmitDelayedCallback),
+    /* 20 */ OS_COM_SLOT(XTaskQueueRegisterWaiter),
+    /* 21 */ OS_COM_SLOT(XTaskQueueUnregisterWaiter),
+    /* 22 */ OS_COM_SLOT(XTaskQueueTerminate),
+    /* 23 */ OS_COM_SLOT(XTaskQueueRegisterMonitor),
+    /* 24 */ OS_COM_SLOT(XTaskQueueUnregisterMonitor),
+    /* 25 */ OS_COM_SLOT(XTaskQueueGetCurrentProcessTaskQueue),
+    /* 26 */ OS_COM_SLOT(XTaskQueueSetCurrentProcessTaskQueue),
+    /* 27 */ OS_COM_SLOT(XThreadSetTimeSensitive),
+    /* 28 */ OS_COM_SLOT(XThreadVerifyNotTimeSensitive),
+    /* 29 */ OS_COM_SLOT(XThreadAssertNotTimeSensitive),
+    /* 30 */ OS_COM_SLOT(XThreadIsTimeSensitive),
+};
+
+// 6. CLSID={0DD112AC-7C24-448C-B92B-3960FB5BD30C}
+//    IIDs={DE3DBDD4-0B37-4BDB-A10E-ACF3A354D06A}, {60B09F4E-1B85-45B1-826C-169118E230E1},
+//         {2D42FEA5-E71D-4B76-97CD-C50AFBB3AE5D}
+const ComVtableSlot g_com_vtbl_store[] = {
+    OS_COM_IUNKNOWN_SLOTS,
+    /*  3 */ OS_COM_SLOT(XStoreCreateContext),
+    /*  4 */ OS_COM_SLOT(XStoreCloseContextHandle),
+    /*  5 */ OS_COM_SLOT(XStoreQueryAssociatedProductsAsync),
+    /*  6 */ OS_COM_SLOT(XStoreQueryAssociatedProductsResult),
+    /*  7 */ OS_COM_SLOT(XStoreQueryProductsAsync),
+    /*  8 */ OS_COM_SLOT(XStoreQueryProductsResult),
+    /*  9 */ OS_COM_SLOT(XStoreQueryEntitledProductsAsync),
+    /* 10 */ OS_COM_SLOT(XStoreQueryEntitledProductsResult),
+    /* 11 */ OS_COM_SLOT(XStoreQueryProductForCurrentGameAsync),
+    /* 12 */ OS_COM_SLOT(XStoreQueryProductForCurrentGameResult),
+    /* 13 */ OS_COM_SLOT(XStoreQueryProductForPackageAsync),
+    /* 14 */ OS_COM_SLOT(XStoreQueryProductForPackageResult),
+    /* 15 */ OS_COM_SLOT(XStoreEnumerateProductsQuery),
+    /* 16 */ OS_COM_SLOT(XStoreProductsQueryHasMorePages),
+    /* 17 */ OS_COM_SLOT(XStoreProductsQueryNextPageAsync),
+    /* 18 */ OS_COM_SLOT(XStoreProductsQueryNextPageResult),
+    /* 19 */ OS_COM_SLOT(XStoreCloseProductsQueryHandle),
+    /* 20 */ OS_COM_SLOT(XStoreAcquireLicenseForPackageAsync),
+    /* 21 */ OS_COM_SLOT(XStoreAcquireLicenseForPackageResult),
+    /* 22 */ OS_COM_SLOT(XStoreIsLicenseValid),
+    /* 23 */ OS_COM_SLOT(XStoreCloseLicenseHandle),
+    /* 24 */ OS_COM_SLOT(XStoreCanAcquireLicenseForStoreIdAsync),
+    /* 25 */ OS_COM_SLOT(XStoreCanAcquireLicenseForStoreIdResult),
+    /* 26 */ OS_COM_SLOT(XStoreCanAcquireLicenseForPackageAsync),
+    /* 27 */ OS_COM_SLOT(XStoreCanAcquireLicenseForPackageResult),
+    /* 28 */ OS_COM_SLOT(XStoreQueryGameLicenseAsync),
+    /* 29 */ OS_COM_SLOT(XStoreQueryGameLicenseResult),
+    /* 30 */ OS_COM_SLOT(XStoreQueryAddOnLicensesAsync),
+    /* 31 */ OS_COM_SLOT(XStoreQueryAddOnLicensesResultCount),
+    /* 32 */ OS_COM_SLOT(XStoreQueryAddOnLicensesResult),
+    /* 33 */ OS_COM_SLOT(XStoreQueryConsumableBalanceRemainingAsync),
+    /* 34 */ OS_COM_SLOT(XStoreQueryConsumableBalanceRemainingResult),
+    /* 35 */ OS_COM_SLOT(XStoreReportConsumableFulfillmentAsync),
+    /* 36 */ OS_COM_SLOT(XStoreReportConsumableFulfillmentResult),
+    /* 37 */ OS_COM_SLOT(XStoreGetUserCollectionsIdAsync),
+    /* 38 */ OS_COM_SLOT(XStoreGetUserCollectionsIdResultSize),
+    /* 39 */ OS_COM_SLOT(XStoreGetUserCollectionsIdResult),
+    /* 40 */ OS_COM_SLOT(XStoreGetUserPurchaseIdAsync),
+    /* 41 */ OS_COM_SLOT(XStoreGetUserPurchaseIdResultSize),
+    /* 42 */ OS_COM_SLOT(XStoreGetUserPurchaseIdResult),
+    /* 43 */ OS_COM_SLOT(XStoreQueryLicenseTokenAsync),
+    /* 44 */ OS_COM_SLOT(XStoreQueryLicenseTokenResultSize),
+    /* 45 */ OS_COM_SLOT(XStoreQueryLicenseTokenResult),
+    /* 46 */ OS_COM_UNIMPL(),
+    /* 47 */ OS_COM_UNIMPL(),
+    /* 48 */ OS_COM_UNIMPL(),
+    /* 49 */ OS_COM_SLOT(XStoreShowPurchaseUIAsync),
+    /* 50 */ OS_COM_SLOT(XStoreShowPurchaseUIResult),
+    /* 51 */ OS_COM_SLOT(XStoreShowRateAndReviewUIAsync),
+    /* 52 */ OS_COM_SLOT(XStoreShowRateAndReviewUIResult),
+    /* 53 */ OS_COM_SLOT(XStoreShowRedeemTokenUIAsync),
+    /* 54 */ OS_COM_SLOT(XStoreShowRedeemTokenUIResult),
+    /* 55 */ OS_COM_SLOT(XStoreQueryGameAndDlcPackageUpdatesAsync),
+    /* 56 */ OS_COM_SLOT(XStoreQueryGameAndDlcPackageUpdatesResultCount),
+    /* 57 */ OS_COM_SLOT(XStoreQueryGameAndDlcPackageUpdatesResult),
+    /* 58 */ OS_COM_SLOT(XStoreDownloadPackageUpdatesAsync),
+    /* 59 */ OS_COM_SLOT(XStoreDownloadPackageUpdatesResult),
+    /* 60 */ OS_COM_SLOT(XStoreDownloadAndInstallPackageUpdatesAsync),
+    /* 61 */ OS_COM_SLOT(XStoreDownloadAndInstallPackageUpdatesResult),
+    /* 62 */ OS_COM_SLOT(XStoreDownloadAndInstallPackagesAsync),
+    /* 63 */ OS_COM_SLOT(XStoreDownloadAndInstallPackagesResultCount),
+    /* 64 */ OS_COM_SLOT(XStoreDownloadAndInstallPackagesResult),
+    /* 65 */ OS_COM_SLOT(XStoreQueryPackageIdentifier),
+    /* 66 */ OS_COM_SLOT(XStoreRegisterGameLicenseChanged),
+    /* 67 */ OS_COM_SLOT(XStoreUnregisterGameLicenseChanged),
+    /* 68 */ OS_COM_SLOT(XStoreRegisterPackageLicenseLost),
+    /* 69 */ OS_COM_SLOT(XStoreUnregisterPackageLicenseLost),
+    /* 70 */ OS_COM_SLOT(XStoreIsAvailabilityPurchasable),
+    /* 71 */ OS_COM_SLOT(XStoreAcquireLicenseForDurablesAsync),
+    /* 72 */ OS_COM_SLOT(XStoreAcquireLicenseForDurablesResult),
+    /* 73 */ OS_COM_SLOT(XStoreShowAssociatedProductsUIAsync),
+    /* 74 */ OS_COM_SLOT(XStoreShowAssociatedProductsUIResult),
+    /* 75 */ OS_COM_SLOT(XStoreShowProductPageUIAsync),
+    /* 76 */ OS_COM_SLOT(XStoreShowProductPageUIResult),
+};
+
+// 7. CLSID={186D5592-A72D-45FB-9560-11AED0E6647A} IID={186D5592-A72D-45FB-9560-11AED0E6647A}
+const ComVtableSlot g_com_vtbl_app_broadcast_meta[] = {
+    OS_COM_IUNKNOWN_SLOTS,
+    /*  3 */ OS_COM_SLOT(XAppBroadcastIsAppBroadcasting),
+    /*  4 */ OS_COM_SLOT(XAppBroadcastShowUI),
+    /*  5 */ OS_COM_SLOT(XAppBroadcastGetStatus),
+    /*  6 */ OS_COM_SLOT(XAppBroadcastRegisterIsAppBroadcastingChanged),
+    /*  7 */ OS_COM_SLOT(XAppBroadcastUnregisterIsAppBroadcastingChanged),
+    /*  8 */ OS_COM_SLOT(XAppCaptureMetadataAddStringEvent),
+    /*  9 */ OS_COM_SLOT(XAppCaptureMetadataAddInt32Event),
+    /* 10 */ OS_COM_SLOT(XAppCaptureMetadataAddDoubleEvent),
+    /* 11 */ OS_COM_SLOT(XAppCaptureMetadataStartStringState),
+    /* 12 */ OS_COM_SLOT(XAppCaptureMetadataStartInt32State),
+    /* 13 */ OS_COM_SLOT(XAppCaptureMetadataStartDoubleState),
+    /* 14 */ OS_COM_SLOT(XAppCaptureMetadataStopState),
+    /* 15 */ OS_COM_SLOT(XAppCaptureMetadataStopAllStates),
+    /* 16 */ OS_COM_SLOT(XAppCaptureMetadataRemainingStorageBytesAvailable),
+    /* 17 */ OS_COM_SLOT(XAppCaptureRegisterMetadataPurged),
+    /* 18 */ OS_COM_SLOT(XAppCaptureUnRegisterMetadataPurged),
+};
+
+// 8. CLSID={1B339674-328D-4283-A200-3171F18D3639} IID={1B339674-328D-4283-A200-3171F18D3639}
+const ComVtableSlot g_com_vtbl_launch_display[] = {
+    OS_COM_IUNKNOWN_SLOTS,
+    /*  3 */ OS_COM_SLOT(XLaunchUri),
+    /*  4 */ OS_COM_SLOT(XDisplayAcquireTimeoutDeferral),
+    /*  5 */ OS_COM_SLOT(XDisplayCloseTimeoutDeferralHandle),
+};
+
+// 9. CLSID={37E56907-2F10-41E8-B72F-36EDB185331A} IID={37E56907-2F10-41E8-B72F-36EDB185331A}
+const ComVtableSlot g_com_vtbl_networking[] = {
+    OS_COM_IUNKNOWN_SLOTS,
+    /*  3 */ OS_COM_SLOT(XNetworkingQueryPreferredLocalUdpMultiplayerPort),
+    /*  4 */ OS_COM_SLOT(XNetworkingQueryPreferredLocalUdpMultiplayerPortAsync),
+    /*  5 */ OS_COM_SLOT(XNetworkingQueryPreferredLocalUdpMultiplayerPortAsyncResult),
+    /*  6 */ OS_COM_SLOT(XNetworkingRegisterPreferredLocalUdpMultiplayerPortChanged),
+    /*  7 */ OS_COM_SLOT(XNetworkingUnregisterPreferredLocalUdpMultiplayerPortChanged),
+    /*  8 */ OS_COM_SLOT(XNetworkingQuerySecurityInformationForUrlAsync),
+    /*  9 */ OS_COM_SLOT(XNetworkingQuerySecurityInformationForUrlAsyncResultSize),
+    /* 10 */ OS_COM_SLOT(XNetworkingQuerySecurityInformationForUrlAsyncResult),
+    /* 11 */ OS_COM_SLOT(XNetworkingQuerySecurityInformationForUrlUtf16Async),
+    /* 12 */ OS_COM_SLOT(XNetworkingQuerySecurityInformationForUrlUtf16AsyncResultSize),
+    /* 13 */ OS_COM_SLOT(XNetworkingQuerySecurityInformationForUrlUtf16AsyncResult),
+    /* 14 */ OS_COM_SLOT(XNetworkingVerifyServerCertificate),
+    /* 15 */ OS_COM_SLOT(XNetworkingGetConnectivityHint),
+    /* 16 */ OS_COM_SLOT(XNetworkingRegisterConnectivityHintChanged),
+    /* 17 */ OS_COM_SLOT(XNetworkingUnregisterConnectivityHintChanged),
+};
+
+// 10. CLSID={3E241977-6237-41E9-8559-102C2D9983F1} IID={D722B373-8C4D-4692-9E51-D6AD9B37AA7D}
+const ComVtableSlot g_com_vtbl_accessibility_speech[] = {
+    OS_COM_IUNKNOWN_SLOTS,
+    /*  3 */ OS_COM_SLOT(XClosedCaptionGetProperties),
+    /*  4 */ OS_COM_SLOT(XClosedCaptionSetEnabled),
+    /*  5 */ OS_COM_SLOT(XHighContrastGetMode),
+    /*  6 */ OS_COM_SLOT(XSpeechToTextSetPositionHint),
+    /*  7 */ OS_COM_SLOT(XSpeechToTextSendString),
+    /*  8 */ OS_COM_SLOT(XSpeechSynthesizerEnumerateInstalledVoices),
+    /*  9 */ OS_COM_SLOT(XSpeechSynthesizerCreate),
+    /* 10 */ OS_COM_SLOT(XSpeechSynthesizerCloseHandle),
+    /* 11 */ OS_COM_SLOT(XSpeechSynthesizerSetDefaultVoice),
+    /* 12 */ OS_COM_SLOT(XSpeechSynthesizerSetCustomVoice),
+    /* 13 */ OS_COM_SLOT(XSpeechSynthesizerCreateStreamFromText),
+    /* 14 */ OS_COM_SLOT(XSpeechSynthesizerCloseStreamHandle),
+    /* 15 */ OS_COM_SLOT(XSpeechSynthesizerGetStreamDataSize),
+    /* 16 */ OS_COM_SLOT(XSpeechSynthesizerGetStreamData),
+    /* 17 */ OS_COM_SLOT(XSpeechToTextBeginHypothesisString),
+    /* 18 */ OS_COM_SLOT(XSpeechToTextUpdateHypothesisString),
+    /* 19 */ OS_COM_SLOT(XSpeechToTextFinalizeHypothesisString),
+    /* 20 */ OS_COM_SLOT(XSpeechToTextCancelHypothesisString),
+    /* 21 */ OS_COM_SLOT(XSpeechSynthesizerCreateStreamFromSsml),
+};
+
+// 11. CLSID={704C3F58-E629-4CC2-B197-30511B996FE2} IID={704C3F58-E629-4CC2-B197-30511B996EE2}
+const ComVtableSlot g_com_vtbl_game_save[] = {
+    OS_COM_IUNKNOWN_SLOTS,
+    /*  3 */ OS_COM_SLOT(XGameSaveInitializeProvider),
+    /*  4 */ OS_COM_SLOT(XGameSaveInitializeProviderAsync),
+    /*  5 */ OS_COM_SLOT(XGameSaveInitializeProviderResult),
+    /*  6 */ OS_COM_SLOT(XGameSaveCloseProvider),
+    /*  7 */ OS_COM_SLOT(XGameSaveGetRemainingQuota),
+    /*  8 */ OS_COM_SLOT(XGameSaveGetRemainingQuotaAsync),
+    /*  9 */ OS_COM_SLOT(XGameSaveGetRemainingQuotaResult),
+    /* 10 */ OS_COM_SLOT(XGameSaveDeleteContainer),
+    /* 11 */ OS_COM_SLOT(XGameSaveDeleteContainerAsync),
+    /* 12 */ OS_COM_SLOT(XGameSaveDeleteContainerResult),
+    /* 13 */ OS_COM_SLOT(XGameSaveGetContainerInfo),
+    /* 14 */ OS_COM_SLOT(XGameSaveEnumerateContainerInfo),
+    /* 15 */ OS_COM_SLOT(XGameSaveEnumerateContainerInfoByName),
+    /* 16 */ OS_COM_SLOT(XGameSaveCreateContainer),
+    /* 17 */ OS_COM_SLOT(XGameSaveCloseContainer),
+    /* 18 */ OS_COM_SLOT(XGameSaveEnumerateBlobInfo),
+    /* 19 */ OS_COM_SLOT(XGameSaveEnumerateBlobInfoByName),
+    /* 20 */ OS_COM_SLOT(XGameSaveReadBlobData),
+    /* 21 */ OS_COM_SLOT(XGameSaveReadBlobDataAsync),
+    /* 22 */ OS_COM_SLOT(XGameSaveReadBlobDataResult),
+    /* 23 */ OS_COM_SLOT(XGameSaveCreateUpdate),
+    /* 24 */ OS_COM_SLOT(XGameSaveCloseUpdate),
+    /* 25 */ OS_COM_SLOT(XGameSaveSubmitBlobWrite),
+    /* 26 */ OS_COM_SLOT(XGameSaveSubmitBlobDelete),
+    /* 27 */ OS_COM_SLOT(XGameSaveSubmitUpdate),
+    /* 28 */ OS_COM_SLOT(XGameSaveSubmitUpdateAsync),
+    /* 29 */ OS_COM_SLOT(XGameSaveSubmitUpdateResult),
+};
+
+// 12. CLSID={7D824997-10DC-45AB-86B7-2737767C0BF1} IID={0CC6A956-E7E1-4FDF-9341-9D5DA649EBC8}
+const ComVtableSlot g_com_vtbl_user_device_audio[] = {
+    OS_COM_IUNKNOWN_SLOTS,
+    /*  3 */ OS_COM_SLOT(XUserFindForDevice),
+    /*  4 */ OS_COM_SLOT(XUserRegisterForDeviceAssociationChanged),
+    /*  5 */ OS_COM_SLOT(XUserUnregisterForDeviceAssociationChanged),
+    /*  6 */ OS_COM_SLOT(XUserGetDefaultAudioEndpointUtf16),
+    /*  7 */ OS_COM_SLOT(XUserRegisterForDefaultAudioEndpointUtf16Changed),
+    /*  8 */ OS_COM_SLOT(XUserUnregisterForDefaultAudioEndpointUtf16Changed),
+};
+
+// 13. CLSID={8836FE87-EDB9-4FE3-8DAD-05F0D2CD5B40} IID={8836FE87-EDB9-4FE3-8DAD-05F0D2CD5B40}
+const ComVtableSlot g_com_vtbl_runtime_feature[] = {
+    OS_COM_IUNKNOWN_SLOTS,
+    /*  3 */ OS_COM_SLOT(XGameRuntimeIsFeatureAvailable),
+};
+
+// 14. CLSID={8CA467F7-22E8-4096-8456-BB8AA13F79D8} IID={8CA467F7-22E8-4096-8456-BB8AA13F79D8}
+const ComVtableSlot g_com_vtbl_error[] = {
+    OS_COM_IUNKNOWN_SLOTS,
+    /*  3 */ OS_COM_SLOT(XErrorReport),
+    /*  4 */ OS_COM_SLOT(XErrorSetCallback),
+    /*  5 */ OS_COM_SLOT(XErrorSetOptions),
+};
+
+// 15. CLSID={973A344E-24BF-4D0F-8457-56C534892B29} IID={2549F142-6419-4A06-97B5-931AAB7C2F34}
+const ComVtableSlot g_com_vtbl_game_title[] = {
+    OS_COM_IUNKNOWN_SLOTS,
+    /*  3 */ OS_COM_SLOT(XGameGetXboxTitleId),
+    /*  4 */ OS_COM_SLOT(XLaunchNewGame),
+};
+
+// 16. CLSID={A4F1AEE2-4BF1-4485-B008-A7C26D52AC27} IID={3A949778-772E-4799-BDEA-0A6639E96BAA}
+const ComVtableSlot g_com_vtbl_app_capture[] = {
+    OS_COM_IUNKNOWN_SLOTS,
+    /*  3 */ OS_COM_SLOT(XAppCaptureTakeDiagnosticScreenshot),
+    /*  4 */ OS_COM_SLOT(XAppCaptureRecordDiagnosticClip),
+    /*  5 */ OS_COM_SLOT(XAppCaptureTakeScreenshot),
+    /*  6 */ OS_COM_SLOT(XAppCaptureOpenScreenshotStream),
+    /*  7 */ OS_COM_SLOT(XAppCaptureReadScreenshotStream),
+    /*  8 */ OS_COM_SLOT(XAppCaptureCloseScreenshotStream),
+    /*  9 */ OS_COM_SLOT(XAppCaptureEnableRecord),
+    /* 10 */ OS_COM_SLOT(XAppCaptureDisableRecord),
+};
+
+// 17. CLSID={AF406016-E850-4AA8-A88D-2F3DCB9DAC7E} IID={F92D8712-2B27-4D8A-BF01-11A6F8E3EB42}
+const ComVtableSlot g_com_vtbl_package[] = {
+    OS_COM_IUNKNOWN_SLOTS,
+    /*  3 */ OS_COM_SLOT(XPackageGetCurrentProcessPackageIdentifier),
+    /*  4 */ OS_COM_SLOT(XPackageIsPackagedProcess),
+    /*  5 */ OS_COM_SLOT(XPackageCreateInstallationMonitor),
+    /*  6 */ OS_COM_SLOT(XPackageCloseInstallationMonitorHandle),
+    /*  7 */ OS_COM_SLOT(XPackageGetInstallationProgress),
+    /*  8 */ OS_COM_SLOT(XPackageUpdateInstallationMonitor),
+    /*  9 */ OS_COM_SLOT(XPackageRegisterInstallationProgressChanged),
+    /* 10 */ OS_COM_SLOT(XPackageUnregisterInstallationProgressChanged),
+    /* 11 */ OS_COM_SLOT(XPackageGetUserLocale),
+    /* 12 */ OS_COM_SLOT(XPackageFindChunkAvailability),
+    /* 13 */ OS_COM_SLOT(XPackageEnumerateChunkAvailability),
+    /* 14 */ OS_COM_SLOT(XPackageChangeChunkInstallOrder),
+    /* 15 */ OS_COM_SLOT(XPackageInstallChunks),
+    /* 16 */ OS_COM_SLOT(XPackageInstallChunksAsync),
+    /* 17 */ OS_COM_SLOT(XPackageInstallChunksResult),
+    /* 18 */ OS_COM_SLOT(XPackageEstimateDownloadSize),
+    /* 19 */ OS_COM_SLOT(XPackageUninstallChunks),
+    /* 20 */ OS_COM_UNIMPL(),
+    /* 21 */ OS_COM_UNIMPL(),
+    /* 22 */ OS_COM_SLOT(XPackageUnregisterPackageInstalled),
+    /* 23 */ OS_COM_UNIMPL(),
+    /* 24 */ OS_COM_SLOT(XPackageGetMountPathSize),
+    /* 25 */ OS_COM_SLOT(XPackageGetMountPath),
+    /* 26 */ OS_COM_SLOT(XPackageCloseMountHandle),
+    /* 27 */ OS_COM_UNIMPL(),
+    /* 28 */ OS_COM_UNIMPL(),
+    /* 29 */ OS_COM_UNIMPL(),
+    /* 30 */ OS_COM_SLOT(XPackageGetWriteStats),
+    /* 31 */ OS_COM_UNIMPL(),
+    /* 32 */ OS_COM_SLOT(XPackageUninstallUWPInstance),
+    /* 33 */ OS_COM_SLOT(XPackageEnumerateFeatures),
+    /* 34 */ OS_COM_UNIMPL(),
+    /* 35 */ OS_COM_SLOT(XPackageEnumeratePackages),
+    /* 36 */ OS_COM_SLOT(XPackageRegisterPackageInstalled),
+};
+
+// 18. CLSID={B884675D-B738-4A9C-815D-9A9A1E0C6C9B} IID={B884675D-B738-4A9C-815D-9A9A1E0C6C9B}
+const ComVtableSlot g_com_vtbl_system_analytics[] = {
+    OS_COM_IUNKNOWN_SLOTS,
+    /*  3 */ reinterpret_cast<ComVtableSlot>(&ComThunk_XSystemGetAnalyticsInfo),
+};
+
+// 19. CLSID={BBFBDCC7-BFE7-409B-A5CA-EDF054960B4D} IID={BBFBDCC7-BFE7-409B-A5CA-EDF054960B4D}
+const ComVtableSlot g_com_vtbl_game_event[] = {
+    OS_COM_IUNKNOWN_SLOTS,
+    /*  3 */ OS_COM_SLOT(XGameEventWrite),
+};
+
+// 20. CLSID={DFCD4649-4FF8-4043-BA07-35D607DF98B0} IID={72C4E70F-4A67-481B-BB84-AA72EDA14FE5}
+const ComVtableSlot g_com_vtbl_game_ui[] = {
+    OS_COM_IUNKNOWN_SLOTS,
+    /*  3 */ OS_COM_SLOT(XGameUiShowMessageDialogAsync),
+    /*  4 */ OS_COM_SLOT(XGameUiShowMessageDialogResult),
+    /*  5 */ OS_COM_SLOT(XGameUiShowSendGameInviteAsync),
+    /*  6 */ OS_COM_SLOT(XGameUiShowSendGameInviteResult),
+    /*  7 */ OS_COM_SLOT(XGameUiShowPlayerProfileCardAsync),
+    /*  8 */ OS_COM_SLOT(XGameUiShowPlayerProfileCardResult),
+    /*  9 */ OS_COM_SLOT(XGameUiShowAchievementsAsync),
+    /* 10 */ OS_COM_SLOT(XGameUiShowAchievementsResult),
+    /* 11 */ OS_COM_SLOT(XGameUiShowPlayerPickerAsync),
+    /* 12 */ OS_COM_SLOT(XGameUiShowPlayerPickerResultCount),
+    /* 13 */ OS_COM_SLOT(XGameUiShowPlayerPickerResult),
+    /* 14 */ OS_COM_SLOT(XGameUiShowErrorDialogAsync),
+    /* 15 */ OS_COM_SLOT(XGameUiShowErrorDialogResult),
+    /* 16 */ OS_COM_SLOT(XGameUiSetNotificationPositionHint),
+    /* 17 */ OS_COM_SLOT(XGameUiShowTextEntryAsync),
+    /* 18 */ OS_COM_SLOT(XGameUiShowTextEntryResultSize),
+    /* 19 */ OS_COM_SLOT(XGameUiShowTextEntryResult),
+    /* 20 */ OS_COM_UNIMPL(),
+    /* 21 */ OS_COM_UNIMPL(),
+    /* 22 */ OS_COM_UNIMPL(),
+    /* 23 */ OS_COM_UNIMPL(),
+    /* 24 */ OS_COM_SLOT(XGameUiShowWebAuthenticationAsync),
+    /* 25 */ OS_COM_SLOT(XGameUiShowWebAuthenticationResultSize),
+    /* 26 */ OS_COM_SLOT(XGameUiShowWebAuthenticationResult),
+    /* 27 */ OS_COM_SLOT(XGameUiShowWebAuthenticationWithOptionsAsync),
+};
+
+// 21. CLSID={E349BD1A-FC20-4E40-B99C-4178CC6B409F} IID={67CE4BFC-B1D1-4AC7-BC3A-CB9219A97A85}
+const ComVtableSlot g_com_vtbl_system_console[] = {
+    OS_COM_IUNKNOWN_SLOTS,
+    /*  3 */ OS_COM_SLOT(XSystemGetConsoleId),
+    /*  4 */ OS_COM_SLOT(XSystemGetXboxLiveSandboxId),
+};
+
+// 22. CLSID={F4FAF4D4-2D04-4FCE-B3E0-474A713A3E84} IID={D29411DF-0794-4553-8B27-95FC02D0F75D}
+const ComVtableSlot g_com_vtbl_pls[] = {
+    OS_COM_IUNKNOWN_SLOTS,
+    /*  3 */ OS_COM_SLOT(XPersistentLocalStorageGetPathSize),
+    /*  4 */ OS_COM_SLOT(XPersistentLocalStorageGetPath),
+    /*  5 */ OS_COM_SLOT(XPersistentLocalStorageGetSpaceInfo),
+    /*  6 */ OS_COM_SLOT(XPersistentLocalStoragePromptUserForSpaceAsync),
+    /*  7 */ OS_COM_SLOT(XPersistentLocalStoragePromptUserForSpaceResult),
+};
+
+#undef OS_COM_IUNKNOWN_SLOTS
+#undef OS_COM_UNIMPL
+#undef OS_COM_SLOT
+
+XgrRealComObject g_real_com_objects[kComObjCount] = {
+    {g_com_vtbl_user, kComUser},
+    {g_com_vtbl_user_gamertag, kComUserGamertag},
+    {g_com_vtbl_display_hdr, kComDisplayHdr},
+    {g_com_vtbl_game_invite, kComGameInvite},
+    {g_com_vtbl_async_taskqueue, kComAsyncTaskQueue},
+    {g_com_vtbl_store, kComStore},
+    {g_com_vtbl_app_broadcast_meta, kComAppBroadcastMeta},
+    {g_com_vtbl_launch_display, kComLaunchDisplay},
+    {g_com_vtbl_networking, kComNetworking},
+    {g_com_vtbl_accessibility_speech, kComAccessibilitySpeech},
+    {g_com_vtbl_game_save, kComGameSave},
+    {g_com_vtbl_user_device_audio, kComUserDeviceAudio},
+    {g_com_vtbl_runtime_feature, kComRuntimeFeature},
+    {g_com_vtbl_error, kComError},
+    {g_com_vtbl_game_title, kComGameTitle},
+    {g_com_vtbl_app_capture, kComAppCapture},
+    {g_com_vtbl_package, kComPackage},
+    {g_com_vtbl_system_analytics, kComSystemAnalytics},
+    {g_com_vtbl_game_event, kComGameEvent},
+    {g_com_vtbl_game_ui, kComGameUi},
+    {g_com_vtbl_system_console, kComSystemConsole},
+    {g_com_vtbl_pls, kComPls},
+};
+
+struct RealComInterfaceMapping {
+    XgrGuid clsid;
+    XgrGuid iid;
+    uint32_t obj_index;
+};
+
+constexpr RealComInterfaceMapping kRealComMappings[] = {
+    // 1. XUser main
+    {{0x01ACD177u, 0x91F9u, 0x4763u, {0xA3, 0x8E, 0xCC, 0xBB, 0x55, 0xCE, 0x32, 0xE0}},
+     {0x1BF2F8C5u, 0xD507u, 0x4E52u, {0xBB, 0x05, 0xF7, 0x26, 0xD0, 0xE7, 0x11, 0x61}},
+     kComUser},
+    // 2. XUser gamertag
+    {{0x01ACD177u, 0x91F9u, 0x4763u, {0xA3, 0x8E, 0xCC, 0xBB, 0x55, 0xCE, 0x32, 0xE0}},
+     {0xCEF4FAC0u, 0x7676u, 0x4A94u, {0xA1, 0x19, 0x4C, 0x43, 0xF9, 0xEB, 0x5B, 0x74}},
+     kComUserGamertag},
+    // 3. XDisplay HDR
+    {{0x03F0FE74u, 0xFDD9u, 0x4E5Cu, {0xB6, 0x30, 0xF9, 0x33, 0x9C, 0x47, 0xAC, 0xC5}},
+     {0x35F07670u, 0x706Eu, 0x4BFBu, {0x94, 0x76, 0x09, 0x07, 0x98, 0xC5, 0xEB, 0xF3}},
+     kComDisplayHdr},
+    // 4. XGameInvite
+    {{0x0651AAE2u, 0x4012u, 0x4077u, {0xBF, 0x84, 0x8B, 0x90, 0x97, 0x09, 0x0E, 0x2C}},
+     {0x0651AAE2u, 0x4012u, 0x4077u, {0xBF, 0x84, 0x8B, 0x90, 0x97, 0x09, 0x0E, 0x2C}},
+     kComGameInvite},
+    // 5. XAsync / XTaskQueue / XThread
+    {{0x073B7DCBu, 0x1FCFu, 0x4030u, {0x94, 0xBE, 0xE3, 0xC9, 0xEB, 0x62, 0x34, 0x28}},
+     {0x073B7DCBu, 0x1FCFu, 0x4030u, {0x94, 0xBE, 0xE3, 0xC9, 0xEB, 0x62, 0x34, 0x28}},
+     kComAsyncTaskQueue},
+    // 6a. XStore main
+    {{0x0DD112ACu, 0x7C24u, 0x448Cu, {0xB9, 0x2B, 0x39, 0x60, 0xFB, 0x5B, 0xD3, 0x0C}},
+     {0xDE3DBDD4u, 0x0B37u, 0x4BDBu, {0xA1, 0x0E, 0xAC, 0xF3, 0xA3, 0x54, 0xD0, 0x6A}},
+     kComStore},
+    // 6b. XStore IsAvailabilityPurchasable
+    {{0x0DD112ACu, 0x7C24u, 0x448Cu, {0xB9, 0x2B, 0x39, 0x60, 0xFB, 0x5B, 0xD3, 0x0C}},
+     {0x60B09F4Eu, 0x1B85u, 0x45B1u, {0x82, 0x6C, 0x16, 0x91, 0x18, 0xE2, 0x30, 0xE1}},
+     kComStore},
+    // 6c. XStore AcquireLicenseForDurables
+    {{0x0DD112ACu, 0x7C24u, 0x448Cu, {0xB9, 0x2B, 0x39, 0x60, 0xFB, 0x5B, 0xD3, 0x0C}},
+     {0x2D42FEA5u, 0xE71Du, 0x4B76u, {0x97, 0xCD, 0xC5, 0x0A, 0xFB, 0xB3, 0xAE, 0x5D}},
+     kComStore},
+    // 7. XAppBroadcast + XAppCaptureMetadata
+    {{0x186D5592u, 0xA72Du, 0x45FBu, {0x95, 0x60, 0x11, 0xAE, 0xD0, 0xE6, 0x64, 0x7A}},
+     {0x186D5592u, 0xA72Du, 0x45FBu, {0x95, 0x60, 0x11, 0xAE, 0xD0, 0xE6, 0x64, 0x7A}},
+     kComAppBroadcastMeta},
+    // 8. XLaunchUri + XDisplay timeout deferral
+    {{0x1B339674u, 0x328Du, 0x4283u, {0xA2, 0x00, 0x31, 0x71, 0xF1, 0x8D, 0x36, 0x39}},
+     {0x1B339674u, 0x328Du, 0x4283u, {0xA2, 0x00, 0x31, 0x71, 0xF1, 0x8D, 0x36, 0x39}},
+     kComLaunchDisplay},
+    // 9. XNetworking
+    {{0x37E56907u, 0x2F10u, 0x41E8u, {0xB7, 0x2F, 0x36, 0xED, 0xB1, 0x85, 0x33, 0x1A}},
+     {0x37E56907u, 0x2F10u, 0x41E8u, {0xB7, 0x2F, 0x36, 0xED, 0xB1, 0x85, 0x33, 0x1A}},
+     kComNetworking},
+    // 10. XAccessibility + XSpeechSynthesizer + XSpeechToText
+    {{0x3E241977u, 0x6237u, 0x41E9u, {0x85, 0x59, 0x10, 0x2C, 0x2D, 0x99, 0x83, 0xF1}},
+     {0xD722B373u, 0x8C4Du, 0x4692u, {0x9E, 0x51, 0xD6, 0xAD, 0x9B, 0x37, 0xAA, 0x7D}},
+     kComAccessibilitySpeech},
+    // 11. XGameSave
+    {{0x704C3F58u, 0xE629u, 0x4CC2u, {0xB1, 0x97, 0x30, 0x51, 0x1B, 0x99, 0x6F, 0xE2}},
+     {0x704C3F58u, 0xE629u, 0x4CC2u, {0xB1, 0x97, 0x30, 0x51, 0x1B, 0x99, 0x6E, 0xE2}},
+     kComGameSave},
+    // 12. XUser device & audio endpoints
+    {{0x7D824997u, 0x10DCu, 0x45ABu, {0x86, 0xB7, 0x27, 0x37, 0x76, 0x7C, 0x0B, 0xF1}},
+     {0x0CC6A956u, 0xE7E1u, 0x4FDFu, {0x93, 0x41, 0x9D, 0x5D, 0xA6, 0x49, 0xEB, 0xC8}},
+     kComUserDeviceAudio},
+    // 13. XGameRuntimeIsFeatureAvailable
+    {{0x8836FE87u, 0xEDB9u, 0x4FE3u, {0x8D, 0xAD, 0x05, 0xF0, 0xD2, 0xCD, 0x5B, 0x40}},
+     {0x8836FE87u, 0xEDB9u, 0x4FE3u, {0x8D, 0xAD, 0x05, 0xF0, 0xD2, 0xCD, 0x5B, 0x40}},
+     kComRuntimeFeature},
+    // 14. XError
+    {{0x8CA467F7u, 0x22E8u, 0x4096u, {0x84, 0x56, 0xBB, 0x8A, 0xA1, 0x3F, 0x79, 0xD8}},
+     {0x8CA467F7u, 0x22E8u, 0x4096u, {0x84, 0x56, 0xBB, 0x8A, 0xA1, 0x3F, 0x79, 0xD8}},
+     kComError},
+    // 15. XGameGetXboxTitleId + XLaunchNewGame
+    {{0x973A344Eu, 0x24BFu, 0x4D0Fu, {0x84, 0x57, 0x56, 0xC5, 0x34, 0x89, 0x2B, 0x29}},
+     {0x2549F142u, 0x6419u, 0x4A06u, {0x97, 0xB5, 0x93, 0x1A, 0xAB, 0x7C, 0x2F, 0x34}},
+     kComGameTitle},
+    // 16. XAppCapture screenshot & record
+    {{0xA4F1AEE2u, 0x4BF1u, 0x4485u, {0xB0, 0x08, 0xA7, 0xC2, 0x6D, 0x52, 0xAC, 0x27}},
+     {0x3A949778u, 0x772Eu, 0x4799u, {0xBD, 0xEA, 0x0A, 0x66, 0x39, 0xE9, 0x6B, 0xAA}},
+     kComAppCapture},
+    // 17. XPackage
+    {{0xAF406016u, 0xE850u, 0x4AA8u, {0xA8, 0x8D, 0x2F, 0x3D, 0xCB, 0x9D, 0xAC, 0x7E}},
+     {0xF92D8712u, 0x2B27u, 0x4D8Au, {0xBF, 0x01, 0x11, 0xA6, 0xF8, 0xE3, 0xEB, 0x42}},
+     kComPackage},
+    // 18. XSystemGetAnalyticsInfo
+    {{0xB884675Du, 0xB738u, 0x4A9Cu, {0x81, 0x5D, 0x9A, 0x9A, 0x1E, 0x0C, 0x6C, 0x9B}},
+     {0xB884675Du, 0xB738u, 0x4A9Cu, {0x81, 0x5D, 0x9A, 0x9A, 0x1E, 0x0C, 0x6C, 0x9B}},
+     kComSystemAnalytics},
+    // 19. XGameEventWrite
+    {{0xBBFBDCC7u, 0xBFE7u, 0x409Bu, {0xA5, 0xCA, 0xED, 0xF0, 0x54, 0x96, 0x0B, 0x4D}},
+     {0xBBFBDCC7u, 0xBFE7u, 0x409Bu, {0xA5, 0xCA, 0xED, 0xF0, 0x54, 0x96, 0x0B, 0x4D}},
+     kComGameEvent},
+    // 20. XGameUi
+    {{0xDFCD4649u, 0x4FF8u, 0x4043u, {0xBA, 0x07, 0x35, 0xD6, 0x07, 0xDF, 0x98, 0xB0}},
+     {0x72C4E70Fu, 0x4A67u, 0x481Bu, {0xBB, 0x84, 0xAA, 0x72, 0xED, 0xA1, 0x4F, 0xE5}},
+     kComGameUi},
+    // 21. XSystem ConsoleId + SandboxId
+    {{0xE349BD1Au, 0xFC20u, 0x4E40u, {0xB9, 0x9C, 0x41, 0x78, 0xCC, 0x6B, 0x40, 0x9F}},
+     {0x67CE4BFCu, 0xB1D1u, 0x4AC7u, {0xBC, 0x3A, 0xCB, 0x92, 0x19, 0xA9, 0x7A, 0x85}},
+     kComSystemConsole},
+    // 22. XPersistentLocalStorage
+    {{0xF4FAF4D4u, 0x2D04u, 0x4FCEu, {0xB3, 0xE0, 0x47, 0x4A, 0x71, 0x3A, 0x3E, 0x84}},
+     {0xD29411DFu, 0x0794u, 0x4553u, {0x8B, 0x27, 0x95, 0xFC, 0x02, 0xD0, 0xF7, 0x5D}},
+     kComPls},
+};
+
+bool IsKnownRealGdkClsid(const XgrGuid& clsid) noexcept {
+    for (const auto& entry : kRealComMappings) {
+        if (XgrGuidEquals(entry.clsid, clsid)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+XgrRealComObject* LookupRealComInterface(const XgrGuid& clsid, const XgrGuid& iid) noexcept {
+    for (const auto& entry : kRealComMappings) {
+        if (XgrGuidEquals(entry.clsid, clsid) &&
+            (XgrGuidEquals(entry.iid, iid) || XgrGuidEquals(iid, XGR_IID_IUNKNOWN))) {
+            return &g_real_com_objects[entry.obj_index];
+        }
+    }
+    return nullptr;
+}
+
+const XgrGuid& GetRealComClsidByIndex(uint32_t idx) noexcept {
+    for (const auto& entry : kRealComMappings) {
+        if (entry.obj_index == idx) {
+            return entry.clsid;
+        }
+    }
+    return kRealComMappings[0].clsid;
+}
+
+const void* LookupInternal2ArgVtable(const XgrGuid& apiId) noexcept {
+    if (XgrGuidEquals(apiId, XGR_API_GUID_TASK_QUEUE)) return &g_task_queue_vtable;
+    if (XgrGuidEquals(apiId, XGR_API_GUID_ASYNC)) return &g_async_vtable;
+    if (XgrGuidEquals(apiId, XGR_API_GUID_USER)) return &g_user_vtable;
+    if (XgrGuidEquals(apiId, XGR_API_GUID_GAME_SAVE)) return &g_game_save_vtable;
+    if (XgrGuidEquals(apiId, XGR_API_GUID_SYSTEM)) return &g_system_vtable;
+    if (XgrGuidEquals(apiId, XGR_API_GUID_MEM)) return &g_mem_vtable;
+    if (XgrGuidEquals(apiId, XGR_API_GUID_PACKAGE)) return &g_package_vtable;
+    if (XgrGuidEquals(apiId, XGR_API_GUID_DISPLAY)) return &g_display_vtable;
+    if (XgrGuidEquals(apiId, XGR_API_GUID_GAME_UI)) return &g_game_ui_vtable;
+    if (XgrGuidEquals(apiId, XGR_API_GUID_GAME_INVITE)) return &g_game_invite_vtable;
+    if (XgrGuidEquals(apiId, XGR_API_GUID_ACCESSIBILITY)) return &g_accessibility_vtable;
+    if (XgrGuidEquals(apiId, XGR_API_GUID_SPEECH_SYNTHESIZER)) return &g_speech_synth_vtable;
+    if (XgrGuidEquals(apiId, XGR_API_GUID_STORE)) return &g_store_vtable;
+    if (XgrGuidEquals(apiId, XGR_API_GUID_NETWORKING)) return &g_networking_vtable;
+    if (XgrGuidEquals(apiId, XGR_API_GUID_CORE_RUNTIME)) return &g_core_runtime_vtable;
+    return nullptr;
+}
+
 }  // namespace
 
 extern "C" {
@@ -8016,6 +9577,15 @@ XGameResult OPENSCARLETT_GDK_CALL InitializeApiImpl(void) {
     auto& rt = GetRuntime();
     rt.api_impl_init_count.fetch_add(1, std::memory_order_acq_rel);
     return RecordHr("InitializeApiImpl", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL InitializeApiImplEx(
+    uint64_t /*versionHigh*/,
+    uint64_t /*versionLow*/,
+    uint64_t /*options*/) {
+    auto& rt = GetRuntime();
+    rt.api_impl_init_count.fetch_add(1, std::memory_order_acq_rel);
+    return RecordHr("InitializeApiImplEx", XGR_S_OK);
 }
 
 void OPENSCARLETT_GDK_CALL UninitializeApiImpl(void) {
@@ -8055,21 +9625,45 @@ XGameResult OPENSCARLETT_GDK_CALL QueryApiImpl(
     void** ppApiVtable3) {
     // Support BOTH:
     //   - 2-arg OpenScarlett internal ABI: QueryApiImpl(const XgrGuid* apiId, void** ppApiVtable)
-    //   - 3-arg real Microsoft XGamingRuntimeThunks.dll ABI:
+    //   - 3-arg real Microsoft XGamingRuntimeThunks.dll COM ABI:
     //       QueryApiImpl(const GUID* clsid, const GUID* iid, void** ppv)
-    //     where arg2 points to a read-only .rdata IID and arg3 is the writable output pointer.
-    if (apiId && ppApiVtable && !IsWritableMemoryPtr(ppApiVtable)) {
+    //     where arg2 points to a .rdata IID (non-writable) OR arg1 is a known real GDK CLSID
+    //     with a valid writable arg3 output pointer.
+    if (apiId) {
+        const void* internal_vtable = LookupInternal2ArgVtable(*apiId);
+        if (internal_vtable) {
+            if (!ppApiVtable) {
+                return RecordHr("QueryApiImpl", XGR_E_POINTER);
+            }
+            XgrVtableAddRef(internal_vtable);
+            *ppApiVtable = const_cast<void*>(internal_vtable);
+            return RecordHr("QueryApiImpl", XGR_S_OK);
+        }
+    }
+
+    const bool is_three_arg =
+        apiId && ppApiVtable &&
+        (!IsWritableMemoryPtr(ppApiVtable) ||
+         (IsKnownRealGdkClsid(*apiId) && ppApiVtable3 && IsWritableMemoryPtr(ppApiVtable3)));
+
+    if (is_three_arg) {
         const auto* clsid = apiId;
         const auto* iid = reinterpret_cast<const XgrGuid*>(ppApiVtable);
         if (!ppApiVtable3 || !IsWritableMemoryPtr(ppApiVtable3)) {
             return RecordHr("QueryApiImpl", XGR_E_POINTER);
         }
         *ppApiVtable3 = nullptr;
-        const std::string sym =
-            "QueryApiImpl(clsid=" + FormatXgrGuid(*clsid) + ",iid=" + FormatXgrGuid(*iid) + ")";
-        openscarlett::CallTelemetry::Global().Record(
-            kModName, sym, openscarlett::CallOutcome::NotImplemented, XGR_E_NOINTERFACE, -1);
-        return XGR_E_NOINTERFACE;
+        XgrRealComObject* com_obj = LookupRealComInterface(*clsid, *iid);
+        if (!com_obj) {
+            const std::string sym =
+                "QueryApiImpl(clsid=" + FormatXgrGuid(*clsid) + ",iid=" + FormatXgrGuid(*iid) + ")";
+            openscarlett::CallTelemetry::Global().Record(
+                kModName, sym, openscarlett::CallOutcome::NotImplemented, XGR_E_NOINTERFACE, -1);
+            return XGR_E_NOINTERFACE;
+        }
+        RealComAddRef(com_obj);
+        *ppApiVtable3 = com_obj;
+        return RecordHr("QueryApiImpl", XGR_S_OK);
     }
 
     if (!ppApiVtable) {
@@ -8080,49 +9674,10 @@ XGameResult OPENSCARLETT_GDK_CALL QueryApiImpl(
         return RecordHr("QueryApiImpl", XGR_E_INVALIDARG);
     }
 
-    const void* vtable = nullptr;
-    if (XgrGuidEquals(*apiId, XGR_API_GUID_TASK_QUEUE)) {
-        vtable = &g_task_queue_vtable;
-    } else if (XgrGuidEquals(*apiId, XGR_API_GUID_ASYNC)) {
-        vtable = &g_async_vtable;
-    } else if (XgrGuidEquals(*apiId, XGR_API_GUID_USER)) {
-        vtable = &g_user_vtable;
-    } else if (XgrGuidEquals(*apiId, XGR_API_GUID_GAME_SAVE)) {
-        vtable = &g_game_save_vtable;
-    } else if (XgrGuidEquals(*apiId, XGR_API_GUID_SYSTEM)) {
-        vtable = &g_system_vtable;
-    } else if (XgrGuidEquals(*apiId, XGR_API_GUID_MEM)) {
-        vtable = &g_mem_vtable;
-    } else if (XgrGuidEquals(*apiId, XGR_API_GUID_PACKAGE)) {
-        vtable = &g_package_vtable;
-    } else if (XgrGuidEquals(*apiId, XGR_API_GUID_DISPLAY)) {
-        vtable = &g_display_vtable;
-    } else if (XgrGuidEquals(*apiId, XGR_API_GUID_GAME_UI)) {
-        vtable = &g_game_ui_vtable;
-    } else if (XgrGuidEquals(*apiId, XGR_API_GUID_GAME_INVITE)) {
-        vtable = &g_game_invite_vtable;
-    } else if (XgrGuidEquals(*apiId, XGR_API_GUID_ACCESSIBILITY)) {
-        vtable = &g_accessibility_vtable;
-    } else if (XgrGuidEquals(*apiId, XGR_API_GUID_SPEECH_SYNTHESIZER)) {
-        vtable = &g_speech_synth_vtable;
-    } else if (XgrGuidEquals(*apiId, XGR_API_GUID_STORE)) {
-        vtable = &g_store_vtable;
-    } else if (XgrGuidEquals(*apiId, XGR_API_GUID_NETWORKING)) {
-        vtable = &g_networking_vtable;
-    } else if (XgrGuidEquals(*apiId, XGR_API_GUID_CORE_RUNTIME)) {
-        vtable = &g_core_runtime_vtable;
-    }
-
-    if (!vtable) {
-        const std::string sym = "QueryApiImpl(" + FormatXgrGuid(*apiId) + ")";
-        openscarlett::CallTelemetry::Global().Record(
-            kModName, sym, openscarlett::CallOutcome::NotImplemented, XGR_E_NOINTERFACE, -1);
-        return XGR_E_NOINTERFACE;
-    }
-
-    XgrVtableAddRef(vtable);
-    *ppApiVtable = const_cast<void*>(vtable);
-    return RecordHr("QueryApiImpl", XGR_S_OK);
+    const std::string sym = "QueryApiImpl(" + FormatXgrGuid(*apiId) + ")";
+    openscarlett::CallTelemetry::Global().Record(
+        kModName, sym, openscarlett::CallOutcome::NotImplemented, XGR_E_NOINTERFACE, -1);
+    return XGR_E_NOINTERFACE;
 }
 
 int32_t OPENSCARLETT_GDK_CALL XgrGetTelemetryCallCountForTest(

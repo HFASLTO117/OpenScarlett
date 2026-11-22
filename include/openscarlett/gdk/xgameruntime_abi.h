@@ -1206,6 +1206,10 @@ OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XSpeechSynthesizerCreateS
     XSpeechSynthesizerHandle speechSynthesizer,
     const char* text,
     XSpeechSynthesizerStreamHandle* speechSynthesisStream);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XSpeechSynthesizerCreateStreamFromSsml(
+    XSpeechSynthesizerHandle speechSynthesizer,
+    const char* ssml,
+    XSpeechSynthesizerStreamHandle* speechSynthesisStream);
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XSpeechSynthesizerGetStreamDataSize(
     XSpeechSynthesizerStreamHandle speechSynthesisStream,
     size_t* bufferSize);
@@ -1216,6 +1220,186 @@ OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XSpeechSynthesizerGetStre
     size_t* bufferUsed);
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XSpeechSynthesizerCloseStreamHandle(
     XSpeechSynthesizerStreamHandle speechSynthesisStream);
+
+// ---------------------------------------------------------------------------
+// XSpeechToText (XAccessibility)
+// ---------------------------------------------------------------------------
+enum XSpeechToTextPositionHint : uint32_t {
+    XSpeechToTextPositionHint_BottomCenter = 0,
+    XSpeechToTextPositionHint_BottomLeft = 1,
+    XSpeechToTextPositionHint_BottomRight = 2,
+    XSpeechToTextPositionHint_MiddleRight = 3,
+    XSpeechToTextPositionHint_MiddleLeft = 4,
+    XSpeechToTextPositionHint_TopCenter = 5,
+    XSpeechToTextPositionHint_TopLeft = 6,
+    XSpeechToTextPositionHint_TopRight = 7,
+};
+
+enum XSpeechToTextType : uint32_t {
+    XSpeechToTextType_Voice = 0,
+    XSpeechToTextType_Text = 1,
+};
+
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XSpeechToTextSetPositionHint(
+    XSpeechToTextPositionHint position);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XSpeechToTextSendString(
+    const char* speakerName,
+    const char* content,
+    XSpeechToTextType type);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XSpeechToTextBeginHypothesisString(
+    const char* speakerName,
+    const char* content,
+    XSpeechToTextType type,
+    uint32_t* hypothesisId);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XSpeechToTextUpdateHypothesisString(
+    uint32_t hypothesisId,
+    const char* content);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XSpeechToTextFinalizeHypothesisString(
+    uint32_t hypothesisId,
+    const char* content);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XSpeechToTextCancelHypothesisString(
+    uint32_t hypothesisId);
+
+// ---------------------------------------------------------------------------
+// XAppBroadcast & XAppCapture
+// ---------------------------------------------------------------------------
+constexpr size_t XAppCaptureMaxLocalIdSize = 1024;
+
+typedef struct XAppCaptureScreenshotStream* XAppCaptureScreenshotStreamHandle;
+
+struct XAppBroadcastStatus {
+    bool canStartBroadcast;
+    bool isAnyAppBroadcasting;
+    bool isCaptureResourceUnavailable;
+    bool isGameStreamInProgress;
+    bool isGpuConstrained;
+    bool isAppInactive;
+    bool isBlockedForApp;
+    bool isDisabledByUser;
+    bool isDisabledBySystem;
+};
+
+enum XAppCaptureMetadataPriority : uint8_t {
+    XAppCaptureMetadataPriority_Informational = 0,
+    XAppCaptureMetadataPriority_Important = 1,
+};
+
+enum XAppCaptureScreenshotFormatFlag : uint16_t {
+    XAppCaptureScreenshotFormatFlag_SDR = 1,
+    XAppCaptureScreenshotFormatFlag_HDR = 2,
+};
+
+struct XAppCaptureScreenshotFile {
+    char path[260];
+    size_t fileSize;
+    uint32_t width;
+    uint32_t height;
+};
+
+struct XAppCaptureDiagnosticScreenshotResult {
+    size_t fileCount;
+    XAppCaptureScreenshotFile files[2];
+};
+
+struct XAppCaptureRecordClipResult {
+    char path[260];
+    size_t fileSize;
+    int64_t startTime;
+    uint32_t durationInMs;
+    uint32_t width;
+    uint32_t height;
+    uint32_t encoding;
+    uint32_t startTimePreciseOffsetHns;
+};
+
+struct XAppCaptureTakeScreenshotResult {
+    char localId[XAppCaptureMaxLocalIdSize];
+    XAppCaptureScreenshotFormatFlag availableScreenshotFormats;
+};
+
+typedef void(OPENSCARLETT_GDK_CALL* XAppBroadcastMonitorCallback)(void* context);
+typedef void(OPENSCARLETT_GDK_CALL* XAppCaptureMetadataPurgedCallback)(void* context);
+
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XAppBroadcastGetStatus(
+    XUserHandle requestingUser,
+    XAppBroadcastStatus* appBroadcastStatus);
+OPENSCARLETT_GDK_API bool OPENSCARLETT_GDK_CALL XAppBroadcastIsAppBroadcasting(void);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XAppBroadcastShowUI(
+    XUserHandle requestingUser);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XAppBroadcastRegisterIsAppBroadcastingChanged(
+    XTaskQueueHandle queue,
+    void* context,
+    XAppBroadcastMonitorCallback appBroadcastMonitorCallback,
+    XTaskQueueRegistrationToken* token);
+OPENSCARLETT_GDK_API bool OPENSCARLETT_GDK_CALL XAppBroadcastUnregisterIsAppBroadcastingChanged(
+    XTaskQueueRegistrationToken token,
+    bool wait);
+
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XAppCaptureMetadataAddStringEvent(
+    const char* name,
+    const char* value,
+    XAppCaptureMetadataPriority priority);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XAppCaptureMetadataAddInt32Event(
+    const char* name,
+    int32_t value,
+    XAppCaptureMetadataPriority priority);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XAppCaptureMetadataAddDoubleEvent(
+    const char* name,
+    double value,
+    XAppCaptureMetadataPriority priority);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XAppCaptureMetadataStartStringState(
+    const char* name,
+    const char* value,
+    XAppCaptureMetadataPriority priority);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XAppCaptureMetadataStartInt32State(
+    const char* name,
+    int32_t value,
+    XAppCaptureMetadataPriority priority);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XAppCaptureMetadataStartDoubleState(
+    const char* name,
+    double value,
+    XAppCaptureMetadataPriority priority);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XAppCaptureMetadataStopState(
+    const char* name);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XAppCaptureMetadataStopAllStates(void);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XAppCaptureMetadataRemainingStorageBytesAvailable(
+    uint64_t* value);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XAppCaptureRegisterMetadataPurged(
+    XTaskQueueHandle queue,
+    void* context,
+    XAppCaptureMetadataPurgedCallback callback,
+    XTaskQueueRegistrationToken* token);
+OPENSCARLETT_GDK_API bool OPENSCARLETT_GDK_CALL XAppCaptureUnRegisterMetadataPurged(
+    XTaskQueueRegistrationToken token,
+    bool wait);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XAppCaptureTakeDiagnosticScreenshot(
+    bool gameDvrShouldBeShutDown,
+    XAppCaptureScreenshotFormatFlag screenshotFormat,
+    const char* filenamePrefix,
+    XAppCaptureDiagnosticScreenshotResult* result);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XAppCaptureRecordDiagnosticClip(
+    int64_t startTime,
+    uint32_t durationInMs,
+    const char* filenamePrefix,
+    XAppCaptureRecordClipResult* result);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XAppCaptureTakeScreenshot(
+    XUserHandle requestingUser,
+    XAppCaptureTakeScreenshotResult* result);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XAppCaptureOpenScreenshotStream(
+    const char* localId,
+    XAppCaptureScreenshotFormatFlag screenshotFormat,
+    XAppCaptureScreenshotStreamHandle* handle,
+    uint64_t* totalBytes);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XAppCaptureReadScreenshotStream(
+    XAppCaptureScreenshotStreamHandle handle,
+    uint64_t startPosition,
+    uint32_t bytesToRead,
+    uint8_t* buffer,
+    uint32_t* bytesWritten);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XAppCaptureCloseScreenshotStream(
+    XAppCaptureScreenshotStreamHandle handle);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XAppCaptureEnableRecord(void);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XAppCaptureDisableRecord(void);
 
 // ---------------------------------------------------------------------------
 // XgrGuid (forward declaration for XStore & QueryApiImpl)
@@ -1927,12 +2111,26 @@ struct XGameEventDataDescriptor {
     uint32_t reserved;
 };
 
+struct XPersistentLocalStorageSpaceInfo {
+    uint64_t availableFreeBytes;
+    uint64_t totalFreeBytes;
+    uint64_t usedBytes;
+    uint64_t totalBytes;
+};
+
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XPersistentLocalStorageGetPathSize(
     size_t* pathSize);
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XPersistentLocalStorageGetPath(
     size_t pathSize,
     char* path,
     size_t* pathUsed);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XPersistentLocalStorageGetSpaceInfo(
+    XPersistentLocalStorageSpaceInfo* spaceInfo);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XPersistentLocalStoragePromptUserForSpaceAsync(
+    uint64_t requestedBytes,
+    XAsyncBlock* asyncBlock);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XPersistentLocalStoragePromptUserForSpaceResult(
+    XAsyncBlock* asyncBlock);
 OPENSCARLETT_GDK_API bool OPENSCARLETT_GDK_CALL XThreadIsTimeSensitive(void);
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XThreadSetTimeSensitive(
     bool isTimeSensitiveThread);
@@ -3092,6 +3290,10 @@ struct IXgrCoreRuntimeApiVtable {
 };
 
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL InitializeApiImpl(void);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL InitializeApiImplEx(
+    uint64_t versionHigh,
+    uint64_t versionLow,
+    uint64_t options);
 OPENSCARLETT_GDK_API void OPENSCARLETT_GDK_CALL UninitializeApiImpl(void);
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL QueryApiImpl(
     const XgrGuid* apiId,
