@@ -1,0 +1,139 @@
+================================================================================
+OpenScarlett Sprint 9 + 10 — Worker 6 Integration Notes (INTEGRATION_w6.txt)
+Branch: swarm/s910-probe-veh-capture
+Scope: First-Boot Probe Mode + Win32 VEH Crash Dumper + Per-Draw Frame Capture
+       + Launcher Play & Launch Tab Integration
+================================================================================
+
+1. NEW & UPDATED FILES IN THIS BRANCH
+--------------------------------------------------------------------------------
+New files:
+  - include/openscarlett/loader/probe_veh.h
+  - src/loader/probe_veh.cpp
+  - include/openscarlett/gpu/frame_capture.h
+  - src/gpu/frame_capture.cpp
+  - src/launcher/launcher_probe_bridge.h
+  - tests/test_probe_veh_capture.cpp
+  - INTEGRATION_w6.txt
+
+Updated files:
+  - src/launcher/hwtest_runner.cpp
+      * Adds LaunchTargetWithProbeOption(...) passing --probe-unknown-imports
+        and OPENSCARLETT_PROBE_UNKNOWN_IMPORTS=1 when enabled (keeping
+        LaunchTargetWithOpenScarlett(...) 100% ABI/source backwards-compatible).
+      * Adds BuildSanitizedLatestTelemetryForClipboard(...) to find the latest
+        telemetry / bring-up JSON, run SanitizeReportText(...), and prepare
+        PII-free JSON for the Win32 clipboard.
+  - src/launcher/launcher_main.cpp
+      * Adds "First-Boot Probe (missing imports + VEH)" checkbox,
+        "Copy Sanitized Telemetry" button, and live telemetry status label
+        on the Play & Launch tab.
+      * Preserves docs/icon.ico (IDI_APP_ICON, WNDCLASSEXW::hIcon/hIconSm,
+        WM_SETICON, launcher.rc, launcher_resource.h) 100% intact.
+
+2. CMAKE INTEGRATION (cmake/sprint9_10_compat.cmake)
+--------------------------------------------------------------------------------
+Add the two new core source files to `openscarlett_core` (or a static library
+linked by `openscarlett_core` / `openscarlett_hook` / `d3d12_xs`) and register
+the unit test target:
+
+    target_sources(openscarlett_core PRIVATE
+        src/loader/probe_veh.cpp
+        src/gpu/frame_capture.cpp
+    )
+
+    openscarlett_add_test(test_probe_veh_capture tests/test_probe_veh_capture.cpp)
+
+Note: Both `probe_veh.cpp` and `frame_capture.cpp` are 100% portable C++20 for
+MSVC, Clang-CL, and MinGW-w64 (zero `__uuidof`, zero `<wrl/client.h>`, zero
+`__try`/`__except`, zero `dbghelp.dll` dependency, zero third-party PNG libs).
+
+3. THIN HOOK FOR src/main.cpp (--probe-unknown-imports)
+--------------------------------------------------------------------------------
+In `RunGuestExecutable(int argc, char** argv)`:
+
+  a) Add flag variable:
+       bool probe_unknown_imports = false;
+
+  b) Inside the `for (int i = 2; i < argc; ++i)` option parser:
+       } else if (arg == "--probe-unknown-imports") {
+           probe_unknown_imports = true;
+
+  c) Save/set/restore `OPENSCARLETT_PROBE_UNKNOWN_IMPORTS` around
+     `openscarlett::LaunchWithApcHook(opts, res)` (identical pattern to
+     `OPENSCARLETT_GPU_BACKEND`):
+       bool had_prev_probe_env = false;
+       std::string prev_probe_env;
+       // Before LaunchWithApcHook:
+       read_env_var("OPENSCARLETT_PROBE_UNKNOWN_IMPORTS", had_prev_probe_env, prev_probe_env);
+       if (probe_unknown_imports) {
+           SetEnvironmentVariableA("OPENSCARLETT_PROBE_UNKNOWN_IMPORTS", "1");
+       }
+       // After LaunchWithApcHook:
+       if (probe_unknown_imports) {
+           SetEnvironmentVariableA("OPENSCARLETT_PROBE_UNKNOWN_IMPORTS",
+                                   had_prev_probe_env ? prev_probe_env.c_str() : nullptr);
+       }
+
+  d) In `PrintUsage()`, document:
+       "      --probe-unknown-imports          Synthesize E_NOTIMPL trampolines & install VEH crash monitor\n"
+
+4. THIN HOOK FOR src/loader/hook_dll.cpp (Probe Trampolines + VEH Monitor)
+--------------------------------------------------------------------------------
+Include:
+    #include "openscarlett/loader/probe_veh.h"
+
+Add static runtime state in anonymous namespace:
+    openscarlett::MissingImportTrampolinePool g_probe_trampoline_pool;
+    openscarlett::VehCrashMonitor g_veh_monitor;
+    bool g_probe_unknown_imports = false;
+
+In `InitializeHookRuntime(HMODULE self_mod)`:
+  1. Read `g_probe_unknown_imports = openscarlett::IsProbeUnknownImportsEnabledByEnv();`
+  2. When `g_probe_unknown_imports` is true:
+       g_veh_monitor.SetTrampolinePool(&g_probe_trampoline_pool);
+       if (!g_telemetry_path_utf8.empty()) {
+           const std::string veh_json = g_telemetry_path_utf8 + ".veh_bringup.json";
+           g_veh_monitor.SetAutoExportPath(veh_json, {openscarlett::WideToUtf8(g_shim_dir_w)});
+       }
+       (void)g_veh_monitor.Install(1);
+
+In `Hook_GetProcAddress(HMODULE hModule, LPCSTR lpProcName)`:
+  When `g_probe_unknown_imports` is true and real `GetProcAddress` returns
+  `nullptr` for a tracked/guest module:
+    const bool by_ord = (reinterpret_cast<uintptr_t>(lpProcName) <= 0xFFFFu);
+    const uint16_t ord = by_ord ? static_cast<uint16_t>(reinterpret_cast<uintptr_t>(lpProcName)) : 0u;
+    const std::string sym = by_ord ? std::string{} : std::string(lpProcName);
+    if (void* stub = g_probe_trampoline_pool.GetOrCreateTrampoline(mod_name, sym, ord, by_ord)) {
+        return reinterpret_cast<FARPROC>(stub);
+    }
+
+In `PatchModuleImports(HMODULE mod)`:
+  When `g_probe_unknown_imports` is true, run
+  `openscarlett::PatchPeImportsWithProbeTrampolines(mod, g_probe_trampoline_pool);`
+  for non-system modules so unresolved static imports receive E_NOTIMPL stubs.
+
+In `OpenScarlettHook_RecordCall(...)`:
+  Also forward to `openscarlett::RecordProbeApiCall(module_name, symbol_name, 0, hr);`
+  when `g_probe_unknown_imports` is true so the 50-entry VEH ring buffer captures
+  all recent shim/D3D12 calls!
+
+In `DllMain` (`DLL_PROCESS_DETACH`):
+  Call `g_veh_monitor.Uninstall();` cleanly before shutdown.
+
+5. THIN HOOK FOR d3d12_xs (FrameCaptureRecorder)
+--------------------------------------------------------------------------------
+In `d3d12_xs` device creation:
+    openscarlett::FrameCaptureRecorder::Global().InitializeFromEnv();
+
+Around draw/dispatch calls (`DrawInstanced`, `DrawIndexedInstanced`, `DispatchMesh`):
+    auto& cap = openscarlett::FrameCaptureRecorder::Global();
+    if (cap.IsEnabled() && cap.BeginDraw(draw_idx, CapturedDrawType::DrawIndexedInstanced)) {
+        // Attach active shader blobs, root args, descriptors, color RT0 & depth D32
+        (void)cap.EndDraw();
+    }
+On Present / Shutdown:
+    if (openscarlett::FrameCaptureRecorder::Global().IsEnabled()) {
+        (void)openscarlett::FrameCaptureRecorder::Global().WriteCaptureIndexJson();
+    }
+================================================================================

@@ -1,4 +1,5 @@
 #include "openscarlett/launcher/hwtest_runner.h"
+#include "launcher_probe_bridge.h"
 
 #include <algorithm>
 #include <array>
@@ -1895,9 +1896,10 @@ bool OpenUrlInDefaultBrowser(const std::string& url) {
 #endif
 }
 
-LauncherRunResult LaunchTargetWithOpenScarlett(
+LauncherRunResult LaunchTargetWithProbeOption(
     const std::filesystem::path& bundle_dir,
     const LauncherRunRequest& req,
+    bool probe_unknown_imports,
     const std::function<void(const std::string&)>& on_log_line,
     const std::atomic<bool>* cancel_flag) {
     LauncherRunResult result{};
@@ -1938,7 +1940,7 @@ LauncherRunResult LaunchTargetWithOpenScarlett(
         std::to_string(static_cast<unsigned long long>(::GetTickCount64())) + "_telemetry.json";
     result.telemetry_path = tel_dir / Utf8ToWide(tel_filename);
 
-    // Assemble command line: openscarlett.exe run <target> --shim-dir <dir> --telemetry <json> [--backend=...] [--timeout-ms N] [-- <extra_args>]
+    // Assemble command line: openscarlett.exe run <target> --shim-dir <dir> --telemetry <json> [--backend=...] [--probe-unknown-imports] [--timeout-ms N] [-- <extra_args>]
     std::wstring cmd = QuoteWin32ArgW(cli_exe.wstring());
     cmd += L" run ";
     cmd += QuoteWin32ArgW(Utf8ToWide(req.target_path));
@@ -1951,6 +1953,10 @@ LauncherRunResult LaunchTargetWithOpenScarlett(
         cmd += L" --backend=d3d12";
     } else if (req.backend == LaunchBackendChoice::Vulkan) {
         cmd += L" --backend=vulkan";
+    }
+
+    if (probe_unknown_imports) {
+        cmd += L" --probe-unknown-imports";
     }
 
     if (req.timeout_ms > 0) {
@@ -1974,6 +1980,9 @@ LauncherRunResult LaunchTargetWithOpenScarlett(
     }
     if (req.null_audio) {
         env_overrides.emplace_back(L"OPENSCARLETT_AUDIO_NULL", L"1");
+    }
+    if (probe_unknown_imports) {
+        env_overrides.emplace_back(L"OPENSCARLETT_PROBE_UNKNOWN_IMPORTS", L"1");
     }
 
     // Allow openscarlett.exe run a brief grace period to flush telemetry if it hits --timeout-ms itself.
@@ -2015,12 +2024,133 @@ LauncherRunResult LaunchTargetWithOpenScarlett(
 #else
     (void)bundle_dir;
     (void)req;
+    (void)probe_unknown_imports;
     (void)on_log_line;
     (void)cancel_flag;
     result.error_message = "LaunchTargetWithOpenScarlett is only supported on Windows.";
 #endif
 
     return result;
+}
+
+LauncherRunResult LaunchTargetWithOpenScarlett(
+    const std::filesystem::path& bundle_dir,
+    const LauncherRunRequest& req,
+    const std::function<void(const std::string&)>& on_log_line,
+    const std::atomic<bool>* cancel_flag) {
+    return LaunchTargetWithProbeOption(bundle_dir, req, false, on_log_line, cancel_flag);
+}
+
+bool BuildSanitizedLatestTelemetryForClipboard(
+    const std::filesystem::path& bundle_dir,
+    const std::filesystem::path& preferred_telemetry_path,
+    const std::string& fallback_launch_log,
+    std::string& out_sanitized_text,
+    std::string& out_source_label) {
+    out_sanitized_text.clear();
+    out_source_label.clear();
+
+    std::error_code ec;
+    std::filesystem::path chosen_path;
+
+    if (!preferred_telemetry_path.empty() &&
+        std::filesystem::is_regular_file(preferred_telemetry_path, ec)) {
+        chosen_path = preferred_telemetry_path;
+    }
+
+    if (chosen_path.empty()) {
+        std::vector<std::filesystem::path> search_dirs;
+#if defined(_WIN32)
+        const std::string temp_env = GetEnvVarUtf8(L"TEMP");
+        std::filesystem::path temp_dir =
+            !temp_env.empty()
+                ? std::filesystem::path(Utf8ToWide(temp_env))
+                : std::filesystem::temp_directory_path(ec);
+        search_dirs.push_back(temp_dir / L"openscarlett_launcher_telemetry");
+        search_dirs.push_back(temp_dir / L"openscarlett_telemetry");
+#else
+        search_dirs.push_back(std::filesystem::temp_directory_path(ec) / "openscarlett_launcher_telemetry");
+#endif
+        if (!bundle_dir.empty()) {
+            search_dirs.push_back(bundle_dir);
+            search_dirs.push_back(bundle_dir / "telemetry");
+        }
+
+        std::filesystem::file_time_type best_time{};
+        bool found_any = false;
+        for (const auto& dir : search_dirs) {
+            if (dir.empty() || !std::filesystem::is_directory(dir, ec)) {
+                continue;
+            }
+            for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+                if (!entry.is_regular_file(ec)) {
+                    continue;
+                }
+#if defined(_WIN32)
+                const std::string fname = PathToUtf8(entry.path().filename());
+#else
+                const std::string fname = entry.path().filename().string();
+#endif
+                const std::string lower = ToLowerAscii(fname);
+                if (!EndsWithIgnoreCaseAscii(lower, ".json")) {
+                    continue;
+                }
+                if (lower.find("telemetry") == std::string::npos &&
+                    lower.find("bringup") == std::string::npos &&
+                    lower.find("veh") == std::string::npos) {
+                    continue;
+                }
+                const auto wt = entry.last_write_time(ec);
+                if (!ec && (!found_any || wt > best_time)) {
+                    best_time = wt;
+                    chosen_path = entry.path();
+                    found_any = true;
+                }
+            }
+        }
+    }
+
+    if (!chosen_path.empty()) {
+        std::ifstream ifs(chosen_path, std::ios::binary);
+        if (ifs) {
+            std::ostringstream buf;
+            buf << ifs.rdbuf();
+            const std::string raw = buf.str();
+            if (!raw.empty()) {
+                out_sanitized_text = SanitizeReportText(raw, bundle_dir);
+#if defined(_WIN32)
+                out_source_label = PathToUtf8(chosen_path.filename());
+#else
+                out_source_label = chosen_path.filename().string();
+#endif
+                return true;
+            }
+        }
+    }
+
+    // Fallback: emit sanitized launcher log wrapped in JSON so clipboard always has valid sanitized data.
+    const std::string clean_log = SanitizeReportText(fallback_launch_log, bundle_dir);
+    std::string escaped;
+    escaped.reserve(clean_log.size() + 32);
+    for (char ch : clean_log) {
+        switch (ch) {
+            case '"':  escaped.append("\\\""); break;
+            case '\\': escaped.append("\\\\"); break;
+            case '\n': escaped.append("\\n"); break;
+            case '\r': break;
+            case '\t': escaped.append("\\t"); break;
+            default:
+                if (static_cast<unsigned char>(ch) >= 0x20u) {
+                    escaped.push_back(ch);
+                }
+                break;
+        }
+    }
+    out_sanitized_text =
+        std::string("{\n  \"schema\": \"openscarlett.launcher_log_telemetry.v1\",\n  \"os\": \"") +
+        GetFriendlyWindowsOsVersion() + "\",\n  \"log\": \"" + escaped + "\"\n}\n";
+    out_source_label = "launcher_log";
+    return true;
 }
 
 PeInspectorSummary InspectBinaryForLauncher(const std::filesystem::path& pe_path,
