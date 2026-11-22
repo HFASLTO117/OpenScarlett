@@ -463,16 +463,18 @@ void TestHardenedCowVfs() {
         OS_REQUIRE(def_cfg.g_sub_mounts.size() == 1u);
         OS_REQUIRE(def_cfg.g_sub_mounts[0].virtual_prefix == L"DLC\\Pack1");
         if (!IsPathOnSystemDriveW(root.wstring())) {
-            OS_REQUIRE(def_cfg.forbid_system_drive_writes);
             OS_REQUIRE(!IsPathOnSystemDriveW(def_cfg.s_root));
             OS_REQUIRE(!IsPathOnSystemDriveW(def_cfg.g_overlay_root));
             OS_REQUIRE(!IsPathOnSystemDriveW(def_cfg.t_root));
 
-            // Attempt to poison OPENSCARLETT_SAVE_ROOT and OPENSCARLETT_VFS_G_OVERLAY with C:\ paths -> rejected!
+            // With OPENSCARLETT_FORBID_SYSTEM_DRIVE_WRITES=1, poisoning env vars with C:\ paths is rejected!
+            ScopedEnvVarW g_forbid(L"OPENSCARLETT_FORBID_SYSTEM_DRIVE_WRITES");
+            ::SetEnvironmentVariableW(L"OPENSCARLETT_FORBID_SYSTEM_DRIVE_WRITES", L"1");
             ::SetEnvironmentVariableW(L"OPENSCARLETT_SAVE_ROOT", L"C:\\OpenScarlettForbiddenSaves");
             ::SetEnvironmentVariableW(L"OPENSCARLETT_VFS_G_OVERLAY", L"C:\\OpenScarlettForbiddenOvl");
             const VfsMountConfig safe_cfg =
                 VfsMounts::BuildDefaultConfig(g_base.wstring(), (root / "def_vfs").wstring());
+            OS_REQUIRE(safe_cfg.forbid_system_drive_writes);
             OS_REQUIRE(!IsPathOnSystemDriveW(safe_cfg.s_root));
             OS_REQUIRE(!IsPathOnSystemDriveW(safe_cfg.g_overlay_root));
             OS_REQUIRE(safe_cfg.s_root == (root / "def_vfs" / "S").wstring());

@@ -893,13 +893,17 @@ VfsMountConfig VfsMounts::BuildDefaultConfig(std::wstring_view default_g_root,
     }
 
     const bool base_is_non_system = !base_vfs.empty() && !IsPathOnSystemDriveW(base_vfs);
-    cfg.forbid_system_drive_writes = base_is_non_system;
+    std::wstring env_forbid_sys = ReadEnvVarW(L"OPENSCARLETT_FORBID_SYSTEM_DRIVE_WRITES");
+    const bool forbid_sys_writes =
+        base_is_non_system &&
+        (!env_forbid_sys.empty() && env_forbid_sys != L"0" && env_forbid_sys != L"false");
+    cfg.forbid_system_drive_writes = forbid_sys_writes;
 
     auto accept_writable_env = [&](const std::wstring& val) -> bool {
         if (val.empty()) {
             return false;
         }
-        if (base_is_non_system && IsPathOnSystemDriveW(val)) {
+        if (forbid_sys_writes && IsPathOnSystemDriveW(val)) {
             return false;
         }
         return true;

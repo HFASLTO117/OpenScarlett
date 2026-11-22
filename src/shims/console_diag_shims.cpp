@@ -78,11 +78,11 @@
 
 namespace {
 
-constexpr int32_t kHrOk = 0x00000000;
-constexpr int32_t kHrPointer = static_cast<int32_t>(0x80004003u);
-constexpr int32_t kHrFail = static_cast<int32_t>(0x80004005u);
-constexpr int32_t kHrHandle = static_cast<int32_t>(0x80070006u);
-constexpr int32_t kHrInvalidArg = static_cast<int32_t>(0x80070057u);
+[[maybe_unused]] constexpr int32_t kHrOk = 0x00000000;
+[[maybe_unused]] constexpr int32_t kHrPointer = static_cast<int32_t>(0x80004003u);
+[[maybe_unused]] constexpr int32_t kHrFail = static_cast<int32_t>(0x80004005u);
+[[maybe_unused]] constexpr int32_t kHrHandle = static_cast<int32_t>(0x80070006u);
+[[maybe_unused]] constexpr int32_t kHrInvalidArg = static_cast<int32_t>(0x80070057u);
 
 int32_t QueryModuleTelemetry(
     const char* module_name,
@@ -104,7 +104,7 @@ int32_t QueryModuleTelemetry(
 }
 
 #if defined(_WIN32)
-HMODULE LoadSystemDll(const wchar_t* dll_name) {
+[[maybe_unused]] HMODULE LoadSystemDll(const wchar_t* dll_name) {
     wchar_t sys_dir[MAX_PATH]{};
     const UINT len = GetSystemDirectoryW(sys_dir, MAX_PATH);
     if (len > 0u && len < MAX_PATH - 32u) {
