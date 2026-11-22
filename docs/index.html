@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpenScarlett — Live Status Dashboard</title>
+  <link rel="icon" type="image/png" href="icon.png" />
+  <style>
+    :root {
+      --bg: #0d1117;
+      --card: #161b22;
+      --border: #30363d;
+      --text: #e6edf3;
+      --muted: #8b949e;
+      --scarlet: #e11d48;
+      --scarlet-soft: #fb7185;
+      --green: #2ea043;
+      --amber: #d29922;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif;
+      line-height: 1.5;
+    }
+    .wrap { max-width: 980px; margin: 0 auto; padding: 24px 18px 56px; }
+    .banner { width: 100%; max-width: 780px; display: block; margin: 0 auto 14px; border-radius: 12px; }
+    .nav { display: flex; flex-wrap: wrap; justify-content: center; gap: 10px; margin-bottom: 24px; }
+    .btn {
+      display: inline-block; padding: 7px 14px; border-radius: 8px; font-size: 13px;
+      font-weight: 600; text-decoration: none; border: 1px solid var(--border);
+      color: var(--text); background: var(--card);
+    }
+    .btn.primary { background: var(--scarlet); border-color: var(--scarlet); color: #fff; }
+    .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-bottom: 24px; }
+    .kpi { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; text-align: center; }
+    .kpi .val { font-size: 26px; font-weight: 700; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; color: var(--scarlet-soft); }
+    .kpi .lbl { font-size: 12px; color: var(--muted); margin-top: 2px; }
+    .section { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 18px; margin-bottom: 20px; }
+    .sec-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 14px; }
+    .sec-head h2 { margin: 0; font-size: 17px; }
+    .controls { display: flex; flex-wrap: wrap; gap: 8px; }
+    input, select {
+      background: var(--bg); color: var(--text); border: 1px solid var(--border);
+      border-radius: 8px; padding: 6px 10px; font-size: 13px; outline: none;
+    }
+    input:focus, select:focus { border-color: var(--scarlet); }
+    .row { border-top: 1px solid #21262d; padding: 12px 0; }
+    .row:first-child { border-top: 0; padding-top: 0; }
+    .row-top { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px; }
+    .row-title { font-weight: 600; font-size: 14px; }
+    .pill { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 11px; font-weight: 600; color: #fff; }
+    .plain { font-size: 12.5px; color: var(--muted); margin: 3px 0 8px; }
+    .bar-wrap { display: flex; align-items: center; gap: 10px; }
+    .track { flex: 1; height: 8px; background: #21262d; border-radius: 999px; overflow: hidden; }
+    .fill { height: 100%; border-radius: 999px; }
+    .pct { font-size: 12px; font-family: ui-monospace, Consolas, monospace; width: 38px; text-align: right; color: var(--muted); }
+    details.tech { margin-top: 8px; font-size: 12px; color: var(--muted); }
+    details.tech summary { cursor: pointer; color: var(--scarlet-soft); }
+    .hw-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; }
+    .hw-card { background: var(--bg); border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
+    .hw-card.needed { border-color: rgba(210, 153, 34, 0.55); }
+    .hw-tier { font-weight: 600; font-size: 13.5px; display: flex; justify-content: space-between; align-items: center; }
+    .hw-detail { font-size: 12px; color: var(--muted); margin-top: 4px; }
+    .tag-ok { color: var(--green); font-size: 11px; font-weight: 600; }
+    .tag-need { color: var(--amber); font-size: 11px; font-weight: 600; }
+    footer { text-align: center; font-size: 12px; color: var(--muted); margin-top: 24px; }
+    footer a { color: var(--scarlet-soft); text-decoration: none; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <img class="banner" src="banner.png" alt="OpenScarlett" />
+    <div class="nav">
+      <a class="btn primary" href="https://github.com/californiaAlmonds/OpenScarlett/releases/latest">Download Latest Win64 Build</a>
+      <a class="btn" href="https://github.com/californiaAlmonds/OpenScarlett">GitHub Repository</a>
+      <a class="btn" href="https://github.com/californiaAlmonds/OpenScarlett/actions">Windows CI</a>
+      <a class="btn" href="https://github.com/californiaAlmonds/OpenScarlett/issues">Submit Hardware Report</a>
+    </div>
+
+    <div class="kpis">
+      <div class="kpi"><div class="val">41/41</div><div class="lbl">Automated CTest Passing</div></div>
+      <div class="kpi"><div class="val">30</div><div class="lbl">Shimmed Xbox / GDK DLLs</div></div>
+      <div class="kpi"><div class="val">292/292</div><div class="lbl">Shipping GDK Thunks</div></div>
+      <div class="kpi"><div class="val">6 PCs</div><div class="lbl">Real NVIDIA &amp; AMD GPUs</div></div>
+    </div>
+
+    <div class="section">
+      <div class="sec-head">
+        <h2>Core Subsystems</h2>
+        <div class="controls">
+          <input id="q" type="search" placeholder="Search shaders, Vulkan, DLLs..." oninput="renderSubsystems()" />
+          <select id="area" onchange="renderSubsystems()">
+            <option value="all">All Areas</option>
+            <option value="Loader">Loader</option>
+            <option value="Graphics">Graphics</option>
+            <option value="Shaders">Shaders</option>
+            <option value="Memory &amp; IO">Memory &amp; IO</option>
+            <option value="Media">Media</option>
+            <option value="GDK Shims">GDK Shims</option>
+            <option value="Workloads">Workloads</option>
+            <option value="UX &amp; Tools">UX &amp; Tools</option>
+          </select>
+        </div>
+      </div>
+      <div id="subsystems"></div>
+    </div>
+
+    <div class="section">
+      <div class="sec-head">
+        <h2>GPU Hardware Coverage</h2>
+        <div class="controls">
+          <select id="hwFilter" onchange="renderHardware()">
+            <option value="all">All Hardware Tiers</option>
+            <option value="verified">Verified Only</option>
+            <option value="needed">Testers Needed</option>
+          </select>
+        </div>
+      </div>
+      <div id="hw" class="hw-grid"></div>
+    </div>
+
+    <footer>
+      Auto-generated by <code>tools/generate_status.py</code> · <a href="https://github.com/californiaAlmonds/OpenScarlett/blob/main/LICENSE">MIT License</a>
+    </footer>
+  </div>
+
+  <script>
+    const SUBSYSTEMS = [{"name": "Game Loader & Virtual Drives", "plain": "Launches unpacked packages, isolates saves, tracks multi-process games", "area": "Loader", "stage": "Live Verified", "pct": 100, "color": "#2ea043", "tech": "MicrosoftGame.Config XML loader, nested G: CoW overlay VFS (zero base/C: writes), System32-first KnownDLL resolution, RVA-0 reloc & .xdata v2/v3 unwind validation, Kahn topo init, 30-DLL routing, CreateProcessW/A child-process APC hook propagation", "verified": "Win10 & Win11 26H2 (test_s7_pe_gdk_runtime, test_loader_child_hook_parity, test_loader_vfs_config, Pizza House Simulator + House Flipper 2)"}, {"name": "DirectX 12 & Vulkan 1.4 Graphics", "plain": "Xbox D3D12 proxy, D3D12-to-Vulkan routing, HDR10 & Mesh Shaders", "area": "Graphics", "stage": "6 GPUs Verified", "pct": 100, "color": "#2ea043", "tech": "Direct d3d12_xs\u2192Vulkan 1.4 command-list routing (--backend=vulkan), Wave32-on-Wave64 compute, staged BC copies, OPENSCARLETT_VK_DEVICE selection, mixed-heap slot separation, R9G9B9E5\u2192RGBA16F UAV fallback, KickoffX/Wait32/64BitValueX/RSSetDepthBiasX, HDR10/scRGB PresentX, full GFX10 xg_xs + HTILE/DCC/CMASK & XGEncodeDCC fuzz check", "verified": "6 GPUs (GTX 1650 Ti, RTX 2060 SUPER/3080 Ti, AMD RX 7600/7900 XTX/9070 XT) + WARP (test_d3d12_vk_routing, test_gpu_d3d12x_vk_parity, test_vulkan_graphics_live, test_vulkan_mesh_showcase, test_hdr10_d3d12)"}, {"name": "Xbox RDNA2 Shader Translator", "plain": "Translates console GPU shaders to PC DXIL & SPIR-V with disk cache", "area": "Shaders", "stage": "6 GPUs Verified", "pct": 100, "color": "#2ea043", "tech": "RDNA2/GFX10.3 disasm/IR/lifter (single-wave lockstep LDS barriers, s_icache_inv/s_ttracedata/s_code_end/s_version no-ops, clamped shifts, v_cmpx, split f16, MTBUF d16, NaN/denorm, PSV0 wave bounds, Wave32-on-64 isolation, mesh merged_wave_info/CullPrimitiveEXT, FSSM/vfetch, DXIL MD5 re-signing), CPU interpreter, content-hashed disk cache", "verified": "spirv-val + dxc SM 6.5 + 6 GPUs + WARP (test_rdna2_lockstep_isa, test_rdna2_corpus_parity, test_rdna2_lifter_live, test_d3d12_xs_autolift)"}, {"name": "Unified Memory & Fast Storage", "plain": "64 KB / 4 MB memory aliasing, tile pools & DirectStorage decompression", "area": "Memory & IO", "stage": "Live Verified", "pct": 100, "color": "#2ea043", "tech": "Win10/11 VirtualAlloc2/MapViewOfFile3 64 KiB & 4 MiB aliasing, GpuTilePool, XMemVirtualQuery + ERA allocation attributes, placed GPU VA attach, dstorage_xs cancellation + bounds + direct physical-page decompression", "verified": "Win10 & Win11 26H2 (test_kernelx, test_s7_pe_gdk_runtime, test_dstorage_audio_diag_parity, test_xg_dstorage)"}, {"name": "Audio, Video & Texture Codecs", "plain": "Opus, XMA2, 3D audio, Bink2, BCPack BC1-BC7, BVH4 & FSR 1.0", "area": "Media", "stage": "6 GPUs Verified", "pct": 100, "color": "#2ea043", "tech": "GDeflate v1, BCPack BC1\u2013BC7 (ring-window/selector-table/NPOT/multi-mip), RDNA2 BVH4 decoder + SAH BVH2\u2192BVH4, XMA2 IMDCT, MSOpusDecoder Opus (0x704F), IMA-ADPCM, WASAPI (all MMDevice formats), X3DAudio/XAudio2FX, Bink2, live GPU FSR 1.0", "verified": "6 PCs (GTX 1650 Ti, RTX 2060 SUPER/3080 Ti, AMD RX 7600/7900 XTX/9070 XT) + WARP (test_codecs, test_bcpack_bvh4, test_audio_opus_wasapi, test_d3d12_xs_live)"}, {"name": "Xbox Live, GDK & Input Services", "plain": "30 shimmed DLLs, 292/292 GDK thunks, saves, Raw Input & WinRT", "area": "GDK Shims", "stage": "Live Verified", "pct": 100, "color": "#2ea043", "tech": "30 shimmed DLLs: xgameruntime (292/292 shipping XGamingRuntimeThunks.dll parity, 24 COM QueryApiImpl interfaces, XGameStreaming/XSystem/headless XStore), XCurl (16/16), XSAPI (178), GameInput (XInput + Raw Input mouse), winrt_xs (20 exports), mfplat_xs, advapi32legacy, KernelTraceControl, hix_xs, xbtp, mflnmhelp, mfhevcdec, gamecoreclient, minuserx, xtfpix, xtfdebugmonitor", "verified": "Live commercial Alexandria IV DEMO shipping thunks (0 E_NOINTERFACE), Win10 & Win11 26H2 (test_real_gdk_thunks_live, test_s7_pe_gdk_runtime, test_xgr_conformance_parity, test_winrt_xs)"}, {"name": "Playable Demos & 3D GDK Workloads", "plain": "Freedoom 60 FPS, ScarlettArena, shadowed 3D scene, DXR 1.1 & Meshlets", "area": "Workloads", "stage": "6 GPUs Verified", "pct": 100, "color": "#2ea043", "tech": "Live 60 FPS Freedoom: Phase 1 & ScarlettArena, 3D shadowed/skinned BC1+BC3 GDK scene over BOTH D3D12 & Vulkan 1.4 (test_gdk_3d_scene_dual_api), ID3D12Device5 DXR 1.1, SimplePBR, MeshletCull, SimpleLighting, HDRCubeMap, VulkanMeshShowcase (not_impl=0)", "verified": "GTX 1650 Ti (HW + WARP, D3D12 + Vulkan 1.4), RTX 2060 SUPER/3080 Ti (DXR=12), AMD RX 7600/7900 XTX/9070 XT (DXR=11) (test_scarlett_game_live, test_gdk_3d_scene_dual_api, test_dxr_live, test_vulkan_mesh_showcase)"}, {"name": "Windows Launcher GUI & Updater", "plain": "All-in-one app launcher, built-in 60s hardware tester & SHA-256 updater", "area": "UX & Tools", "stage": "In Progress", "pct": 40, "color": "#d29922", "tech": "Wave 2 in progress: native Win32/Direct2D GUI shell, integrated 60s Hardware Self-Test runner, PE32+ inspector, and opt-in WinHTTP + BCrypt SHA-256 verified updater (CLI & run_hardware_test.bat live today)", "verified": "Wave 2 active (run_hardware_test.ps1 / .bat verified on 6 PCs)"}];
+    const HARDWARE = [{"tier": "NVIDIA Turing", "status": "verified", "detail": "GTX 1650 Ti (Win10 22H2) \u00b7 RTX 2060 SUPER (Win11 26H2, DXR=12)"}, {"tier": "NVIDIA Ampere", "status": "verified", "detail": "RTX 3080 Ti (Win11 25H2, DXR=12, Vulkan 1.4.357)"}, {"tier": "AMD RDNA 3 & 4", "status": "verified", "detail": "RX 7600 \u00b7 RX 7900 XTX \u00b7 RX 9070 XT (Win11 26H2, Wave64, DXR=11)"}, {"tier": "Software Fallback", "status": "verified", "detail": "D3D12 WARP (Windows 10/11 & CI runners)"}, {"tier": "NVIDIA RTX 40 / 50", "status": "needed", "detail": "Ada / Blackwell SM 6.7\u20136.8 validation \u2014 tester needed"}, {"tier": "AMD RX 6000 (RDNA2)", "status": "needed", "detail": "Native RDNA2 (Series X|S sibling) \u2014 tester needed"}, {"tier": "Intel Arc (A / B)", "status": "needed", "detail": "Wave8/Wave16/Wave32 & UMA heaps \u2014 tester needed"}, {"tier": "Handheld APUs", "status": "needed", "detail": "ROG Ally / Legion Go / Steam Deck Windows \u2014 tester needed"}];
+
+    function esc(s) {
+      return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
+    function renderSubsystems() {
+      const q = document.getElementById('q').value.trim().toLowerCase();
+      const area = document.getElementById('area').value;
+      const root = document.getElementById('subsystems');
+      const items = SUBSYSTEMS.filter(s =>
+        (area === 'all' || s.area === area) &&
+        (!q || (s.name + ' ' + s.plain + ' ' + s.tech + ' ' + s.verified).toLowerCase().includes(q))
+      );
+      if (!items.length) {
+        root.innerHTML = '<div class="plain">No matching subsystems found.</div>';
+        return;
+      }
+      root.innerHTML = items.map(s => `
+        <div class="row">
+          <div class="row-top">
+            <span class="row-title">${esc(s.name)}</span>
+            <span class="pill" style="background:${s.color}">${esc(s.stage)}</span>
+          </div>
+          <div class="plain">${esc(s.plain)}</div>
+          <div class="bar-wrap">
+            <div class="track"><div class="fill" style="width:${s.pct}%;background:${s.color}"></div></div>
+            <div class="pct">${s.pct}%</div>
+          </div>
+          <details class="tech">
+            <summary>Technical details &amp; test coverage</summary>
+            <p style="margin:6px 0 4px"><strong>Coverage:</strong> ${esc(s.tech)}</p>
+            <p style="margin:0"><strong>Verified on:</strong> ${esc(s.verified)}</p>
+          </details>
+        </div>
+      `).join('');
+    }
+
+    function renderHardware() {
+      const f = document.getElementById('hwFilter').value;
+      const root = document.getElementById('hw');
+      const items = HARDWARE.filter(h => f === 'all' || h.status === f);
+      root.innerHTML = items.map(h => `
+        <div class="hw-card ${h.status === 'needed' ? 'needed' : ''}">
+          <div class="hw-tier">
+            <span>${esc(h.tier)}</span>
+            <span class="${h.status === 'verified' ? 'tag-ok' : 'tag-need'}">${h.status === 'verified' ? 'Verified' : 'Tester Needed'}</span>
+          </div>
+          <div class="hw-detail">${esc(h.detail)}</div>
+        </div>
+      `).join('');
+    }
+
+    renderSubsystems();
+    renderHardware();
+  </script>
+</body>
+</html>

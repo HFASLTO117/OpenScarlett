@@ -1,85 +1,89 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="900" height="522" viewBox="0 0 900 522" role="img" aria-label="OpenScarlett Status: 100.0%">
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="542" viewBox="0 0 900 542" role="img" aria-label="OpenScarlett Core Subsystems (41/41 tests passing)">
+  <defs>
+    <linearGradient id="accentBar" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#e11d48"/>
+      <stop offset="100%" stop-color="#fb7185"/>
+    </linearGradient>
+    <clipPath id="cardClip"><rect width="900" height="542" rx="12"/></clipPath>
+  </defs>
   <style>
     text { font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif; }
-    .h1 { font-size: 22px; font-weight: 700; fill: #e6edf3; }
+    .h1 { font-size: 19px; font-weight: 700; fill: #f0f6fc; }
     .sub { font-size: 12px; fill: #8b949e; }
-    .name { font-size: 13px; fill: #e6edf3; font-weight: 500; }
-    .stage { font-size: 11px; fill: #ffffff; font-weight: 600; }
+    .name { font-size: 13.5px; fill: #e6edf3; font-weight: 600; }
+    .desc { font-size: 11.5px; fill: #8b949e; }
+    .pill { font-size: 11px; fill: #ffffff; font-weight: 600; }
     .pct { font-size: 12px; fill: #c9d1d9; font-weight: 600; }
   </style>
-  <rect width="900" height="522" rx="10" fill="#0d1117" stroke="#30363d" stroke-width="1"/>
-  <text class="h1" x="28" y="42">OpenScarlett — Live Subsystem Readiness: 100.0%</text>
-  <text class="sub" x="28" y="64">Windows 10/11 x64 · MIT Clean-Room · CTest: 41/41 passing · Target: Xbox Series X|S (Scarlett)</text>
-  <line x1="28" y1="80" x2="872" y2="80" stroke="#21262d" stroke-width="1"/>
-  <text class="sub" x="28" y="102">Legend:  ■ Green = Live GPU / Real Binary Verified   ■ Purple = Unit-Tested   ■ Amber = In Progress   ■ Grey = Planned</text>
-  <line x1="28" y1="116" x2="872" y2="116" stroke="#21262d" stroke-width="1"/>
-  <text class="name" x="28" y="142">PE32+ Loader, CoW VFS, 24-DLL Routing &amp; Child-Hook Propagation</text>
-  <rect x="440" y="128" width="146" height="20" rx="10" fill="#2ea043"/>
-  <text class="stage" x="513" y="142" text-anchor="middle">Live-Binary Verified</text>
-  <rect x="610" y="132" width="180" height="10" rx="5" fill="#21262d"/>
-  <rect x="610" y="132" width="180" height="10" rx="5" fill="#2ea043"/>
-  <text class="pct" x="872" y="142" text-anchor="end">100%</text>
-  <line x1="28" y1="154" x2="872" y2="154" stroke="#161b22" stroke-width="1"/>
-  <text class="name" x="28" y="176">Vulkan 1.2/1.4 Graphics, Sparse/Reserved, `VK_EXT_mesh_shader` &amp; Swapchain</text>
-  <rect x="440" y="162" width="146" height="20" rx="10" fill="#2ea043"/>
-  <text class="stage" x="513" y="176" text-anchor="middle">Live-GPU Verified</text>
-  <rect x="610" y="166" width="180" height="10" rx="5" fill="#21262d"/>
-  <rect x="610" y="166" width="180" height="10" rx="5" fill="#2ea043"/>
-  <text class="pct" x="872" y="176" text-anchor="end">100%</text>
-  <line x1="28" y1="188" x2="872" y2="188" stroke="#161b22" stroke-width="1"/>
-  <text class="name" x="28" y="210">Codecs (BCPack BC1–BC7), RDNA2 BVH4, Opus/WASAPI &amp; GPU FSR 1.0</text>
-  <rect x="440" y="196" width="146" height="20" rx="10" fill="#2ea043"/>
-  <text class="stage" x="513" y="210" text-anchor="middle">Live-GPU Verified</text>
-  <rect x="610" y="200" width="180" height="10" rx="5" fill="#21262d"/>
-  <rect x="610" y="200" width="180" height="10" rx="5" fill="#2ea043"/>
-  <text class="pct" x="872" y="210" text-anchor="end">100%</text>
-  <line x1="28" y1="222" x2="872" y2="222" stroke="#161b22" stroke-width="1"/>
-  <text class="name" x="28" y="244">RDNA2 Corpus Lifter, PSV0 Wave Bounds, Mesh Contracts &amp; DXIL Re-Signing</text>
-  <rect x="440" y="230" width="146" height="20" rx="10" fill="#2ea043"/>
-  <text class="stage" x="513" y="244" text-anchor="middle">Live-GPU Verified</text>
-  <rect x="610" y="234" width="180" height="10" rx="5" fill="#21262d"/>
-  <rect x="610" y="234" width="180" height="10" rx="5" fill="#2ea043"/>
-  <text class="pct" x="872" y="244" text-anchor="end">100%</text>
-  <line x1="28" y1="256" x2="872" y2="256" stroke="#161b22" stroke-width="1"/>
-  <text class="name" x="28" y="278">WinRT Activation &amp; HSTRING (`winrt_xs.dll`)</text>
-  <rect x="440" y="264" width="146" height="20" rx="10" fill="#2ea043"/>
-  <text class="stage" x="513" y="278" text-anchor="middle">Live-Binary Verified</text>
-  <rect x="610" y="268" width="180" height="10" rx="5" fill="#21262d"/>
-  <rect x="610" y="268" width="180" height="10" rx="5" fill="#2ea043"/>
-  <text class="pct" x="872" y="278" text-anchor="end">100%</text>
-  <line x1="28" y1="290" x2="872" y2="290" stroke="#161b22" stroke-width="1"/>
-  <text class="name" x="28" y="312">Xbox Unified Memory, `GpuTilePool` &amp; `kernelx.dll`</text>
-  <rect x="440" y="298" width="146" height="20" rx="10" fill="#2ea043"/>
-  <text class="stage" x="513" y="312" text-anchor="middle">Live-Binary Verified</text>
-  <rect x="610" y="302" width="180" height="10" rx="5" fill="#21262d"/>
-  <rect x="610" y="302" width="180" height="10" rx="5" fill="#2ea043"/>
-  <text class="pct" x="872" y="312" text-anchor="end">100%</text>
-  <line x1="28" y1="324" x2="872" y2="324" stroke="#161b22" stroke-width="1"/>
-  <text class="name" x="28" y="346">`d3d12_xs.dll` Proxy, HDR10 `PresentX` &amp; Full `xg_xs` Metadata</text>
-  <rect x="440" y="332" width="146" height="20" rx="10" fill="#2ea043"/>
-  <text class="stage" x="513" y="346" text-anchor="middle">Live-GPU Verified</text>
-  <rect x="610" y="336" width="180" height="10" rx="5" fill="#21262d"/>
-  <rect x="610" y="336" width="180" height="10" rx="5" fill="#2ea043"/>
-  <text class="pct" x="872" y="346" text-anchor="end">100%</text>
-  <line x1="28" y1="358" x2="872" y2="358" stroke="#161b22" stroke-width="1"/>
-  <text class="name" x="28" y="380">GDK &amp; Console Shims (24 DLLs, 292/292 Thunks Parity &amp; Zero `E_NOINTERFACE`)</text>
-  <rect x="440" y="366" width="146" height="20" rx="10" fill="#2ea043"/>
-  <text class="stage" x="513" y="380" text-anchor="middle">Live-Binary Verified</text>
-  <rect x="610" y="370" width="180" height="10" rx="5" fill="#21262d"/>
-  <rect x="610" y="370" width="180" height="10" rx="5" fill="#2ea043"/>
-  <text class="pct" x="872" y="380" text-anchor="end">100%</text>
-  <line x1="28" y1="392" x2="872" y2="392" stroke="#161b22" stroke-width="1"/>
-  <text class="name" x="28" y="414">Playable Scarlett Games, DXR Tier 1.1 &amp; Cross-API Real-Binary Workloads</text>
-  <rect x="440" y="400" width="146" height="20" rx="10" fill="#2ea043"/>
-  <text class="stage" x="513" y="414" text-anchor="middle">Live-GPU Verified</text>
-  <rect x="610" y="404" width="180" height="10" rx="5" fill="#21262d"/>
-  <rect x="610" y="404" width="180" height="10" rx="5" fill="#2ea043"/>
-  <text class="pct" x="872" y="414" text-anchor="end">100%</text>
-  <line x1="28" y1="426" x2="872" y2="426" stroke="#161b22" stroke-width="1"/>
-  <text class="name" x="28" y="448">Retail DRM / Encrypted `.xvc`/`.xvd` Decryption</text>
-  <rect x="440" y="434" width="146" height="20" rx="10" fill="#6e7681"/>
-  <text class="stage" x="513" y="448" text-anchor="middle">Out of Scope</text>
-  <rect x="610" y="438" width="180" height="10" rx="5" fill="#21262d"/>
-  <text class="pct" x="872" y="448" text-anchor="end">0%</text>
-  <line x1="28" y1="460" x2="872" y2="460" stroke="#161b22" stroke-width="1"/>
+  <g clip-path="url(#cardClip)">
+    <rect width="900" height="542" fill="#0d1117"/>
+    <rect x="0" y="0" width="900" height="3" fill="url(#accentBar)"/>
+    <text class="h1" x="28" y="40">OpenScarlett — Core Subsystems</text>
+    <text class="sub" x="28" y="62">Windows 10/11 x64 · MIT · 41/41 tests passing · 30 shimmed Xbox DLLs · 6 real PCs verified</text>
+    <line x1="28" y1="82" x2="872" y2="82" stroke="#21262d" stroke-width="1"/>
+    <text class="name" x="28" y="118">Game Loader &amp; Virtual Drives</text>
+    <text class="desc" x="28" y="135">Launches unpacked packages, isolates saves, tracks multi-process games</text>
+    <rect x="488" y="112" width="138" height="22" rx="11" fill="#2ea043"/>
+    <text class="pill" x="557" y="127" text-anchor="middle">Live Verified</text>
+    <rect x="648" y="118" width="176" height="10" rx="5" fill="#21262d"/>
+    <rect x="648" y="118" width="176" height="10" rx="5" fill="#2ea043"/>
+    <text class="pct" x="872" y="127" text-anchor="end">100%</text>
+    <line x1="28" y1="148" x2="872" y2="148" stroke="#161b22" stroke-width="1"/>
+    <text class="name" x="28" y="170">DirectX 12 &amp; Vulkan 1.4 Graphics</text>
+    <text class="desc" x="28" y="187">Xbox D3D12 proxy, D3D12-to-Vulkan routing, HDR10 &amp; Mesh Shaders</text>
+    <rect x="488" y="164" width="138" height="22" rx="11" fill="#2ea043"/>
+    <text class="pill" x="557" y="179" text-anchor="middle">6 GPUs Verified</text>
+    <rect x="648" y="170" width="176" height="10" rx="5" fill="#21262d"/>
+    <rect x="648" y="170" width="176" height="10" rx="5" fill="#2ea043"/>
+    <text class="pct" x="872" y="179" text-anchor="end">100%</text>
+    <line x1="28" y1="200" x2="872" y2="200" stroke="#161b22" stroke-width="1"/>
+    <text class="name" x="28" y="222">Xbox RDNA2 Shader Translator</text>
+    <text class="desc" x="28" y="239">Translates console GPU shaders to PC DXIL &amp; SPIR-V with disk cache</text>
+    <rect x="488" y="216" width="138" height="22" rx="11" fill="#2ea043"/>
+    <text class="pill" x="557" y="231" text-anchor="middle">6 GPUs Verified</text>
+    <rect x="648" y="222" width="176" height="10" rx="5" fill="#21262d"/>
+    <rect x="648" y="222" width="176" height="10" rx="5" fill="#2ea043"/>
+    <text class="pct" x="872" y="231" text-anchor="end">100%</text>
+    <line x1="28" y1="252" x2="872" y2="252" stroke="#161b22" stroke-width="1"/>
+    <text class="name" x="28" y="274">Unified Memory &amp; Fast Storage</text>
+    <text class="desc" x="28" y="291">64 KB / 4 MB memory aliasing, tile pools &amp; DirectStorage decompression</text>
+    <rect x="488" y="268" width="138" height="22" rx="11" fill="#2ea043"/>
+    <text class="pill" x="557" y="283" text-anchor="middle">Live Verified</text>
+    <rect x="648" y="274" width="176" height="10" rx="5" fill="#21262d"/>
+    <rect x="648" y="274" width="176" height="10" rx="5" fill="#2ea043"/>
+    <text class="pct" x="872" y="283" text-anchor="end">100%</text>
+    <line x1="28" y1="304" x2="872" y2="304" stroke="#161b22" stroke-width="1"/>
+    <text class="name" x="28" y="326">Audio, Video &amp; Texture Codecs</text>
+    <text class="desc" x="28" y="343">Opus, XMA2, 3D audio, Bink2, BCPack BC1-BC7, BVH4 &amp; FSR 1.0</text>
+    <rect x="488" y="320" width="138" height="22" rx="11" fill="#2ea043"/>
+    <text class="pill" x="557" y="335" text-anchor="middle">6 GPUs Verified</text>
+    <rect x="648" y="326" width="176" height="10" rx="5" fill="#21262d"/>
+    <rect x="648" y="326" width="176" height="10" rx="5" fill="#2ea043"/>
+    <text class="pct" x="872" y="335" text-anchor="end">100%</text>
+    <line x1="28" y1="356" x2="872" y2="356" stroke="#161b22" stroke-width="1"/>
+    <text class="name" x="28" y="378">Xbox Live, GDK &amp; Input Services</text>
+    <text class="desc" x="28" y="395">30 shimmed DLLs, 292/292 GDK thunks, saves, Raw Input &amp; WinRT</text>
+    <rect x="488" y="372" width="138" height="22" rx="11" fill="#2ea043"/>
+    <text class="pill" x="557" y="387" text-anchor="middle">Live Verified</text>
+    <rect x="648" y="378" width="176" height="10" rx="5" fill="#21262d"/>
+    <rect x="648" y="378" width="176" height="10" rx="5" fill="#2ea043"/>
+    <text class="pct" x="872" y="387" text-anchor="end">100%</text>
+    <line x1="28" y1="408" x2="872" y2="408" stroke="#161b22" stroke-width="1"/>
+    <text class="name" x="28" y="430">Playable Demos &amp; 3D GDK Workloads</text>
+    <text class="desc" x="28" y="447">Freedoom 60 FPS, ScarlettArena, shadowed 3D scene, DXR 1.1 &amp; Meshlets</text>
+    <rect x="488" y="424" width="138" height="22" rx="11" fill="#2ea043"/>
+    <text class="pill" x="557" y="439" text-anchor="middle">6 GPUs Verified</text>
+    <rect x="648" y="430" width="176" height="10" rx="5" fill="#21262d"/>
+    <rect x="648" y="430" width="176" height="10" rx="5" fill="#2ea043"/>
+    <text class="pct" x="872" y="439" text-anchor="end">100%</text>
+    <line x1="28" y1="460" x2="872" y2="460" stroke="#161b22" stroke-width="1"/>
+    <text class="name" x="28" y="482">Windows Launcher GUI &amp; Updater</text>
+    <text class="desc" x="28" y="499">All-in-one app launcher, built-in 60s hardware tester &amp; SHA-256 updater</text>
+    <rect x="488" y="476" width="138" height="22" rx="11" fill="#d29922"/>
+    <text class="pill" x="557" y="491" text-anchor="middle">In Progress</text>
+    <rect x="648" y="482" width="176" height="10" rx="5" fill="#21262d"/>
+    <rect x="648" y="482" width="70" height="10" rx="5" fill="#d29922"/>
+    <text class="pct" x="872" y="491" text-anchor="end">40%</text>
+  </g>
+  <rect x="0.5" y="0.5" width="899" height="541" rx="12" fill="none" stroke="#30363d" stroke-width="1"/>
 </svg>
