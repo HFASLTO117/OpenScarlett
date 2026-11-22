@@ -63,12 +63,41 @@ constexpr size_t kPage4MB = 4ull * 1024ull * 1024ull;
 constexpr size_t kDefaultAuxTitleMemoryBytes = 4ull * 1024ull * 1024ull;  // 4 MiB default chunk
 
 constexpr int32_t kHrOk = 0;
+constexpr int32_t kHrHandle = static_cast<int32_t>(0x80070006u);
 constexpr int32_t kHrInvalidArg = static_cast<int32_t>(0x80070057u);
 constexpr int32_t kHrInsufficientBuffer = static_cast<int32_t>(0x8007007Au);
 constexpr int32_t kHrFail = static_cast<int32_t>(0x80004005u);
 
+constexpr uint64_t kScarlettAllCoresMask = (1ull << kScarlettTitleProcessorCount) - 1ull;
+
+bool IsPowerOfTwo(size_t v) noexcept {
+    return v != 0u && (v & (v - 1u)) == 0u;
+}
+
+bool ValidateXAllocAttributes(uint64_t attrs) noexcept {
+    const uint32_t mem_type = static_cast<uint32_t>((attrs >> 28) & 0xFu);
+    if (mem_type > XALLOC_MEMTYPE_PHYSICAL) {
+        return false;
+    }
+    return true;
+}
+
+int32_t ClampThreadPriority(int32_t priority) noexcept {
+    if (priority <= -15) return -15;  // THREAD_PRIORITY_IDLE
+    if (priority >= 15) return 15;    // THREAD_PRIORITY_TIME_CRITICAL
+    if (priority < -2) return -2;     // THREAD_PRIORITY_LOWEST
+    if (priority > 2) return 2;       // THREAD_PRIORITY_HIGHEST
+    return priority;
+}
+
 inline void RecordTelemetry(const char* symbol, CallOutcome outcome, int32_t hr = 0) {
+#if defined(_WIN32)
+    const DWORD saved_err = GetLastError();
+#endif
     CallTelemetry::Global().Record(kModuleName, symbol, outcome, hr);
+#if defined(_WIN32)
+    SetLastError(saved_err);
+#endif
 }
 
 size_t AlignUp(size_t value, size_t alignment) {
@@ -326,14 +355,29 @@ public:
         return std::max(prev, current);
     }
 
-    void* XMemAllocImpl(size_t dwSize, uint64_t dwAllocAttributes) {
-        if (dwSize == 0) {
+    void* XMemAllocImpl(size_t dwSize, uint64_t dwAllocAttributes, size_t explicitAlignment = 0u) {
+        if (dwSize == 0u || !ValidateXAllocAttributes(dwAllocAttributes)) {
             SetHostLastError(87u);
             return nullptr;
         }
-        const size_t alignment = DecodeXAllocAlignment(dwAllocAttributes);
-        const size_t alloc_size = AlignUp(dwSize, std::min<size_t>(alignment, kPage64KB));
-        if (CurrentTitleUsedBytes() + alloc_size > GetTitleBudgetBytes()) {
+        if (explicitAlignment != 0u && (!IsPowerOfTwo(explicitAlignment) || explicitAlignment > kPage4MB)) {
+            SetHostLastError(87u);
+            return nullptr;
+        }
+        const uint64_t budget = GetTitleBudgetBytes();
+        if (static_cast<uint64_t>(dwSize) > budget) {
+            SetHostLastError(8u);  // ERROR_NOT_ENOUGH_MEMORY
+            return nullptr;
+        }
+        const size_t attr_align = DecodeXAllocAlignment(dwAllocAttributes);
+        const size_t alignment = std::max(attr_align, explicitAlignment);
+        const size_t pad_granule = std::min<size_t>(alignment, kPage64KB);
+        if (dwSize > (SIZE_MAX - pad_granule)) {
+            SetHostLastError(8u);
+            return nullptr;
+        }
+        const size_t alloc_size = AlignUp(dwSize, pad_granule);
+        if (CurrentTitleUsedBytes() + alloc_size > budget) {
             SetHostLastError(8u);  // ERROR_NOT_ENOUGH_MEMORY
             return nullptr;
         }
@@ -373,6 +417,7 @@ public:
 
     bool XMemFreeImpl(void* pAddress) {
         if (!pAddress) {
+            SetHostLastError(0u);
             return true;
         }
         size_t freed_bytes = 0;
@@ -392,6 +437,7 @@ public:
         std::free(pAddress);
 #endif
         xmem_allocated_bytes_.fetch_sub(freed_bytes, std::memory_order_acq_rel);
+        SetHostLastError(0u);
         return true;
     }
 
@@ -545,6 +591,10 @@ public:
         std::vector<uint64_t> pools_to_free;
         {
             std::lock_guard<std::mutex> lock(mutex_);
+            if (numberOfPages > pfn_table_.size()) {
+                SetHostLastError(87u);
+                return 0;
+            }
             std::unordered_map<uint64_t, uint64_t> seen;
             seen.reserve(static_cast<size_t>(numberOfPages));
             for (uint64_t i = 0; i < numberOfPages; ++i) {
@@ -599,6 +649,10 @@ public:
             SetHostLastError(87u);
             return nullptr;
         }
+        if (numberOfPages > (GetTitleBudgetBytes() / kPage64KB)) {
+            SetHostLastError(87u);
+            return nullptr;
+        }
 
         std::lock_guard<std::mutex> lock(mutex_);
         std::vector<PageFrameRecord> frames;
@@ -627,7 +681,18 @@ public:
             frames.push_back(it->second);
         }
 
+        if (numberOfPages > (static_cast<uint64_t>(SIZE_MAX) / static_cast<uint64_t>(page_bytes))) {
+            SetHostLastError(87u);
+            return nullptr;
+        }
         const size_t total_bytes = static_cast<size_t>(numberOfPages) * page_bytes;
+        if (virtualAddress != nullptr) {
+            const uintptr_t req_check = reinterpret_cast<uintptr_t>(virtualAddress);
+            if (req_check + total_bytes < req_check) {
+                SetHostLastError(487u);
+                return nullptr;
+            }
+        }
         const MemoryPageSize page_granule =
             (page_bytes == kPage4MB) ? MemoryPageSize::Page4MB : MemoryPageSize::Page64KB;
         const MemoryProtection prot = ToMemoryProtection(flProtect);
@@ -1119,13 +1184,19 @@ public:
             return kHrInvalidArg;
         }
 #if defined(_WIN32)
+        if (hThread == INVALID_HANDLE_VALUE) {
+            SetHostLastError(6u);
+            return kHrHandle;
+        }
         HANDLE target = hThread ? static_cast<HANDLE>(hThread) : GetCurrentThread();
         const DWORD tid = GetThreadId(target);
+        if (tid == 0u) {
+            SetHostLastError(6u);
+            return kHrHandle;
+        }
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (tid != 0) {
-                thread_names_[tid] = lpThreadName;
-            }
+            thread_names_[tid] = lpThreadName;
         }
         if (ThreadDescApi().set_desc != nullptr) {
             const HRESULT hr = ThreadDescApi().set_desc(target, lpThreadName);
@@ -1148,7 +1219,16 @@ public:
                               size_t* pnRequiredLength) {
         std::wstring resolved;
 #if defined(_WIN32)
+        if (hThread == INVALID_HANDLE_VALUE) {
+            SetHostLastError(6u);
+            return kHrHandle;
+        }
         HANDLE target = hThread ? static_cast<HANDLE>(hThread) : GetCurrentThread();
+        const DWORD tid = GetThreadId(target);
+        if (tid == 0u) {
+            SetHostLastError(6u);
+            return kHrHandle;
+        }
         bool got_from_os = false;
         if (ThreadDescApi().get_desc != nullptr) {
             PWSTR desc = nullptr;
@@ -1159,7 +1239,6 @@ public:
             }
         }
         if (!got_from_os || resolved.empty()) {
-            const DWORD tid = GetThreadId(target);
             std::lock_guard<std::mutex> lock(mutex_);
             auto it = thread_names_.find(tid);
             if (it != thread_names_.end()) {
@@ -1185,6 +1264,114 @@ public:
         }
         std::memcpy(lpThreadName, resolved.c_str(), required * sizeof(wchar_t));
         return kHrOk;
+    }
+
+    uint64_t SetThreadAffinityMaskImpl(void* hThread, uint64_t dwThreadAffinityMask) {
+#if defined(_WIN32)
+        if (!hThread || hThread == INVALID_HANDLE_VALUE) {
+            SetHostLastError(6u);  // ERROR_INVALID_HANDLE
+            return 0ull;
+        }
+        HANDLE target = static_cast<HANDLE>(hThread);
+        const DWORD tid = GetThreadId(target);
+        if (tid == 0u) {
+            SetHostLastError(6u);  // ERROR_INVALID_HANDLE
+            return 0ull;
+        }
+        if (dwThreadAffinityMask == 0ull) {
+            SetHostLastError(87u);  // ERROR_INVALID_PARAMETER
+            return 0ull;
+        }
+
+        DWORD_PTR proc_mask = 0;
+        DWORD_PTR sys_mask = 0;
+        if (!GetProcessAffinityMask(GetCurrentProcess(), &proc_mask, &sys_mask) || proc_mask == 0) {
+            proc_mask = 1u;
+        }
+        const uint64_t allowed_guest_bits = kScarlettAllCoresMask | static_cast<uint64_t>(proc_mask);
+        if ((dwThreadAffinityMask & allowed_guest_bits) == 0ull) {
+            SetHostLastError(87u);  // ERROR_INVALID_PARAMETER
+            return 0ull;
+        }
+
+        DWORD_PTR host_mask = static_cast<DWORD_PTR>(dwThreadAffinityMask & static_cast<uint64_t>(proc_mask));
+        if (host_mask == 0u) {
+            // Fold higher Scarlett logical cores (e.g. cores 8..13 on an 8-core host)
+            // deterministically onto the host process affinity mask.
+            std::vector<uint32_t> host_bits;
+            for (uint32_t b = 0u; b < 64u; ++b) {
+                if ((static_cast<uint64_t>(proc_mask) & (1ull << b)) != 0ull) {
+                    host_bits.push_back(b);
+                }
+            }
+            for (uint32_t b = 0u; b < kScarlettTitleProcessorCount; ++b) {
+                if ((dwThreadAffinityMask & (1ull << b)) != 0ull && !host_bits.empty()) {
+                    const uint32_t mapped = host_bits[b % host_bits.size()];
+                    host_mask |= (static_cast<DWORD_PTR>(1u) << mapped);
+                }
+            }
+            if (host_mask == 0u) {
+                host_mask = proc_mask;
+            }
+        }
+
+        const DWORD_PTR os_prev = ::SetThreadAffinityMask(target, host_mask);
+        if (os_prev == 0u) {
+            return 0ull;
+        }
+
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = thread_affinities_.find(tid);
+        const uint64_t prev_logical = (it != thread_affinities_.end())
+                                          ? it->second
+                                          : (kScarlettAllCoresMask & allowed_guest_bits);
+        thread_affinities_[tid] = dwThreadAffinityMask & allowed_guest_bits;
+        return prev_logical;
+#else
+        if (!hThread || dwThreadAffinityMask == 0ull) {
+            return 0ull;
+        }
+        return kScarlettAllCoresMask;
+#endif
+    }
+
+    int32_t SetThreadPriorityImpl(void* hThread, int32_t nPriority) {
+#if defined(_WIN32)
+        if (!hThread || hThread == INVALID_HANDLE_VALUE) {
+            SetHostLastError(6u);  // ERROR_INVALID_HANDLE
+            return 0;
+        }
+        HANDLE target = static_cast<HANDLE>(hThread);
+        if (GetThreadId(target) == 0u) {
+            SetHostLastError(6u);  // ERROR_INVALID_HANDLE
+            return 0;
+        }
+        const int32_t clamped = ClampThreadPriority(nPriority);
+        if (!::SetThreadPriority(target, clamped)) {
+            return 0;
+        }
+        return 1;
+#else
+        (void)nPriority;
+        return hThread ? 1 : 0;
+#endif
+    }
+
+    int32_t GetThreadPriorityImpl(void* hThread) {
+#if defined(_WIN32)
+        if (!hThread || hThread == INVALID_HANDLE_VALUE) {
+            SetHostLastError(6u);  // ERROR_INVALID_HANDLE
+            return KERNELX_THREAD_PRIORITY_ERROR_RETURN;
+        }
+        HANDLE target = static_cast<HANDLE>(hThread);
+        if (GetThreadId(target) == 0u) {
+            SetHostLastError(6u);  // ERROR_INVALID_HANDLE
+            return KERNELX_THREAD_PRIORITY_ERROR_RETURN;
+        }
+        return ::GetThreadPriority(target);
+#else
+        return hThread ? 0 : KERNELX_THREAD_PRIORITY_ERROR_RETURN;
+#endif
     }
 
     ~KernelXState() {
@@ -1254,6 +1441,7 @@ private:
     std::unordered_map<uintptr_t, XMemAllocRecord> xmem_allocs_;
     std::unordered_map<uintptr_t, size_t> aux_allocs_;
     std::unordered_map<uint32_t, std::wstring> thread_names_;
+    std::unordered_map<uint32_t, uint64_t> thread_affinities_;
 };
 
 }  // namespace
@@ -1326,6 +1514,13 @@ void* OPENSCARLETT_KERNELX_CALL XMemAlloc(size_t dwSize, uint64_t dwAllocAttribu
 void* OPENSCARLETT_KERNELX_CALL XMemAllocDefault(size_t dwSize, uint64_t dwAllocAttributes) {
     void* ptr = KernelXState::Instance().XMemAllocImpl(dwSize, dwAllocAttributes);
     RecordTelemetry(__func__, ptr ? CallOutcome::Ok : CallOutcome::Error, ptr ? kHrOk : kHrFail);
+    return ptr;
+}
+
+void* OPENSCARLETT_KERNELX_CALL XMemAllocAligned(
+    size_t dwSize, size_t alignment, uint64_t dwAllocAttributes) {
+    void* ptr = KernelXState::Instance().XMemAllocImpl(dwSize, dwAllocAttributes, alignment);
+    RecordTelemetry(__func__, ptr ? CallOutcome::Ok : CallOutcome::Error, ptr ? kHrOk : kHrInvalidArg);
     return ptr;
 }
 
@@ -1518,6 +1713,29 @@ int32_t OPENSCARLETT_KERNELX_CALL GetThreadName(void* hThread,
         hThread, lpThreadName, nBufferLength, pnRequiredLength);
     RecordTelemetry(__func__, hr >= 0 ? CallOutcome::Ok : CallOutcome::Error, hr);
     return hr;
+}
+
+uint64_t OPENSCARLETT_KERNELX_CALL XThreadSetAffinityMask(void* hThread,
+                                                          uint64_t dwThreadAffinityMask) {
+    const uint64_t prev =
+        KernelXState::Instance().SetThreadAffinityMaskImpl(hThread, dwThreadAffinityMask);
+    RecordTelemetry(__func__, prev != 0ull ? CallOutcome::Ok : CallOutcome::Error,
+                    prev != 0ull ? kHrOk : kHrInvalidArg);
+    return prev;
+}
+
+int32_t OPENSCARLETT_KERNELX_CALL XThreadSetPriority(void* hThread, int32_t nPriority) {
+    const int32_t ok = KernelXState::Instance().SetThreadPriorityImpl(hThread, nPriority);
+    RecordTelemetry(__func__, ok != 0 ? CallOutcome::Ok : CallOutcome::Error,
+                    ok != 0 ? kHrOk : kHrHandle);
+    return ok;
+}
+
+int32_t OPENSCARLETT_KERNELX_CALL XThreadGetPriority(void* hThread) {
+    const int32_t prio = KernelXState::Instance().GetThreadPriorityImpl(hThread);
+    const bool ok = (prio != KERNELX_THREAD_PRIORITY_ERROR_RETURN);
+    RecordTelemetry(__func__, ok ? CallOutcome::Ok : CallOutcome::Error, ok ? kHrOk : kHrHandle);
+    return prio;
 }
 
 void* OPENSCARLETT_KERNELX_CALL KernelXCreateWaitableTimerExW(void* lpTimerAttributes,

@@ -2,6 +2,7 @@ LIBRARY xmem.dll
 EXPORTS
     XMemAlloc = XMemShim_XMemAlloc
     XMemAllocDefault = XMemShim_XMemAllocDefault
+    XMemAllocAligned = XMemShim_XMemAllocAligned
     XMemFree = XMemShim_XMemFree
     XMemFreeDefault = XMemShim_XMemFreeDefault
     XMemSize = XMemShim_XMemSize

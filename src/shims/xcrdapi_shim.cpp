@@ -1,7 +1,10 @@
 #define OPENSCARLETT_BUILDING_XCRDAPI 1
 #include "openscarlett/shims/secondary_shims_abi.h"
 #include "openscarlett/core/telemetry.h"
+#include "openscarlett/io/bcpack.h"
+#include "openscarlett/io/gdeflate.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -11,6 +14,10 @@
 #include <sstream>
 #include <string>
 #include <vector>
+
+#if defined(_WIN32)
+#  include <windows.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -285,6 +292,126 @@ OS_XCRDAPI_API int OS_SHIM_CALL OpenScarlettXCrdGetTelemetryDetail(
     if (out_not_impl_calls) *out_not_impl_calls = 0;
     if (out_last_hr) *out_last_hr = 0;
     return 0;
+}
+
+OS_XCRDAPI_API int32_t OS_SHIM_CALL XCrdValidateIntermediateBuffer(
+    size_t requiredSize,
+    size_t intermediateSize,
+    size_t maxAllowedSize) {
+    constexpr size_t kDefaultMaxIntermediate = 256u * 1024u * 1024u;
+    const size_t limit = (maxAllowedSize != 0u) ? maxAllowedSize : kDefaultMaxIntermediate;
+    if (requiredSize == 0u || intermediateSize == 0u || intermediateSize > limit) {
+        return RecordHr("XCrdValidateIntermediateBuffer", OS_SHIM_E_INVALIDARG);
+    }
+    if (intermediateSize < requiredSize) {
+        return RecordHr("XCrdValidateIntermediateBuffer", OS_SHIM_E_NOT_SUFFICIENT_BUFFER);
+    }
+    return RecordHr("XCrdValidateIntermediateBuffer", OS_SHIM_S_OK);
+}
+
+OS_XCRDAPI_API int32_t OS_SHIM_CALL XCrdDecompressToBuffer(
+    uint32_t compressionFormat,
+    const void* src,
+    size_t srcSize,
+    void* dst,
+    size_t dstSize,
+    size_t intermediateSize,
+    size_t* outDecompressedSize) {
+    if (outDecompressedSize) {
+        *outDecompressedSize = 0u;
+    }
+    if (!src || !dst || srcSize == 0u || dstSize == 0u) {
+        return RecordHr("XCrdDecompressToBuffer", OS_SHIM_E_INVALIDARG);
+    }
+    constexpr size_t kMaxIntermediate = 256u * 1024u * 1024u;
+    if (intermediateSize == 0u || intermediateSize > kMaxIntermediate) {
+        return RecordHr("XCrdDecompressToBuffer", OS_SHIM_E_INVALIDARG);
+    }
+
+#if defined(_WIN32)
+    // Verify destination is committed & writable (supports kernelx/xmem physical pages).
+    uintptr_t cursor = reinterpret_cast<uintptr_t>(dst);
+    if (cursor + dstSize < cursor) {
+        return RecordHr("XCrdDecompressToBuffer", OS_SHIM_E_INVALIDARG);
+    }
+    size_t rem = dstSize;
+    while (rem > 0u) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<LPCVOID>(cursor), &mbi, sizeof(mbi)) == 0u ||
+            mbi.State != MEM_COMMIT) {
+            return RecordHr("XCrdDecompressToBuffer", OS_SHIM_E_INVALIDARG);
+        }
+        const DWORD base_prot = mbi.Protect & 0xFFu;
+        const bool writable =
+            (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0u &&
+            (base_prot == PAGE_READWRITE || base_prot == PAGE_WRITECOPY ||
+             base_prot == PAGE_EXECUTE_READWRITE || base_prot == PAGE_EXECUTE_WRITECOPY);
+        if (!writable) {
+            return RecordHr("XCrdDecompressToBuffer", OS_SHIM_E_INVALIDARG);
+        }
+        const uintptr_t end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+        if (end <= cursor) {
+            return RecordHr("XCrdDecompressToBuffer", OS_SHIM_E_INVALIDARG);
+        }
+        const size_t step = std::min(rem, static_cast<size_t>(end - cursor));
+        cursor += step;
+        rem -= step;
+    }
+#endif
+
+    const auto* src_bytes = static_cast<const uint8_t*>(src);
+    auto* dst_bytes = static_cast<uint8_t*>(dst);
+
+    if (compressionFormat == 0u) {
+        if (intermediateSize < srcSize || dstSize < srcSize) {
+            return RecordHr("XCrdDecompressToBuffer", OS_SHIM_E_NOT_SUFFICIENT_BUFFER);
+        }
+        std::memcpy(dst_bytes, src_bytes, srcSize);
+        if (outDecompressedSize) *outDecompressedSize = srcSize;
+        return RecordHr("XCrdDecompressToBuffer", OS_SHIM_S_OK);
+    }
+
+    if (compressionFormat == 1u) {  // GDeflate
+        size_t needed = 0u;
+        if (!openscarlett::GDeflateIsValidStream(src_bytes, srcSize) ||
+            !openscarlett::GDeflateGetUncompressedSize(src_bytes, srcSize, &needed) ||
+            needed == 0u) {
+            return RecordHr("XCrdDecompressToBuffer", OS_SHIM_E_FAIL);
+        }
+        if (intermediateSize < needed || dstSize < needed) {
+            return RecordHr("XCrdDecompressToBuffer", OS_SHIM_E_NOT_SUFFICIENT_BUFFER);
+        }
+        size_t written = 0u;
+        if (openscarlett::GDeflateDecompress(src_bytes, srcSize, dst_bytes, dstSize, &written) !=
+            openscarlett::GDeflateResult::Ok) {
+            return RecordHr("XCrdDecompressToBuffer", OS_SHIM_E_FAIL);
+        }
+        if (outDecompressedSize) *outDecompressedSize = written;
+        return RecordHr("XCrdDecompressToBuffer", OS_SHIM_S_OK);
+    }
+
+    if (compressionFormat == 2u || compressionFormat == 3u) {  // BCPack
+        openscarlett::BcPackHeader hdr{};
+        if (!openscarlett::BcPackParseHeader(src_bytes, srcSize, hdr).ok() ||
+            hdr.original_size == 0u) {
+            return RecordHr("XCrdDecompressToBuffer", OS_SHIM_E_FAIL);
+        }
+        if (intermediateSize < hdr.original_size || dstSize < hdr.original_size) {
+            return RecordHr("XCrdDecompressToBuffer", OS_SHIM_E_NOT_SUFFICIENT_BUFFER);
+        }
+        std::vector<uint8_t> unpacked;
+        if (!openscarlett::BcPackDecompress(src_bytes, srcSize, unpacked).ok()) {
+            return RecordHr("XCrdDecompressToBuffer", OS_SHIM_E_FAIL);
+        }
+        if (unpacked.size() > dstSize) {
+            return RecordHr("XCrdDecompressToBuffer", OS_SHIM_E_NOT_SUFFICIENT_BUFFER);
+        }
+        std::memcpy(dst_bytes, unpacked.data(), unpacked.size());
+        if (outDecompressedSize) *outDecompressedSize = unpacked.size();
+        return RecordHr("XCrdDecompressToBuffer", OS_SHIM_S_OK);
+    }
+
+    return RecordHr("XCrdDecompressToBuffer", OS_SHIM_E_INVALIDARG);
 }
 
 }  // extern "C"

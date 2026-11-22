@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -75,6 +76,190 @@ std::string GetEnvString(const char* name) {
 bool IsNullAudioForced() {
     const std::string v = GetEnvString("OPENSCARLETT_AUDIO_NULL");
     return v == "1" || v == "true" || v == "TRUE" || v == "yes";
+}
+
+// ===========================================================================
+// Windows MMDevice Endpoint ID Validation & Normalization
+// Accepts:
+//   - NULL / empty / "default" (case-insensitive)
+//   - Canonical IMMDevice ID: "{0.0.0.00000000}.{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}"
+//   - WinRT/PnP device interface path:
+//       "\\?\SWD#MMDEVAPI#{0.0.0.00000000}.{guid}"
+//       "\\?\SWD#MMDEVAPI#{0.0.0.00000000}.{guid}#{interface-guid}"
+//   - Bare GUID: "{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}"
+// ===========================================================================
+struct ParsedEndpointId {
+    bool valid = false;
+    bool is_default = false;
+    std::wstring canonical_id;
+};
+
+bool IsAsciiHexW(wchar_t c) noexcept {
+    return (c >= L'0' && c <= L'9') ||
+           (c >= L'a' && c <= L'f') ||
+           (c >= L'A' && c <= L'F');
+}
+
+bool IsAsciiDigitW(wchar_t c) noexcept {
+    return c >= L'0' && c <= L'9';
+}
+
+wchar_t ToLowerAsciiW(wchar_t c) noexcept {
+    return (c >= L'A' && c <= L'Z') ? static_cast<wchar_t>(c - L'A' + L'a') : c;
+}
+
+bool EqualsIgnoreCaseAsciiW(const std::wstring& a, const wchar_t* b) {
+    size_t i = 0u;
+    for (; i < a.size() && b[i] != L'\0'; ++i) {
+        if (ToLowerAsciiW(a[i]) != ToLowerAsciiW(b[i])) {
+            return false;
+        }
+    }
+    return i == a.size() && b[i] == L'\0';
+}
+
+bool StartsWithIgnoreCaseAsciiW(const std::wstring& s, const wchar_t* prefix) {
+    size_t i = 0u;
+    for (; prefix[i] != L'\0'; ++i) {
+        if (i >= s.size() || ToLowerAsciiW(s[i]) != ToLowerAsciiW(prefix[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::wstring ToLowerGuidAsciiW(const std::wstring& s) {
+    std::wstring out = s;
+    for (wchar_t& c : out) {
+        c = ToLowerAsciiW(c);
+    }
+    return out;
+}
+
+// Validates "{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}" (38 chars).
+bool IsValidBracedGuidW(const std::wstring& s) noexcept {
+    if (s.size() != 38u || s.front() != L'{' || s.back() != L'}') {
+        return false;
+    }
+    for (size_t i = 1u; i < 37u; ++i) {
+        if (i == 9u || i == 14u || i == 19u || i == 24u) {
+            if (s[i] != L'-') return false;
+        } else {
+            if (!IsAsciiHexW(s[i])) return false;
+        }
+    }
+    return true;
+}
+
+// Validates "{d.d.d.hhhhhhhh}.{guid}" (standard Windows Core Audio IMMDevice ID).
+bool IsValidMmDeviceCanonicalIdW(const std::wstring& s) noexcept {
+    const size_t sep = s.find(L"}.{");
+    if (sep == std::wstring::npos || s.front() != L'{') {
+        return false;
+    }
+    const std::wstring prefix = s.substr(1u, sep - 1u);
+    const std::wstring guid = s.substr(sep + 2u);
+    if (!IsValidBracedGuidW(guid)) {
+        return false;
+    }
+    // Prefix format: "<flow>.<reserved>.<role>.<8 hex digits>", e.g. "0.0.0.00000000"
+    size_t dot1 = prefix.find(L'.');
+    if (dot1 == std::wstring::npos || dot1 == 0u) return false;
+    size_t dot2 = prefix.find(L'.', dot1 + 1u);
+    if (dot2 == std::wstring::npos || dot2 == dot1 + 1u) return false;
+    size_t dot3 = prefix.find(L'.', dot2 + 1u);
+    if (dot3 == std::wstring::npos || dot3 == dot2 + 1u) return false;
+    if (prefix.find(L'.', dot3 + 1u) != std::wstring::npos) return false;
+
+    for (size_t i = 0u; i < dot1; ++i) {
+        if (!IsAsciiDigitW(prefix[i])) return false;
+    }
+    for (size_t i = dot1 + 1u; i < dot2; ++i) {
+        if (!IsAsciiDigitW(prefix[i])) return false;
+    }
+    for (size_t i = dot2 + 1u; i < dot3; ++i) {
+        if (!IsAsciiDigitW(prefix[i])) return false;
+    }
+    const size_t tail_len = prefix.size() - (dot3 + 1u);
+    if (tail_len != 8u) return false;
+    for (size_t i = dot3 + 1u; i < prefix.size(); ++i) {
+        if (!IsAsciiHexW(prefix[i])) return false;
+    }
+    return true;
+}
+
+ParsedEndpointId ParseMmDeviceEndpointIdW(const wchar_t* deviceId) {
+    ParsedEndpointId out{};
+    if (!deviceId || deviceId[0] == L'\0') {
+        out.valid = true;
+        out.is_default = true;
+        return out;
+    }
+
+    const std::wstring raw(deviceId);
+    if (raw.size() >= 256u) {
+        return out;
+    }
+    if (EqualsIgnoreCaseAsciiW(raw, L"default")) {
+        out.valid = true;
+        out.is_default = true;
+        return out;
+    }
+
+    // 1. Canonical IMMDevice ID: "{0.0.0.00000000}.{guid}"
+    if (IsValidMmDeviceCanonicalIdW(raw)) {
+        out.valid = true;
+        out.is_default = false;
+        out.canonical_id = ToLowerGuidAsciiW(raw);
+        return out;
+    }
+
+    // 2. WinRT / PnP Device Interface Path: "\\?\SWD#MMDEVAPI#{0.0.0.00000000}.{guid}[#{iface-guid}]"
+    constexpr const wchar_t* kSwdPrefix1 = L"\\\\?\\SWD#MMDEVAPI#";
+    constexpr const wchar_t* kSwdPrefix2 = L"\\\\.\\SWD#MMDEVAPI#";
+    size_t prefix_len = 0u;
+    if (StartsWithIgnoreCaseAsciiW(raw, kSwdPrefix1)) {
+        prefix_len = 17u;
+    } else if (StartsWithIgnoreCaseAsciiW(raw, kSwdPrefix2)) {
+        prefix_len = 17u;
+    }
+    if (prefix_len > 0u) {
+        const std::wstring rest = raw.substr(prefix_len);
+        if (rest.empty()) {
+            return out;
+        }
+        const size_t hash_pos = rest.find(L'#');
+        const std::wstring id_part = (hash_pos == std::wstring::npos) ? rest : rest.substr(0u, hash_pos);
+        if (hash_pos != std::wstring::npos) {
+            const std::wstring iface_part = rest.substr(hash_pos + 1u);
+            if (!IsValidBracedGuidW(iface_part)) {
+                return out;
+            }
+        }
+        if (IsValidMmDeviceCanonicalIdW(id_part)) {
+            out.valid = true;
+            out.is_default = false;
+            out.canonical_id = ToLowerGuidAsciiW(id_part);
+            return out;
+        }
+        if (IsValidBracedGuidW(id_part)) {
+            out.valid = true;
+            out.is_default = false;
+            out.canonical_id = L"{0.0.0.00000000}." + ToLowerGuidAsciiW(id_part);
+            return out;
+        }
+        return out;
+    }
+
+    // 3. Bare GUID: "{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}"
+    if (IsValidBracedGuidW(raw)) {
+        out.valid = true;
+        out.is_default = false;
+        out.canonical_id = L"{0.0.0.00000000}." + ToLowerGuidAsciiW(raw);
+        return out;
+    }
+
+    return out;
 }
 
 class XAudio2Impl;
@@ -858,13 +1043,23 @@ public:
         uint32_t InputChannels,
         uint32_t InputSampleRate,
         uint32_t Flags,
-        const wchar_t* /*szDeviceId*/,
+        const wchar_t* szDeviceId,
         const void* /*pEffectChain*/,
         uint32_t /*StreamCategory*/) override {
         if (!ppMasteringVoice) {
             return RecordHr("IXAudio2::CreateMasteringVoice", OS_XAUDIO2_E_INVALIDARG, 7);
         }
         *ppMasteringVoice = nullptr;
+        const ParsedEndpointId parsed_ep = ParseMmDeviceEndpointIdW(szDeviceId);
+        if (!parsed_ep.valid) {
+            return RecordHr("IXAudio2::CreateMasteringVoice", OS_XAUDIO2_E_INVALIDARG, 7);
+        }
+#if defined(_WIN32)
+        {
+            std::lock_guard<std::mutex> wlk(wasapi_mutex_);
+            requested_endpoint_id_ = parsed_ep.is_default ? std::wstring() : parsed_ep.canonical_id;
+        }
+#endif
         {
             std::lock_guard<std::mutex> lk(mutex_);
             mastering_voice_ = std::make_unique<MasteringVoiceImpl>(
@@ -1052,7 +1247,7 @@ private:
             ResetEvent(wasapi_stop_event_);
         }
         wasapi_thread_ = std::thread(&XAudio2Impl::WasapiRenderLoop, this);
-        wasapi_init_cv_.wait_for(lk, std::chrono::milliseconds(500), [&]() {
+        wasapi_init_cv_.wait_for(lk, std::chrono::milliseconds(2000), [&]() {
             return wasapi_init_done_;
         });
 #endif
@@ -1132,12 +1327,24 @@ private:
             return;
         }
 
-        hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+        std::wstring req_endpoint;
+        {
+            std::lock_guard<std::mutex> wlk(wasapi_mutex_);
+            req_endpoint = requested_endpoint_id_;
+        }
+        if (!req_endpoint.empty()) {
+            hr = enumerator->GetDevice(req_endpoint.c_str(), &device);
+        } else {
+            hr = E_FAIL;
+        }
+        if (FAILED(hr) || !device) {
+            hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+        }
         if (FAILED(hr) || !device) {
             hr = enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &device);
         }
         wasapi_last_hr_.store(static_cast<int32_t>(hr), std::memory_order_release);
-        if (FAILED(hr) || !device) {
+        if (FAILED(hr) || !device || wasapi_stop_.load(std::memory_order_acquire)) {
             cleanup();
             return;
         }
@@ -1145,7 +1352,7 @@ private:
         hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
                               reinterpret_cast<void**>(&client));
         wasapi_last_hr_.store(static_cast<int32_t>(hr), std::memory_order_release);
-        if (FAILED(hr) || !client) {
+        if (FAILED(hr) || !client || wasapi_stop_.load(std::memory_order_acquire)) {
             cleanup();
             return;
         }
@@ -1328,6 +1535,7 @@ private:
     std::mutex wasapi_mutex_;
     std::condition_variable wasapi_init_cv_;
     bool wasapi_init_done_ = false;
+    std::wstring requested_endpoint_id_;
     HANDLE wasapi_stop_event_ = nullptr;
     std::atomic<bool> wasapi_stop_{false};
     std::atomic<bool> wasapi_active_{false};
@@ -2017,6 +2225,150 @@ int32_t OPENSCARLETT_XAUDIO2_CALL OpenScarlettXAudio2GetBackendInfo(
     auto* impl = static_cast<XAudio2Impl*>(pXAudio2);
     impl->GetBackendInfo(*out_info);
     return RecordHr("OpenScarlettXAudio2GetBackendInfo", OS_XAUDIO2_S_OK);
+}
+
+int32_t OPENSCARLETT_XAUDIO2_CALL OpenScarlettXAudio2ValidateEndpointIdW(
+    const wchar_t* deviceId,
+    wchar_t* outCanonicalId,
+    uint32_t outCanonicalChars) {
+    const ParsedEndpointId parsed = ParseMmDeviceEndpointIdW(deviceId);
+    if (!parsed.valid) {
+        if (outCanonicalId && outCanonicalChars > 0u) {
+            outCanonicalId[0] = L'\0';
+        }
+        return RecordHr("OpenScarlettXAudio2ValidateEndpointIdW", OS_XAUDIO2_E_INVALIDARG);
+    }
+    if (outCanonicalId && outCanonicalChars > 0u) {
+        const size_t needed = parsed.canonical_id.size() + 1u;
+        if (outCanonicalChars < needed) {
+            outCanonicalId[0] = L'\0';
+            return RecordHr("OpenScarlettXAudio2ValidateEndpointIdW", OS_XAUDIO2_E_INVALIDARG);
+        }
+        std::memcpy(outCanonicalId, parsed.canonical_id.c_str(), needed * sizeof(wchar_t));
+    }
+    return RecordHr("OpenScarlettXAudio2ValidateEndpointIdW", OS_XAUDIO2_S_OK);
+}
+
+int32_t OPENSCARLETT_XAUDIO2_CALL OpenScarlettXAudio2ValidateEndpointIdA(
+    const char* deviceId,
+    char* outCanonicalId,
+    uint32_t outCanonicalChars) {
+    std::wstring wide_in;
+    if (deviceId && deviceId[0] != '\0') {
+        for (const char* p = deviceId; *p != '\0'; ++p) {
+            const unsigned char c = static_cast<unsigned char>(*p);
+            if (c < 0x20u || c >= 0x7Fu) {
+                if (outCanonicalId && outCanonicalChars > 0u) {
+                    outCanonicalId[0] = '\0';
+                }
+                return RecordHr("OpenScarlettXAudio2ValidateEndpointIdA", OS_XAUDIO2_E_INVALIDARG);
+            }
+            wide_in.push_back(static_cast<wchar_t>(c));
+        }
+    }
+    const ParsedEndpointId parsed =
+        ParseMmDeviceEndpointIdW(deviceId ? wide_in.c_str() : nullptr);
+    if (!parsed.valid) {
+        if (outCanonicalId && outCanonicalChars > 0u) {
+            outCanonicalId[0] = '\0';
+        }
+        return RecordHr("OpenScarlettXAudio2ValidateEndpointIdA", OS_XAUDIO2_E_INVALIDARG);
+    }
+    if (outCanonicalId && outCanonicalChars > 0u) {
+        const size_t needed = parsed.canonical_id.size() + 1u;
+        if (outCanonicalChars < needed) {
+            outCanonicalId[0] = '\0';
+            return RecordHr("OpenScarlettXAudio2ValidateEndpointIdA", OS_XAUDIO2_E_INVALIDARG);
+        }
+        for (size_t i = 0u; i < parsed.canonical_id.size(); ++i) {
+            outCanonicalId[i] = static_cast<char>(parsed.canonical_id[i] & 0x7Fu);
+        }
+        outCanonicalId[parsed.canonical_id.size()] = '\0';
+    }
+    return RecordHr("OpenScarlettXAudio2ValidateEndpointIdA", OS_XAUDIO2_S_OK);
+}
+
+int32_t OPENSCARLETT_XAUDIO2_CALL OpenScarlettXAudio2ProbeWasapiEndpointW(
+    const wchar_t* deviceId,
+    OS_XAUDIO2_ENDPOINT_PROBE* outProbe) {
+    if (!outProbe) {
+        return RecordHr("OpenScarlettXAudio2ProbeWasapiEndpointW", OS_XAUDIO2_E_POINTER);
+    }
+    std::memset(outProbe, 0, sizeof(*outProbe));
+    const ParsedEndpointId parsed = ParseMmDeviceEndpointIdW(deviceId);
+    if (!parsed.valid) {
+        return RecordHr("OpenScarlettXAudio2ProbeWasapiEndpointW", OS_XAUDIO2_E_INVALIDARG);
+    }
+    outProbe->format_valid = 1u;
+    outProbe->is_default = parsed.is_default ? 1u : 0u;
+    const size_t copy_len = std::min<size_t>(parsed.canonical_id.size(), 255u);
+    if (copy_len > 0u) {
+        std::memcpy(outProbe->canonical_id, parsed.canonical_id.c_str(), copy_len * sizeof(wchar_t));
+    }
+    outProbe->canonical_id[copy_len] = L'\0';
+
+#if defined(_WIN32)
+    if (!IsNullAudioForced()) {
+        const HRESULT co_hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        const bool co_init = SUCCEEDED(co_hr);
+        IMMDeviceEnumerator* enumerator = nullptr;
+        IMMDevice* device = nullptr;
+        IAudioClient* client = nullptr;
+        WAVEFORMATEX* mix_fmt = nullptr;
+
+        HRESULT hr = CoCreateInstance(
+            __uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+            __uuidof(IMMDeviceEnumerator), reinterpret_cast<void**>(&enumerator));
+        if (SUCCEEDED(hr) && enumerator) {
+            if (!parsed.is_default) {
+                hr = enumerator->GetDevice(parsed.canonical_id.c_str(), &device);
+                if (SUCCEEDED(hr) && device) {
+                    outProbe->exact_device_found = 1u;
+                }
+            }
+            if (!device) {
+                hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
+                if (FAILED(hr) || !device) {
+                    hr = enumerator->GetDefaultAudioEndpoint(eRender, eMultimedia, &device);
+                }
+                if (SUCCEEDED(hr) && device) {
+                    if (parsed.is_default) {
+                        outProbe->exact_device_found = 1u;
+                        LPWSTR actual_id = nullptr;
+                        if (SUCCEEDED(device->GetId(&actual_id)) && actual_id) {
+                            const size_t alen = std::min<size_t>(std::wcslen(actual_id), 255u);
+                            std::memcpy(outProbe->canonical_id, actual_id, alen * sizeof(wchar_t));
+                            outProbe->canonical_id[alen] = L'\0';
+                            CoTaskMemFree(actual_id);
+                        }
+                    } else {
+                        outProbe->fallback_used = 1u;
+                    }
+                }
+            }
+            if (device) {
+                hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr,
+                                      reinterpret_cast<void**>(&client));
+                if (SUCCEEDED(hr) && client) {
+                    hr = client->GetMixFormat(&mix_fmt);
+                    if (SUCCEEDED(hr) && mix_fmt) {
+                        outProbe->mix_sample_rate = mix_fmt->nSamplesPerSec;
+                        outProbe->mix_channels = mix_fmt->nChannels;
+                        outProbe->mix_bits_per_sample = mix_fmt->wBitsPerSample;
+                    }
+                }
+            }
+        }
+        outProbe->wasapi_hresult = static_cast<int32_t>(hr);
+        if (mix_fmt) CoTaskMemFree(mix_fmt);
+        if (client) client->Release();
+        if (device) device->Release();
+        if (enumerator) enumerator->Release();
+        if (co_init) CoUninitialize();
+    }
+#endif
+
+    return RecordHr("OpenScarlettXAudio2ProbeWasapiEndpointW", OS_XAUDIO2_S_OK);
 }
 
 }  // extern "C"

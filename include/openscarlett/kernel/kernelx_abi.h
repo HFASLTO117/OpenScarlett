@@ -222,6 +222,11 @@ OPENSCARLETT_KERNELX_API void* OPENSCARLETT_KERNELX_CALL XMemAllocDefault(
     size_t dwSize,
     uint64_t dwAllocAttributes);
 
+OPENSCARLETT_KERNELX_API void* OPENSCARLETT_KERNELX_CALL XMemAllocAligned(
+    size_t dwSize,
+    size_t alignment,
+    uint64_t dwAllocAttributes);
+
 OPENSCARLETT_KERNELX_API void OPENSCARLETT_KERNELX_CALL XMemFree(
     void* pAddress,
     uint64_t dwAllocAttributes);
@@ -337,6 +342,19 @@ OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL GetThreadName(
     wchar_t* lpThreadName,
     size_t nBufferLength,
     size_t* pnRequiredLength);
+
+#define KERNELX_THREAD_PRIORITY_ERROR_RETURN 0x7FFFFFFF
+
+OPENSCARLETT_KERNELX_API uint64_t OPENSCARLETT_KERNELX_CALL XThreadSetAffinityMask(
+    void* hThread,
+    uint64_t dwThreadAffinityMask);
+
+OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL XThreadSetPriority(
+    void* hThread,
+    int32_t nPriority);
+
+OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL XThreadGetPriority(
+    void* hThread);
 
 OPENSCARLETT_KERNELX_API void* OPENSCARLETT_KERNELX_CALL KernelXCreateWaitableTimerExW(
     void* lpTimerAttributes,

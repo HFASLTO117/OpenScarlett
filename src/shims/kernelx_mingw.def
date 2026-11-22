@@ -8,6 +8,7 @@ EXPORTS
     ToolingMemoryStatus
     XMemAlloc
     XMemAllocDefault
+    XMemAllocAligned
     XMemFree
     XMemFreeDefault
     XMemSize
@@ -31,6 +32,9 @@ EXPORTS
     XGetProcessorCount
     SetThreadName
     GetThreadName
+    XThreadSetAffinityMask
+    XThreadSetPriority
+    XThreadGetPriority
     KernelXCreateWaitableTimerExW
     KernelXQueryUnbiasedInterruptTime
     KernelXCreateTilePool

@@ -26,9 +26,12 @@ constexpr int32_t OS_DSTORAGE_E_PENDING = static_cast<int32_t>(0x8000000Au);
 constexpr int32_t OS_DSTORAGE_E_OUTOFMEMORY = static_cast<int32_t>(0x8007000Eu);
 constexpr int32_t OS_DSTORAGE_E_INVALIDARG = static_cast<int32_t>(0x80070057u);
 constexpr int32_t OS_DSTORAGE_E_FILE_NOT_FOUND = static_cast<int32_t>(0x80070002u);
-constexpr int32_t OS_DSTORAGE_E_DECOMPRESSION_ERROR = static_cast<int32_t>(0x89240014u);
+constexpr int32_t OS_DSTORAGE_E_STAGING_BUFFER_TOO_SMALL = static_cast<int32_t>(0x8924000Au);
 constexpr int32_t OS_DSTORAGE_E_REQUEST_TOO_LARGE = static_cast<int32_t>(0x8924000Bu);
+constexpr int32_t OS_DSTORAGE_E_STAGING_BUFFER_INVALID = static_cast<int32_t>(0x8924000Cu);
+constexpr int32_t OS_DSTORAGE_E_DECOMPRESSION_ERROR = static_cast<int32_t>(0x89240014u);
 constexpr int32_t OS_DSTORAGE_E_IO_ERROR = static_cast<int32_t>(0x89240015u);
+constexpr int32_t OS_DSTORAGE_E_CANCELLED = static_cast<int32_t>(0x89240016u);
 
 struct DStorageGuid {
     uint32_t Data1;
@@ -89,6 +92,10 @@ enum DSTORAGE_COMPRESSION_FORMAT : uint8_t {
 
 constexpr uint16_t DSTORAGE_MIN_QUEUE_CAPACITY = 128u;
 constexpr uint16_t DSTORAGE_MAX_QUEUE_CAPACITY = 2000u;
+
+constexpr uint32_t DSTORAGE_MIN_STAGING_BUFFER_SIZE = 64u * 1024u;           // 64 KiB
+constexpr uint32_t DSTORAGE_DEFAULT_STAGING_BUFFER_SIZE = 32u * 1024u * 1024u;  // 32 MiB
+constexpr uint32_t DSTORAGE_MAX_STAGING_BUFFER_SIZE = 256u * 1024u * 1024u;  // 256 MiB
 
 struct IDStorageFileX;
 struct IDStorageStatusArrayX;
@@ -186,6 +193,19 @@ struct DSTORAGE_QUEUE_INFO {
     uint16_t RequestCountUntilAutoSubmit;
 };
 
+struct DSTORAGE_QUEUE_STATS {
+    uint64_t StagedCanceled;
+    uint64_t SubmittedCanceled;
+    uint64_t InFlightCanceled;
+    uint64_t CompletedOk;
+    uint64_t CompletedFailed;
+    uint64_t CompletedCanceled;
+    uint64_t PhysicalPageWrites;
+    uint64_t XMemDestinationWrites;
+    uint32_t StagingBufferSize;
+    uint32_t LastIntermediateSize;
+};
+
 struct IDStorageFileX {
     virtual int32_t OPENSCARLETT_DSTORAGE_CALL QueryInterface(
         const DStorageGuid* riid, void** ppvObject) = 0;
@@ -249,6 +269,21 @@ OPENSCARLETT_DSTORAGE_API int32_t OPENSCARLETT_DSTORAGE_CALL DStorageSetConfigur
     const DSTORAGE_CONFIGURATION* configuration);
 OPENSCARLETT_DSTORAGE_API int32_t OPENSCARLETT_DSTORAGE_CALL DStorageSetConfiguration1(
     const DSTORAGE_CONFIGURATION1* configuration);
+
+OPENSCARLETT_DSTORAGE_API int32_t OPENSCARLETT_DSTORAGE_CALL OpenScarlettDStorageGetQueueStats(
+    IDStorageQueueX* queue, DSTORAGE_QUEUE_STATS* outStats);
+
+OPENSCARLETT_DSTORAGE_API int32_t OPENSCARLETT_DSTORAGE_CALL OpenScarlettDStorageGetStagingBufferSize(
+    IDStorageFactoryX* factory, uint32_t* outSize);
+
+OPENSCARLETT_DSTORAGE_API int32_t OPENSCARLETT_DSTORAGE_CALL OpenScarlettDStorageDecompressWithIntermediate(
+    DSTORAGE_COMPRESSION_FORMAT format,
+    const void* src,
+    size_t src_size,
+    void* dst,
+    size_t dst_size,
+    size_t intermediate_size,
+    size_t* out_decompressed_size);
 
 #ifdef __cplusplus
 }
