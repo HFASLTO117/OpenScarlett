@@ -14,6 +14,16 @@
 #include "openscarlett/gpu/rt_bvh.h"
 
 struct ID3D12Device;
+struct ID3D12Device5;
+struct ID3D12Device11;
+struct ID3D12GraphicsCommandList4;
+struct ID3D12GraphicsCommandList6;
+struct ID3D12GraphicsCommandList8;
+struct D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS;
+struct D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO;
+struct D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC;
+struct D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC;
+struct D3D12_STATE_OBJECT_DESC;
 
 namespace openscarlett {
 
@@ -142,6 +152,21 @@ bool IntersectRayTriangleEx(
     float& out_v,
     Vec3& out_normal,
     bool& out_front_face) noexcept;
+
+// CPU reference ray-AABB traversal for procedural leaf primitives (implemented in rt_bvh.cpp).
+struct RtProceduralHit {
+    bool hit = false;
+    float t = 1e30f;
+    uint32_t primitive_index = 0xFFFFFFFFu;
+    uint32_t geometry_index = 0u;
+};
+
+bool TraceRayProceduralAabbs(
+    const std::vector<Rdna2BvhProceduralInput>& procedurals,
+    const RtRay& ray,
+    float t_best,
+    bool accept_first,
+    RtProceduralHit& out_hit) noexcept;
 
 // ---------------------------------------------------------------------------
 // 3. 64-bit Multi-Window RDNA2 BVH4 Traversal (implemented in bvh4_decoder.cpp)
@@ -470,4 +495,314 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+// ---------------------------------------------------------------------------
+// 7. Dual-Path Pre-Built RDNA2 BVH4 Rehydration & Xbox->PC VA Translation
+//    Path A: DXR 1.1 GPU path (decode BVH4 leaves -> build native PC BLAS/TLAS)
+//    Path B: DXR=0 fallback (in-place 64-bit pointer patch + multi-window GPU compute)
+//    Implemented in dxr_hardware.cpp.
+// ---------------------------------------------------------------------------
+enum class Bvh4RehydrationPath : uint8_t {
+    HardwareDxr11 = 0,
+    ComputeBvh4Fallback = 1,
+};
+
+struct XboxVaTranslationEntry {
+    uint64_t xbox_gpu_va = 0ull;
+    uint64_t native_pc_gpu_va = 0ull;
+    uint64_t host_as_id = 0ull;
+    Rdna2BvhAsType as_type = Rdna2BvhAsType::BottomLevel;
+    Bvh4RehydrationPath path = Bvh4RehydrationPath::ComputeBvh4Fallback;
+    uint32_t triangle_count = 0u;
+    uint32_t procedural_count = 0u;
+    uint32_t instance_count = 0u;
+    bool hardware_dxr_built = false;
+};
+
+struct XboxBvh4RehydrateResult {
+    Bvh4RehydrationPath selected_path = Bvh4RehydrationPath::ComputeBvh4Fallback;
+    uint64_t source_xbox_va = 0ull;
+    uint64_t dest_xbox_va = 0ull;
+    uint64_t native_pc_gpu_va = 0ull;
+    uint64_t host_as_id = 0ull;
+    uint32_t decoded_triangle_count = 0u;
+    uint32_t decoded_procedural_count = 0u;
+    uint32_t decoded_instance_count = 0u;
+    uint32_t patched_instance_pointers = 0u;
+    bool hardware_dxr_built = false;
+    std::vector<DxrInstanceDesc> translated_tlas_instances;
+};
+
+class XboxBvh4RehydrationManager {
+public:
+    XboxBvh4RehydrationManager();
+    ~XboxBvh4RehydrationManager();
+
+    XboxBvh4RehydrationManager(const XboxBvh4RehydrationManager&) = delete;
+    XboxBvh4RehydrationManager& operator=(const XboxBvh4RehydrationManager&) = delete;
+
+    Status Initialize(DxrHardwareEngine* engine, bool force_dxr0_fallback = false);
+    void Clear();
+
+    Bvh4RehydrationPath ActivePath() const noexcept;
+
+    // Rehydrates a pre-built RDNA2 BVH4 BLAS buffer (triangle and/or procedural AABB leaves).
+    Status RehydrateBlas(
+        uint64_t source_xbox_va,
+        uint64_t dest_xbox_va,
+        std::vector<uint8_t>& bvh4_buffer_in_out,
+        uint32_t build_flags,
+        XboxBvh4RehydrateResult& out_result);
+
+    // Rehydrates a pre-built RDNA2 BVH4 TLAS buffer (instance and/or procedural leaves),
+    // translating 64-bit Xbox BLAS VAs -> native PC BLAS VAs (Path A) and patching
+    // in-place 64-bit BLAS pointers for multi-window GPU compute traversal (Path B).
+    Status RehydrateTlas(
+        uint64_t source_xbox_va,
+        uint64_t dest_xbox_va,
+        std::vector<uint8_t>& tlas_bvh4_in_out,
+        uint32_t build_flags,
+        XboxBvh4RehydrateResult& out_result);
+
+    // Thread-safe lookup in the 64-bit Xbox GPU VA -> native PC BLAS/TLAS VA table.
+    bool TranslateXboxVaToNativePcVa(
+        uint64_t xbox_va,
+        XboxVaTranslationEntry& out_entry) const;
+
+    // Registers an explicit source -> dest Xbox VA relocation (used for TLAS patching).
+    void RegisterVaRelocation(uint64_t source_xbox_va, uint64_t dest_xbox_va);
+
+    // Snapshot / direct access to the rehydrated multi-window BVH4 table for GPU compute traversal.
+    Status CopyMultiWindow(Rdna2Bvh64MultiWindow& out_windows) const;
+    size_t RehydratedWindowCount() const noexcept;
+
+    // Convenience CPU trace against rehydrated multi-window BVH4.
+    Status TraceRehydratedRay(
+        uint64_t root_xbox_va,
+        const Rdna2RayQueryInput& ray,
+        Rdna2RayQueryHit& out_hit,
+        RtStats* out_stats = nullptr) const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+// ---------------------------------------------------------------------------
+// 8. DXR StateObject Auto-Lifting Helper (LiftDxrStateObjectDesc)
+//    Inspects D3D12_STATE_OBJECT_DESC, lifts embedded Xbox RDNA2 / XS2 / Xbox DXBC
+//    DXIL_LIBRARY subobjects to standard PC lib_6_5 / lib_6_6 DXIL libraries,
+//    passes through native PC DXIL cleanly, remaps SBT shader identifiers, and
+//    returns graceful DXR=0 fallback plan metadata.
+//    Implemented in rdna2_rayquery_bridge.cpp.
+// ---------------------------------------------------------------------------
+struct DxrLiftedLibraryRecord {
+    uint32_t subobject_index = 0u;
+    bool was_xbox_shader = false;
+    bool compiled_to_dxil = false;
+    std::string target_profile = "lib_6_5";
+    std::string lifted_hlsl;
+    std::vector<uint8_t> pc_dxil_bytes;
+    std::vector<std::string> export_names;
+    std::string diagnostics;
+};
+
+struct DxrLiftedSbtIdentifierMapping {
+    std::string export_name;
+    DxrStateObjectExportDesc::Kind kind = DxrStateObjectExportDesc::Kind::RayGen;
+    std::string closest_hit_shader;
+    std::string any_hit_shader;
+    std::string intersection_shader;
+    std::vector<uint8_t> xbox_shader_identifier;
+    std::array<uint8_t, kDxrShaderIdentifierSize> host_shader_id{};
+    uint32_t software_shader_index = 0u;
+};
+
+struct DxrStateObjectFallbackPlan {
+    bool requires_software_fallback = false;
+    uint32_t host_dxr_tier = 0u;
+    Rdna2RayQueryBackend fallback_backend = Rdna2RayQueryBackend::ComputeBvh4Fallback;
+    uint32_t max_payload_size_bytes = 32u;
+    uint32_t max_attribute_size_bytes = 8u;
+    uint32_t max_recursion_depth = 1u;
+    uint32_t raygen_count = 0u;
+    uint32_t miss_count = 0u;
+    uint32_t hit_group_count = 0u;
+    uint32_t callable_count = 0u;
+    std::string reason;
+};
+
+struct DxrStateObjectLiftOptions {
+    uint32_t host_dxr_tier = 0u;
+    bool prefer_sm66 = false;
+    bool compile_with_dxc = true;
+    uint32_t xbox_identifier_size_bytes = 32u;  // 32 or 64
+    std::string dxc_path;
+};
+
+struct DxrLiftedStateObjectResult {
+    bool modified = false;
+    uint32_t total_subobjects = 0u;
+    uint32_t lifted_xbox_libraries = 0u;
+    uint32_t passthrough_pc_libraries = 0u;
+    uint32_t discovered_hit_groups = 0u;
+    std::vector<DxrLiftedLibraryRecord> libraries;
+    std::vector<DxrLiftedSbtIdentifierMapping> sbt_mappings;
+    DxrStateObjectFallbackPlan fallback_plan{};
+
+    // Returns pointer to rewritten D3D12_STATE_OBJECT_DESC owned by this struct
+    // (safe to pass directly into ID3D12Device5::CreateStateObject).
+    const D3D12_STATE_OBJECT_DESC* LiftedDesc() const noexcept;
+
+    // Builds a DxrStateObjectDesc ready for DxrStateObjectSbtRemapper::CreateStateObject.
+    DxrStateObjectDesc BuildSbtRemapperDesc() const;
+
+    DxrLiftedStateObjectResult();
+    ~DxrLiftedStateObjectResult();
+    DxrLiftedStateObjectResult(DxrLiftedStateObjectResult&&) noexcept;
+    DxrLiftedStateObjectResult& operator=(DxrLiftedStateObjectResult&&) noexcept;
+    DxrLiftedStateObjectResult(const DxrLiftedStateObjectResult&) = delete;
+    DxrLiftedStateObjectResult& operator=(const DxrLiftedStateObjectResult&) = delete;
+
+    struct Storage;
+    std::unique_ptr<Storage> storage_;
+};
+
+Status LiftDxrStateObjectDesc(
+    const D3D12_STATE_OBJECT_DESC* pDesc,
+    const DxrStateObjectLiftOptions& options,
+    DxrLiftedStateObjectResult& out_result);
+
 }  // namespace openscarlett
+
+// ---------------------------------------------------------------------------
+// 9. Real MSVC-Mangled C++ Class ABI for XboxBvhBuilder.dll
+//    Exported at global scope matching Xbox Series X|S XboxBvhBuilder.dll.
+//    Implemented in src/shims/xbox_bvh_builder_shim.cpp.
+// ---------------------------------------------------------------------------
+#if defined(_WIN32)
+#  if defined(OPENSCARLETT_BUILDING_XBOX_BVH)
+#    define OS_XBOX_BVH_CLASS_API __declspec(dllexport)
+#  else
+#    define OS_XBOX_BVH_CLASS_API __declspec(dllimport)
+#  endif
+using OsBvhHresult = long;
+#else
+#  define OS_XBOX_BVH_CLASS_API __attribute__((visibility("default")))
+using OsBvhHresult = int32_t;
+#endif
+
+enum XboxBvhBuilderFlags : uint32_t {
+    kXboxBvhBuilderFlagNone = 0x0u,
+    kXboxBvhBuilderFlag64BitMortonCodes = 0x1u,
+    kXboxBvhBuilderFlagPreferHardwareDxr = 0x2u,
+    kXboxBvhBuilderFlagForceSoftwareBvh4 = 0x4u,
+    kXboxBvhBuilderFlagEnableCpuValidation = 0x8u,
+};
+
+struct XboxBvhRehydrateDesc {
+    uint64_t destAccelerationStructureVa = 0ull;
+    uint64_t sourceAccelerationStructureVa = 0ull;
+    void* cpuBvhBuffer = nullptr;
+    size_t cpuBvhBufferSize = 0u;
+    uint32_t buildFlags = 0u;
+    uint32_t reserved = 0u;
+};
+
+struct XboxBvhBatchedBuildDesc {
+    uint32_t numDescs = 0u;
+    const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* pDescs = nullptr;
+    uint32_t numPostbuildInfoDescs = 0u;
+    const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* pPostbuildInfoDescs = nullptr;
+    uint32_t batchFlags = 0u;
+};
+
+struct XboxBvhCpuValidationResult {
+    bool valid = false;
+    bool headerValid = false;
+    bool crcValid = false;
+    bool boundsValid = false;
+    uint32_t visitedInternalNodes = 0u;
+    uint32_t visitedLeafNodes = 0u;
+    uint32_t maxDepthObserved = 0u;
+    uint32_t errorCode = 0u;
+    char diagnostic[256] = {};
+};
+
+class OS_XBOX_BVH_CLASS_API XboxBvhBuilder {
+public:
+    XboxBvhBuilder();
+    ~XboxBvhBuilder();
+
+    XboxBvhBuilder(const XboxBvhBuilder&) = delete;
+    XboxBvhBuilder& operator=(const XboxBvhBuilder&) = delete;
+
+    static OsBvhHresult Create(ID3D12Device11* device, XboxBvhBuilder** outBuilder);
+
+    OsBvhHresult Initialize(
+        ID3D12Device11* device,
+        uint32_t flags = kXboxBvhBuilderFlagPreferHardwareDxr);
+    void Shutdown();
+
+    OsBvhHresult GetRaytracingAccelerationStructurePrebuildInfoX(
+        const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* pDesc,
+        D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO* pInfo) const;
+
+    OsBvhHresult BuildRaytracingAccelerationStructureX(
+        ID3D12GraphicsCommandList4* commandList,
+        const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* pDesc,
+        uint32_t numPostbuildInfoDescs,
+        const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* pPostbuildInfoDescs);
+
+    OsBvhHresult BuildRaytracingAccelerationStructureBatchedX(
+        ID3D12GraphicsCommandList6* commandList,
+        uint32_t numDescs,
+        const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* pDescs);
+
+    OsBvhHresult BuildRaytracingAccelerationStructureBatched2X(
+        ID3D12GraphicsCommandList8* commandList,
+        const XboxBvhBatchedBuildDesc* pBatchDesc);
+
+    OsBvhHresult RehydrateRaytracingAccelerationStructureX(
+        ID3D12GraphicsCommandList4* commandList,
+        const XboxBvhRehydrateDesc* pDesc);
+
+    OsBvhHresult RehydrateRaytracingAccelerationStructureBatchedX(
+        ID3D12GraphicsCommandList6* commandList,
+        uint32_t numDescs,
+        const XboxBvhRehydrateDesc* pDescs);
+
+    OsBvhHresult RehydrateRaytracingAccelerationStructureBatched2X(
+        ID3D12GraphicsCommandList8* commandList,
+        uint32_t numDescs,
+        const XboxBvhRehydrateDesc* pDescs,
+        uint32_t rehydrateFlags);
+
+    void Set64BitMortonCodes(bool enable);
+    bool Get64BitMortonCodes() const noexcept;
+
+    OsBvhHresult ValidateRehydrateAccelerationStructureBuildDesc(
+        const XboxBvhRehydrateDesc* pDesc) const;
+
+    OsBvhHresult CpuValidateResultX(
+        const void* bvhData,
+        size_t bvhDataSize,
+        XboxBvhCpuValidationResult* outResult) const;
+
+    uint32_t GetFlags() const noexcept;
+    void SetFlags(uint32_t flags) noexcept;
+
+    bool LookupNativeBlasVa(uint64_t xboxBlasVa, uint64_t* outNativePcVa) const noexcept;
+    uint32_t GetRehydratedWindowCount() const noexcept;
+    bool UsesHardwareDxrPath() const noexcept;
+    OsBvhHresult TraceRehydratedRayX(
+        uint64_t rootXboxVa,
+        const openscarlett::Rdna2RayQueryInput* ray,
+        openscarlett::Rdna2RayQueryHit* outHit) const;
+
+    uint32_t Release();
+    void Destroy();
+
+private:
+    struct Impl;
+    Impl* impl_;
+};

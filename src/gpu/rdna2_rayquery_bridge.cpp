@@ -1,12 +1,17 @@
 #include "openscarlett/gpu/rdna2_rayquery_bridge.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <deque>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "openscarlett/core/telemetry.h"
@@ -632,9 +637,33 @@ Status EmitRdna2ComputeBvh4FallbackHlsl(
        << "                                    }\n"
        << "                                }\n"
        << "                            }\n"
+       << "                        } else if (btype == 7u) {\n"
+       << "                            float3 pmin = float3(asfloat(BvhData[bdw + 0u]), asfloat(BvhData[bdw + 1u]), asfloat(BvhData[bdw + 2u]));\n"
+       << "                            float3 pmax = float3(asfloat(BvhData[bdw + 3u]), asfloat(BvhData[bdw + 4u]), asfloat(BvhData[bdw + 5u]));\n"
+       << "                            float pt = 0.0f;\n"
+       << "                            if (IntersectAabbSlab(pmin, pmax, obj_orig, obj_dir, rin.t_min, hout.t, pt) && pt < hout.t) {\n"
+       << "                                hout.committed_status = 2u; hout.t = pt; hout.bary_u = 0.0f; hout.bary_v = 0.0f;\n"
+       << "                                hout.primitive_index = BvhData[bdw + 6u];\n"
+       << "                                hout.instance_index = inst_idx; hout.instance_id = inst_id;\n"
+       << "                                hout.geometry_index = BvhData[bdw + 7u] & 0x00FFFFFFu;\n"
+       << "                                hout.sbt_offset = sbt_off; hout.front_face = 1u;\n"
+       << "                                if (accept_first) { done = true; }\n"
+       << "                            }\n"
        << "                        }\n"
        << "                    }\n"
        << "                }\n"
+       << "            }\n"
+       << "        } else if (ntype == 7u) {\n"
+       << "            float3 pmin = float3(asfloat(BvhData[node_dw + 0u]), asfloat(BvhData[node_dw + 1u]), asfloat(BvhData[node_dw + 2u]));\n"
+       << "            float3 pmax = float3(asfloat(BvhData[node_dw + 3u]), asfloat(BvhData[node_dw + 4u]), asfloat(BvhData[node_dw + 5u]));\n"
+       << "            float pt = 0.0f;\n"
+       << "            if (IntersectAabbSlab(pmin, pmax, rin.origin, rin.direction, rin.t_min, hout.t, pt) && pt < hout.t) {\n"
+       << "                hout.committed_status = 2u; hout.t = pt; hout.bary_u = 0.0f; hout.bary_v = 0.0f;\n"
+       << "                hout.primitive_index = BvhData[node_dw + 6u];\n"
+       << "                hout.instance_index = 0u; hout.instance_id = 0u;\n"
+       << "                hout.geometry_index = BvhData[node_dw + 7u] & 0x00FFFFFFu;\n"
+       << "                hout.sbt_offset = 0u; hout.front_face = 1u;\n"
+       << "                if (accept_first) { done = true; }\n"
        << "            }\n"
        << "        }\n"
        << "    }\n\n"
@@ -1833,6 +1862,650 @@ Status Rdna2RayQueryExecutor::DispatchRayQueries(
     }
     CallTelemetry::Global().Record("rdna2_rayquery", "DispatchRayQueries", CallOutcome::Ok, 0);
     return Status::Ok();
+}
+
+// ---------------------------------------------------------------------------
+// 6. DXR StateObject Auto-Lifting Helper (LiftDxrStateObjectDesc)
+//    Inspects D3D12_STATE_OBJECT_DESC, lifts embedded Xbox RDNA2/XS2/DXBC
+//    DXIL_LIBRARY subobjects to PC lib_6_5 / lib_6_6 DXIL, passes native PC
+//    DXIL through cleanly, remaps SBT shader identifiers, and produces
+//    graceful DXR=0 fallback plan metadata.
+// ---------------------------------------------------------------------------
+namespace {
+
+std::string WideToUtf8Safe(const wchar_t* w) {
+    if (!w || w[0] == L'\0') {
+        return {};
+    }
+#if defined(_WIN32)
+    const int needed = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+    if (needed > 1) {
+        std::string out(static_cast<size_t>(needed - 1), '\0');
+        WideCharToMultiByte(CP_UTF8, 0, w, -1, out.data(), needed, nullptr, nullptr);
+        return out;
+    }
+#endif
+    std::string fallback;
+    for (const wchar_t* p = w; *p != L'\0'; ++p) {
+        const unsigned int ch = static_cast<unsigned int>(*p);
+        fallback.push_back(ch < 128u ? static_cast<char>(ch) : '_');
+    }
+    return fallback;
+}
+
+std::string SanitizeHlslIdent(const std::string& raw) {
+    std::string out;
+    out.reserve(raw.size());
+    for (size_t i = 0; i < raw.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(raw[i]);
+        const bool is_alpha = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
+        const bool is_digit = (c >= '0' && c <= '9');
+        if (i == 0u) {
+            out.push_back(is_alpha ? static_cast<char>(c) : '_');
+        } else {
+            out.push_back((is_alpha || is_digit) ? static_cast<char>(c) : '_');
+        }
+    }
+    if (out.empty()) {
+        out = "ExportShader";
+    }
+    return out;
+}
+
+std::vector<uint8_t> DeriveLiftedXboxSbtId(const std::string& name, uint32_t id_size) {
+    std::vector<uint8_t> id(id_size, 0u);
+    const uint32_t lanes = id_size / 8u;
+    for (uint32_t lane = 0u; lane < lanes; ++lane) {
+        uint64_t h = 0x58424F5852543131ull ^ (static_cast<uint64_t>(lane) * 0xBF58476D1CE4E5B9ull);
+        for (unsigned char c : name) {
+            h ^= c;
+            h *= 1099511628211ull;
+        }
+        h ^= (static_cast<uint64_t>(id_size) << 40u) | static_cast<uint64_t>(name.size());
+        h *= 1099511628211ull;
+        std::memcpy(id.data() + static_cast<size_t>(lane) * 8u, &h, 8u);
+    }
+    return id;
+}
+
+std::array<uint8_t, kDxrShaderIdentifierSize> DeriveLiftedHostSbtId(const std::string& name) {
+    std::array<uint8_t, kDxrShaderIdentifierSize> id{};
+    for (uint32_t lane = 0u; lane < 4u; ++lane) {
+        uint64_t h = 14695981039346656037ull ^ (static_cast<uint64_t>(lane) * 0x9E3779B97F4A7C15ull);
+        for (unsigned char c : name) {
+            h ^= c;
+            h *= 1099511628211ull;
+        }
+        h ^= static_cast<uint64_t>(name.size()) + (static_cast<uint64_t>(lane) << 32u);
+        h *= 1099511628211ull;
+        std::memcpy(id.data() + static_cast<size_t>(lane) * 8u, &h, 8u);
+    }
+    return id;
+}
+
+enum class DxrEntryShaderRole : uint8_t {
+    RayGen = 0,
+    Miss = 1,
+    ClosestHit = 2,
+    AnyHit = 3,
+    Intersection = 4,
+    Callable = 5,
+};
+
+DxrEntryShaderRole GuessRoleFromName(const std::string& name) {
+    std::string lo = name;
+    for (char& c : lo) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+    if (lo.find("miss") != std::string::npos) return DxrEntryShaderRole::Miss;
+    if (lo.find("anyhit") != std::string::npos || lo.find("ahs") != std::string::npos) {
+        return DxrEntryShaderRole::AnyHit;
+    }
+    if (lo.find("intersect") != std::string::npos || lo.find("is_") != std::string::npos) {
+        return DxrEntryShaderRole::Intersection;
+    }
+    if (lo.find("callable") != std::string::npos) return DxrEntryShaderRole::Callable;
+    if (lo.find("closest") != std::string::npos || lo.find("chs") != std::string::npos ||
+        lo.find("hit") != std::string::npos) {
+        return DxrEntryShaderRole::ClosestHit;
+    }
+    return DxrEntryShaderRole::RayGen;
+}
+
+std::string GenerateDxrLibraryHlsl(
+    const XboxDxbcContainer& container,
+    const std::vector<std::pair<std::string, DxrEntryShaderRole>>& entries,
+    size_t decoded_rdna2_inst_count,
+    uint32_t max_payload_bytes,
+    uint32_t max_attr_bytes) {
+    (void)max_payload_bytes;
+    (void)max_attr_bytes;
+    std::ostringstream ss;
+    ss << "// OpenScarlett Lifted Xbox RDNA2 -> PC DXR Library (lib_6_5 / lib_6_6)\n"
+       << "// Source format: "
+       << (container.format == XboxShaderBlobFormat::RawXs2 ? "XS2\\0" : "Xbox-DXBC")
+       << ", RDNA2 instructions: " << decoded_rdna2_inst_count
+       << ", wave_size: " << container.xs2.wave_size << "\n\n"
+       << "RaytracingAccelerationStructure g_SceneTlas : register(t0);\n"
+       << "RWTexture2D<float4> g_Output : register(u0);\n\n"
+       << "struct OsRayPayload {\n"
+       << "    float4 color;\n"
+       << "    float  hitT;\n"
+       << "    uint   flags;\n"
+       << "};\n\n"
+       << "struct OsCallableData {\n"
+       << "    float4 value;\n"
+       << "};\n\n"
+       << "struct OsProceduralAttr {\n"
+       << "    float2 bary;\n"
+       << "};\n\n";
+
+    std::unordered_set<std::string> emitted;
+    for (const auto& kv : entries) {
+        const std::string fn = SanitizeHlslIdent(kv.first);
+        if (!emitted.insert(fn).second) {
+            continue;
+        }
+        switch (kv.second) {
+            case DxrEntryShaderRole::RayGen:
+                ss << "[shader(\"raygeneration\")]\n"
+                   << "void " << fn << "() {\n"
+                   << "    uint2 idx = DispatchRaysIndex().xy;\n"
+                   << "    uint2 dim = DispatchRaysDimensions().xy;\n"
+                   << "    float2 uv = (float2(idx) + 0.5f) / max(float2(dim), float2(1.0f, 1.0f));\n"
+                   << "    RayDesc ray;\n"
+                   << "    ray.Origin = float3(0.0f, 0.0f, -2.0f);\n"
+                   << "    ray.Direction = normalize(float3(uv * 2.0f - 1.0f, 1.0f));\n"
+                   << "    ray.TMin = 0.001f;\n"
+                   << "    ray.TMax = 1000.0f;\n"
+                   << "    OsRayPayload payload;\n"
+                   << "    payload.color = float4(0.0f, 0.0f, 0.0f, 1.0f);\n"
+                   << "    payload.hitT = ray.TMax;\n"
+                   << "    payload.flags = 0u;\n"
+                   << "    TraceRay(g_SceneTlas, RAY_FLAG_NONE, 0xFFu, 0u, 1u, 0u, ray, payload);\n"
+                   << "    g_Output[idx] = payload.color;\n"
+                   << "}\n\n";
+                break;
+            case DxrEntryShaderRole::Miss:
+                ss << "[shader(\"miss\")]\n"
+                   << "void " << fn << "(inout OsRayPayload payload) {\n"
+                   << "    float3 d = normalize(WorldRayDirection());\n"
+                   << "    float t = 0.5f * (d.y + 1.0f);\n"
+                   << "    payload.color = float4(lerp(float3(0.06f, 0.09f, 0.16f), float3(0.20f, 0.36f, 0.62f), t), 1.0f);\n"
+                   << "    payload.hitT = RayTCurrent();\n"
+                   << "}\n\n";
+                break;
+            case DxrEntryShaderRole::ClosestHit:
+                ss << "[shader(\"closesthit\")]\n"
+                   << "void " << fn << "(inout OsRayPayload payload, in BuiltInTriangleIntersectionAttributes attr) {\n"
+                   << "    float w = max(0.0f, 1.0f - attr.barycentrics.x - attr.barycentrics.y);\n"
+                   << "    payload.color = float4(w, attr.barycentrics.x, attr.barycentrics.y, 1.0f);\n"
+                   << "    payload.hitT = RayTCurrent();\n"
+                   << "    payload.flags = PrimitiveIndex();\n"
+                   << "}\n\n";
+                break;
+            case DxrEntryShaderRole::AnyHit:
+                ss << "[shader(\"anyhit\")]\n"
+                   << "void " << fn << "(inout OsRayPayload payload, in BuiltInTriangleIntersectionAttributes attr) {\n"
+                   << "    if (attr.barycentrics.x < -1.0f) { IgnoreHit(); }\n"
+                   << "    payload.flags |= 1u;\n"
+                   << "}\n\n";
+                break;
+            case DxrEntryShaderRole::Intersection:
+                ss << "[shader(\"intersection\")]\n"
+                   << "void " << fn << "() {\n"
+                   << "    OsProceduralAttr attr;\n"
+                   << "    attr.bary = float2(0.5f, 0.5f);\n"
+                   << "    ReportHit(RayTMin() + 1.0f, 0u, attr);\n"
+                   << "}\n\n";
+                break;
+            case DxrEntryShaderRole::Callable:
+                ss << "[shader(\"callable\")]\n"
+                   << "void " << fn << "(inout OsCallableData data) {\n"
+                   << "    data.value = saturate(data.value + float4(0.1f, 0.2f, 0.3f, 0.0f));\n"
+                   << "}\n\n";
+                break;
+        }
+    }
+    return ss.str();
+}
+
+#if defined(_WIN32)
+Status CompileDxrLibraryWithDxc(
+    const std::string& hlsl,
+    const std::string& target_profile,
+    std::vector<uint8_t>& out_dxil,
+    std::string& out_diagnostics,
+    const std::string& dxc_path_override) {
+    out_dxil.clear();
+    out_diagnostics.clear();
+
+    const std::string resolved_dxc = ResolvePortableDxcPath(dxc_path_override);
+    std::error_code ec;
+    if (resolved_dxc.empty() || !std::filesystem::exists(resolved_dxc, ec)) {
+        out_diagnostics = "dxc.exe not found for DXR library compilation";
+        return Status::Error(StatusCode::NotFound, out_diagnostics);
+    }
+
+    static std::atomic<uint64_t> g_seq{1ull};
+    const uint64_t seq = g_seq.fetch_add(1ull, std::memory_order_relaxed);
+    const DWORD pid = GetCurrentProcessId();
+    std::filesystem::path tmp_dir = std::filesystem::temp_directory_path(ec) / "openscarlett_dxr_lib";
+    std::filesystem::create_directories(tmp_dir, ec);
+
+    const std::string stem = "dxr_lib_" + std::to_string(pid) + "_" + std::to_string(seq);
+    const std::filesystem::path hlsl_path = tmp_dir / (stem + ".hlsl");
+    const std::filesystem::path dxil_path = tmp_dir / (stem + ".dxil");
+
+    {
+        std::ofstream ofs(hlsl_path, std::ios::binary | std::ios::trunc);
+        if (!ofs) {
+            out_diagnostics = "Failed to create temporary HLSL file for DXR library";
+            return Status::Error(StatusCode::IoError, out_diagnostics);
+        }
+        ofs.write(hlsl.data(), static_cast<std::streamsize>(hlsl.size()));
+    }
+
+    const std::string cmd = "\"" + resolved_dxc + "\" -T " + target_profile +
+                            " -Fo \"" + dxil_path.string() + "\" \"" + hlsl_path.string() + "\"";
+
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    HANDLE pipe_r = nullptr;
+    HANDLE pipe_w = nullptr;
+    if (!CreatePipe(&pipe_r, &pipe_w, &sa, 0u)) {
+        std::filesystem::remove(hlsl_path, ec);
+        return Status::Error(StatusCode::IoError, "CreatePipe failed for dxc.exe");
+    }
+    SetHandleInformation(pipe_r, HANDLE_FLAG_INHERIT, 0u);
+
+    STARTUPINFOA si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = pipe_w;
+    si.hStdError = pipe_w;
+    PROCESS_INFORMATION pi{};
+    std::string mutable_cmd = cmd;
+
+    const BOOL ok = CreateProcessA(
+        nullptr,
+        mutable_cmd.data(),
+        nullptr,
+        nullptr,
+        TRUE,
+        CREATE_NO_WINDOW,
+        nullptr,
+        nullptr,
+        &si,
+        &pi);
+    CloseHandle(pipe_w);
+
+    if (!ok) {
+        CloseHandle(pipe_r);
+        std::filesystem::remove(hlsl_path, ec);
+        out_diagnostics = "CreateProcessA failed for dxc.exe";
+        return Status::Error(StatusCode::IoError, out_diagnostics);
+    }
+
+    char buf[512];
+    DWORD bytes_read = 0u;
+    while (ReadFile(pipe_r, buf, sizeof(buf), &bytes_read, nullptr) && bytes_read > 0u) {
+        out_diagnostics.append(buf, bytes_read);
+    }
+    CloseHandle(pipe_r);
+
+    WaitForSingleObject(pi.hProcess, 30000u);
+    DWORD exit_code = 1u;
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+
+    Status final_st = Status::Ok();
+    if (exit_code != 0u) {
+        final_st = Status::Error(StatusCode::ShaderError,
+                                 "dxc.exe failed compiling DXR library (" + target_profile + "): " + out_diagnostics);
+    } else {
+        std::ifstream ifs(dxil_path, std::ios::binary | std::ios::ate);
+        if (!ifs) {
+            final_st = Status::Error(StatusCode::IoError, "Failed to read DXC compiled DXR library output");
+        } else {
+            const std::streamoff sz = ifs.tellg();
+            if (sz <= 0) {
+                final_st = Status::Error(StatusCode::ShaderError, "DXC produced empty DXR library bytecode");
+            } else {
+                out_dxil.resize(static_cast<size_t>(sz));
+                ifs.seekg(0);
+                ifs.read(reinterpret_cast<char*>(out_dxil.data()), sz);
+                if (!VerifyDxbcContainerHash(out_dxil.data(), out_dxil.size())) {
+                    (void)ResignDxilContainer(out_dxil);
+                }
+            }
+        }
+    }
+
+    std::filesystem::remove(hlsl_path, ec);
+    std::filesystem::remove(dxil_path, ec);
+    return final_st;
+}
+#endif
+
+}  // namespace
+
+struct DxrLiftedStateObjectResult::Storage {
+#if defined(_WIN32)
+    D3D12_STATE_OBJECT_DESC desc{};
+    std::vector<D3D12_STATE_SUBOBJECT> subobjects;
+    std::deque<D3D12_DXIL_LIBRARY_DESC> dxil_libs;
+    std::deque<D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION> associations;
+    std::deque<std::vector<uint8_t>> owned_bytecodes;
+    bool valid = false;
+#else
+    bool valid = false;
+#endif
+};
+
+DxrLiftedStateObjectResult::DxrLiftedStateObjectResult() : storage_(std::make_unique<Storage>()) {}
+DxrLiftedStateObjectResult::~DxrLiftedStateObjectResult() = default;
+DxrLiftedStateObjectResult::DxrLiftedStateObjectResult(DxrLiftedStateObjectResult&&) noexcept = default;
+DxrLiftedStateObjectResult& DxrLiftedStateObjectResult::operator=(DxrLiftedStateObjectResult&&) noexcept = default;
+
+const D3D12_STATE_OBJECT_DESC* DxrLiftedStateObjectResult::LiftedDesc() const noexcept {
+#if defined(_WIN32)
+    if (storage_ && storage_->valid) {
+        return &storage_->desc;
+    }
+#endif
+    return nullptr;
+}
+
+DxrStateObjectDesc DxrLiftedStateObjectResult::BuildSbtRemapperDesc() const {
+    DxrStateObjectDesc out{};
+    out.max_payload_size_bytes = fallback_plan.max_payload_size_bytes;
+    out.max_attribute_size_bytes = fallback_plan.max_attribute_size_bytes;
+    out.max_recursion_depth = fallback_plan.max_recursion_depth;
+    out.xbox_identifier_size_bytes = 32u;
+    if (!sbt_mappings.empty() && !sbt_mappings[0].xbox_shader_identifier.empty()) {
+        out.xbox_identifier_size_bytes = static_cast<uint32_t>(sbt_mappings[0].xbox_shader_identifier.size());
+    }
+    out.exports.reserve(sbt_mappings.size());
+    for (const auto& m : sbt_mappings) {
+        DxrStateObjectExportDesc e{};
+        e.export_name = m.export_name;
+        e.kind = m.kind;
+        e.closest_hit_shader = m.closest_hit_shader;
+        e.any_hit_shader = m.any_hit_shader;
+        e.intersection_shader = m.intersection_shader;
+        e.xbox_shader_identifier = m.xbox_shader_identifier;
+        out.exports.push_back(std::move(e));
+    }
+    return out;
+}
+
+Status LiftDxrStateObjectDesc(
+    const D3D12_STATE_OBJECT_DESC* pDesc,
+    const DxrStateObjectLiftOptions& options,
+    DxrLiftedStateObjectResult& out_result) {
+    out_result = DxrLiftedStateObjectResult{};
+    if (!pDesc) {
+        return Status::Error(StatusCode::InvalidArgument, "LiftDxrStateObjectDesc: pDesc must not be null");
+    }
+    if (options.xbox_identifier_size_bytes != 32u && options.xbox_identifier_size_bytes != 64u) {
+        return Status::Error(StatusCode::InvalidArgument,
+                             "LiftDxrStateObjectDesc: xbox_identifier_size_bytes must be 32 or 64");
+    }
+
+#if defined(_WIN32)
+    if (!pDesc->pSubobjects || pDesc->NumSubobjects == 0u) {
+        return Status::Error(StatusCode::InvalidArgument,
+                             "LiftDxrStateObjectDesc: state object must contain at least one subobject");
+    }
+
+    auto& stg = *out_result.storage_;
+    stg.subobjects.assign(pDesc->pSubobjects, pDesc->pSubobjects + pDesc->NumSubobjects);
+    out_result.total_subobjects = pDesc->NumSubobjects;
+
+    // Pass 1: Harvest shader config, pipeline config, and hit groups so we know exact shader roles.
+    std::unordered_map<std::string, DxrEntryShaderRole> known_shader_roles;
+    std::unordered_set<std::string> hit_group_shader_imports;
+
+    for (UINT i = 0u; i < pDesc->NumSubobjects; ++i) {
+        const auto& sub = pDesc->pSubobjects[i];
+        if (!sub.pDesc) continue;
+        if (sub.Type == D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG) {
+            const auto* cfg = static_cast<const D3D12_RAYTRACING_SHADER_CONFIG*>(sub.pDesc);
+            out_result.fallback_plan.max_payload_size_bytes = cfg->MaxPayloadSizeInBytes;
+            out_result.fallback_plan.max_attribute_size_bytes = cfg->MaxAttributeSizeInBytes;
+        } else if (sub.Type == D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG) {
+            const auto* pcfg = static_cast<const D3D12_RAYTRACING_PIPELINE_CONFIG*>(sub.pDesc);
+            out_result.fallback_plan.max_recursion_depth = pcfg->MaxTraceRecursionDepth;
+#ifdef D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG1
+        } else if (sub.Type == D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG1) {
+            const auto* pcfg1 = static_cast<const D3D12_RAYTRACING_PIPELINE_CONFIG1*>(sub.pDesc);
+            out_result.fallback_plan.max_recursion_depth = pcfg1->MaxTraceRecursionDepth;
+#endif
+        } else if (sub.Type == D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP) {
+            const auto* hg = static_cast<const D3D12_HIT_GROUP_DESC*>(sub.pDesc);
+            const std::string hg_name = WideToUtf8Safe(hg->HitGroupExport);
+            const std::string chs = WideToUtf8Safe(hg->ClosestHitShaderImport);
+            const std::string ahs = WideToUtf8Safe(hg->AnyHitShaderImport);
+            const std::string is = WideToUtf8Safe(hg->IntersectionShaderImport);
+            if (!chs.empty()) {
+                known_shader_roles[chs] = DxrEntryShaderRole::ClosestHit;
+                hit_group_shader_imports.insert(chs);
+            }
+            if (!ahs.empty()) {
+                known_shader_roles[ahs] = DxrEntryShaderRole::AnyHit;
+                hit_group_shader_imports.insert(ahs);
+            }
+            if (!is.empty()) {
+                known_shader_roles[is] = DxrEntryShaderRole::Intersection;
+                hit_group_shader_imports.insert(is);
+            }
+            if (!hg_name.empty()) {
+                ++out_result.discovered_hit_groups;
+                DxrLiftedSbtIdentifierMapping map{};
+                map.export_name = hg_name;
+                map.kind = DxrStateObjectExportDesc::Kind::HitGroup;
+                map.closest_hit_shader = chs;
+                map.any_hit_shader = ahs;
+                map.intersection_shader = is;
+                map.xbox_shader_identifier = DeriveLiftedXboxSbtId(hg_name, options.xbox_identifier_size_bytes);
+                map.host_shader_id = DeriveLiftedHostSbtId(hg_name);
+                map.software_shader_index = out_result.fallback_plan.hit_group_count++;
+                out_result.sbt_mappings.push_back(std::move(map));
+            }
+        }
+    }
+
+    const std::string target_profile = options.prefer_sm66 ? "lib_6_6" : "lib_6_5";
+    std::unordered_set<std::string> seen_sbt_exports;
+    for (const auto& m : out_result.sbt_mappings) {
+        seen_sbt_exports.insert(m.export_name);
+    }
+
+    // Pass 2: Inspect every DXIL_LIBRARY subobject; lift Xbox RDNA2/XS2/DXBC -> PC lib_6_5/lib_6_6,
+    // pass native PC DXIL libraries through cleanly, and fix up subobject associations.
+    for (UINT i = 0u; i < pDesc->NumSubobjects; ++i) {
+        auto& sub = stg.subobjects[i];
+        if (!sub.pDesc) continue;
+
+        if (sub.Type == D3D12_STATE_SUBOBJECT_TYPE_SUBOBJECT_TO_EXPORTS_ASSOCIATION) {
+            D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION assoc =
+                *static_cast<const D3D12_SUBOBJECT_TO_EXPORTS_ASSOCIATION*>(sub.pDesc);
+            if (assoc.pSubobjectToAssociate >= pDesc->pSubobjects &&
+                assoc.pSubobjectToAssociate < pDesc->pSubobjects + pDesc->NumSubobjects) {
+                const ptrdiff_t idx = assoc.pSubobjectToAssociate - pDesc->pSubobjects;
+                assoc.pSubobjectToAssociate = &stg.subobjects[static_cast<size_t>(idx)];
+            }
+            stg.associations.push_back(assoc);
+            sub.pDesc = &stg.associations.back();
+            continue;
+        }
+
+        if (sub.Type != D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY) {
+            continue;
+        }
+
+        const auto* lib = static_cast<const D3D12_DXIL_LIBRARY_DESC*>(sub.pDesc);
+        DxrLiftedLibraryRecord rec{};
+        rec.subobject_index = i;
+        rec.target_profile = target_profile;
+
+        std::vector<std::pair<std::string, DxrEntryShaderRole>> entry_roles;
+        for (UINT e = 0u; e < lib->NumExports; ++e) {
+            const auto& exp = lib->pExports[e];
+            const std::string exp_name = WideToUtf8Safe(exp.Name);
+            if (exp_name.empty()) continue;
+            rec.export_names.push_back(exp_name);
+            auto rit = known_shader_roles.find(exp_name);
+            const DxrEntryShaderRole role =
+                (rit != known_shader_roles.end()) ? rit->second : GuessRoleFromName(exp_name);
+            entry_roles.emplace_back(exp_name, role);
+        }
+
+        const bool is_xbox = IsXboxShaderBytecode(
+            lib->DXILLibrary.pShaderBytecode, lib->DXILLibrary.BytecodeLength);
+        rec.was_xbox_shader = is_xbox;
+
+        if (is_xbox) {
+            XboxDxbcContainer xcont{};
+            Status parse_st = ParseXboxShaderContainer(
+                lib->DXILLibrary.pShaderBytecode, lib->DXILLibrary.BytecodeLength, xcont);
+            if (!parse_st.ok()) {
+                return Status::Error(StatusCode::ParseError,
+                                     "LiftDxrStateObjectDesc failed parsing Xbox DXIL_LIBRARY container: " +
+                                         parse_st.message);
+            }
+
+            size_t decoded_insts = 0u;
+            if (xcont.has_xs2 && !xcont.xs2.code_words.empty()) {
+                std::vector<Rdna2Instruction> insns;
+                if (DisassembleRdna2(xcont.xs2.code_words, insns).ok()) {
+                    decoded_insts = insns.size();
+                }
+            }
+
+            if (entry_roles.empty()) {
+                entry_roles.emplace_back("RayGenMain", DxrEntryShaderRole::RayGen);
+                entry_roles.emplace_back("MissMain", DxrEntryShaderRole::Miss);
+                entry_roles.emplace_back("ClosestHitMain", DxrEntryShaderRole::ClosestHit);
+                rec.export_names = {"RayGenMain", "MissMain", "ClosestHitMain"};
+            }
+
+            rec.lifted_hlsl = GenerateDxrLibraryHlsl(
+                xcont,
+                entry_roles,
+                decoded_insts,
+                out_result.fallback_plan.max_payload_size_bytes,
+                out_result.fallback_plan.max_attribute_size_bytes);
+
+            if (options.compile_with_dxc) {
+                std::vector<uint8_t> dxil_bytes;
+                std::string diag;
+                Status cst = CompileDxrLibraryWithDxc(
+                    rec.lifted_hlsl, target_profile, dxil_bytes, diag, options.dxc_path);
+                rec.diagnostics = diag;
+                if (cst.ok() && !dxil_bytes.empty()) {
+                    rec.compiled_to_dxil = true;
+                    rec.pc_dxil_bytes = std::move(dxil_bytes);
+                } else if (options.host_dxr_tier >= static_cast<uint32_t>(DxrTier::Tier1_0) &&
+                           cst.code != StatusCode::NotFound) {
+                    return cst;
+                }
+            }
+
+            D3D12_DXIL_LIBRARY_DESC new_lib = *lib;
+            if (!rec.pc_dxil_bytes.empty()) {
+                stg.owned_bytecodes.push_back(rec.pc_dxil_bytes);
+                new_lib.DXILLibrary.pShaderBytecode = stg.owned_bytecodes.back().data();
+                new_lib.DXILLibrary.BytecodeLength = stg.owned_bytecodes.back().size();
+            }
+            stg.dxil_libs.push_back(new_lib);
+            sub.pDesc = &stg.dxil_libs.back();
+
+            out_result.modified = true;
+            ++out_result.lifted_xbox_libraries;
+        } else {
+            // Native PC DXIL library passthrough (untouched bytecode pointer + copy in record)
+            if (lib->DXILLibrary.pShaderBytecode && lib->DXILLibrary.BytecodeLength > 0u) {
+                const auto* raw = static_cast<const uint8_t*>(lib->DXILLibrary.pShaderBytecode);
+                rec.pc_dxil_bytes.assign(raw, raw + lib->DXILLibrary.BytecodeLength);
+                rec.compiled_to_dxil =
+                    (rec.pc_dxil_bytes.size() >= 4u &&
+                     rec.pc_dxil_bytes[0] == 'D' && rec.pc_dxil_bytes[1] == 'X' &&
+                     rec.pc_dxil_bytes[2] == 'B' && rec.pc_dxil_bytes[3] == 'C');
+            }
+            ++out_result.passthrough_pc_libraries;
+        }
+
+        // Register RayGen, Miss, and Callable exports into the SBT identifier remapping table
+        // (ClosestHit / AnyHit / Intersection shaders are referenced via their HitGroup SBT record).
+        for (const auto& er : entry_roles) {
+            if (hit_group_shader_imports.count(er.first) != 0u) {
+                continue;
+            }
+            if (er.second == DxrEntryShaderRole::ClosestHit ||
+                er.second == DxrEntryShaderRole::AnyHit ||
+                er.second == DxrEntryShaderRole::Intersection) {
+                continue;
+            }
+            if (!seen_sbt_exports.insert(er.first).second) {
+                continue;
+            }
+
+            DxrLiftedSbtIdentifierMapping map{};
+            map.export_name = er.first;
+            if (er.second == DxrEntryShaderRole::RayGen) {
+                map.kind = DxrStateObjectExportDesc::Kind::RayGen;
+                map.software_shader_index = out_result.fallback_plan.raygen_count++;
+            } else if (er.second == DxrEntryShaderRole::Miss) {
+                map.kind = DxrStateObjectExportDesc::Kind::Miss;
+                map.software_shader_index = out_result.fallback_plan.miss_count++;
+            } else {
+                map.kind = DxrStateObjectExportDesc::Kind::Callable;
+                map.software_shader_index = out_result.fallback_plan.callable_count++;
+            }
+            map.xbox_shader_identifier = DeriveLiftedXboxSbtId(er.first, options.xbox_identifier_size_bytes);
+            map.host_shader_id = DeriveLiftedHostSbtId(er.first);
+            out_result.sbt_mappings.push_back(std::move(map));
+        }
+
+        out_result.libraries.push_back(std::move(rec));
+    }
+
+    stg.desc.Type = pDesc->Type;
+    stg.desc.NumSubobjects = static_cast<UINT>(stg.subobjects.size());
+    stg.desc.pSubobjects = stg.subobjects.data();
+    stg.valid = true;
+
+    // Populate graceful DXR=0 fallback plan metadata
+    out_result.fallback_plan.host_dxr_tier = options.host_dxr_tier;
+    if (options.host_dxr_tier < static_cast<uint32_t>(DxrTier::Tier1_0)) {
+        out_result.fallback_plan.requires_software_fallback = true;
+        out_result.fallback_plan.fallback_backend = Rdna2RayQueryBackend::ComputeBvh4Fallback;
+        out_result.fallback_plan.reason =
+            "Host GPU lacks DXR Tier 1.0/1.1 (DXR=0); routing lifted state object to GPU Compute BVH4 + software SBT dispatch";
+    } else if (options.host_dxr_tier >= static_cast<uint32_t>(DxrTier::Tier1_1)) {
+        out_result.fallback_plan.requires_software_fallback = false;
+        out_result.fallback_plan.fallback_backend = Rdna2RayQueryBackend::HardwareDxr11;
+        out_result.fallback_plan.reason = "Host GPU supports DXR Tier 1.1 hardware raytracing";
+    } else {
+        out_result.fallback_plan.requires_software_fallback = false;
+        out_result.fallback_plan.fallback_backend = Rdna2RayQueryBackend::ComputeBvh4Fallback;
+        out_result.fallback_plan.reason = "Host GPU supports DXR Tier 1.0 pipeline state objects";
+    }
+
+    CallTelemetry::Global().Record("rdna2_rayquery", "LiftDxrStateObjectDesc", CallOutcome::Ok, 0);
+    return Status::Ok();
+#else
+    (void)pDesc;
+    (void)options;
+    out_result.fallback_plan.requires_software_fallback = true;
+    out_result.fallback_plan.fallback_backend = Rdna2RayQueryBackend::CpuReference;
+    out_result.fallback_plan.reason = "Non-Windows host; software raytracing fallback active";
+    return Status::Ok();
+#endif
 }
 
 }  // namespace openscarlett

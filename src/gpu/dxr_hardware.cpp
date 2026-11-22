@@ -1882,4 +1882,328 @@ Status DxrStateObjectSbtRemapper::DestroyStateObject(uint64_t state_object_id) {
         erased ? Status::Ok() : Status::Error(StatusCode::NotFound, "State object ID not found"));
 }
 
+// ---------------------------------------------------------------------------
+// Dual-Path Pre-Built RDNA2 BVH4 Rehydration & Xbox->PC VA Translation Table
+// ---------------------------------------------------------------------------
+struct XboxBvh4RehydrationManager::Impl {
+    mutable std::mutex mutex;
+    DxrHardwareEngine* engine = nullptr;
+    bool force_dxr0_fallback = false;
+    uint64_t next_fallback_pc_va = 0x0000008000000000ull;
+
+    std::unordered_map<uint64_t, XboxVaTranslationEntry> va_table;
+    std::unordered_map<uint64_t, uint64_t> va_relocations;
+    std::unordered_map<uint64_t, std::vector<uint8_t>> window_buffers;
+    Rdna2Bvh64MultiWindow bvh64_windows;
+
+    Bvh4RehydrationPath ResolvePath() const noexcept {
+        if (!force_dxr0_fallback && engine && engine->IsInitialized() && engine->using_hardware_path()) {
+            return Bvh4RehydrationPath::HardwareDxr11;
+        }
+        return Bvh4RehydrationPath::ComputeBvh4Fallback;
+    }
+
+    uint64_t AllocFallbackPcVa(uint64_t size_bytes) noexcept {
+        const uint64_t va = AlignUp(next_fallback_pc_va, kDxrAsByteAlignment);
+        const uint64_t span = AlignUp(std::max<uint64_t>(size_bytes, 65536ull), kDxrAsByteAlignment);
+        next_fallback_pc_va = va + span;
+        return va;
+    }
+};
+
+XboxBvh4RehydrationManager::XboxBvh4RehydrationManager() : impl_(std::make_unique<Impl>()) {}
+XboxBvh4RehydrationManager::~XboxBvh4RehydrationManager() = default;
+
+Status XboxBvh4RehydrationManager::Initialize(DxrHardwareEngine* engine, bool force_dxr0_fallback) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->engine = engine;
+    impl_->force_dxr0_fallback = force_dxr0_fallback;
+    return RecordDxrResult("RehydrationManager::Initialize", Status::Ok());
+}
+
+void XboxBvh4RehydrationManager::Clear() {
+    if (!impl_) return;
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->va_table.clear();
+    impl_->va_relocations.clear();
+    impl_->window_buffers.clear();
+    impl_->bvh64_windows.Clear();
+}
+
+Bvh4RehydrationPath XboxBvh4RehydrationManager::ActivePath() const noexcept {
+    if (!impl_) return Bvh4RehydrationPath::ComputeBvh4Fallback;
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->ResolvePath();
+}
+
+void XboxBvh4RehydrationManager::RegisterVaRelocation(uint64_t source_xbox_va, uint64_t dest_xbox_va) {
+    if (!impl_ || source_xbox_va == 0ull || dest_xbox_va == 0ull) return;
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->va_relocations[source_xbox_va] = dest_xbox_va;
+}
+
+Status XboxBvh4RehydrationManager::RehydrateBlas(
+    uint64_t source_xbox_va,
+    uint64_t dest_xbox_va,
+    std::vector<uint8_t>& bvh4_buffer_in_out,
+    uint32_t build_flags,
+    XboxBvh4RehydrateResult& out_result) {
+    out_result = XboxBvh4RehydrateResult{};
+    if (dest_xbox_va == 0ull || (dest_xbox_va & (kDxrAsByteAlignment - 1u)) != 0ull) {
+        return RecordDxrResult("RehydrateBlas",
+                               Status::Error(StatusCode::InvalidArgument,
+                                             "RehydrateBlas dest_xbox_va must be non-zero and 256-byte aligned"));
+    }
+    if (bvh4_buffer_in_out.size() < kRdna2BvhHeaderSize) {
+        return RecordDxrResult("RehydrateBlas",
+                               Status::Error(StatusCode::InvalidArgument,
+                                             "RehydrateBlas requires a valid RDNA2 BVH4 buffer"));
+    }
+
+    Rdna2Bvh4DecodedLeaves leaves{};
+    Status st = ExtractRdna2Bvh4Leaves(bvh4_buffer_in_out.data(), bvh4_buffer_in_out.size(), leaves);
+    if (!st.ok()) {
+        return RecordDxrResult("RehydrateBlas", st);
+    }
+
+    Rdna2Bvh4RelocationReport reloc_rep{};
+    st = PatchRdna2Bvh4PointersInPlace(
+        bvh4_buffer_in_out.data(), bvh4_buffer_in_out.size(),
+        source_xbox_va, dest_xbox_va, {}, &reloc_rep);
+    if (!st.ok()) {
+        return RecordDxrResult("RehydrateBlas", st);
+    }
+
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const Bvh4RehydrationPath path = impl_->ResolvePath();
+
+    uint64_t host_as_id = 0ull;
+    uint64_t native_pc_va = 0ull;
+    bool hw_built = false;
+
+    if (!leaves.triangles.empty() && impl_->engine && impl_->engine->IsInitialized()) {
+        st = impl_->engine->BuildBlas(leaves.triangles, build_flags, host_as_id);
+        if (!st.ok()) {
+            return RecordDxrResult("RehydrateBlas", st);
+        }
+        DxrAsRecordInfo info{};
+        if (impl_->engine->GetAsInfo(host_as_id, info).ok()) {
+            native_pc_va = info.gpu_virtual_address;
+            hw_built = info.hardware_built;
+        }
+    }
+    if (native_pc_va == 0ull) {
+        native_pc_va = impl_->AllocFallbackPcVa(bvh4_buffer_in_out.size());
+    }
+
+    st = impl_->bvh64_windows.RegisterWindow(dest_xbox_va, bvh4_buffer_in_out);
+    if (!st.ok()) {
+        return RecordDxrResult("RehydrateBlas", st);
+    }
+    impl_->window_buffers[dest_xbox_va] = bvh4_buffer_in_out;
+
+    if (source_xbox_va != 0ull && source_xbox_va != dest_xbox_va) {
+        impl_->va_relocations[source_xbox_va] = dest_xbox_va;
+    }
+
+    XboxVaTranslationEntry entry{};
+    entry.xbox_gpu_va = dest_xbox_va;
+    entry.native_pc_gpu_va = native_pc_va;
+    entry.host_as_id = host_as_id;
+    entry.as_type = Rdna2BvhAsType::BottomLevel;
+    entry.path = path;
+    entry.triangle_count = static_cast<uint32_t>(leaves.triangles.size());
+    entry.procedural_count = static_cast<uint32_t>(leaves.procedurals.size());
+    entry.hardware_dxr_built = hw_built;
+
+    impl_->va_table[dest_xbox_va] = entry;
+    if (source_xbox_va != 0ull && source_xbox_va != dest_xbox_va) {
+        XboxVaTranslationEntry alias_entry = entry;
+        alias_entry.xbox_gpu_va = source_xbox_va;
+        impl_->va_table[source_xbox_va] = alias_entry;
+    }
+
+    out_result.selected_path = path;
+    out_result.source_xbox_va = source_xbox_va;
+    out_result.dest_xbox_va = dest_xbox_va;
+    out_result.native_pc_gpu_va = native_pc_va;
+    out_result.host_as_id = host_as_id;
+    out_result.decoded_triangle_count = entry.triangle_count;
+    out_result.decoded_procedural_count = entry.procedural_count;
+    out_result.patched_instance_pointers = reloc_rep.patched_instance_nodes;
+    out_result.hardware_dxr_built = hw_built;
+    return RecordDxrResult("RehydrateBlas", Status::Ok());
+}
+
+Status XboxBvh4RehydrationManager::RehydrateTlas(
+    uint64_t source_xbox_va,
+    uint64_t dest_xbox_va,
+    std::vector<uint8_t>& tlas_bvh4_in_out,
+    uint32_t build_flags,
+    XboxBvh4RehydrateResult& out_result) {
+    out_result = XboxBvh4RehydrateResult{};
+    if (dest_xbox_va == 0ull || (dest_xbox_va & (kDxrAsByteAlignment - 1u)) != 0ull) {
+        return RecordDxrResult("RehydrateTlas",
+                               Status::Error(StatusCode::InvalidArgument,
+                                             "RehydrateTlas dest_xbox_va must be non-zero and 256-byte aligned"));
+    }
+    if (tlas_bvh4_in_out.size() < kRdna2BvhHeaderSize) {
+        return RecordDxrResult("RehydrateTlas",
+                               Status::Error(StatusCode::InvalidArgument,
+                                             "RehydrateTlas requires a valid RDNA2 BVH4 buffer"));
+    }
+
+    Rdna2Bvh4DecodedLeaves leaves{};
+    Status st = ExtractRdna2Bvh4Leaves(tlas_bvh4_in_out.data(), tlas_bvh4_in_out.size(), leaves);
+    if (!st.ok()) {
+        return RecordDxrResult("RehydrateTlas", st);
+    }
+
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const Bvh4RehydrationPath path = impl_->ResolvePath();
+
+    // Build relocation table from registered BLAS relocations so embedded 64-bit BLAS VAs
+    // inside TLAS instance nodes are patched in-place cleanly.
+    std::vector<Rdna2Bvh4RelocationEntry> relocs;
+    relocs.reserve(impl_->va_relocations.size());
+    for (const auto& kv : impl_->va_relocations) {
+        relocs.push_back({kv.first, kv.second});
+    }
+
+    Rdna2Bvh4RelocationReport reloc_rep{};
+    st = PatchRdna2Bvh4PointersInPlace(
+        tlas_bvh4_in_out.data(), tlas_bvh4_in_out.size(),
+        source_xbox_va, dest_xbox_va, relocs, &reloc_rep);
+    if (!st.ok()) {
+        return RecordDxrResult("RehydrateTlas", st);
+    }
+
+    // Translate every TLAS instance leaf through the Xbox VA -> native PC BLAS VA table,
+    // preserving SBT offsets, instance IDs, instance masks, flags, and 3x4 transforms!
+    std::vector<DxrInstanceDesc> translated_all;
+    std::vector<DxrInstanceDesc> triangle_backed_insts;
+    translated_all.reserve(leaves.instances.size());
+
+    for (const auto& inode : leaves.instances) {
+        uint64_t lookup_va = inode.blas_base_va;
+        if (auto rit = impl_->va_relocations.find(lookup_va); rit != impl_->va_relocations.end()) {
+            lookup_va = rit->second;
+        }
+        DxrInstanceDesc d{};
+        std::memcpy(d.transform, inode.object_to_world, sizeof(d.transform));
+        d.instance_id = inode.instance_id & 0x00FFFFFFu;
+        d.instance_mask = inode.instance_mask & 0xFFu;
+        d.instance_contribution_to_hit_group_index = inode.sbt_offset & 0x00FFFFFFu;
+        d.flags = inode.instance_flags & 0xFFu;
+
+        auto vit = impl_->va_table.find(lookup_va);
+        if (vit == impl_->va_table.end()) {
+            vit = impl_->va_table.find(inode.blas_base_va);
+        }
+        if (vit != impl_->va_table.end()) {
+            d.blas_id = vit->second.host_as_id;
+            if (vit->second.host_as_id != 0ull) {
+                triangle_backed_insts.push_back(d);
+            }
+        }
+        translated_all.push_back(d);
+    }
+
+    uint64_t host_tlas_id = 0ull;
+    uint64_t native_pc_va = 0ull;
+    bool hw_built = false;
+
+    if (!triangle_backed_insts.empty() && impl_->engine && impl_->engine->IsInitialized()) {
+        st = impl_->engine->BuildTlas(triangle_backed_insts, build_flags, host_tlas_id);
+        if (st.ok()) {
+            DxrAsRecordInfo info{};
+            if (impl_->engine->GetAsInfo(host_tlas_id, info).ok()) {
+                native_pc_va = info.gpu_virtual_address;
+                hw_built = info.hardware_built;
+            }
+        }
+    }
+    if (native_pc_va == 0ull) {
+        native_pc_va = impl_->AllocFallbackPcVa(tlas_bvh4_in_out.size());
+    }
+
+    st = impl_->bvh64_windows.RegisterWindow(dest_xbox_va, tlas_bvh4_in_out);
+    if (!st.ok()) {
+        return RecordDxrResult("RehydrateTlas", st);
+    }
+    impl_->window_buffers[dest_xbox_va] = tlas_bvh4_in_out;
+
+    XboxVaTranslationEntry entry{};
+    entry.xbox_gpu_va = dest_xbox_va;
+    entry.native_pc_gpu_va = native_pc_va;
+    entry.host_as_id = host_tlas_id;
+    entry.as_type = Rdna2BvhAsType::TopLevel;
+    entry.path = path;
+    entry.procedural_count = static_cast<uint32_t>(leaves.procedurals.size());
+    entry.instance_count = static_cast<uint32_t>(leaves.instances.size());
+    entry.hardware_dxr_built = hw_built;
+    impl_->va_table[dest_xbox_va] = entry;
+
+    out_result.selected_path = path;
+    out_result.source_xbox_va = source_xbox_va;
+    out_result.dest_xbox_va = dest_xbox_va;
+    out_result.native_pc_gpu_va = native_pc_va;
+    out_result.host_as_id = host_tlas_id;
+    out_result.decoded_procedural_count = entry.procedural_count;
+    out_result.decoded_instance_count = entry.instance_count;
+    out_result.patched_instance_pointers = reloc_rep.patched_instance_nodes;
+    out_result.hardware_dxr_built = hw_built;
+    out_result.translated_tlas_instances = std::move(translated_all);
+    return RecordDxrResult("RehydrateTlas", Status::Ok());
+}
+
+bool XboxBvh4RehydrationManager::TranslateXboxVaToNativePcVa(
+    uint64_t xbox_va,
+    XboxVaTranslationEntry& out_entry) const {
+    out_entry = XboxVaTranslationEntry{};
+    if (!impl_ || xbox_va == 0ull) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    auto it = impl_->va_table.find(xbox_va);
+    if (it == impl_->va_table.end()) {
+        return false;
+    }
+    out_entry = it->second;
+    return true;
+}
+
+Status XboxBvh4RehydrationManager::CopyMultiWindow(Rdna2Bvh64MultiWindow& out_windows) const {
+    out_windows.Clear();
+    if (!impl_) {
+        return Status::Error(StatusCode::DeviceError, "RehydrationManager not initialized");
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    for (const auto& kv : impl_->window_buffers) {
+        Status st = out_windows.RegisterWindow(kv.first, kv.second);
+        if (!st.ok()) {
+            return st;
+        }
+    }
+    return Status::Ok();
+}
+
+size_t XboxBvh4RehydrationManager::RehydratedWindowCount() const noexcept {
+    if (!impl_) return 0u;
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->bvh64_windows.WindowCount();
+}
+
+Status XboxBvh4RehydrationManager::TraceRehydratedRay(
+    uint64_t root_xbox_va,
+    const Rdna2RayQueryInput& ray,
+    Rdna2RayQueryHit& out_hit,
+    RtStats* out_stats) const {
+    if (!impl_) {
+        return Status::Error(StatusCode::DeviceError, "RehydrationManager not initialized");
+    }
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->bvh64_windows.TraceRay64(root_xbox_va, ray, out_hit, out_stats);
+}
+
 }  // namespace openscarlett

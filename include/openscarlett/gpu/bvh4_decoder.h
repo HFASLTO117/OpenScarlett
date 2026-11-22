@@ -230,6 +230,58 @@ Status BuildRdna2Bvh4Tlas(
     std::vector<uint8_t>& out_buffer,
     Rdna2BvhHeader* out_header = nullptr);
 
+// Builds a 4-wide RDNA2 BVH4 BLAS buffer containing procedural AABB leaf nodes.
+Status BuildRdna2Bvh4ProceduralBlas(
+    const std::vector<Rdna2BvhProceduralInput>& procedurals,
+    const Rdna2BvhEncodeOptions& options,
+    std::vector<uint8_t>& out_buffer,
+    Rdna2BvhHeader* out_header = nullptr);
+
+// Decoded leaf geometry extracted from a pre-built RDNA2 BVH4 buffer
+// (for Path A native PC DXR 1.1 BLAS/TLAS reconstruction).
+struct Rdna2Bvh4DecodedLeaves {
+    Rdna2BvhAsType as_type = Rdna2BvhAsType::BottomLevel;
+    std::vector<RtTriangle> triangles;
+    std::vector<uint32_t> triangle_primitive_indices;
+    std::vector<uint32_t> triangle_geometry_indices;
+    std::vector<uint32_t> triangle_geometry_flags;
+    std::vector<Rdna2BvhProceduralNode> procedurals;
+    std::vector<Rdna2BvhInstanceNode> instances;
+};
+
+// Extracts all reachable leaf triangles, procedural AABBs, and TLAS instance leaves
+// from a validated RDNA2 BVH4 buffer.
+Status ExtractRdna2Bvh4Leaves(
+    const uint8_t* data,
+    size_t size,
+    Rdna2Bvh4DecodedLeaves& out_leaves);
+
+// Relocation entry mapping an original 64-bit Xbox BLAS GPU VA to its relocated VA.
+struct Rdna2Bvh4RelocationEntry {
+    uint64_t source_xbox_va = 0ull;
+    uint64_t dest_va = 0ull;
+};
+
+struct Rdna2Bvh4RelocationReport {
+    uint32_t patched_instance_nodes = 0u;
+    uint32_t verified_internal_nodes = 0u;
+    uint32_t verified_leaf_nodes = 0u;
+    uint32_t old_payload_crc32 = 0u;
+    uint32_t new_payload_crc32 = 0u;
+    bool crc_updated = false;
+};
+
+// Path B (DXR=0) in-place 64-bit RDNA2 BVH4 pointer relocation & bounds-checked rehydration.
+// Validates internal node offsets and relocates 64-bit BLAS virtual addresses inside TLAS
+// instance nodes in-place, updating the header payload CRC32.
+Status PatchRdna2Bvh4PointersInPlace(
+    uint8_t* data,
+    size_t size,
+    uint64_t source_base_va,
+    uint64_t dest_base_va,
+    const std::vector<Rdna2Bvh4RelocationEntry>& blas_relocations,
+    Rdna2Bvh4RelocationReport* out_report = nullptr);
+
 // Strictly validates an RDNA2 BVH4 buffer: header, alignment, CRC32, pointer bounds,
 // cycle detection, depth limits, AABB finiteness/containment, and node counts.
 Status ValidateRdna2Bvh4(

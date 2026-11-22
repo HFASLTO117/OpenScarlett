@@ -475,6 +475,29 @@ bool IntersectRayTriangleEx(const RtTriangle& tri,
     return true;
 }
 
+bool TraceRayProceduralAabbs(
+    const std::vector<Rdna2BvhProceduralInput>& procedurals,
+    const RtRay& ray,
+    float t_best,
+    bool accept_first,
+    RtProceduralHit& out_hit) noexcept {
+    out_hit = RtProceduralHit{};
+    out_hit.t = t_best;
+    for (const auto& proc : procedurals) {
+        float t_near = 0.0f;
+        if (IntersectAabb(proc.bounds, ray, out_hit.t, t_near) && t_near < out_hit.t) {
+            out_hit.hit = true;
+            out_hit.t = t_near;
+            out_hit.primitive_index = proc.primitive_index;
+            out_hit.geometry_index = proc.geometry_index;
+            if (accept_first) {
+                return true;
+            }
+        }
+    }
+    return out_hit.hit;
+}
+
 bool BvhAccelerationStructure::GetNodeView(uint32_t index, BvhNodeView& out_node) const noexcept {
     if (index >= nodes_.size()) {
         return false;
