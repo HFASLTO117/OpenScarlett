@@ -47,12 +47,13 @@ CommandListX::CommandListX(DeviceX* parent_device, ID3D12GraphicsCommandList* ho
     if (device_x_) device_x_->AddRef();
     if (host_list_) {
         host_list_->AddRef();
-        host_list_->QueryInterface(IID_PPV_ARGS(&host_list1_));
-        host_list_->QueryInterface(IID_PPV_ARGS(&host_list2_));
-        host_list_->QueryInterface(IID_PPV_ARGS(&host_list3_));
-        host_list_->QueryInterface(IID_PPV_ARGS(&host_list4_));
-        host_list_->QueryInterface(IID_PPV_ARGS(&host_list5_));
-        host_list_->QueryInterface(IID_PPV_ARGS(&host_list6_));
+        list_type_ = host_list_->GetType();
+        host_list_->QueryInterface(OS_D3D12_IID(ID3D12GraphicsCommandList1), reinterpret_cast<void**>(&host_list1_));
+        host_list_->QueryInterface(OS_D3D12_IID(ID3D12GraphicsCommandList2), reinterpret_cast<void**>(&host_list2_));
+        host_list_->QueryInterface(OS_D3D12_IID(ID3D12GraphicsCommandList3), reinterpret_cast<void**>(&host_list3_));
+        host_list_->QueryInterface(OS_D3D12_IID(ID3D12GraphicsCommandList4), reinterpret_cast<void**>(&host_list4_));
+        host_list_->QueryInterface(OS_D3D12_IID(ID3D12GraphicsCommandList5), reinterpret_cast<void**>(&host_list5_));
+        host_list_->QueryInterface(OS_D3D12_IID(ID3D12GraphicsCommandList6), reinterpret_cast<void**>(&host_list6_));
     }
     auto& reg = GetCommandListRegistry();
     std::unique_lock<std::shared_mutex> lock(reg.mutex);
@@ -121,48 +122,54 @@ HRESULT STDMETHODCALLTYPE CommandListX::QueryInterface(REFIID riid, void** ppvOb
     }
     *ppvObject = nullptr;
 
-    if (IsEqualIID(riid, __uuidof(IUnknown)) ||
-        IsEqualIID(riid, __uuidof(ID3D12Object)) ||
-        IsEqualIID(riid, __uuidof(ID3D12DeviceChild)) ||
-        IsEqualIID(riid, __uuidof(ID3D12CommandList)) ||
-        IsEqualIID(riid, __uuidof(ID3D12GraphicsCommandList)) ||
+    if (IsEqualIID(riid, OS_D3D12_IID(IUnknown)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Object)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12DeviceChild)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12CommandList)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12GraphicsCommandList)) ||
         IsEqualIID(riid, IID_ID3D12GraphicsCommandListX)) {
         *ppvObject = static_cast<ID3D12GraphicsCommandListX*>(this);
         AddRef();
         RecordList("ID3D12GraphicsCommandListX::QueryInterface", 0, S_OK);
         return S_OK;
     }
-    if (IsEqualIID(riid, __uuidof(ID3D12GraphicsCommandList1)) && host_list1_) {
+    if (IsEqualIID(riid, IID_IOpenScarlettCommandListExtState)) {
+        *ppvObject = static_cast<IOpenScarlettCommandListExtState*>(this);
+        AddRef();
+        RecordList("ID3D12GraphicsCommandListX::QueryInterface", 0, S_OK);
+        return S_OK;
+    }
+    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12GraphicsCommandList1)) && host_list1_) {
         *ppvObject = static_cast<ID3D12GraphicsCommandList1*>(this);
         AddRef();
         RecordList("ID3D12GraphicsCommandListX::QueryInterface", 0, S_OK);
         return S_OK;
     }
-    if (IsEqualIID(riid, __uuidof(ID3D12GraphicsCommandList2)) && host_list2_) {
+    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12GraphicsCommandList2)) && host_list2_) {
         *ppvObject = static_cast<ID3D12GraphicsCommandList2*>(this);
         AddRef();
         RecordList("ID3D12GraphicsCommandListX::QueryInterface", 0, S_OK);
         return S_OK;
     }
-    if (IsEqualIID(riid, __uuidof(ID3D12GraphicsCommandList3)) && host_list3_) {
+    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12GraphicsCommandList3)) && host_list3_) {
         *ppvObject = static_cast<ID3D12GraphicsCommandList3*>(this);
         AddRef();
         RecordList("ID3D12GraphicsCommandListX::QueryInterface", 0, S_OK);
         return S_OK;
     }
-    if (IsEqualIID(riid, __uuidof(ID3D12GraphicsCommandList4)) && host_list4_) {
+    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12GraphicsCommandList4)) && host_list4_) {
         *ppvObject = static_cast<ID3D12GraphicsCommandList4*>(this);
         AddRef();
         RecordList("ID3D12GraphicsCommandListX::QueryInterface", 0, S_OK);
         return S_OK;
     }
-    if (IsEqualIID(riid, __uuidof(ID3D12GraphicsCommandList5)) && host_list5_) {
+    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12GraphicsCommandList5)) && host_list5_) {
         *ppvObject = static_cast<ID3D12GraphicsCommandList5*>(this);
         AddRef();
         RecordList("ID3D12GraphicsCommandListX::QueryInterface", 0, S_OK);
         return S_OK;
     }
-    if (IsEqualIID(riid, __uuidof(ID3D12GraphicsCommandList6)) && host_list6_) {
+    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12GraphicsCommandList6)) && host_list6_) {
         *ppvObject = static_cast<ID3D12GraphicsCommandList6*>(this);
         AddRef();
         RecordList("ID3D12GraphicsCommandListX::QueryInterface", 0, S_OK);
@@ -242,7 +249,16 @@ HRESULT STDMETHODCALLTYPE CommandListX::Reset(
     depth_bias_.store(0.0f, std::memory_order_relaxed);
     depth_bias_clamp_.store(0.0f, std::memory_order_relaxed);
     slope_scaled_depth_bias_.store(0.0f, std::memory_order_relaxed);
-    ID3D12PipelineState* host_pso = pInitialState;
+    depth_bounds_min_.store(0.0f, std::memory_order_relaxed);
+    depth_bounds_max_.store(1.0f, std::memory_order_relaxed);
+    view_instance_mask_.store(0u, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(ext_state_mutex_);
+        sample_positions_per_pixel_ = 0u;
+        sample_positions_pixels_ = 0u;
+        sample_positions_.clear();
+    }
+    ID3D12PipelineState* host_pso = UnwrapPipelineState(pInitialState);
     if (device_x_ && device_x_->IsVulkanRoutingActive()) {
         const bool is_spirv = device_x_->IsSpirvDirectPipeline(pInitialState);
         if (is_spirv) host_pso = nullptr;
@@ -269,7 +285,7 @@ HRESULT STDMETHODCALLTYPE CommandListX::Reset(
         vk_cmp_srvs_.clear();
         vk_cmp_uavs_.clear();
     }
-    const HRESULT hr = host_list_->Reset(pAllocator, host_pso);
+    const HRESULT hr = host_list_->Reset(UnwrapCommandAllocator(pAllocator), host_pso);
     RecordList("ID3D12GraphicsCommandListX::Reset", 10, hr);
     return hr;
 }
@@ -278,7 +294,16 @@ void STDMETHODCALLTYPE CommandListX::ClearState(ID3D12PipelineState* pPipelineSt
     depth_bias_.store(0.0f, std::memory_order_relaxed);
     depth_bias_clamp_.store(0.0f, std::memory_order_relaxed);
     slope_scaled_depth_bias_.store(0.0f, std::memory_order_relaxed);
-    ID3D12PipelineState* host_pso = pPipelineState;
+    depth_bounds_min_.store(0.0f, std::memory_order_relaxed);
+    depth_bounds_max_.store(1.0f, std::memory_order_relaxed);
+    view_instance_mask_.store(0u, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(ext_state_mutex_);
+        sample_positions_per_pixel_ = 0u;
+        sample_positions_pixels_ = 0u;
+        sample_positions_.clear();
+    }
+    ID3D12PipelineState* host_pso = UnwrapPipelineState(pPipelineState);
     if (device_x_ && device_x_->IsVulkanRoutingActive()) {
         const bool is_spirv = device_x_->IsSpirvDirectPipeline(pPipelineState);
         if (is_spirv) host_pso = nullptr;
@@ -409,50 +434,68 @@ void STDMETHODCALLTYPE CommandListX::Dispatch(
 void STDMETHODCALLTYPE CommandListX::CopyBufferRegion(
     ID3D12Resource* pDstBuffer, UINT64 DstOffset,
     ID3D12Resource* pSrcBuffer, UINT64 SrcOffset, UINT64 NumBytes) {
+    ID3D12Resource* host_dst = UnwrapResource(pDstBuffer);
+    ID3D12Resource* host_src = UnwrapResource(pSrcBuffer);
     if (device_x_ && device_x_->IsVulkanRoutingActive()) {
         std::lock_guard<std::mutex> lock(vk_rec_mutex_);
         VulkanRecordedOp op{};
         op.kind = VulkanRecordedOpKind::CopyBuffer;
-        op.dst_resource = pDstBuffer;
-        op.src_resource = pSrcBuffer;
+        op.dst_resource = host_dst;
+        op.src_resource = host_src;
         op.dst_offset = DstOffset;
         op.src_offset = SrcOffset;
         op.num_bytes = NumBytes;
         vk_batch_.ops.push_back(std::move(op));
         vk_batch_.has_host_commands = true;
     }
-    host_list_->CopyBufferRegion(pDstBuffer, DstOffset, pSrcBuffer, SrcOffset, NumBytes);
+    host_list_->CopyBufferRegion(host_dst, DstOffset, host_src, SrcOffset, NumBytes);
     RecordList("ID3D12GraphicsCommandListX::CopyBufferRegion", 15, S_OK);
 }
 
 void STDMETHODCALLTYPE CommandListX::CopyTextureRegion(
     const D3D12_TEXTURE_COPY_LOCATION* pDst, UINT DstX, UINT DstY, UINT DstZ,
     const D3D12_TEXTURE_COPY_LOCATION* pSrc, const D3D12_BOX* pSrcBox) {
+    D3D12_TEXTURE_COPY_LOCATION dst_loc{};
+    D3D12_TEXTURE_COPY_LOCATION src_loc{};
+    const D3D12_TEXTURE_COPY_LOCATION* dst_ptr = pDst;
+    const D3D12_TEXTURE_COPY_LOCATION* src_ptr = pSrc;
+    if (pDst) {
+        dst_loc = *pDst;
+        dst_loc.pResource = UnwrapResource(pDst->pResource);
+        dst_ptr = &dst_loc;
+    }
+    if (pSrc) {
+        src_loc = *pSrc;
+        src_loc.pResource = UnwrapResource(pSrc->pResource);
+        src_ptr = &src_loc;
+    }
     if (device_x_ && device_x_->IsVulkanRoutingActive()) {
         std::lock_guard<std::mutex> lock(vk_rec_mutex_);
         VulkanRecordedOp op{};
         op.kind = VulkanRecordedOpKind::CopyTexture;
-        op.dst_resource = pDst ? pDst->pResource : nullptr;
-        op.src_resource = pSrc ? pSrc->pResource : nullptr;
+        op.dst_resource = dst_ptr ? dst_ptr->pResource : nullptr;
+        op.src_resource = src_ptr ? src_ptr->pResource : nullptr;
         vk_batch_.ops.push_back(std::move(op));
         vk_batch_.has_host_commands = true;
     }
-    host_list_->CopyTextureRegion(pDst, DstX, DstY, DstZ, pSrc, pSrcBox);
+    host_list_->CopyTextureRegion(dst_ptr, DstX, DstY, DstZ, src_ptr, pSrcBox);
     RecordList("ID3D12GraphicsCommandListX::CopyTextureRegion", 16, S_OK);
 }
 
 void STDMETHODCALLTYPE CommandListX::CopyResource(
     ID3D12Resource* pDstResource, ID3D12Resource* pSrcResource) {
+    ID3D12Resource* host_dst = UnwrapResource(pDstResource);
+    ID3D12Resource* host_src = UnwrapResource(pSrcResource);
     if (device_x_ && device_x_->IsVulkanRoutingActive()) {
         std::lock_guard<std::mutex> lock(vk_rec_mutex_);
         VulkanRecordedOp op{};
         op.kind = VulkanRecordedOpKind::CopyResource;
-        op.dst_resource = pDstResource;
-        op.src_resource = pSrcResource;
+        op.dst_resource = host_dst;
+        op.src_resource = host_src;
         vk_batch_.ops.push_back(std::move(op));
         vk_batch_.has_host_commands = true;
     }
-    host_list_->CopyResource(pDstResource, pSrcResource);
+    host_list_->CopyResource(host_dst, host_src);
     RecordList("ID3D12GraphicsCommandListX::CopyResource", 17, S_OK);
 }
 
@@ -463,15 +506,17 @@ void STDMETHODCALLTYPE CommandListX::CopyTiles(
     ID3D12Resource* pBuffer, UINT64 BufferStartOffsetInBytes,
     D3D12_TILE_COPY_FLAGS Flags) {
     host_list_->CopyTiles(
-        pTiledResource, pTileRegionStartCoordinate, pTileRegionSize,
-        pBuffer, BufferStartOffsetInBytes, Flags);
+        UnwrapResource(pTiledResource), pTileRegionStartCoordinate, pTileRegionSize,
+        UnwrapResource(pBuffer), BufferStartOffsetInBytes, Flags);
     RecordList("ID3D12GraphicsCommandListX::CopyTiles", 18, S_OK);
 }
 
 void STDMETHODCALLTYPE CommandListX::ResolveSubresource(
     ID3D12Resource* pDstResource, UINT DstSubresource,
     ID3D12Resource* pSrcResource, UINT SrcSubresource, DXGI_FORMAT Format) {
-    host_list_->ResolveSubresource(pDstResource, DstSubresource, pSrcResource, SrcSubresource, Format);
+    host_list_->ResolveSubresource(
+        UnwrapResource(pDstResource), DstSubresource,
+        UnwrapResource(pSrcResource), SrcSubresource, Format);
     RecordList("ID3D12GraphicsCommandListX::ResolveSubresource", 19, S_OK);
 }
 
@@ -518,24 +563,53 @@ void STDMETHODCALLTYPE CommandListX::SetPipelineState(ID3D12PipelineState* pPipe
         skip_host = is_spirv;
     }
     if (!skip_host) {
-        host_list_->SetPipelineState(pPipelineState);
+        host_list_->SetPipelineState(UnwrapPipelineState(pPipelineState));
     }
     RecordList("ID3D12GraphicsCommandListX::SetPipelineState", 25, S_OK);
 }
 
 void STDMETHODCALLTYPE CommandListX::ResourceBarrier(
     UINT NumBarriers, const D3D12_RESOURCE_BARRIER* pBarriers) {
-    if (device_x_ && pBarriers && NumBarriers > 0u && device_x_->HasRegisteredUnifiedTextures()) {
-        for (UINT i = 0; i < NumBarriers; ++i) {
-            if (pBarriers[i].Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION &&
-                pBarriers[i].Transition.pResource != nullptr) {
-                device_x_->NotifyResourceStateTransition(
-                    pBarriers[i].Transition.pResource,
-                    pBarriers[i].Transition.StateAfter);
-            }
+    if (!pBarriers || NumBarriers == 0u) {
+        host_list_->ResourceBarrier(NumBarriers, pBarriers);
+        RecordList("ID3D12GraphicsCommandListX::ResourceBarrier", 26, S_OK);
+        return;
+    }
+
+    constexpr UINT kStackBarriers = 16u;
+    D3D12_RESOURCE_BARRIER stack_buf[kStackBarriers];
+    std::vector<D3D12_RESOURCE_BARRIER> heap_buf;
+    D3D12_RESOURCE_BARRIER* unwrapped = stack_buf;
+    if (NumBarriers > kStackBarriers) {
+        heap_buf.resize(NumBarriers);
+        unwrapped = heap_buf.data();
+    }
+
+    const bool track_unified = device_x_ && device_x_->HasRegisteredUnifiedTextures();
+    for (UINT i = 0u; i < NumBarriers; ++i) {
+        unwrapped[i] = pBarriers[i];
+        switch (unwrapped[i].Type) {
+            case D3D12_RESOURCE_BARRIER_TYPE_TRANSITION:
+                unwrapped[i].Transition.pResource = UnwrapResource(pBarriers[i].Transition.pResource);
+                if (track_unified && unwrapped[i].Transition.pResource != nullptr) {
+                    device_x_->NotifyResourceStateTransition(
+                        unwrapped[i].Transition.pResource,
+                        unwrapped[i].Transition.StateAfter);
+                }
+                break;
+            case D3D12_RESOURCE_BARRIER_TYPE_ALIASING:
+                unwrapped[i].Aliasing.pResourceBefore = UnwrapResource(pBarriers[i].Aliasing.pResourceBefore);
+                unwrapped[i].Aliasing.pResourceAfter = UnwrapResource(pBarriers[i].Aliasing.pResourceAfter);
+                break;
+            case D3D12_RESOURCE_BARRIER_TYPE_UAV:
+                unwrapped[i].UAV.pResource = UnwrapResource(pBarriers[i].UAV.pResource);
+                break;
+            default:
+                break;
         }
     }
-    if (device_x_ && device_x_->IsVulkanRoutingActive() && NumBarriers > 0u) {
+
+    if (device_x_ && device_x_->IsVulkanRoutingActive()) {
         std::lock_guard<std::mutex> lock(vk_rec_mutex_);
         VulkanRecordedOp op{};
         op.kind = VulkanRecordedOpKind::Barrier;
@@ -543,7 +617,7 @@ void STDMETHODCALLTYPE CommandListX::ResourceBarrier(
         vk_batch_.ops.push_back(std::move(op));
         vk_batch_.has_host_commands = true;
     }
-    host_list_->ResourceBarrier(NumBarriers, pBarriers);
+    host_list_->ResourceBarrier(NumBarriers, unwrapped);
     RecordList("ID3D12GraphicsCommandListX::ResourceBarrier", 26, S_OK);
 }
 
@@ -554,19 +628,35 @@ void STDMETHODCALLTYPE CommandListX::ExecuteBundle(ID3D12GraphicsCommandList* pC
 
 void STDMETHODCALLTYPE CommandListX::SetDescriptorHeaps(
     UINT NumDescriptorHeaps, ID3D12DescriptorHeap* const* ppDescriptorHeaps) {
-    host_list_->SetDescriptorHeaps(NumDescriptorHeaps, ppDescriptorHeaps);
+    if (!ppDescriptorHeaps || NumDescriptorHeaps == 0u) {
+        host_list_->SetDescriptorHeaps(NumDescriptorHeaps, ppDescriptorHeaps);
+        RecordList("ID3D12GraphicsCommandListX::SetDescriptorHeaps", 28, S_OK);
+        return;
+    }
+    constexpr UINT kStackHeaps = 8u;
+    ID3D12DescriptorHeap* stack_heaps[kStackHeaps];
+    std::vector<ID3D12DescriptorHeap*> heap_vec;
+    ID3D12DescriptorHeap** unwrapped = stack_heaps;
+    if (NumDescriptorHeaps > kStackHeaps) {
+        heap_vec.resize(NumDescriptorHeaps);
+        unwrapped = heap_vec.data();
+    }
+    for (UINT i = 0u; i < NumDescriptorHeaps; ++i) {
+        unwrapped[i] = UnwrapDescriptorHeap(ppDescriptorHeaps[i]);
+    }
+    host_list_->SetDescriptorHeaps(NumDescriptorHeaps, unwrapped);
     RecordList("ID3D12GraphicsCommandListX::SetDescriptorHeaps", 28, S_OK);
 }
 
 void STDMETHODCALLTYPE CommandListX::SetComputeRootSignature(
     ID3D12RootSignature* pRootSignature) {
-    host_list_->SetComputeRootSignature(pRootSignature);
+    host_list_->SetComputeRootSignature(UnwrapRootSignature(pRootSignature));
     RecordList("ID3D12GraphicsCommandListX::SetComputeRootSignature", 29, S_OK);
 }
 
 void STDMETHODCALLTYPE CommandListX::SetGraphicsRootSignature(
     ID3D12RootSignature* pRootSignature) {
-    host_list_->SetGraphicsRootSignature(pRootSignature);
+    host_list_->SetGraphicsRootSignature(UnwrapRootSignature(pRootSignature));
     RecordList("ID3D12GraphicsCommandListX::SetGraphicsRootSignature", 30, S_OK);
 }
 
@@ -811,7 +901,7 @@ void STDMETHODCALLTYPE CommandListX::ClearUnorderedAccessViewUint(
     D3D12_CPU_DESCRIPTOR_HANDLE ViewCPUHandle, ID3D12Resource* pResource,
     const UINT Values[4], UINT NumRects, const D3D12_RECT* pRects) {
     host_list_->ClearUnorderedAccessViewUint(
-        ViewGPUHandleInCurrentHeap, ViewCPUHandle, pResource, Values, NumRects, pRects);
+        ViewGPUHandleInCurrentHeap, ViewCPUHandle, UnwrapResource(pResource), Values, NumRects, pRects);
     RecordList("ID3D12GraphicsCommandListX::ClearUnorderedAccessViewUint", 49, S_OK);
 }
 
@@ -820,25 +910,25 @@ void STDMETHODCALLTYPE CommandListX::ClearUnorderedAccessViewFloat(
     D3D12_CPU_DESCRIPTOR_HANDLE ViewCPUHandle, ID3D12Resource* pResource,
     const FLOAT Values[4], UINT NumRects, const D3D12_RECT* pRects) {
     host_list_->ClearUnorderedAccessViewFloat(
-        ViewGPUHandleInCurrentHeap, ViewCPUHandle, pResource, Values, NumRects, pRects);
+        ViewGPUHandleInCurrentHeap, ViewCPUHandle, UnwrapResource(pResource), Values, NumRects, pRects);
     RecordList("ID3D12GraphicsCommandListX::ClearUnorderedAccessViewFloat", 50, S_OK);
 }
 
 void STDMETHODCALLTYPE CommandListX::DiscardResource(
     ID3D12Resource* pResource, const D3D12_DISCARD_REGION* pRegion) {
-    host_list_->DiscardResource(pResource, pRegion);
+    host_list_->DiscardResource(UnwrapResource(pResource), pRegion);
     RecordList("ID3D12GraphicsCommandListX::DiscardResource", 51, S_OK);
 }
 
 void STDMETHODCALLTYPE CommandListX::BeginQuery(
     ID3D12QueryHeap* pQueryHeap, D3D12_QUERY_TYPE Type, UINT Index) {
-    host_list_->BeginQuery(pQueryHeap, Type, Index);
+    host_list_->BeginQuery(UnwrapQueryHeap(pQueryHeap), Type, Index);
     RecordList("ID3D12GraphicsCommandListX::BeginQuery", 52, S_OK);
 }
 
 void STDMETHODCALLTYPE CommandListX::EndQuery(
     ID3D12QueryHeap* pQueryHeap, D3D12_QUERY_TYPE Type, UINT Index) {
-    host_list_->EndQuery(pQueryHeap, Type, Index);
+    host_list_->EndQuery(UnwrapQueryHeap(pQueryHeap), Type, Index);
     RecordList("ID3D12GraphicsCommandListX::EndQuery", 53, S_OK);
 }
 
@@ -846,14 +936,14 @@ void STDMETHODCALLTYPE CommandListX::ResolveQueryData(
     ID3D12QueryHeap* pQueryHeap, D3D12_QUERY_TYPE Type, UINT StartIndex, UINT NumQueries,
     ID3D12Resource* pDestinationBuffer, UINT64 AlignedDestinationBufferOffset) {
     host_list_->ResolveQueryData(
-        pQueryHeap, Type, StartIndex, NumQueries,
-        pDestinationBuffer, AlignedDestinationBufferOffset);
+        UnwrapQueryHeap(pQueryHeap), Type, StartIndex, NumQueries,
+        UnwrapResource(pDestinationBuffer), AlignedDestinationBufferOffset);
     RecordList("ID3D12GraphicsCommandListX::ResolveQueryData", 54, S_OK);
 }
 
 void STDMETHODCALLTYPE CommandListX::SetPredication(
     ID3D12Resource* pBuffer, UINT64 AlignedBufferOffset, D3D12_PREDICATION_OP Operation) {
-    host_list_->SetPredication(pBuffer, AlignedBufferOffset, Operation);
+    host_list_->SetPredication(UnwrapResource(pBuffer), AlignedBufferOffset, Operation);
     RecordList("ID3D12GraphicsCommandListX::SetPredication", 55, S_OK);
 }
 
@@ -877,8 +967,9 @@ void STDMETHODCALLTYPE CommandListX::ExecuteIndirect(
     ID3D12Resource* pArgumentBuffer, UINT64 ArgumentBufferOffset,
     ID3D12Resource* pCountBuffer, UINT64 CountBufferOffset) {
     host_list_->ExecuteIndirect(
-        pCommandSignature, MaxCommandCount, pArgumentBuffer,
-        ArgumentBufferOffset, pCountBuffer, CountBufferOffset);
+        UnwrapCommandSignature(pCommandSignature), MaxCommandCount,
+        UnwrapResource(pArgumentBuffer), ArgumentBufferOffset,
+        UnwrapResource(pCountBuffer), CountBufferOffset);
     RecordList("ID3D12GraphicsCommandListX::ExecuteIndirect", 59, S_OK);
 }
 
@@ -889,9 +980,18 @@ void STDMETHODCALLTYPE CommandListX::AtomicCopyBufferUINT(
     ID3D12Resource* const* ppDependentResources,
     const D3D12_SUBRESOURCE_RANGE_UINT64* pDependentSubresourceRanges) {
     if (host_list1_) {
+        std::vector<ID3D12Resource*> deps;
+        ID3D12Resource* const* dep_ptr = ppDependentResources;
+        if (Dependencies > 0u && ppDependentResources) {
+            deps.resize(Dependencies);
+            for (UINT i = 0u; i < Dependencies; ++i) {
+                deps[i] = UnwrapResource(ppDependentResources[i]);
+            }
+            dep_ptr = deps.data();
+        }
         host_list1_->AtomicCopyBufferUINT(
-            pDstBuffer, DstOffset, pSrcBuffer, SrcOffset, Dependencies,
-            ppDependentResources, pDependentSubresourceRanges);
+            UnwrapResource(pDstBuffer), DstOffset, UnwrapResource(pSrcBuffer), SrcOffset,
+            Dependencies, dep_ptr, pDependentSubresourceRanges);
     }
     RecordList("ID3D12GraphicsCommandListX::AtomicCopyBufferUINT",
                60, host_list1_ ? S_OK : E_NOINTERFACE);
@@ -903,27 +1003,51 @@ void STDMETHODCALLTYPE CommandListX::AtomicCopyBufferUINT64(
     ID3D12Resource* const* ppDependentResources,
     const D3D12_SUBRESOURCE_RANGE_UINT64* pDependentSubresourceRanges) {
     if (host_list1_) {
+        std::vector<ID3D12Resource*> deps;
+        ID3D12Resource* const* dep_ptr = ppDependentResources;
+        if (Dependencies > 0u && ppDependentResources) {
+            deps.resize(Dependencies);
+            for (UINT i = 0u; i < Dependencies; ++i) {
+                deps[i] = UnwrapResource(ppDependentResources[i]);
+            }
+            dep_ptr = deps.data();
+        }
         host_list1_->AtomicCopyBufferUINT64(
-            pDstBuffer, DstOffset, pSrcBuffer, SrcOffset, Dependencies,
-            ppDependentResources, pDependentSubresourceRanges);
+            UnwrapResource(pDstBuffer), DstOffset, UnwrapResource(pSrcBuffer), SrcOffset,
+            Dependencies, dep_ptr, pDependentSubresourceRanges);
     }
     RecordList("ID3D12GraphicsCommandListX::AtomicCopyBufferUINT64",
                61, host_list1_ ? S_OK : E_NOINTERFACE);
 }
 
 void STDMETHODCALLTYPE CommandListX::OMSetDepthBounds(FLOAT Min, FLOAT Max) {
-    if (host_list1_) host_list1_->OMSetDepthBounds(Min, Max);
-    RecordList("ID3D12GraphicsCommandListX::OMSetDepthBounds",
-               62, host_list1_ ? S_OK : E_NOINTERFACE);
+    depth_bounds_min_.store(Min, std::memory_order_relaxed);
+    depth_bounds_max_.store(Max, std::memory_order_relaxed);
+    if (host_list1_ && device_x_ && device_x_->SupportsDepthBoundsTest() &&
+        list_type_ == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        host_list1_->OMSetDepthBounds(Min, Max);
+    }
+    RecordList("ID3D12GraphicsCommandListX::OMSetDepthBounds", 62, S_OK);
 }
 
 void STDMETHODCALLTYPE CommandListX::SetSamplePositions(
     UINT NumSamplesPerPixel, UINT NumPixels, D3D12_SAMPLE_POSITION* pSamplePositions) {
-    if (host_list1_) {
+    {
+        std::lock_guard<std::mutex> lock(ext_state_mutex_);
+        sample_positions_per_pixel_ = NumSamplesPerPixel;
+        sample_positions_pixels_ = NumPixels;
+        const size_t total = static_cast<size_t>(NumSamplesPerPixel) * static_cast<size_t>(NumPixels);
+        if (pSamplePositions && total > 0u && total <= 64u) {
+            sample_positions_.assign(pSamplePositions, pSamplePositions + total);
+        } else {
+            sample_positions_.clear();
+        }
+    }
+    if (host_list1_ && device_x_ && device_x_->SupportsProgrammableSamplePositions() &&
+        list_type_ == D3D12_COMMAND_LIST_TYPE_DIRECT) {
         host_list1_->SetSamplePositions(NumSamplesPerPixel, NumPixels, pSamplePositions);
     }
-    RecordList("ID3D12GraphicsCommandListX::SetSamplePositions",
-               63, host_list1_ ? S_OK : E_NOINTERFACE);
+    RecordList("ID3D12GraphicsCommandListX::SetSamplePositions", 63, S_OK);
 }
 
 void STDMETHODCALLTYPE CommandListX::ResolveSubresourceRegion(
@@ -932,26 +1056,82 @@ void STDMETHODCALLTYPE CommandListX::ResolveSubresourceRegion(
     DXGI_FORMAT Format, D3D12_RESOLVE_MODE ResolveMode) {
     if (host_list1_) {
         host_list1_->ResolveSubresourceRegion(
-            pDstResource, DstSubresource, DstX, DstY,
-            pSrcResource, SrcSubresource, pSrcRect, Format, ResolveMode);
+            UnwrapResource(pDstResource), DstSubresource, DstX, DstY,
+            UnwrapResource(pSrcResource), SrcSubresource, pSrcRect, Format, ResolveMode);
     }
     RecordList("ID3D12GraphicsCommandListX::ResolveSubresourceRegion",
                64, host_list1_ ? S_OK : E_NOINTERFACE);
 }
 
 void STDMETHODCALLTYPE CommandListX::SetViewInstanceMask(UINT Mask) {
-    if (host_list1_) host_list1_->SetViewInstanceMask(Mask);
-    RecordList("ID3D12GraphicsCommandListX::SetViewInstanceMask",
-               65, host_list1_ ? S_OK : E_NOINTERFACE);
+    view_instance_mask_.store(Mask, std::memory_order_relaxed);
+    if (host_list1_ && device_x_ && device_x_->SupportsViewInstancing() &&
+        list_type_ == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        host_list1_->SetViewInstanceMask(Mask);
+    }
+    RecordList("ID3D12GraphicsCommandListX::SetViewInstanceMask", 65, S_OK);
 }
 
 // ID3D12GraphicsCommandList2 (slot 66)
 void STDMETHODCALLTYPE CommandListX::WriteBufferImmediate(
     UINT Count, const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER* pParams,
     const D3D12_WRITEBUFFERIMMEDIATE_MODE* pModes) {
-    if (host_list2_) host_list2_->WriteBufferImmediate(Count, pParams, pModes);
-    RecordList("ID3D12GraphicsCommandListX::WriteBufferImmediate",
-               66, host_list2_ ? S_OK : E_NOINTERFACE);
+    if (Count == 0u || !pParams) {
+        RecordList("ID3D12GraphicsCommandListX::WriteBufferImmediate", 66, S_OK);
+        return;
+    }
+
+    constexpr UINT kStackParams = 32u;
+    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER stack_params[kStackParams];
+    std::vector<D3D12_WRITEBUFFERIMMEDIATE_PARAMETER> heap_params;
+    D3D12_WRITEBUFFERIMMEDIATE_PARAMETER* translated = stack_params;
+    if (Count > kStackParams) {
+        heap_params.resize(Count);
+        translated = heap_params.data();
+    }
+
+    for (UINT i = 0u; i < Count; ++i) {
+        translated[i] = pParams[i];
+        if (device_x_) {
+            translated[i].Dest = device_x_->TranslateGuestGpuVa(pParams[i].Dest);
+            if (device_x_->IsVulkanRoutingActive()) {
+                uint64_t buf_off = 0ull;
+                ID3D12Resource* vk_res =
+                    device_x_->ResolveVulkanBufferByGpuVa(translated[i].Dest, &buf_off);
+                if (vk_res) {
+                    const uint32_t v = translated[i].Value;
+                    device_x_->WriteVulkanBufferData(vk_res, buf_off, &v, sizeof(v));
+                }
+            }
+        }
+    }
+
+    if (host_list2_) {
+        host_list2_->WriteBufferImmediate(Count, translated, pModes);
+    } else {
+        // Safe CPU fallback when host command list lacks ID3D12GraphicsCommandList2.
+        for (UINT i = 0u; i < Count; ++i) {
+            const uint64_t addr = translated[i].Dest;
+            if (addr != 0ull) {
+                MEMORY_BASIC_INFORMATION mbi{};
+                if (VirtualQuery(reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(addr)),
+                                 &mbi, sizeof(mbi)) != 0 &&
+                    mbi.State == MEM_COMMIT &&
+                    (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) != 0u &&
+                    (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0u) {
+                    const uint64_t region_end =
+                        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(mbi.BaseAddress)) +
+                        static_cast<uint64_t>(mbi.RegionSize);
+                    if (addr + sizeof(uint32_t) <= region_end) {
+                        *reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(addr)) =
+                            translated[i].Value;
+                    }
+                }
+            }
+        }
+    }
+    write_buffer_immediate_calls_.fetch_add(1ull, std::memory_order_relaxed);
+    RecordList("ID3D12GraphicsCommandListX::WriteBufferImmediate", 66, S_OK);
 }
 
 // ID3D12GraphicsCommandList3 (slot 67)
@@ -968,7 +1148,28 @@ void STDMETHODCALLTYPE CommandListX::BeginRenderPass(
     const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC* pDepthStencil,
     D3D12_RENDER_PASS_FLAGS Flags) {
     if (host_list4_) {
-        host_list4_->BeginRenderPass(NumRenderTargets, pRenderTargets, pDepthStencil, Flags);
+        std::vector<D3D12_RENDER_PASS_RENDER_TARGET_DESC> rts;
+        const D3D12_RENDER_PASS_RENDER_TARGET_DESC* rt_ptr = pRenderTargets;
+        if (NumRenderTargets > 0u && pRenderTargets) {
+            bool any_resolve = false;
+            for (UINT i = 0u; i < NumRenderTargets; ++i) {
+                if (pRenderTargets[i].EndingAccess.Type == D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_RESOLVE) {
+                    any_resolve = true;
+                    break;
+                }
+            }
+            if (any_resolve) {
+                rts.assign(pRenderTargets, pRenderTargets + NumRenderTargets);
+                for (auto& rt : rts) {
+                    if (rt.EndingAccess.Type == D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_RESOLVE) {
+                        rt.EndingAccess.Resolve.pSrcResource = UnwrapResource(rt.EndingAccess.Resolve.pSrcResource);
+                        rt.EndingAccess.Resolve.pDstResource = UnwrapResource(rt.EndingAccess.Resolve.pDstResource);
+                    }
+                }
+                rt_ptr = rts.data();
+            }
+        }
+        host_list4_->BeginRenderPass(NumRenderTargets, rt_ptr, pDepthStencil, Flags);
     }
     RecordList("ID3D12GraphicsCommandListX::BeginRenderPass",
                68, host_list4_ ? S_OK : E_NOINTERFACE);
@@ -1039,9 +1240,13 @@ void STDMETHODCALLTYPE CommandListX::CopyRaytracingAccelerationStructure(
 }
 
 void STDMETHODCALLTYPE CommandListX::SetPipelineState1(ID3D12StateObject* pStateObject) {
-    if (host_list4_) host_list4_->SetPipelineState1(pStateObject);
+    ID3D12StateObject* host_so = UnwrapStateObject(pStateObject);
+    const bool is_sw_proxy = (pStateObject != nullptr && host_so == nullptr);
+    if (host_list4_ && !is_sw_proxy) {
+        host_list4_->SetPipelineState1(host_so);
+    }
     RecordList("ID3D12GraphicsCommandListX::SetPipelineState1",
-               75, host_list4_ ? S_OK : E_NOINTERFACE);
+               75, (host_list4_ || is_sw_proxy) ? S_OK : E_NOINTERFACE);
 }
 
 void STDMETHODCALLTYPE CommandListX::DispatchRays(const D3D12_DISPATCH_RAYS_DESC* pDesc) {
@@ -1060,7 +1265,7 @@ void STDMETHODCALLTYPE CommandListX::RSSetShadingRate(
 }
 
 void STDMETHODCALLTYPE CommandListX::RSSetShadingRateImage(ID3D12Resource* shadingRateImage) {
-    if (host_list5_) host_list5_->RSSetShadingRateImage(shadingRateImage);
+    if (host_list5_) host_list5_->RSSetShadingRateImage(UnwrapResource(shadingRateImage));
     RecordList("ID3D12GraphicsCommandListX::RSSetShadingRateImage",
                78, host_list5_ ? S_OK : E_NOINTERFACE);
 }
@@ -1179,6 +1384,28 @@ void CommandListX::GetDepthBiasXState(
     if (out_slope_scaled_depth_bias) {
         *out_slope_scaled_depth_bias = slope_scaled_depth_bias_.load(std::memory_order_relaxed);
     }
+}
+
+HRESULT STDMETHODCALLTYPE CommandListX::GetCommandListExtState(
+    D3D12XBOX_CMDLIST_EXT_STATE* out_state) const noexcept {
+    if (!out_state) return E_POINTER;
+    out_state->depth_bounds_min = depth_bounds_min_.load(std::memory_order_relaxed);
+    out_state->depth_bounds_max = depth_bounds_max_.load(std::memory_order_relaxed);
+    out_state->view_instance_mask = view_instance_mask_.load(std::memory_order_relaxed);
+    out_state->write_buffer_immediate_calls =
+        write_buffer_immediate_calls_.load(std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(ext_state_mutex_);
+        out_state->sample_positions_per_pixel = sample_positions_per_pixel_;
+        out_state->sample_positions_pixels = sample_positions_pixels_;
+    }
+    out_state->host_supports_depth_bounds =
+        (device_x_ && device_x_->SupportsDepthBoundsTest()) ? 1u : 0u;
+    out_state->host_supports_view_instancing =
+        (device_x_ && device_x_->SupportsViewInstancing()) ? 1u : 0u;
+    out_state->host_supports_sample_positions =
+        (device_x_ && device_x_->SupportsProgrammableSamplePositions()) ? 1u : 0u;
+    return S_OK;
 }
 
 }  // namespace openscarlett::d3d12_xs

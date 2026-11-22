@@ -31,6 +31,15 @@ public:
     CommandQueueX& operator=(const CommandQueueX&) = delete;
 
     ID3D12CommandQueue* HostQueue() const noexcept { return host_queue_; }
+    D3D12_COMMAND_LIST_TYPE QueueType() const noexcept { return queue_type_; }
+
+    // Zero-overhead C++ integration hook invoked on command list submission.
+    using QueueSubmitHookFn = void (*)(
+        ID3D12CommandQueue* host_queue,
+        UINT num_lists,
+        ID3D12CommandList* const* host_lists,
+        void* user_ctx) noexcept;
+    void SetSubmitHook(QueueSubmitHookFn fn, void* user_ctx) noexcept;
 
     static ID3D12Pageable* UnwrapHostPageable(ID3D12Pageable* maybe_wrapped) noexcept;
     static ID3D12CommandQueue* UnwrapHostQueue(ID3D12CommandQueue* maybe_wrapped) noexcept;
@@ -175,8 +184,11 @@ private:
     std::atomic<ULONG> ref_count_{1};
     DeviceX* device_x_ = nullptr;
     ID3D12CommandQueue* host_queue_ = nullptr;
+    D3D12_COMMAND_LIST_TYPE queue_type_ = D3D12_COMMAND_LIST_TYPE_DIRECT;
     std::atomic<bool> suspended_{false};
     std::atomic<uint64_t> kickoff_count_{0ull};
+    std::atomic<QueueSubmitHookFn> submit_hook_{nullptr};
+    std::atomic<void*> submit_hook_ctx_{nullptr};
 
     std::mutex present_mutex_;
     HWND attached_hwnd_ = nullptr;

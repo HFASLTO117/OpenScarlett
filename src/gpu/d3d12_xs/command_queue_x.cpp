@@ -8,6 +8,7 @@
 
 #include "command_list_x.h"
 #include "device_x.h"
+#include "proxies_x.h"
 #include "openscarlett/core/telemetry.h"
 #include "openscarlett/gpu/d3d12_adapter.h"
 
@@ -515,7 +516,10 @@ CommandQueueX::CommandQueueX(
     qpc_freq_ = freq.QuadPart;
 
     if (device_x_) device_x_->AddRef();
-    if (host_queue_) host_queue_->AddRef();
+    if (host_queue_) {
+        host_queue_->AddRef();
+        queue_type_ = host_queue_->GetDesc().Type;
+    }
     {
         auto& reg = GetQueueRegistry();
         std::unique_lock<std::shared_mutex> lock(reg.mutex);
@@ -525,6 +529,11 @@ CommandQueueX::CommandQueueX(
         std::lock_guard<std::mutex> lock(present_mutex_);
         AttachWindowSubclassLocked(initial_hwnd);
     }
+}
+
+void CommandQueueX::SetSubmitHook(QueueSubmitHookFn fn, void* user_ctx) noexcept {
+    submit_hook_ctx_.store(user_ctx, std::memory_order_release);
+    submit_hook_.store(fn, std::memory_order_release);
 }
 
 CommandQueueX::~CommandQueueX() {
@@ -571,11 +580,11 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::QueryInterface(REFIID riid, void** ppvO
     }
     *ppvObject = nullptr;
 
-    if (IsEqualIID(riid, __uuidof(IUnknown)) ||
-        IsEqualIID(riid, __uuidof(ID3D12Object)) ||
-        IsEqualIID(riid, __uuidof(ID3D12DeviceChild)) ||
-        IsEqualIID(riid, __uuidof(ID3D12Pageable)) ||
-        IsEqualIID(riid, __uuidof(ID3D12CommandQueue)) ||
+    if (IsEqualIID(riid, OS_D3D12_IID(IUnknown)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Object)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12DeviceChild)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12Pageable)) ||
+        IsEqualIID(riid, OS_D3D12_IID(ID3D12CommandQueue)) ||
         IsEqualIID(riid, IID_ID3D12CommandQueueX)) {
         *ppvObject = static_cast<ID3D12CommandQueueX*>(this);
         AddRef();
@@ -673,8 +682,8 @@ void STDMETHODCALLTYPE CommandQueueX::UpdateTileMappings(
     const UINT* pRangeTileCounts,
     D3D12_TILE_MAPPING_FLAGS Flags) {
     host_queue_->UpdateTileMappings(
-        pResource, NumResourceRegions, pResourceRegionStartCoordinates, pResourceRegionSizes,
-        pHeap, NumRanges, pRangeFlags, pHeapRangeStartOffsets, pRangeTileCounts, Flags);
+        UnwrapResource(pResource), NumResourceRegions, pResourceRegionStartCoordinates, pResourceRegionSizes,
+        UnwrapHeap(pHeap), NumRanges, pRangeFlags, pHeapRangeStartOffsets, pRangeTileCounts, Flags);
     RecordQueue("ID3D12CommandQueueX::UpdateTileMappings", 8, S_OK);
 }
 
@@ -686,7 +695,7 @@ void STDMETHODCALLTYPE CommandQueueX::CopyTileMappings(
     const D3D12_TILE_REGION_SIZE* pRegionSize,
     D3D12_TILE_MAPPING_FLAGS Flags) {
     host_queue_->CopyTileMappings(
-        pDstResource, pDstRegionStartCoordinate, pSrcResource,
+        UnwrapResource(pDstResource), pDstRegionStartCoordinate, UnwrapResource(pSrcResource),
         pSrcRegionStartCoordinate, pRegionSize, Flags);
     RecordQueue("ID3D12CommandQueueX::CopyTileMappings", 9, S_OK);
 }
@@ -696,7 +705,7 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
     ID3D12CommandList* const* ppCommandLists) {
     // Auto-flush any dirty title unified-memory textures before GPU work samples them.
     if (device_x_ && device_x_->HasDirtyUnifiedTextures() &&
-        host_queue_ && host_queue_->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        host_queue_ && queue_type_ == D3D12_COMMAND_LIST_TYPE_DIRECT) {
         device_x_->FlushDirtyUnifiedTextures(host_queue_, nullptr);
     }
 
@@ -719,6 +728,10 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
 
     for (UINT i = 0; i < NumCommandLists; ++i) {
         raw_lists[i] = CommandListX::UnwrapHostList(ppCommandLists[i]);
+    }
+
+    if (const auto hook = submit_hook_.load(std::memory_order_acquire)) {
+        hook(host_queue_, NumCommandLists, raw_lists, submit_hook_ctx_.load(std::memory_order_acquire));
     }
 
     host_queue_->ExecuteCommandLists(NumCommandLists, raw_lists);
@@ -1066,13 +1079,13 @@ void STDMETHODCALLTYPE CommandQueueX::EndEvent() {
 }
 
 HRESULT STDMETHODCALLTYPE CommandQueueX::Signal(ID3D12Fence* pFence, UINT64 Value) {
-    const HRESULT hr = host_queue_->Signal(pFence, Value);
+    const HRESULT hr = host_queue_->Signal(UnwrapFence(pFence), Value);
     RecordQueue("ID3D12CommandQueueX::Signal", 14, hr);
     return hr;
 }
 
 HRESULT STDMETHODCALLTYPE CommandQueueX::Wait(ID3D12Fence* pFence, UINT64 Value) {
-    const HRESULT hr = host_queue_->Wait(pFence, Value);
+    const HRESULT hr = host_queue_->Wait(UnwrapFence(pFence), Value);
     RecordQueue("ID3D12CommandQueueX::Wait", 15, hr);
     return hr;
 }
@@ -1739,7 +1752,7 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
         return E_INVALIDARG;
     }
 
-    ID3D12Resource* src_tex = pPlaneParameters[0].ppResources[0];
+    ID3D12Resource* src_tex = UnwrapResource(pPlaneParameters[0].ppResources[0]);
     const D3D12_RESOURCE_DESC src_desc = src_tex->GetDesc();
     if (src_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
         src_desc.Width == 0 || src_desc.Height == 0) {
@@ -2304,7 +2317,7 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::ResumeX() {
 
 HRESULT STDMETHODCALLTYPE CommandQueueX::KickoffX() {
     if (device_x_ && device_x_->HasDirtyUnifiedTextures() &&
-        host_queue_ && host_queue_->GetDesc().Type == D3D12_COMMAND_LIST_TYPE_DIRECT) {
+        host_queue_ && queue_type_ == D3D12_COMMAND_LIST_TYPE_DIRECT) {
         device_x_->FlushDirtyUnifiedTextures(host_queue_, nullptr);
     }
     {
