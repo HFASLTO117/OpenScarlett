@@ -1212,9 +1212,37 @@ Status DownloadHttpsFile(
 
 void CleanDirectoryBestEffort(const std::filesystem::path& dir) noexcept {
     std::error_code ec;
-    if (std::filesystem::exists(dir, ec)) {
-        std::filesystem::remove_all(dir, ec);
+    if (!std::filesystem::exists(dir, ec) || ec) {
+        return;
     }
+    std::filesystem::remove_all(dir, ec);
+    if (!ec) {
+        return;
+    }
+
+    // Retry after stripping read-only / system / hidden attributes on Windows.
+    std::error_code walk_ec;
+    for (std::filesystem::recursive_directory_iterator it(
+             dir, std::filesystem::directory_options::skip_permission_denied, walk_ec),
+         end;
+         it != end && !walk_ec;
+         it.increment(walk_ec)) {
+        SetFileAttributesW(it->path().c_str(), FILE_ATTRIBUTE_NORMAL);
+    }
+    SetFileAttributesW(dir.c_str(), FILE_ATTRIBUTE_NORMAL);
+    ec.clear();
+    std::filesystem::remove_all(dir, ec);
+}
+
+std::wstring StripTrailingSeparators(std::wstring path) {
+    while (path.size() > 1 && (path.back() == L'\\' || path.back() == L'/')) {
+        // Preserve Windows drive roots such as "C:\" or "E:\".
+        if (path.size() == 3 && path[1] == L':') {
+            break;
+        }
+        path.pop_back();
+    }
+    return path;
 }
 
 bool IsPathInsideDirectory(const std::filesystem::path& candidate,
@@ -1224,18 +1252,31 @@ bool IsPathInsideDirectory(const std::filesystem::path& candidate,
     if (ec) {
         return false;
     }
-    const std::filesystem::path norm_dir = std::filesystem::weakly_canonical(dir, ec);
+    std::filesystem::path norm_dir = std::filesystem::weakly_canonical(dir, ec);
     if (ec) {
         return false;
     }
 
-    auto it_dir = norm_dir.begin();
-    auto it_cand = norm_cand.begin();
-    for (; it_dir != norm_dir.end(); ++it_dir, ++it_cand) {
-        if (it_cand == norm_cand.end()) {
-            return false;
+    // Collect non-empty components so trailing slashes never break prefix matching.
+    std::vector<std::wstring> dir_parts;
+    for (const auto& part : norm_dir) {
+        const std::wstring w = part.wstring();
+        if (!w.empty()) {
+            dir_parts.push_back(w);
         }
-        if (!EqualsCaseInsensitive(WideToUtf8(it_dir->wstring()), WideToUtf8(it_cand->wstring()))) {
+    }
+    std::vector<std::wstring> cand_parts;
+    for (const auto& part : norm_cand) {
+        const std::wstring w = part.wstring();
+        if (!w.empty()) {
+            cand_parts.push_back(w);
+        }
+    }
+    if (dir_parts.empty() || cand_parts.size() < dir_parts.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < dir_parts.size(); ++i) {
+        if (!EqualsCaseInsensitive(WideToUtf8(dir_parts[i]), WideToUtf8(cand_parts[i]))) {
             return false;
         }
     }
@@ -1299,8 +1340,322 @@ std::wstring GetWindowsSystemExecutable(const wchar_t* relative_subpath) {
     return std::wstring(relative_subpath);
 }
 
-Status ExtractZipWithPowerShell(const std::filesystem::path& zip_path,
-                                const std::filesystem::path& extract_dir) {
+std::wstring QuoteWin32Arg(const std::wstring& arg) {
+    std::wstring out;
+    out.reserve(arg.size() + 4);
+    out.push_back(L'"');
+    size_t backslashes = 0;
+    for (wchar_t c : arg) {
+        if (c == L'\\') {
+            ++backslashes;
+        } else if (c == L'"') {
+            out.append(backslashes * 2 + 1, L'\\');
+            out.push_back(L'"');
+            backslashes = 0;
+        } else {
+            if (backslashes > 0) {
+                out.append(backslashes, L'\\');
+                backslashes = 0;
+            }
+            out.push_back(c);
+        }
+    }
+    if (backslashes > 0) {
+        out.append(backslashes * 2, L'\\');
+    }
+    out.push_back(L'"');
+    return out;
+}
+
+std::wstring Base64EncodeUtf16Le(const std::wstring& text) {
+    static constexpr wchar_t kTable[] =
+        L"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    std::vector<uint8_t> bytes;
+    bytes.reserve(text.size() * 2u);
+    for (wchar_t ch : text) {
+        const uint16_t u = static_cast<uint16_t>(ch);
+        bytes.push_back(static_cast<uint8_t>(u & 0xFFu));
+        bytes.push_back(static_cast<uint8_t>((u >> 8u) & 0xFFu));
+    }
+
+    std::wstring out;
+    out.reserve(((bytes.size() + 2u) / 3u) * 4u);
+    size_t i = 0;
+    while (i + 3u <= bytes.size()) {
+        const uint32_t triple = (static_cast<uint32_t>(bytes[i]) << 16u) |
+                                (static_cast<uint32_t>(bytes[i + 1u]) << 8u) |
+                                static_cast<uint32_t>(bytes[i + 2u]);
+        out.push_back(kTable[(triple >> 18u) & 0x3Fu]);
+        out.push_back(kTable[(triple >> 12u) & 0x3Fu]);
+        out.push_back(kTable[(triple >> 6u) & 0x3Fu]);
+        out.push_back(kTable[triple & 0x3Fu]);
+        i += 3u;
+    }
+    const size_t rem = bytes.size() - i;
+    if (rem == 1u) {
+        const uint32_t triple = static_cast<uint32_t>(bytes[i]) << 16u;
+        out.push_back(kTable[(triple >> 18u) & 0x3Fu]);
+        out.push_back(kTable[(triple >> 12u) & 0x3Fu]);
+        out.push_back(L'=');
+        out.push_back(L'=');
+    } else if (rem == 2u) {
+        const uint32_t triple = (static_cast<uint32_t>(bytes[i]) << 16u) |
+                                (static_cast<uint32_t>(bytes[i + 1u]) << 8u);
+        out.push_back(kTable[(triple >> 18u) & 0x3Fu]);
+        out.push_back(kTable[(triple >> 12u) & 0x3Fu]);
+        out.push_back(kTable[(triple >> 6u) & 0x3Fu]);
+        out.push_back(L'=');
+    }
+    return out;
+}
+
+uint16_t ReadLe16(const uint8_t* p) noexcept {
+    return static_cast<uint16_t>(static_cast<uint16_t>(p[0]) |
+                                 (static_cast<uint16_t>(p[1]) << 8u));
+}
+
+uint32_t ReadLe32(const uint8_t* p) noexcept {
+    return static_cast<uint32_t>(p[0]) |
+           (static_cast<uint32_t>(p[1]) << 8u) |
+           (static_cast<uint32_t>(p[2]) << 16u) |
+           (static_cast<uint32_t>(p[3]) << 24u);
+}
+
+uint32_t ComputeCrc32Ieee(const uint8_t* data, size_t len) noexcept {
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; ++i) {
+        crc ^= static_cast<uint32_t>(data[i]);
+        for (int b = 0; b < 8; ++b) {
+            const uint32_t mask = 0u - (crc & 1u);
+            crc = (crc >> 1u) ^ (0xEDB88320u & mask);
+        }
+    }
+    return ~crc;
+}
+
+bool DirectoryHasAnyEntries(const std::filesystem::path& dir) noexcept {
+    std::error_code ec;
+    const std::filesystem::directory_iterator it(dir, ec);
+    return !ec && (it != std::filesystem::directory_iterator());
+}
+
+// Clean-room pure C++ PKZIP STORE (compression method 0) fallback extractor.
+// Provides zero-subprocess extraction with strict Zip-Slip path validation and CRC-32 checks.
+Status ExtractStoredZipNative(const std::filesystem::path& zip_path,
+                              const std::filesystem::path& extract_dir) {
+    std::ifstream ifs(zip_path, std::ios::binary | std::ios::ate);
+    if (!ifs.is_open()) {
+        return Status::Error(StatusCode::IoError, "Unable to open zip archive for native extraction");
+    }
+    const std::streamoff end_pos = ifs.tellg();
+    if (end_pos < 22) {
+        return Status::Error(StatusCode::ParseError, "Zip archive is smaller than minimum EOCD size");
+    }
+    const size_t file_size = static_cast<size_t>(end_pos);
+    constexpr size_t kMaxNativeFallbackZipBytes = 256u * 1024u * 1024u;
+    if (file_size > kMaxNativeFallbackZipBytes) {
+        return Status::Error(StatusCode::IoError, "Zip archive exceeds native STORE fallback memory cap");
+    }
+
+    std::vector<uint8_t> buf(file_size);
+    ifs.seekg(0, std::ios::beg);
+    if (!ifs.read(reinterpret_cast<char*>(buf.data()), static_cast<std::streamsize>(file_size))) {
+        return Status::Error(StatusCode::IoError, "Failed to read zip archive bytes");
+    }
+
+    // Locate End of Central Directory (0x06054B50) scanning backwards (up to 64 KiB comment).
+    const size_t max_back = std::min<size_t>(file_size, 65535u + 22u);
+    const size_t min_eocd = file_size - max_back;
+    size_t eocd_pos = std::string::npos;
+    for (size_t pos = file_size - 22u;; --pos) {
+        if (ReadLe32(buf.data() + pos) == 0x06054B50u) {
+            const uint16_t comment_len = ReadLe16(buf.data() + pos + 20u);
+            if (pos + 22u + comment_len == file_size) {
+                eocd_pos = pos;
+                break;
+            }
+        }
+        if (pos == min_eocd) {
+            break;
+        }
+    }
+    if (eocd_pos == std::string::npos) {
+        return Status::Error(StatusCode::ParseError, "Zip EOCD record not found");
+    }
+
+    const uint16_t total_entries = ReadLe16(buf.data() + eocd_pos + 10u);
+    const uint32_t cd_size = ReadLe32(buf.data() + eocd_pos + 12u);
+    const uint32_t cd_offset = ReadLe32(buf.data() + eocd_pos + 16u);
+    if (total_entries == 0xFFFFu || cd_size == 0xFFFFFFFFu || cd_offset == 0xFFFFFFFFu) {
+        return Status::Error(StatusCode::ParseError, "Zip64 archives are not supported by native STORE fallback");
+    }
+    if (static_cast<uint64_t>(cd_offset) + static_cast<uint64_t>(cd_size) > file_size) {
+        return Status::Error(StatusCode::ParseError, "Zip central directory extends past end of file");
+    }
+
+    size_t cd_pos = cd_offset;
+    const size_t cd_end = static_cast<size_t>(cd_offset) + static_cast<size_t>(cd_size);
+    size_t extracted_count = 0;
+
+    for (uint16_t i = 0; i < total_entries; ++i) {
+        if (cd_pos + 46u > cd_end) {
+            return Status::Error(StatusCode::ParseError, "Truncated zip central directory entry");
+        }
+        const uint8_t* cd = buf.data() + cd_pos;
+        if (ReadLe32(cd) != 0x02014B50u) {
+            return Status::Error(StatusCode::ParseError, "Invalid zip central directory signature");
+        }
+
+        const uint16_t flags = ReadLe16(cd + 8u);
+        const uint16_t method = ReadLe16(cd + 10u);
+        const uint32_t expected_crc = ReadLe32(cd + 16u);
+        const uint32_t comp_size = ReadLe32(cd + 20u);
+        const uint32_t uncomp_size = ReadLe32(cd + 24u);
+        const uint16_t name_len = ReadLe16(cd + 28u);
+        const uint16_t extra_len = ReadLe16(cd + 30u);
+        const uint16_t comment_len = ReadLe16(cd + 32u);
+        const uint32_t local_hdr_off = ReadLe32(cd + 42u);
+
+        const size_t entry_total =
+            46u + static_cast<size_t>(name_len) + static_cast<size_t>(extra_len) + static_cast<size_t>(comment_len);
+        if (cd_pos + entry_total > cd_end) {
+            return Status::Error(StatusCode::ParseError, "Zip central directory entry overflows table");
+        }
+
+        if ((flags & 0x0001u) != 0u) {
+            return Status::Error(StatusCode::ParseError, "Encrypted zip entries are not supported");
+        }
+        if (method != 0u) {
+            std::ostringstream oss;
+            oss << "Native fallback supports STORE (method 0) only; entry uses compression method " << method;
+            return Status::Error(StatusCode::IoError, oss.str());
+        }
+        if (comp_size != uncomp_size) {
+            return Status::Error(StatusCode::ParseError, "STORE zip entry compressed/uncompressed size mismatch");
+        }
+
+        const std::string raw_name(reinterpret_cast<const char*>(cd + 46u), name_len);
+        cd_pos += entry_total;
+
+        if (raw_name.empty() || raw_name.find('\0') != std::string::npos ||
+            raw_name.find(':') != std::string::npos || raw_name[0] == '/' || raw_name[0] == '\\') {
+            return Status::Error(StatusCode::ParseError, "Rejected unsafe zip entry path");
+        }
+
+        const bool is_dir = (raw_name.back() == '/' || raw_name.back() == '\\');
+        std::filesystem::path rel_path;
+        size_t seg_start = 0;
+        while (seg_start < raw_name.size()) {
+            size_t seg_end = raw_name.find_first_of("/\\", seg_start);
+            if (seg_end == std::string::npos) {
+                seg_end = raw_name.size();
+            }
+            const std::string seg = raw_name.substr(seg_start, seg_end - seg_start);
+            seg_start = seg_end + 1u;
+            if (seg.empty() || seg == ".") {
+                continue;
+            }
+            if (seg == "..") {
+                return Status::Error(StatusCode::ParseError, "Rejected zip-slip '..' path traversal entry");
+            }
+            rel_path /= Utf8ToWide(seg);
+        }
+        if (rel_path.empty()) {
+            continue;
+        }
+
+        const std::filesystem::path out_path = extract_dir / rel_path;
+        if (!IsPathInsideDirectory(out_path, extract_dir)) {
+            return Status::Error(StatusCode::ParseError, "Rejected zip entry escaping extraction directory");
+        }
+
+        std::error_code ec;
+        if (is_dir) {
+            std::filesystem::create_directories(out_path, ec);
+            if (ec) {
+                return Status::Error(StatusCode::IoError, "Failed to create directory from zip: " + ec.message());
+            }
+            ++extracted_count;
+            continue;
+        }
+
+        if (static_cast<uint64_t>(local_hdr_off) + 30u > file_size) {
+            return Status::Error(StatusCode::ParseError, "Zip local file header offset out of range");
+        }
+        const uint8_t* lh = buf.data() + local_hdr_off;
+        if (ReadLe32(lh) != 0x04034B50u) {
+            return Status::Error(StatusCode::ParseError, "Invalid zip local file header signature");
+        }
+        const uint16_t lh_name_len = ReadLe16(lh + 26u);
+        const uint16_t lh_extra_len = ReadLe16(lh + 28u);
+        const uint64_t data_off = static_cast<uint64_t>(local_hdr_off) + 30u +
+                                  static_cast<uint64_t>(lh_name_len) +
+                                  static_cast<uint64_t>(lh_extra_len);
+        if (data_off + static_cast<uint64_t>(comp_size) > file_size) {
+            return Status::Error(StatusCode::ParseError, "Zip entry payload extends past end of file");
+        }
+
+        const uint8_t* payload = buf.data() + static_cast<size_t>(data_off);
+        const uint32_t actual_crc = ComputeCrc32Ieee(payload, comp_size);
+        if (actual_crc != expected_crc) {
+            return Status::Error(StatusCode::ParseError, "Zip entry CRC-32 mismatch during native extraction");
+        }
+
+        if (out_path.has_parent_path()) {
+            std::filesystem::create_directories(out_path.parent_path(), ec);
+            if (ec) {
+                return Status::Error(StatusCode::IoError, "Failed to create parent directory: " + ec.message());
+            }
+        }
+        std::ofstream ofs(out_path, std::ios::binary | std::ios::trunc);
+        if (!ofs.is_open()) {
+            return Status::Error(StatusCode::IoError, "Failed to create extracted file");
+        }
+        if (comp_size > 0) {
+            ofs.write(reinterpret_cast<const char*>(payload), static_cast<std::streamsize>(comp_size));
+        }
+        ofs.flush();
+        if (!ofs.good()) {
+            return Status::Error(StatusCode::IoError, "Failed to write extracted file bytes");
+        }
+        ++extracted_count;
+    }
+
+    if (extracted_count == 0) {
+        return Status::Error(StatusCode::ParseError, "Zip archive contained no extractable entries");
+    }
+    return Status::Ok();
+}
+
+Status ExtractZipArchive(const std::filesystem::path& zip_path,
+                         const std::filesystem::path& extract_dir) {
+    std::error_code norm_ec;
+    std::filesystem::path abs_zip = std::filesystem::absolute(zip_path, norm_ec);
+    if (norm_ec) {
+        abs_zip = zip_path;
+    }
+    abs_zip = std::filesystem::path(StripTrailingSeparators(abs_zip.lexically_normal().wstring()));
+
+    norm_ec.clear();
+    std::filesystem::path abs_dest = std::filesystem::absolute(extract_dir, norm_ec);
+    if (norm_ec) {
+        abs_dest = extract_dir;
+    }
+    abs_dest = std::filesystem::path(StripTrailingSeparators(abs_dest.lexically_normal().wstring()));
+
+    auto prepare_clean_dest = [&]() -> Status {
+        CleanDirectoryBestEffort(abs_dest);
+        std::error_code dir_ec;
+        std::filesystem::create_directories(abs_dest, dir_ec);
+        if (dir_ec) {
+            return Status::Error(
+                StatusCode::IoError,
+                "Failed to prepare clean extraction directory: " + dir_ec.message());
+        }
+        return Status::Ok();
+    };
+
     auto run_hidden = [](const std::wstring& exe, const std::wstring& cmdline, DWORD& out_exit) -> Status {
         std::vector<wchar_t> cmd_buf(cmdline.begin(), cmdline.end());
         cmd_buf.push_back(L'\0');
@@ -1343,47 +1698,97 @@ Status ExtractZipWithPowerShell(const std::filesystem::path& zip_path,
         return Status::Ok();
     };
 
+    std::ostringstream diag;
+
     // Fast path 1: Windows 10 1803+ / Windows 11 / Server 2019+ built-in System32\tar.exe
     // (handles ZIP STORE & DEFLATE natively without PowerShell or PSModulePath issues).
     const std::wstring tar_exe = GetWindowsSystemExecutable(L"tar.exe");
     std::error_code ec;
     if (std::filesystem::exists(tar_exe, ec) && !ec) {
+        Status prep_st = prepare_clean_dest();
+        if (!prep_st.ok()) {
+            return prep_st;
+        }
         const std::wstring tar_cmd =
-            L"\"" + tar_exe + L"\" -xf \"" + zip_path.wstring() +
-            L"\" -C \"" + extract_dir.wstring() + L"\"";
+            QuoteWin32Arg(tar_exe) + L" -xf " + QuoteWin32Arg(abs_zip.wstring()) +
+            L" -C " + QuoteWin32Arg(abs_dest.wstring());
         DWORD tar_exit = 1;
         const Status tar_st = run_hidden(tar_exe, tar_cmd, tar_exit);
-        if (tar_st.ok() && tar_exit == 0) {
+        if (tar_st.ok() && tar_exit == 0 && DirectoryHasAnyEntries(abs_dest)) {
             return Status::Ok();
         }
+        diag << "tar.exe(";
+        if (!tar_st.ok()) {
+            diag << tar_st.message;
+        } else if (tar_exit != 0) {
+            diag << "exit=" << tar_exit;
+        } else {
+            diag << "empty output";
+        }
+        diag << ")";
+    } else {
+        diag << "tar.exe(not found)";
     }
 
-    // Fallback 2: .NET System.IO.Compression.ZipFile via WindowsPowerShell (immune to pwsh7 PSModulePath
-    // pollution that breaks Expand-Archive's Microsoft.PowerShell.Archive module under GitHub Actions).
+    // Fallback 2: .NET System.IO.Compression.ZipFile via WindowsPowerShell with -EncodedCommand
+    // and direct Assembly::Load (zero PowerShell module imports, 100% immune to pwsh7 PSModulePath
+    // pollution AND path special characters like spaces, parentheses, $, &, or quotes).
     const std::wstring ps_exe =
         GetWindowsSystemExecutable(L"WindowsPowerShell\\v1.0\\powershell.exe");
+    ec.clear();
+    if (std::filesystem::exists(ps_exe, ec) && !ec) {
+        Status prep_st = prepare_clean_dest();
+        if (!prep_st.ok()) {
+            return prep_st;
+        }
 
-    const std::wstring escaped_zip = EscapePowerShellSingleQuoted(zip_path.wstring());
-    const std::wstring escaped_dest = EscapePowerShellSingleQuoted(extract_dir.wstring());
+        const std::wstring escaped_zip = EscapePowerShellSingleQuoted(abs_zip.wstring());
+        const std::wstring escaped_dest = EscapePowerShellSingleQuoted(abs_dest.wstring());
+        const std::wstring ps_script =
+            L"$ErrorActionPreference = 'Stop'; "
+            L"[void][System.Reflection.Assembly]::Load("
+            L"'System.IO.Compression.FileSystem, Version=4.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089'); "
+            L"[System.IO.Compression.ZipFile]::ExtractToDirectory('" + escaped_zip +
+            L"', '" + escaped_dest + L"')";
+        const std::wstring ps_encoded = Base64EncodeUtf16Le(ps_script);
 
-    const std::wstring ps_cmd =
-        L"\"" + ps_exe +
-        L"\" -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "
-        L"\"Add-Type -AssemblyName System.IO.Compression.FileSystem; "
-        L"[System.IO.Compression.ZipFile]::ExtractToDirectory('" + escaped_zip +
-        L"', '" + escaped_dest + L"')\"";
+        const std::wstring ps_cmd =
+            QuoteWin32Arg(ps_exe) +
+            L" -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand " + ps_encoded;
 
-    DWORD ps_exit = 1;
-    const Status ps_st = run_hidden(ps_exe, ps_cmd, ps_exit);
-    if (!ps_st.ok()) {
-        return ps_st;
+        DWORD ps_exit = 1;
+        const Status ps_st = run_hidden(ps_exe, ps_cmd, ps_exit);
+        if (ps_st.ok() && ps_exit == 0 && DirectoryHasAnyEntries(abs_dest)) {
+            return Status::Ok();
+        }
+        diag << "; powershell-zipfile(";
+        if (!ps_st.ok()) {
+            diag << ps_st.message;
+        } else if (ps_exit != 0) {
+            diag << "exit=" << ps_exit;
+        } else {
+            diag << "empty output";
+        }
+        diag << ")";
+    } else {
+        diag << "; powershell-zipfile(not found)";
     }
-    if (ps_exit != 0) {
-        std::ostringstream oss;
-        oss << "ZipFile extraction failed with exit code " << ps_exit;
-        return Status::Error(StatusCode::IoError, oss.str());
+
+    // Fallback 3: Built-in clean-room pure C++ PKZIP STORE (method 0) extractor
+    // (guarantees zero-subprocess extraction even on locked-down environments).
+    {
+        Status prep_st = prepare_clean_dest();
+        if (!prep_st.ok()) {
+            return prep_st;
+        }
+        const Status native_st = ExtractStoredZipNative(abs_zip, abs_dest);
+        if (native_st.ok() && DirectoryHasAnyEntries(abs_dest)) {
+            return Status::Ok();
+        }
+        diag << "; native-store(" << native_st.message << ")";
     }
-    return Status::Ok();
+
+    return Status::Error(StatusCode::IoError, "All zip extractors failed: " + diag.str());
 }
 
 std::filesystem::path ResolveExtractedPayloadDir(const std::filesystem::path& extract_dir) {
@@ -1415,9 +1820,12 @@ Status WriteRestartApplyScript(const std::filesystem::path& script_path,
                                const std::filesystem::path& staging_dir,
                                const std::filesystem::path& payload_dir,
                                const std::string& tag_name) {
-    const std::string app_str = EscapeBatchLiteral(WideToUtf8(app_dir.wstring()));
-    const std::string staging_str = EscapeBatchLiteral(WideToUtf8(staging_dir.wstring()));
-    const std::string payload_str = EscapeBatchLiteral(WideToUtf8(payload_dir.wstring()));
+    const std::string app_str = EscapeBatchLiteral(
+        WideToUtf8(StripTrailingSeparators(app_dir.wstring())));
+    const std::string staging_str = EscapeBatchLiteral(
+        WideToUtf8(StripTrailingSeparators(staging_dir.wstring())));
+    const std::string payload_str = EscapeBatchLiteral(
+        WideToUtf8(StripTrailingSeparators(payload_dir.wstring())));
     const std::string tag_str = EscapeBatchLiteral(tag_name);
 
     std::ostringstream script;
@@ -2043,8 +2451,8 @@ UpdateApplyResult VerifyAndStageLocalUpdateFiles(
         on_progress(p);
     }
 
-    // 3. Extract verified zip archive using native Windows PowerShell Expand-Archive.
-    st = ExtractZipWithPowerShell(zip_path, extract_dir);
+    // 3. Extract verified zip archive (tar.exe -> .NET ZipFile -> native STORE fallback).
+    st = ExtractZipArchive(zip_path, extract_dir);
     if (!st.ok()) {
         return fail_and_purge(st.message);
     }

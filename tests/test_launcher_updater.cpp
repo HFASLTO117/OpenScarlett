@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include "launcher_resource.h"
 #include "openscarlett/launcher/hwtest_runner.h"
 #include "openscarlett/launcher/updater.h"
 #include "os_check.h"
@@ -464,7 +465,80 @@ void TestSha256AndUpdateStaging(const fs::path& scratch_dir) {
         ::SetEnvironmentVariableW(L"OPENSCARLETT_NO_UPDATE_CHECK", pn > 0 ? prev : nullptr);
     }
 
-    std::printf("[PASS] Test 3: BCrypt SHA-256 vectors, valid staging, tampered zip rejection & offline guard\n");
+    // 3F. Regression: paths with spaces/parentheses + poisoned PSModulePath (GitHub Actions pwsh7 edge case)
+    {
+        struct ScopedEnvOverride {
+            std::wstring key;
+            bool existed = false;
+            std::wstring prev_val;
+            ScopedEnvOverride(std::wstring k, const wchar_t* new_val) : key(std::move(k)) {
+                const DWORD needed = ::GetEnvironmentVariableW(key.c_str(), nullptr, 0);
+                if (needed > 0) {
+                    prev_val.resize(needed);
+                    const DWORD got = ::GetEnvironmentVariableW(key.c_str(), prev_val.data(), needed);
+                    if (got > 0 && got < needed) {
+                        prev_val.resize(got);
+                        existed = true;
+                    }
+                }
+                ::SetEnvironmentVariableW(key.c_str(), new_val);
+            }
+            ~ScopedEnvOverride() {
+                ::SetEnvironmentVariableW(key.c_str(), existed ? prev_val.c_str() : nullptr);
+            }
+        };
+
+        const fs::path spaced_root = scratch_dir / "CI Dir With Spaces (x64 & Release)";
+        const fs::path spaced_app = spaced_root / "OpenScarlett App (Portable)";
+        const fs::path spaced_dl = spaced_root / "Download Cache (Spaces)";
+        fs::create_directories(spaced_app / "saves", ec);
+        fs::create_directories(spaced_dl, ec);
+
+        const std::string spaced_payload = "OpenScarlett spaced-path + poisoned PSModulePath payload\n";
+        const auto spaced_zip_bytes = BuildMinimalStoredZip("OpenScarlett_Spaced_Test.txt", spaced_payload);
+        const fs::path spaced_zip = spaced_dl / "OpenScarlett (v0.5.1) win64.zip";
+        {
+            std::ofstream ofs(spaced_zip, std::ios::binary | std::ios::trunc);
+            ofs.write(reinterpret_cast<const char*>(spaced_zip_bytes.data()),
+                      static_cast<std::streamsize>(spaced_zip_bytes.size()));
+        }
+
+        std::string spaced_hash;
+        OS_REQUIRE(ComputeFileSha256Hex(spaced_zip, spaced_hash).ok());
+        const fs::path spaced_sha = spaced_dl / "OpenScarlett (v0.5.1) win64.zip.sha256";
+        {
+            std::ofstream ofs(spaced_sha, std::ios::binary | std::ios::trunc);
+            ofs << spaced_hash << "  OpenScarlett (v0.5.1) win64.zip\n";
+        }
+
+        // Poison PSModulePath like a GitHub Actions pwsh7 step + bogus nonexistent path.
+        ScopedEnvOverride poison_ps(
+            L"PSModulePath",
+            L"C:\\Program Files\\PowerShell\\7\\Modules;Z:\\nonexistent_poisoned_psmodulepath");
+
+        int spaced_progress = 0;
+        const auto stage_spaced = VerifyAndStageLocalUpdateFiles(
+            spaced_zip, spaced_sha, spaced_app, "v0.5.1-alpha",
+            [&](const UpdateDownloadProgress&) { ++spaced_progress; });
+        if (!stage_spaced.ok) {
+            std::fprintf(stderr, "Spaced-path / poisoned PSModulePath staging failed: %s\n",
+                         stage_spaced.error_message.c_str());
+        }
+        OS_REQUIRE(stage_spaced.ok);
+        OS_REQUIRE(stage_spaced.verified_sha256 == spaced_hash);
+        OS_REQUIRE(fs::exists(stage_spaced.restart_script_path, ec));
+        OS_REQUIRE(spaced_progress > 0);
+
+        const fs::path extracted_file =
+            stage_spaced.staging_dir / "extracted" / "OpenScarlett_Spaced_Test.txt";
+        OS_REQUIRE(fs::exists(extracted_file, ec));
+        OS_REQUIRE(ReadTextFile(extracted_file) == spaced_payload);
+
+        const std::string spaced_script = ReadTextFile(stage_spaced.restart_script_path);
+        OS_REQUIRE(spaced_script.find("OpenScarlett App (Portable)") != std::string::npos);
+    }
+
+    std::printf("[PASS] Test 3: BCrypt SHA-256 vectors, valid staging, tampered zip rejection, spaces+PSModulePath regression & offline guard\n");
 }
 
 // ============================================================================
@@ -643,7 +717,32 @@ void TestLauncherExecutableSmoke(const fs::path& bin_dir) {
         OS_REQUIRE(r.stdout_text.find("[PASS]") != std::string::npos);
     }
 
-    std::printf("[PASS] Test 6: OpenScarlettLauncher.exe --version, --headless-check, --smoke-gui (HW + WARP)\n");
+    // 6E. Verify docs/icon.ico is genuinely embedded as IDI_APP_ICON in OpenScarlettLauncher.exe
+    {
+        HMODULE hmod = ::LoadLibraryExW(
+            launcher_exe.c_str(), nullptr, LOAD_LIBRARY_AS_DATAFILE);
+        OS_REQUIRE(hmod != nullptr);
+
+        const LPCWSTR kRtGroupIconW =
+            MAKEINTRESOURCEW(reinterpret_cast<ULONG_PTR>(RT_GROUP_ICON));
+        HRSRC hrsrc = ::FindResourceW(
+            hmod, MAKEINTRESOURCEW(IDI_APP_ICON), kRtGroupIconW);
+        OS_REQUIRE(hrsrc != nullptr);
+
+        HICON icon_32 = static_cast<HICON>(::LoadImageW(
+            hmod, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON, 32, 32, LR_DEFAULTCOLOR));
+        OS_REQUIRE(icon_32 != nullptr);
+        ::DestroyIcon(icon_32);
+
+        HICON icon_16 = static_cast<HICON>(::LoadImageW(
+            hmod, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR));
+        OS_REQUIRE(icon_16 != nullptr);
+        ::DestroyIcon(icon_16);
+
+        ::FreeLibrary(hmod);
+    }
+
+    std::printf("[PASS] Test 6: OpenScarlettLauncher.exe --version, --headless-check, --smoke-gui (HW + WARP) & embedded IDI_APP_ICON\n");
 }
 
 }  // namespace

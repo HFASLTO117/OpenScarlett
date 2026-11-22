@@ -3,9 +3,11 @@
 # Integrated 60s Hardware Self-Test Bridge & Opt-In WinHTTP/BCrypt SHA-256 Updater.
 
 if(WIN32)
+    enable_language(RC)
+
     function(_openscarlett_configure_launcher_target tgt)
         if(MSVC)
-            target_compile_options(${tgt} PRIVATE /W4)
+            target_compile_options(${tgt} PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:/W4>)
         elseif(MINGW)
             target_compile_definitions(${tgt} PRIVATE
                 OPENSCARLETT_MINGW=1
@@ -13,14 +15,17 @@ if(WIN32)
                 WINVER=0x0A00
             )
             target_compile_options(${tgt} PRIVATE
-                -Wall
-                -Wextra
-                -Wno-unknown-pragmas
-                -Wno-missing-field-initializers
-                -Wno-unused-parameter
+                $<$<COMPILE_LANGUAGE:C,CXX>:-Wall>
+                $<$<COMPILE_LANGUAGE:C,CXX>:-Wextra>
+                $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-unknown-pragmas>
+                $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-missing-field-initializers>
+                $<$<COMPILE_LANGUAGE:C,CXX>:-Wno-unused-parameter>
             )
         else()
-            target_compile_options(${tgt} PRIVATE -Wall -Wextra)
+            target_compile_options(${tgt} PRIVATE
+                $<$<COMPILE_LANGUAGE:C,CXX>:-Wall>
+                $<$<COMPILE_LANGUAGE:C,CXX>:-Wextra>
+            )
         endif()
     endfunction()
 
@@ -49,10 +54,15 @@ if(WIN32)
 
     add_executable(OpenScarlettLauncher WIN32
         src/launcher/launcher_main.cpp
+        src/launcher/launcher.rc
+    )
+    set_source_files_properties(src/launcher/launcher.rc PROPERTIES
+        OBJECT_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/docs/icon.ico"
     )
     target_include_directories(OpenScarlettLauncher PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src/launcher
+        ${CMAKE_CURRENT_SOURCE_DIR}/docs
     )
     target_compile_definitions(OpenScarlettLauncher PRIVATE
         WIN32_LEAN_AND_MEAN
@@ -86,6 +96,9 @@ if(WIN32)
     _openscarlett_configure_launcher_target(OpenScarlettLauncher)
 
     openscarlett_add_test(test_launcher_updater tests/test_launcher_updater.cpp)
+    target_include_directories(test_launcher_updater PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/launcher
+    )
     target_link_libraries(test_launcher_updater PRIVATE
         openscarlett_launcher_core
         d2d1
