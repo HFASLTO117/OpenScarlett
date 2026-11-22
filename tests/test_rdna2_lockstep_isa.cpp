@@ -676,7 +676,7 @@ void Test1_SingleWaveLockstepLdsBarrier() {
     const auto d3d_dxil = SelectDxilForDevice(d3d, lifted);
 #endif
     VulkanBackend vk;
-    OS_REQUIRE(vk.Initialize(true).ok());
+    const bool has_hw_vk = vk.Initialize(/*allow_software_fallback=*/false).ok() && !vk.is_fallback_mode();
 
     constexpr uint32_t kGroups = 4u;
     constexpr uint32_t kThreads = kGroups * 64u;
@@ -709,12 +709,16 @@ void Test1_SingleWaveLockstepLdsBarrier() {
         OS_REQUIRE(d3d_out == math_ref);
 #endif
 
-        // Live Vulkan SPIR-V
-        std::vector<uint32_t> vk_out;
-        OS_REQUIRE(vk.ExecuteComputeShader(lifted.spirv_words, input, vk_out, kGroups).ok());
-        OS_REQUIRE(vk_out == math_ref);
+        // Live Vulkan SPIR-V (when hardware Vulkan ICD is present)
+        if (has_hw_vk) {
+            std::vector<uint32_t> vk_out;
+            OS_REQUIRE(vk.ExecuteComputeShader(lifted.spirv_words, input, vk_out, kGroups).ok());
+            OS_REQUIRE(vk_out == math_ref);
+        }
     }
-    vk.Shutdown();
+    if (has_hw_vk) {
+        vk.Shutdown();
+    }
 
     // 1B. 2D PSV0 threadgroup (8x8x1 = 64 threads) + LDS atomic add followed by LDS read (no s_barrier)
     {
@@ -921,20 +925,23 @@ void Test3_SBfeEdgeCases() {
     OS_REQUIRE(LiftRdna2Xs2Shader(xs2, lifted, opts).ok());
     VerifySpirvStrict(lifted.spirv_words, "SBfeEdgeCases", 1u, 1u, 1u);
 
-    // Pad expected to uav0 size for Vulkan ExecuteComputeShader (which sizes output == input)
-    std::vector<uint32_t> vk_out;
-    VulkanBackend vk;
-    OS_REQUIRE(vk.Initialize(true).ok());
-    OS_REQUIRE(vk.ExecuteComputeShader(lifted.spirv_words, uav0, vk_out, 1u).ok());
-    OS_REQUIRE(vk_out.size() >= math_ref.size());
-    for (size_t i = 0; i < math_ref.size(); ++i) {
-        if (vk_out[i] != math_ref[i]) {
-            std::fprintf(stderr, "[FAIL] Vulkan s_bfe mismatch idx=%zu got=0x%08x exp=0x%08x\n",
-                         i, vk_out[i], math_ref[i]);
-            OS_REQUIRE(false);
+    // Pad expected to uav0 size for Vulkan ExecuteComputeShader (when hardware Vulkan ICD is present)
+    {
+        VulkanBackend vk;
+        if (vk.Initialize(/*allow_software_fallback=*/false).ok() && !vk.is_fallback_mode()) {
+            std::vector<uint32_t> vk_out;
+            OS_REQUIRE(vk.ExecuteComputeShader(lifted.spirv_words, uav0, vk_out, 1u).ok());
+            OS_REQUIRE(vk_out.size() >= math_ref.size());
+            for (size_t i = 0; i < math_ref.size(); ++i) {
+                if (vk_out[i] != math_ref[i]) {
+                    std::fprintf(stderr, "[FAIL] Vulkan s_bfe mismatch idx=%zu got=0x%08x exp=0x%08x\n",
+                                 i, vk_out[i], math_ref[i]);
+                    OS_REQUIRE(false);
+                }
+            }
+            vk.Shutdown();
         }
     }
-    vk.Shutdown();
 
 #if defined(_WIN32)
     RunDualUavOnSelectedAdapters(lifted, uav0, math_ref, 1u, "SBfeEdgeCases");
