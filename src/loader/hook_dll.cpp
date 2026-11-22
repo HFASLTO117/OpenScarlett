@@ -42,6 +42,26 @@ using PfnDeleteFileW = BOOL(WINAPI*)(LPCWSTR);
 using PfnMoveFileExW = BOOL(WINAPI*)(LPCWSTR, LPCWSTR, DWORD);
 using PfnRemoveDirectoryW = BOOL(WINAPI*)(LPCWSTR);
 using PfnFindFirstFileW = HANDLE(WINAPI*)(LPCWSTR, LPWIN32_FIND_DATAW);
+using PfnCreateProcessA = BOOL(WINAPI*)(LPCSTR,
+                                        LPSTR,
+                                        LPSECURITY_ATTRIBUTES,
+                                        LPSECURITY_ATTRIBUTES,
+                                        BOOL,
+                                        DWORD,
+                                        LPVOID,
+                                        LPCSTR,
+                                        LPSTARTUPINFOA,
+                                        LPPROCESS_INFORMATION);
+using PfnCreateProcessW = BOOL(WINAPI*)(LPCWSTR,
+                                        LPWSTR,
+                                        LPSECURITY_ATTRIBUTES,
+                                        LPSECURITY_ATTRIBUTES,
+                                        BOOL,
+                                        DWORD,
+                                        LPVOID,
+                                        LPCWSTR,
+                                        LPSTARTUPINFOW,
+                                        LPPROCESS_INFORMATION);
 using PfnExitProcess = VOID(WINAPI*)(UINT);
 
 PfnLoadLibraryA g_real_LoadLibraryA = nullptr;
@@ -64,15 +84,23 @@ PfnDeleteFileW g_real_DeleteFileW = nullptr;
 PfnMoveFileExW g_real_MoveFileExW = nullptr;
 PfnRemoveDirectoryW g_real_RemoveDirectoryW = nullptr;
 PfnFindFirstFileW g_real_FindFirstFileW = nullptr;
+PfnCreateProcessA g_real_CreateProcessA = nullptr;
+PfnCreateProcessW g_real_CreateProcessW = nullptr;
+PfnCreateProcessA g_kernelbase_CreateProcessA = nullptr;
+PfnCreateProcessW g_kernelbase_CreateProcessW = nullptr;
 PfnExitProcess g_real_ExitProcess = nullptr;
 
 // ---------------------------------------------------------------------------
 // Hook Runtime State
 // ---------------------------------------------------------------------------
 HMODULE g_self_module = nullptr;
+HMODULE g_kernel32_mod = nullptr;
+HMODULE g_kernelbase_mod = nullptr;
 std::wstring g_shim_dir_w;
+std::wstring g_hook_dll_path_w;
 std::wstring g_guest_dir_w;
 std::wstring g_windows_dir_lower_w;
+std::wstring g_telemetry_base_w;
 std::string g_telemetry_path_utf8;
 openscarlett::VfsMounts g_vfs;
 openscarlett::DllRoutingTable g_routing_table;
@@ -95,6 +123,7 @@ std::unordered_map<HMODULE, PatchedModuleKey> g_patched_modules;
 
 thread_local uint32_t tl_forwarder_depth = 0;
 thread_local bool tl_in_topo_preload = false;
+thread_local bool tl_in_create_process_hook = false;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -303,6 +332,26 @@ int FlushTelemetryInternal(bool only_once) {
 void PatchModuleImports(HMODULE mod);
 void PatchAllLoadedNonSystemModules();
 FARPROC WINAPI Hook_GetProcAddress(HMODULE hModule, LPCSTR lpProcName);
+BOOL WINAPI Hook_CreateProcessA(LPCSTR lpApplicationName,
+                                LPSTR lpCommandLine,
+                                LPSECURITY_ATTRIBUTES lpProcessAttributes,
+                                LPSECURITY_ATTRIBUTES lpThreadAttributes,
+                                BOOL bInheritHandles,
+                                DWORD dwCreationFlags,
+                                LPVOID lpEnvironment,
+                                LPCSTR lpCurrentDirectory,
+                                LPSTARTUPINFOA lpStartupInfo,
+                                LPPROCESS_INFORMATION lpProcessInformation);
+BOOL WINAPI Hook_CreateProcessW(LPCWSTR lpApplicationName,
+                                LPWSTR lpCommandLine,
+                                LPSECURITY_ATTRIBUTES lpProcessAttributes,
+                                LPSECURITY_ATTRIBUTES lpThreadAttributes,
+                                BOOL bInheritHandles,
+                                DWORD dwCreationFlags,
+                                LPVOID lpEnvironment,
+                                LPCWSTR lpCurrentDirectory,
+                                LPSTARTUPINFOW lpStartupInfo,
+                                LPPROCESS_INFORMATION lpProcessInformation);
 
 // ---------------------------------------------------------------------------
 // Topological DLL Dependency Pre-Loader (Kahn's Sort over PE Import Graph)
@@ -738,6 +787,20 @@ BOOL WINAPI Hook_GetModuleHandleExW(DWORD dwFlags, LPCWSTR lpModuleName, HMODULE
 }
 
 FARPROC WINAPI Hook_GetProcAddress(HMODULE hModule, LPCSTR lpProcName) {
+    // Intercept dynamic GetProcAddress lookups for CreateProcessW/A on kernel32/kernelbase
+    // so guest launchers that resolve process creation dynamically still propagate hooks.
+    if (!g_shutting_down.load(std::memory_order_acquire) &&
+        hModule != nullptr &&
+        reinterpret_cast<uintptr_t>(lpProcName) > 0xFFFFu &&
+        (hModule == g_kernel32_mod || (g_kernelbase_mod != nullptr && hModule == g_kernelbase_mod))) {
+        if (g_real_CreateProcessW != nullptr && std::strcmp(lpProcName, "CreateProcessW") == 0) {
+            return reinterpret_cast<FARPROC>(&Hook_CreateProcessW);
+        }
+        if (g_real_CreateProcessA != nullptr && std::strcmp(lpProcName, "CreateProcessA") == 0) {
+            return reinterpret_cast<FARPROC>(&Hook_CreateProcessA);
+        }
+    }
+
     // Intercept forwarded exports targeting shimmed Xbox DLLs BEFORE Windows resolves them
     // against C:\Windows\System32\.
     if (!g_shutting_down.load(std::memory_order_acquire) &&
@@ -1360,6 +1423,336 @@ HANDLE WINAPI Hook_FindFirstFileW(LPCWSTR lpFileName, LPWIN32_FIND_DATAW lpFindF
     return g_real_FindFirstFileW(lpFileName, lpFindFileData);
 }
 
+// ---------------------------------------------------------------------------
+// Hook Implementations: Win32 Child-Process Hook Propagation
+//   Hooks CreateProcessW / CreateProcessA so non-Store guest launchers
+//   (e.g. Unreal Game.exe -> *-Win64-Shipping.exe) propagate OPENSCARLETT_*
+//   environment variables, non-clobbering per-PID child telemetry paths, and
+//   openscarlett_hook.dll APC injection into spawned Win32 children.
+// ---------------------------------------------------------------------------
+std::wstring QueryChildProcessImagePathW(HANDLE h_process) {
+    if (!h_process) {
+        return {};
+    }
+    std::wstring buf(MAX_PATH, L'\0');
+    for (;;) {
+        DWORD size = static_cast<DWORD>(buf.size());
+        if (::QueryFullProcessImageNameW(h_process, 0, buf.data(), &size)) {
+            buf.resize(size);
+            return buf;
+        }
+        if (::GetLastError() != ERROR_INSUFFICIENT_BUFFER || buf.size() >= 32768u) {
+            return {};
+        }
+        buf.resize(buf.size() * 2u);
+    }
+}
+
+bool IsProtectedStoreOrSystemExeW(const std::wstring& exe_path) {
+    if (exe_path.empty()) {
+        return false;
+    }
+    std::wstring lo = ToLowerAsciiW(exe_path);
+    for (wchar_t& c : lo) {
+        if (c == L'/') {
+            c = L'\\';
+        }
+    }
+    if (lo.find(L"\\windowsapps\\") != std::wstring::npos) {
+        return true;
+    }
+    if (!g_windows_dir_lower_w.empty()) {
+        const std::wstring sys32 = g_windows_dir_lower_w + L"\\system32\\";
+        const std::wstring syswow = g_windows_dir_lower_w + L"\\syswow64\\";
+        if (lo.rfind(sys32, 0) == 0 || lo.rfind(syswow, 0) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::string WideToAnsiAcp(std::wstring_view wide) {
+    if (wide.empty()) {
+        return {};
+    }
+    const int needed = ::WideCharToMultiByte(
+        CP_ACP, 0, wide.data(), static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr);
+    if (needed <= 0) {
+        return {};
+    }
+    std::string out(static_cast<size_t>(needed), '\0');
+    ::WideCharToMultiByte(
+        CP_ACP, 0, wide.data(), static_cast<int>(wide.size()), out.data(), needed, nullptr, nullptr);
+    return out;
+}
+
+void PropagateHookToCreatedChild(const PROCESS_INFORMATION& pi,
+                                 bool caller_suspended,
+                                 const char* api_tag) {
+    const std::wstring child_exe_w = QueryChildProcessImagePathW(pi.hProcess);
+
+    // Strictly respect Microsoft Store / WindowsApps & Windows system process boundaries.
+    if (IsProtectedStoreOrSystemExeW(child_exe_w)) {
+        openscarlett::CallTelemetry::Global().Record(
+            "loader",
+            std::string(api_tag) + ":child_skipped_protected",
+            openscarlett::CallOutcome::StubOk,
+            static_cast<int32_t>(pi.dwProcessId),
+            -1);
+        if (!caller_suspended) {
+            ::ResumeThread(pi.hThread);
+        }
+        return;
+    }
+
+    if (!g_telemetry_base_w.empty() && pi.dwProcessId != 0u) {
+        const std::wstring expected_child_tel =
+            openscarlett::FormatChildTelemetryPathW(g_telemetry_base_w, pi.dwProcessId);
+        if (!expected_child_tel.empty()) {
+            const std::wstring parent_dir =
+                std::filesystem::path(expected_child_tel).parent_path().wstring();
+            if (!parent_dir.empty()) {
+                openscarlett::EnsureDirectoryTreeW(parent_dir);
+            }
+        }
+    }
+
+    const std::wstring child_guest_dir_w =
+        !child_exe_w.empty() ? std::filesystem::path(child_exe_w).parent_path().wstring() : g_guest_dir_w;
+
+    uint32_t inject_win32_err = 0u;
+    const openscarlett::Status st = openscarlett::InjectHookDllIntoSuspendedProcess(
+        pi.hProcess,
+        pi.hThread,
+        g_hook_dll_path_w,
+        g_shim_dir_w,
+        child_guest_dir_w,
+        &inject_win32_err);
+
+    if (st.ok()) {
+        openscarlett::CallTelemetry::Global().Record(
+            "loader",
+            std::string(api_tag) + ":child_hook_propagated",
+            openscarlett::CallOutcome::Ok,
+            static_cast<int32_t>(pi.dwProcessId),
+            -1);
+    } else {
+        // Gracefully fall back on ERROR_ACCESS_DENIED (protected process) or incompatible arch
+        // without terminating or breaking child launch.
+        const std::string sym =
+            std::string(api_tag) +
+            (inject_win32_err == ERROR_ACCESS_DENIED ? ":child_access_denied_fallback"
+                                                     : ":child_inject_skipped");
+        openscarlett::CallTelemetry::Global().Record(
+            "loader",
+            sym,
+            openscarlett::CallOutcome::StubOk,
+            static_cast<int32_t>(inject_win32_err),
+            -1);
+    }
+
+    if (!caller_suspended) {
+        ::ResumeThread(pi.hThread);
+    }
+}
+
+BOOL WINAPI Hook_CreateProcessW(LPCWSTR lpApplicationName,
+                                LPWSTR lpCommandLine,
+                                LPSECURITY_ATTRIBUTES lpProcessAttributes,
+                                LPSECURITY_ATTRIBUTES lpThreadAttributes,
+                                BOOL bInheritHandles,
+                                DWORD dwCreationFlags,
+                                LPVOID lpEnvironment,
+                                LPCWSTR lpCurrentDirectory,
+                                LPSTARTUPINFOW lpStartupInfo,
+                                LPPROCESS_INFORMATION lpProcessInformation) {
+    if (!g_real_CreateProcessW) {
+        ::SetLastError(ERROR_PROC_NOT_FOUND);
+        return FALSE;
+    }
+    if (g_shutting_down.load(std::memory_order_acquire) ||
+        tl_in_create_process_hook ||
+        !lpProcessInformation ||
+        g_hook_dll_path_w.empty()) {
+        return g_real_CreateProcessW(lpApplicationName,
+                                     lpCommandLine,
+                                     lpProcessAttributes,
+                                     lpThreadAttributes,
+                                     bInheritHandles,
+                                     dwCreationFlags,
+                                     lpEnvironment,
+                                     lpCurrentDirectory,
+                                     lpStartupInfo,
+                                     lpProcessInformation);
+    }
+
+    tl_in_create_process_hook = true;
+    struct RecursionGuard {
+        ~RecursionGuard() { tl_in_create_process_hook = false; }
+    } guard;
+
+    std::wstring translated_app;
+    LPCWSTR effective_app = lpApplicationName;
+    if (lpApplicationName != nullptr &&
+        openscarlett::VfsMounts::DetectVirtualDriveW(lpApplicationName) != openscarlett::VfsDrive::None) {
+        if (g_vfs.TranslateForAccessW(lpApplicationName,
+                                      openscarlett::VfsAccessMode::ReadOnly,
+                                      translated_app,
+                                      nullptr,
+                                      true) == openscarlett::VfsTranslateStatus::Translated) {
+            effective_app = translated_app.c_str();
+        }
+    }
+
+    std::wstring translated_cwd;
+    LPCWSTR effective_cwd = lpCurrentDirectory;
+    if (lpCurrentDirectory != nullptr &&
+        openscarlett::VfsMounts::DetectVirtualDriveW(lpCurrentDirectory) != openscarlett::VfsDrive::None) {
+        if (g_vfs.TranslateForAccessW(lpCurrentDirectory,
+                                      openscarlett::VfsAccessMode::ReadOnly,
+                                      translated_cwd,
+                                      nullptr,
+                                      true) == openscarlett::VfsTranslateStatus::Translated) {
+            effective_cwd = translated_cwd.c_str();
+        }
+    }
+
+    const bool caller_suspended = (dwCreationFlags & CREATE_SUSPENDED) != 0;
+    const bool caller_env_unicode = (dwCreationFlags & CREATE_UNICODE_ENVIRONMENT) != 0;
+
+    std::vector<wchar_t> merged_env = openscarlett::MergeOpenScarlettEnvironmentBlockW(
+        lpEnvironment,
+        caller_env_unicode,
+        g_shim_dir_w,
+        g_hook_dll_path_w,
+        g_telemetry_base_w,
+        !g_telemetry_base_w.empty());
+
+    const DWORD child_flags = dwCreationFlags | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT;
+    const BOOL created = g_real_CreateProcessW(effective_app,
+                                               lpCommandLine,
+                                               lpProcessAttributes,
+                                               lpThreadAttributes,
+                                               bInheritHandles,
+                                               child_flags,
+                                               merged_env.data(),
+                                               effective_cwd,
+                                               lpStartupInfo,
+                                               lpProcessInformation);
+    const DWORD create_err = ::GetLastError();
+    if (!created) {
+        ::SetLastError(create_err);
+        return FALSE;
+    }
+
+    PropagateHookToCreatedChild(*lpProcessInformation, caller_suspended, "CreateProcessW");
+    ::SetLastError(create_err);
+    return TRUE;
+}
+
+BOOL WINAPI Hook_CreateProcessA(LPCSTR lpApplicationName,
+                                LPSTR lpCommandLine,
+                                LPSECURITY_ATTRIBUTES lpProcessAttributes,
+                                LPSECURITY_ATTRIBUTES lpThreadAttributes,
+                                BOOL bInheritHandles,
+                                DWORD dwCreationFlags,
+                                LPVOID lpEnvironment,
+                                LPCSTR lpCurrentDirectory,
+                                LPSTARTUPINFOA lpStartupInfo,
+                                LPPROCESS_INFORMATION lpProcessInformation) {
+    if (!g_real_CreateProcessA) {
+        ::SetLastError(ERROR_PROC_NOT_FOUND);
+        return FALSE;
+    }
+    if (g_shutting_down.load(std::memory_order_acquire) ||
+        tl_in_create_process_hook ||
+        !lpProcessInformation ||
+        g_hook_dll_path_w.empty()) {
+        return g_real_CreateProcessA(lpApplicationName,
+                                     lpCommandLine,
+                                     lpProcessAttributes,
+                                     lpThreadAttributes,
+                                     bInheritHandles,
+                                     dwCreationFlags,
+                                     lpEnvironment,
+                                     lpCurrentDirectory,
+                                     lpStartupInfo,
+                                     lpProcessInformation);
+    }
+
+    tl_in_create_process_hook = true;
+    struct RecursionGuard {
+        ~RecursionGuard() { tl_in_create_process_hook = false; }
+    } guard;
+
+    std::string translated_app_a;
+    LPCSTR effective_app = lpApplicationName;
+    if (lpApplicationName != nullptr &&
+        openscarlett::VfsMounts::DetectVirtualDriveA(lpApplicationName) != openscarlett::VfsDrive::None) {
+        std::wstring host_w;
+        if (g_vfs.TranslateForAccessW(AnsiToWide(lpApplicationName),
+                                      openscarlett::VfsAccessMode::ReadOnly,
+                                      host_w,
+                                      nullptr,
+                                      true) == openscarlett::VfsTranslateStatus::Translated) {
+            translated_app_a = WideToAnsiAcp(host_w);
+            if (!translated_app_a.empty()) {
+                effective_app = translated_app_a.c_str();
+            }
+        }
+    }
+
+    std::string translated_cwd_a;
+    LPCSTR effective_cwd = lpCurrentDirectory;
+    if (lpCurrentDirectory != nullptr &&
+        openscarlett::VfsMounts::DetectVirtualDriveA(lpCurrentDirectory) != openscarlett::VfsDrive::None) {
+        std::wstring host_w;
+        if (g_vfs.TranslateForAccessW(AnsiToWide(lpCurrentDirectory),
+                                      openscarlett::VfsAccessMode::ReadOnly,
+                                      host_w,
+                                      nullptr,
+                                      true) == openscarlett::VfsTranslateStatus::Translated) {
+            translated_cwd_a = WideToAnsiAcp(host_w);
+            if (!translated_cwd_a.empty()) {
+                effective_cwd = translated_cwd_a.c_str();
+            }
+        }
+    }
+
+    const bool caller_suspended = (dwCreationFlags & CREATE_SUSPENDED) != 0;
+    const bool caller_env_unicode = (dwCreationFlags & CREATE_UNICODE_ENVIRONMENT) != 0;
+
+    std::vector<wchar_t> merged_env = openscarlett::MergeOpenScarlettEnvironmentBlockW(
+        lpEnvironment,
+        caller_env_unicode,
+        g_shim_dir_w,
+        g_hook_dll_path_w,
+        g_telemetry_base_w,
+        !g_telemetry_base_w.empty());
+
+    // Win32 CreateProcessA supports Unicode lpEnvironment when CREATE_UNICODE_ENVIRONMENT is set.
+    const DWORD child_flags = dwCreationFlags | CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT;
+    const BOOL created = g_real_CreateProcessA(effective_app,
+                                               lpCommandLine,
+                                               lpProcessAttributes,
+                                               lpThreadAttributes,
+                                               bInheritHandles,
+                                               child_flags,
+                                               merged_env.data(),
+                                               effective_cwd,
+                                               lpStartupInfo,
+                                               lpProcessInformation);
+    const DWORD create_err = ::GetLastError();
+    if (!created) {
+        ::SetLastError(create_err);
+        return FALSE;
+    }
+
+    PropagateHookToCreatedChild(*lpProcessInformation, caller_suspended, "CreateProcessA");
+    ::SetLastError(create_err);
+    return TRUE;
+}
+
 VOID WINAPI Hook_ExitProcess(UINT uExitCode) {
     FlushTelemetryInternal(true);
     g_shutting_down.store(true, std::memory_order_release);
@@ -1420,6 +1813,10 @@ void* ResolveHookForSymbol(const char* name) {
          reinterpret_cast<void**>(&g_real_RemoveDirectoryW)},
         {"FindFirstFileW", reinterpret_cast<void*>(&Hook_FindFirstFileW),
          reinterpret_cast<void**>(&g_real_FindFirstFileW)},
+        {"CreateProcessA", reinterpret_cast<void*>(&Hook_CreateProcessA),
+         reinterpret_cast<void**>(&g_real_CreateProcessA)},
+        {"CreateProcessW", reinterpret_cast<void*>(&Hook_CreateProcessW),
+         reinterpret_cast<void**>(&g_real_CreateProcessW)},
         {"ExitProcess", reinterpret_cast<void*>(&Hook_ExitProcess),
          reinterpret_cast<void**>(&g_real_ExitProcess)},
     };
@@ -1461,6 +1858,10 @@ void* ResolveHookForRealAddress(ULONGLONG addr) {
     if (void* p = match(g_real_MoveFileExW, &Hook_MoveFileExW)) return p;
     if (void* p = match(g_real_RemoveDirectoryW, &Hook_RemoveDirectoryW)) return p;
     if (void* p = match(g_real_FindFirstFileW, &Hook_FindFirstFileW)) return p;
+    if (void* p = match(g_real_CreateProcessA, &Hook_CreateProcessA)) return p;
+    if (void* p = match(g_real_CreateProcessW, &Hook_CreateProcessW)) return p;
+    if (void* p = match(g_kernelbase_CreateProcessA, &Hook_CreateProcessA)) return p;
+    if (void* p = match(g_kernelbase_CreateProcessW, &Hook_CreateProcessW)) return p;
     if (void* p = match(g_real_ExitProcess, &Hook_ExitProcess)) return p;
     return nullptr;
 }
@@ -1675,6 +2076,27 @@ void PatchModuleImports(HMODULE mod) {
     const auto& imp_dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
     if (imp_dir.VirtualAddress != 0 && imp_dir.VirtualAddress < image_size) {
         auto* desc = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(base + imp_dir.VirtualAddress);
+        bool module_has_console_exclusive = false;
+        if (!is_shim_module) {
+            for (size_t idx = 0; idx < 2048; ++idx) {
+                if (imp_dir.VirtualAddress + (idx + 1) * sizeof(IMAGE_IMPORT_DESCRIPTOR) > image_size) {
+                    break;
+                }
+                const auto& d = desc[idx];
+                if (d.OriginalFirstThunk == 0 && d.Name == 0 && d.FirstThunk == 0) {
+                    break;
+                }
+                if (d.Name == 0 || d.Name >= image_size) {
+                    continue;
+                }
+                const char* dll_name = reinterpret_cast<const char*>(base + d.Name);
+                if (openscarlett::ClassifyImportDll(dll_name) ==
+                    openscarlett::DllCategory::ConsoleExclusive) {
+                    module_has_console_exclusive = true;
+                    break;
+                }
+            }
+        }
         for (size_t idx = 0; idx < 2048; ++idx) {
             if (imp_dir.VirtualAddress + (idx + 1) * sizeof(IMAGE_IMPORT_DESCRIPTOR) > image_size) {
                 break;
@@ -1690,7 +2112,8 @@ void PatchModuleImports(HMODULE mod) {
             if (IsHookableImportDll(dll_name)) {
                 PatchThunkTable(base, image_size, d.OriginalFirstThunk, d.FirstThunk);
             } else if (!is_shim_module) {
-                const auto decision = g_routing_table.ResolveRoute(dll_name, g_shim_dir_w, g_guest_dir_w);
+                const auto decision = g_routing_table.ResolveRoute(
+                    dll_name, g_shim_dir_w, g_guest_dir_w, module_has_console_exclusive);
                 if (decision.policy == openscarlett::DllRoutePolicy::Shim &&
                     !decision.resolved_path.empty()) {
                     deferred_shim_iats.push_back(
@@ -1806,6 +2229,8 @@ bool InitializeHookRuntime(HMODULE self_mod) {
     if (!k32) {
         return false;
     }
+    g_kernel32_mod = k32;
+    g_kernelbase_mod = ::GetModuleHandleW(L"kernelbase.dll");
 
     g_real_LoadLibraryA = reinterpret_cast<PfnLoadLibraryA>(::GetProcAddress(k32, "LoadLibraryA"));
     g_real_LoadLibraryW = reinterpret_cast<PfnLoadLibraryW>(::GetProcAddress(k32, "LoadLibraryW"));
@@ -1827,6 +2252,14 @@ bool InitializeHookRuntime(HMODULE self_mod) {
     g_real_MoveFileExW = reinterpret_cast<PfnMoveFileExW>(::GetProcAddress(k32, "MoveFileExW"));
     g_real_RemoveDirectoryW = reinterpret_cast<PfnRemoveDirectoryW>(::GetProcAddress(k32, "RemoveDirectoryW"));
     g_real_FindFirstFileW = reinterpret_cast<PfnFindFirstFileW>(::GetProcAddress(k32, "FindFirstFileW"));
+    g_real_CreateProcessA = reinterpret_cast<PfnCreateProcessA>(::GetProcAddress(k32, "CreateProcessA"));
+    g_real_CreateProcessW = reinterpret_cast<PfnCreateProcessW>(::GetProcAddress(k32, "CreateProcessW"));
+    if (g_kernelbase_mod != nullptr) {
+        g_kernelbase_CreateProcessA =
+            reinterpret_cast<PfnCreateProcessA>(::GetProcAddress(g_kernelbase_mod, "CreateProcessA"));
+        g_kernelbase_CreateProcessW =
+            reinterpret_cast<PfnCreateProcessW>(::GetProcAddress(g_kernelbase_mod, "CreateProcessW"));
+    }
     g_real_ExitProcess = reinterpret_cast<PfnExitProcess>(::GetProcAddress(k32, "ExitProcess"));
 
     // Resolve %SystemRoot% for Windows system DLL exclusion
@@ -1840,17 +2273,40 @@ bool InitializeHookRuntime(HMODULE self_mod) {
     }
 
     // Parse OpenScarlett environment variables
+    const std::wstring self_path = GetModulePathW(self_mod);
+    g_hook_dll_path_w = ReadEnvW(L"OPENSCARLETT_HOOK_DLL");
+    if (g_hook_dll_path_w.empty()) {
+        g_hook_dll_path_w = self_path;
+    }
+
     g_shim_dir_w = ReadEnvW(L"OPENSCARLETT_SHIM_DIR");
     if (g_shim_dir_w.empty()) {
-        std::wstring self_path = GetModulePathW(self_mod);
         g_shim_dir_w = std::filesystem::path(self_path).parent_path().wstring();
     }
     while (g_shim_dir_w.size() > 3 && (g_shim_dir_w.back() == L'\\' || g_shim_dir_w.back() == L'/')) {
         g_shim_dir_w.pop_back();
     }
 
-    std::wstring tel_w = ReadEnvW(L"OPENSCARLETT_TELEMETRY_PATH");
-    if (!tel_w.empty()) {
+    const std::wstring tel_w = ReadEnvW(L"OPENSCARLETT_TELEMETRY_PATH");
+    const std::wstring tel_base_w = ReadEnvW(L"OPENSCARLETT_TELEMETRY_BASE");
+    g_telemetry_base_w = !tel_base_w.empty() ? tel_base_w : tel_w;
+
+    const std::wstring child_per_pid = ReadEnvW(L"OPENSCARLETT_CHILD_TELEMETRY_PER_PID");
+    if (child_per_pid == L"1" && !g_telemetry_base_w.empty()) {
+        const std::wstring child_tel_w =
+            openscarlett::FormatChildTelemetryPathW(g_telemetry_base_w, ::GetCurrentProcessId());
+        if (!child_tel_w.empty()) {
+            g_telemetry_path_utf8 = openscarlett::WideToUtf8(child_tel_w);
+            ::SetEnvironmentVariableW(L"OPENSCARLETT_TELEMETRY_PATH", child_tel_w.c_str());
+            ::SetEnvironmentVariableW(L"OPENSCARLETT_CHILD_TELEMETRY_PER_PID", nullptr);
+            openscarlett::CallTelemetry::Global().Record(
+                "loader",
+                "child_hook_attached",
+                openscarlett::CallOutcome::Ok,
+                static_cast<int32_t>(::GetCurrentProcessId()),
+                -1);
+        }
+    } else if (!tel_w.empty()) {
         g_telemetry_path_utf8 = openscarlett::WideToUtf8(tel_w);
     }
 

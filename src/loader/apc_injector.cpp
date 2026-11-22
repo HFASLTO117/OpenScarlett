@@ -110,6 +110,7 @@ void RemoveEnvEntry(std::vector<std::pair<std::wstring, std::wstring>>& entries,
 }
 
 std::vector<wchar_t> BuildChildEnvironmentBlock(const std::wstring& shim_dir,
+                                                const std::wstring& hook_dll_path,
                                                 const std::wstring& vfs_g,
                                                 const std::wstring& vfs_g_overlay,
                                                 const std::wstring& vfs_t,
@@ -153,11 +154,15 @@ std::vector<wchar_t> BuildChildEnvironmentBlock(const std::wstring& shim_dir,
     }
 
     UpsertEnvEntry(entries, L"OPENSCARLETT_SHIM_DIR", shim_dir);
+    if (!hook_dll_path.empty()) {
+        UpsertEnvEntry(entries, L"OPENSCARLETT_HOOK_DLL", hook_dll_path);
+    }
     UpsertEnvEntry(entries, L"OPENSCARLETT_VFS_G", vfs_g);
     UpsertEnvEntry(entries, L"OPENSCARLETT_VFS_G_OVERLAY", vfs_g_overlay);
     UpsertEnvEntry(entries, L"OPENSCARLETT_VFS_T", vfs_t);
     UpsertEnvEntry(entries, L"OPENSCARLETT_VFS_S", vfs_s);
     UpsertEnvEntry(entries, L"OPENSCARLETT_SAVE_ROOT", vfs_s);
+    RemoveEnvEntry(entries, L"OPENSCARLETT_CHILD_TELEMETRY_PER_PID");
 
     if (!title_id.empty()) {
         UpsertEnvEntry(entries, L"OPENSCARLETT_TITLE_ID", title_id);
@@ -173,8 +178,10 @@ std::vector<wchar_t> BuildChildEnvironmentBlock(const std::wstring& shim_dir,
 
     if (!telemetry_path.empty()) {
         UpsertEnvEntry(entries, L"OPENSCARLETT_TELEMETRY_PATH", telemetry_path);
+        UpsertEnvEntry(entries, L"OPENSCARLETT_TELEMETRY_BASE", telemetry_path);
     } else {
         RemoveEnvEntry(entries, L"OPENSCARLETT_TELEMETRY_PATH");
+        RemoveEnvEntry(entries, L"OPENSCARLETT_TELEMETRY_BASE");
     }
 
     std::sort(entries.begin(), entries.end(),
@@ -193,6 +200,76 @@ std::vector<wchar_t> BuildChildEnvironmentBlock(const std::wstring& shim_dir,
     }
     block.push_back(L'\0');
     return block;
+}
+
+bool StartsWithIgnoreCaseAsciiW(std::wstring_view text, std::wstring_view prefix) noexcept {
+    if (text.size() < prefix.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < prefix.size(); ++i) {
+        wchar_t a = text[i];
+        wchar_t b = prefix[i];
+        if (a >= L'A' && a <= L'Z') a = static_cast<wchar_t>(a - L'A' + L'a');
+        if (b >= L'A' && b <= L'Z') b = static_cast<wchar_t>(b - L'A' + L'a');
+        if (a != b) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool HasEnvKeyIgnoreCase(const std::vector<std::pair<std::wstring, std::wstring>>& entries,
+                         const std::wstring& key) {
+    for (const auto& kv : entries) {
+        if (::_wcsicmp(kv.first.c_str(), key.c_str()) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+std::wstring AnsiStrToWideAcp(const char* text) {
+    if (!text || *text == '\0') {
+        return {};
+    }
+    const int needed = ::MultiByteToWideChar(CP_ACP, 0, text, -1, nullptr, 0);
+    if (needed <= 1) {
+        return {};
+    }
+    std::wstring out(static_cast<size_t>(needed - 1), L'\0');
+    ::MultiByteToWideChar(CP_ACP, 0, text, -1, out.data(), needed);
+    return out;
+}
+
+bool IsTargetProcessCompatibleX64(HANDLE h_process, DWORD& out_win32_error) {
+    out_win32_error = ERROR_SUCCESS;
+#if defined(_M_X64) || defined(__x86_64__)
+    using PfnIsWow64Process2 = BOOL(WINAPI*)(HANDLE, USHORT*, USHORT*);
+    HMODULE k32 = ::GetModuleHandleW(L"kernel32.dll");
+    auto fn_wow64_2 = k32 ? reinterpret_cast<PfnIsWow64Process2>(
+                                ::GetProcAddress(k32, "IsWow64Process2"))
+                          : nullptr;
+    if (fn_wow64_2 != nullptr) {
+        USHORT process_machine = IMAGE_FILE_MACHINE_UNKNOWN;
+        USHORT native_machine = IMAGE_FILE_MACHINE_UNKNOWN;
+        if (!fn_wow64_2(h_process, &process_machine, &native_machine)) {
+            out_win32_error = ::GetLastError();
+            return false;
+        }
+        // Native x64 process on x64 host reports process_machine == IMAGE_FILE_MACHINE_UNKNOWN.
+        return process_machine == IMAGE_FILE_MACHINE_UNKNOWN &&
+               native_machine == IMAGE_FILE_MACHINE_AMD64;
+    }
+    BOOL is_wow64 = FALSE;
+    if (!::IsWow64Process(h_process, &is_wow64)) {
+        out_win32_error = ::GetLastError();
+        return false;
+    }
+    return is_wow64 == FALSE;
+#else
+    (void)h_process;
+    return false;
+#endif
 }
 
 // Redirect static PE imports of routed DLLs in the suspended child process BEFORE
@@ -256,9 +333,8 @@ bool RedirectChildStaticXboxImports(HANDLE h_process,
     const DllRoutingTable routing = DllRoutingTable::CreateWithEnvOverrides();
 
     std::vector<IMAGE_IMPORT_DESCRIPTOR> descs;
-    std::vector<std::string> full_paths;
-    std::vector<int> priorities;
-    bool any_redirected = false;
+    std::vector<std::string> imported_names;
+    bool has_console_exclusive_import = false;
 
     const uintptr_t imp_table_addr = image_base + imp_dir.VirtualAddress;
     for (size_t idx = 0; idx < 1024; ++idx) {
@@ -284,9 +360,24 @@ bool RedirectChildStaticXboxImports(HANDLE h_process,
                 dll_name = name_buf;
             }
         }
+        if (!dll_name.empty() && ClassifyImportDll(dll_name) == DllCategory::ConsoleExclusive) {
+            has_console_exclusive_import = true;
+        }
+        imported_names.push_back(std::move(dll_name));
+        descs.push_back(d);
+    }
 
+    std::vector<std::string> full_paths;
+    std::vector<int> priorities;
+    full_paths.reserve(descs.size());
+    priorities.reserve(descs.size());
+    bool any_redirected = false;
+
+    for (size_t idx = 0; idx < descs.size(); ++idx) {
+        const std::string& dll_name = imported_names[idx];
         if (!dll_name.empty()) {
-            const DllRouteDecision decision = routing.ResolveRoute(dll_name, shim_dir_w, guest_dir_w);
+            const DllRouteDecision decision =
+                routing.ResolveRoute(dll_name, shim_dir_w, guest_dir_w, has_console_exclusive_import);
             const bool should_rewrite =
                 !decision.resolved_path.empty() &&
                 (decision.policy == DllRoutePolicy::Shim ||
@@ -303,7 +394,6 @@ bool RedirectChildStaticXboxImports(HANDLE h_process,
             full_paths.emplace_back();
             priorities.push_back(10);
         }
-        descs.push_back(d);
     }
 
     if (!any_redirected || descs.empty()) {
@@ -697,6 +787,302 @@ Status LoadDllsInTopologicalOrder(const std::vector<std::string>& dll_paths,
 #endif
 }
 
+std::wstring FormatChildTelemetryPathW(std::wstring_view base_telemetry_path, uint32_t child_pid) {
+    if (base_telemetry_path.empty() || child_pid == 0u) {
+        return {};
+    }
+    const std::filesystem::path base_p(base_telemetry_path);
+    const std::filesystem::path parent_p = base_p.parent_path();
+    std::wstring stem = base_p.stem().wstring();
+
+    auto ends_with_ci = [](const std::wstring& s, std::wstring_view suffix) -> bool {
+        if (s.size() < suffix.size()) {
+            return false;
+        }
+        const size_t off = s.size() - suffix.size();
+        for (size_t i = 0; i < suffix.size(); ++i) {
+            wchar_t a = s[off + i];
+            wchar_t b = suffix[i];
+            if (a >= L'A' && a <= L'Z') a = static_cast<wchar_t>(a - L'A' + L'a');
+            if (b >= L'A' && b <= L'Z') b = static_cast<wchar_t>(b - L'A' + L'a');
+            if (a != b) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    if (ends_with_ci(stem, L"_telemetry")) {
+        stem.resize(stem.size() - 10u);
+    }
+
+    // Strip any prior "_pid<digits>" suffix so grandchild paths stay clean.
+    if (stem.size() > 5u) {
+        size_t pos = stem.size();
+        while (pos > 0 && stem[pos - 1] >= L'0' && stem[pos - 1] <= L'9') {
+            --pos;
+        }
+        if (pos < stem.size() && pos >= 4u) {
+            const std::wstring prefix_check = stem.substr(0, pos);
+            if (ends_with_ci(prefix_check, L"_pid")) {
+                stem.resize(pos - 4u);
+            }
+        }
+    }
+
+    if (stem.empty()) {
+        stem = L"child";
+    }
+
+    const std::wstring filename =
+        stem + L"_pid" + std::to_wstring(child_pid) + L"_telemetry.json";
+    if (parent_p.empty()) {
+        return filename;
+    }
+    return (parent_p / filename).wstring();
+}
+
+std::string FormatChildTelemetryPathUtf8(std::string_view base_telemetry_path, uint32_t child_pid) {
+    return WideToUtf8(FormatChildTelemetryPathW(Utf8ToWide(base_telemetry_path), child_pid));
+}
+
+std::vector<wchar_t> MergeOpenScarlettEnvironmentBlockW(const void* caller_env,
+                                                        bool caller_env_is_unicode,
+                                                        std::wstring_view shim_dir,
+                                                        std::wstring_view hook_dll_path,
+                                                        std::wstring_view telemetry_base_path,
+                                                        bool enable_child_per_pid_telemetry) {
+#if !defined(_WIN32)
+    (void)caller_env;
+    (void)caller_env_is_unicode;
+    (void)shim_dir;
+    (void)hook_dll_path;
+    (void)telemetry_base_path;
+    (void)enable_child_per_pid_telemetry;
+    return {L'\0', L'\0'};
+#else
+    std::vector<std::pair<std::wstring, std::wstring>> parent_entries;
+    LPWCH raw_parent = ::GetEnvironmentStringsW();
+    if (raw_parent != nullptr) {
+        const wchar_t* cur = raw_parent;
+        while (*cur != L'\0') {
+            std::wstring entry(cur);
+            cur += entry.size() + 1;
+            const size_t eq = entry.find(L'=', entry.front() == L'=' ? 1 : 0);
+            if (eq == std::wstring::npos) {
+                continue;
+            }
+            parent_entries.emplace_back(entry.substr(0, eq), entry.substr(eq + 1));
+        }
+        ::FreeEnvironmentStringsW(raw_parent);
+    }
+
+    std::vector<std::pair<std::wstring, std::wstring>> entries;
+    if (caller_env == nullptr) {
+        entries = parent_entries;
+    } else if (caller_env_is_unicode) {
+        const auto* cur = static_cast<const wchar_t*>(caller_env);
+        while (*cur != L'\0') {
+            std::wstring entry(cur);
+            cur += entry.size() + 1;
+            const size_t eq = entry.find(L'=', entry.front() == L'=' ? 1 : 0);
+            if (eq == std::wstring::npos) {
+                continue;
+            }
+            entries.emplace_back(entry.substr(0, eq), entry.substr(eq + 1));
+        }
+    } else {
+        const auto* cur = static_cast<const char*>(caller_env);
+        while (*cur != '\0') {
+            std::string entry_a(cur);
+            cur += entry_a.size() + 1;
+            std::wstring entry = AnsiStrToWideAcp(entry_a.c_str());
+            if (entry.empty()) {
+                continue;
+            }
+            const size_t eq = entry.find(L'=', entry.front() == L'=' ? 1 : 0);
+            if (eq == std::wstring::npos) {
+                continue;
+            }
+            entries.emplace_back(entry.substr(0, eq), entry.substr(eq + 1));
+        }
+    }
+
+    // Preserve/merge all OPENSCARLETT_* variables from parent into the child environment.
+    if (caller_env != nullptr) {
+        for (const auto& pkv : parent_entries) {
+            if (StartsWithIgnoreCaseAsciiW(pkv.first, L"OPENSCARLETT_") &&
+                !HasEnvKeyIgnoreCase(entries, pkv.first)) {
+                entries.push_back(pkv);
+            }
+        }
+    }
+
+    // Ensure shim_dir is prepended to PATH (without duplicating if already at the front).
+    if (!shim_dir.empty()) {
+        const std::wstring shim_str(shim_dir);
+        bool found_path = false;
+        for (auto& kv : entries) {
+            if (::_wcsicmp(kv.first.c_str(), L"PATH") == 0) {
+                found_path = true;
+                if (kv.second.empty()) {
+                    kv.second = shim_str;
+                } else {
+                    const size_t first_semi = kv.second.find(L';');
+                    const std::wstring first_seg =
+                        (first_semi == std::wstring::npos) ? kv.second : kv.second.substr(0, first_semi);
+                    if (::_wcsicmp(first_seg.c_str(), shim_str.c_str()) != 0) {
+                        kv.second = shim_str + L";" + kv.second;
+                    }
+                }
+                break;
+            }
+        }
+        if (!found_path) {
+            entries.emplace_back(L"PATH", shim_str);
+        }
+        if (!HasEnvKeyIgnoreCase(entries, L"OPENSCARLETT_SHIM_DIR")) {
+            UpsertEnvEntry(entries, L"OPENSCARLETT_SHIM_DIR", shim_str);
+        }
+    }
+
+    if (!hook_dll_path.empty() && !HasEnvKeyIgnoreCase(entries, L"OPENSCARLETT_HOOK_DLL")) {
+        UpsertEnvEntry(entries, L"OPENSCARLETT_HOOK_DLL", std::wstring(hook_dll_path));
+    }
+
+    if (enable_child_per_pid_telemetry && !telemetry_base_path.empty()) {
+        const std::wstring base_str(telemetry_base_path);
+        UpsertEnvEntry(entries, L"OPENSCARLETT_TELEMETRY_BASE", base_str);
+        if (!HasEnvKeyIgnoreCase(entries, L"OPENSCARLETT_TELEMETRY_PATH")) {
+            UpsertEnvEntry(entries, L"OPENSCARLETT_TELEMETRY_PATH", base_str);
+        }
+        UpsertEnvEntry(entries, L"OPENSCARLETT_CHILD_TELEMETRY_PER_PID", L"1");
+    }
+
+    std::sort(entries.begin(), entries.end(),
+              [](const std::pair<std::wstring, std::wstring>& a,
+                 const std::pair<std::wstring, std::wstring>& b) {
+                  return ::_wcsicmp(a.first.c_str(), b.first.c_str()) < 0;
+              });
+
+    std::vector<wchar_t> block;
+    block.reserve(4096);
+    for (const auto& kv : entries) {
+        block.insert(block.end(), kv.first.begin(), kv.first.end());
+        block.push_back(L'=');
+        block.insert(block.end(), kv.second.begin(), kv.second.end());
+        block.push_back(L'\0');
+    }
+    block.push_back(L'\0');
+    if (block.size() == 1u) {
+        block.push_back(L'\0');
+    }
+    return block;
+#endif
+}
+
+bool RedirectSuspendedProcessStaticXboxImports(void* process_handle,
+                                               std::wstring_view shim_dir,
+                                               std::wstring_view guest_dir) {
+#if !defined(_WIN32)
+    (void)process_handle;
+    (void)shim_dir;
+    (void)guest_dir;
+    return false;
+#else
+    if (!process_handle) {
+        return false;
+    }
+    return RedirectChildStaticXboxImports(
+        static_cast<HANDLE>(process_handle), std::wstring(shim_dir), std::wstring(guest_dir));
+#endif
+}
+
+Status InjectHookDllIntoSuspendedProcess(void* process_handle,
+                                         void* thread_handle,
+                                         std::wstring_view hook_dll_path,
+                                         std::wstring_view shim_dir,
+                                         std::wstring_view guest_dir,
+                                         uint32_t* out_win32_error) {
+    if (out_win32_error) {
+        *out_win32_error = 0u;
+    }
+#if !defined(_WIN32)
+    (void)process_handle;
+    (void)thread_handle;
+    (void)hook_dll_path;
+    (void)shim_dir;
+    (void)guest_dir;
+    return Status::Error(StatusCode::NotImplemented, "APC hook injection is Windows-only");
+#else
+    if (!process_handle || !thread_handle || hook_dll_path.empty()) {
+        return Status::Error(StatusCode::InvalidArgument, "Invalid process/thread handle or hook DLL path");
+    }
+
+    HANDLE h_process = static_cast<HANDLE>(process_handle);
+    HANDLE h_thread = static_cast<HANDLE>(thread_handle);
+
+    DWORD arch_err = ERROR_SUCCESS;
+    if (!IsTargetProcessCompatibleX64(h_process, arch_err)) {
+        if (out_win32_error) {
+            *out_win32_error = arch_err;
+        }
+        if (arch_err != ERROR_SUCCESS) {
+            return Status::Error(StatusCode::DeviceError, FormatWin32Error("IsWow64Process", arch_err));
+        }
+        return Status::Error(StatusCode::UnsupportedFormat,
+                             "Child process architecture does not match x64 openscarlett_hook.dll");
+    }
+
+    // Best-effort static PE Xbox import redirection before LdrInitializeThunk runs.
+    if (!shim_dir.empty()) {
+        (void)RedirectChildStaticXboxImports(
+            h_process, std::wstring(shim_dir), std::wstring(guest_dir));
+    }
+
+    HMODULE h_kernel32 = ::GetModuleHandleW(L"kernel32.dll");
+    FARPROC p_load_library_w = h_kernel32 ? ::GetProcAddress(h_kernel32, "LoadLibraryW") : nullptr;
+    if (!p_load_library_w) {
+        const DWORD err = ::GetLastError();
+        if (out_win32_error) *out_win32_error = err;
+        return Status::Error(StatusCode::DeviceError, FormatWin32Error("GetProcAddress(LoadLibraryW)", err));
+    }
+
+    const std::wstring hook_w(hook_dll_path);
+    const size_t path_bytes = (hook_w.size() + 1u) * sizeof(wchar_t);
+    LPVOID remote_path = ::VirtualAllocEx(h_process,
+                                          nullptr,
+                                          path_bytes,
+                                          MEM_COMMIT | MEM_RESERVE,
+                                          PAGE_READWRITE);
+    if (!remote_path) {
+        const DWORD err = ::GetLastError();
+        if (out_win32_error) *out_win32_error = err;
+        return Status::Error(StatusCode::OutOfMemory, FormatWin32Error("VirtualAllocEx", err));
+    }
+
+    SIZE_T written = 0;
+    if (!::WriteProcessMemory(h_process, remote_path, hook_w.c_str(), path_bytes, &written) ||
+        written != path_bytes) {
+        const DWORD err = ::GetLastError();
+        if (out_win32_error) *out_win32_error = err;
+        ::VirtualFreeEx(h_process, remote_path, 0, MEM_RELEASE);
+        return Status::Error(StatusCode::IoError, FormatWin32Error("WriteProcessMemory", err));
+    }
+
+    if (::QueueUserAPC(reinterpret_cast<PAPCFUNC>(p_load_library_w),
+                       h_thread,
+                       reinterpret_cast<ULONG_PTR>(remote_path)) == 0) {
+        const DWORD err = ::GetLastError();
+        if (out_win32_error) *out_win32_error = err;
+        ::VirtualFreeEx(h_process, remote_path, 0, MEM_RELEASE);
+        return Status::Error(StatusCode::DeviceError, FormatWin32Error("QueueUserAPC", err));
+    }
+
+    return Status::Ok();
+#endif
+}
+
 Status LaunchWithApcHook(const LaunchOptions& options, LaunchResult& out_result) {
     out_result = {};
 
@@ -837,6 +1223,7 @@ Status LaunchWithApcHook(const LaunchOptions& options, LaunchResult& out_result)
 
     std::vector<wchar_t> env_block = BuildChildEnvironmentBlock(
         shim_dir_w,
+        hook_dll_w,
         vfs_g_w,
         vfs_g_overlay_w,
         vfs_t_w,
@@ -869,9 +1256,6 @@ Status LaunchWithApcHook(const LaunchOptions& options, LaunchResult& out_result)
 
     out_result.process_id = static_cast<uint32_t>(pi.dwProcessId);
 
-    // Apply unified data-driven static import routing BEFORE LdrInitializeThunk runs.
-    (void)RedirectChildStaticXboxImports(pi.hProcess, shim_dir_w, vfs_g_w);
-
     auto abort_child = [&](StatusCode code, const char* step, DWORD err) -> Status {
         ::TerminateProcess(pi.hProcess, 1);
         ::WaitForSingleObject(pi.hProcess, 2000);
@@ -880,36 +1264,15 @@ Status LaunchWithApcHook(const LaunchOptions& options, LaunchResult& out_result)
         return Status::Error(code, FormatWin32Error(step, err));
     };
 
-    HMODULE h_kernel32 = ::GetModuleHandleW(L"kernel32.dll");
-    FARPROC p_load_library_w = h_kernel32 ? ::GetProcAddress(h_kernel32, "LoadLibraryW") : nullptr;
-    if (!p_load_library_w) {
-        return abort_child(StatusCode::DeviceError, "GetProcAddress(LoadLibraryW)", ::GetLastError());
-    }
-
-    const size_t path_bytes = (hook_dll_w.size() + 1) * sizeof(wchar_t);
-    LPVOID remote_path = ::VirtualAllocEx(pi.hProcess,
-                                          nullptr,
-                                          path_bytes,
-                                          MEM_COMMIT | MEM_RESERVE,
-                                          PAGE_READWRITE);
-    if (!remote_path) {
-        return abort_child(StatusCode::OutOfMemory, "VirtualAllocEx", ::GetLastError());
-    }
-
-    SIZE_T written = 0;
-    if (!::WriteProcessMemory(pi.hProcess, remote_path, hook_dll_w.c_str(), path_bytes, &written) ||
-        written != path_bytes) {
-        DWORD err = ::GetLastError();
-        ::VirtualFreeEx(pi.hProcess, remote_path, 0, MEM_RELEASE);
-        return abort_child(StatusCode::IoError, "WriteProcessMemory", err);
-    }
-
-    if (::QueueUserAPC(reinterpret_cast<PAPCFUNC>(p_load_library_w),
-                       pi.hThread,
-                       reinterpret_cast<ULONG_PTR>(remote_path)) == 0) {
-        DWORD err = ::GetLastError();
-        ::VirtualFreeEx(pi.hProcess, remote_path, 0, MEM_RELEASE);
-        return abort_child(StatusCode::DeviceError, "QueueUserAPC", err);
+    uint32_t inject_err = 0;
+    Status inject_st = InjectHookDllIntoSuspendedProcess(
+        pi.hProcess, pi.hThread, hook_dll_w, shim_dir_w, vfs_g_w, &inject_err);
+    if (!inject_st.ok()) {
+        ::TerminateProcess(pi.hProcess, 1);
+        ::WaitForSingleObject(pi.hProcess, 2000);
+        ::CloseHandle(pi.hThread);
+        ::CloseHandle(pi.hProcess);
+        return inject_st;
     }
 
     if (::ResumeThread(pi.hThread) == static_cast<DWORD>(-1)) {

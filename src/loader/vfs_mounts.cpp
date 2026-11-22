@@ -108,6 +108,11 @@ VfsTranslateStatus ParseVirtualPathW(std::wstring_view virtual_path, ParsedVirtu
     }
 
     std::wstring_view sub = rest.substr(prefix_len);
+    for (wchar_t ch : sub) {
+        if (ch == L'\0') {
+            return VfsTranslateStatus::RejectedTraversal;
+        }
+    }
     size_t pos = 0;
     while (pos < sub.size()) {
         while (pos < sub.size() && (sub[pos] == L'\\' || sub[pos] == L'/')) {
@@ -141,6 +146,96 @@ VfsTranslateStatus ParseVirtualPathW(std::wstring_view virtual_path, ParsedVirtu
     }
 
     return VfsTranslateStatus::Translated;
+}
+
+bool SplitNormalizedSubMountPrefixW(std::wstring_view raw_subpath,
+                                    std::vector<std::wstring>& out_parts,
+                                    std::wstring& out_canonical) {
+    out_parts.clear();
+    out_canonical.clear();
+    std::wstring_view rest = raw_subpath;
+    while (!rest.empty() && (rest.front() == L' ' || rest.front() == L'\t')) {
+        rest.remove_prefix(1);
+    }
+    while (!rest.empty() && (rest.back() == L' ' || rest.back() == L'\t')) {
+        rest.remove_suffix(1);
+    }
+    if (IsExtendedPrefixW(rest)) {
+        rest.remove_prefix(4);
+    }
+    if (MatchGamePrefixW(rest)) {
+        rest.remove_prefix(5);
+    } else if (rest.size() >= 2 && rest[1] == L':' && DriveCharToEnum(rest[0]) == VfsDrive::Game) {
+        rest.remove_prefix(2);
+    }
+
+    size_t pos = 0;
+    while (pos < rest.size()) {
+        while (pos < rest.size() && (rest[pos] == L'\\' || rest[pos] == L'/')) {
+            ++pos;
+        }
+        if (pos >= rest.size()) {
+            break;
+        }
+        size_t end = pos;
+        while (end < rest.size() && rest[end] != L'\\' && rest[end] != L'/') {
+            ++end;
+        }
+        std::wstring_view comp = rest.substr(pos, end - pos);
+        pos = end;
+        if (comp == L".") {
+            continue;
+        }
+        if (comp == L"..") {
+            if (out_parts.empty()) {
+                return false;
+            }
+            out_parts.pop_back();
+            continue;
+        }
+        if (comp.find(L':') != std::wstring_view::npos || comp.find(L'\0') != std::wstring_view::npos) {
+            return false;
+        }
+        out_parts.emplace_back(comp);
+    }
+    if (out_parts.empty()) {
+        return false;
+    }
+    for (size_t i = 0; i < out_parts.size(); ++i) {
+        if (i > 0) {
+            out_canonical.push_back(L'\\');
+        }
+        out_canonical.append(out_parts[i]);
+    }
+    return true;
+}
+
+bool EqualsIgnoreCaseAsciiW(std::wstring_view a, std::wstring_view b) noexcept {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (AsciiLowerW(a[i]) != AsciiLowerW(b[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::vector<std::wstring_view> SplitCanonicalPartsView(std::wstring_view canonical) {
+    std::vector<std::wstring_view> out;
+    size_t pos = 0;
+    while (pos < canonical.size()) {
+        size_t sep = canonical.find(L'\\', pos);
+        if (sep == std::wstring_view::npos) {
+            sep = canonical.size();
+        }
+        if (sep > pos) {
+            out.push_back(canonical.substr(pos, sep - pos));
+        }
+        pos = sep + 1;
+    }
+    return out;
 }
 
 std::wstring ReadEnvVarW(const wchar_t* name) {
@@ -394,6 +489,142 @@ bool IsDirectoryWritableW(const std::wstring& candidate_dir) {
     return true;
 }
 
+std::wstring GetFinalCanonicalPathLowerW(const std::wstring& path) {
+    if (path.empty()) {
+        return {};
+    }
+    HANDLE h = ::CreateFileW(path.c_str(),
+                             FILE_READ_ATTRIBUTES,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                             nullptr,
+                             OPEN_EXISTING,
+                             FILE_FLAG_BACKUP_SEMANTICS,
+                             nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        return {};
+    }
+    std::wstring buf(MAX_PATH, L'\0');
+    DWORD len = ::GetFinalPathNameByHandleW(
+        h, buf.data(), static_cast<DWORD>(buf.size()), FILE_NAME_NORMALIZED);
+    if (len >= buf.size()) {
+        buf.resize(len + 1, L'\0');
+        len = ::GetFinalPathNameByHandleW(
+            h, buf.data(), static_cast<DWORD>(buf.size()), FILE_NAME_NORMALIZED);
+    }
+    ::CloseHandle(h);
+    if (len == 0 || len >= buf.size()) {
+        return {};
+    }
+    buf.resize(len);
+    if (buf.size() >= 8 && buf.compare(0, 8, L"\\\\?\\UNC\\") == 0) {
+        buf = L"\\\\" + buf.substr(8);
+    } else if (IsExtendedPrefixW(buf)) {
+        buf.erase(0, 4);
+    }
+    while (buf.size() > 3 && buf.back() == L'\\') {
+        buf.pop_back();
+    }
+    return ToLowerAsciiW(buf);
+}
+
+bool IsSubPathEqualOrUnderLowerW(const std::wstring& candidate_lo, const std::wstring& root_lo) noexcept {
+    if (candidate_lo.empty() || root_lo.empty()) {
+        return false;
+    }
+    if (candidate_lo == root_lo) {
+        return true;
+    }
+    if (candidate_lo.size() > root_lo.size() &&
+        candidate_lo.compare(0, root_lo.size(), root_lo) == 0) {
+        return root_lo.back() == L'\\' || candidate_lo[root_lo.size()] == L'\\';
+    }
+    return false;
+}
+
+VfsTranslateStatus VerifyHostPathContainmentW(const std::wstring& root,
+                                              const std::vector<std::wstring_view>& rel_parts,
+                                              const std::vector<std::wstring>* extra_ro_roots,
+                                              bool is_mutating,
+                                              bool forbid_system_drive_writes) {
+    if (root.empty()) {
+        return VfsTranslateStatus::UnconfiguredMount;
+    }
+    if (is_mutating && forbid_system_drive_writes && IsPathOnSystemDriveW(root)) {
+        return VfsTranslateStatus::ReadOnlyViolation;
+    }
+
+    // Check root itself if it exists and is a reparse point.
+    const DWORD root_attrs = ::GetFileAttributesW(root.c_str());
+    if (root_attrs == INVALID_FILE_ATTRIBUTES) {
+        // Root directory not created yet on disk; lexical containment already verified by parser.
+        return VfsTranslateStatus::Translated;
+    }
+    if (is_mutating && forbid_system_drive_writes && (root_attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        const std::wstring final_root_check = GetFinalCanonicalPathLowerW(root);
+        if (final_root_check.empty() || IsPathOnSystemDriveW(final_root_check)) {
+            return VfsTranslateStatus::ReadOnlyViolation;
+        }
+    }
+
+    std::wstring final_root_lo;
+    std::vector<std::wstring> extra_final_lo;
+    bool loaded_roots = false;
+
+    auto ensure_roots_loaded = [&]() {
+        if (loaded_roots) {
+            return;
+        }
+        loaded_roots = true;
+        final_root_lo = GetFinalCanonicalPathLowerW(root);
+        if (!is_mutating && extra_ro_roots != nullptr) {
+            for (const auto& r : *extra_ro_roots) {
+                std::wstring fr = GetFinalCanonicalPathLowerW(r);
+                if (!fr.empty()) {
+                    extra_final_lo.push_back(std::move(fr));
+                }
+            }
+        }
+    };
+
+    std::wstring cur = root;
+    for (const auto& part : rel_parts) {
+        if (!cur.empty() && cur.back() != L'\\') {
+            cur.push_back(L'\\');
+        }
+        cur.append(part);
+
+        const DWORD attrs = ::GetFileAttributesW(cur.c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES) {
+            // Remaining components do not exist yet on disk.
+            break;
+        }
+        if ((attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+            ensure_roots_loaded();
+            const std::wstring final_cur_lo = GetFinalCanonicalPathLowerW(cur);
+            if (final_cur_lo.empty() || final_root_lo.empty()) {
+                return VfsTranslateStatus::RejectedTraversal;
+            }
+            if (is_mutating && forbid_system_drive_writes && IsPathOnSystemDriveW(final_cur_lo)) {
+                return VfsTranslateStatus::RejectedTraversal;
+            }
+            bool contained = IsSubPathEqualOrUnderLowerW(final_cur_lo, final_root_lo);
+            if (!contained && !is_mutating) {
+                for (const auto& extra_lo : extra_final_lo) {
+                    if (IsSubPathEqualOrUnderLowerW(final_cur_lo, extra_lo)) {
+                        contained = true;
+                        break;
+                    }
+                }
+            }
+            if (!contained) {
+                return VfsTranslateStatus::RejectedTraversal;
+            }
+        }
+    }
+
+    return VfsTranslateStatus::Translated;
+}
+
 #endif  // _WIN32
 
 std::wstring NormalizePathRootW(std::wstring_view root) {
@@ -406,11 +637,61 @@ std::wstring NormalizePathRootW(std::wstring_view root) {
             c = L'\\';
         }
     }
-    const size_t min_len = IsExtendedPrefixW(out) ? 7u : 3u;
+    const bool had_ext = IsExtendedPrefixW(out);
+    if (had_ext) {
+        std::wstring inner = std::filesystem::path(out.substr(4)).lexically_normal().wstring();
+        out = L"\\\\?\\" + inner;
+    } else if (out.find(L"\\..") != std::wstring::npos || out.find(L"\\.") != std::wstring::npos) {
+        out = std::filesystem::path(out).lexically_normal().wstring();
+    }
+    const size_t min_len = had_ext ? 7u : 3u;
     while (out.size() > min_len && out.back() == L'\\') {
         out.pop_back();
     }
     return out;
+}
+
+void ResolveGameBaseTarget(const std::wstring& g_root,
+                           const std::vector<VfsSubMount>& sub_mounts,
+                           const std::vector<std::wstring_view>& parts,
+                           std::wstring& out_matched_root,
+                           std::vector<std::wstring_view>& out_rel_parts) {
+    for (const auto& sub : sub_mounts) {
+        const auto prefix_parts = SplitCanonicalPartsView(sub.virtual_prefix);
+        if (prefix_parts.empty() || parts.size() < prefix_parts.size()) {
+            continue;
+        }
+        bool match = true;
+        for (size_t i = 0; i < prefix_parts.size(); ++i) {
+            if (!EqualsIgnoreCaseAsciiW(parts[i], prefix_parts[i])) {
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            out_matched_root = sub.host_root;
+            out_rel_parts.assign(parts.begin() + static_cast<std::ptrdiff_t>(prefix_parts.size()),
+                                 parts.end());
+            return;
+        }
+    }
+    out_matched_root = g_root;
+    out_rel_parts = parts;
+}
+
+std::vector<std::wstring> CollectAllowedGameReadRoots(const std::wstring& g_root,
+                                                      const std::vector<VfsSubMount>& sub_mounts) {
+    std::vector<std::wstring> roots;
+    roots.reserve(1 + sub_mounts.size());
+    if (!g_root.empty()) {
+        roots.push_back(g_root);
+    }
+    for (const auto& sub : sub_mounts) {
+        if (!sub.host_root.empty()) {
+            roots.push_back(sub.host_root);
+        }
+    }
+    return roots;
 }
 
 }  // namespace
@@ -505,7 +786,7 @@ bool EnsureDirectoryTreeW(std::wstring_view path) {
 #endif
 }
 
-static bool IsOnSystemDriveW(std::wstring_view path) {
+bool IsPathOnSystemDriveW(std::wstring_view path) noexcept {
     if (IsExtendedPrefixW(path)) {
         path.remove_prefix(4);
     }
@@ -536,7 +817,7 @@ std::wstring ResolveDefaultWorkDirW(std::wstring_view anchor_dir) {
     if (env_temp.empty()) {
         env_temp = ReadEnvVarW(L"TMP");
     }
-    if (!env_temp.empty() && !IsOnSystemDriveW(env_temp)) {
+    if (!env_temp.empty() && !IsPathOnSystemDriveW(env_temp)) {
         std::wstring custom_temp = NormalizePathRootW(env_temp);
         if (!custom_temp.empty() && IsDirectoryWritableW(custom_temp)) {
             return custom_temp;
@@ -611,6 +892,19 @@ VfsMountConfig VfsMounts::BuildDefaultConfig(std::wstring_view default_g_root,
         base_vfs = ResolveDefaultVfsRootW();
     }
 
+    const bool base_is_non_system = !base_vfs.empty() && !IsPathOnSystemDriveW(base_vfs);
+    cfg.forbid_system_drive_writes = base_is_non_system;
+
+    auto accept_writable_env = [&](const std::wstring& val) -> bool {
+        if (val.empty()) {
+            return false;
+        }
+        if (base_is_non_system && IsPathOnSystemDriveW(val)) {
+            return false;
+        }
+        return true;
+    };
+
     std::wstring env_g = ReadEnvVarW(L"OPENSCARLETT_VFS_G");
     if (!env_g.empty()) {
         cfg.g_root = NormalizeRoot(env_g);
@@ -619,18 +913,19 @@ VfsMountConfig VfsMounts::BuildDefaultConfig(std::wstring_view default_g_root,
     }
 
     std::wstring env_t = ReadEnvVarW(L"OPENSCARLETT_VFS_T");
-    if (!env_t.empty()) {
+    if (accept_writable_env(env_t)) {
         cfg.t_root = NormalizeRoot(env_t);
     } else {
         cfg.t_root = NormalizeRoot(base_vfs + L"\\T");
     }
 
+    // Route S:\ strictly to OPENSCARLETT_VFS_S or OPENSCARLETT_SAVE_ROOT (never C:\ when base is off C:\).
     std::wstring env_s = ReadEnvVarW(L"OPENSCARLETT_VFS_S");
-    if (!env_s.empty()) {
+    if (accept_writable_env(env_s)) {
         cfg.s_root = NormalizeRoot(env_s);
     } else {
         std::wstring env_save_root = ReadEnvVarW(L"OPENSCARLETT_SAVE_ROOT");
-        if (!env_save_root.empty()) {
+        if (accept_writable_env(env_save_root)) {
             cfg.s_root = NormalizeRoot(env_save_root);
         } else {
             cfg.s_root = NormalizeRoot(base_vfs + L"\\S");
@@ -638,10 +933,38 @@ VfsMountConfig VfsMounts::BuildDefaultConfig(std::wstring_view default_g_root,
     }
 
     std::wstring env_g_overlay = ReadEnvVarW(L"OPENSCARLETT_VFS_G_OVERLAY");
-    if (!env_g_overlay.empty()) {
+    if (accept_writable_env(env_g_overlay)) {
         cfg.g_overlay_root = NormalizeRoot(env_g_overlay);
     } else {
         cfg.g_overlay_root = NormalizeRoot(base_vfs + L"\\G_overlay");
+    }
+
+    // Optional semicolon-separated nested G:\ read-only sub-mounts:
+    //   OPENSCARLETT_VFS_G_SUBMOUNTS="DLC\Pack1=E:\dlc1;Content/Paks=E:\paks"
+    std::wstring env_submounts = ReadEnvVarW(L"OPENSCARLETT_VFS_G_SUBMOUNTS");
+    if (!env_submounts.empty()) {
+        size_t pos = 0;
+        while (pos < env_submounts.size()) {
+            size_t sep = env_submounts.find(L';', pos);
+            if (sep == std::wstring::npos) {
+                sep = env_submounts.size();
+            }
+            std::wstring_view item(env_submounts.data() + pos, sep - pos);
+            pos = sep + 1;
+            const size_t eq = item.find(L'=');
+            if (eq == std::wstring_view::npos || eq == 0 || eq + 1 >= item.size()) {
+                continue;
+            }
+            std::vector<std::wstring> parts;
+            std::wstring canon_prefix;
+            if (!SplitNormalizedSubMountPrefixW(item.substr(0, eq), parts, canon_prefix)) {
+                continue;
+            }
+            std::wstring host_root = NormalizeRoot(item.substr(eq + 1));
+            if (!host_root.empty()) {
+                cfg.g_sub_mounts.push_back(VfsSubMount{std::move(canon_prefix), std::move(host_root)});
+            }
+        }
     }
 
     return cfg;
@@ -656,19 +979,58 @@ void VfsMounts::Configure(const VfsMountConfig& config) {
     t_root_ = NormalizeRoot(config.t_root);
     s_root_ = NormalizeRoot(config.s_root);
     g_overlay_root_ = NormalizeRoot(config.g_overlay_root);
+    forbid_system_drive_writes_ = config.forbid_system_drive_writes;
+    g_sub_mounts_.clear();
+    for (const auto& sub : config.g_sub_mounts) {
+        (void)AddGameSubMount(sub.virtual_prefix, sub.host_root);
+    }
+}
+
+bool VfsMounts::AddGameSubMount(std::wstring_view virtual_subpath, std::wstring_view host_ro_root) {
+    std::vector<std::wstring> parts;
+    std::wstring canon_prefix;
+    if (!SplitNormalizedSubMountPrefixW(virtual_subpath, parts, canon_prefix)) {
+        return false;
+    }
+    std::wstring norm_host = NormalizeRoot(host_ro_root);
+    if (norm_host.empty()) {
+        return false;
+    }
+    for (auto& existing : g_sub_mounts_) {
+        if (EqualsIgnoreCaseAsciiW(existing.virtual_prefix, canon_prefix)) {
+            existing.host_root = std::move(norm_host);
+            return true;
+        }
+    }
+    g_sub_mounts_.push_back(VfsSubMount{std::move(canon_prefix), std::move(norm_host)});
+    // Sort longest component count first so nested sub-mounts (e.g. DLC\Pack1\HD) beat shallower ones (DLC\Pack1).
+    std::stable_sort(g_sub_mounts_.begin(), g_sub_mounts_.end(),
+                     [](const VfsSubMount& a, const VfsSubMount& b) {
+                         const size_t ca = SplitCanonicalPartsView(a.virtual_prefix).size();
+                         const size_t cb = SplitCanonicalPartsView(b.virtual_prefix).size();
+                         if (ca != cb) {
+                             return ca > cb;
+                         }
+                         return a.virtual_prefix.size() > b.virtual_prefix.size();
+                     });
+    return true;
 }
 
 bool VfsMounts::EnsureWritableMounts() const {
     bool ok = true;
-    if (!t_root_.empty()) {
-        ok = EnsureDirectoryTreeW(t_root_) && ok;
-    }
-    if (!s_root_.empty()) {
-        ok = EnsureDirectoryTreeW(s_root_) && ok;
-    }
-    if (!g_overlay_root_.empty()) {
-        ok = EnsureDirectoryTreeW(g_overlay_root_) && ok;
-    }
+    auto ensure_safe = [&](const std::wstring& dir) {
+        if (dir.empty()) {
+            return;
+        }
+        if (forbid_system_drive_writes_ && IsPathOnSystemDriveW(dir)) {
+            ok = false;
+            return;
+        }
+        ok = EnsureDirectoryTreeW(dir) && ok;
+    };
+    ensure_safe(t_root_);
+    ensure_safe(s_root_);
+    ensure_safe(g_overlay_root_);
     return ok;
 }
 
@@ -724,6 +1086,21 @@ VfsTranslateStatus VfsMounts::TranslateForAccessW(std::wstring_view virtual_path
         if (root.empty()) {
             return VfsTranslateStatus::UnconfiguredMount;
         }
+        const bool is_mutating = (mode != VfsAccessMode::ReadOnly);
+        if (forbid_system_drive_writes_ && IsPathOnSystemDriveW(root)) {
+            if (is_mutating || ensure_writable_dirs) {
+                out_host_path.clear();
+                return VfsTranslateStatus::ReadOnlyViolation;
+            }
+        }
+#if defined(_WIN32)
+        const VfsTranslateStatus contain_st = VerifyHostPathContainmentW(
+            root, parsed.parts, nullptr, is_mutating, forbid_system_drive_writes_);
+        if (contain_st != VfsTranslateStatus::Translated) {
+            out_host_path.clear();
+            return contain_st;
+        }
+#endif
         if (ensure_writable_dirs) {
             EnsureDirectoryTreeW(root);
         }
@@ -731,19 +1108,34 @@ VfsTranslateStatus VfsMounts::TranslateForAccessW(std::wstring_view virtual_path
         return VfsTranslateStatus::Translated;
     }
 
-    // G:\ / GAME:\ -> Read-Only Copy-on-Write (CoW) overlay semantics!
-    if (g_root_.empty()) {
+    // G:\ / GAME:\ -> Read-Only Copy-on-Write (CoW) overlay semantics with nested sub-mounts!
+    if (g_root_.empty() && g_sub_mounts_.empty()) {
         return VfsTranslateStatus::UnconfiguredMount;
     }
 
-    const std::wstring base_plain = JoinRootAndParts(g_root_, parsed.parts, false);
-    const std::wstring base_final = JoinRootAndParts(g_root_, parsed.parts, parsed.had_extended);
+    std::wstring matched_base_root;
+    std::vector<std::wstring_view> base_rel_parts;
+    ResolveGameBaseTarget(g_root_, g_sub_mounts_, parsed.parts, matched_base_root, base_rel_parts);
+    if (matched_base_root.empty()) {
+        return VfsTranslateStatus::UnconfiguredMount;
+    }
+
+    const std::wstring base_plain = JoinRootAndParts(matched_base_root, base_rel_parts, false);
+    const std::wstring base_final = JoinRootAndParts(matched_base_root, base_rel_parts, parsed.had_extended);
 
 #if !defined(_WIN32)
     (void)mode;
     out_host_path = base_final;
     return VfsTranslateStatus::Translated;
 #else
+    const std::vector<std::wstring> allowed_ro_roots = CollectAllowedGameReadRoots(g_root_, g_sub_mounts_);
+    const VfsTranslateStatus base_contain = VerifyHostPathContainmentW(
+        matched_base_root, base_rel_parts, &allowed_ro_roots, false, false);
+    if (base_contain != VfsTranslateStatus::Translated) {
+        out_host_path.clear();
+        return base_contain;
+    }
+
     if (mode == VfsAccessMode::ReadOnly) {
         if (!g_overlay_root_.empty() && HasAnyWhiteoutInOverlay(g_overlay_root_, parsed.parts)) {
             if (out_was_whiteout) {
@@ -753,6 +1145,12 @@ VfsTranslateStatus VfsMounts::TranslateForAccessW(std::wstring_view virtual_path
             return VfsTranslateStatus::DeletedWhiteout;
         }
         if (!g_overlay_root_.empty() && !parsed.parts.empty()) {
+            const VfsTranslateStatus ovl_contain = VerifyHostPathContainmentW(
+                g_overlay_root_, parsed.parts, nullptr, false, false);
+            if (ovl_contain != VfsTranslateStatus::Translated) {
+                out_host_path.clear();
+                return ovl_contain;
+            }
             const std::wstring overlay_plain = JoinRootAndParts(g_overlay_root_, parsed.parts, false);
             if (HostPathExistsW(overlay_plain)) {
                 out_host_path = JoinRootAndParts(g_overlay_root_, parsed.parts, parsed.had_extended);
@@ -763,10 +1161,18 @@ VfsTranslateStatus VfsMounts::TranslateForAccessW(std::wstring_view virtual_path
         return VfsTranslateStatus::Translated;
     }
 
-    // All mutating modes (WriteCreate, WriteModify, Delete) MUST NEVER return a path inside g_root_!
+    // All mutating modes (WriteCreate, WriteModify, Delete) MUST NEVER return a path inside g_root_
+    // or any read-only sub-mount, and MUST NEVER write to C:\ when forbid_system_drive_writes_ is set!
     if (g_overlay_root_.empty()) {
         out_host_path.clear();
         return VfsTranslateStatus::ReadOnlyViolation;
+    }
+
+    const VfsTranslateStatus ovl_mut_contain = VerifyHostPathContainmentW(
+        g_overlay_root_, parsed.parts, nullptr, true, forbid_system_drive_writes_);
+    if (ovl_mut_contain != VfsTranslateStatus::Translated) {
+        out_host_path.clear();
+        return ovl_mut_contain;
     }
 
     const std::wstring overlay_plain = JoinRootAndParts(g_overlay_root_, parsed.parts, false);
@@ -901,19 +1307,34 @@ bool VfsMounts::IsVisibleGamePathW(std::wstring_view virtual_path, bool* out_is_
 #else
     ParsedVirtualPath parsed;
     if (ParseVirtualPathW(virtual_path, parsed) != VfsTranslateStatus::Translated ||
-        parsed.drive != VfsDrive::Game || g_root_.empty()) {
+        parsed.drive != VfsDrive::Game || (g_root_.empty() && g_sub_mounts_.empty())) {
         return false;
     }
     if (!g_overlay_root_.empty() && HasAnyWhiteoutInOverlay(g_overlay_root_, parsed.parts)) {
         return false;
     }
     if (!g_overlay_root_.empty() && !parsed.parts.empty()) {
+        if (VerifyHostPathContainmentW(g_overlay_root_, parsed.parts, nullptr, false, false) !=
+            VfsTranslateStatus::Translated) {
+            return false;
+        }
         const std::wstring overlay_plain = JoinRootAndParts(g_overlay_root_, parsed.parts, false);
         if (HostPathExistsW(overlay_plain, out_is_dir)) {
             return true;
         }
     }
-    const std::wstring base_plain = JoinRootAndParts(g_root_, parsed.parts, false);
+    std::wstring matched_base_root;
+    std::vector<std::wstring_view> base_rel_parts;
+    ResolveGameBaseTarget(g_root_, g_sub_mounts_, parsed.parts, matched_base_root, base_rel_parts);
+    if (matched_base_root.empty()) {
+        return false;
+    }
+    const std::vector<std::wstring> allowed_ro_roots = CollectAllowedGameReadRoots(g_root_, g_sub_mounts_);
+    if (VerifyHostPathContainmentW(matched_base_root, base_rel_parts, &allowed_ro_roots, false, false) !=
+        VfsTranslateStatus::Translated) {
+        return false;
+    }
+    const std::wstring base_plain = JoinRootAndParts(matched_base_root, base_rel_parts, false);
     return HostPathExistsW(base_plain, out_is_dir);
 #endif
 }
@@ -942,6 +1363,11 @@ bool VfsMounts::DeleteVirtualFileW(std::wstring_view virtual_path, uint32_t& out
             out_win32_error = ERROR_PATH_NOT_FOUND;
             return false;
         }
+        if (VerifyHostPathContainmentW(root, parsed.parts, nullptr, true, forbid_system_drive_writes_) !=
+            VfsTranslateStatus::Translated) {
+            out_win32_error = ERROR_ACCESS_DENIED;
+            return false;
+        }
         const std::wstring host = JoinRootAndParts(root, parsed.parts, parsed.had_extended);
         if (!::DeleteFileW(host.c_str())) {
             out_win32_error = ::GetLastError();
@@ -950,7 +1376,12 @@ bool VfsMounts::DeleteVirtualFileW(std::wstring_view virtual_path, uint32_t& out
         return true;
     }
 
-    if (g_root_.empty() || g_overlay_root_.empty() || parsed.parts.empty()) {
+    if ((g_root_.empty() && g_sub_mounts_.empty()) || g_overlay_root_.empty() || parsed.parts.empty()) {
+        out_win32_error = ERROR_ACCESS_DENIED;
+        return false;
+    }
+    if (VerifyHostPathContainmentW(g_overlay_root_, parsed.parts, nullptr, true, forbid_system_drive_writes_) !=
+        VfsTranslateStatus::Translated) {
         out_win32_error = ERROR_ACCESS_DENIED;
         return false;
     }
@@ -959,13 +1390,25 @@ bool VfsMounts::DeleteVirtualFileW(std::wstring_view virtual_path, uint32_t& out
         return false;
     }
 
-    const std::wstring base_plain = JoinRootAndParts(g_root_, parsed.parts, false);
+    std::wstring matched_base_root;
+    std::vector<std::wstring_view> base_rel_parts;
+    ResolveGameBaseTarget(g_root_, g_sub_mounts_, parsed.parts, matched_base_root, base_rel_parts);
+    const std::vector<std::wstring> allowed_ro_roots = CollectAllowedGameReadRoots(g_root_, g_sub_mounts_);
+    if (!matched_base_root.empty() &&
+        VerifyHostPathContainmentW(matched_base_root, base_rel_parts, &allowed_ro_roots, false, false) !=
+            VfsTranslateStatus::Translated) {
+        out_win32_error = ERROR_ACCESS_DENIED;
+        return false;
+    }
+
+    const std::wstring base_plain =
+        matched_base_root.empty() ? std::wstring{} : JoinRootAndParts(matched_base_root, base_rel_parts, false);
     const std::wstring overlay_plain = JoinRootAndParts(g_overlay_root_, parsed.parts, false);
 
     bool overlay_is_dir = false;
     const bool in_overlay = HostPathExistsW(overlay_plain, &overlay_is_dir);
     bool base_is_dir = false;
-    const bool in_base = HostPathExistsW(base_plain, &base_is_dir);
+    const bool in_base = !base_plain.empty() && HostPathExistsW(base_plain, &base_is_dir);
 
     if (!in_overlay && !in_base) {
         out_win32_error = ERROR_FILE_NOT_FOUND;
@@ -1019,6 +1462,11 @@ bool VfsMounts::RemoveVirtualDirectoryW(std::wstring_view virtual_path,
             out_win32_error = ERROR_PATH_NOT_FOUND;
             return false;
         }
+        if (VerifyHostPathContainmentW(root, parsed.parts, nullptr, true, forbid_system_drive_writes_) !=
+            VfsTranslateStatus::Translated) {
+            out_win32_error = ERROR_ACCESS_DENIED;
+            return false;
+        }
         const std::wstring host = JoinRootAndParts(root, parsed.parts, parsed.had_extended);
         if (!::RemoveDirectoryW(host.c_str())) {
             out_win32_error = ::GetLastError();
@@ -1027,7 +1475,12 @@ bool VfsMounts::RemoveVirtualDirectoryW(std::wstring_view virtual_path,
         return true;
     }
 
-    if (g_root_.empty() || g_overlay_root_.empty() || parsed.parts.empty()) {
+    if ((g_root_.empty() && g_sub_mounts_.empty()) || g_overlay_root_.empty() || parsed.parts.empty()) {
+        out_win32_error = ERROR_ACCESS_DENIED;
+        return false;
+    }
+    if (VerifyHostPathContainmentW(g_overlay_root_, parsed.parts, nullptr, true, forbid_system_drive_writes_) !=
+        VfsTranslateStatus::Translated) {
         out_win32_error = ERROR_ACCESS_DENIED;
         return false;
     }
@@ -1036,13 +1489,17 @@ bool VfsMounts::RemoveVirtualDirectoryW(std::wstring_view virtual_path,
         return false;
     }
 
-    const std::wstring base_plain = JoinRootAndParts(g_root_, parsed.parts, false);
+    std::wstring matched_base_root;
+    std::vector<std::wstring_view> base_rel_parts;
+    ResolveGameBaseTarget(g_root_, g_sub_mounts_, parsed.parts, matched_base_root, base_rel_parts);
+    const std::wstring base_plain =
+        matched_base_root.empty() ? std::wstring{} : JoinRootAndParts(matched_base_root, base_rel_parts, false);
     const std::wstring overlay_plain = JoinRootAndParts(g_overlay_root_, parsed.parts, false);
 
     bool overlay_is_dir = false;
     const bool in_overlay = HostPathExistsW(overlay_plain, &overlay_is_dir);
     bool base_is_dir = false;
-    const bool in_base = HostPathExistsW(base_plain, &base_is_dir);
+    const bool in_base = !base_plain.empty() && HostPathExistsW(base_plain, &base_is_dir);
 
     if (!in_overlay && !in_base) {
         out_win32_error = ERROR_FILE_NOT_FOUND;
@@ -1092,7 +1549,7 @@ bool VfsMounts::MoveVirtualPathW(std::wstring_view src_path,
     if (src_drive != VfsDrive::None) {
         bool was_wo = false;
         auto st = TranslateForAccessW(src_path, VfsAccessMode::ReadOnly, src_host, &was_wo, true);
-        if (st == VfsTranslateStatus::RejectedTraversal) {
+        if (st == VfsTranslateStatus::RejectedTraversal || st == VfsTranslateStatus::ReadOnlyViolation) {
             out_win32_error = ERROR_ACCESS_DENIED;
             return false;
         }
@@ -1137,7 +1594,7 @@ bool VfsMounts::MoveVirtualPathW(std::wstring_view src_path,
         }
     }
 
-    // Resolve destination host path for writing (NEVER inside g_root_!).
+    // Resolve destination host path for writing (NEVER inside g_root_ or any sub-mount!).
     std::wstring dst_host;
     if (dst_drive != VfsDrive::None) {
         auto st = TranslateForAccessW(dst_path, VfsAccessMode::WriteCreate, dst_host, nullptr, true);
@@ -1163,9 +1620,10 @@ bool VfsMounts::MoveVirtualPathW(std::wstring_view src_path,
         return true;
     }
 
-    // Check if source currently lives in read-only g_root_ (must copy, never move out of g_root_!).
+    // Check if source currently lives in read-only g_root_ / sub-mount (must copy, never move out!).
     bool src_is_in_base_only = false;
     ParsedVirtualPath src_parsed;
+    std::wstring src_base_plain;
     if (src_drive == VfsDrive::Game &&
         ParseVirtualPathW(src_path, src_parsed) == VfsTranslateStatus::Translated) {
         if (g_overlay_root_.empty()) {
@@ -1174,6 +1632,12 @@ bool VfsMounts::MoveVirtualPathW(std::wstring_view src_path,
         }
         const std::wstring src_overlay = JoinRootAndParts(g_overlay_root_, src_parsed.parts, false);
         src_is_in_base_only = !HostPathExistsW(src_overlay);
+        std::wstring matched_base_root;
+        std::vector<std::wstring_view> base_rel_parts;
+        ResolveGameBaseTarget(g_root_, g_sub_mounts_, src_parsed.parts, matched_base_root, base_rel_parts);
+        if (!matched_base_root.empty()) {
+            src_base_plain = JoinRootAndParts(matched_base_root, base_rel_parts, false);
+        }
     }
 
     if (src_is_dir) {
@@ -1193,8 +1657,7 @@ bool VfsMounts::MoveVirtualPathW(std::wstring_view src_path,
             if (!src_is_in_base_only) {
                 std::filesystem::remove_all(src_host, ec);
             }
-            const std::wstring src_base = JoinRootAndParts(g_root_, src_parsed.parts, false);
-            if (HostPathExistsW(src_base)) {
+            if (!src_base_plain.empty() && HostPathExistsW(src_base_plain)) {
                 EnsureDirectoryTreeW(g_overlay_root_);
                 WriteWhiteoutMarker(g_overlay_root_, src_parsed.parts);
             }
@@ -1225,8 +1688,7 @@ bool VfsMounts::MoveVirtualPathW(std::wstring_view src_path,
         return false;
     }
     if (src_drive == VfsDrive::Game) {
-        const std::wstring src_base = JoinRootAndParts(g_root_, src_parsed.parts, false);
-        if (HostPathExistsW(src_base)) {
+        if (!src_base_plain.empty() && HostPathExistsW(src_base_plain)) {
             EnsureDirectoryTreeW(g_overlay_root_);
             WriteWhiteoutMarker(g_overlay_root_, src_parsed.parts);
         }
@@ -1251,11 +1713,27 @@ VfsTranslateStatus VfsMounts::ResolveGamePairW(std::wstring_view virtual_path,
     if (parsed.drive != VfsDrive::Game) {
         return VfsTranslateStatus::NotVirtual;
     }
-    if (g_root_.empty()) {
+    if (g_root_.empty() && g_sub_mounts_.empty()) {
         return VfsTranslateStatus::UnconfiguredMount;
     }
 
-    out_base_path = JoinRootAndParts(g_root_, parsed.parts, parsed.had_extended);
+    std::wstring matched_base_root;
+    std::vector<std::wstring_view> base_rel_parts;
+    ResolveGameBaseTarget(g_root_, g_sub_mounts_, parsed.parts, matched_base_root, base_rel_parts);
+    if (matched_base_root.empty()) {
+        return VfsTranslateStatus::UnconfiguredMount;
+    }
+
+#if defined(_WIN32)
+    const std::vector<std::wstring> allowed_ro_roots = CollectAllowedGameReadRoots(g_root_, g_sub_mounts_);
+    const VfsTranslateStatus base_contain = VerifyHostPathContainmentW(
+        matched_base_root, base_rel_parts, &allowed_ro_roots, false, false);
+    if (base_contain != VfsTranslateStatus::Translated) {
+        return base_contain;
+    }
+#endif
+
+    out_base_path = JoinRootAndParts(matched_base_root, base_rel_parts, parsed.had_extended);
     out_overlay_path = g_overlay_root_.empty()
                            ? std::wstring{}
                            : JoinRootAndParts(g_overlay_root_, parsed.parts, parsed.had_extended);
