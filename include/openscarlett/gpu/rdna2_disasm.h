@@ -253,6 +253,8 @@ enum class Rdna2Opcode : uint16_t {
     S_LSHL_B32,
     S_LSHR_B32,
     S_ASHR_I32,
+    S_BFE_U32,
+    S_BFE_I32,
     S_MUL_I32,
 
     // SOP1
@@ -280,6 +282,7 @@ enum class Rdna2Opcode : uint16_t {
 
     // SOPK
     S_MOVK_I32,
+    S_VERSION,
     S_ADDK_I32,
     S_MULK_I32,
 
@@ -296,6 +299,10 @@ enum class Rdna2Opcode : uint16_t {
     S_WAITCNT,
     S_BARRIER,
     S_SENDMSG,
+    S_ICACHE_INV,
+    S_TTRACEDATA,
+    S_CODE_END,
+    S_TTRACEDATA_IMM,
 
     // VOP2
     V_CNDMASK_B32,
@@ -339,6 +346,8 @@ enum class Rdna2Opcode : uint16_t {
     V_FLOOR_F32,
     V_CEIL_F32,
     V_FRACT_F32,
+    V_CVT_NORM_I16_F16,
+    V_CVT_NORM_U16_F16,
 
     // VOPC (and GFX10 V_CMPX execution-mask compares + split-range F16 compares)
     V_CMP_LT_F32,
@@ -416,6 +425,8 @@ enum class Rdna2Opcode : uint16_t {
     V_MBCNT_LO_U32_B32,
     V_MBCNT_HI_U32_B32,
     V_READLANE_B32,
+    V_CVT_PKNORM_I16_F32,
+    V_CVT_PKNORM_U16_F32,
     V_ADD3_U32,
     V_DOT2_F32_F16,
     V_PERMLANE16_B32,

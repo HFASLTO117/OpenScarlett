@@ -118,6 +118,10 @@ enum class IrOp : uint16_t {
     F2I,
     U2F,
     F2U,
+    CvtPkNormI16F32,  // operands: [src0_f32, src1_f32] -> u32 packed 2x snorm16
+    CvtPkNormU16F32,  // operands: [src0_f32, src1_f32] -> u32 packed 2x unorm16
+    CvtNormI16F16,    // operands: [src0_u32], imm_u32 = op_sel|(neg<<8)|(abs<<12) -> u32 lo16 snorm16
+    CvtNormU16F16,    // operands: [src0_u32], imm_u32 = op_sel|(neg<<8)|(abs<<12) -> u32 lo16 unorm16
 
     // Comparisons (produce IrType::Bool)
     CmpEq,
@@ -176,6 +180,13 @@ struct Rdna2IrOptStats {
     uint32_t folded_constants = 0;
     uint32_t pruned_mask_ops = 0;
     uint32_t eliminated_ops = 0;
+    uint32_t inserted_lockstep_lds_barriers = 0;
+};
+
+// Optional SRV texture format contract for MIMG IMAGE_LOAD / IMAGE_LOAD_MIP
+enum class Rdna2TextureFormat : uint8_t {
+    Float4 = 0,  // RGBA32F / RGBA8_UNORM / RGBA16F
+    Uint4 = 1,   // R32_UINT / RGBA32_UINT
 };
 
 // Interpolation mode contract between Pixel Shader and its feeder stage (VS / GS / MS)
@@ -208,6 +219,7 @@ struct FssmPixelInputEntry {
 struct StageContractTable {
     std::vector<VertexFetchEntry> vertex_fetches;
     std::vector<FssmPixelInputEntry> pixel_inputs;
+    Rdna2TextureFormat texture_srv_format = Rdna2TextureFormat::Float4;
 };
 
 struct Rdna2IrModule {
@@ -239,6 +251,8 @@ struct Rdna2IrModule {
     bool uses_texture_uav = false;
     bool uses_texture_u32_uav = false;
     uint8_t texture_u32_uav_dim = 1;  // 1=2D, 2=3D, 3=Cube
+    Rdna2TextureFormat texture_srv_format = Rdna2TextureFormat::Float4;
+    uint32_t inserted_lockstep_lds_barriers = 0;
     bool uses_bvh_ray = false;
     bool uses_wave64_emulation = false;
     bool exports_pos0 = false;
@@ -292,7 +306,10 @@ Status BuildRdna2Ir(
 // Reconciles interpolation modifiers (Flat / NoPerspective / Centroid / Sample) between PS and its feeder stage.
 void ReconcileStageInterpolation(Rdna2IrModule& feeder_ir, Rdna2IrModule& ps_ir) noexcept;
 
-// Runs Constant Folding and Dead-Code Elimination passes on an IR module.
+// Inserts explicit group barriers for 1-wave (<=64 threads) lockstep LDS hazards.
+uint32_t InsertSingleWaveLockstepLdsBarriers(Rdna2IrModule& module);
+
+// Runs Constant Folding, Dead-Code Elimination, and single-wave lockstep LDS barrier insertion.
 Status OptimizeRdna2Ir(Rdna2IrModule& module, Rdna2IrOptStats* out_stats = nullptr);
 
 // Formats the SSA IR module into human-readable text for diagnostics/debugging.

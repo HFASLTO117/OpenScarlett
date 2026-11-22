@@ -35,9 +35,12 @@ struct Rdna2CpuTexture {
         uint8_t dimension,
         uint32_t width,
         uint32_t height,
-        uint32_t depth_or_faces = 1);
+        uint32_t depth_or_faces = 1,
+        uint32_t mip_levels = 1);
 
     std::array<float, 4> LoadRgba32f(uint32_t x, uint32_t y, uint32_t z, uint32_t mip) const noexcept;
+    std::array<uint32_t, 4> LoadR32uRgba(uint32_t x, uint32_t y, uint32_t z, uint32_t mip) const noexcept;
+    uint32_t LoadR32u(uint32_t x, uint32_t y, uint32_t z, uint32_t mip) const noexcept;
     std::array<float, 4> SampleNearest(float u, float v, float lod) const noexcept;
     void StoreRgba32f(uint32_t x, uint32_t y, uint32_t z, const std::array<float, 4>& rgba) noexcept;
     uint32_t AtomicCmpSwapR32u(uint32_t x, uint32_t y, uint32_t z, uint32_t cmp_val, uint32_t new_val) noexcept;

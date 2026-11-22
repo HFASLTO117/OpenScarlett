@@ -43,6 +43,7 @@ struct Rdna2LiftResult {
     std::string hlsl_target;
     std::vector<uint8_t> pc_dxil;
     uint64_t pc_dxil_hash = 0;
+    uint32_t inserted_lockstep_lds_barriers = 0;
     std::string spirv_val_diagnostics;
     std::string dxc_diagnostics;
 };

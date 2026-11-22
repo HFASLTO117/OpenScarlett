@@ -162,6 +162,47 @@ uint32_t EvalAlignByteB32(uint32_t hi, uint32_t lo, uint32_t byte_sel) noexcept 
     return lo_part | hi_part;
 }
 
+float RoundNearestEvenF32(float x) noexcept {
+    const float fl = std::floor(x);
+    const float diff = x - fl;
+    if (diff < 0.5f) return fl;
+    if (diff > 0.5f) return fl + 1.0f;
+    const float half_fl = fl * 0.5f;
+    return (std::floor(half_fl) == half_fl) ? fl : (fl + 1.0f);
+}
+
+uint16_t CvtSnorm16F32(float x) noexcept {
+    if (std::isnan(x)) return 0u;
+    const float c = (x >= 1.0f) ? 1.0f : ((x <= -1.0f) ? -1.0f : x);
+    const int32_t v = static_cast<int32_t>(RoundNearestEvenF32(c * 32767.0f));
+    return static_cast<uint16_t>(static_cast<int16_t>(std::clamp(v, -32767, 32767)));
+}
+
+uint16_t CvtUnorm16F32(float x) noexcept {
+    if (std::isnan(x)) return 0u;
+    const float c = (x >= 1.0f) ? 1.0f : ((x <= 0.0f) ? 0.0f : x);
+    const int32_t v = static_cast<int32_t>(RoundNearestEvenF32(c * 65535.0f));
+    return static_cast<uint16_t>(std::clamp(v, 0, 65535));
+}
+
+uint32_t EvalSBfeU32(uint32_t src0, uint32_t src1) noexcept {
+    const uint32_t off = src1 & 31u;
+    const uint32_t wid = (src1 >> 16) & 0x7Fu;
+    if (wid == 0u) return 0u;
+    if (off + wid < 32u) return (src0 >> off) & ((1u << wid) - 1u);
+    return src0 >> off;
+}
+
+uint32_t EvalSBfeI32(uint32_t src0, uint32_t src1) noexcept {
+    const uint32_t off = src1 & 31u;
+    const uint32_t wid = (src1 >> 16) & 0x7Fu;
+    if (wid == 0u) return 0u;
+    if (off + wid < 32u) {
+        return static_cast<uint32_t>(static_cast<int32_t>(src0 << (32u - off - wid)) >> (32u - wid));
+    }
+    return static_cast<uint32_t>(static_cast<int32_t>(src0) >> off);
+}
+
 bool EvalF16CompareCpu(Rdna2Opcode op, float a, float b) noexcept {
     const bool unord = std::isnan(a) || std::isnan(b);
     switch (op) {
@@ -542,15 +583,26 @@ void Rdna2CpuTexture::AllocateR32u(
     uint8_t dimension,
     uint32_t width,
     uint32_t height,
-    uint32_t depth_or_faces) {
+    uint32_t depth_or_faces,
+    uint32_t mip_levels) {
     dim = dimension;
+    const uint32_t levels = mip_levels ? mip_levels : 1u;
     mips.clear();
-    mips.resize(1);
-    mips[0].width = width ? width : 1u;
-    mips[0].height = height ? height : 1u;
-    mips[0].depth = (dimension == 3u) ? 6u : (depth_or_faces ? depth_or_faces : 1u);
-    mips[0].r32u.assign(
-        static_cast<size_t>(mips[0].width) * mips[0].height * mips[0].depth, 0u);
+    mips.resize(levels);
+    uint32_t w = width ? width : 1u;
+    uint32_t h = height ? height : 1u;
+    uint32_t d = (dimension == 3u) ? 6u : (depth_or_faces ? depth_or_faces : 1u);
+    for (uint32_t m = 0; m < levels; ++m) {
+        mips[m].width = w;
+        mips[m].height = h;
+        mips[m].depth = d;
+        mips[m].r32u.assign(static_cast<size_t>(w) * h * d, 0u);
+        w = std::max(1u, w >> 1);
+        h = std::max(1u, h >> 1);
+        if (dimension == 2u) {
+            d = std::max(1u, d >> 1);
+        }
+    }
 }
 
 std::array<float, 4> Rdna2CpuTexture::LoadRgba32f(
@@ -562,6 +614,25 @@ std::array<float, 4> Rdna2CpuTexture::LoadRgba32f(
     if (idx * 4u + 3u >= lv.rgba32f.size()) return {0.0f, 0.0f, 0.0f, 0.0f};
     return {lv.rgba32f[idx * 4u + 0u], lv.rgba32f[idx * 4u + 1u],
             lv.rgba32f[idx * 4u + 2u], lv.rgba32f[idx * 4u + 3u]};
+}
+
+std::array<uint32_t, 4> Rdna2CpuTexture::LoadR32uRgba(
+    uint32_t x, uint32_t y, uint32_t z, uint32_t mip) const noexcept {
+    // Null / unbound descriptor returns all zeros; for a valid bound R32_UINT texture,
+    // D3D12 / AMD RDNA2 T# DST_SEL missing-component substitution fills (G=0, B=0, A=1)
+    // even when present channel R is clamped to 0 on out-of-bounds coordinates or mip.
+    if (mips.empty()) return {0u, 0u, 0u, 0u};
+    if (mip >= mips.size()) return {0u, 0u, 0u, 1u};
+    const auto& lv = mips[mip];
+    if (x >= lv.width || y >= lv.height || z >= lv.depth) return {0u, 0u, 0u, 1u};
+    const size_t idx = (static_cast<size_t>(z) * lv.height + y) * lv.width + x;
+    if (idx >= lv.r32u.size()) return {0u, 0u, 0u, 1u};
+    return {lv.r32u[idx], 0u, 0u, 1u};
+}
+
+uint32_t Rdna2CpuTexture::LoadR32u(
+    uint32_t x, uint32_t y, uint32_t z, uint32_t mip) const noexcept {
+    return LoadR32uRgba(x, y, z, mip)[0];
 }
 
 std::array<float, 4> Rdna2CpuTexture::SampleNearest(float u, float v, float lod) const noexcept {
@@ -980,6 +1051,18 @@ Status ExecuteRdna2Cpu(
                                     wv.scc = (r != 0);
                                     break;
                                 }
+                                case Rdna2Opcode::S_BFE_U32: {
+                                    const uint32_t r = EvalSBfeU32(read_op_u32(inst.src[0], 0), read_op_u32(inst.src[1], 0));
+                                    write_sgpr(inst.dst, r);
+                                    wv.scc = (r != 0u);
+                                    break;
+                                }
+                                case Rdna2Opcode::S_BFE_I32: {
+                                    const uint32_t r = EvalSBfeI32(read_op_u32(inst.src[0], 0), read_op_u32(inst.src[1], 0));
+                                    write_sgpr(inst.dst, r);
+                                    wv.scc = (r != 0u);
+                                    break;
+                                }
                                 case Rdna2Opcode::S_MUL_I32:
                                     write_sgpr(inst.dst, read_op_u32(inst.src[0], 0) * read_op_u32(inst.src[1], 0));
                                     break;
@@ -1066,6 +1149,8 @@ Status ExecuteRdna2Cpu(
                                 case Rdna2Opcode::S_MOVK_I32:
                                     write_sgpr(inst.dst, static_cast<uint32_t>(static_cast<int32_t>(inst.simm16)));
                                     break;
+                                case Rdna2Opcode::S_VERSION:
+                                    break;
                                 case Rdna2Opcode::S_ADDK_I32: {
                                     const uint32_t cur = read_op_u32(inst.dst, 0);
                                     write_sgpr(inst.dst, cur + static_cast<uint32_t>(static_cast<int32_t>(inst.simm16)));
@@ -1080,6 +1165,10 @@ Status ExecuteRdna2Cpu(
                                 // ----- SOPP -----
                                 case Rdna2Opcode::S_NOP:
                                 case Rdna2Opcode::S_WAITCNT:
+                                case Rdna2Opcode::S_ICACHE_INV:
+                                case Rdna2Opcode::S_TTRACEDATA:
+                                case Rdna2Opcode::S_TTRACEDATA_IMM:
+                                case Rdna2Opcode::S_CODE_END:
                                     break;
                                 case Rdna2Opcode::S_BARRIER:
                                     wv.pc = next_pc;
@@ -1403,6 +1492,20 @@ Status ExecuteRdna2Cpu(
                                         wv.vgpr[l][inst.dst.reg_index] = FloatToBits(clamp_f32(x - ExactFloorF32(x)));
                                     }
                                     break;
+                                case Rdna2Opcode::V_CVT_NORM_I16_F16:
+                                case Rdna2Opcode::V_CVT_NORM_U16_F16:
+                                    for (uint32_t l = 0; l < wv.lane_count; ++l) {
+                                        if (!lane_active(l)) continue;
+                                        const uint16_t h = PickHalf16(read_op_u32(inst.src[0], l), (inst.vop3_op_sel & 1u) != 0u);
+                                        float f = HalfBitsToFloat(h);
+                                        if (inst.src[0].abs) f = std::fabs(f);
+                                        if (inst.src[0].neg) f = -f;
+                                        const uint16_t out16 = (inst.opcode == Rdna2Opcode::V_CVT_NORM_I16_F16)
+                                                                   ? CvtSnorm16F32(f)
+                                                                   : CvtUnorm16F32(f);
+                                        wv.vgpr[l][inst.dst.reg_index] = static_cast<uint32_t>(out16);
+                                    }
+                                    break;
 
                                 // ----- VOPC & GFX10 V_CMPX & split-range F16 compares -----
                                 case Rdna2Opcode::V_CMP_LT_F32:
@@ -1659,6 +1762,22 @@ Status ExecuteRdna2Cpu(
                                     write_sgpr(inst.dst, read_op_u32(inst.src[0], src_lane));
                                     break;
                                 }
+                                case Rdna2Opcode::V_CVT_PKNORM_I16_F32:
+                                case Rdna2Opcode::V_CVT_PKNORM_U16_F32:
+                                    for (uint32_t l = 0; l < wv.lane_count; ++l) {
+                                        if (!lane_active(l)) continue;
+                                        const float f0 = read_op_f32(inst.src[0], l);
+                                        const float f1 = read_op_f32(inst.src[1], l);
+                                        const uint16_t lo = (inst.opcode == Rdna2Opcode::V_CVT_PKNORM_I16_F32)
+                                                                ? CvtSnorm16F32(f0)
+                                                                : CvtUnorm16F32(f0);
+                                        const uint16_t hi = (inst.opcode == Rdna2Opcode::V_CVT_PKNORM_I16_F32)
+                                                                ? CvtSnorm16F32(f1)
+                                                                : CvtUnorm16F32(f1);
+                                        wv.vgpr[l][inst.dst.reg_index] =
+                                            static_cast<uint32_t>(lo) | (static_cast<uint32_t>(hi) << 16);
+                                    }
+                                    break;
                                 case Rdna2Opcode::V_ADD3_U32:
                                     for (uint32_t l = 0; l < wv.lane_count; ++l) {
                                         if (!lane_active(l)) continue;
@@ -1872,14 +1991,26 @@ Status ExecuteRdna2Cpu(
                                     const uint8_t vaddr_b = static_cast<uint8_t>(inst.src[0].reg_index);
                                     const uint8_t vdata_b = static_cast<uint8_t>(inst.dst.reg_index);
                                     const uint8_t dmask = inst.mimg_dmask ? inst.mimg_dmask : 0xFu;
+                                    const bool is_u32 = !state.tex2d_srv.mips.empty() && !state.tex2d_srv.mips[0].r32u.empty();
                                     for (uint32_t l = 0; l < wv.lane_count; ++l) {
                                         if (!lane_active(l)) continue;
-                                        const auto px = state.tex2d_srv.LoadRgba32f(
-                                            wv.vgpr[l][vaddr_b], wv.vgpr[l][vaddr_b + 1u], 0u, 0u);
-                                        uint8_t out_r = vdata_b;
-                                        for (uint32_t ch = 0; ch < 4u; ++ch) {
-                                            if ((dmask & (1u << ch)) != 0u) {
-                                                wv.vgpr[l][out_r++] = FloatToBits(px[ch]);
+                                        if (is_u32) {
+                                            const auto px = state.tex2d_srv.LoadR32uRgba(
+                                                wv.vgpr[l][vaddr_b], wv.vgpr[l][vaddr_b + 1u], 0u, 0u);
+                                            uint8_t out_r = vdata_b;
+                                            for (uint32_t ch = 0; ch < 4u; ++ch) {
+                                                if ((dmask & (1u << ch)) != 0u) {
+                                                    wv.vgpr[l][out_r++] = px[ch];
+                                                }
+                                            }
+                                        } else {
+                                            const auto px = state.tex2d_srv.LoadRgba32f(
+                                                wv.vgpr[l][vaddr_b], wv.vgpr[l][vaddr_b + 1u], 0u, 0u);
+                                            uint8_t out_r = vdata_b;
+                                            for (uint32_t ch = 0; ch < 4u; ++ch) {
+                                                if ((dmask & (1u << ch)) != 0u) {
+                                                    wv.vgpr[l][out_r++] = FloatToBits(px[ch]);
+                                                }
                                             }
                                         }
                                     }
@@ -1892,17 +2023,28 @@ Status ExecuteRdna2Cpu(
                                     const uint8_t dim = inst.mimg_dim;
                                     const auto& tex = (dim == 2u) ? state.tex3d_srv
                                                                   : ((dim == 3u) ? state.texcube_srv : state.tex2d_srv);
+                                    const bool is_u32 = !tex.mips.empty() && !tex.mips[0].r32u.empty();
                                     for (uint32_t l = 0; l < wv.lane_count; ++l) {
                                         if (!lane_active(l)) continue;
                                         const uint32_t x = wv.vgpr[l][vaddr_b];
                                         const uint32_t y = wv.vgpr[l][vaddr_b + 1u];
                                         const uint32_t z = (dim == 2u || dim == 3u) ? wv.vgpr[l][vaddr_b + 2u] : 0u;
                                         const uint32_t mip = (dim == 2u || dim == 3u) ? wv.vgpr[l][vaddr_b + 3u] : wv.vgpr[l][vaddr_b + 2u];
-                                        const auto px = tex.LoadRgba32f(x, y, z, mip);
-                                        uint8_t out_r = vdata_b;
-                                        for (uint32_t ch = 0; ch < 4u; ++ch) {
-                                            if ((dmask & (1u << ch)) != 0u) {
-                                                wv.vgpr[l][out_r++] = FloatToBits(px[ch]);
+                                        if (is_u32) {
+                                            const auto px = tex.LoadR32uRgba(x, y, z, mip);
+                                            uint8_t out_r = vdata_b;
+                                            for (uint32_t ch = 0; ch < 4u; ++ch) {
+                                                if ((dmask & (1u << ch)) != 0u) {
+                                                    wv.vgpr[l][out_r++] = px[ch];
+                                                }
+                                            }
+                                        } else {
+                                            const auto px = tex.LoadRgba32f(x, y, z, mip);
+                                            uint8_t out_r = vdata_b;
+                                            for (uint32_t ch = 0; ch < 4u; ++ch) {
+                                                if ((dmask & (1u << ch)) != 0u) {
+                                                    wv.vgpr[l][out_r++] = FloatToBits(px[ch]);
+                                                }
                                             }
                                         }
                                     }

@@ -1,0 +1,83 @@
+Worker 2 Integration Manifest — Sprint 7 (v0.4.0-alpha)
+Branch: swarm/s7-rdna2-lockstep-isa
+Worktree: E:\OpenScarlett\.worktrees\s7-rdna2-lockstep-isa
+
+=== MODIFIED FILES ===
+- include/openscarlett/gpu/rdna2_disasm.h
+- include/openscarlett/gpu/rdna2_ir.h
+- include/openscarlett/gpu/rdna2_interpreter.h
+- include/openscarlett/gpu/rdna2_lifter.h
+- src/gpu/rdna2_disasm.cpp
+- src/gpu/rdna2_ir.cpp
+- src/gpu/rdna2_interpreter.cpp
+- src/gpu/rdna2_lifter.cpp
+
+=== NEW FILES ===
+- tests/test_rdna2_lockstep_isa.cpp
+- INTEGRATION_worker2.txt
+
+=== NEW CTEST TARGET TO ADD IN CMakeLists.txt (by integrator) ===
+Target name : test_rdna2_lockstep_isa
+Source file : tests/test_rdna2_lockstep_isa.cpp
+Include dirs: include, tests (same as test_rdna2_lifter_live)
+Link libs   : openscarlett_core
+Windows libs: d3d12 dxgi d3dcompiler ole32 uuid
+CTest entry : add_test(NAME test_rdna2_lockstep_isa COMMAND test_rdna2_lockstep_isa)
+Optional WARP test env: OPENSCARLETT_PREFER_WARP=1 (selects Microsoft Basic Render Driver / D3D12 WARP)
+
+=== SUMMARY OF DELIVERABLES ===
+1. Single-Wave Lockstep LDS Barrier Insertion:
+   - ParseXboxShaderContainer() now always honors non-zero PSV0 compute threadgroup dimensions
+     (NumThreadsX/Y/Z), overriding XS2 header defaults so [numthreads(x,y,z)] and SPIR-V
+     OpExecutionMode LocalSize match the PSV0 contract.
+   - Added InsertSingleWaveLockstepLdsBarriers() pass in OptimizeRdna2Ir() for compute/mesh
+     shaders with 1 < (tg_x * tg_y * tg_z) <= 64 (single AMD Wave64 group that splits into 2
+     independent Wave32 warps on NVIDIA/Intel GPUs).
+   - Performs intra-block and cross-block CFG LDS hazard analysis (write/atomic -> read/atomic,
+     read -> write/atomic) without an intervening explicit IrOp::Barrier, inserting explicit
+     workgroup barriers (HLSL GroupMemoryBarrierWithGroupSync() + SPIR-V OpControlBarrier
+     Execution=Workgroup(2), Memory=Workgroup(2), Semantics=AcquireRelease|WorkgroupMemory(0x108)).
+   - Records telemetry in Rdna2IrOptStats::inserted_lockstep_lds_barriers,
+     Rdna2IrModule::inserted_lockstep_lds_barriers, and Rdna2LiftResult::inserted_lockstep_lds_barriers.
+   - Verified zero spurious insertions when explicit s_barrier exists, when only LDS writes occur,
+     or for multi-wave (>64 thread) threadgroups.
+
+2. 5 Explicit No-Op Opcodes (AMD RDNA2 / GFX10.3):
+   - s_icache_inv      (SOPP 0x13, 0xBF930000)
+   - s_ttracedata      (SOPP 0x16, 0xBF960000)
+   - s_code_end        (SOPP 0x1F, 0xBF9F0000) — including unreachable trailing s_code_end padding after s_endpgm
+   - s_ttracedata_imm  (SOPP 0x28, 0xBFA8xxxx)
+   - s_version         (SOPK 0x01, 0xB080xxxx)
+   - Cleanly encoded, decoded, disassembled, lowered to IR no-ops, interpreted on CPU, and
+     lifted to valid HLSL/DXIL (SM 6.5 / SM 6.2) + SPIR-V (validated by Khronos spirv-val).
+
+3. Missing ISA Paths Added for Differential Verification:
+   - s_bfe_u32 (SOP2 0x27) & s_bfe_i32 (SOP2 0x28): full 5-bit offset (src1[4:0]) & 7-bit width
+     (src1[22:16]) decode, IR lowering, constant-folding, CPU interpreter, and UB-free HLSL + SPIR-V lifting.
+   - v_cvt_pknorm_i16_f32 (VOP3 0x368), v_cvt_pknorm_u16_f32 (VOP3 0x369),
+     v_cvt_norm_i16_f16 (VOP1 0x63 / VOP3 0x1E3), v_cvt_norm_u16_f16 (VOP1 0x64 / VOP3 0x1E4):
+     full decode, IR, constant-folding, CPU interpreter, and HLSL + SPIR-V lifting (NaN->0, clamp, RNE).
+   - Rdna2TextureFormat::Uint4 contract in StageContractTable + Rdna2IrModule + HLSL Texture2D<uint4> +
+     SPIR-V OpTypeImage(..., u32, ...) + Rdna2CpuTexture::AllocateR32u(mip_levels) / LoadR32uRgba()
+     matching D3D12 / RDNA2 T# missing-component fill (R=0 on OOB, G=0, B=0, A=1) bit-exact on both
+     NVIDIA GTX 1650 Ti and Microsoft D3D12 WARP.
+
+=== TEST RESULTS ===
+- Warnings: 0 warnings at /W4 across all modified/new files (Release & Debug /W4 /WX verified).
+- Existing CTest suite: 37/37 passed (100%, 50.92 sec).
+- test_rdna2_lockstep_isa (Hardware: NVIDIA GeForce GTX 1650 Ti + Vulkan 1.4.329 + spirv-val vulkan1.1/1.2 + dxc SM 6.5):
+    [INFO] test_rdna2_lockstep_isa D3D12 adapter: NVIDIA GeForce GTX 1650 Ti (warp=no)
+    [PASS] Test 1: Single-wave lockstep LDS barrier insertion + PSV0 [numthreads] (16x live GPU dispatches bit-exact)
+    [PASS] Test 2: All 5 explicit no-op opcodes (s_icache_inv, s_ttracedata, s_ttracedata_imm, s_code_end, s_version)
+    [PASS] Test 3: s_bfe_u32 & s_bfe_i32 (16 edge cases: width=0/32/40, off=0/31/>=32, MSB/sign-ext bit-exact)
+    [PASS] Test 4: v_cvt_pknorm_{i16,u16}_f32 & v_cvt_norm_{i16,u16}_f16 (16 edge values including +-2/+-1/+-0.5/+-0/NaN/+-Inf bit-exact)
+    [PASS] Test 5: image_load / image_load_mip edge cases (in-bounds, OOB=0, mips, dmask 0x1/0x5/0x9/0xF, RGBA32F/RGBA8_UNORM/R32_UINT)
+    [PASS] test_rdna2_lockstep_isa: ALL 5 DIFFERENTIAL ISA & LOCKSTEP LDS SUITES PASSED!
+- test_rdna2_lockstep_isa (D3D12 WARP: OPENSCARLETT_PREFER_WARP=1, Microsoft Basic Render Driver, dxc cs_6_2 + Vulkan 1.4.329 + spirv-val):
+    [INFO] test_rdna2_lockstep_isa D3D12 adapter: Microsoft Basic Render Driver (warp=yes)
+    [PASS] Test 1: Single-wave lockstep LDS barrier insertion + PSV0 [numthreads] (16x live GPU dispatches bit-exact)
+    [PASS] Test 2: All 5 explicit no-op opcodes (s_icache_inv, s_ttracedata, s_ttracedata_imm, s_code_end, s_version)
+    [PASS] Test 3: s_bfe_u32 & s_bfe_i32 (16 edge cases: width=0/32/40, off=0/31/>=32, MSB/sign-ext bit-exact)
+    [PASS] Test 4: v_cvt_pknorm_{i16,u16}_f32 & v_cvt_norm_{i16,u16}_f16 (16 edge values including +-2/+-1/+-0.5/+-0/NaN/+-Inf bit-exact)
+    [PASS] Test 5: image_load / image_load_mip edge cases (in-bounds, OOB=0, mips, dmask 0x1/0x5/0x9/0xF, RGBA32F/RGBA8_UNORM/R32_UINT)
+    [PASS] test_rdna2_lockstep_isa: ALL 5 DIFFERENTIAL ISA & LOCKSTEP LDS SUITES PASSED!
