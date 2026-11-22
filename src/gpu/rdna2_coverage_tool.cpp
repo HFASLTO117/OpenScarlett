@@ -4340,7 +4340,9 @@ void BuildExtendedSvGpuKernels(std::vector<PreparedExtKernel>& kernels, std::str
            << "RWByteAddressBuffer _uav0 : register(u0);\n"
            << "RWByteAddressBuffer _uav1 : register(u1);\n";
         if (uses_vopc) {
-            os << "groupshared uint _wm_shared;\n";
+            // Atomic-free per-lane ballot array (fixes AMD RDNA4 RX 9070 XT Issue #29
+            // single-wave scalar-store vs InterlockedOr hazard on groupshared _wm_shared)
+            os << "groupshared uint _wm_lanes[" << std::max<uint32_t>(32u, tg_x) << "];\n";
         }
         os << "uint _ff1_64(uint2 x) {\n"
            << "    if (x.x != 0u) return firstbitlow(x.x);\n"
@@ -4685,11 +4687,10 @@ void BuildExtendedSvGpuKernels(std::vector<PreparedExtKernel>& kernels, std::str
         auto emit_wave_mask = [&](const std::string& cond_expr, bool to_exec) {
             os << "    { bool _act = ((_exec_lo >> _lid) & 1u) != 0u;\n"
                << "      bool _cr = _act && (" << cond_expr << ");\n"
-               << "      if (_lid == 0u) _wm_shared = 0u;\n"
+               << "      _wm_lanes[_lid] = _cr ? (1u << _lid) : 0u;\n"
                << "      GroupMemoryBarrierWithGroupSync();\n"
-               << "      if (_cr) InterlockedOr(_wm_shared, 1u << _lid);\n"
-               << "      GroupMemoryBarrierWithGroupSync();\n"
-               << "      uint _wm = _wm_shared;\n"
+               << "      uint _wm = 0u;\n"
+               << "      [unroll] for (uint _wi = 0u; _wi < " << tg_x << "u; ++_wi) _wm |= _wm_lanes[_wi];\n"
                << "      GroupMemoryBarrierWithGroupSync();\n";
             if (to_exec) {
                 os << "      _exec_lo = _wm; _exec_hi = 0u; }\n";
