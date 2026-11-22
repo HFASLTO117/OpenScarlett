@@ -406,6 +406,10 @@ void TestSha256AndUpdateStaging(const fs::path& scratch_dir) {
     const auto stage_ok = VerifyAndStageLocalUpdateFiles(
         zip_path, sha_path, app_dir, "v0.5.0-alpha",
         [&](const UpdateDownloadProgress&) { ++progress_hits; });
+    if (!stage_ok.ok) {
+        std::fprintf(stderr, "VerifyAndStageLocalUpdateFiles failed: %s\n",
+                     stage_ok.error_message.c_str());
+    }
     OS_REQUIRE(stage_ok.ok);
     OS_REQUIRE(stage_ok.verified_sha256 == zip_hash);
     OS_REQUIRE(fs::exists(stage_ok.restart_script_path, ec));

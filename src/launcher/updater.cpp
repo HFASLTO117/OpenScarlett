@@ -1301,59 +1301,88 @@ std::wstring GetWindowsSystemExecutable(const wchar_t* relative_subpath) {
 
 Status ExtractZipWithPowerShell(const std::filesystem::path& zip_path,
                                 const std::filesystem::path& extract_dir) {
+    auto run_hidden = [](const std::wstring& exe, const std::wstring& cmdline, DWORD& out_exit) -> Status {
+        std::vector<wchar_t> cmd_buf(cmdline.begin(), cmdline.end());
+        cmd_buf.push_back(L'\0');
+
+        STARTUPINFOW si{};
+        si.cb = sizeof(si);
+        si.dwFlags = STARTF_USESHOWWINDOW;
+        si.wShowWindow = SW_HIDE;
+
+        PROCESS_INFORMATION pi{};
+        if (!CreateProcessW(
+                exe.c_str(),
+                cmd_buf.data(),
+                nullptr,
+                nullptr,
+                FALSE,
+                CREATE_NO_WINDOW,
+                nullptr,
+                nullptr,
+                &si,
+                &pi)) {
+            return Status::Error(
+                StatusCode::IoError,
+                FormatWin32Error("Failed to launch zip extractor process", GetLastError()));
+        }
+
+        UniqueHandle proc(pi.hProcess);
+        UniqueHandle thread(pi.hThread);
+
+        const DWORD wait_rc = WaitForSingleObject(proc.Get(), kExpandArchiveTimeoutMs);
+        if (wait_rc != WAIT_OBJECT_0) {
+            TerminateProcess(proc.Get(), 1);
+            return Status::Error(StatusCode::IoError, "Zip extraction timed out or failed to wait");
+        }
+
+        out_exit = 1;
+        if (!GetExitCodeProcess(proc.Get(), &out_exit)) {
+            return Status::Error(StatusCode::IoError, "Failed to query zip extractor exit code");
+        }
+        return Status::Ok();
+    };
+
+    // Fast path 1: Windows 10 1803+ / Windows 11 / Server 2019+ built-in System32\tar.exe
+    // (handles ZIP STORE & DEFLATE natively without PowerShell or PSModulePath issues).
+    const std::wstring tar_exe = GetWindowsSystemExecutable(L"tar.exe");
+    std::error_code ec;
+    if (std::filesystem::exists(tar_exe, ec) && !ec) {
+        const std::wstring tar_cmd =
+            L"\"" + tar_exe + L"\" -xf \"" + zip_path.wstring() +
+            L"\" -C \"" + extract_dir.wstring() + L"\"";
+        DWORD tar_exit = 1;
+        const Status tar_st = run_hidden(tar_exe, tar_cmd, tar_exit);
+        if (tar_st.ok() && tar_exit == 0) {
+            return Status::Ok();
+        }
+    }
+
+    // Fallback 2: .NET System.IO.Compression.ZipFile via WindowsPowerShell (immune to pwsh7 PSModulePath
+    // pollution that breaks Expand-Archive's Microsoft.PowerShell.Archive module under GitHub Actions).
     const std::wstring ps_exe =
         GetWindowsSystemExecutable(L"WindowsPowerShell\\v1.0\\powershell.exe");
 
     const std::wstring escaped_zip = EscapePowerShellSingleQuoted(zip_path.wstring());
     const std::wstring escaped_dest = EscapePowerShellSingleQuoted(extract_dir.wstring());
 
-    std::wstring cmd =
+    const std::wstring ps_cmd =
         L"\"" + ps_exe +
         L"\" -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "
-        L"\"Expand-Archive -LiteralPath '" + escaped_zip +
-        L"' -DestinationPath '" + escaped_dest + L"' -Force\"";
+        L"\"Add-Type -AssemblyName System.IO.Compression.FileSystem; "
+        L"[System.IO.Compression.ZipFile]::ExtractToDirectory('" + escaped_zip +
+        L"', '" + escaped_dest + L"')\"";
 
-    std::vector<wchar_t> cmd_buf(cmd.begin(), cmd.end());
-    cmd_buf.push_back(L'\0');
-
-    STARTUPINFOW si{};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-
-    PROCESS_INFORMATION pi{};
-    if (!CreateProcessW(
-            ps_exe.c_str(),
-            cmd_buf.data(),
-            nullptr,
-            nullptr,
-            FALSE,
-            CREATE_NO_WINDOW,
-            nullptr,
-            nullptr,
-            &si,
-            &pi)) {
-        return Status::Error(
-            StatusCode::IoError,
-            FormatWin32Error("Failed to launch PowerShell Expand-Archive", GetLastError()));
+    DWORD ps_exit = 1;
+    const Status ps_st = run_hidden(ps_exe, ps_cmd, ps_exit);
+    if (!ps_st.ok()) {
+        return ps_st;
     }
-
-    UniqueHandle proc(pi.hProcess);
-    UniqueHandle thread(pi.hThread);
-
-    const DWORD wait_rc = WaitForSingleObject(proc.Get(), kExpandArchiveTimeoutMs);
-    if (wait_rc != WAIT_OBJECT_0) {
-        TerminateProcess(proc.Get(), 1);
-        return Status::Error(StatusCode::IoError, "PowerShell Expand-Archive timed out or failed to wait");
-    }
-
-    DWORD exit_code = 1;
-    if (!GetExitCodeProcess(proc.Get(), &exit_code) || exit_code != 0) {
+    if (ps_exit != 0) {
         std::ostringstream oss;
-        oss << "PowerShell Expand-Archive failed with exit code " << exit_code;
+        oss << "ZipFile extraction failed with exit code " << ps_exit;
         return Status::Error(StatusCode::IoError, oss.str());
     }
-
     return Status::Ok();
 }
 
