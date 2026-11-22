@@ -215,12 +215,12 @@ def collect_components() -> tuple[list[Component], int]:
             what_works=(
                 "Native Win32/Direct2D launcher with GPU telemetry strip, Play & Launch tab, integrated 60s Hardware Self-Test, PE32+ Binary Inspector, and opt-in WinHTTP + BCrypt SHA-256 verified GitHub updater"
                 if has_launcher
-                else "Wave 2 in progress: native Win32/Direct2D GUI shell, integrated 60s Hardware Self-Test runner, PE32+ inspector, and opt-in WinHTTP + BCrypt SHA-256 verified updater (CLI & `run_hardware_test.bat` live today)"
+                else "Wave 2 in progress: native Win32/Direct2D GUI shell, integrated 60s Hardware Self-Test runner, PE32+ inspector, and opt-in WinHTTP + BCrypt SHA-256 verified updater (CLI & `run_hardware_test.ps1` live today)"
             ),
             verified_on=(
                 "Win10 & Win11 x64 (`test_launcher_updater`)"
                 if has_launcher
-                else "Wave 2 active (`run_hardware_test.ps1` / `.bat` verified on 6 PCs)"
+                else "Wave 2 active (`run_hardware_test.ps1` verified on 6 PCs)"
             ),
         ),
     ]
