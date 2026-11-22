@@ -19,17 +19,99 @@
 struct HCCallObject {
     std::atomic<int32_t> ref_count{1};
     std::mutex mutex;
+    uint64_t call_id = 0;
 
     std::string method = "GET";
     std::string url;
     std::vector<std::pair<std::string, std::string>> request_headers;
     std::vector<uint8_t> request_body;
+    uint32_t timeout_seconds = 30u;
+    uint32_t retry_delay_seconds = 2u;
+    uint32_t timeout_window_seconds = 20u;
+    uint32_t retry_cache_id = 0u;
+    bool retry_allowed = true;
+    bool ssl_validation = true;
+    bool trace_call = true;
+    void* user_context = nullptr;
 
     bool completed = false;
     uint32_t response_status = 0;
+    int32_t network_error_code = 0;
+    uint32_t platform_network_error_code = 0;
+    std::string platform_network_error_message;
     std::vector<std::pair<std::string, std::string>> response_headers;
     std::vector<uint8_t> response_body;
     std::string response_string;
+};
+
+struct HCWebSocketObject;
+typedef HCWebSocketObject* HCWebsocketHandle;
+
+enum HCWebSocketCloseStatus : uint32_t {
+    HCWebSocketCloseStatus_Normal = 1000u,
+    HCWebSocketCloseStatus_GoingAway = 1001u,
+    HCWebSocketCloseStatus_ProtocolError = 1002u,
+    HCWebSocketCloseStatus_Unsupported = 1003u,
+    HCWebSocketCloseStatus_Abnormal = 1006u,
+};
+
+struct WebSocketCompletionResult {
+    HCWebsocketHandle websocket;
+    int32_t errorCode;
+    uint32_t platformErrorCode;
+};
+
+typedef void(OS_SHIM_CALL* HCWebSocketMessageFunction)(
+    HCWebsocketHandle websocket,
+    const char* incomingBodyString,
+    void* functionContext);
+typedef void(OS_SHIM_CALL* HCWebSocketBinaryMessageFunction)(
+    HCWebsocketHandle websocket,
+    const uint8_t* payloadBytes,
+    uint32_t payloadSize,
+    void* functionContext);
+typedef void(OS_SHIM_CALL* HCWebSocketCloseEventFunction)(
+    HCWebsocketHandle websocket,
+    HCWebSocketCloseStatus closeStatus,
+    void* functionContext);
+
+typedef int32_t(OS_SHIM_CALL* HCWebSocketConnectFunction)(
+    const char* uri,
+    const char* subProtocol,
+    HCWebsocketHandle websocket,
+    XAsyncBlock* asyncBlock,
+    void* context);
+typedef int32_t(OS_SHIM_CALL* HCWebSocketSendMessageFunction)(
+    HCWebsocketHandle websocket,
+    const char* message,
+    XAsyncBlock* asyncBlock,
+    void* context);
+typedef int32_t(OS_SHIM_CALL* HCWebSocketSendBinaryMessageFunction)(
+    HCWebsocketHandle websocket,
+    const uint8_t* payloadBytes,
+    uint32_t payloadSize,
+    XAsyncBlock* asyncBlock,
+    void* context);
+typedef int32_t(OS_SHIM_CALL* HCWebSocketDisconnectFunction)(
+    HCWebsocketHandle websocket,
+    HCWebSocketCloseStatus closeStatus,
+    void* context);
+
+struct HCWebSocketObject {
+    std::atomic<int32_t> ref_count{1};
+    std::mutex mutex;
+    std::string uri;
+    std::string sub_protocol;
+    std::string proxy_uri;
+    std::vector<std::pair<std::string, std::string>> headers;
+    size_t max_receive_buffer_size = 64u * 1024u;
+    bool connected = false;
+    HCWebSocketMessageFunction message_fn = nullptr;
+    HCWebSocketBinaryMessageFunction binary_message_fn = nullptr;
+    HCWebSocketCloseEventFunction close_fn = nullptr;
+    void* fn_context = nullptr;
+    std::vector<std::string> sent_text_messages;
+    std::vector<std::vector<uint8_t>> sent_binary_messages;
 };
 
 namespace {
@@ -48,10 +130,18 @@ struct MockRule {
 struct HcState {
     std::mutex mutex;
     uint32_t init_count = 0;
+    uint64_t next_call_id = 1ull;
     bool trace_to_debugger = false;
     HCTraceLevel trace_level = HCTraceLevel_Off;
     std::unordered_map<HCCallObject*, std::shared_ptr<HCCallObject>> live_calls;
+    std::unordered_map<HCWebSocketObject*, std::shared_ptr<HCWebSocketObject>> live_websockets;
     std::vector<MockRule> mocks;
+
+    HCWebSocketConnectFunction ws_connect_fn = nullptr;
+    HCWebSocketSendMessageFunction ws_send_text_fn = nullptr;
+    HCWebSocketSendBinaryMessageFunction ws_send_bin_fn = nullptr;
+    HCWebSocketDisconnectFunction ws_disconnect_fn = nullptr;
+    void* ws_fn_context = nullptr;
 };
 
 HcState& GetHc() {
@@ -114,8 +204,74 @@ std::shared_ptr<HCCallObject> LookupCall(HCCallHandle handle) {
     return it == st.live_calls.end() ? nullptr : it->second;
 }
 
+std::shared_ptr<HCWebSocketObject> LookupWebSocket(HCWebsocketHandle handle) {
+    if (!handle) return nullptr;
+    auto& st = GetHc();
+    std::lock_guard<std::mutex> lk(st.mutex);
+    auto it = st.live_websockets.find(handle);
+    return it == st.live_websockets.end() ? nullptr : it->second;
+}
+
 const char kIdHcPerform[] = "HCHttpCallPerformAsync";
 const char kIdHcCleanup[] = "HCCleanupAsync";
+const char kIdWsConnect[] = "HCWebSocketConnectAsync";
+const char kIdWsSend[] = "HCWebSocketSendMessageAsync";
+const char kIdWsSendBin[] = "HCWebSocketSendBinaryMessageAsync";
+
+struct WsAsyncCtx {
+    std::shared_ptr<HCWebSocketObject> ws;
+    std::string uri;
+    std::string sub_protocol;
+    std::string text_payload;
+    std::vector<uint8_t> bin_payload;
+    uint32_t op_kind = 0u;  // 0=connect, 1=send_text, 2=send_binary
+    WebSocketCompletionResult result{};
+};
+
+XGameResult OPENSCARLETT_GDK_CALL HcWebSocketAsyncProvider(
+    XAsyncOp op,
+    const XAsyncProviderData* data) {
+    auto* ctx = static_cast<WsAsyncCtx*>(data->context);
+    switch (op) {
+        case XAsyncOp_Begin:
+            return XGR_S_OK;
+        case XAsyncOp_DoWork: {
+            if (!ctx || !ctx->ws) {
+                XAsyncComplete(data->async, XGR_E_INVALIDARG, 0);
+                return XGR_E_PENDING;
+            }
+            {
+                std::lock_guard<std::mutex> lk(ctx->ws->mutex);
+                if (ctx->op_kind == 0u) {
+                    ctx->ws->uri = ctx->uri;
+                    ctx->ws->sub_protocol = ctx->sub_protocol;
+                    ctx->ws->connected = true;
+                } else if (ctx->op_kind == 1u) {
+                    ctx->ws->sent_text_messages.push_back(ctx->text_payload);
+                } else if (ctx->op_kind == 2u) {
+                    ctx->ws->sent_binary_messages.push_back(ctx->bin_payload);
+                }
+            }
+            ctx->result.websocket = ctx->ws.get();
+            ctx->result.errorCode = OS_SHIM_S_OK;
+            ctx->result.platformErrorCode = 0u;
+            XAsyncComplete(data->async, XGR_S_OK, sizeof(WebSocketCompletionResult));
+            return XGR_E_PENDING;
+        }
+        case XAsyncOp_GetResult: {
+            if (!ctx || !data->buffer || data->bufferSize < sizeof(WebSocketCompletionResult)) {
+                return XGR_E_INVALIDARG;
+            }
+            std::memcpy(data->buffer, &ctx->result, sizeof(WebSocketCompletionResult));
+            return XGR_S_OK;
+        }
+        case XAsyncOp_Cleanup:
+            delete ctx;
+            return XGR_S_OK;
+        default:
+            return XGR_S_OK;
+    }
+}
 
 struct HcPerformAsyncCtx {
     std::shared_ptr<HCCallObject> call;
@@ -304,6 +460,7 @@ int32_t OS_SHIM_CALL HCHttpCallCreate(HCCallHandle* call) {
     {
         auto& st = GetHc();
         std::lock_guard<std::mutex> lk(st.mutex);
+        obj->call_id = st.next_call_id++;
         st.live_calls[raw] = std::move(obj);
     }
     *call = raw;
@@ -565,6 +722,609 @@ void OS_SHIM_CALL HCClearMockResponsesForTest(void) {
     std::lock_guard<std::mutex> lk(st.mutex);
     st.mocks.clear();
     RecordOk("HCClearMockResponsesForTest");
+}
+
+// ===========================================================================
+// Extended HCHttpCall Request/Response Getters & Setters (Offline Mode)
+// ===========================================================================
+OS_HC_API uint64_t OS_SHIM_CALL HCHttpCallGetId(HCCallHandle call) {
+    auto obj = LookupCall(call);
+    if (!obj) {
+        RecordHr("HCHttpCallGetId", OS_SHIM_E_HANDLE);
+        return 0ull;
+    }
+    RecordOk("HCHttpCallGetId");
+    return obj->call_id;
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCHttpCallSetTracing(HCCallHandle call, bool traceCall) {
+    auto obj = LookupCall(call);
+    if (!obj) return RecordHr("HCHttpCallSetTracing", OS_SHIM_E_HANDLE);
+    std::lock_guard<std::mutex> lk(obj->mutex);
+    obj->trace_call = traceCall;
+    return RecordHr("HCHttpCallSetTracing", OS_SHIM_S_OK);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCHttpCallSetContext(HCCallHandle call, void* context) {
+    auto obj = LookupCall(call);
+    if (!obj) return RecordHr("HCHttpCallSetContext", OS_SHIM_E_HANDLE);
+    std::lock_guard<std::mutex> lk(obj->mutex);
+    obj->user_context = context;
+    return RecordHr("HCHttpCallSetContext", OS_SHIM_S_OK);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCHttpCallGetContext(HCCallHandle call, void** context) {
+    if (!context) return RecordHr("HCHttpCallGetContext", OS_SHIM_E_INVALIDARG);
+    auto obj = LookupCall(call);
+    if (!obj) return RecordHr("HCHttpCallGetContext", OS_SHIM_E_HANDLE);
+    std::lock_guard<std::mutex> lk(obj->mutex);
+    *context = obj->user_context;
+    return RecordHr("HCHttpCallGetContext", OS_SHIM_S_OK);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestSetTimeout(
+    HCCallHandle call,
+    uint32_t timeoutInSeconds) {
+    auto obj = LookupCall(call);
+    if (!obj) return RecordHr("HCHttpCallRequestSetTimeout", OS_SHIM_E_HANDLE);
+    std::lock_guard<std::mutex> lk(obj->mutex);
+    obj->timeout_seconds = timeoutInSeconds;
+    return RecordHr("HCHttpCallRequestSetTimeout", OS_SHIM_S_OK);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestGetTimeout(
+    HCCallHandle call,
+    uint32_t* timeoutInSeconds) {
+    if (!timeoutInSeconds) return RecordHr("HCHttpCallRequestGetTimeout", OS_SHIM_E_INVALIDARG);
+    auto obj = LookupCall(call);
+    if (!obj) return RecordHr("HCHttpCallRequestGetTimeout", OS_SHIM_E_HANDLE);
+    std::lock_guard<std::mutex> lk(obj->mutex);
+    *timeoutInSeconds = obj->timeout_seconds;
+    return RecordHr("HCHttpCallRequestGetTimeout", OS_SHIM_S_OK);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestSetRetryAllowed(
+    HCCallHandle call,
+    bool retryAllowed) {
+    auto obj = LookupCall(call);
+    if (!obj) return RecordHr("HCHttpCallRequestSetRetryAllowed", OS_SHIM_E_HANDLE);
+    std::lock_guard<std::mutex> lk(obj->mutex);
+    obj->retry_allowed = retryAllowed;
+    return RecordHr("HCHttpCallRequestSetRetryAllowed", OS_SHIM_S_OK);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestGetRetryAllowed(
+    HCCallHandle call,
+    bool* retryAllowed) {
+    if (!retryAllowed) return RecordHr("HCHttpCallRequestGetRetryAllowed", OS_SHIM_E_INVALIDARG);
+    auto obj = LookupCall(call);
+    if (!obj) return RecordHr("HCHttpCallRequestGetRetryAllowed", OS_SHIM_E_HANDLE);
+    std::lock_guard<std::mutex> lk(obj->mutex);
+    *retryAllowed = obj->retry_allowed;
+    return RecordHr("HCHttpCallRequestGetRetryAllowed", OS_SHIM_S_OK);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestSetRetryDelay(
+    HCCallHandle call,
+    uint32_t retryDelayInSeconds) {
+    auto obj = LookupCall(call);
+    if (!obj) return RecordHr("HCHttpCallRequestSetRetryDelay", OS_SHIM_E_HANDLE);
+    std::lock_guard<std::mutex> lk(obj->mutex);
+    obj->retry_delay_seconds = retryDelayInSeconds;
+    return RecordHr("HCHttpCallRequestSetRetryDelay", OS_SHIM_S_OK);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestGetRetryDelay(
+    HCCallHandle call,
+    uint32_t* retryDelayInSeconds) {
+    if (!retryDelayInSeconds) return RecordHr("HCHttpCallRequestGetRetryDelay", OS_SHIM_E_INVALIDARG);
+    auto obj = LookupCall(call);
+    if (!obj) return RecordHr("HCHttpCallRequestGetRetryDelay", OS_SHIM_E_HANDLE);
+    std::lock_guard<std::mutex> lk(obj->mutex);
+    *retryDelayInSeconds = obj->retry_delay_seconds;
+    return RecordHr("HCHttpCallRequestGetRetryDelay", OS_SHIM_S_OK);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestSetTimeoutWindow(
+    HCCallHandle call,
+    uint32_t timeoutWindowInSeconds) {
+    auto obj = LookupCall(call);
+    if (!obj) return RecordHr("HCHttpCallRequestSetTimeoutWindow", OS_SHIM_E_HANDLE);
+    std::lock_guard<std::mutex> lk(obj->mutex);
+    obj->timeout_window_seconds = timeoutWindowInSeconds;
+    return RecordHr("HCHttpCallRequestSetTimeoutWindow", OS_SHIM_S_OK);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestGetTimeoutWindow(
+    HCCallHandle call,
+    uint32_t* timeoutWindowInSeconds) {
+    if (!timeoutWindowInSeconds) {
+        return RecordHr("HCHttpCallRequestGetTimeoutWindow", OS_SHIM_E_INVALIDARG);
+    }
+    auto obj = LookupCall(call);
+    if (!obj) return RecordHr("HCHttpCallRequestGetTimeoutWindow", OS_SHIM_E_HANDLE);
+    std::lock_guard<std::mutex> lk(obj->mutex);
+    *timeoutWindowInSeconds = obj->timeout_window_seconds;
+    return RecordHr("HCHttpCallRequestGetTimeoutWindow", OS_SHIM_S_OK);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestSetRetryCacheId(
+    HCCallHandle call,
+    uint32_t retryAfterCacheId) {
+    auto obj = LookupCall(call);
+    if (!obj) return RecordHr("HCHttpCallRequestSetRetryCacheId", OS_SHIM_E_HANDLE);
+    std::lock_guard<std::mutex> lk(obj->mutex);
+    obj->retry_cache_id = retryAfterCacheId;
+    return RecordHr("HCHttpCallRequestSetRetryCacheId", OS_SHIM_S_OK);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestSetSSLValidation(
+    HCCallHandle call,
+    bool sslValidation) {
+    auto obj = LookupCall(call);
+    if (!obj) return RecordHr("HCHttpCallRequestSetSSLValidation", OS_SHIM_E_HANDLE);
+    std::lock_guard<std::mutex> lk(obj->mutex);
+    obj->ssl_validation = sslValidation;
+    return RecordHr("HCHttpCallRequestSetSSLValidation", OS_SHIM_S_OK);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestGetUrl(
+    HCCallHandle call,
+    const char** method,
+    const char** url) {
+    if (!method || !url) return RecordHr("HCHttpCallRequestGetUrl", OS_SHIM_E_INVALIDARG);
+    auto obj = LookupCall(call);
+    if (!obj) return RecordHr("HCHttpCallRequestGetUrl", OS_SHIM_E_HANDLE);
+    std::lock_guard<std::mutex> lk(obj->mutex);
+    *method = obj->method.c_str();
+    *url = obj->url.c_str();
+    return RecordHr("HCHttpCallRequestGetUrl", OS_SHIM_S_OK);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestGetNumHeaders(
+    HCCallHandle call,
+    uint32_t* numHeaders) {
+    if (!numHeaders) return RecordHr("HCHttpCallRequestGetNumHeaders", OS_SHIM_E_INVALIDARG);
+    auto obj = LookupCall(call);
+    if (!obj) return RecordHr("HCHttpCallRequestGetNumHeaders", OS_SHIM_E_HANDLE);
+    std::lock_guard<std::mutex> lk(obj->mutex);
+    *numHeaders = static_cast<uint32_t>(obj->request_headers.size());
+    return RecordHr("HCHttpCallRequestGetNumHeaders", OS_SHIM_S_OK);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestGetHeaderAtIndex(
+    HCCallHandle call,
+    uint32_t headerIndex,
+    const char** headerName,
+    const char** headerValue) {
+    if (!headerName || !headerValue) {
+        return RecordHr("HCHttpCallRequestGetHeaderAtIndex", OS_SHIM_E_INVALIDARG);
+    }
+    auto obj = LookupCall(call);
+    if (!obj) return RecordHr("HCHttpCallRequestGetHeaderAtIndex", OS_SHIM_E_HANDLE);
+    std::lock_guard<std::mutex> lk(obj->mutex);
+    if (headerIndex >= obj->request_headers.size()) {
+        return RecordHr("HCHttpCallRequestGetHeaderAtIndex", OS_SHIM_E_INVALIDARG);
+    }
+    *headerName = obj->request_headers[headerIndex].first.c_str();
+    *headerValue = obj->request_headers[headerIndex].second.c_str();
+    return RecordHr("HCHttpCallRequestGetHeaderAtIndex", OS_SHIM_S_OK);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestGetHeader(
+    HCCallHandle call,
+    const char* headerName,
+    const char** headerValue) {
+    if (!headerName || !*headerName || !headerValue) {
+        return RecordHr("HCHttpCallRequestGetHeader", OS_SHIM_E_INVALIDARG);
+    }
+    *headerValue = nullptr;
+    auto obj = LookupCall(call);
+    if (!obj) return RecordHr("HCHttpCallRequestGetHeader", OS_SHIM_E_HANDLE);
+    std::lock_guard<std::mutex> lk(obj->mutex);
+    for (const auto& kv : obj->request_headers) {
+        if (EqualsAsciiCaseInsensitive(kv.first, headerName)) {
+            *headerValue = kv.second.c_str();
+            break;
+        }
+    }
+    return RecordHr("HCHttpCallRequestGetHeader", OS_SHIM_S_OK);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestGetRequestBodyBytes(
+    HCCallHandle call,
+    const uint8_t** requestBodyBytes,
+    uint32_t* requestBodySize) {
+    if (!requestBodyBytes || !requestBodySize) {
+        return RecordHr("HCHttpCallRequestGetRequestBodyBytes", OS_SHIM_E_INVALIDARG);
+    }
+    auto obj = LookupCall(call);
+    if (!obj) return RecordHr("HCHttpCallRequestGetRequestBodyBytes", OS_SHIM_E_HANDLE);
+    std::lock_guard<std::mutex> lk(obj->mutex);
+    *requestBodyBytes = obj->request_body.empty() ? nullptr : obj->request_body.data();
+    *requestBodySize = static_cast<uint32_t>(obj->request_body.size());
+    return RecordHr("HCHttpCallRequestGetRequestBodyBytes", OS_SHIM_S_OK);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCHttpCallResponseGetNetworkErrorCode(
+    HCCallHandle call,
+    int32_t* networkErrorCode,
+    uint32_t* platformNetworkErrorCode) {
+    if (!networkErrorCode || !platformNetworkErrorCode) {
+        return RecordHr("HCHttpCallResponseGetNetworkErrorCode", OS_SHIM_E_INVALIDARG);
+    }
+    auto obj = LookupCall(call);
+    if (!obj) return RecordHr("HCHttpCallResponseGetNetworkErrorCode", OS_SHIM_E_HANDLE);
+    std::lock_guard<std::mutex> lk(obj->mutex);
+    *networkErrorCode = obj->network_error_code;
+    *platformNetworkErrorCode = obj->platform_network_error_code;
+    return RecordHr("HCHttpCallResponseGetNetworkErrorCode", OS_SHIM_S_OK);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCHttpCallResponseGetPlatformNetworkErrorMessage(
+    HCCallHandle call,
+    const char** platformNetworkErrorMessage) {
+    if (!platformNetworkErrorMessage) {
+        return RecordHr("HCHttpCallResponseGetPlatformNetworkErrorMessage", OS_SHIM_E_INVALIDARG);
+    }
+    auto obj = LookupCall(call);
+    if (!obj) {
+        return RecordHr("HCHttpCallResponseGetPlatformNetworkErrorMessage", OS_SHIM_E_HANDLE);
+    }
+    std::lock_guard<std::mutex> lk(obj->mutex);
+    *platformNetworkErrorMessage = obj->platform_network_error_message.c_str();
+    return RecordHr("HCHttpCallResponseGetPlatformNetworkErrorMessage", OS_SHIM_S_OK);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCHttpCallResponseGetNumHeaders(
+    HCCallHandle call,
+    uint32_t* numHeaders) {
+    if (!numHeaders) return RecordHr("HCHttpCallResponseGetNumHeaders", OS_SHIM_E_INVALIDARG);
+    auto obj = LookupCall(call);
+    if (!obj) return RecordHr("HCHttpCallResponseGetNumHeaders", OS_SHIM_E_HANDLE);
+    std::lock_guard<std::mutex> lk(obj->mutex);
+    *numHeaders = static_cast<uint32_t>(obj->response_headers.size());
+    return RecordHr("HCHttpCallResponseGetNumHeaders", OS_SHIM_S_OK);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCHttpCallResponseGetHeaderAtIndex(
+    HCCallHandle call,
+    uint32_t headerIndex,
+    const char** headerName,
+    const char** headerValue) {
+    if (!headerName || !headerValue) {
+        return RecordHr("HCHttpCallResponseGetHeaderAtIndex", OS_SHIM_E_INVALIDARG);
+    }
+    auto obj = LookupCall(call);
+    if (!obj) return RecordHr("HCHttpCallResponseGetHeaderAtIndex", OS_SHIM_E_HANDLE);
+    std::lock_guard<std::mutex> lk(obj->mutex);
+    if (headerIndex >= obj->response_headers.size()) {
+        return RecordHr("HCHttpCallResponseGetHeaderAtIndex", OS_SHIM_E_INVALIDARG);
+    }
+    *headerName = obj->response_headers[headerIndex].first.c_str();
+    *headerValue = obj->response_headers[headerIndex].second.c_str();
+    return RecordHr("HCHttpCallResponseGetHeaderAtIndex", OS_SHIM_S_OK);
+}
+
+// ===========================================================================
+// WebSocket C ABI Exports (Offline-Safe / XAsync Backed)
+// ===========================================================================
+OS_HC_API int32_t OS_SHIM_CALL HCWebSocketCreate(
+    HCWebsocketHandle* websocket,
+    HCWebSocketMessageFunction messageFunc,
+    HCWebSocketBinaryMessageFunction binaryMessageFunc,
+    HCWebSocketCloseEventFunction closeFunc,
+    void* functionContext) {
+    if (!websocket) {
+        return RecordHr("HCWebSocketCreate", OS_SHIM_E_INVALIDARG);
+    }
+    *websocket = nullptr;
+    auto obj = std::make_shared<HCWebSocketObject>();
+    obj->message_fn = messageFunc;
+    obj->binary_message_fn = binaryMessageFunc;
+    obj->close_fn = closeFunc;
+    obj->fn_context = functionContext;
+    HCWebsocketHandle raw = obj.get();
+    {
+        auto& st = GetHc();
+        std::lock_guard<std::mutex> lk(st.mutex);
+        st.live_websockets[raw] = std::move(obj);
+    }
+    *websocket = raw;
+    return RecordHr("HCWebSocketCreate", OS_SHIM_S_OK);
+}
+
+OS_HC_API HCWebsocketHandle OS_SHIM_CALL HCWebSocketDuplicateHandle(HCWebsocketHandle websocket) {
+    auto obj = LookupWebSocket(websocket);
+    if (!obj) {
+        RecordHr("HCWebSocketDuplicateHandle", OS_SHIM_E_HANDLE);
+        return nullptr;
+    }
+    obj->ref_count.fetch_add(1, std::memory_order_relaxed);
+    RecordOk("HCWebSocketDuplicateHandle");
+    return websocket;
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCWebSocketCloseHandle(HCWebsocketHandle websocket) {
+    if (!websocket) {
+        return RecordHr("HCWebSocketCloseHandle", OS_SHIM_E_INVALIDARG);
+    }
+    auto& st = GetHc();
+    std::lock_guard<std::mutex> lk(st.mutex);
+    auto it = st.live_websockets.find(websocket);
+    if (it == st.live_websockets.end()) {
+        return RecordHr("HCWebSocketCloseHandle", OS_SHIM_E_HANDLE);
+    }
+    if (it->second->ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        st.live_websockets.erase(it);
+    }
+    return RecordHr("HCWebSocketCloseHandle", OS_SHIM_S_OK);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCWebSocketSetProxyUri(
+    HCWebsocketHandle websocket,
+    const char* proxyUri) {
+    if (!websocket || !proxyUri) {
+        return RecordHr("HCWebSocketSetProxyUri", OS_SHIM_E_INVALIDARG);
+    }
+    auto obj = LookupWebSocket(websocket);
+    if (!obj) return RecordHr("HCWebSocketSetProxyUri", OS_SHIM_E_HANDLE);
+    std::lock_guard<std::mutex> lk(obj->mutex);
+    obj->proxy_uri = proxyUri;
+    return RecordHr("HCWebSocketSetProxyUri", OS_SHIM_S_OK);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCWebSocketSetHeader(
+    HCWebsocketHandle websocket,
+    const char* headerName,
+    const char* headerValue) {
+    if (!websocket || !headerName || !*headerName || !headerValue) {
+        return RecordHr("HCWebSocketSetHeader", OS_SHIM_E_INVALIDARG);
+    }
+    auto obj = LookupWebSocket(websocket);
+    if (!obj) return RecordHr("HCWebSocketSetHeader", OS_SHIM_E_HANDLE);
+    std::lock_guard<std::mutex> lk(obj->mutex);
+    for (auto& kv : obj->headers) {
+        if (EqualsAsciiCaseInsensitive(kv.first, headerName)) {
+            kv.second = headerValue;
+            return RecordHr("HCWebSocketSetHeader", OS_SHIM_S_OK);
+        }
+    }
+    obj->headers.emplace_back(headerName, headerValue);
+    return RecordHr("HCWebSocketSetHeader", OS_SHIM_S_OK);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCWebSocketSetFunctions(
+    HCWebSocketConnectFunction websocketConnectFunc,
+    HCWebSocketSendMessageFunction websocketSendMessageFunc,
+    HCWebSocketSendBinaryMessageFunction websocketSendBinaryMessageFunc,
+    HCWebSocketDisconnectFunction websocketDisconnectFunc,
+    void* context) {
+    auto& st = GetHc();
+    std::lock_guard<std::mutex> lk(st.mutex);
+    st.ws_connect_fn = websocketConnectFunc;
+    st.ws_send_text_fn = websocketSendMessageFunc;
+    st.ws_send_bin_fn = websocketSendBinaryMessageFunc;
+    st.ws_disconnect_fn = websocketDisconnectFunc;
+    st.ws_fn_context = context;
+    return RecordHr("HCWebSocketSetFunctions", OS_SHIM_S_OK);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCWebSocketGetEventFunctions(
+    HCWebsocketHandle websocket,
+    HCWebSocketMessageFunction* messageFunc,
+    HCWebSocketBinaryMessageFunction* binaryMessageFunc,
+    HCWebSocketCloseEventFunction* closeFunc,
+    void** functionContext) {
+    if (!websocket) {
+        return RecordHr("HCWebSocketGetEventFunctions", OS_SHIM_E_INVALIDARG);
+    }
+    auto obj = LookupWebSocket(websocket);
+    if (!obj) return RecordHr("HCWebSocketGetEventFunctions", OS_SHIM_E_HANDLE);
+    std::lock_guard<std::mutex> lk(obj->mutex);
+    if (messageFunc) *messageFunc = obj->message_fn;
+    if (binaryMessageFunc) *binaryMessageFunc = obj->binary_message_fn;
+    if (closeFunc) *closeFunc = obj->close_fn;
+    if (functionContext) *functionContext = obj->fn_context;
+    return RecordHr("HCWebSocketGetEventFunctions", OS_SHIM_S_OK);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCWebSocketSetMaxReceiveBufferSize(
+    HCWebsocketHandle websocket,
+    size_t bufferSizeInBytes) {
+    if (!websocket || bufferSizeInBytes == 0u) {
+        return RecordHr("HCWebSocketSetMaxReceiveBufferSize", OS_SHIM_E_INVALIDARG);
+    }
+    auto obj = LookupWebSocket(websocket);
+    if (!obj) return RecordHr("HCWebSocketSetMaxReceiveBufferSize", OS_SHIM_E_HANDLE);
+    std::lock_guard<std::mutex> lk(obj->mutex);
+    obj->max_receive_buffer_size = bufferSizeInBytes;
+    return RecordHr("HCWebSocketSetMaxReceiveBufferSize", OS_SHIM_S_OK);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCWebSocketConnectAsync(
+    const char* uri,
+    const char* subProtocol,
+    HCWebsocketHandle websocket,
+    XAsyncBlock* asyncBlock) {
+    if (!uri || !*uri || !websocket || !asyncBlock) {
+        return RecordHr("HCWebSocketConnectAsync", OS_SHIM_E_INVALIDARG);
+    }
+    auto obj = LookupWebSocket(websocket);
+    if (!obj) return RecordHr("HCWebSocketConnectAsync", OS_SHIM_E_HANDLE);
+
+    HCWebSocketConnectFunction custom_fn = nullptr;
+    void* custom_ctx = nullptr;
+    {
+        auto& st = GetHc();
+        std::lock_guard<std::mutex> lk(st.mutex);
+        custom_fn = st.ws_connect_fn;
+        custom_ctx = st.ws_fn_context;
+    }
+    if (custom_fn) {
+        return RecordHr("HCWebSocketConnectAsync",
+                        custom_fn(uri, subProtocol ? subProtocol : "", websocket, asyncBlock, custom_ctx));
+    }
+
+    auto* ctx = new (std::nothrow) WsAsyncCtx();
+    if (!ctx) return RecordHr("HCWebSocketConnectAsync", OS_SHIM_E_OUTOFMEMORY);
+    ctx->ws = std::move(obj);
+    ctx->uri = uri;
+    ctx->sub_protocol = subProtocol ? subProtocol : "";
+    ctx->op_kind = 0u;
+
+    XGameResult hr = XAsyncBegin(asyncBlock, ctx, kIdWsConnect, kIdWsConnect, &HcWebSocketAsyncProvider);
+    if (hr < 0) {
+        delete ctx;
+        return RecordHr("HCWebSocketConnectAsync", hr);
+    }
+    hr = XAsyncSchedule(asyncBlock, 0u);
+    if (hr < 0) {
+        XAsyncComplete(asyncBlock, hr, 0);
+    }
+    return RecordHr("HCWebSocketConnectAsync", hr);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCGetWebSocketConnectResult(
+    XAsyncBlock* asyncBlock,
+    WebSocketCompletionResult* result) {
+    if (!asyncBlock || !result) {
+        return RecordHr("HCGetWebSocketConnectResult", OS_SHIM_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetResult(
+        asyncBlock, kIdWsConnect, sizeof(WebSocketCompletionResult), result, nullptr);
+    return RecordHr("HCGetWebSocketConnectResult", hr);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCWebSocketSendMessageAsync(
+    HCWebsocketHandle websocket,
+    const char* message,
+    XAsyncBlock* asyncBlock) {
+    if (!websocket || !message || !asyncBlock) {
+        return RecordHr("HCWebSocketSendMessageAsync", OS_SHIM_E_INVALIDARG);
+    }
+    auto obj = LookupWebSocket(websocket);
+    if (!obj) return RecordHr("HCWebSocketSendMessageAsync", OS_SHIM_E_HANDLE);
+
+    HCWebSocketSendMessageFunction custom_fn = nullptr;
+    void* custom_ctx = nullptr;
+    {
+        auto& st = GetHc();
+        std::lock_guard<std::mutex> lk(st.mutex);
+        custom_fn = st.ws_send_text_fn;
+        custom_ctx = st.ws_fn_context;
+    }
+    if (custom_fn) {
+        return RecordHr("HCWebSocketSendMessageAsync",
+                        custom_fn(websocket, message, asyncBlock, custom_ctx));
+    }
+
+    auto* ctx = new (std::nothrow) WsAsyncCtx();
+    if (!ctx) return RecordHr("HCWebSocketSendMessageAsync", OS_SHIM_E_OUTOFMEMORY);
+    ctx->ws = std::move(obj);
+    ctx->text_payload = message;
+    ctx->op_kind = 1u;
+
+    XGameResult hr = XAsyncBegin(asyncBlock, ctx, kIdWsSend, kIdWsSend, &HcWebSocketAsyncProvider);
+    if (hr < 0) {
+        delete ctx;
+        return RecordHr("HCWebSocketSendMessageAsync", hr);
+    }
+    hr = XAsyncSchedule(asyncBlock, 0u);
+    if (hr < 0) {
+        XAsyncComplete(asyncBlock, hr, 0);
+    }
+    return RecordHr("HCWebSocketSendMessageAsync", hr);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCGetWebSocketSendMessageResult(
+    XAsyncBlock* asyncBlock,
+    WebSocketCompletionResult* result) {
+    if (!asyncBlock || !result) {
+        return RecordHr("HCGetWebSocketSendMessageResult", OS_SHIM_E_INVALIDARG);
+    }
+    XGameResult hr = XAsyncGetResult(
+        asyncBlock, kIdWsSend, sizeof(WebSocketCompletionResult), result, nullptr);
+    return RecordHr("HCGetWebSocketSendMessageResult", hr);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCWebSocketSendBinaryMessageAsync(
+    HCWebsocketHandle websocket,
+    const uint8_t* payloadBytes,
+    uint32_t payloadSize,
+    XAsyncBlock* asyncBlock) {
+    if (!websocket || !asyncBlock || (payloadSize > 0u && !payloadBytes)) {
+        return RecordHr("HCWebSocketSendBinaryMessageAsync", OS_SHIM_E_INVALIDARG);
+    }
+    auto obj = LookupWebSocket(websocket);
+    if (!obj) return RecordHr("HCWebSocketSendBinaryMessageAsync", OS_SHIM_E_HANDLE);
+
+    HCWebSocketSendBinaryMessageFunction custom_fn = nullptr;
+    void* custom_ctx = nullptr;
+    {
+        auto& st = GetHc();
+        std::lock_guard<std::mutex> lk(st.mutex);
+        custom_fn = st.ws_send_bin_fn;
+        custom_ctx = st.ws_fn_context;
+    }
+    if (custom_fn) {
+        return RecordHr("HCWebSocketSendBinaryMessageAsync",
+                        custom_fn(websocket, payloadBytes, payloadSize, asyncBlock, custom_ctx));
+    }
+
+    auto* ctx = new (std::nothrow) WsAsyncCtx();
+    if (!ctx) return RecordHr("HCWebSocketSendBinaryMessageAsync", OS_SHIM_E_OUTOFMEMORY);
+    ctx->ws = std::move(obj);
+    if (payloadSize > 0u) {
+        ctx->bin_payload.assign(payloadBytes, payloadBytes + payloadSize);
+    }
+    ctx->op_kind = 2u;
+
+    XGameResult hr = XAsyncBegin(
+        asyncBlock, ctx, kIdWsSendBin, kIdWsSendBin, &HcWebSocketAsyncProvider);
+    if (hr < 0) {
+        delete ctx;
+        return RecordHr("HCWebSocketSendBinaryMessageAsync", hr);
+    }
+    hr = XAsyncSchedule(asyncBlock, 0u);
+    if (hr < 0) {
+        XAsyncComplete(asyncBlock, hr, 0);
+    }
+    return RecordHr("HCWebSocketSendBinaryMessageAsync", hr);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCWebSocketDisconnect(HCWebsocketHandle websocket) {
+    if (!websocket) {
+        return RecordHr("HCWebSocketDisconnect", OS_SHIM_E_INVALIDARG);
+    }
+    auto obj = LookupWebSocket(websocket);
+    if (!obj) return RecordHr("HCWebSocketDisconnect", OS_SHIM_E_HANDLE);
+
+    HCWebSocketDisconnectFunction custom_fn = nullptr;
+    void* custom_ctx = nullptr;
+    {
+        auto& st = GetHc();
+        std::lock_guard<std::mutex> lk(st.mutex);
+        custom_fn = st.ws_disconnect_fn;
+        custom_ctx = st.ws_fn_context;
+    }
+    if (custom_fn) {
+        return RecordHr("HCWebSocketDisconnect",
+                        custom_fn(websocket, HCWebSocketCloseStatus_Normal, custom_ctx));
+    }
+
+    HCWebSocketCloseEventFunction close_fn = nullptr;
+    void* fn_ctx = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(obj->mutex);
+        obj->connected = false;
+        close_fn = obj->close_fn;
+        fn_ctx = obj->fn_context;
+    }
+    if (close_fn) {
+        close_fn(websocket, HCWebSocketCloseStatus_Normal, fn_ctx);
+    }
+    return RecordHr("HCWebSocketDisconnect", OS_SHIM_S_OK);
 }
 
 }  // extern "C"

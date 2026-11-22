@@ -2182,6 +2182,122 @@ int32_t OPENSCARLETT_KERNELX_CALL XMemGetAllocationAttributes(
     return ok;
 }
 
+// Xbox Game OS / XMem working set statistics (kernelx.dll & xmem.dll).
+// Self-contained ABI layout matching Win32/GDK size-prefixed memory stats structs.
+struct XMEM_WORKING_SET_STATISTICS {
+    uint64_t Size;
+    uint64_t TotalPhysicalBytes;
+    uint64_t WorkingSetBytes;
+    uint64_t PeakWorkingSetBytes;
+    uint64_t PrivateUsageBytes;
+    uint64_t AvailablePhysicalBytes;
+    uint64_t PageFaultCount;
+    uint64_t TrackedTitleAllocBytes;
+};
+
+OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL XMemGetWorkingSetStatistics(
+    void* lpBuffer) {
+    if (!lpBuffer) {
+        SetHostLastError(87u);
+        RecordTelemetry(__func__, CallOutcome::Error, kHrInvalidArg);
+        return 0;
+    }
+
+    uint64_t caller_size = 0ull;
+    std::memcpy(&caller_size, lpBuffer, sizeof(caller_size));
+    if (caller_size != 0ull && caller_size < sizeof(uint64_t)) {
+        SetHostLastError(87u);
+        RecordTelemetry(__func__, CallOutcome::Error, kHrInvalidArg);
+        return 0;
+    }
+
+    auto& state = KernelXState::Instance();
+    const uint64_t title_budget = GetTitleBudgetBytes();
+    const uint64_t tracked_used = state.CurrentTitleUsedBytes();
+    const uint64_t tracked_peak = state.UpdateAndGetPeakTitleUsed();
+
+    XMEM_WORKING_SET_STATISTICS stats{};
+    stats.Size = sizeof(XMEM_WORKING_SET_STATISTICS);
+    stats.TotalPhysicalBytes = title_budget;
+    stats.WorkingSetBytes = tracked_used;
+    stats.PeakWorkingSetBytes = tracked_peak;
+    stats.PrivateUsageBytes = tracked_used;
+    stats.AvailablePhysicalBytes = (title_budget > tracked_used) ? (title_budget - tracked_used) : 0ull;
+    stats.PageFaultCount = 0ull;
+    stats.TrackedTitleAllocBytes = tracked_used;
+
+#if defined(_WIN32)
+    MEMORYSTATUSEX mem_status{};
+    mem_status.dwLength = sizeof(mem_status);
+    if (::GlobalMemoryStatusEx(&mem_status)) {
+        if (mem_status.ullTotalPhys > 0ull) {
+            stats.TotalPhysicalBytes = std::min<uint64_t>(title_budget, mem_status.ullTotalPhys);
+            if (stats.TotalPhysicalBytes == 0ull) {
+                stats.TotalPhysicalBytes = title_budget;
+            }
+        }
+        const uint64_t title_avail =
+            (stats.TotalPhysicalBytes > tracked_used) ? (stats.TotalPhysicalBytes - tracked_used) : 0ull;
+        stats.AvailablePhysicalBytes = std::min<uint64_t>(title_avail, mem_status.ullAvailPhys);
+    }
+
+    struct OsProcessMemoryCountersEx {
+        DWORD cb;
+        DWORD PageFaultCount;
+        SIZE_T PeakWorkingSetSize;
+        SIZE_T WorkingSetSize;
+        SIZE_T QuotaPeakPagedPoolUsage;
+        SIZE_T QuotaPagedPoolUsage;
+        SIZE_T QuotaPeakNonPagedPoolUsage;
+        SIZE_T QuotaNonPagedPoolUsage;
+        SIZE_T PagefileUsage;
+        SIZE_T PeakPagefileUsage;
+        SIZE_T PrivateUsage;
+    };
+    using PfnGetProcessMemoryInfo = BOOL(WINAPI*)(HANDLE, OsProcessMemoryCountersEx*, DWORD);
+    PfnGetProcessMemoryInfo pfn_get_pmi = nullptr;
+    HMODULE k32 = ::GetModuleHandleW(L"kernel32.dll");
+    if (k32) {
+        pfn_get_pmi = reinterpret_cast<PfnGetProcessMemoryInfo>(
+            ::GetProcAddress(k32, "K32GetProcessMemoryInfo"));
+    }
+    if (!pfn_get_pmi) {
+        HMODULE psapi = ::GetModuleHandleW(L"psapi.dll");
+        if (psapi) {
+            pfn_get_pmi = reinterpret_cast<PfnGetProcessMemoryInfo>(
+                ::GetProcAddress(psapi, "GetProcessMemoryInfo"));
+        }
+    }
+    if (pfn_get_pmi) {
+        OsProcessMemoryCountersEx pmc{};
+        pmc.cb = sizeof(pmc);
+        if (pfn_get_pmi(::GetCurrentProcess(), &pmc, sizeof(pmc))) {
+            stats.WorkingSetBytes = std::max<uint64_t>(
+                tracked_used, static_cast<uint64_t>(pmc.WorkingSetSize));
+            stats.PeakWorkingSetBytes = std::max<uint64_t>(
+                std::max<uint64_t>(tracked_peak, stats.WorkingSetBytes),
+                static_cast<uint64_t>(pmc.PeakWorkingSetSize));
+            stats.PrivateUsageBytes = std::max<uint64_t>(
+                tracked_used, static_cast<uint64_t>(pmc.PrivateUsage));
+            stats.PageFaultCount = static_cast<uint64_t>(pmc.PageFaultCount);
+        }
+    }
+#endif
+
+    const size_t copy_bytes =
+        (caller_size == 0ull || caller_size >= sizeof(XMEM_WORKING_SET_STATISTICS))
+            ? sizeof(XMEM_WORKING_SET_STATISTICS)
+            : static_cast<size_t>(caller_size);
+    if (copy_bytes < sizeof(XMEM_WORKING_SET_STATISTICS)) {
+        stats.Size = static_cast<uint64_t>(copy_bytes);
+    }
+    std::memcpy(lpBuffer, &stats, copy_bytes);
+
+    SetHostLastError(0u);
+    RecordTelemetry(__func__, CallOutcome::Ok, kHrOk);
+    return 1;
+}
+
 int32_t OPENSCARLETT_KERNELX_CALL AllocateTitlePhysicalPages(void* hProcess,
                                                              uint32_t flAllocationType,
                                                              uint64_t* pNumberOfPages,

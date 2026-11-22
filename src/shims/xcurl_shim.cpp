@@ -12,6 +12,7 @@
 #include <cstring>
 #include <ctime>
 #include <deque>
+#include <fstream>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -31,6 +32,55 @@ struct XCurlU {
     std::string query;
     std::string fragment;
     std::string zoneid;
+};
+
+// Standard libcurl legacy multipart form node (curl_httppost) & MIME ABI structures.
+struct XCurlHttpPost {
+    XCurlHttpPost* next = nullptr;
+    char* name = nullptr;
+    long namelength = 0L;
+    char* contents = nullptr;
+    long contentslength = 0L;
+    char* buffer = nullptr;
+    long bufferlength = 0L;
+    char* contenttype = nullptr;
+    XCurlSlist* contentheader = nullptr;
+    XCurlHttpPost* more = nullptr;
+    long flags = 0L;
+    char* showfilename = nullptr;
+    void* userp = nullptr;
+    int64_t contentlen = 0;
+};
+
+struct XCurlMime;
+struct XCurlMimePart;
+
+using XCurlFormGetCallback = size_t(OS_SHIM_CDECL*)(void* arg, const char* buf, size_t len);
+using XCurlMimeReadCallback = size_t(OS_SHIM_CDECL*)(char* buffer, size_t size, size_t nitems, void* arg);
+using XCurlMimeSeekCallback = int32_t(OS_SHIM_CDECL*)(void* arg, int64_t offset, int32_t origin);
+using XCurlMimeFreeCallback = void(OS_SHIM_CDECL*)(void* arg);
+
+struct XCurlMimePart {
+    XCurlMime* owner = nullptr;
+    std::string name;
+    std::string filename;
+    std::string mimetype;
+    std::string encoder;
+    std::vector<uint8_t> data;
+    std::string filepath;
+    XCurlMimeReadCallback read_cb = nullptr;
+    XCurlMimeSeekCallback seek_cb = nullptr;
+    XCurlMimeFreeCallback free_cb = nullptr;
+    void* cb_arg = nullptr;
+    int64_t cb_datasize = -1;
+    XCurlMime* subparts = nullptr;
+    XCurlSlist* headers = nullptr;
+    bool owns_headers = false;
+};
+
+struct XCurlMime {
+    XCurlEasyHandle easy = nullptr;
+    std::vector<std::unique_ptr<XCurlMimePart>> parts;
 };
 
 namespace {
@@ -163,7 +213,106 @@ struct XCurlState {
     std::unordered_map<void*, std::shared_ptr<MultiObject>> multi_handles;
     std::unordered_map<void*, std::unique_ptr<ShareObject>> share_handles;
     std::unordered_map<XCurlU*, std::unique_ptr<XCurlU>> url_handles;
+    std::unordered_map<XCurlMime*, std::unique_ptr<XCurlMime>> mime_handles;
 };
+
+void SerializeMimeToBytes(const XCurlMime* mime, std::vector<uint8_t>& out, int depth = 0) {
+    if (!mime || depth > 8) {
+        return;
+    }
+    const std::string boundary = "----OpenScarlettBoundary";
+    for (const auto& part : mime->parts) {
+        if (!part) continue;
+        std::string hdr = "--" + boundary + "\r\nContent-Disposition: form-data";
+        if (!part->name.empty()) {
+            hdr += "; name=\"" + part->name + "\"";
+        }
+        if (!part->filename.empty()) {
+            hdr += "; filename=\"" + part->filename + "\"";
+        }
+        hdr += "\r\n";
+        if (!part->mimetype.empty()) {
+            hdr += "Content-Type: " + part->mimetype + "\r\n";
+        }
+        if (!part->encoder.empty()) {
+            hdr += "Content-Transfer-Encoding: " + part->encoder + "\r\n";
+        }
+        hdr += "\r\n";
+        out.insert(out.end(), hdr.begin(), hdr.end());
+        if (!part->data.empty()) {
+            out.insert(out.end(), part->data.begin(), part->data.end());
+        } else if (part->subparts) {
+            SerializeMimeToBytes(part->subparts, out, depth + 1);
+        }
+        out.push_back('\r');
+        out.push_back('\n');
+    }
+    const std::string end_mark = "--" + boundary + "--\r\n";
+    out.insert(out.end(), end_mark.begin(), end_mark.end());
+}
+
+void SerializeHttpPostToBytes(const XCurlHttpPost* form, std::vector<uint8_t>& out) {
+    const std::string boundary = "----OpenScarlettFormBoundary";
+    for (const XCurlHttpPost* cur = form; cur != nullptr; cur = cur->next) {
+        std::string hdr = "--" + boundary + "\r\nContent-Disposition: form-data";
+        if (cur->name && cur->namelength > 0L) {
+            hdr += "; name=\"";
+            hdr.append(cur->name, static_cast<size_t>(cur->namelength));
+            hdr += "\"";
+        } else if (cur->name) {
+            hdr += "; name=\"" + std::string(cur->name) + "\"";
+        }
+        if (cur->showfilename) {
+            hdr += "; filename=\"" + std::string(cur->showfilename) + "\"";
+        }
+        hdr += "\r\n";
+        if (cur->contenttype) {
+            hdr += "Content-Type: " + std::string(cur->contenttype) + "\r\n";
+        }
+        hdr += "\r\n";
+        out.insert(out.end(), hdr.begin(), hdr.end());
+        if (cur->contents) {
+            const size_t len = (cur->contentlen > 0)
+                                   ? static_cast<size_t>(cur->contentlen)
+                                   : ((cur->contentslength > 0L)
+                                          ? static_cast<size_t>(cur->contentslength)
+                                          : std::strlen(cur->contents));
+            out.insert(out.end(),
+                       reinterpret_cast<const uint8_t*>(cur->contents),
+                       reinterpret_cast<const uint8_t*>(cur->contents) + len);
+        } else if (cur->buffer && cur->bufferlength > 0L) {
+            out.insert(out.end(),
+                       reinterpret_cast<const uint8_t*>(cur->buffer),
+                       reinterpret_cast<const uint8_t*>(cur->buffer) +
+                           static_cast<size_t>(cur->bufferlength));
+        }
+        out.push_back('\r');
+        out.push_back('\n');
+    }
+    const std::string end_mark = "--" + boundary + "--\r\n";
+    out.insert(out.end(), end_mark.begin(), end_mark.end());
+}
+
+void FreeMimeTree(XCurlMime* mime) {
+    if (!mime) return;
+    for (auto& part : mime->parts) {
+        if (!part) continue;
+        if (part->free_cb) {
+            part->free_cb(part->cb_arg);
+            part->free_cb = nullptr;
+        }
+        if (part->owns_headers && part->headers) {
+            curl_slist_free_all(part->headers);
+            part->headers = nullptr;
+        }
+        if (part->subparts) {
+            FreeMimeTree(part->subparts);
+            delete part->subparts;
+            part->subparts = nullptr;
+        }
+    }
+    mime->parts.clear();
+}
 
 XCurlState& GetXCurl() {
     static XCurlState* s = new XCurlState();
@@ -1003,6 +1152,24 @@ int32_t OS_SHIM_CDECL curl_easy_setopt(XCurlEasyHandle curl, int32_t option, ...
                     easy.headers.emplace_back(list->data);
                 }
                 list = list->next;
+            }
+            break;
+        }
+        case 10024: {  // CURLOPT_HTTPPOST
+            const auto* form = va_arg(ap, const XCurlHttpPost*);
+            easy.post_body.clear();
+            if (form) {
+                SerializeHttpPostToBytes(form, easy.post_body);
+                if (easy.method == "GET") easy.method = "POST";
+            }
+            break;
+        }
+        case 10269: {  // CURLOPT_MIMEPOST
+            const auto* mime = va_arg(ap, const XCurlMime*);
+            easy.post_body.clear();
+            if (mime) {
+                SerializeMimeToBytes(mime, easy.post_body);
+                if (easy.method == "GET") easy.method = "POST";
             }
             break;
         }
@@ -2011,6 +2178,484 @@ int32_t OS_SHIM_CDECL xcurl_global_set_request_limit(uint32_t requestLimit) {
     std::lock_guard<std::mutex> lk(st.mutex);
     st.request_limit = requestLimit;
     return RecordCode("xcurl_global_set_request_limit", XCURLE_OK);
+}
+
+// ===========================================================================
+// 15 libcurl Form & MIME API Exports (offline-safe in-memory implementation)
+// ===========================================================================
+namespace {
+constexpr int32_t kCurlFormOk = 0;
+constexpr int32_t kCurlFormMemory = 1;
+constexpr int32_t kCurlFormOptionTwice = 2;
+constexpr int32_t kCurlFormNull = 3;
+constexpr int32_t kCurlFormUnknownOption = 4;
+constexpr int32_t kCurlFormIncomplete = 5;
+
+constexpr int32_t kCurlFormCopyName = 1;
+constexpr int32_t kCurlFormPtrName = 2;
+constexpr int32_t kCurlFormNameLength = 3;
+constexpr int32_t kCurlFormCopyContents = 4;
+constexpr int32_t kCurlFormPtrContents = 5;
+constexpr int32_t kCurlFormContentsLength = 6;
+constexpr int32_t kCurlFormFileContent = 7;
+constexpr int32_t kCurlFormFile = 10;
+constexpr int32_t kCurlFormBuffer = 11;
+constexpr int32_t kCurlFormBufferPtr = 12;
+constexpr int32_t kCurlFormBufferLength = 13;
+constexpr int32_t kCurlFormContentType = 14;
+constexpr int32_t kCurlFormContentHeader = 15;
+constexpr int32_t kCurlFormFilename = 16;
+constexpr int32_t kCurlFormEnd = 17;
+constexpr int32_t kCurlFormContentLen = 19;
+
+constexpr long kHttpPostFlagCopyName = (1L << 0);
+constexpr long kHttpPostFlagCopyContents = (1L << 1);
+constexpr long kHttpPostFlagCopyType = (1L << 2);
+constexpr long kHttpPostFlagCopyFilename = (1L << 3);
+
+char* CurlDupBytes(const char* src, size_t len) {
+    auto* out = static_cast<char*>(CurlAlloc(len + 1u));
+    if (!out) return nullptr;
+    if (len > 0u && src) {
+        std::memcpy(out, src, len);
+    }
+    out[len] = '\0';
+    return out;
+}
+}  // namespace
+
+OS_XCURL_API int32_t OS_SHIM_CDECL curl_formadd(
+    XCurlHttpPost** httppost,
+    XCurlHttpPost** last_post,
+    ...) {
+    if (!httppost || !last_post) {
+        return RecordCode("curl_formadd", kCurlFormNull);
+    }
+
+    auto* node = static_cast<XCurlHttpPost*>(CurlAlloc(sizeof(XCurlHttpPost)));
+    if (!node) {
+        return RecordCode("curl_formadd", kCurlFormMemory);
+    }
+    std::memset(node, 0, sizeof(XCurlHttpPost));
+
+    va_list ap;
+    va_start(ap, last_post);
+    int32_t rc = kCurlFormOk;
+
+    const char* copy_name_src = nullptr;
+    const char* copy_contents_src = nullptr;
+    size_t explicit_name_len = 0u;
+    size_t explicit_contents_len = 0u;
+    bool has_explicit_name_len = false;
+    bool has_explicit_contents_len = false;
+
+    for (;;) {
+        const int32_t opt = va_arg(ap, int32_t);
+        if (opt == kCurlFormEnd) {
+            break;
+        }
+        switch (opt) {
+            case kCurlFormCopyName:
+                copy_name_src = va_arg(ap, const char*);
+                if (!copy_name_src) rc = kCurlFormNull;
+                break;
+            case kCurlFormPtrName:
+                node->name = const_cast<char*>(va_arg(ap, const char*));
+                if (!node->name) rc = kCurlFormNull;
+                break;
+            case kCurlFormNameLength:
+                explicit_name_len = static_cast<size_t>(va_arg(ap, long));
+                has_explicit_name_len = true;
+                node->namelength = static_cast<long>(explicit_name_len);
+                break;
+            case kCurlFormCopyContents:
+                copy_contents_src = va_arg(ap, const char*);
+                if (!copy_contents_src) rc = kCurlFormNull;
+                break;
+            case kCurlFormPtrContents:
+                node->contents = const_cast<char*>(va_arg(ap, const char*));
+                if (!node->contents) rc = kCurlFormNull;
+                break;
+            case kCurlFormContentsLength:
+                explicit_contents_len = static_cast<size_t>(va_arg(ap, long));
+                has_explicit_contents_len = true;
+                node->contentslength = static_cast<long>(explicit_contents_len);
+                node->contentlen = static_cast<int64_t>(explicit_contents_len);
+                break;
+            case kCurlFormContentLen: {
+                const int64_t cl = va_arg(ap, int64_t);
+                explicit_contents_len = cl > 0 ? static_cast<size_t>(cl) : 0u;
+                has_explicit_contents_len = true;
+                node->contentlen = cl;
+                node->contentslength = static_cast<long>(explicit_contents_len);
+                break;
+            }
+            case kCurlFormFile:
+            case kCurlFormFileContent: {
+                const char* fname = va_arg(ap, const char*);
+                if (!fname) {
+                    rc = kCurlFormNull;
+                } else {
+                    std::ifstream ifs(fname, std::ios::binary);
+                    if (ifs) {
+                        std::string data((std::istreambuf_iterator<char>(ifs)),
+                                         std::istreambuf_iterator<char>());
+                        node->contents = CurlDupBytes(data.data(), data.size());
+                        node->contentslength = static_cast<long>(data.size());
+                        node->contentlen = static_cast<int64_t>(data.size());
+                        node->flags |= kHttpPostFlagCopyContents;
+                    }
+                    if (!node->showfilename) {
+                        node->showfilename = CurlDupBytes(fname, std::strlen(fname));
+                        node->flags |= kHttpPostFlagCopyFilename;
+                    }
+                }
+                break;
+            }
+            case kCurlFormBuffer: {
+                const char* bname = va_arg(ap, const char*);
+                if (!bname) {
+                    rc = kCurlFormNull;
+                } else {
+                    if (node->showfilename && (node->flags & kHttpPostFlagCopyFilename) != 0L) {
+                        CurlDealloc(node->showfilename);
+                    }
+                    node->showfilename = CurlDupBytes(bname, std::strlen(bname));
+                    node->flags |= kHttpPostFlagCopyFilename;
+                }
+                break;
+            }
+            case kCurlFormBufferPtr:
+                node->buffer = const_cast<char*>(va_arg(ap, const char*));
+                break;
+            case kCurlFormBufferLength:
+                node->bufferlength = va_arg(ap, long);
+                break;
+            case kCurlFormContentType: {
+                const char* ctype = va_arg(ap, const char*);
+                if (!ctype) {
+                    rc = kCurlFormNull;
+                } else {
+                    if (node->contenttype && (node->flags & kHttpPostFlagCopyType) != 0L) {
+                        CurlDealloc(node->contenttype);
+                    }
+                    node->contenttype = CurlDupBytes(ctype, std::strlen(ctype));
+                    node->flags |= kHttpPostFlagCopyType;
+                }
+                break;
+            }
+            case kCurlFormFilename: {
+                const char* fn = va_arg(ap, const char*);
+                if (!fn) {
+                    rc = kCurlFormNull;
+                } else {
+                    if (node->showfilename && (node->flags & kHttpPostFlagCopyFilename) != 0L) {
+                        CurlDealloc(node->showfilename);
+                    }
+                    node->showfilename = CurlDupBytes(fn, std::strlen(fn));
+                    node->flags |= kHttpPostFlagCopyFilename;
+                }
+                break;
+            }
+            case kCurlFormContentHeader:
+                node->contentheader = va_arg(ap, XCurlSlist*);
+                break;
+            default:
+                rc = kCurlFormUnknownOption;
+                break;
+        }
+        if (rc != kCurlFormOk) {
+            break;
+        }
+    }
+    va_end(ap);
+
+    if (rc == kCurlFormOk && copy_name_src) {
+        const size_t nlen = has_explicit_name_len ? explicit_name_len : std::strlen(copy_name_src);
+        node->name = CurlDupBytes(copy_name_src, nlen);
+        node->namelength = static_cast<long>(nlen);
+        node->flags |= kHttpPostFlagCopyName;
+        if (!node->name) rc = kCurlFormMemory;
+    }
+    if (rc == kCurlFormOk && copy_contents_src) {
+        const size_t clen =
+            has_explicit_contents_len ? explicit_contents_len : std::strlen(copy_contents_src);
+        node->contents = CurlDupBytes(copy_contents_src, clen);
+        node->contentslength = static_cast<long>(clen);
+        node->contentlen = static_cast<int64_t>(clen);
+        node->flags |= kHttpPostFlagCopyContents;
+        if (!node->contents) rc = kCurlFormMemory;
+    }
+    if (rc == kCurlFormOk && !node->name) {
+        rc = kCurlFormIncomplete;
+    }
+
+    if (rc != kCurlFormOk) {
+        if ((node->flags & kHttpPostFlagCopyName) != 0L) CurlDealloc(node->name);
+        if ((node->flags & kHttpPostFlagCopyContents) != 0L) CurlDealloc(node->contents);
+        if ((node->flags & kHttpPostFlagCopyType) != 0L) CurlDealloc(node->contenttype);
+        if ((node->flags & kHttpPostFlagCopyFilename) != 0L) CurlDealloc(node->showfilename);
+        CurlDealloc(node);
+        return RecordCode("curl_formadd", rc);
+    }
+
+    if (!*httppost) {
+        *httppost = node;
+    } else if (*last_post) {
+        (*last_post)->next = node;
+    } else {
+        XCurlHttpPost* tail = *httppost;
+        while (tail->next) tail = tail->next;
+        tail->next = node;
+    }
+    *last_post = node;
+    (void)kCurlFormOptionTwice;
+    return RecordCode("curl_formadd", kCurlFormOk);
+}
+
+OS_XCURL_API void OS_SHIM_CDECL curl_formfree(XCurlHttpPost* form) {
+    RecordOk("curl_formfree");
+    while (form) {
+        XCurlHttpPost* next = form->next;
+        if (form->more) {
+            curl_formfree(form->more);
+        }
+        if ((form->flags & kHttpPostFlagCopyName) != 0L) CurlDealloc(form->name);
+        if ((form->flags & kHttpPostFlagCopyContents) != 0L) CurlDealloc(form->contents);
+        if ((form->flags & kHttpPostFlagCopyType) != 0L) CurlDealloc(form->contenttype);
+        if ((form->flags & kHttpPostFlagCopyFilename) != 0L) CurlDealloc(form->showfilename);
+        CurlDealloc(form);
+        form = next;
+    }
+}
+
+OS_XCURL_API size_t OS_SHIM_CDECL curl_formget(
+    XCurlHttpPost* form,
+    void* arg,
+    XCurlFormGetCallback append) {
+    if (!form || !append) {
+        RecordCode("curl_formget", XCURLE_BAD_FUNCTION_ARGUMENT);
+        return 1u;
+    }
+    std::vector<uint8_t> payload;
+    SerializeHttpPostToBytes(form, payload);
+    const size_t written = append(
+        arg, reinterpret_cast<const char*>(payload.data()), payload.size());
+    const size_t rc = (written == payload.size()) ? 0u : 1u;
+    RecordCode("curl_formget", rc == 0u ? XCURLE_OK : XCURLE_WRITE_ERROR);
+    return rc;
+}
+
+OS_XCURL_API XCurlMime* OS_SHIM_CDECL curl_mime_init(XCurlEasyHandle easy) {
+    auto obj = std::make_unique<XCurlMime>();
+    obj->easy = easy;
+    XCurlMime* raw = obj.get();
+    {
+        auto& st = GetXCurl();
+        std::lock_guard<std::mutex> lk(st.mutex);
+        st.mime_handles[raw] = std::move(obj);
+    }
+    RecordOk("curl_mime_init");
+    return raw;
+}
+
+OS_XCURL_API void OS_SHIM_CDECL curl_mime_free(XCurlMime* mime) {
+    RecordOk("curl_mime_free");
+    if (!mime) return;
+    std::unique_ptr<XCurlMime> owned;
+    {
+        auto& st = GetXCurl();
+        std::lock_guard<std::mutex> lk(st.mutex);
+        auto it = st.mime_handles.find(mime);
+        if (it != st.mime_handles.end()) {
+            owned = std::move(it->second);
+            st.mime_handles.erase(it);
+        }
+    }
+    if (owned) {
+        FreeMimeTree(owned.get());
+    } else {
+        FreeMimeTree(mime);
+        delete mime;
+    }
+}
+
+OS_XCURL_API XCurlMimePart* OS_SHIM_CDECL curl_mime_addpart(XCurlMime* mime) {
+    if (!mime) {
+        RecordCode("curl_mime_addpart", XCURLE_BAD_FUNCTION_ARGUMENT);
+        return nullptr;
+    }
+    auto part = std::make_unique<XCurlMimePart>();
+    part->owner = mime;
+    XCurlMimePart* raw = part.get();
+    {
+        auto& st = GetXCurl();
+        std::lock_guard<std::mutex> lk(st.mutex);
+        mime->parts.push_back(std::move(part));
+    }
+    RecordOk("curl_mime_addpart");
+    return raw;
+}
+
+OS_XCURL_API int32_t OS_SHIM_CDECL curl_mime_name(XCurlMimePart* part, const char* name) {
+    if (!part) {
+        return RecordCode("curl_mime_name", XCURLE_BAD_FUNCTION_ARGUMENT);
+    }
+    auto& st = GetXCurl();
+    std::lock_guard<std::mutex> lk(st.mutex);
+    part->name = name ? name : "";
+    return RecordCode("curl_mime_name", XCURLE_OK);
+}
+
+OS_XCURL_API int32_t OS_SHIM_CDECL curl_mime_filename(XCurlMimePart* part, const char* filename) {
+    if (!part) {
+        return RecordCode("curl_mime_filename", XCURLE_BAD_FUNCTION_ARGUMENT);
+    }
+    auto& st = GetXCurl();
+    std::lock_guard<std::mutex> lk(st.mutex);
+    part->filename = filename ? filename : "";
+    return RecordCode("curl_mime_filename", XCURLE_OK);
+}
+
+OS_XCURL_API int32_t OS_SHIM_CDECL curl_mime_type(XCurlMimePart* part, const char* mimetype) {
+    if (!part) {
+        return RecordCode("curl_mime_type", XCURLE_BAD_FUNCTION_ARGUMENT);
+    }
+    auto& st = GetXCurl();
+    std::lock_guard<std::mutex> lk(st.mutex);
+    part->mimetype = mimetype ? mimetype : "";
+    return RecordCode("curl_mime_type", XCURLE_OK);
+}
+
+OS_XCURL_API int32_t OS_SHIM_CDECL curl_mime_encoder(XCurlMimePart* part, const char* encoding) {
+    if (!part) {
+        return RecordCode("curl_mime_encoder", XCURLE_BAD_FUNCTION_ARGUMENT);
+    }
+    if (encoding && *encoding) {
+        const std::string lo = ToLowerAscii(encoding);
+        if (lo != "binary" && lo != "8bit" && lo != "7bit" &&
+            lo != "base64" && lo != "quoted-printable") {
+            return RecordCode("curl_mime_encoder", XCURLE_BAD_FUNCTION_ARGUMENT);
+        }
+    }
+    auto& st = GetXCurl();
+    std::lock_guard<std::mutex> lk(st.mutex);
+    part->encoder = encoding ? encoding : "";
+    return RecordCode("curl_mime_encoder", XCURLE_OK);
+}
+
+OS_XCURL_API int32_t OS_SHIM_CDECL curl_mime_data(
+    XCurlMimePart* part,
+    const char* data,
+    size_t datasize) {
+    if (!part) {
+        return RecordCode("curl_mime_data", XCURLE_BAD_FUNCTION_ARGUMENT);
+    }
+    auto& st = GetXCurl();
+    std::lock_guard<std::mutex> lk(st.mutex);
+    part->data.clear();
+    if (data) {
+        constexpr size_t kZeroTerminated = static_cast<size_t>(-1);
+        const size_t len = (datasize == kZeroTerminated) ? std::strlen(data) : datasize;
+        part->data.assign(
+            reinterpret_cast<const uint8_t*>(data),
+            reinterpret_cast<const uint8_t*>(data) + len);
+    }
+    return RecordCode("curl_mime_data", XCURLE_OK);
+}
+
+OS_XCURL_API int32_t OS_SHIM_CDECL curl_mime_filedata(XCurlMimePart* part, const char* filename) {
+    if (!part) {
+        return RecordCode("curl_mime_filedata", XCURLE_BAD_FUNCTION_ARGUMENT);
+    }
+    std::vector<uint8_t> loaded;
+    if (filename && *filename) {
+        std::ifstream ifs(filename, std::ios::binary);
+        if (ifs) {
+            loaded.assign((std::istreambuf_iterator<char>(ifs)),
+                          std::istreambuf_iterator<char>());
+        }
+    }
+    auto& st = GetXCurl();
+    std::lock_guard<std::mutex> lk(st.mutex);
+    part->filepath = filename ? filename : "";
+    part->data = std::move(loaded);
+    if (filename && *filename && part->filename.empty()) {
+        std::string fn(filename);
+        const size_t sep = fn.find_last_of("\\/");
+        part->filename = (sep == std::string::npos) ? fn : fn.substr(sep + 1u);
+    }
+    return RecordCode("curl_mime_filedata", XCURLE_OK);
+}
+
+OS_XCURL_API int32_t OS_SHIM_CDECL curl_mime_data_cb(
+    XCurlMimePart* part,
+    int64_t datasize,
+    XCurlMimeReadCallback readfunc,
+    XCurlMimeSeekCallback seekfunc,
+    XCurlMimeFreeCallback freefunc,
+    void* arg) {
+    if (!part) {
+        return RecordCode("curl_mime_data_cb", XCURLE_BAD_FUNCTION_ARGUMENT);
+    }
+    auto& st = GetXCurl();
+    std::lock_guard<std::mutex> lk(st.mutex);
+    if (part->free_cb) {
+        part->free_cb(part->cb_arg);
+    }
+    part->cb_datasize = datasize;
+    part->read_cb = readfunc;
+    part->seek_cb = seekfunc;
+    part->free_cb = freefunc;
+    part->cb_arg = arg;
+    return RecordCode("curl_mime_data_cb", XCURLE_OK);
+}
+
+OS_XCURL_API int32_t OS_SHIM_CDECL curl_mime_subparts(
+    XCurlMimePart* part,
+    XCurlMime* subparts) {
+    if (!part) {
+        return RecordCode("curl_mime_subparts", XCURLE_BAD_FUNCTION_ARGUMENT);
+    }
+    if (subparts && subparts == part->owner) {
+        return RecordCode("curl_mime_subparts", XCURLE_BAD_FUNCTION_ARGUMENT);
+    }
+    auto& st = GetXCurl();
+    std::lock_guard<std::mutex> lk(st.mutex);
+    if (part->subparts) {
+        FreeMimeTree(part->subparts);
+        delete part->subparts;
+        part->subparts = nullptr;
+    }
+    if (subparts) {
+        // Transfer ownership from top-level registry into parent part so curl_mime_free
+        // on the parent recursively frees subparts without double-free.
+        auto it = st.mime_handles.find(subparts);
+        if (it != st.mime_handles.end()) {
+            part->subparts = it->second.release();
+            st.mime_handles.erase(it);
+        } else {
+            part->subparts = subparts;
+        }
+    }
+    return RecordCode("curl_mime_subparts", XCURLE_OK);
+}
+
+OS_XCURL_API int32_t OS_SHIM_CDECL curl_mime_headers(
+    XCurlMimePart* part,
+    XCurlSlist* headers,
+    int32_t take_ownership) {
+    if (!part) {
+        return RecordCode("curl_mime_headers", XCURLE_BAD_FUNCTION_ARGUMENT);
+    }
+    auto& st = GetXCurl();
+    std::lock_guard<std::mutex> lk(st.mutex);
+    if (part->owns_headers && part->headers) {
+        curl_slist_free_all(part->headers);
+    }
+    part->headers = headers;
+    part->owns_headers = (take_ownership != 0);
+    return RecordCode("curl_mime_headers", XCURLE_OK);
 }
 
 }  // extern "C"

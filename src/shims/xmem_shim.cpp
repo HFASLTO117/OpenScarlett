@@ -29,6 +29,7 @@
 #pragma comment(linker, "/export:XMemGetAllocationAttributes=XMemShim_XMemGetAllocationAttributes")
 #pragma comment(linker, "/export:XMemMapPhysicalPages=XMemShim_XMemMapPhysicalPages")
 #pragma comment(linker, "/export:XMemUnmapPhysicalPages=XMemShim_XMemUnmapPhysicalPages")
+#pragma comment(linker, "/export:XMemGetWorkingSetStatistics=XMemShim_XMemGetWorkingSetStatistics")
 #pragma comment(linker, "/export:XMemGetTelemetryCallCountForTest=XMemShim_GetTelemetryCallCountForTest")
 #endif
 
@@ -49,6 +50,9 @@ inline void RecordOutcome(const char* sym, bool ok) {
 }  // namespace
 
 extern "C" {
+
+OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL XMemGetWorkingSetStatistics(
+    void* lpBuffer);
 
 void* OPENSCARLETT_KERNELX_CALL XMemShim_XMemAlloc(size_t dwSize, uint64_t dwAllocAttributes) {
     void* ptr = ::XMemAlloc(dwSize, dwAllocAttributes);
@@ -163,6 +167,12 @@ int32_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemUnmapPhysicalPages(
     uint64_t numberOfPages) {
     const int32_t ok = ::XMemUnmapPhysicalPages(virtualAddress, numberOfPages);
     RecordOutcome("XMemUnmapPhysicalPages", ok != 0);
+    return ok;
+}
+
+int32_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemGetWorkingSetStatistics(void* lpBuffer) {
+    const int32_t ok = ::XMemGetWorkingSetStatistics(lpBuffer);
+    RecordOutcome("XMemGetWorkingSetStatistics", ok != 0);
     return ok;
 }
 

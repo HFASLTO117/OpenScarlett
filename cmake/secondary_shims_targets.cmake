@@ -55,7 +55,29 @@ if(MSVC)
 endif()
 
 # 7. amd_fidelityfx_upscaler_xbox.dll
+# Export all 5 real AMD FidelityFX API 2.0 C entry points alongside the 6 ffxUpscaler* symbols.
+# Marking the 5 ffx* aliases PRIVATE keeps host import-library resolution bound to
+# amd_fidelityfx_loader_xbox.lib while exposing all 5 exports in amd_fidelityfx_upscaler_xbox.dll.
+set(_os_ffx_upscaler_def "${CMAKE_CURRENT_BINARY_DIR}/ffx_upscaler_exports.def")
+file(WRITE "${_os_ffx_upscaler_def}"
+"LIBRARY amd_fidelityfx_upscaler_xbox.dll\n"
+"EXPORTS\n"
+"    ffxUpscalerGetVersion\n"
+"    ffxUpscalerCreateContext\n"
+"    ffxUpscalerDestroyContext\n"
+"    ffxUpscalerDispatchRgba8\n"
+"    ffxUpscalerConfigure\n"
+"    ffxUpscalerQuery\n"
+"    ffxCreateContext = FfxUpscaler_Api2_CreateContext PRIVATE\n"
+"    ffxDestroyContext = FfxUpscaler_Api2_DestroyContext PRIVATE\n"
+"    ffxConfigure = FfxUpscaler_Api2_Configure PRIVATE\n"
+"    ffxQuery = FfxUpscaler_Api2_Query PRIVATE\n"
+"    ffxDispatch = FfxUpscaler_Api2_Dispatch PRIVATE\n"
+)
 add_library(amd_fidelityfx_upscaler_xbox SHARED src/shims/ffx_upscaler_shim.cpp)
+if(WIN32)
+    target_sources(amd_fidelityfx_upscaler_xbox PRIVATE "${_os_ffx_upscaler_def}")
+endif()
 set_target_properties(amd_fidelityfx_upscaler_xbox PROPERTIES
     PREFIX ""
     OUTPUT_NAME "amd_fidelityfx_upscaler_xbox"
