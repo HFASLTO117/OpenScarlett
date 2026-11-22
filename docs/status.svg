@@ -19,7 +19,7 @@
     <rect width="900" height="542" fill="#0d1117"/>
     <rect x="0" y="0" width="900" height="3" fill="url(#accentBar)"/>
     <text class="h1" x="28" y="40">OpenScarlett — Honest Subsystem Progress (Early Alpha)</text>
-    <text class="sub" x="28" y="62">Windows 10/11 x64 · MIT · 45/45 tests passing · 30 DLLs (926 exports) · 774/779 RDNA2 ops · 6 PCs</text>
+    <text class="sub" x="28" y="62">Windows 10/11 x64 · MIT · 45/45 tests passing · 30 DLLs (926 exports) · 774/779 RDNA2 ops · 7 PCs</text>
     <line x1="28" y1="82" x2="872" y2="82" stroke="#21262d" stroke-width="1"/>
     <text class="name" x="28" y="118">Xbox RDNA2 Shader Translator</text>
     <text class="desc" x="28" y="135">774/779 GFX10.3 opcodes decoded — MIMG, DS, SMEM &amp; FLAT expanding now</text>
@@ -32,7 +32,7 @@
     <text class="name" x="28" y="170">DirectX 12 &amp; Vulkan 1.4 Graphics</text>
     <text class="desc" x="28" y="187">3/13 COM proxies &amp; early Vulkan live; full proxies, MT &amp; GPU untile next</text>
     <rect x="498" y="164" width="132" height="22" rx="11" fill="#d29922"/>
-    <text class="pill" x="564" y="179" text-anchor="middle">Partial (6 GPUs)</text>
+    <text class="pill" x="564" y="179" text-anchor="middle">Partial (7 GPUs)</text>
     <rect x="648" y="170" width="176" height="10" rx="5" fill="#21262d"/>
     <rect x="648" y="170" width="88" height="10" rx="5" fill="#d29922"/>
     <text class="pct" x="872" y="179" text-anchor="end">50%</text>
@@ -56,7 +56,7 @@
     <text class="name" x="28" y="326">Audio, Video &amp; Texture Codecs</text>
     <text class="desc" x="28" y="343">Opus/XMA2/BCPack/FSR live; mfplat H.264/HEVC video &amp; GameInput rings next</text>
     <rect x="498" y="320" width="132" height="22" rx="11" fill="#d29922"/>
-    <text class="pill" x="564" y="335" text-anchor="middle">Partial (6 GPUs)</text>
+    <text class="pill" x="564" y="335" text-anchor="middle">Partial (7 GPUs)</text>
     <rect x="648" y="326" width="176" height="10" rx="5" fill="#21262d"/>
     <rect x="648" y="326" width="120" height="10" rx="5" fill="#d29922"/>
     <text class="pct" x="872" y="335" text-anchor="end">68%</text>
