@@ -19,6 +19,16 @@
 #  include <windows.h>
 #endif
 
+#if defined(_MSC_VER)
+// Export DirectStorage entry points from xcrdapi.dll for early GDK / UE5 titles that
+// import DStorageGetFactory (and DStorageSetConfiguration*) from XCRDAPI.dll instead of
+// dstorage_xs.dll. Marking them PRIVATE exposes them in xcrdapi.dll's export table while
+// keeping host import-library linkage bound unambiguously to dstorage_xs.lib.
+#  pragma comment(linker, "/export:DStorageGetFactory=XCrd_DStorageGetFactory,PRIVATE")
+#  pragma comment(linker, "/export:DStorageSetConfiguration=XCrd_DStorageSetConfiguration,PRIVATE")
+#  pragma comment(linker, "/export:DStorageSetConfiguration1=XCrd_DStorageSetConfiguration1,PRIVATE")
+#endif
+
 namespace fs = std::filesystem;
 
 namespace {
@@ -96,6 +106,97 @@ std::string EscapeJson(const std::string& input) {
     }
     return out;
 }
+
+#if defined(_WIN32)
+
+using PfnDStorageGetFactory = int32_t(OS_SHIM_CALL*)(const void* riid, void** ppv);
+using PfnDStorageSetConfiguration = int32_t(OS_SHIM_CALL*)(const void* configuration);
+using PfnDStorageSetConfiguration1 = int32_t(OS_SHIM_CALL*)(const void* configuration);
+
+constexpr int32_t kCrdHrModNotFound = static_cast<int32_t>(0x8007007Eu);
+
+struct DStorageBridgeState {
+    std::mutex mutex;
+    HMODULE module = nullptr;
+    PfnDStorageGetFactory get_factory = nullptr;
+    PfnDStorageSetConfiguration set_config = nullptr;
+    PfnDStorageSetConfiguration1 set_config1 = nullptr;
+    bool attempted = false;
+};
+
+DStorageBridgeState& GetDStorageBridge() {
+    static DStorageBridgeState* s = new DStorageBridgeState();
+    return *s;
+}
+
+bool BindDStorageProcs(HMODULE mod, DStorageBridgeState& st) {
+    if (!mod) return false;
+    auto fn_get = reinterpret_cast<PfnDStorageGetFactory>(
+        GetProcAddress(mod, "DStorageGetFactory"));
+    if (!fn_get) return false;
+    st.module = mod;
+    st.get_factory = fn_get;
+    st.set_config = reinterpret_cast<PfnDStorageSetConfiguration>(
+        GetProcAddress(mod, "DStorageSetConfiguration"));
+    st.set_config1 = reinterpret_cast<PfnDStorageSetConfiguration1>(
+        GetProcAddress(mod, "DStorageSetConfiguration1"));
+    return true;
+}
+
+void ResolveDStorageXsLocked(DStorageBridgeState& st) {
+    if (st.get_factory != nullptr || st.attempted) {
+        return;
+    }
+    st.attempted = true;
+
+    // 1. Reuse already-loaded dstorage_xs.dll so global DirectStorage state is shared.
+    if (HMODULE existing = GetModuleHandleW(L"dstorage_xs.dll"); existing != nullptr) {
+        if (BindDStorageProcs(existing, st)) {
+            return;
+        }
+    }
+
+    // 2. Load sibling dstorage_xs.dll from xcrdapi.dll's directory.
+    HMODULE self_mod = nullptr;
+    if (GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&ResolveDStorageXsLocked),
+            &self_mod) &&
+        self_mod != nullptr) {
+        wchar_t path_buf[MAX_PATH]{};
+        const DWORD len = GetModuleFileNameW(
+            self_mod, path_buf, static_cast<DWORD>(std::size(path_buf)));
+        if (len > 0u && len < std::size(path_buf)) {
+            const fs::path sibling = fs::path(path_buf).parent_path() / L"dstorage_xs.dll";
+            std::error_code ec;
+            if (fs::exists(sibling, ec)) {
+                const std::wstring wpath = sibling.wstring();
+                HMODULE mod = LoadLibraryExW(
+                    wpath.c_str(), nullptr,
+                    LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+                if (!mod) {
+                    mod = LoadLibraryW(wpath.c_str());
+                }
+                if (mod) {
+                    if (BindDStorageProcs(mod, st)) {
+                        return;
+                    }
+                    FreeLibrary(mod);
+                }
+            }
+        }
+    }
+
+    // 3. Fallback to standard Windows search path.
+    if (HMODULE mod = LoadLibraryW(L"dstorage_xs.dll"); mod != nullptr) {
+        if (BindDStorageProcs(mod, st)) {
+            return;
+        }
+        FreeLibrary(mod);
+    }
+}
+
+#endif  // _WIN32
 
 }  // namespace
 
@@ -413,5 +514,69 @@ OS_XCRDAPI_API int32_t OS_SHIM_CALL XCrdDecompressToBuffer(
 
     return RecordHr("XCrdDecompressToBuffer", OS_SHIM_E_INVALIDARG);
 }
+
+#if defined(_WIN32)
+#  if defined(_MSC_VER)
+int32_t OS_SHIM_CALL XCrd_DStorageGetFactory(const void* riid, void** ppv) {
+#  else
+OS_XCRDAPI_API int32_t OS_SHIM_CALL DStorageGetFactory(const void* riid, void** ppv) {
+#  endif
+    if (!ppv) {
+        return RecordHr("DStorageGetFactory", OS_SHIM_E_POINTER);
+    }
+    *ppv = nullptr;
+
+    PfnDStorageGetFactory fn = nullptr;
+    {
+        auto& bridge = GetDStorageBridge();
+        std::lock_guard<std::mutex> lk(bridge.mutex);
+        ResolveDStorageXsLocked(bridge);
+        fn = bridge.get_factory;
+    }
+    if (!fn) {
+        return RecordHr("DStorageGetFactory", kCrdHrModNotFound);
+    }
+    const int32_t hr = fn(riid, ppv);
+    return RecordHr("DStorageGetFactory", hr);
+}
+
+#  if defined(_MSC_VER)
+int32_t OS_SHIM_CALL XCrd_DStorageSetConfiguration(const void* configuration) {
+#  else
+OS_XCRDAPI_API int32_t OS_SHIM_CALL DStorageSetConfiguration(const void* configuration) {
+#  endif
+    PfnDStorageSetConfiguration fn = nullptr;
+    {
+        auto& bridge = GetDStorageBridge();
+        std::lock_guard<std::mutex> lk(bridge.mutex);
+        ResolveDStorageXsLocked(bridge);
+        fn = bridge.set_config;
+    }
+    if (!fn) {
+        return RecordHr("DStorageSetConfiguration", kCrdHrModNotFound);
+    }
+    const int32_t hr = fn(configuration);
+    return RecordHr("DStorageSetConfiguration", hr);
+}
+
+#  if defined(_MSC_VER)
+int32_t OS_SHIM_CALL XCrd_DStorageSetConfiguration1(const void* configuration) {
+#  else
+OS_XCRDAPI_API int32_t OS_SHIM_CALL DStorageSetConfiguration1(const void* configuration) {
+#  endif
+    PfnDStorageSetConfiguration1 fn = nullptr;
+    {
+        auto& bridge = GetDStorageBridge();
+        std::lock_guard<std::mutex> lk(bridge.mutex);
+        ResolveDStorageXsLocked(bridge);
+        fn = bridge.set_config1;
+    }
+    if (!fn) {
+        return RecordHr("DStorageSetConfiguration1", kCrdHrModNotFound);
+    }
+    const int32_t hr = fn(configuration);
+    return RecordHr("DStorageSetConfiguration1", hr);
+}
+#endif  // _WIN32
 
 }  // extern "C"
