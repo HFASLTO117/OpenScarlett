@@ -1,0 +1,117 @@
+OpenScarlett Sprint 7 (v0.4.0-alpha) — Wave 2 Worker C Integration Notes
+Branch: swarm/s7-w2-gui-shell
+Worktree: E:\OpenScarlett\.worktrees\s7-w2-gui-shell
+
+================================================================================
+1. DELIVERED FILES (STRICTLY WITHIN WORKER C OWNERSHIP)
+================================================================================
+- src/launcher/launcher_theme.h
+    Dark modern Xbox / GitHub-dark palette (#0D1117, #161B22, #21262D, #30363D,
+    #107C10/#2EA043 emerald accent, #58A6FF telemetry blue, #F85149 fail red,
+    #E6EDF3/#8B949E text), portable ComRef<T>, UTF-8/UTF-16 helpers, dynamic
+    Per-Monitor DPI v2 helper, Win10/11 dark titlebar DwmSetWindowAttribute(20/19/35/36),
+    RAII GDI resources, and owner-drawn dark button renderer.
+
+- src/launcher/launcher_main.cpp
+    Native Win32 + Direct2D + DirectWrite GUI executable (OpenScarlettLauncher.exe)
+    with full GDI fallback if ID2D1HwndRenderTarget creation fails:
+    * Header / GPU Telemetry Strip (non-blocking worker probe, live GPU/VRAM,
+      SM 6.x, Wave, MeshTier, DXR, Vulkan 1.4 badges, opt-in "Check for Updates",
+      "Offline" checkbox toggle, unobtrusive Update Available pill & modal dialog
+      with release notes, BCrypt SHA-256 verification status, and explicit
+      Download & Apply + confirmation before LaunchUpdateRestartHelper).
+    * Tab 1 — Play & Launch: folder/EXE pickers (IFileOpenDialog + GetOpenFileNameW),
+      drag-and-drop (WM_DROPFILES), Backend selector (Auto/D3D12/Vulkan 1.4), dynamic
+      GPU Adapter selector + D3D12 WARP, Windowed/Null Audio toggles, Extra Args,
+      Launch/Stop, 1-Click Quick-Launch Bundled Demos (DiscoverBundledDemos),
+      CallTelemetry strip (Total Calls, Tracked Symbols, not_impl, Exit Code),
+      and live monospace log viewer.
+    * Tab 2 — 60-Second Hardware Self-Test: Run/Cancel, D2D smooth progress bar,
+      privacy sanitization banner, per-test PASS/FAIL ListView with custom draw,
+      live sanitized log viewer, "Open Pre-Filled GitHub Hardware Report" (respects
+      github_url_mode clipboard/compact flow), "Copy Markdown", saved report path.
+    * Tab 3 — Binary Inspector: drag-and-drop / Browse PE32+ / Inspect Current
+      Target, D2D PE32+ header summary metrics (Format, ImageBase, Size, Sections,
+      Relocs, TLS, .pdata SEH, Exports, Total/Console/GDK/Delay-Load Imports,
+      Missing Exports badge), and per-DLL routing + missing exports ListView.
+    * CLI / Headless & Smoke Modes (WIN32 subsystem, zero console flash):
+      --version, --headless-check, --smoke-gui [--smoke-ms N], [--bundle-dir DIR].
+      Zero external network calls in --headless-check and --smoke-gui.
+
+- tests/test_launcher_updater.cpp
+    Comprehensive 6-part automated test suite:
+    1. SemVer parsing, prerelease ordering (alpha < beta < rc < stable), invalid rejection.
+    2. GitHub Release JSON parser (zip + .sha256 assets, escaped markdown, missing/bad JSON).
+    3. Windows BCrypt SHA-256 NIST vectors, valid local zip staging + restart helper
+       saves-preservation check, tampered 1-byte zip rejection & temp cleanup,
+       malformed checksum rejection, offline & OPENSCARLETT_NO_UPDATE_CHECK=1 guards.
+    4. Privacy path sanitization (bundle dir, USERPROFILE, TEMP, LOCALAPPDATA, APPDATA,
+       forward/back slashes, case-insensitive, C:\Users\<name>).
+    5. GPU telemetry probe, bundled demo discovery, PE32+ inspector (0 missing exports),
+       and GitHub Hardware Report 6200-char URL budget across complete/compact/clipboard.
+    6. OpenScarlettLauncher.exe live CLI/headless & GUI smoke tests (--version,
+       --headless-check, --smoke-gui on HW GPU and OPENSCARLETT_PREFER_WARP=1).
+
+================================================================================
+2. RECOMMENDED CMAKE INTEGRATION (FOR COORDINATOR MERGE)
+================================================================================
+Target 1: OpenScarlettLauncher (WIN32 executable)
+  add_executable(OpenScarlettLauncher WIN32
+      src/launcher/launcher_main.cpp
+      src/launcher/updater.cpp
+      src/launcher/hwtest_runner.cpp
+  )
+  target_include_directories(OpenScarlettLauncher PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include
+      ${CMAKE_CURRENT_SOURCE_DIR}/src/launcher
+  )
+  target_compile_definitions(OpenScarlettLauncher PRIVATE
+      UNICODE _UNICODE
+  )
+  target_link_libraries(OpenScarlettLauncher PRIVATE
+      openscarlett_core
+      d2d1 dwrite dwmapi comctl32 comdlg32 shell32 ole32 uuid gdi32 user32
+      winhttp bcrypt advapi32 version
+  )
+  if(MSVC)
+      target_compile_options(OpenScarlettLauncher PRIVATE /W4 /WX)
+  endif()
+  add_dependencies(OpenScarlettLauncher openscarlett)
+
+Target 2: test_launcher_updater (CTest executable)
+  openscarlett_add_test(test_launcher_updater
+      tests/test_launcher_updater.cpp
+  )
+  target_sources(test_launcher_updater PRIVATE
+      src/launcher/updater.cpp
+      src/launcher/hwtest_runner.cpp
+  )
+  target_link_libraries(test_launcher_updater PRIVATE
+      winhttp bcrypt advapi32 version user32 shell32 ole32 uuid
+  )
+  if(MSVC)
+      target_compile_options(test_launcher_updater PRIVATE /W4 /WX)
+  endif()
+  add_dependencies(test_launcher_updater openscarlett OpenScarlettLauncher)
+
+Required Windows System Link Libraries (Zero Third-Party Dependencies):
+  d2d1, dwrite, dwmapi, comctl32, comdlg32, shell32, ole32, uuid, gdi32,
+  user32, winhttp, bcrypt, advapi32, version
+
+================================================================================
+3. VERIFICATION RESULTS (ISOLATED WORKTREE)
+================================================================================
+- MSVC C++20 /W4 /WX Release:
+    src/launcher/launcher_main.cpp   -> PASS (0 warnings, 0 errors)
+    tests/test_launcher_updater.cpp  -> PASS (0 warnings, 0 errors)
+- MSVC C++20 /W4 /WX Debug:
+    src/launcher/launcher_main.cpp   -> PASS (0 warnings, 0 errors)
+    tests/test_launcher_updater.cpp  -> PASS (0 warnings, 0 errors)
+- Linked mock OpenScarlettLauncher_mock.exe (/SUBSYSTEM:WINDOWS, temp in E:\OpenScarlett\.tmp\):
+    --version                        -> OpenScarlettLauncher v0.4.0-alpha (exit 0)
+    --headless-check                 -> [PASS] d2d=ok, dwrite=ok, sanitize=ok (exit 0)
+    --smoke-gui --smoke-ms 150 (HW)  -> [PASS] tabs=3, paint_frames=4, d2d=true (exit 0)
+    --smoke-gui --smoke-ms 150 (WARP)-> [PASS] tabs=3, paint_frames=4, d2d=true (exit 0)
+- Portability:
+    Zero WRL dependencies, portable ComRef<T>, explicit D2D1 struct initializers,
+    portable IID fallback for MinGW-w64 (OS_UUIDOF_*), no MSVC-only CRT macros.
