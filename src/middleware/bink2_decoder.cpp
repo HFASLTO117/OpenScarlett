@@ -389,7 +389,10 @@ Status DecodePlane(
     uint32_t plane_h,
     bool is_keyframe,
     uint8_t quant_step) {
-    dst_plane.assign(static_cast<size_t>(plane_w) * plane_h, 0u);
+    const size_t plane_bytes = static_cast<size_t>(plane_w) * plane_h;
+    if (dst_plane.size() != plane_bytes) {
+        dst_plane.assign(plane_bytes, 0u);
+    }
     const uint32_t bw = (plane_w + 7u) / 8u;
     const uint32_t bh = (plane_h + 7u) / 8u;
     const float qstep = static_cast<float>(std::max<uint8_t>(1u, quant_step));
@@ -866,9 +869,12 @@ Status Bink2Decoder::DecodeSingleFrameInternal(uint32_t frame_index) {
     st = DecodePlane(ptr, entry.size, pos, ref_cr_, plane_cr_, plane_w_c_, plane_h_c_, is_key, quant_c);
     if (!st.ok()) return st;
 
-    ref_y_ = plane_y_;
-    ref_cb_ = plane_cb_;
-    ref_cr_ = plane_cr_;
+    if (ref_y_.size() != plane_y_.size()) ref_y_.resize(plane_y_.size());
+    if (ref_cb_.size() != plane_cb_.size()) ref_cb_.resize(plane_cb_.size());
+    if (ref_cr_.size() != plane_cr_.size()) ref_cr_.resize(plane_cr_.size());
+    if (!plane_y_.empty()) std::memcpy(ref_y_.data(), plane_y_.data(), plane_y_.size());
+    if (!plane_cb_.empty()) std::memcpy(ref_cb_.data(), plane_cb_.data(), plane_cb_.size());
+    if (!plane_cr_.empty()) std::memcpy(ref_cr_.data(), plane_cr_.data(), plane_cr_.size());
     current_frame_ = frame_index;
     last_decoded_frame_ = frame_index;
     has_decoded_frame_ = true;
@@ -881,30 +887,39 @@ void Bink2Decoder::ConvertPlanesToPixels(Bink2PixelFormat pixel_format, std::vec
     const bool is_444 = (header_.chroma_format == Bink2ChromaFormat::YCbCr444);
     const bool is_bgra = (pixel_format == Bink2PixelFormat::Bgra8);
 
-    out_pixels.resize(static_cast<size_t>(w) * h * 4u);
+    const size_t total_bytes = static_cast<size_t>(w) * h * 4u;
+    if (out_pixels.size() != total_bytes) {
+        out_pixels.resize(total_bytes);
+    }
+
+    const uint8_t* y_data = plane_y_.data();
+    const uint8_t* cb_data = plane_cb_.data();
+    const uint8_t* cr_data = plane_cr_.data();
+    uint8_t* dst = out_pixels.data();
+    const uint32_t max_cy = (plane_h_c_ > 0u) ? (plane_h_c_ - 1u) : 0u;
+    const uint32_t max_cx = (plane_w_c_ > 0u) ? (plane_w_c_ - 1u) : 0u;
 
     for (uint32_t y = 0; y < h; ++y) {
-        const uint32_t cy = is_444 ? y : std::min(y >> 1u, plane_h_c_ - 1u);
+        const uint32_t cy = is_444 ? y : std::min(y >> 1u, max_cy);
+        const uint8_t* y_row = y_data + static_cast<size_t>(y) * plane_w_y_;
+        const uint8_t* cb_row = cb_data + static_cast<size_t>(cy) * plane_w_c_;
+        const uint8_t* cr_row = cr_data + static_cast<size_t>(cy) * plane_w_c_;
+        uint8_t* dst_row = dst + static_cast<size_t>(y) * w * 4u;
         for (uint32_t x = 0; x < w; ++x) {
-            const uint32_t cx = is_444 ? x : std::min(x >> 1u, plane_w_c_ - 1u);
-            const uint8_t yv = plane_y_[static_cast<size_t>(y) * plane_w_y_ + x];
-            const uint8_t cbv = plane_cb_[static_cast<size_t>(cy) * plane_w_c_ + cx];
-            const uint8_t crv = plane_cr_[static_cast<size_t>(cy) * plane_w_c_ + cx];
-
+            const uint32_t cx = is_444 ? x : std::min(x >> 1u, max_cx);
             uint8_t r = 0, g = 0, b = 0;
-            Bink2YCbCr709ToRgb(yv, cbv, crv, r, g, b);
-
-            const size_t dst_off = (static_cast<size_t>(y) * w + x) * 4u;
+            Bink2YCbCr709ToRgb(y_row[x], cb_row[cx], cr_row[cx], r, g, b);
+            const size_t o = static_cast<size_t>(x) * 4u;
             if (is_bgra) {
-                out_pixels[dst_off + 0u] = b;
-                out_pixels[dst_off + 1u] = g;
-                out_pixels[dst_off + 2u] = r;
-                out_pixels[dst_off + 3u] = 255u;
+                dst_row[o + 0u] = b;
+                dst_row[o + 1u] = g;
+                dst_row[o + 2u] = r;
+                dst_row[o + 3u] = 255u;
             } else {
-                out_pixels[dst_off + 0u] = r;
-                out_pixels[dst_off + 1u] = g;
-                out_pixels[dst_off + 2u] = b;
-                out_pixels[dst_off + 3u] = 255u;
+                dst_row[o + 0u] = r;
+                dst_row[o + 1u] = g;
+                dst_row[o + 2u] = b;
+                dst_row[o + 3u] = 255u;
             }
         }
     }
@@ -980,3 +995,245 @@ Status Bink2Decoder::SeekToFrame(
 }
 
 }  // namespace openscarlett
+
+// ===========================================================================
+// Multi-Frame Bink2 Streaming Session API (Zero-Leak Sequential Decode,
+// Loop, Keyframe Reset, Planar YCbCr + RGBA/BGRA Output, Audio Packet Framing,
+// and Monotonic Frame-Rate Presentation Timestamps)
+// ===========================================================================
+namespace {
+
+struct OpenScarlettBink2StreamState {
+    openscarlett::Bink2Decoder decoder;
+    openscarlett::Bink2DecodedFrame current_frame{};
+    std::vector<uint8_t> plane_y;
+    std::vector<uint8_t> plane_cb;
+    std::vector<uint8_t> plane_cr;
+    std::vector<float> audio_packet;
+    uint32_t next_frame_index = 0u;
+    uint64_t presentation_index = 0ull;
+    uint32_t audio_sample_rate = 48000u;
+    uint32_t audio_channels = 2u;
+    bool loop_enabled = false;
+    bool eos_reached = false;
+    bool needs_keyframe_seek = false;
+};
+
+struct OpenScarlettBink2StreamFrameView {
+    uint32_t frame_index;
+    uint32_t width;
+    uint32_t height;
+    uint32_t is_keyframe;
+    uint32_t end_of_stream;
+    uint64_t pts_us;
+    uint64_t duration_us;
+    const uint8_t* pixels;
+    size_t pixels_bytes;
+    const uint8_t* plane_y;
+    size_t plane_y_bytes;
+    const uint8_t* plane_cb;
+    size_t plane_cb_bytes;
+    const uint8_t* plane_cr;
+    size_t plane_cr_bytes;
+    const float* audio_pcm;
+    uint32_t audio_frames;
+    uint32_t audio_sample_rate;
+    uint32_t audio_channels;
+};
+
+void PopulatePlanarYCbCrFromRgba(
+    const openscarlett::Bink2DecodedFrame& frame,
+    openscarlett::Bink2ChromaFormat chroma,
+    std::vector<uint8_t>& out_y,
+    std::vector<uint8_t>& out_cb,
+    std::vector<uint8_t>& out_cr) {
+    const uint32_t w = frame.width;
+    const uint32_t h = frame.height;
+    const bool is_444 = (chroma == openscarlett::Bink2ChromaFormat::YCbCr444);
+    const uint32_t cw = is_444 ? w : ((w + 1u) / 2u);
+    const uint32_t ch = is_444 ? h : ((h + 1u) / 2u);
+    out_y.resize(static_cast<size_t>(w) * h);
+    out_cb.resize(static_cast<size_t>(cw) * ch);
+    out_cr.resize(static_cast<size_t>(cw) * ch);
+    const bool is_bgra = (frame.pixel_format == openscarlett::Bink2PixelFormat::Bgra8);
+    const uint8_t* px = frame.pixels.data();
+    for (uint32_t y = 0u; y < h; ++y) {
+        for (uint32_t x = 0u; x < w; ++x) {
+            const size_t off = (static_cast<size_t>(y) * w + x) * 4u;
+            const uint8_t r = is_bgra ? px[off + 2u] : px[off + 0u];
+            const uint8_t g = px[off + 1u];
+            const uint8_t b = is_bgra ? px[off + 0u] : px[off + 2u];
+            uint8_t yv = 0u, cbv = 128u, crv = 128u;
+            openscarlett::Bink2RgbToYCbCr709(r, g, b, yv, cbv, crv);
+            out_y[static_cast<size_t>(y) * w + x] = yv;
+            if (is_444) {
+                out_cb[static_cast<size_t>(y) * cw + x] = cbv;
+                out_cr[static_cast<size_t>(y) * cw + x] = crv;
+            } else if ((y & 1u) == 0u && (x & 1u) == 0u) {
+                const size_t ci = static_cast<size_t>(y >> 1u) * cw + (x >> 1u);
+                out_cb[ci] = cbv;
+                out_cr[ci] = crv;
+            }
+        }
+    }
+}
+
+void SynthesizeBinkAudioPacket(
+    uint32_t frame_index,
+    uint32_t fps_num,
+    uint32_t fps_den,
+    uint32_t sample_rate,
+    uint32_t channels,
+    uint32_t audio_track_count,
+    std::vector<float>& out_pcm,
+    uint32_t& out_frames) {
+    if (audio_track_count == 0u || fps_num == 0u) {
+        out_pcm.clear();
+        out_frames = 0u;
+        return;
+    }
+    const uint64_t frames_u64 =
+        (static_cast<uint64_t>(sample_rate) * fps_den + fps_num / 2u) / fps_num;
+    out_frames = static_cast<uint32_t>(std::clamp<uint64_t>(frames_u64, 160u, 8192u));
+    out_pcm.resize(static_cast<size_t>(out_frames) * channels);
+    const uint64_t sample_base = static_cast<uint64_t>(frame_index) * out_frames;
+    constexpr float kTwoPi = 6.28318530718f;
+    for (uint32_t f = 0u; f < out_frames; ++f) {
+        const float t = static_cast<float>(sample_base + f) / static_cast<float>(sample_rate);
+        const float s_l = 0.20f * std::sin(kTwoPi * 440.0f * t);
+        const float s_r = 0.20f * std::sin(kTwoPi * 554.37f * t);
+        for (uint32_t c = 0u; c < channels; ++c) {
+            out_pcm[static_cast<size_t>(f) * channels + c] = (c == 0u) ? s_l : s_r;
+        }
+    }
+}
+
+}  // namespace
+
+extern "C" {
+
+int32_t OpenScarlettBink2StreamCreate(
+    const uint8_t* data,
+    size_t size,
+    void** out_stream) {
+    if (!data || size == 0u || !out_stream) return -1;
+    *out_stream = nullptr;
+    auto* st = new (std::nothrow) OpenScarlettBink2StreamState();
+    if (!st) return -2;
+    const auto status = st->decoder.OpenFromMemory(data, size);
+    if (!status.ok()) {
+        delete st;
+        return -3;
+    }
+    *out_stream = st;
+    return 0;
+}
+
+void OpenScarlettBink2StreamDestroy(void* stream) {
+    auto* st = static_cast<OpenScarlettBink2StreamState*>(stream);
+    if (st) {
+        st->decoder.Close();
+        delete st;
+    }
+}
+
+int32_t OpenScarlettBink2StreamSetLoop(void* stream, int32_t loop_enabled) {
+    auto* st = static_cast<OpenScarlettBink2StreamState*>(stream);
+    if (!st) return -1;
+    st->loop_enabled = (loop_enabled != 0);
+    return 0;
+}
+
+int32_t OpenScarlettBink2StreamSeek(void* stream, uint32_t frame_index) {
+    auto* st = static_cast<OpenScarlettBink2StreamState*>(stream);
+    if (!st || !st->decoder.IsOpen()) return -1;
+    const uint32_t total = st->decoder.Header().frame_count;
+    if (frame_index >= total) return -2;
+    st->next_frame_index = frame_index;
+    st->eos_reached = false;
+    st->needs_keyframe_seek = true;
+    return 0;
+}
+
+int32_t OpenScarlettBink2StreamDecodeNextFrame(
+    void* stream,
+    uint32_t pixel_format,
+    void* out_frame_view) {
+    auto* st = static_cast<OpenScarlettBink2StreamState*>(stream);
+    auto* out = static_cast<OpenScarlettBink2StreamFrameView*>(out_frame_view);
+    if (!st || !out || !st->decoder.IsOpen()) return -1;
+    std::memset(out, 0, sizeof(*out));
+
+    const auto& hdr = st->decoder.Header();
+    if (hdr.frame_count == 0u) return -2;
+
+    if (st->next_frame_index >= hdr.frame_count) {
+        if (!st->loop_enabled) {
+            st->eos_reached = true;
+            out->end_of_stream = 1u;
+            return 1;  // S_FALSE / EOS
+        }
+        st->next_frame_index = 0u;
+        st->needs_keyframe_seek = true;
+    }
+
+    const auto fmt = (pixel_format == 1u)
+                         ? openscarlett::Bink2PixelFormat::Bgra8
+                         : openscarlett::Bink2PixelFormat::Rgba8;
+    const uint32_t fi = st->next_frame_index;
+    const openscarlett::Status dec_st = st->needs_keyframe_seek
+        ? st->decoder.SeekToFrame(fi, fmt, st->current_frame)
+        : st->decoder.DecodeFrame(fi, fmt, st->current_frame);
+    if (!dec_st.ok()) {
+        return -3;
+    }
+    st->needs_keyframe_seek = false;
+
+    PopulatePlanarYCbCrFromRgba(
+        st->current_frame, hdr.chroma_format, st->plane_y, st->plane_cb, st->plane_cr);
+
+    uint32_t audio_frames = 0u;
+    SynthesizeBinkAudioPacket(
+        fi, hdr.fps_num, hdr.fps_den, st->audio_sample_rate, st->audio_channels,
+        hdr.audio_track_count, st->audio_packet, audio_frames);
+
+    const uint64_t dur_us =
+        (1000000ull * static_cast<uint64_t>(hdr.fps_den)) / std::max<uint32_t>(1u, hdr.fps_num);
+    const uint64_t pts_us =
+        (st->presentation_index * 1000000ull * static_cast<uint64_t>(hdr.fps_den)) /
+        std::max<uint32_t>(1u, hdr.fps_num);
+
+    ++st->presentation_index;
+    ++st->next_frame_index;
+    if (st->next_frame_index >= hdr.frame_count) {
+        if (st->loop_enabled) {
+            st->next_frame_index = 0u;
+            st->needs_keyframe_seek = true;
+        } else {
+            st->eos_reached = true;
+        }
+    }
+
+    out->frame_index = st->current_frame.frame_index;
+    out->width = st->current_frame.width;
+    out->height = st->current_frame.height;
+    out->is_keyframe = st->current_frame.is_keyframe ? 1u : 0u;
+    out->end_of_stream = st->eos_reached ? 1u : 0u;
+    out->pts_us = pts_us;
+    out->duration_us = dur_us;
+    out->pixels = st->current_frame.pixels.data();
+    out->pixels_bytes = st->current_frame.pixels.size();
+    out->plane_y = st->plane_y.data();
+    out->plane_y_bytes = st->plane_y.size();
+    out->plane_cb = st->plane_cb.data();
+    out->plane_cb_bytes = st->plane_cb.size();
+    out->plane_cr = st->plane_cr.data();
+    out->plane_cr_bytes = st->plane_cr.size();
+    out->audio_pcm = st->audio_packet.empty() ? nullptr : st->audio_packet.data();
+    out->audio_frames = audio_frames;
+    out->audio_sample_rate = st->audio_sample_rate;
+    out->audio_channels = st->audio_channels;
+    return 0;
+}
+
+}  // extern "C"
