@@ -1826,6 +1826,11 @@ void DStoragePriorityScheduler::UnregisterQueue(DStorageQueueImpl* q) {
 }
 
 void DStoragePriorityScheduler::NotifyWorkAvailable() {
+    // Acquire scheduler mutex_ before notifying so the producer cannot race
+    // between RunLoop's pick_next() check and entering work_cv_.wait() (lost wakeup).
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
+    }
     work_cv_.notify_one();
 }
 
