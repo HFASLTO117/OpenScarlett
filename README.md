@@ -36,7 +36,7 @@ Because Xbox Series X|S runs on an **AMD Zen 2 x86-64 CPU** and a **Windows-deri
 
 ![OpenScarlett Status](docs/status.svg)
 
-**Overall Clean-Room Readiness:** `100.0%` · **Automated Tests:** `37/37` passing · **Verified Hardware (6 PCs):** `Win10 + GTX 1650 Ti` · `Win11 25H2/26H2 + RTX 2060 SUPER & RTX 3080 Ti (DXR=12)` · `Win11 26H2 + AMD RX 7600, RX 7900 XTX & RX 9070 XT (Wave64/DXR=11)`
+**Overall Clean-Room Readiness:** `100.0%` · **Automated Tests:** `41/41` passing · **Verified Hardware (6 PCs):** `Win10 + GTX 1650 Ti` · `Win11 25H2/26H2 + RTX 2060 SUPER & RTX 3080 Ti (DXR=12)` · `Win11 26H2 + AMD RX 7600, RX 7900 XTX & RX 9070 XT (Wave64/DXR=11)`
 
 | Subsystem | Area | Status | Progress | What Works Right Now | Verified On |
 | :--- | :--- | :--- | :---: | :--- | :--- |

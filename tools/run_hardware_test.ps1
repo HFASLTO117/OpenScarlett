@@ -113,6 +113,10 @@ $TestDescriptions = @{
     'test_bcpack_bvh4.exe'             = 'Hardened BCPack BC1-BC7 entropy codecs & RDNA2 BVH4 header/node-pointer decoder + SAH equivalence'
     'test_real_gdk_thunks_live.exe'    = 'Live 292/292 xgameruntime + 16/16 XCurl + shipping commercial GDK thunks (zero E_NOINTERFACE)'
     'test_scarlett_game_live.exe'      = 'Full playable Scarlett game stack via openscarlett run (d3d12_xs+PresentX+GameInput+XAudio2+S:)'
+    'test_d3d12_vk_routing.exe'        = 'Direct d3d12_xs->Vulkan 1.4 routing, BC1-BC7 staged copies, mixed-heap isolation & PresentX timing'
+    'test_rdna2_lockstep_isa.exe'      = 'Single-wave lockstep LDS barriers, 5 RDNA2 no-ops & CPU-vs-GPU differential ISA checks'
+    'test_s7_pe_gdk_runtime.exe'       = 'PE/KnownDLL/.xdata hardening, XMemVirtualQuery, Minecraft-GDK surface, 6 stubs, RawInput & DCC fuzz'
+    'test_gdk_3d_scene_dual_api.exe'   = '3D shadowed/skinned/BC1+BC3 GDK scene launched via openscarlett run on D3D12 & Vulkan 1.4'
 }
 
 Write-Host ''

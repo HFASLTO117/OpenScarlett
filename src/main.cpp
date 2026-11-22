@@ -429,32 +429,43 @@ int RunGuestExecutable(int argc, char** argv) {
         opts.telemetry_output_path = (tel_base / (stem + "_telemetry.json")).string();
     }
 
-    // Save/set/restore OPENSCARLETT_GPU_BACKEND around LaunchWithApcHook
+    // Save/set/restore OPENSCARLETT_GPU_BACKEND & OPENSCARLETT_BACKEND around LaunchWithApcHook
+    bool had_prev_gpu_backend_env = false;
+    std::string prev_gpu_backend_env;
     bool had_prev_backend_env = false;
     std::string prev_backend_env;
 #if defined(_WIN32)
     {
-        char prev_buf[256]{};
-        const DWORD prev_len = GetEnvironmentVariableA(
-            "OPENSCARLETT_GPU_BACKEND", prev_buf, static_cast<DWORD>(sizeof(prev_buf)));
-        if (prev_len > 0 && prev_len < sizeof(prev_buf)) {
-            had_prev_backend_env = true;
-            prev_backend_env = prev_buf;
-        } else if (prev_len == 0 && GetLastError() != ERROR_ENVVAR_NOT_FOUND) {
-            had_prev_backend_env = true;
-            prev_backend_env.clear();
-        }
+        auto read_env_var = [](const char* name, bool& had, std::string& val) {
+            char buf[256]{};
+            const DWORD len = GetEnvironmentVariableA(name, buf, static_cast<DWORD>(sizeof(buf)));
+            if (len > 0 && len < sizeof(buf)) {
+                had = true;
+                val = buf;
+            } else if (len == 0 && GetLastError() != ERROR_ENVVAR_NOT_FOUND) {
+                had = true;
+                val.clear();
+            }
+        };
+        read_env_var("OPENSCARLETT_GPU_BACKEND", had_prev_gpu_backend_env, prev_gpu_backend_env);
+        read_env_var("OPENSCARLETT_BACKEND", had_prev_backend_env, prev_backend_env);
         if (!gpu_backend_override.empty()) {
             SetEnvironmentVariableA("OPENSCARLETT_GPU_BACKEND", gpu_backend_override.c_str());
+            SetEnvironmentVariableA("OPENSCARLETT_BACKEND", gpu_backend_override.c_str());
         }
     }
 #else
     if (const char* prev = std::getenv("OPENSCARLETT_GPU_BACKEND")) {
+        had_prev_gpu_backend_env = true;
+        prev_gpu_backend_env = prev;
+    }
+    if (const char* prev = std::getenv("OPENSCARLETT_BACKEND")) {
         had_prev_backend_env = true;
         prev_backend_env = prev;
     }
     if (!gpu_backend_override.empty()) {
         setenv("OPENSCARLETT_GPU_BACKEND", gpu_backend_override.c_str(), 1);
+        setenv("OPENSCARLETT_BACKEND", gpu_backend_override.c_str(), 1);
     }
 #endif
 
@@ -462,23 +473,29 @@ int RunGuestExecutable(int argc, char** argv) {
                                            ? gpu_backend_override
                                            : (had_prev_backend_env && !prev_backend_env.empty()
                                                   ? prev_backend_env
-                                                  : "d3d12 (default)");
+                                                  : (had_prev_gpu_backend_env && !prev_gpu_backend_env.empty()
+                                                         ? prev_gpu_backend_env
+                                                         : "d3d12 (default)"));
 
     openscarlett::LaunchResult res{};
     auto st = openscarlett::LaunchWithApcHook(opts, res);
 
     if (!gpu_backend_override.empty()) {
 #if defined(_WIN32)
-        if (had_prev_backend_env) {
-            SetEnvironmentVariableA("OPENSCARLETT_GPU_BACKEND", prev_backend_env.c_str());
-        } else {
-            SetEnvironmentVariableA("OPENSCARLETT_GPU_BACKEND", nullptr);
-        }
+        SetEnvironmentVariableA("OPENSCARLETT_GPU_BACKEND",
+                                had_prev_gpu_backend_env ? prev_gpu_backend_env.c_str() : nullptr);
+        SetEnvironmentVariableA("OPENSCARLETT_BACKEND",
+                                had_prev_backend_env ? prev_backend_env.c_str() : nullptr);
 #else
-        if (had_prev_backend_env) {
-            setenv("OPENSCARLETT_GPU_BACKEND", prev_backend_env.c_str(), 1);
+        if (had_prev_gpu_backend_env) {
+            setenv("OPENSCARLETT_GPU_BACKEND", prev_gpu_backend_env.c_str(), 1);
         } else {
             unsetenv("OPENSCARLETT_GPU_BACKEND");
+        }
+        if (had_prev_backend_env) {
+            setenv("OPENSCARLETT_BACKEND", prev_backend_env.c_str(), 1);
+        } else {
+            unsetenv("OPENSCARLETT_BACKEND");
         }
 #endif
     }
