@@ -262,10 +262,7 @@ public:
     void STDMETHODCALLTYPE DispatchMesh(UINT x, UINT y, UINT z) override { parent_->DispatchMesh(x, y, z); }
 
     void STDMETHODCALLTYPE Barrier(UINT32 NumBarrierGroups, const D3D12_BARRIER_GROUP* pBarrierGroups) override {
-        if (parent_->host_list7_) {
-            parent_->host_list7_->Barrier(NumBarrierGroups, pBarrierGroups);
-        }
-        RecordList("ID3D12GraphicsCommandListX::Barrier", 80, parent_->host_list7_ ? S_OK : E_NOINTERFACE);
+        parent_->ExecuteEnhancedBarriers(NumBarrierGroups, pBarrierGroups);
     }
 #ifdef __ID3D12GraphicsCommandList8_INTERFACE_DEFINED__
     void STDMETHODCALLTYPE OMSetFrontAndBackStencilRef(UINT FrontStencilRef, UINT BackStencilRef) override {
@@ -462,8 +459,16 @@ HRESULT STDMETHODCALLTYPE CommandListX::QueryInterface(REFIID riid, void** ppvOb
         RecordList("ID3D12GraphicsCommandListX::QueryInterface", 0, S_OK);
         return S_OK;
     }
+    if (IsEqualIID(riid, IID_IOpenScarlettEnhancedBarrierStats)) {
+        *ppvObject = static_cast<IOpenScarlettEnhancedBarrierStats*>(this);
+        AddRef();
+        RecordList("ID3D12GraphicsCommandListX::QueryInterface", 0, S_OK);
+        return S_OK;
+    }
 #ifdef __ID3D12GraphicsCommandList7_INTERFACE_DEFINED__
-    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12GraphicsCommandList7)) && host_list7_ && ext_proxy_) {
+    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12GraphicsCommandList7)) && ext_proxy_) {
+        // Expose CommandList7 via ext_proxy_ even on inbox D3D12 without native host_list7_,
+        // since ExecuteEnhancedBarriers() unwraps proxies and cleanly falls back to legacy ResourceBarrier.
         *ppvObject = static_cast<ID3D12GraphicsCommandList7*>(ext_proxy_);
         AddRef();
         RecordList("ID3D12GraphicsCommandListX::QueryInterface", 0, S_OK);
@@ -1058,6 +1063,362 @@ void STDMETHODCALLTYPE CommandListX::ResourceBarrier(
     }
     RecordList("ID3D12GraphicsCommandListX::ResourceBarrier", 26, S_OK);
 }
+
+HRESULT STDMETHODCALLTYPE CommandListX::GetEnhancedBarrierStats(
+    D3D12XBOX_ENHANCED_BARRIER_STATS* out_stats) const noexcept {
+    if (!out_stats) return E_POINTER;
+    out_stats->barrier_calls = eb_barrier_calls_.load(std::memory_order_relaxed);
+    out_stats->native_barrier_calls = eb_native_calls_.load(std::memory_order_relaxed);
+    out_stats->legacy_fallback_calls = eb_legacy_fallbacks_.load(std::memory_order_relaxed);
+    out_stats->buffer_barriers_processed = eb_buffer_barriers_.load(std::memory_order_relaxed);
+    out_stats->texture_barriers_processed = eb_texture_barriers_.load(std::memory_order_relaxed);
+    out_stats->global_barriers_processed = eb_global_barriers_.load(std::memory_order_relaxed);
+    out_stats->proxy_resources_unwrapped = eb_resources_unwrapped_.load(std::memory_order_relaxed);
+    out_stats->va_mirror_notifications = eb_va_mirror_notifs_.load(std::memory_order_relaxed);
+    out_stats->unified_texture_notifications = eb_unified_tex_notifs_.load(std::memory_order_relaxed);
+#ifdef __ID3D12GraphicsCommandList7_INTERFACE_DEFINED__
+    out_stats->host_has_cmdlist7 = host_list7_ ? 1u : 0u;
+#else
+    out_stats->host_has_cmdlist7 = 0u;
+#endif
+    return S_OK;
+}
+
+#ifdef __ID3D12GraphicsCommandList7_INTERFACE_DEFINED__
+namespace {
+
+D3D12_RESOURCE_STATES BarrierAccessToLegacyState(D3D12_BARRIER_ACCESS access) noexcept {
+    if (access == D3D12_BARRIER_ACCESS_COMMON || access == D3D12_BARRIER_ACCESS_NO_ACCESS) {
+        return D3D12_RESOURCE_STATE_COMMON;
+    }
+    if ((access & D3D12_BARRIER_ACCESS_RENDER_TARGET) != 0) {
+        return D3D12_RESOURCE_STATE_RENDER_TARGET;
+    }
+    if ((access & D3D12_BARRIER_ACCESS_UNORDERED_ACCESS) != 0) {
+        return D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    }
+    if ((access & D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE) != 0) {
+        return D3D12_RESOURCE_STATE_DEPTH_WRITE;
+    }
+    if ((access & D3D12_BARRIER_ACCESS_DEPTH_STENCIL_READ) != 0) {
+        return D3D12_RESOURCE_STATE_DEPTH_READ;
+    }
+    if ((access & D3D12_BARRIER_ACCESS_COPY_DEST) != 0) {
+        return D3D12_RESOURCE_STATE_COPY_DEST;
+    }
+    if ((access & D3D12_BARRIER_ACCESS_COPY_SOURCE) != 0) {
+        return D3D12_RESOURCE_STATE_COPY_SOURCE;
+    }
+    if ((access & D3D12_BARRIER_ACCESS_RESOLVE_DEST) != 0) {
+        return D3D12_RESOURCE_STATE_RESOLVE_DEST;
+    }
+    if ((access & D3D12_BARRIER_ACCESS_RESOLVE_SOURCE) != 0) {
+        return D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+    }
+    if ((access & D3D12_BARRIER_ACCESS_STREAM_OUTPUT) != 0) {
+        return D3D12_RESOURCE_STATE_STREAM_OUT;
+    }
+    if ((access & D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_READ) != 0 ||
+        (access & D3D12_BARRIER_ACCESS_RAYTRACING_ACCELERATION_STRUCTURE_WRITE) != 0) {
+        return D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE;
+    }
+    D3D12_RESOURCE_STATES read_state = D3D12_RESOURCE_STATE_COMMON;
+    if ((access & (D3D12_BARRIER_ACCESS_VERTEX_BUFFER | D3D12_BARRIER_ACCESS_CONSTANT_BUFFER)) != 0) {
+        read_state |= D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER;
+    }
+    if ((access & D3D12_BARRIER_ACCESS_INDEX_BUFFER) != 0) {
+        read_state |= D3D12_RESOURCE_STATE_INDEX_BUFFER;
+    }
+    if ((access & D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT) != 0) {
+        read_state |= D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT;
+    }
+    if ((access & D3D12_BARRIER_ACCESS_SHADER_RESOURCE) != 0) {
+        read_state |= D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |
+                      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    }
+    return read_state;
+}
+
+D3D12_RESOURCE_STATES BarrierLayoutToLegacyState(
+    D3D12_BARRIER_LAYOUT layout,
+    D3D12_BARRIER_ACCESS fallback_access) noexcept {
+    switch (layout) {
+        case D3D12_BARRIER_LAYOUT_UNDEFINED:
+        case D3D12_BARRIER_LAYOUT_COMMON:
+        case D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COMMON:
+        case D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COMMON:
+            return D3D12_RESOURCE_STATE_COMMON;
+        case D3D12_BARRIER_LAYOUT_GENERIC_READ:
+        case D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_GENERIC_READ:
+        case D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_GENERIC_READ:
+            return D3D12_RESOURCE_STATE_GENERIC_READ;
+        case D3D12_BARRIER_LAYOUT_RENDER_TARGET:
+            return D3D12_RESOURCE_STATE_RENDER_TARGET;
+        case D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS:
+        case D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_UNORDERED_ACCESS:
+        case D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_UNORDERED_ACCESS:
+            return D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        case D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE:
+            return D3D12_RESOURCE_STATE_DEPTH_WRITE;
+        case D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_READ:
+            return D3D12_RESOURCE_STATE_DEPTH_READ;
+        case D3D12_BARRIER_LAYOUT_SHADER_RESOURCE:
+        case D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_SHADER_RESOURCE:
+        case D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_SHADER_RESOURCE:
+            return D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        case D3D12_BARRIER_LAYOUT_COPY_SOURCE:
+        case D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COPY_SOURCE:
+        case D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COPY_SOURCE:
+            return D3D12_RESOURCE_STATE_COPY_SOURCE;
+        case D3D12_BARRIER_LAYOUT_COPY_DEST:
+        case D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COPY_DEST:
+        case D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COPY_DEST:
+            return D3D12_RESOURCE_STATE_COPY_DEST;
+        case D3D12_BARRIER_LAYOUT_RESOLVE_SOURCE:
+            return D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
+        case D3D12_BARRIER_LAYOUT_RESOLVE_DEST:
+            return D3D12_RESOURCE_STATE_RESOLVE_DEST;
+        case D3D12_BARRIER_LAYOUT_SHADING_RATE_SOURCE:
+            return D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE;
+        default:
+            return BarrierAccessToLegacyState(fallback_access);
+    }
+}
+
+bool IsEnhancedWriteAccess(D3D12_BARRIER_ACCESS access) noexcept {
+    constexpr uint32_t kWriteMask =
+        static_cast<uint32_t>(D3D12_BARRIER_ACCESS_UNORDERED_ACCESS) |
+        static_cast<uint32_t>(D3D12_BARRIER_ACCESS_COPY_DEST) |
+        static_cast<uint32_t>(D3D12_BARRIER_ACCESS_RENDER_TARGET) |
+        static_cast<uint32_t>(D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE) |
+        static_cast<uint32_t>(D3D12_BARRIER_ACCESS_RESOLVE_DEST) |
+        static_cast<uint32_t>(D3D12_BARRIER_ACCESS_STREAM_OUTPUT);
+    return (static_cast<uint32_t>(access) & kWriteMask) != 0u;
+}
+
+bool IsEnhancedReadAccess(D3D12_BARRIER_ACCESS access) noexcept {
+    constexpr uint32_t kReadMask =
+        static_cast<uint32_t>(D3D12_BARRIER_ACCESS_VERTEX_BUFFER) |
+        static_cast<uint32_t>(D3D12_BARRIER_ACCESS_CONSTANT_BUFFER) |
+        static_cast<uint32_t>(D3D12_BARRIER_ACCESS_INDEX_BUFFER) |
+        static_cast<uint32_t>(D3D12_BARRIER_ACCESS_SHADER_RESOURCE) |
+        static_cast<uint32_t>(D3D12_BARRIER_ACCESS_INDIRECT_ARGUMENT) |
+        static_cast<uint32_t>(D3D12_BARRIER_ACCESS_COPY_SOURCE) |
+        static_cast<uint32_t>(D3D12_BARRIER_ACCESS_RESOLVE_SOURCE) |
+        static_cast<uint32_t>(D3D12_BARRIER_ACCESS_DEPTH_STENCIL_READ);
+    return (static_cast<uint32_t>(access) & kReadMask) != 0u;
+}
+
+}  // namespace
+
+void CommandListX::ExecuteEnhancedBarriers(
+    UINT32 num_barrier_groups,
+    const D3D12_BARRIER_GROUP* barrier_groups) {
+    eb_barrier_calls_.fetch_add(1ull, std::memory_order_relaxed);
+    if (!barrier_groups || num_barrier_groups == 0u) {
+        if (host_list7_) {
+            host_list7_->Barrier(num_barrier_groups, barrier_groups);
+            eb_native_calls_.fetch_add(1ull, std::memory_order_relaxed);
+        }
+        RecordList("ID3D12GraphicsCommandListX::Barrier", 80, S_OK);
+        return;
+    }
+
+    const bool track_unified =
+        device_x_ && (device_x_->HasRegisteredUnifiedTextures() ||
+                      device_x_->HasMirroredTitleVaRegions());
+
+    std::vector<D3D12_BARRIER_GROUP> unwrapped_groups(num_barrier_groups);
+    std::vector<std::vector<D3D12_BUFFER_BARRIER>> buffer_storage;
+    std::vector<std::vector<D3D12_TEXTURE_BARRIER>> texture_storage;
+    buffer_storage.reserve(num_barrier_groups);
+    texture_storage.reserve(num_barrier_groups);
+
+    std::vector<D3D12_RESOURCE_BARRIER> legacy_barriers;
+    uint64_t unwrapped_count = 0ull;
+    uint64_t va_notifs = 0ull;
+    uint64_t unified_notifs = 0ull;
+    uint32_t total_individual_barriers = 0u;
+
+    for (UINT32 g = 0u; g < num_barrier_groups; ++g) {
+        D3D12_BARRIER_GROUP grp = barrier_groups[g];
+        unwrapped_groups[g] = grp;
+
+        if (grp.Type == D3D12_BARRIER_TYPE_GLOBAL) {
+            eb_global_barriers_.fetch_add(grp.NumBarriers, std::memory_order_relaxed);
+            total_individual_barriers += grp.NumBarriers;
+            if (grp.pGlobalBarriers && grp.NumBarriers > 0u) {
+                for (UINT32 i = 0u; i < grp.NumBarriers; ++i) {
+                    const D3D12_GLOBAL_BARRIER& gb = grp.pGlobalBarriers[i];
+                    if ((gb.AccessBefore & D3D12_BARRIER_ACCESS_UNORDERED_ACCESS) != 0 ||
+                        (gb.AccessAfter & D3D12_BARRIER_ACCESS_UNORDERED_ACCESS) != 0) {
+                        D3D12_RESOURCE_BARRIER lb{};
+                        lb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                        lb.UAV.pResource = nullptr;
+                        legacy_barriers.push_back(lb);
+                    }
+                }
+            }
+        } else if (grp.Type == D3D12_BARRIER_TYPE_BUFFER) {
+            eb_buffer_barriers_.fetch_add(grp.NumBarriers, std::memory_order_relaxed);
+            total_individual_barriers += grp.NumBarriers;
+            if (grp.pBufferBarriers && grp.NumBarriers > 0u) {
+                buffer_storage.emplace_back(grp.pBufferBarriers, grp.pBufferBarriers + grp.NumBarriers);
+                auto& buf_vec = buffer_storage.back();
+                for (UINT32 i = 0u; i < grp.NumBarriers; ++i) {
+                    D3D12_BUFFER_BARRIER& bb = buf_vec[i];
+                    ID3D12Resource* orig_res = bb.pResource;
+                    ID3D12Resource* host_res = UnwrapResource(orig_res);
+                    if (orig_res && host_res != orig_res) {
+                        ++unwrapped_count;
+                    }
+                    bb.pResource = host_res;
+
+                    if (host_res) {
+                        const D3D12_RESOURCE_STATES before_st = BarrierAccessToLegacyState(bb.AccessBefore);
+                        const D3D12_RESOURCE_STATES after_st = BarrierAccessToLegacyState(bb.AccessAfter);
+                        if (track_unified) {
+                            device_x_->NotifyResourceStateTransition(host_res, after_st);
+                            ++unified_notifs;
+                            uint64_t va = 0ull;
+                            if (device_x_->LookupMirroredTitleVaForResource(host_res, va) && va != 0ull) {
+                                ++va_notifs;
+                                if (IsEnhancedReadAccess(bb.AccessAfter)) {
+                                    std::vector<openscarlett::DirtyPageRange> dirty_ranges;
+                                    if (device_x_->GetTitleVaMirror().QueryDirtyPageRanges(va, false, dirty_ranges).ok() &&
+                                        !dirty_ranges.empty()) {
+                                        openscarlett::FlushStats fstats{};
+                                        (void)device_x_->GetTitleVaMirror().FlushDirtyPagesToGpu(
+                                            host_list_, va, &fstats, after_st);
+                                    }
+                                }
+                            }
+                        }
+                        if (IsEnhancedWriteAccess(bb.AccessBefore) || IsEnhancedWriteAccess(bb.AccessAfter)) {
+                            RecordMirroredResourceGpuWrite(host_res);
+                        }
+                        if ((bb.AccessBefore & D3D12_BARRIER_ACCESS_UNORDERED_ACCESS) != 0 ||
+                            (bb.AccessAfter & D3D12_BARRIER_ACCESS_UNORDERED_ACCESS) != 0) {
+                            D3D12_RESOURCE_BARRIER lb{};
+                            lb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                            lb.UAV.pResource = host_res;
+                            legacy_barriers.push_back(lb);
+                        } else if (before_st != after_st) {
+                            D3D12_RESOURCE_BARRIER lb{};
+                            lb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                            lb.Transition.pResource = host_res;
+                            lb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                            lb.Transition.StateBefore = before_st;
+                            lb.Transition.StateAfter = after_st;
+                            legacy_barriers.push_back(lb);
+                        }
+                    }
+                }
+                unwrapped_groups[g].pBufferBarriers = buf_vec.data();
+            }
+        } else if (grp.Type == D3D12_BARRIER_TYPE_TEXTURE) {
+            eb_texture_barriers_.fetch_add(grp.NumBarriers, std::memory_order_relaxed);
+            total_individual_barriers += grp.NumBarriers;
+            if (grp.pTextureBarriers && grp.NumBarriers > 0u) {
+                texture_storage.emplace_back(grp.pTextureBarriers, grp.pTextureBarriers + grp.NumBarriers);
+                auto& tex_vec = texture_storage.back();
+                for (UINT32 i = 0u; i < grp.NumBarriers; ++i) {
+                    D3D12_TEXTURE_BARRIER& tb = tex_vec[i];
+                    ID3D12Resource* orig_res = tb.pResource;
+                    ID3D12Resource* host_res = UnwrapResource(orig_res);
+                    if (orig_res && host_res != orig_res) {
+                        ++unwrapped_count;
+                    }
+                    tb.pResource = host_res;
+
+                    if (host_res) {
+                        const D3D12_RESOURCE_STATES before_st =
+                            BarrierLayoutToLegacyState(tb.LayoutBefore, tb.AccessBefore);
+                        const D3D12_RESOURCE_STATES after_st =
+                            BarrierLayoutToLegacyState(tb.LayoutAfter, tb.AccessAfter);
+                        if (track_unified) {
+                            device_x_->NotifyResourceStateTransition(host_res, after_st);
+                            ++unified_notifs;
+                            uint64_t va = 0ull;
+                            if (device_x_->LookupMirroredTitleVaForResource(host_res, va) && va != 0ull) {
+                                ++va_notifs;
+                            }
+                        }
+                        if (IsEnhancedWriteAccess(tb.AccessBefore) || IsEnhancedWriteAccess(tb.AccessAfter) ||
+                            after_st == D3D12_RESOURCE_STATE_COPY_DEST ||
+                            after_st == D3D12_RESOURCE_STATE_UNORDERED_ACCESS ||
+                            after_st == D3D12_RESOURCE_STATE_RENDER_TARGET) {
+                            RecordMirroredResourceGpuWrite(host_res);
+                        }
+                        if (before_st != after_st) {
+                            D3D12_RESOURCE_BARRIER lb{};
+                            lb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                            lb.Transition.pResource = host_res;
+                            lb.Transition.Subresource =
+                                (tb.Subresources.NumMipLevels == 0u)
+                                    ? tb.Subresources.IndexOrFirstMipLevel
+                                    : D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                            lb.Transition.StateBefore = before_st;
+                            lb.Transition.StateAfter = after_st;
+                            legacy_barriers.push_back(lb);
+                        } else if ((tb.AccessBefore & D3D12_BARRIER_ACCESS_UNORDERED_ACCESS) != 0 ||
+                                   (tb.AccessAfter & D3D12_BARRIER_ACCESS_UNORDERED_ACCESS) != 0) {
+                            D3D12_RESOURCE_BARRIER lb{};
+                            lb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                            lb.UAV.pResource = host_res;
+                            legacy_barriers.push_back(lb);
+                        }
+                    }
+                }
+                unwrapped_groups[g].pTextureBarriers = tex_vec.data();
+            }
+        }
+    }
+
+    if (unwrapped_count > 0ull) {
+        eb_resources_unwrapped_.fetch_add(unwrapped_count, std::memory_order_relaxed);
+    }
+    if (va_notifs > 0ull) {
+        eb_va_mirror_notifs_.fetch_add(va_notifs, std::memory_order_relaxed);
+    }
+    if (unified_notifs > 0ull) {
+        eb_unified_tex_notifs_.fetch_add(unified_notifs, std::memory_order_relaxed);
+    }
+
+    std::vector<D3D12_RESOURCE_BARRIER> extra_tiled_barriers;
+    if (!legacy_barriers.empty()) {
+        TrackPlacedTiledResourceBarriers(
+            static_cast<UINT>(legacy_barriers.size()), legacy_barriers.data(), extra_tiled_barriers);
+    }
+
+    if (device_x_ && device_x_->IsVulkanRoutingActive()) {
+        std::lock_guard<std::mutex> lock(vk_rec_mutex_);
+        VulkanRecordedOp op{};
+        op.kind = VulkanRecordedOpKind::Barrier;
+        op.barrier_count = std::max<uint32_t>(1u, total_individual_barriers);
+        vk_batch_.ops.push_back(std::move(op));
+        vk_batch_.has_host_commands = true;
+    }
+
+    if (host_list7_) {
+        host_list7_->Barrier(num_barrier_groups, unwrapped_groups.data());
+        eb_native_calls_.fetch_add(1ull, std::memory_order_relaxed);
+    } else if (host_list_) {
+        // Legacy fallback for Windows 10 22H2 inbox D3D12 without Agility SDK D3D12Core.dll.
+        if (!extra_tiled_barriers.empty()) {
+            host_list_->ResourceBarrier(
+                static_cast<UINT>(extra_tiled_barriers.size()), extra_tiled_barriers.data());
+        }
+        if (!legacy_barriers.empty()) {
+            host_list_->ResourceBarrier(
+                static_cast<UINT>(legacy_barriers.size()), legacy_barriers.data());
+        }
+        eb_legacy_fallbacks_.fetch_add(1ull, std::memory_order_relaxed);
+    }
+    RecordList("ID3D12GraphicsCommandListX::Barrier", 80, S_OK);
+}
+#endif  // __ID3D12GraphicsCommandList7_INTERFACE_DEFINED__
 
 void STDMETHODCALLTYPE CommandListX::ExecuteBundle(ID3D12GraphicsCommandList* pCommandList) {
     host_list_->ExecuteBundle(UnwrapHostGraphicsList(pCommandList));
@@ -2715,6 +3076,34 @@ bool CommandListX::TryBridgePlacedTiledCopyTextureRegion(
         }
 
         // Safe CPU fallback (e.g. COPY command list or minimal host without DXC).
+        // Guard CPU reads from placed/tiled memory with SEH on MSVC and VirtualQuery on non-MSVC (xbox-emulator #153).
+#if !defined(_MSC_VER)
+        auto is_readable_range = [](const void* ptr, uint64_t len) noexcept -> bool {
+            if (!ptr || len == 0ull) return false;
+            const uintptr_t base = reinterpret_cast<uintptr_t>(ptr);
+            if (base > UINTPTR_MAX - static_cast<uintptr_t>(len)) return false;
+            uintptr_t cur = base;
+            const uintptr_t end = base + static_cast<uintptr_t>(len);
+            while (cur < end) {
+                MEMORY_BASIC_INFORMATION mbi{};
+                if (VirtualQuery(reinterpret_cast<LPCVOID>(cur), &mbi, sizeof(mbi)) == 0u) {
+                    return false;
+                }
+                if (mbi.State != MEM_COMMIT) return false;
+                constexpr DWORD kReadMask =
+                    PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                    PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+                if ((mbi.Protect & kReadMask) == 0u || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0u) {
+                    return false;
+                }
+                const uintptr_t region_end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+                if (region_end <= cur) return false;
+                cur = region_end;
+            }
+            return true;
+        };
+#endif
+
         D3D12_HEAP_PROPERTIES src_hp{};
         D3D12_HEAP_FLAGS src_hf = D3D12_HEAP_FLAG_NONE;
         if (FAILED(src_loc.pResource->GetHeapProperties(&src_hp, &src_hf)) ||
@@ -2728,11 +3117,40 @@ bool CommandListX::TryBridgePlacedTiledCopyTextureRegion(
             return false;
         }
 
+        const uint8_t* raw_tiled_ptr = static_cast<const uint8_t*>(src_mapped) + src_loc.PlacedFootprint.Offset;
+        const uint64_t raw_tiled_avail = (src_buf_width > src_loc.PlacedFootprint.Offset)
+                                             ? (src_buf_width - src_loc.PlacedFootprint.Offset)
+                                             : 0ull;
+        std::vector<uint8_t> safe_src_copy;
+        bool safe_read_ok = false;
+        if (raw_tiled_avail > 0ull) {
+            safe_src_copy.resize(static_cast<size_t>(raw_tiled_avail));
+#if defined(_MSC_VER)
+            auto seh_copy = [](void* dst, const void* src, size_t n) noexcept -> bool {
+                __try {
+                    std::memcpy(dst, src, n);
+                    return true;
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    return false;
+                }
+            };
+            safe_read_ok = seh_copy(safe_src_copy.data(), raw_tiled_ptr, static_cast<size_t>(raw_tiled_avail));
+#else
+            if (is_readable_range(raw_tiled_ptr, raw_tiled_avail)) {
+                std::memcpy(safe_src_copy.data(), raw_tiled_ptr, static_cast<size_t>(raw_tiled_avail));
+                safe_read_ok = true;
+            }
+#endif
+        }
+        D3D12_RANGE wn{0u, 0u};
+        src_loc.pResource->Unmap(0u, &wn);
+        if (!safe_read_ok) {
+            return false;
+        }
+
         std::vector<uint8_t> gathered_cpu;
-        const uint8_t* tiled_ptr = static_cast<const uint8_t*>(src_mapped) + src_loc.PlacedFootprint.Offset;
-        uint64_t tiled_avail = (src_buf_width > src_loc.PlacedFootprint.Offset)
-                                   ? (src_buf_width - src_loc.PlacedFootprint.Offset)
-                                   : 0ull;
+        const uint8_t* tiled_ptr = safe_src_copy.data();
+        uint64_t tiled_avail = static_cast<uint64_t>(safe_src_copy.size());
         if (dst_snap.has_custom_tile_mapping) {
             std::vector<openscarlett::XgPlacedTilePoolEntry> entries;
             entries.reserve(static_cast<size_t>(sp.tiles_x) * sp.tiles_y);
@@ -2780,8 +3198,6 @@ bool CommandListX::TryBridgePlacedTiledCopyTextureRegion(
                 lin_up->Unmap(0u, &wf);
             }
         }
-        D3D12_RANGE wn{0u, 0u};
-        src_loc.pResource->Unmap(0u, &wn);
 
         if (!ok || !lin_up) {
             if (lin_up) lin_up->Release();

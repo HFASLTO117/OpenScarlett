@@ -204,6 +204,12 @@ ResourceXProxy::ResourceXProxy(
     if (device_x_) device_x_->AddRef();
     if (host_res_) {
         host_res_->AddRef();
+#ifdef __ID3D12Resource1_INTERFACE_DEFINED__
+        host_res_->QueryInterface(OS_D3D12_IID(ID3D12Resource1), reinterpret_cast<void**>(&host_res1_));
+#endif
+#ifdef __ID3D12Resource2_INTERFACE_DEFINED__
+        host_res_->QueryInterface(OS_D3D12_IID(ID3D12Resource2), reinterpret_cast<void**>(&host_res2_));
+#endif
         cached_desc_ = host_res_->GetDesc();
         if (cached_desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER && xbox_gpu_va_ == 0ull) {
             xbox_gpu_va_ = host_res_->GetGPUVirtualAddress();
@@ -230,6 +236,12 @@ ResourceXProxy::~ResourceXProxy() {
     if (device_x_ && host_res_) {
         device_x_->NotifyResourceDestroyed(host_res_);
     }
+#ifdef __ID3D12Resource2_INTERFACE_DEFINED__
+    if (host_res2_) host_res2_->Release();
+#endif
+#ifdef __ID3D12Resource1_INTERFACE_DEFINED__
+    if (host_res1_) host_res1_->Release();
+#endif
     if (host_res_) host_res_->Release();
     if (device_x_) device_x_->Release();
 }
@@ -248,12 +260,27 @@ HRESULT STDMETHODCALLTYPE ResourceXProxy::QueryInterface(REFIID riid, void** ppv
         AddRef();
         return S_OK;
     }
+#ifdef __ID3D12Resource1_INTERFACE_DEFINED__
+    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12Resource1))) {
+        *ppvObject = static_cast<ID3D12Resource1*>(this);
+        AddRef();
+        return S_OK;
+    }
+#endif
+#ifdef __ID3D12Resource2_INTERFACE_DEFINED__
+    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12Resource2))) {
+        *ppvObject = static_cast<ID3D12Resource2*>(this);
+        AddRef();
+        return S_OK;
+    }
+#endif
     if (IsEqualIID(riid, IID_IOpenScarlettProxyInspect)) {
         *ppvObject = static_cast<IOpenScarlettProxyInspect*>(this);
         AddRef();
         return S_OK;
     }
-    return host_res_ ? host_res_->QueryInterface(riid, ppvObject) : E_NOINTERFACE;
+    // Never fall through to raw host_res_->QueryInterface() so wrapped proxies cannot leak raw host pointers.
+    return E_NOINTERFACE;
 }
 
 ULONG STDMETHODCALLTYPE ResourceXProxy::AddRef() {
@@ -348,13 +375,76 @@ HRESULT STDMETHODCALLTYPE ResourceXProxy::GetHeapProperties(
     return S_OK;
 }
 
+#ifdef __ID3D12Resource1_INTERFACE_DEFINED__
+HRESULT STDMETHODCALLTYPE ResourceXProxy::GetProtectedResourceSession(
+    REFIID riid, void** ppProtectedSession) {
+    if (!ppProtectedSession) return E_POINTER;
+    *ppProtectedSession = nullptr;
+    if (host_res1_) {
+        return host_res1_->GetProtectedResourceSession(riid, ppProtectedSession);
+    }
+    return DXGI_ERROR_NOT_FOUND;
+}
+#endif
+
+#ifdef __ID3D12Resource2_INTERFACE_DEFINED__
+namespace {
+D3D12_RESOURCE_DESC1 ConvertResourceDescToDesc1(const D3D12_RESOURCE_DESC& d) noexcept {
+    D3D12_RESOURCE_DESC1 d1{};
+    d1.Dimension = d.Dimension;
+    d1.Alignment = d.Alignment;
+    d1.Width = d.Width;
+    d1.Height = d.Height;
+    d1.DepthOrArraySize = d.DepthOrArraySize;
+    d1.MipLevels = d.MipLevels;
+    d1.Format = d.Format;
+    d1.SampleDesc = d.SampleDesc;
+    d1.Layout = d.Layout;
+    d1.Flags = d.Flags;
+    d1.SamplerFeedbackMipRegion = D3D12_MIP_REGION{0u, 0u, 0u};
+    return d1;
+}
+}  // namespace
+
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+D3D12_RESOURCE_DESC1* STDMETHODCALLTYPE ResourceXProxy::GetDesc1(D3D12_RESOURCE_DESC1* pRet) {
+    if (!pRet) return nullptr;
+    if (host_res2_) {
+        host_res2_->GetDesc1(pRet);
+    } else {
+        D3D12_RESOURCE_DESC base{};
+        if (host_res_) {
+            host_res_->GetDesc(&base);
+        } else {
+            base = cached_desc_;
+        }
+        *pRet = ConvertResourceDescToDesc1(base);
+    }
+    return pRet;
+}
+#else
+D3D12_RESOURCE_DESC1 STDMETHODCALLTYPE ResourceXProxy::GetDesc1() {
+    if (host_res2_) {
+        return host_res2_->GetDesc1();
+    }
+    const D3D12_RESOURCE_DESC base = host_res_ ? host_res_->GetDesc() : cached_desc_;
+    return ConvertResourceDescToDesc1(base);
+}
+#endif
+#endif
+
 // ---------------------------------------------------------------------------
 // 2. HeapXProxy
 // ---------------------------------------------------------------------------
 HeapXProxy::HeapXProxy(DeviceX* parent_device, ID3D12Heap* host_heap, uint64_t xbox_va_hint)
     : device_x_(parent_device), host_heap_(host_heap), xbox_va_(xbox_va_hint) {
     if (device_x_) device_x_->AddRef();
-    if (host_heap_) host_heap_->AddRef();
+    if (host_heap_) {
+        host_heap_->AddRef();
+#ifdef __ID3D12Heap1_INTERFACE_DEFINED__
+        host_heap_->QueryInterface(OS_D3D12_IID(ID3D12Heap1), reinterpret_cast<void**>(&host_heap1_));
+#endif
+    }
     RegisterProxy(static_cast<const ID3D12Heap*>(this), D3D12XProxyKind::Heap, host_heap_);
 }
 
@@ -363,6 +453,9 @@ HeapXProxy::~HeapXProxy() {
     if (device_x_ && host_heap_) {
         device_x_->NotifyHeapDestroyed(host_heap_);
     }
+#ifdef __ID3D12Heap1_INTERFACE_DEFINED__
+    if (host_heap1_) host_heap1_->Release();
+#endif
     if (host_heap_) host_heap_->Release();
     if (device_x_) device_x_->Release();
 }
@@ -380,12 +473,20 @@ HRESULT STDMETHODCALLTYPE HeapXProxy::QueryInterface(REFIID riid, void** ppvObje
         AddRef();
         return S_OK;
     }
+#ifdef __ID3D12Heap1_INTERFACE_DEFINED__
+    if (IsEqualIID(riid, OS_D3D12_IID(ID3D12Heap1))) {
+        *ppvObject = static_cast<ID3D12Heap1*>(this);
+        AddRef();
+        return S_OK;
+    }
+#endif
     if (IsEqualIID(riid, IID_IOpenScarlettProxyInspect)) {
         *ppvObject = static_cast<IOpenScarlettProxyInspect*>(this);
         AddRef();
         return S_OK;
     }
-    return host_heap_ ? host_heap_->QueryInterface(riid, ppvObject) : E_NOINTERFACE;
+    // Never fall through to raw host_heap_->QueryInterface() so wrapped proxies cannot leak raw host pointers.
+    return E_NOINTERFACE;
 }
 
 ULONG STDMETHODCALLTYPE HeapXProxy::AddRef() {
@@ -435,6 +536,18 @@ D3D12_HEAP_DESC STDMETHODCALLTYPE HeapXProxy::GetDesc() {
 }
 #endif
 
+#ifdef __ID3D12Heap1_INTERFACE_DEFINED__
+HRESULT STDMETHODCALLTYPE HeapXProxy::GetProtectedResourceSession(
+    REFIID riid, void** ppProtectedSession) {
+    if (!ppProtectedSession) return E_POINTER;
+    *ppProtectedSession = nullptr;
+    if (host_heap1_) {
+        return host_heap1_->GetProtectedResourceSession(riid, ppProtectedSession);
+    }
+    return DXGI_ERROR_NOT_FOUND;
+}
+#endif
+
 // ---------------------------------------------------------------------------
 // 3. DescriptorHeapXProxy
 // ---------------------------------------------------------------------------
@@ -456,6 +569,9 @@ DescriptorHeapXProxy::DescriptorHeapXProxy(DeviceX* parent_device, ID3D12Descrip
 
 DescriptorHeapXProxy::~DescriptorHeapXProxy() {
     UnregisterProxy(static_cast<const ID3D12DescriptorHeap*>(this));
+    if (device_x_ && host_heap_) {
+        device_x_->NotifyDescriptorHeapDestroyed(host_heap_);
+    }
     if (host_heap_) host_heap_->Release();
     if (device_x_) device_x_->Release();
 }

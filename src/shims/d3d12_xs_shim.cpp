@@ -7,12 +7,22 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
+#include <mutex>
 #include <new>
+#include <string>
 
 #include "gpu/d3d12_xs/command_list_x.h"
 #include "gpu/d3d12_xs/device_x.h"
 #include "openscarlett/core/telemetry.h"
 #include "openscarlett/gpu/d3d12_adapter.h"
+
+// DirectX 12 Agility SDK magic exports (public Microsoft D3D12 Agility SDK specification).
+// Exported from d3d12_xs.dll so titles / D3D12 loader detect Agility SDK version & path.
+extern "C" {
+__declspec(dllexport) extern const UINT D3D12SDKVersion = 614u;
+__declspec(dllexport) extern const char* D3D12SDKPath = ".\\D3D12\\";
+}
 
 #if defined(_MSC_VER)
 #pragma comment(linker, "/EXPORT:D3D12CreateDevice=OS_D3D12CreateDevice")
@@ -100,6 +110,152 @@ using PfnD3D12CreateVersionedRootSignatureDeserializer = HRESULT(WINAPI*)(
 using PfnD3D12GetDebugInterface = HRESULT(WINAPI*)(REFIID, void**);
 using PfnD3D12EnableExperimentalFeatures = HRESULT(WINAPI*)(
     UINT, const IID*, void*, UINT*);
+using PfnD3D12GetInterface = HRESULT(WINAPI*)(REFCLSID, REFIID, void**);
+
+// Local clean-room definitions of public Microsoft Agility SDK CLSID/IID/COM interface so
+// MSVC, Clang-CL, AND MinGW-w64 compile cleanly regardless of installed SDK header version.
+constexpr GUID kClsidD3D12SDKConfiguration = {
+    0x7cda6acau, 0xa03eu, 0x49c8u, {0x94u, 0x58u, 0x03u, 0x34u, 0xd2u, 0x0eu, 0x07u, 0xceu}};
+constexpr GUID kIidID3D12SDKConfiguration = {
+    0xe9eb5314u, 0x33aau, 0x42b2u, {0xa7u, 0x18u, 0xd7u, 0x7fu, 0x58u, 0xb1u, 0xf1u, 0xc7u}};
+
+struct OS_ID3D12SDKConfiguration : public IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE SetSDKVersion(UINT SDKVersion, LPCSTR SDKPath) = 0;
+};
+
+struct AgilitySdkRuntimeState {
+    std::once_flag init_once;
+    std::atomic<bool> configured{false};
+    std::atomic<bool> core_dll_found{false};
+    std::atomic<bool> using_inbox_fallback{true};
+    std::atomic<uint32_t> sdk_version{614u};
+    std::atomic<HRESULT> last_hr{S_FALSE};
+    std::mutex path_mutex;
+    std::string discovered_dir;
+};
+
+AgilitySdkRuntimeState& GetAgilityState() {
+    static AgilitySdkRuntimeState st;
+    return st;
+}
+
+std::string GetModuleDirectoryA(HMODULE mod) {
+    char buf[MAX_PATH * 2]{};
+    const DWORD n = GetModuleFileNameA(mod, buf, static_cast<DWORD>(sizeof(buf) - 1u));
+    if (n == 0u || n >= sizeof(buf) - 1u) return {};
+    std::error_code ec;
+    const auto p = std::filesystem::path(buf).parent_path();
+    return ec ? std::string() : p.string();
+}
+
+void TryConfigureAgilitySdkOnce() noexcept {
+    auto& st = GetAgilityState();
+    std::call_once(st.init_once, [&st]() {
+        uint32_t desired_ver = D3D12SDKVersion;
+        {
+            char ver_buf[32]{};
+            const DWORD vlen = GetEnvironmentVariableA(
+                "OPENSCARLETT_AGILITY_SDK_VERSION", ver_buf, static_cast<DWORD>(sizeof(ver_buf)));
+            if (vlen > 0u && vlen < sizeof(ver_buf)) {
+                char* end = nullptr;
+                const unsigned long parsed = std::strtoul(ver_buf, &end, 10);
+                if (end && end != ver_buf && parsed > 0ul) {
+                    desired_ver = static_cast<uint32_t>(parsed);
+                }
+            }
+        }
+        st.sdk_version.store(desired_ver, std::memory_order_release);
+
+        // Build ordered opt-in candidate directories for D3D12Core.dll.
+        std::vector<std::string> candidates;
+        {
+            char env_dir[MAX_PATH * 2]{};
+            const DWORD elen = GetEnvironmentVariableA(
+                "OPENSCARLETT_AGILITY_SDK_DIR", env_dir, static_cast<DWORD>(sizeof(env_dir)));
+            if (elen > 0u && elen < sizeof(env_dir)) {
+                candidates.emplace_back(env_dir, elen);
+            }
+        }
+
+        HMODULE self_mod = nullptr;
+        if (GetModuleHandleExA(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCSTR>(&TryConfigureAgilitySdkOnce),
+                &self_mod) != FALSE && self_mod != nullptr) {
+            const std::string dll_dir = GetModuleDirectoryA(self_mod);
+            if (!dll_dir.empty()) {
+                candidates.push_back(dll_dir + "\\D3D12");
+            }
+        }
+
+        const std::string exe_dir = GetModuleDirectoryA(nullptr);
+        if (!exe_dir.empty()) {
+            candidates.push_back(exe_dir + "\\D3D12");
+        }
+        candidates.emplace_back(".\\D3D12");
+
+        std::string found_dir;
+        for (const auto& dir : candidates) {
+            if (dir.empty()) continue;
+            std::error_code ec;
+            const auto core_path = std::filesystem::path(dir) / "D3D12Core.dll";
+            if (std::filesystem::exists(core_path, ec) && !ec) {
+                found_dir = dir;
+                break;
+            }
+        }
+
+        if (found_dir.empty()) {
+            // Graceful fallback to inbox d3d12.dll when D3D12Core.dll is absent.
+            st.core_dll_found.store(false, std::memory_order_release);
+            st.configured.store(false, std::memory_order_release);
+            st.using_inbox_fallback.store(true, std::memory_order_release);
+            st.last_hr.store(S_FALSE, std::memory_order_release);
+            return;
+        }
+
+        st.core_dll_found.store(true, std::memory_order_release);
+        {
+            std::lock_guard<std::mutex> lk(st.path_mutex);
+            st.discovered_dir = found_dir;
+        }
+
+        auto get_iface = reinterpret_cast<PfnD3D12GetInterface>(
+            openscarlett::ResolveHostD3D12Proc("D3D12GetInterface"));
+        if (!get_iface) {
+            st.using_inbox_fallback.store(true, std::memory_order_release);
+            st.last_hr.store(E_NOINTERFACE, std::memory_order_release);
+            return;
+        }
+
+        OS_ID3D12SDKConfiguration* sdk_cfg = nullptr;
+        HRESULT hr = get_iface(
+            kClsidD3D12SDKConfiguration,
+            kIidID3D12SDKConfiguration,
+            reinterpret_cast<void**>(&sdk_cfg));
+        if (SUCCEEDED(hr) && sdk_cfg) {
+            std::string sdk_path = found_dir;
+            if (!sdk_path.empty() && sdk_path.back() != '\\' && sdk_path.back() != '/') {
+                sdk_path.push_back('\\');
+            }
+            hr = sdk_cfg->SetSDKVersion(desired_ver, sdk_path.c_str());
+            if (FAILED(hr)) {
+                // Retry with canonical relative path ".\\D3D12\\" if absolute path wasn't accepted.
+                hr = sdk_cfg->SetSDKVersion(desired_ver, D3D12SDKPath);
+            }
+            sdk_cfg->Release();
+        }
+
+        st.last_hr.store(hr, std::memory_order_release);
+        if (SUCCEEDED(hr)) {
+            st.configured.store(true, std::memory_order_release);
+            st.using_inbox_fallback.store(false, std::memory_order_release);
+        } else {
+            st.configured.store(false, std::memory_order_release);
+            st.using_inbox_fallback.store(true, std::memory_order_release);
+        }
+    });
+}
 
 bool EnvPrefersWarp() noexcept {
     char buf[32]{};
@@ -117,6 +273,9 @@ HRESULT CreateWrappedDeviceInternal(
     HWND default_hwnd,
     REFIID riid,
     void** ppDevice) {
+    // Opt-in D3D12 Agility SDK discovery (graceful fallback to inbox d3d12.dll when absent).
+    TryConfigureAgilitySdkOnce();
+
     auto host_create = reinterpret_cast<PfnD3D12CreateDevice>(
         openscarlett::ResolveHostD3D12Proc("D3D12CreateDevice"));
     if (!host_create) {
@@ -167,6 +326,34 @@ HRESULT CreateWrappedDeviceInternal(
 }
 
 }  // namespace
+
+namespace openscarlett::d3d12_xs {
+
+void QueryAgilitySdkRuntimeSnapshot(D3D12XBOX_AGILITY_SDK_INFO* out_info) noexcept {
+    if (!out_info) return;
+    std::memset(out_info, 0, sizeof(*out_info));
+    TryConfigureAgilitySdkOnce();
+    auto& st = GetAgilityState();
+    out_info->exported_sdk_version = D3D12SDKVersion;
+    out_info->configured_sdk_version = st.sdk_version.load(std::memory_order_acquire);
+    out_info->core_dll_found = st.core_dll_found.load(std::memory_order_acquire) ? 1u : 0u;
+    out_info->agility_active = st.configured.load(std::memory_order_acquire) ? 1u : 0u;
+    out_info->using_inbox_fallback = st.using_inbox_fallback.load(std::memory_order_acquire) ? 1u : 0u;
+    out_info->last_config_hr = st.last_hr.load(std::memory_order_acquire);
+    if (D3D12SDKPath) {
+        const size_t plen = std::min<size_t>(std::strlen(D3D12SDKPath), sizeof(out_info->exported_sdk_path) - 1u);
+        std::memcpy(out_info->exported_sdk_path, D3D12SDKPath, plen);
+        out_info->exported_sdk_path[plen] = '\0';
+    }
+    std::lock_guard<std::mutex> lk(st.path_mutex);
+    if (!st.discovered_dir.empty()) {
+        const size_t dlen = std::min<size_t>(st.discovered_dir.size(), sizeof(out_info->discovered_core_dir) - 1u);
+        std::memcpy(out_info->discovered_core_dir, st.discovered_dir.data(), dlen);
+        out_info->discovered_core_dir[dlen] = '\0';
+    }
+}
+
+}  // namespace openscarlett::d3d12_xs
 
 extern "C" {
 

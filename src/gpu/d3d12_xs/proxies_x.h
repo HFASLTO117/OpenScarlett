@@ -95,10 +95,24 @@ struct IOpenScarlettCommandListExtState : public IUnknown {
 };
 
 // ---------------------------------------------------------------------------
-// 1. ResourceXProxy (ID3D12Resource / ID3D12ResourceX)
+// 1. ResourceXProxy (ID3D12Resource / ID3D12Resource1 / ID3D12Resource2 / ID3D12ResourceX)
 // ---------------------------------------------------------------------------
+#if defined(__ID3D12Resource2_INTERFACE_DEFINED__)
+using ResourceXProxyBase = ID3D12Resource2;
+#elif defined(__ID3D12Resource1_INTERFACE_DEFINED__)
+using ResourceXProxyBase = ID3D12Resource1;
+#else
+using ResourceXProxyBase = ID3D12Resource;
+#endif
+
+#if defined(__ID3D12Heap1_INTERFACE_DEFINED__)
+using HeapXProxyBase = ID3D12Heap1;
+#else
+using HeapXProxyBase = ID3D12Heap;
+#endif
+
 class ResourceXProxy final
-    : public ID3D12Resource,
+    : public ResourceXProxyBase,
       public IOpenScarlettProxyInspect {
 public:
     ResourceXProxy(
@@ -152,6 +166,22 @@ public:
     HRESULT STDMETHODCALLTYPE GetHeapProperties(
         D3D12_HEAP_PROPERTIES* pHeapProperties, D3D12_HEAP_FLAGS* pHeapFlags) override;
 
+#ifdef __ID3D12Resource1_INTERFACE_DEFINED__
+    // ID3D12Resource1 (slot 15)
+    HRESULT STDMETHODCALLTYPE GetProtectedResourceSession(
+        REFIID riid, void** ppProtectedSession) override;
+#endif
+
+#ifdef __ID3D12Resource2_INTERFACE_DEFINED__
+    // ID3D12Resource2 (slot 16)
+#ifdef WIDL_EXPLICIT_AGGREGATE_RETURNS
+    using ID3D12Resource2::GetDesc1;
+    D3D12_RESOURCE_DESC1* STDMETHODCALLTYPE GetDesc1(D3D12_RESOURCE_DESC1* pRet) override;
+#else
+    D3D12_RESOURCE_DESC1 STDMETHODCALLTYPE GetDesc1() override;
+#endif
+#endif
+
     // IOpenScarlettProxyInspect
     D3D12XProxyKind STDMETHODCALLTYPE GetProxyKind() const noexcept override {
         return D3D12XProxyKind::Resource;
@@ -167,6 +197,12 @@ private:
     std::atomic<ULONG> ref_count_{1u};
     DeviceX* device_x_ = nullptr;
     ID3D12Resource* host_res_ = nullptr;
+#ifdef __ID3D12Resource1_INTERFACE_DEFINED__
+    ID3D12Resource1* host_res1_ = nullptr;
+#endif
+#ifdef __ID3D12Resource2_INTERFACE_DEFINED__
+    ID3D12Resource2* host_res2_ = nullptr;
+#endif
     D3D12_RESOURCE_DESC cached_desc_{};
     D3D12_HEAP_PROPERTIES cached_heap_props_{};
     D3D12_HEAP_FLAGS cached_heap_flags_ = D3D12_HEAP_FLAG_NONE;
@@ -175,10 +211,10 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// 2. HeapXProxy (ID3D12Heap / ID3D12HeapX)
+// 2. HeapXProxy (ID3D12Heap / ID3D12Heap1 / ID3D12HeapX)
 // ---------------------------------------------------------------------------
 class HeapXProxy final
-    : public ID3D12Heap,
+    : public HeapXProxyBase,
       public IOpenScarlettProxyInspect {
 public:
     HeapXProxy(
@@ -209,6 +245,12 @@ public:
     D3D12_HEAP_DESC STDMETHODCALLTYPE GetDesc() override;
 #endif
 
+#ifdef __ID3D12Heap1_INTERFACE_DEFINED__
+    // ID3D12Heap1 (slot 9)
+    HRESULT STDMETHODCALLTYPE GetProtectedResourceSession(
+        REFIID riid, void** ppProtectedSession) override;
+#endif
+
     D3D12XProxyKind STDMETHODCALLTYPE GetProxyKind() const noexcept override {
         return D3D12XProxyKind::Heap;
     }
@@ -223,6 +265,9 @@ private:
     std::atomic<ULONG> ref_count_{1u};
     DeviceX* device_x_ = nullptr;
     ID3D12Heap* host_heap_ = nullptr;
+#ifdef __ID3D12Heap1_INTERFACE_DEFINED__
+    ID3D12Heap1* host_heap1_ = nullptr;
+#endif
     uint64_t xbox_va_ = 0ull;
 };
 

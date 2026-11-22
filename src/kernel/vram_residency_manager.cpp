@@ -11,6 +11,7 @@
 
 #if defined(_WIN32)
 #include <d3d12.h>
+#include <dxgi1_4.h>
 #include <windows.h>
 
 #if defined(_MSC_VER)
@@ -966,6 +967,268 @@ VramResidencyStats VramResidencyManager::GetStats() const {
     s.is_warp = impl_->is_warp;
     s.adapter_name = impl_->adapter_name;
     return s;
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 14: Live DeviceX VRAM Residency, DXGI Adapter3 Budget Query,
+// Series S / Series X Auto-Profile Selection, & Sparse VRAM Window-0 Isolation
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr uint64_t kGiB = 1024ull * 1024ull * 1024ull;
+constexpr uint64_t kSeriesSProfileThresholdBytes = 12ull * kGiB;
+constexpr uint64_t kSeriesSBudgetBytes = 8ull * kGiB;                          // Lockhart 8 GiB
+constexpr uint64_t kSeriesXBudgetBytes = 13ull * kGiB + (512ull * 1024ull * 1024ull);  // Anaconda 13.5 GiB
+
+bool EqualsIgnoreCaseAscii(const char* a, const char* b) noexcept {
+    if (!a || !b) return false;
+    while (*a && *b) {
+        char ca = *a++;
+        char cb = *b++;
+        if (ca >= 'A' && ca <= 'Z') ca = static_cast<char>(ca + ('a' - 'A'));
+        if (cb >= 'A' && cb <= 'Z') cb = static_cast<char>(cb + ('a' - 'A'));
+        if (ca != cb) return false;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
+}  // namespace
+
+struct XboxConsoleProfileSelection {
+    uint32_t profile_id = 0u;  // 0 = Series S (Lockhart 8 GiB), 1 = Series X (Anaconda 13.5 GiB)
+    uint64_t target_console_vram_bytes = kSeriesSBudgetBytes;
+    uint64_t host_dedicated_vram_bytes = 0ull;
+    bool overridden_by_env = false;
+};
+
+XboxConsoleProfileSelection SelectXboxConsoleMemoryProfileFromHostVram(
+    uint64_t host_dedicated_vram_bytes,
+    const char* explicit_override_or_null) noexcept {
+    XboxConsoleProfileSelection sel{};
+    sel.host_dedicated_vram_bytes = host_dedicated_vram_bytes;
+
+    const char* ov = explicit_override_or_null;
+#if defined(_WIN32)
+    char env_buf[64]{};
+    if (!ov || ov[0] == '\0') {
+        const DWORD len = GetEnvironmentVariableA(
+            "OPENSCARLETT_CONSOLE_PROFILE", env_buf, static_cast<DWORD>(sizeof(env_buf)));
+        if (len > 0u && len < sizeof(env_buf)) {
+            ov = env_buf;
+        }
+    }
+#endif
+
+    if (ov && ov[0] != '\0') {
+        if (EqualsIgnoreCaseAscii(ov, "series_s") ||
+            EqualsIgnoreCaseAscii(ov, "lockhart") ||
+            EqualsIgnoreCaseAscii(ov, "8gb") ||
+            EqualsIgnoreCaseAscii(ov, "s")) {
+            sel.profile_id = 0u;
+            sel.target_console_vram_bytes = kSeriesSBudgetBytes;
+            sel.overridden_by_env = true;
+            return sel;
+        }
+        if (EqualsIgnoreCaseAscii(ov, "series_x") ||
+            EqualsIgnoreCaseAscii(ov, "anaconda") ||
+            EqualsIgnoreCaseAscii(ov, "13.5gb") ||
+            EqualsIgnoreCaseAscii(ov, "x")) {
+            sel.profile_id = 1u;
+            sel.target_console_vram_bytes = kSeriesXBudgetBytes;
+            sel.overridden_by_env = true;
+            return sel;
+        }
+    }
+
+    // Auto-select Series S (Lockhart 8 GiB) on PCs with < 12 GiB dedicated VRAM;
+    // select Series X (Anaconda 13.5 GiB) on PCs with >= 12 GiB dedicated VRAM.
+    if (host_dedicated_vram_bytes < kSeriesSProfileThresholdBytes) {
+        sel.profile_id = 0u;
+        sel.target_console_vram_bytes = kSeriesSBudgetBytes;
+    } else {
+        sel.profile_id = 1u;
+        sel.target_console_vram_bytes = kSeriesXBudgetBytes;
+    }
+    return sel;
+}
+
+#if defined(_WIN32)
+struct HostAdapterVideoMemoryInfo {
+    bool queried_dxgi_adapter3 = false;
+    uint64_t local_budget_bytes = 0ull;
+    uint64_t local_current_usage_bytes = 0ull;
+    uint64_t local_available_reservation_bytes = 0ull;
+    uint64_t non_local_budget_bytes = 0ull;
+    uint64_t non_local_current_usage_bytes = 0ull;
+};
+
+bool QueryHostAdapterVideoMemoryInfo(
+    ID3D12Device* host_device,
+    HostAdapterVideoMemoryInfo& out_info) noexcept {
+    out_info = HostAdapterVideoMemoryInfo{};
+    if (!host_device) return false;
+
+    const LUID luid = host_device->GetAdapterLuid();
+    IDXGIFactory4* factory4 = nullptr;
+    if (FAILED(CreateDXGIFactory1(OS_UUIDOF(IDXGIFactory4), reinterpret_cast<void**>(&factory4))) ||
+        !factory4) {
+        return false;
+    }
+
+    IDXGIAdapter3* adapter3 = nullptr;
+    HRESULT hr = factory4->EnumAdapterByLuid(
+        luid, OS_UUIDOF(IDXGIAdapter3), reinterpret_cast<void**>(&adapter3));
+    factory4->Release();
+    if (FAILED(hr) || !adapter3) {
+        return false;
+    }
+
+    DXGI_QUERY_VIDEO_MEMORY_INFO local_mem{};
+    DXGI_QUERY_VIDEO_MEMORY_INFO nonlocal_mem{};
+    const HRESULT local_hr = adapter3->QueryVideoMemoryInfo(
+        0u, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local_mem);
+    const HRESULT nonlocal_hr = adapter3->QueryVideoMemoryInfo(
+        0u, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &nonlocal_mem);
+    adapter3->Release();
+
+    if (SUCCEEDED(local_hr)) {
+        out_info.queried_dxgi_adapter3 = true;
+        out_info.local_budget_bytes = local_mem.Budget;
+        out_info.local_current_usage_bytes = local_mem.CurrentUsage;
+        out_info.local_available_reservation_bytes = local_mem.AvailableForReservation;
+    }
+    if (SUCCEEDED(nonlocal_hr)) {
+        out_info.queried_dxgi_adapter3 = true;
+        out_info.non_local_budget_bytes = nonlocal_mem.Budget;
+        out_info.non_local_current_usage_bytes = nonlocal_mem.CurrentUsage;
+    }
+    return out_info.queried_dxgi_adapter3;
+}
+#endif
+
+// Sparse VRAM Window Isolator (xcl #40 / acbbc55):
+// Strictly separates Descriptor Heap Window 0 [0x1_0000_0000, 0x2_0000_0000)
+// from Title Buffer / Resource Window 1+ [0x2_0000_0000, 0x80_0000_0000).
+class SparseVramWindowIsolator {
+public:
+    static constexpr uint64_t kDescriptorWindow0Base = 0x0000000100000000ull;
+    static constexpr uint64_t kDescriptorWindow0Limit = 0x0000000200000000ull;
+    static constexpr uint64_t kTitleBufferWindow1Base = 0x0000000200000000ull;
+    static constexpr uint64_t kTitleBufferWindow1Limit = 0x0000008000000000ull;
+
+    uint64_t AllocateDescriptorWindow0(uint64_t size_bytes, uint64_t alignment = 65536ull) noexcept {
+        std::lock_guard<std::mutex> lk(mutex_);
+        const uint64_t eff_align = std::max<uint64_t>(alignment, 65536ull);
+        const uint64_t eff_size = AlignUpBytes(std::max<uint64_t>(size_bytes, 65536ull), eff_align);
+        const uint64_t addr = AlignUpBytes(window0_cursor_, eff_align);
+        if (addr < kDescriptorWindow0Base || addr > kDescriptorWindow0Limit ||
+            eff_size > (kDescriptorWindow0Limit - addr)) {
+            return 0ull;
+        }
+        window0_cursor_ = addr + eff_size;
+        allocations_[addr] = Allocation{eff_size, true};
+        ++window0_alloc_count_;
+        window0_bytes_used_ += eff_size;
+        return addr;
+    }
+
+    uint64_t AllocateTitleBufferWindow(uint64_t size_bytes, uint64_t alignment = 65536ull) noexcept {
+        std::lock_guard<std::mutex> lk(mutex_);
+        const uint64_t eff_align = std::max<uint64_t>(alignment, 65536ull);
+        const uint64_t eff_size = AlignUpBytes(std::max<uint64_t>(size_bytes, 65536ull), eff_align);
+        const uint64_t addr = AlignUpBytes(window1_cursor_, eff_align);
+        if (addr < kTitleBufferWindow1Base || addr > kTitleBufferWindow1Limit ||
+            eff_size > (kTitleBufferWindow1Limit - addr)) {
+            return 0ull;
+        }
+        window1_cursor_ = addr + eff_size;
+        allocations_[addr] = Allocation{eff_size, false};
+        ++window1_alloc_count_;
+        window1_bytes_used_ += eff_size;
+        return addr;
+    }
+
+    void Free(uint64_t va) noexcept {
+        if (va == 0ull) return;
+        std::lock_guard<std::mutex> lk(mutex_);
+        auto it = allocations_.find(va);
+        if (it == allocations_.end()) return;
+        if (it->second.is_window0) {
+            if (window0_bytes_used_ >= it->second.size) window0_bytes_used_ -= it->second.size;
+            else window0_bytes_used_ = 0ull;
+        } else {
+            if (window1_bytes_used_ >= it->second.size) window1_bytes_used_ -= it->second.size;
+            else window1_bytes_used_ = 0ull;
+        }
+        allocations_.erase(it);
+    }
+
+    static bool IsInDescriptorWindow0(uint64_t va) noexcept {
+        return va >= kDescriptorWindow0Base && va < kDescriptorWindow0Limit;
+    }
+    static bool IsInTitleBufferWindow(uint64_t va) noexcept {
+        return va >= kTitleBufferWindow1Base && va < kTitleBufferWindow1Limit;
+    }
+
+    void GetStats(
+        uint64_t& out_w0_allocs,
+        uint64_t& out_w0_bytes,
+        uint64_t& out_w1_allocs,
+        uint64_t& out_w1_bytes) const noexcept {
+        std::lock_guard<std::mutex> lk(mutex_);
+        out_w0_allocs = window0_alloc_count_;
+        out_w0_bytes = window0_bytes_used_;
+        out_w1_allocs = window1_alloc_count_;
+        out_w1_bytes = window1_bytes_used_;
+    }
+
+private:
+    struct Allocation {
+        uint64_t size = 0ull;
+        bool is_window0 = false;
+    };
+    mutable std::mutex mutex_;
+    uint64_t window0_cursor_ = kDescriptorWindow0Base;
+    uint64_t window1_cursor_ = kTitleBufferWindow1Base;
+    uint64_t window0_alloc_count_ = 0ull;
+    uint64_t window0_bytes_used_ = 0ull;
+    uint64_t window1_alloc_count_ = 0ull;
+    uint64_t window1_bytes_used_ = 0ull;
+    std::unordered_map<uint64_t, Allocation> allocations_;
+};
+
+// Exported C++ factory/helpers used by DeviceX (compiled in openscarlett_core).
+uint64_t SparseVramAllocateWindow0(SparseVramWindowIsolator* iso, uint64_t size_bytes) noexcept {
+    return iso ? iso->AllocateDescriptorWindow0(size_bytes) : 0ull;
+}
+
+uint64_t SparseVramAllocateTitleWindow(SparseVramWindowIsolator* iso, uint64_t size_bytes) noexcept {
+    return iso ? iso->AllocateTitleBufferWindow(size_bytes) : 0ull;
+}
+
+void SparseVramFree(SparseVramWindowIsolator* iso, uint64_t va) noexcept {
+    if (iso) iso->Free(va);
+}
+
+void SparseVramGetStats(
+    const SparseVramWindowIsolator* iso,
+    uint64_t& out_w0_allocs,
+    uint64_t& out_w0_bytes,
+    uint64_t& out_w1_allocs,
+    uint64_t& out_w1_bytes) noexcept {
+    if (!iso) {
+        out_w0_allocs = out_w0_bytes = out_w1_allocs = out_w1_bytes = 0ull;
+        return;
+    }
+    iso->GetStats(out_w0_allocs, out_w0_bytes, out_w1_allocs, out_w1_bytes);
+}
+
+SparseVramWindowIsolator* CreateSparseVramWindowIsolator() {
+    return new SparseVramWindowIsolator();
+}
+
+void DestroySparseVramWindowIsolator(SparseVramWindowIsolator* iso) noexcept {
+    delete iso;
 }
 
 }  // namespace openscarlett
