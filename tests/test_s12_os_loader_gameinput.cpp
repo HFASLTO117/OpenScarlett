@@ -862,6 +862,38 @@ void TestGameInputS12() {
         OS_REQUIRE(snap2[0].ok_calls == 25ull);
     }
 
+    using PfnIsCursorLocked = bool(OPENSCARLETT_GAMEINPUT_CALL*)(IGameInput*);
+    using PfnSetCursorLocked = void(OPENSCARLETT_GAMEINPUT_CALL*)(IGameInput*, bool);
+    using PfnIsAnyCursorLocked = bool(OPENSCARLETT_GAMEINPUT_CALL*)();
+    auto is_locked = reinterpret_cast<PfnIsCursorLocked>(
+        reinterpret_cast<void*>(::GetProcAddress(gi_mod, "OpenScarlettGameInputIsCursorLocked")));
+    auto set_locked = reinterpret_cast<PfnSetCursorLocked>(
+        reinterpret_cast<void*>(::GetProcAddress(gi_mod, "OpenScarlettGameInputSetCursorLocked")));
+    auto any_locked = reinterpret_cast<PfnIsAnyCursorLocked>(
+        reinterpret_cast<void*>(::GetProcAddress(gi_mod, "OpenScarlettGameInputIsAnyCursorLocked")));
+    OS_REQUIRE(is_locked != nullptr && set_locked != nullptr && any_locked != nullptr);
+    OS_REQUIRE(!is_locked(gi));
+    OS_REQUIRE(!any_locked());
+    set_locked(gi, true);
+    OS_REQUIRE(is_locked(gi));
+    OS_REQUIRE(any_locked());
+    set_locked(gi, false);
+    OS_REQUIRE(!is_locked(gi));
+    OS_REQUIRE(!any_locked());
+
+    // Verify OPENSCARLETT_CURSOR_LOCK=1 initializes locked & releasing decrements global lock count
+    char prev_lock_env[32]{};
+    const DWORD prev_lock_len = ::GetEnvironmentVariableA(
+        "OPENSCARLETT_CURSOR_LOCK", prev_lock_env, static_cast<DWORD>(sizeof(prev_lock_env)));
+    ::SetEnvironmentVariableA("OPENSCARLETT_CURSOR_LOCK", "1");
+    IGameInput* env_gi = nullptr;
+    OS_REQUIRE(GameInputCreate(&env_gi) == GAMEINPUT_S_OK && env_gi != nullptr);
+    OS_REQUIRE(is_locked(env_gi));
+    OS_REQUIRE(any_locked());
+    env_gi->Release();
+    OS_REQUIRE(!any_locked());
+    ::SetEnvironmentVariableA("OPENSCARLETT_CURSOR_LOCK", prev_lock_len > 0u ? prev_lock_env : nullptr);
+
     gi->Release();
     std::printf("[PASS] GameInput user-before-connect, rumble+triggers, ordinal #1, window events & TLS telemetry\n");
 }

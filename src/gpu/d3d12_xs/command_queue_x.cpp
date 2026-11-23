@@ -31,6 +31,7 @@ struct WindowCallbackState {
     std::atomic<bool> in_fullscreen_toggle{false};
     std::atomic<uint64_t> alt_enter_toggle_count{0ull};
     std::atomic<bool> raw_mouse_registered{false};
+    std::atomic<bool> raw_mouse_packets_seen{false};
     std::atomic<bool> gi_target_hwnd_sent{false};
     std::atomic<bool> cursor_clipped{false};
 
@@ -144,6 +145,17 @@ bool BroadcastWindowEventToGameInput(
         return fn(reinterpret_cast<void*>(hwnd), event_kind, p1, p2) >= 0;
     }
     return false;
+}
+
+bool IsGameInputCursorLocked() noexcept {
+    using PfnIsAnyCursorLocked = bool(__cdecl*)();
+    HMODULE gi_mod = GetModuleHandleW(L"GameInput.dll");
+    if (!gi_mod) {
+        return false;
+    }
+    auto fn = reinterpret_cast<PfnIsAnyCursorLocked>(
+        reinterpret_cast<void*>(GetProcAddress(gi_mod, "OpenScarlettGameInputIsAnyCursorLocked")));
+    return fn ? fn() : false;
 }
 
 void TryRegisterRawMouseForWindow(HWND hwnd, WindowCallbackState& state) noexcept {
@@ -408,7 +420,16 @@ LRESULT CALLBACK SubclassWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 BroadcastWindowEventToGameInput(hwnd, kGiWinEventFocus, 0, 0);
                 break;
             }
+            case WM_SETCURSOR: {
+                if (LOWORD(lParam) == HTCLIENT && state->is_active.load(std::memory_order_acquire) &&
+                    IsGameInputCursorLocked()) {
+                    SetCursor(nullptr);
+                    return TRUE;
+                }
+                break;
+            }
             case WM_INPUT: {
+                state->raw_mouse_packets_seen.store(true, std::memory_order_release);
                 BroadcastRawInputToGameInput(reinterpret_cast<void*>(lParam));
                 break;
             }
@@ -3467,7 +3488,8 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
             ci.cbSize = sizeof(ci);
             const bool cursor_hidden =
                 (GetCursorInfo(&ci) != FALSE) && ((ci.flags & CURSOR_SHOWING) == 0u);
-            if (focused && cursor_hidden) {
+            const bool user_cursor_locked = IsGameInputCursorLocked();
+            if (focused && (cursor_hidden || user_cursor_locked)) {
                 RECT cr{};
                 if (GetClientRect(target_hwnd, &cr) != FALSE && cr.right > cr.left && cr.bottom > cr.top) {
                     POINT tl{cr.left, cr.top};
@@ -3477,6 +3499,10 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
                     RECT sr{tl.x, tl.y, br.x, br.y};
                     if (ClipCursor(&sr) != FALSE) {
                         window_state_->cursor_clipped.store(true, std::memory_order_release);
+                    }
+                    if (user_cursor_locked && !cursor_hidden &&
+                        window_state_->raw_mouse_packets_seen.load(std::memory_order_acquire)) {
+                        SetCursorPos((sr.left + sr.right) / 2, (sr.top + sr.bottom) / 2);
                     }
                 }
             } else if (window_state_->cursor_clipped.exchange(false, std::memory_order_acq_rel)) {
