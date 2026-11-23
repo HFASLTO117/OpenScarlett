@@ -614,6 +614,18 @@ private:
         const D3D12_RESOURCE_BARRIER* unwrapped_barriers,
         std::vector<D3D12_RESOURCE_BARRIER>& extra_coherency_barriers);
 
+public:
+    static bool IsDiagTraceEnabled() noexcept;
+    static const char* DiagTraceLogPath() noexcept;
+    void AppendDiagOp(std::string op);
+    std::vector<std::string> CopyDiagOps() const;
+    bool LastCloseFailed() const noexcept { return last_close_failed_.load(std::memory_order_acquire); }
+
+private:
+    std::atomic<bool> last_close_failed_{false};
+    mutable std::mutex diag_ops_mutex_;
+    std::vector<std::string> diag_ops_;
+
     // Sprint 14 Enhanced Barriers telemetry & diagnostics
     std::atomic<uint64_t> eb_barrier_calls_{0ull};
     std::atomic<uint64_t> eb_native_calls_{0ull};

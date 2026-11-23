@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <new>
@@ -312,6 +313,19 @@ inline void RecordDev(const char* method, int32_t slot, HRESULT hr = S_OK) {
         outcome = openscarlett::CallOutcome::NotImplemented;
     } else if (FAILED(hr)) {
         outcome = openscarlett::CallOutcome::Error;
+        if (hr != E_NOINTERFACE && hr != DXGI_ERROR_NOT_FOUND && CommandListX::IsDiagTraceEnabled()) {
+            static std::mutex s_dev_log_mu;
+            static std::atomic<uint32_t> s_fail_lines{0u};
+            if (s_fail_lines.fetch_add(1u, std::memory_order_relaxed) < 200u) {
+                std::lock_guard<std::mutex> lk(s_dev_log_mu);
+                FILE* f = nullptr;
+                if (::fopen_s(&f, CommandListX::DiagTraceLogPath(), "a") == 0 && f) {
+                    std::fprintf(f, "[DeviceX:FAIL] %s slot=%d hr=0x%08X\n",
+                                 method, slot, static_cast<unsigned>(hr));
+                    std::fclose(f);
+                }
+            }
+        }
     }
     openscarlett::CallTelemetry::Global().Record(
         kModule,

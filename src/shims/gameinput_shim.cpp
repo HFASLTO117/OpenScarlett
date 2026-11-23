@@ -13,6 +13,7 @@
 #include <map>
 #include <mutex>
 #include <new>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -388,17 +389,18 @@ void PollGamepadAndKeyboard(
                 }
             }
         }
-        static const bool s_trace_gi = []() {
-            char buf[8]{};
-            return ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_GAMEINPUT", buf, sizeof(buf)) > 0 && buf[0] == '1';
+        static const std::string s_trace_gi_path = []() {
+            char buf[512]{};
+            DWORD n = ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_GAMEINPUT", buf, sizeof(buf));
+            return (n > 0 && n < sizeof(buf)) ? std::string(buf, n) : std::string{};
         }();
-        if (s_trace_gi) {
+        if (!s_trace_gi_path.empty()) {
             static std::atomic<uint32_t> s_prev_state{0xFFFFFFFFu};
             const uint32_t packed = (physical_pad_found ? 0x80000000u : 0u) |
                                     ((out_active_slot & 0xFu) << 16) |
                                     (physical_pad_found ? static_cast<uint32_t>(st.Gamepad.wButtons) : (last_rc & 0xFFFFu));
             if (s_prev_state.exchange(packed, std::memory_order_relaxed) != packed) {
-                char msg[200];
+                char msg[220];
                 std::snprintf(msg, sizeof(msg),
                               "[GameInput] XInput found=%d slot=%u rc=%lu pkt=%u btn=0x%04X lx=%d ly=%d\n",
                               physical_pad_found ? 1 : 0, out_active_slot, static_cast<unsigned long>(last_rc),
@@ -406,6 +408,13 @@ void PollGamepadAndKeyboard(
                               physical_pad_found ? static_cast<int>(st.Gamepad.sThumbLX) : 0,
                               physical_pad_found ? static_cast<int>(st.Gamepad.sThumbLY) : 0);
                 ::OutputDebugStringA(msg);
+                if (s_trace_gi_path != "1") {
+                    FILE* f = nullptr;
+                    if (::fopen_s(&f, s_trace_gi_path.c_str(), "a") == 0 && f) {
+                        std::fputs(msg, f);
+                        std::fclose(f);
+                    }
+                }
             }
         }
         if (physical_pad_found) {
