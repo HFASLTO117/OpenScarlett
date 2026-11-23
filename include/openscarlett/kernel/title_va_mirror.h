@@ -211,6 +211,8 @@ private:
         void* cpu_backing_ptr = nullptr;
         bool owns_cpu_memory = false;
         bool write_watch_enabled = false;
+        mutable bool fallback_hashes_initialized = false;
+        mutable std::vector<uint64_t> fallback_chunk_hashes;
 
         ID3D12Resource* gpu_shadow = nullptr;
         ID3D12Resource* upload_staging = nullptr;

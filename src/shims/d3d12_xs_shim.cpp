@@ -1155,9 +1155,11 @@ public:
             std::fflush(stderr);
         }
         const HRESULT hr = inner_->PresentX(PlaneCount, pPlaneParameters, pPresentParameters);
-        if (idx < 5u || (idx % 25u) == 0u || (FAILED(hr) && idx < 15u)) {
-            std::fprintf(stderr, "[OpenScarlett][d3d12_xs] PresentX(#%u) -> hr=0x%08lX\n",
-                         idx, static_cast<unsigned long>(hr));
+        static const ULONGLONG s_t0 = ::GetTickCount64();
+        if (idx < 5u || (idx % 5u) == 0u || (FAILED(hr) && idx < 15u)) {
+            std::fprintf(stderr, "[OpenScarlett][d3d12_xs] PresentX(#%u t=%llums) -> hr=0x%08lX\n",
+                         idx, static_cast<unsigned long long>(::GetTickCount64() - s_t0),
+                         static_cast<unsigned long>(hr));
             std::fflush(stderr);
         }
         return hr;

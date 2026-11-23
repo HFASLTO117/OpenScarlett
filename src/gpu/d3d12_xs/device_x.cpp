@@ -2286,6 +2286,14 @@ DeviceX::~DeviceX() {
         }
     }
     {
+        std::lock_guard<std::mutex> alk(placed_alias_mutex_);
+        for (auto& [bk, hp] : placed_alias_heaps_) {
+            (void)bk;
+            if (hp) hp->Release();
+        }
+        placed_alias_heaps_.clear();
+    }
+    {
         std::lock_guard<std::mutex> lock(paged_desc_mutex_);
         for (auto& kv : paged_desc_heaps_) {
             for (auto& page : kv.second.pages) {
@@ -8471,18 +8479,137 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResourceX(
         }
     }
 
-    // Fallback to committed default-heap resource if not attached or heap placement incompatible.
+    // Retail Scarlett render-graph aliasing: place textures into a single shared 256 MiB
+    // DEFAULT aliasing heap (plus 64 MiB MSAA heap) using VirtualAddress mod heap size.
+    // On Xbox Series X, GTA VI aliases hundreds of transient 1440p/4K RT/DS/UAV textures
+    // inside a ~256 MiB transient range (0xCE0000000..0xCEFFFFFFF); aliasing them into one
+    // fixed 256 MiB Tier-2 ID3D12Heap keeps total RT VRAM bounded at 256 MiB on 4 GiB GPUs.
     D3D12_HEAP_PROPERTIES default_heap_props{};
     default_heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+    bool spilled_to_l0 = false;
+    bool placed_in_alias_heap = false;
+    if ((FAILED(hr) || !host_res) && retail_scarlett_abi_ && VirtualAddress != 0ull &&
+        clean_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+        const bool is_msaa = (clean_desc.SampleDesc.Count > 1u);
+        const uint64_t pool_bytes = is_msaa ? (64ull * 1024ull * 1024ull)
+                                            : (256ull * 1024ull * 1024ull);
+        const D3D12_RESOURCE_ALLOCATION_INFO ainfo =
+            host_dev_->GetResourceAllocationInfo(0u, 1u, &clean_desc);
+        const uint64_t req_align = std::max<uint64_t>(
+            ainfo.Alignment ? ainfo.Alignment : 65536ull, 65536ull);
+        if (ainfo.SizeInBytes > 0ull && ainfo.SizeInBytes <= pool_bytes) {
+            uint64_t heap_off = (VirtualAddress & (pool_bytes - 1ull)) & ~(req_align - 1ull);
+            if (heap_off + ainfo.SizeInBytes > pool_bytes) {
+                heap_off = 0ull;
+            }
+            const bool is_rt_ds =
+                (clean_desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                     D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) != 0;
+            const uint64_t map_key = is_msaa ? 1ull : 0ull;
+            ID3D12Heap* alias_heap = nullptr;
+            {
+                std::lock_guard<std::mutex> alk(placed_alias_mutex_);
+                auto it = placed_alias_heaps_.find(map_key);
+                if (it != placed_alias_heaps_.end() && it->second) {
+                    alias_heap = it->second;
+                    alias_heap->AddRef();
+                } else {
+                    D3D12_HEAP_DESC hd{};
+                    hd.SizeInBytes = pool_bytes;
+                    hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+                    hd.Alignment = is_msaa ? D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT
+                                           : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+                    hd.Flags = D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES;
+                    ID3D12Heap* new_heap = nullptr;
+                    HRESULT hhr = host_dev_->CreateHeap(
+                        &hd, OS_D3D12_IID(ID3D12Heap), reinterpret_cast<void**>(&new_heap));
+                    if ((FAILED(hhr) || !new_heap) && is_rt_ds) {
+                        hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
+                        hhr = host_dev_->CreateHeap(
+                            &hd, OS_D3D12_IID(ID3D12Heap), reinterpret_cast<void**>(&new_heap));
+                    }
+                    if (SUCCEEDED(hhr) && new_heap) {
+                        placed_alias_heaps_[map_key] = new_heap;
+                        alias_heap = new_heap;
+                        alias_heap->AddRef();
+                    }
+                }
+            }
+            if (alias_heap) {
+                hr = host_dev_->CreatePlacedResource(
+                    alias_heap, heap_off, &clean_desc, InitialState,
+                    clear_ptr, OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
+                if (SUCCEEDED(hr) && host_res) {
+                    placed_in_alias_heap = true;
+                }
+                alias_heap->Release();
+            }
+        }
+    }
+
+    // Fallback to committed default-heap resource if not attached or heap placement incompatible.
     if (FAILED(hr) || !host_res) {
         hr = host_dev_->CreateCommittedResource(
             &default_heap_props, D3D12_HEAP_FLAG_NONE, &clean_desc, InitialState,
             clear_ptr, OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
     }
+    if ((FAILED(hr) || !host_res) && hr == E_OUTOFMEMORY) {
+        // 4-8 GiB desktop GPUs can exhaust dedicated L1 VRAM when retail Scarlett titles
+        // alias dozens of 1440p/4K render-graph targets onto the same physical VAs.
+        // Spill cleanly into GPU-accessible L0 system memory (NOT_AVAILABLE supports RT/DS/UAV).
+        D3D12_HEAP_PROPERTIES l0_props{};
+        l0_props.Type = D3D12_HEAP_TYPE_CUSTOM;
+        l0_props.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
+        l0_props.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+        l0_props.CreationNodeMask = 1u;
+        l0_props.VisibleNodeMask = 1u;
+        hr = host_dev_->CreateCommittedResource(
+            &l0_props, D3D12_HEAP_FLAG_NONE, &clean_desc, InitialState,
+            clear_ptr, OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
+        if (SUCCEEDED(hr) && host_res) {
+            default_heap_props = l0_props;
+            spilled_to_l0 = true;
+        } else {
+            // Second fallback: page-demand non-resident DEFAULT allocation.
+            hr = host_dev_->CreateCommittedResource(
+                &default_heap_props, D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT, &clean_desc, InitialState,
+                clear_ptr, OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
+        }
+    }
 
     if (FAILED(hr) || !host_res) {
         RecordDev("ID3D12DeviceX::CreatePlacedResourceX", 76, hr);
         return hr;
+    }
+    {
+        static std::atomic<uint32_t> s_cprx_cnt{0u};
+        static std::atomic<uint64_t> s_cprx_vram{0ull};
+        static std::atomic<uint64_t> s_cprx_l0{0ull};
+        const uint64_t eb = placed_in_alias_heap ? 0ull : EstimateResourceVramBytes(clean_desc);
+        const uint32_t n = s_cprx_cnt.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        const uint64_t tv = s_cprx_vram.fetch_add(spilled_to_l0 ? 0ull : eb, std::memory_order_relaxed) + (spilled_to_l0 ? 0ull : eb);
+        const uint64_t tl = s_cprx_l0.fetch_add(spilled_to_l0 ? eb : 0ull, std::memory_order_relaxed) + (spilled_to_l0 ? eb : 0ull);
+        static const bool trace_cprx = []() {
+            char v[16]{};
+            return ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_RETAIL", v, sizeof(v)) > 0 && v[0] == '1';
+        }();
+        if (trace_cprx && ((n % 100u) == 0u || (spilled_to_l0 && (n % 25u) == 0u))) {
+            size_t alias_buckets = 0u;
+            {
+                std::lock_guard<std::mutex> alk(placed_alias_mutex_);
+                alias_buckets = placed_alias_heaps_.size();
+            }
+            std::fprintf(stderr,
+                         "[OpenScarlett][CPRX] #%u va=0x%llX dim=%d %llux%u fmt=%d alias=%d(%zu*64MB) l0=%d | comm_vram=%lluMB comm_l0=%lluMB\n",
+                         n, static_cast<unsigned long long>(VirtualAddress),
+                         static_cast<int>(clean_desc.Dimension),
+                         static_cast<unsigned long long>(clean_desc.Width), clean_desc.Height,
+                         static_cast<int>(clean_desc.Format), placed_in_alias_heap ? 1 : 0, alias_buckets,
+                         spilled_to_l0 ? 1 : 0,
+                         static_cast<unsigned long long>(tv >> 20u),
+                         static_cast<unsigned long long>(tl >> 20u));
+            std::fflush(stderr);
+        }
     }
 
     {
@@ -8494,9 +8621,9 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResourceX(
         TrackLiveResidencyObject(
             static_cast<ID3D12Pageable*>(host_res),
             est_bytes,
-            D3D12_HEAP_TYPE_DEFAULT,
+            default_heap_props.Type,
             /*is_placed_suballocation=*/false,
-            /*spilled_to_l0=*/false,
+            /*spilled_to_l0=*/spilled_to_l0,
             sparse_va);
     }
     TrackFallbackResource(host_res, did_r9g9b9e5_fallback);
@@ -8846,6 +8973,19 @@ bool DeviceX::RefreshDirtyUnifiedResources() noexcept {
         }
         if (!m.cpu_readable || m.guest_va == 0ull || m.byte_size == 0ull) {
             continue;
+        }
+        // Never hash or CPU->GPU upload RenderTarget, DepthStencil, UAV, MSAA, or Tiled textures.
+        if (m.resource) {
+            const D3D12_RESOURCE_DESC rdesc = m.resource->GetDesc();
+            if (rdesc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+                ((rdesc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                 D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) != 0 ||
+                 rdesc.SampleDesc.Count > 1u ||
+                 rdesc.Layout == D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE)) {
+                m.cpu_readable = false;
+                continue;
+            }
         }
         bool modified = false;
         if (m.write_watch_enabled) {
@@ -9858,9 +9998,17 @@ HRESULT DeviceX::FlushMirroredTitleVaPagesOnQueue(
     if (candidate_vas.empty()) return S_OK;
 
     // Fast dirty probe before touching any GPU command allocator.
+    // For non-write-watch regions, skip the duplicate probe pass so the chunk-hash scan
+    // runs only once inside FlushDirtyPagesToGpu.
     std::vector<uint64_t> dirty_vas;
     std::vector<openscarlett::DirtyPageRange> probe_ranges;
     for (uint64_t va : candidate_vas) {
+        openscarlett::TitleVaRegionInfo rinfo{};
+        if (!title_va_mirror_.LookupRegion(va, rinfo)) continue;
+        if (!rinfo.write_watch_enabled) {
+            dirty_vas.push_back(va);
+            continue;
+        }
         probe_ranges.clear();
         if (title_va_mirror_.QueryDirtyPageRanges(va, /*reset_watch=*/false, probe_ranges).ok() &&
             !probe_ranges.empty()) {

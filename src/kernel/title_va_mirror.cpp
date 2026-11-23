@@ -358,7 +358,77 @@ Status TitleVAMirror::QueryDirtyLocked(RegionEntry& entry,
         (entry.alloc_size_bytes + page_size_bytes_ - 1ull) / page_size_bytes_;
 
     if (!entry.cpu_backing_ptr || !entry.write_watch_enabled) {
-        // Fallback when write-watch isn't active: treat whole region as dirty.
+        if (entry.cpu_backing_ptr && entry.size_bytes > 0ull) {
+            constexpr uint64_t kChunk = kPageSize64KB;
+            const size_t num_chunks = static_cast<size_t>((entry.size_bytes + kChunk - 1ull) / kChunk);
+            if (!entry.fallback_hashes_initialized || entry.fallback_chunk_hashes.size() != num_chunks) {
+                // D3D12 GPU shadow buffers start zero-filled; seed hash with all-zero chunk hash
+                // so untouched zero pages are never redundantly uploaded over PCIe.
+                constexpr uint64_t kZeroChunkHash = 0ull;
+                entry.fallback_chunk_hashes.assign(num_chunks, kZeroChunkHash);
+                entry.fallback_hashes_initialized = true;
+            }
+            const auto* base = static_cast<const uint8_t*>(entry.cpu_backing_ptr);
+            uint64_t run_start = 0ull;
+            uint64_t run_end = 0ull;
+            bool in_run = false;
+            uint64_t dirty_chunks = 0ull;
+            for (size_t c = 0u; c < num_chunks; ++c) {
+                const uint64_t off = static_cast<uint64_t>(c) * kChunk;
+                const uint64_t len = std::min<uint64_t>(kChunk, entry.size_bytes - off);
+                const auto* words = reinterpret_cast<const uint64_t*>(base + off);
+                const size_t nwords = static_cast<size_t>(len >> 3u);
+                uint64_t h0 = 0ull, h1 = 0ull, h2 = 0ull, h3 = 0ull;
+                size_t wi = 0u;
+                for (; wi + 4u <= nwords; wi += 4u) {
+                    const uint64_t w0 = words[wi + 0u];
+                    const uint64_t w1 = words[wi + 1u];
+                    const uint64_t w2 = words[wi + 2u];
+                    const uint64_t w3 = words[wi + 3u];
+                    if ((w0 | w1 | w2 | w3) != 0ull) {
+                        h0 = (h0 ^ (w0 + 0x9E3779B97F4A7C15ull)) * 0xBF58476D1CE4E5B9ull;
+                        h1 = (h1 ^ (w1 + 0x9E3779B97F4A7C15ull)) * 0x94D049BB133111EBull;
+                        h2 = (h2 ^ (w2 + 0x9E3779B97F4A7C15ull)) * 0xBF58476D1CE4E5B9ull;
+                        h3 = (h3 ^ (w3 + 0x9E3779B97F4A7C15ull)) * 0x94D049BB133111EBull;
+                    }
+                }
+                uint64_t h = h0 ^ (h1 << 1u) ^ (h2 << 2u) ^ (h3 << 3u);
+                for (; wi < nwords; ++wi) {
+                    if (words[wi] != 0ull) {
+                        h = (h ^ (words[wi] + 0x9E3779B97F4A7C15ull)) * 0xBF58476D1CE4E5B9ull;
+                    }
+                }
+                for (uint64_t bi = static_cast<uint64_t>(nwords) << 3u; bi < len; ++bi) {
+                    const uint8_t b = base[off + bi];
+                    if (b != 0u) h = (h ^ b) * 0x100000001B3ull;
+                }
+                if (h != entry.fallback_chunk_hashes[c]) {
+                    if (reset_watch) {
+                        entry.fallback_chunk_hashes[c] = h;
+                    }
+                    ++dirty_chunks;
+                    if (!in_run) {
+                        run_start = off;
+                        run_end = off + len;
+                        in_run = true;
+                    } else if (off == run_end) {
+                        run_end = off + len;
+                    } else {
+                        out_ranges.push_back(DirtyPageRange{run_start, run_end - run_start});
+                        run_start = off;
+                        run_end = off + len;
+                    }
+                }
+            }
+            if (in_run) {
+                out_ranges.push_back(DirtyPageRange{run_start, run_end - run_start});
+            }
+            const uint64_t pages_per_chunk = std::max<uint64_t>(1ull, kChunk / page_size_bytes_);
+            out_dirty_pages = std::min<uint64_t>(total_pages, dirty_chunks * pages_per_chunk);
+            out_clean_pages = (total_pages > out_dirty_pages) ? (total_pages - out_dirty_pages) : 0ull;
+            return Status::Ok();
+        }
+        // Fallback for small or null-backed regions when write-watch isn't active.
         out_ranges.push_back(DirtyPageRange{0ull, entry.size_bytes});
         out_dirty_pages = total_pages;
         out_clean_pages = 0ull;

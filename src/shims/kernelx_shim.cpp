@@ -1577,10 +1577,20 @@ public:
                     GetCurrentProcess(),
                     baseAddress,
                     rep_size,
-                    MEM_RESERVE | MEM_COMMIT | kMemReplacePlaceholder,
+                    MEM_RESERVE | MEM_COMMIT | kMemReplacePlaceholder | MEM_WRITE_WATCH,
                     win_prot,
                     nullptr,
                     0u);
+                if (!replaced) {
+                    replaced = s_va2(
+                        GetCurrentProcess(),
+                        baseAddress,
+                        rep_size,
+                        MEM_RESERVE | MEM_COMMIT | kMemReplacePlaceholder,
+                        win_prot,
+                        nullptr,
+                        0u);
+                }
             }
             if (!replaced) {
                 using PfnMapViewOfFile3 = PVOID(WINAPI*)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG, void*, ULONG);
@@ -1711,7 +1721,16 @@ public:
                 prefer_sparse = true;
             }
         }
-        void* ptr = prefer_sparse ? nullptr : VirtualAlloc(baseAddress, aligned_size, win_alloc, win_prot);
+        void* ptr = nullptr;
+        if (!prefer_sparse) {
+            if ((win_alloc & MEM_RESERVE) != 0u && (win_alloc & MEM_RESET) == 0u &&
+                (win_prot == PAGE_READWRITE || win_prot == PAGE_NOACCESS)) {
+                ptr = VirtualAlloc(baseAddress, aligned_size, win_alloc | MEM_WRITE_WATCH, win_prot);
+            }
+            if (!ptr) {
+                ptr = VirtualAlloc(baseAddress, aligned_size, win_alloc, win_prot);
+            }
+        }
         if (!ptr && baseAddress == nullptr && (allocationType & MEM_COMMIT) != 0u &&
             (prefer_sparse || GetLastError() == ERROR_COMMITMENT_LIMIT || GetLastError() == ERROR_NOT_ENOUGH_MEMORY)) {
             // Host pagefile commit limit exhausted (common when retail Scarlett titles pre-commit

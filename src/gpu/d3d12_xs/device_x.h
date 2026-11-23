@@ -1352,6 +1352,11 @@ private:
     std::atomic<uint8_t*> cbv_align_ring_cpu_{nullptr};
     std::atomic<D3D12_GPU_VIRTUAL_ADDRESS> cbv_align_ring_gpu_{0ull};
     std::atomic<uint32_t> cbv_align_ring_cursor_{0u};
+
+    // 64 MiB VA-bucketed aliasing heaps for CreatePlacedResourceX textures so Xbox transient
+    // render-graph resources placed at overlapping physical VAs share host VRAM (zero bloat).
+    std::mutex placed_alias_mutex_;
+    std::unordered_map<uint64_t, ID3D12Heap*> placed_alias_heaps_;
 };
 
 }  // namespace openscarlett::d3d12_xs
