@@ -1503,7 +1503,7 @@ OS_DIAG_API int32_t OS_DIAG_CALL OpenScarlettKernelTraceGetTelemetryCount(
 }  // extern "C"
 
 // ===========================================================================
-// TARGET 3: hix_xs.dll (Xbox Hang-Dump / Debug Instrumentation Forwards)
+// TARGET 3: hix_xs.dll (Xbox Hang-Dump, Watchdog & Ring Diagnostic Shim)
 // ===========================================================================
 #elif defined(OPENSCARLETT_DIAG_TARGET_HIX_XS)
 
@@ -1511,10 +1511,92 @@ namespace {
 
 namespace fs = std::filesystem;
 constexpr const char* kHixMod = "hix_xs.dll";
+constexpr size_t kHixMaxRingEntries = 256u;
+constexpr int32_t kHixHrInsufficientBuffer = static_cast<int32_t>(0x8007007Au);
+
+uint64_t HixQueryQpcTicks() noexcept {
+#if defined(_WIN32)
+    LARGE_INTEGER li{};
+    ::QueryPerformanceCounter(&li);
+    return static_cast<uint64_t>(li.QuadPart);
+#else
+    return static_cast<uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+#endif
+}
+
+uint64_t HixQueryQpcFreq() noexcept {
+#if defined(_WIN32)
+    LARGE_INTEGER li{};
+    ::QueryPerformanceFrequency(&li);
+    return li.QuadPart > 0 ? static_cast<uint64_t>(li.QuadPart) : 10000000ull;
+#else
+    return 1000000000ull;
+#endif
+}
+
+uint32_t HixCurrentThreadId() noexcept {
+#if defined(_WIN32)
+    return static_cast<uint32_t>(::GetCurrentThreadId());
+#else
+    return 1u;
+#endif
+}
+
+uint32_t HixCurrentProcessId() noexcept {
+#if defined(_WIN32)
+    return static_cast<uint32_t>(::GetCurrentProcessId());
+#else
+    return 1u;
+#endif
+}
+
+std::string HixEscapeJson(const std::string& in) {
+    std::string out;
+    out.reserve(in.size() + 8u);
+    for (unsigned char c : in) {
+        switch (c) {
+            case '\\': out.append("\\\\"); break;
+            case '"': out.append("\\\""); break;
+            case '\r': out.append("\\r"); break;
+            case '\n': out.append("\\n"); break;
+            case '\t': out.append("\\t"); break;
+            default:
+                if (c < 0x20u) {
+                    char buf[8]{};
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned int>(c));
+                    out.append(buf);
+                } else {
+                    out.push_back(static_cast<char>(c));
+                }
+                break;
+        }
+    }
+    return out;
+}
 
 struct HixCallbackEntry {
     void* callback = nullptr;
     void* context = nullptr;
+};
+
+struct HixRingEntry {
+    uint64_t seq = 0u;
+    uint64_t qpc_ticks = 0u;
+    uint32_t thread_id = 0u;
+    uint32_t slot = 0u;
+    std::string kind;
+    std::string tag;
+    uint64_t value = 0u;
+};
+
+struct HixWatchdogEntry {
+    uint64_t id = 0u;
+    std::string name;
+    uint32_t timeout_ms = 5000u;
+    uint64_t last_heartbeat_qpc = 0u;
+    uint64_t heartbeat_count = 0u;
+    std::string last_tag;
 };
 
 struct HixState {
@@ -1525,14 +1607,39 @@ struct HixState {
     uint64_t heartbeats = 0u;
     uint64_t dump_requests = 0u;
     uint64_t next_cb_token = 1u;
+    uint64_t next_watchdog_id = 1u;
+    uint64_t next_ring_seq = 1u;
     std::string last_heartbeat_tag;
+    std::string last_hang_report;
     std::map<uint32_t, std::pair<std::string, uint64_t>> breadcrumbs;
     std::unordered_map<uint64_t, HixCallbackEntry> callbacks;
+    std::unordered_map<uint64_t, HixCallbackEntry> minidump_callbacks;
+    std::map<uint64_t, HixWatchdogEntry> watchdogs;
+    std::deque<HixRingEntry> ring;
 };
 
 HixState& GetHix() {
     static HixState* s = new HixState();
     return *s;
+}
+
+void PushHixRingLocked(HixState& st,
+                       const char* kind,
+                       uint32_t slot,
+                       const char* tag,
+                       uint64_t value) {
+    HixRingEntry e{};
+    e.seq = st.next_ring_seq++;
+    e.qpc_ticks = HixQueryQpcTicks();
+    e.thread_id = HixCurrentThreadId();
+    e.slot = slot;
+    e.kind = kind ? kind : "event";
+    e.tag = tag ? tag : "";
+    e.value = value;
+    if (st.ring.size() >= kHixMaxRingEntries) {
+        st.ring.pop_front();
+    }
+    st.ring.push_back(std::move(e));
 }
 
 inline int32_t RecordHix(const char* sym, int32_t hr) {
@@ -1569,6 +1676,7 @@ OS_DIAG_API int32_t OS_DIAG_CALL HixInitialize(uint32_t flags) {
     std::lock_guard<std::mutex> lk(st.mutex);
     ++st.init_count;
     st.flags = flags;
+    PushHixRingLocked(st, "init", 0u, "HixInitialize", static_cast<uint64_t>(flags));
     return RecordHix("HixInitialize", kHrOk);
 }
 
@@ -1578,6 +1686,7 @@ OS_DIAG_API void OS_DIAG_CALL HixUninitialize(void) {
     if (st.init_count > 0u) {
         --st.init_count;
     }
+    PushHixRingLocked(st, "uninit", 0u, "HixUninitialize", static_cast<uint64_t>(st.init_count));
     RecordHix("HixUninitialize", kHrOk);
 }
 
@@ -1588,6 +1697,7 @@ OS_DIAG_API int32_t OS_DIAG_CALL HixSetHangTimeoutMs(uint32_t timeoutMs) {
     auto& st = GetHix();
     std::lock_guard<std::mutex> lk(st.mutex);
     st.hang_timeout_ms = timeoutMs;
+    PushHixRingLocked(st, "config", 0u, "hang_timeout_ms", static_cast<uint64_t>(timeoutMs));
     return RecordHix("HixSetHangTimeoutMs", kHrOk);
 }
 
@@ -1608,6 +1718,7 @@ OS_DIAG_API int32_t OS_DIAG_CALL HixHeartbeat(const char* tag) {
     if (tag) {
         st.last_heartbeat_tag = tag;
     }
+    PushHixRingLocked(st, "heartbeat", 0u, tag ? tag : "", st.heartbeats);
     return RecordHix("HixHeartbeat", kHrOk);
 }
 
@@ -1638,6 +1749,128 @@ OS_DIAG_API int32_t OS_DIAG_CALL HixUnregisterHangCallback(uint64_t token) {
     return RecordHix("HixUnregisterHangCallback", kHrOk);
 }
 
+OS_DIAG_API int32_t OS_DIAG_CALL HixRegisterMinidumpCallback(
+    void* callback,
+    void* context,
+    uint64_t* outToken) {
+    if (!callback || !outToken) {
+        return RecordHix("HixRegisterMinidumpCallback", kHrInvalidArg);
+    }
+    auto& st = GetHix();
+    std::lock_guard<std::mutex> lk(st.mutex);
+    const uint64_t tok = st.next_cb_token++;
+    st.minidump_callbacks[tok] = HixCallbackEntry{callback, context};
+    *outToken = tok;
+    return RecordHix("HixRegisterMinidumpCallback", kHrOk);
+}
+
+OS_DIAG_API int32_t OS_DIAG_CALL HixUnregisterMinidumpCallback(uint64_t token) {
+    if (token == 0ull) {
+        return RecordHix("HixUnregisterMinidumpCallback", kHrInvalidArg);
+    }
+    auto& st = GetHix();
+    std::lock_guard<std::mutex> lk(st.mutex);
+    if (st.minidump_callbacks.erase(token) == 0u) {
+        return RecordHix("HixUnregisterMinidumpCallback", kHrInvalidArg);
+    }
+    return RecordHix("HixUnregisterMinidumpCallback", kHrOk);
+}
+
+OS_DIAG_API int32_t OS_DIAG_CALL HixRegisterWatchdog(
+    const char* name,
+    uint32_t timeoutMs,
+    uint64_t* outWatchdogId) {
+    if (!name || !*name || timeoutMs == 0u || !outWatchdogId) {
+        return RecordHix("HixRegisterWatchdog", kHrInvalidArg);
+    }
+    auto& st = GetHix();
+    std::lock_guard<std::mutex> lk(st.mutex);
+    const uint64_t id = st.next_watchdog_id++;
+    HixWatchdogEntry wd{};
+    wd.id = id;
+    wd.name = name;
+    wd.timeout_ms = timeoutMs;
+    wd.last_heartbeat_qpc = HixQueryQpcTicks();
+    wd.heartbeat_count = 1u;
+    wd.last_tag = "registered";
+    st.watchdogs[id] = std::move(wd);
+    PushHixRingLocked(st, "watchdog_reg", 0u, name, static_cast<uint64_t>(timeoutMs));
+    *outWatchdogId = id;
+    return RecordHix("HixRegisterWatchdog", kHrOk);
+}
+
+OS_DIAG_API int32_t OS_DIAG_CALL HixWatchdogHeartbeat(
+    uint64_t watchdogId,
+    const char* tag) {
+    if (watchdogId == 0ull) {
+        return RecordHix("HixWatchdogHeartbeat", kHrInvalidArg);
+    }
+    auto& st = GetHix();
+    std::lock_guard<std::mutex> lk(st.mutex);
+    auto it = st.watchdogs.find(watchdogId);
+    if (it == st.watchdogs.end()) {
+        return RecordHix("HixWatchdogHeartbeat", kHrInvalidArg);
+    }
+    it->second.last_heartbeat_qpc = HixQueryQpcTicks();
+    ++it->second.heartbeat_count;
+    if (tag) {
+        it->second.last_tag = tag;
+    }
+    PushHixRingLocked(st, "watchdog_hb", 0u, tag ? tag : it->second.name.c_str(),
+                      it->second.heartbeat_count);
+    return RecordHix("HixWatchdogHeartbeat", kHrOk);
+}
+
+OS_DIAG_API int32_t OS_DIAG_CALL HixUnregisterWatchdog(uint64_t watchdogId) {
+    if (watchdogId == 0ull) {
+        return RecordHix("HixUnregisterWatchdog", kHrInvalidArg);
+    }
+    auto& st = GetHix();
+    std::lock_guard<std::mutex> lk(st.mutex);
+    if (st.watchdogs.erase(watchdogId) == 0u) {
+        return RecordHix("HixUnregisterWatchdog", kHrInvalidArg);
+    }
+    PushHixRingLocked(st, "watchdog_unreg", 0u, "unregistered", watchdogId);
+    return RecordHix("HixUnregisterWatchdog", kHrOk);
+}
+
+OS_DIAG_API int32_t OS_DIAG_CALL HixCheckWatchdogs(uint32_t* outHungCount) {
+    if (!outHungCount) {
+        return RecordHix("HixCheckWatchdogs", kHrPointer);
+    }
+    const uint64_t now_qpc = HixQueryQpcTicks();
+    const uint64_t freq = HixQueryQpcFreq();
+    uint32_t hung = 0u;
+    {
+        auto& st = GetHix();
+        std::lock_guard<std::mutex> lk(st.mutex);
+        for (const auto& kv : st.watchdogs) {
+            const uint64_t delta = (now_qpc >= kv.second.last_heartbeat_qpc)
+                                       ? (now_qpc - kv.second.last_heartbeat_qpc)
+                                       : 0ull;
+            const uint64_t elapsed_ms = (delta * 1000ull) / freq;
+            if (elapsed_ms >= static_cast<uint64_t>(kv.second.timeout_ms)) {
+                ++hung;
+            }
+        }
+    }
+    *outHungCount = hung;
+    return RecordHix("HixCheckWatchdogs", kHrOk);
+}
+
+OS_DIAG_API int32_t OS_DIAG_CALL HixLogEvent(
+    const char* category,
+    const char* message,
+    uint64_t value) {
+    if (!message || !*message) {
+        return RecordHix("HixLogEvent", kHrInvalidArg);
+    }
+    auto& st = GetHix();
+    std::lock_guard<std::mutex> lk(st.mutex);
+    PushHixRingLocked(st, (category && *category) ? category : "event", 0u, message, value);
+    return RecordHix("HixLogEvent", kHrOk);
+}
+
 OS_DIAG_API int32_t OS_DIAG_CALL HixRecordBreadcrumb(
     uint32_t slot,
     const char* tag,
@@ -1649,6 +1882,7 @@ OS_DIAG_API int32_t OS_DIAG_CALL HixRecordBreadcrumb(
         auto& st = GetHix();
         std::lock_guard<std::mutex> lk(st.mutex);
         st.breadcrumbs[slot] = std::make_pair(std::string(tag), value);
+        PushHixRingLocked(st, "breadcrumb", slot, tag, value);
     }
     ForwardBreadcrumbToXCrd(slot, tag, value);
     return RecordHix("HixRecordBreadcrumb", kHrOk);
@@ -1660,20 +1894,96 @@ OS_DIAG_API int32_t OS_DIAG_CALL HixRequestHangDump(
     if (!reason || !*reason) {
         return RecordHix("HixRequestHangDump", kHrInvalidArg);
     }
-    std::ostringstream oss;
+    std::vector<HixCallbackEntry> hang_cbs;
+    std::vector<HixCallbackEntry> minidump_cbs;
+    std::string body;
     {
         auto& st = GetHix();
         std::lock_guard<std::mutex> lk(st.mutex);
         ++st.dump_requests;
+        PushHixRingLocked(st, "hang_dump", 0u, reason, st.dump_requests);
+
+        hang_cbs.reserve(st.callbacks.size());
+        for (const auto& kv : st.callbacks) {
+            hang_cbs.push_back(kv.second);
+        }
+        minidump_cbs.reserve(st.minidump_callbacks.size());
+        for (const auto& kv : st.minidump_callbacks) {
+            minidump_cbs.push_back(kv.second);
+        }
+
+        const uint64_t qpc_now = HixQueryQpcTicks();
+        const uint64_t qpc_freq = HixQueryQpcFreq();
+
+        std::ostringstream oss;
         oss << "{\n"
             << "  \"module\": \"hix_xs.dll\",\n"
-            << "  \"reason\": \"" << reason << "\",\n"
+            << "  \"reason\": \"" << HixEscapeJson(reason) << "\",\n"
+            << "  \"pid\": " << HixCurrentProcessId() << ",\n"
+            << "  \"tid\": " << HixCurrentThreadId() << ",\n"
+            << "  \"qpc_ticks\": " << qpc_now << ",\n"
+            << "  \"qpc_frequency\": " << qpc_freq << ",\n"
+            << "  \"session_active\": " << (st.init_count > 0u ? "true" : "false") << ",\n"
             << "  \"timeout_ms\": " << st.hang_timeout_ms << ",\n"
             << "  \"heartbeats\": " << st.heartbeats << ",\n"
-            << "  \"last_heartbeat\": \"" << st.last_heartbeat_tag << "\",\n"
-            << "  \"dump_requests\": " << st.dump_requests << "\n"
+            << "  \"last_heartbeat\": \"" << HixEscapeJson(st.last_heartbeat_tag) << "\",\n"
+            << "  \"dump_requests\": " << st.dump_requests << ",\n"
+            << "  \"breadcrumbs\": [\n";
+        bool first_bc = true;
+        for (const auto& bc : st.breadcrumbs) {
+            if (!first_bc) oss << ",\n";
+            first_bc = false;
+            oss << "    {\"slot\": " << bc.first
+                << ", \"tag\": \"" << HixEscapeJson(bc.second.first)
+                << "\", \"value\": " << bc.second.second << "}";
+        }
+        oss << "\n  ],\n"
+            << "  \"watchdogs\": [\n";
+        bool first_wd = true;
+        for (const auto& kv : st.watchdogs) {
+            if (!first_wd) oss << ",\n";
+            first_wd = false;
+            const auto& wd = kv.second;
+            const uint64_t delta = (qpc_now >= wd.last_heartbeat_qpc)
+                                       ? (qpc_now - wd.last_heartbeat_qpc)
+                                       : 0ull;
+            const uint64_t elapsed_ms = (delta * 1000ull) / qpc_freq;
+            oss << "    {\"id\": " << wd.id
+                << ", \"name\": \"" << HixEscapeJson(wd.name)
+                << "\", \"timeout_ms\": " << wd.timeout_ms
+                << ", \"elapsed_ms\": " << elapsed_ms
+                << ", \"heartbeats\": " << wd.heartbeat_count
+                << ", \"last_tag\": \"" << HixEscapeJson(wd.last_tag) << "\"}";
+        }
+        oss << "\n  ],\n"
+            << "  \"ring_events\": [\n";
+        bool first_ev = true;
+        for (const auto& ev : st.ring) {
+            if (!first_ev) oss << ",\n";
+            first_ev = false;
+            oss << "    {\"seq\": " << ev.seq
+                << ", \"qpc\": " << ev.qpc_ticks
+                << ", \"tid\": " << ev.thread_id
+                << ", \"kind\": \"" << HixEscapeJson(ev.kind)
+                << "\", \"slot\": " << ev.slot
+                << ", \"tag\": \"" << HixEscapeJson(ev.tag)
+                << "\", \"value\": " << ev.value << "}";
+        }
+        oss << "\n  ]\n"
             << "}\n";
+        body = oss.str();
+        st.last_hang_report = body;
     }
+
+    // Invoke registered hang callbacks outside the mutex to prevent re-entrancy deadlocks.
+    using PfnHixHangCb = void(OS_DIAG_CALL*)(const char*, void*);
+    for (const auto& cb : hang_cbs) {
+        if (cb.callback) {
+            auto fn = reinterpret_cast<PfnHixHangCb>(cb.callback);
+            fn(reason, cb.context);
+        }
+    }
+
     if (optionalOutputPath && *optionalOutputPath) {
         fs::path out_path(optionalOutputPath);
         std::error_code ec;
@@ -1684,14 +1994,67 @@ OS_DIAG_API int32_t OS_DIAG_CALL HixRequestHangDump(
         if (!ofs) {
             return RecordHix("HixRequestHangDump", kHrFail);
         }
-        const std::string body = oss.str();
         ofs.write(body.data(), static_cast<std::streamsize>(body.size()));
         ofs.flush();
         if (!ofs.good()) {
             return RecordHix("HixRequestHangDump", kHrFail);
         }
     }
+
+    using PfnHixMinidumpCb = void(OS_DIAG_CALL*)(const char*, const char*, void*);
+    for (const auto& cb : minidump_cbs) {
+        if (cb.callback) {
+            auto fn = reinterpret_cast<PfnHixMinidumpCb>(cb.callback);
+            fn(reason, optionalOutputPath ? optionalOutputPath : "", cb.context);
+        }
+    }
+
     return RecordHix("HixRequestHangDump", kHrOk);
+}
+
+OS_DIAG_API int32_t OS_DIAG_CALL HixGetLastHangReport(
+    char* outBuffer,
+    uint32_t bufferBytes,
+    uint32_t* outWritten) {
+    auto& st = GetHix();
+    std::lock_guard<std::mutex> lk(st.mutex);
+    const uint32_t needed = static_cast<uint32_t>(st.last_hang_report.size() + 1u);
+    if (outWritten) {
+        *outWritten = needed;
+    }
+    if (!outBuffer || bufferBytes == 0u) {
+        return RecordHix("HixGetLastHangReport",
+                         outWritten ? kHrOk : kHrInvalidArg);
+    }
+    if (bufferBytes < needed) {
+        return RecordHix("HixGetLastHangReport", kHixHrInsufficientBuffer);
+    }
+    std::memcpy(outBuffer, st.last_hang_report.c_str(), needed);
+    return RecordHix("HixGetLastHangReport", kHrOk);
+}
+
+OS_DIAG_API int32_t OS_DIAG_CALL HixGetRingLogCount(
+    uint64_t* outTotalEvents,
+    uint32_t* outBufferedEvents) {
+    auto& st = GetHix();
+    std::lock_guard<std::mutex> lk(st.mutex);
+    if (outTotalEvents) {
+        *outTotalEvents = st.next_ring_seq > 0u ? (st.next_ring_seq - 1u) : 0u;
+    }
+    if (outBufferedEvents) {
+        *outBufferedEvents = static_cast<uint32_t>(st.ring.size());
+    }
+    return RecordHix("HixGetRingLogCount", kHrOk);
+}
+
+OS_DIAG_API int32_t OS_DIAG_CALL HixIsSessionActive(int32_t* outActive) {
+    if (!outActive) {
+        return RecordHix("HixIsSessionActive", kHrPointer);
+    }
+    auto& st = GetHix();
+    std::lock_guard<std::mutex> lk(st.mutex);
+    *outActive = (st.init_count > 0u) ? 1 : 0;
+    return RecordHix("HixIsSessionActive", kHrOk);
 }
 
 OS_DIAG_API int32_t OS_DIAG_CALL HixGetStats(
@@ -1714,20 +2077,65 @@ OS_DIAG_API int32_t OS_DIAG_CALL OpenScarlettHixGetTelemetryCount(
 }  // extern "C"
 
 // ===========================================================================
-// TARGET 4: xbtp.dll (Xbox Binary Telemetry / Profiling Session Stubs)
+// TARGET 4: xbtp.dll (Real Windows IOCP Bidirectional Transport & Sessions)
 // ===========================================================================
 #elif defined(OPENSCARLETT_DIAG_TARGET_XBTP)
 
 namespace {
 
 constexpr const char* kXbtpMod = "xbtp.dll";
+constexpr int32_t kXbtpHrAbort = static_cast<int32_t>(0x80004004u);
+constexpr int32_t kXbtpHrTimeout = static_cast<int32_t>(0x80070102u);
+constexpr int32_t kXbtpHrInsufficientBuffer = static_cast<int32_t>(0x8007007Au);
+constexpr int32_t kXbtpHrOutOfMemory = static_cast<int32_t>(0x8007000Eu);
+
+#if defined(_WIN32)
+constexpr ULONG_PTR kXbtpCompKeyPacket = 0x58425450u;
+constexpr ULONG_PTR kXbtpCompKeyCancel = 0x43414E43u;
+#endif
+
+struct XbtpFramedPacket {
+    uint32_t packet_type = 0u;
+    uint64_t seq = 0u;
+    std::vector<uint8_t> payload;
+};
+
+struct XbtpIocpQueue {
+#if defined(_WIN32)
+    HANDLE iocp = nullptr;
+#else
+    std::deque<XbtpFramedPacket*> fallback_queue;
+#endif
+    std::mutex wait_mutex;
+    std::condition_variable wait_cv;
+    uint32_t active_waiters = 0u;
+    std::atomic<bool> closing{false};
+    std::atomic<uint64_t> next_seq{1u};
+    std::atomic<uint64_t> packets_sent{0u};
+    std::atomic<uint64_t> packets_received{0u};
+    std::atomic<uint64_t> packets_drained{0u};
+};
+
+struct XbtpState;
+XbtpState& GetXbtp();
+
+struct XbtpChannel {
+    uintptr_t handle = 0u;
+    uintptr_t parent_session = 0u;
+    std::string name;
+    uint32_t channel_number = 0u;
+    // Direction 0: client->host, Direction 1: host->client
+    XbtpIocpQueue queues[2];
+};
 
 struct XbtpSession {
+    uintptr_t handle = 0u;
     std::string name;
     uint32_t flags = 0u;
-    uint64_t events_written = 0u;
-    uint64_t bytes_written = 0u;
-    uint64_t flush_count = 0u;
+    std::atomic<uint64_t> events_written{0u};
+    std::atomic<uint64_t> bytes_written{0u};
+    std::atomic<uint64_t> flush_count{0u};
+    XbtpIocpQueue event_queue;
 };
 
 struct XbtpState {
@@ -1735,12 +2143,241 @@ struct XbtpState {
     uint32_t init_count = 0u;
     uint32_t flags = 0u;
     uintptr_t next_handle = 0x7B790001u;
-    std::unordered_map<uintptr_t, XbtpSession> sessions;
+    uintptr_t next_channel = 0x7B7C0001u;
+    std::unordered_map<uintptr_t, std::shared_ptr<XbtpSession>> sessions;
+    std::unordered_map<uintptr_t, std::shared_ptr<XbtpChannel>> channels;
+    std::atomic<uint64_t> active_iocp_handles{0u};
+    std::atomic<uint64_t> total_packets_sent{0u};
+    std::atomic<uint64_t> total_packets_received{0u};
+    std::atomic<uint64_t> total_packets_drained{0u};
 };
 
 XbtpState& GetXbtp() {
     static XbtpState* s = new XbtpState();
     return *s;
+}
+
+bool InitIocpQueue(XbtpIocpQueue& q) {
+#if defined(_WIN32)
+    q.iocp = ::CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0u, 1u);
+    if (!q.iocp) {
+        return false;
+    }
+    GetXbtp().active_iocp_handles.fetch_add(1u, std::memory_order_acq_rel);
+    return true;
+#else
+    (void)q;
+    return true;
+#endif
+}
+
+int32_t PostPacketToIocpQueue(XbtpIocpQueue& q,
+                              uint32_t packetType,
+                              const void* payload,
+                              uint32_t payloadBytes) {
+    if (q.closing.load(std::memory_order_acquire)) {
+        return kXbtpHrAbort;
+    }
+    auto* pkt = new (std::nothrow) XbtpFramedPacket();
+    if (!pkt) {
+        return kXbtpHrOutOfMemory;
+    }
+    pkt->packet_type = packetType;
+    pkt->seq = q.next_seq.fetch_add(1u, std::memory_order_relaxed);
+    if (payloadBytes > 0u && payload) {
+        const auto* bytes = static_cast<const uint8_t*>(payload);
+        pkt->payload.assign(bytes, bytes + payloadBytes);
+    }
+#if defined(_WIN32)
+    // Hold wait_mutex briefly while checking closing & posting so CloseIocpQueue
+    // cannot close the HANDLE mid-PostQueuedCompletionStatus.
+    std::lock_guard<std::mutex> lk(q.wait_mutex);
+    if (q.closing.load(std::memory_order_acquire) || !q.iocp) {
+        delete pkt;
+        return kXbtpHrAbort;
+    }
+    if (!::PostQueuedCompletionStatus(
+            q.iocp,
+            static_cast<DWORD>(payloadBytes),
+            kXbtpCompKeyPacket,
+            reinterpret_cast<LPOVERLAPPED>(pkt))) {
+        delete pkt;
+        return kHrFail;
+    }
+#else
+    {
+        std::lock_guard<std::mutex> lk(q.wait_mutex);
+        if (q.closing.load(std::memory_order_acquire)) {
+            delete pkt;
+            return kXbtpHrAbort;
+        }
+        q.fallback_queue.push_back(pkt);
+        q.wait_cv.notify_one();
+    }
+#endif
+    q.packets_sent.fetch_add(1u, std::memory_order_relaxed);
+    GetXbtp().total_packets_sent.fetch_add(1u, std::memory_order_relaxed);
+    return kHrOk;
+}
+
+int32_t RecvPacketFromIocpQueue(XbtpIocpQueue& q,
+                                uint32_t timeoutMs,
+                                uint32_t* outPacketType,
+                                void* outPayload,
+                                uint32_t payloadCap,
+                                uint32_t* outPayloadBytes) {
+    if (outPacketType) *outPacketType = 0u;
+    if (outPayloadBytes) *outPayloadBytes = 0u;
+
+#if defined(_WIN32)
+    HANDLE iocp_local = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(q.wait_mutex);
+        if (q.closing.load(std::memory_order_acquire) || !q.iocp) {
+            return kXbtpHrAbort;
+        }
+        iocp_local = q.iocp;
+        ++q.active_waiters;
+    }
+
+    struct WaiterGuard {
+        XbtpIocpQueue* queue = nullptr;
+        ~WaiterGuard() {
+            std::lock_guard<std::mutex> lk(queue->wait_mutex);
+            if (queue->active_waiters > 0u) {
+                --queue->active_waiters;
+            }
+            if (queue->active_waiters == 0u) {
+                queue->wait_cv.notify_all();
+            }
+        }
+    } guard{&q};
+
+    DWORD transferred = 0u;
+    ULONG_PTR comp_key = 0u;
+    LPOVERLAPPED ov = nullptr;
+    const BOOL ok = ::GetQueuedCompletionStatus(
+        iocp_local,
+        &transferred,
+        &comp_key,
+        &ov,
+        static_cast<DWORD>(timeoutMs));
+    if (!ok) {
+        const DWORD err = ::GetLastError();
+        if (err == WAIT_TIMEOUT) {
+            return kXbtpHrTimeout;
+        }
+        return kXbtpHrAbort;
+    }
+    if (comp_key == kXbtpCompKeyCancel || !ov) {
+        return kXbtpHrAbort;
+    }
+
+    std::unique_ptr<XbtpFramedPacket> pkt(reinterpret_cast<XbtpFramedPacket*>(ov));
+    const uint32_t nbytes = static_cast<uint32_t>(pkt->payload.size());
+    if (outPacketType) *outPacketType = pkt->packet_type;
+    if (outPayloadBytes) *outPayloadBytes = nbytes;
+    q.packets_received.fetch_add(1u, std::memory_order_relaxed);
+    GetXbtp().total_packets_received.fetch_add(1u, std::memory_order_relaxed);
+    if (nbytes > 0u) {
+        if (!outPayload || payloadCap < nbytes) {
+            return kXbtpHrInsufficientBuffer;
+        }
+        std::memcpy(outPayload, pkt->payload.data(), nbytes);
+    }
+    return kHrOk;
+#else
+    std::unique_ptr<XbtpFramedPacket> pkt;
+    {
+        std::unique_lock<std::mutex> lk(q.wait_mutex);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+        while (q.fallback_queue.empty() && !q.closing.load(std::memory_order_acquire)) {
+            if (timeoutMs == 0u) {
+                return kXbtpHrTimeout;
+            }
+            if (q.wait_cv.wait_until(lk, deadline) == std::cv_status::timeout) {
+                if (q.fallback_queue.empty()) {
+                    return kXbtpHrTimeout;
+                }
+            }
+        }
+        if (q.fallback_queue.empty()) {
+            return kXbtpHrAbort;
+        }
+        pkt.reset(q.fallback_queue.front());
+        q.fallback_queue.pop_front();
+    }
+    const uint32_t nbytes = static_cast<uint32_t>(pkt->payload.size());
+    if (outPacketType) *outPacketType = pkt->packet_type;
+    if (outPayloadBytes) *outPayloadBytes = nbytes;
+    q.packets_received.fetch_add(1u, std::memory_order_relaxed);
+    GetXbtp().total_packets_received.fetch_add(1u, std::memory_order_relaxed);
+    if (nbytes > 0u) {
+        if (!outPayload || payloadCap < nbytes) {
+            return kXbtpHrInsufficientBuffer;
+        }
+        std::memcpy(outPayload, pkt->payload.data(), nbytes);
+    }
+    return kHrOk;
+#endif
+}
+
+void CloseIocpQueue(XbtpIocpQueue& q) {
+#if defined(_WIN32)
+    HANDLE iocp_to_close = nullptr;
+    {
+        std::unique_lock<std::mutex> lk(q.wait_mutex);
+        q.closing.store(true, std::memory_order_release);
+        if (!q.iocp) {
+            return;
+        }
+        // Wake every active blocked waiter via explicit cancel completion sentinel.
+        const uint32_t wake_count = q.active_waiters + 1u;
+        for (uint32_t i = 0u; i < wake_count; ++i) {
+            (void)::PostQueuedCompletionStatus(q.iocp, 0u, kXbtpCompKeyCancel, nullptr);
+        }
+        q.wait_cv.wait(lk, [&]() { return q.active_waiters == 0u; });
+        iocp_to_close = q.iocp;
+        q.iocp = nullptr;
+    }
+
+    // Drain every remaining queued framed packet so ZERO heap allocations leak.
+    uint64_t drained = 0u;
+    for (;;) {
+        DWORD transferred = 0u;
+        ULONG_PTR comp_key = 0u;
+        LPOVERLAPPED ov = nullptr;
+        const BOOL got = ::GetQueuedCompletionStatus(
+            iocp_to_close, &transferred, &comp_key, &ov, 0u);
+        if (!got) {
+            break;
+        }
+        if (comp_key == kXbtpCompKeyPacket && ov != nullptr) {
+            delete reinterpret_cast<XbtpFramedPacket*>(ov);
+            ++drained;
+        }
+    }
+    if (drained > 0u) {
+        q.packets_drained.fetch_add(drained, std::memory_order_relaxed);
+        GetXbtp().total_packets_drained.fetch_add(drained, std::memory_order_relaxed);
+    }
+    ::CloseHandle(iocp_to_close);
+    GetXbtp().active_iocp_handles.fetch_sub(1u, std::memory_order_acq_rel);
+#else
+    std::lock_guard<std::mutex> lk(q.wait_mutex);
+    q.closing.store(true, std::memory_order_release);
+    q.wait_cv.notify_all();
+    uint64_t drained = 0u;
+    while (!q.fallback_queue.empty()) {
+        delete q.fallback_queue.front();
+        q.fallback_queue.pop_front();
+        ++drained;
+    }
+    if (drained > 0u) {
+        q.packets_drained.fetch_add(drained, std::memory_order_relaxed);
+        GetXbtp().total_packets_drained.fetch_add(drained, std::memory_order_relaxed);
+    }
+#endif
 }
 
 inline int32_t RecordXbtp(const char* sym, int32_t hr) {
@@ -1785,13 +2422,20 @@ OS_DIAG_API int32_t OS_DIAG_CALL XbtpOpenSession(
     if (!sessionName || !*sessionName) {
         return RecordXbtp("XbtpOpenSession", kHrInvalidArg);
     }
-    auto& st = GetXbtp();
-    std::lock_guard<std::mutex> lk(st.mutex);
-    const uintptr_t h = st.next_handle++;
-    XbtpSession sess{};
-    sess.name = sessionName;
-    sess.flags = flags;
-    st.sessions.emplace(h, std::move(sess));
+    auto sess = std::make_shared<XbtpSession>();
+    if (!InitIocpQueue(sess->event_queue)) {
+        return RecordXbtp("XbtpOpenSession", kHrFail);
+    }
+    sess->name = sessionName;
+    sess->flags = flags;
+    uintptr_t h = 0u;
+    {
+        auto& st = GetXbtp();
+        std::lock_guard<std::mutex> lk(st.mutex);
+        h = st.next_handle++;
+        sess->handle = h;
+        st.sessions.emplace(h, std::move(sess));
+    }
     *outSession = reinterpret_cast<void*>(h);
     return RecordXbtp("XbtpOpenSession", kHrOk);
 }
@@ -1800,12 +2444,33 @@ OS_DIAG_API int32_t OS_DIAG_CALL XbtpCloseSession(void* session) {
     if (!session) {
         return RecordXbtp("XbtpCloseSession", kHrHandle);
     }
-    auto& st = GetXbtp();
-    std::lock_guard<std::mutex> lk(st.mutex);
     const uintptr_t key = reinterpret_cast<uintptr_t>(session);
-    if (st.sessions.erase(key) == 0u) {
-        return RecordXbtp("XbtpCloseSession", kHrHandle);
+    std::shared_ptr<XbtpSession> sess;
+    std::vector<std::shared_ptr<XbtpChannel>> child_channels;
+    {
+        auto& st = GetXbtp();
+        std::lock_guard<std::mutex> lk(st.mutex);
+        auto it = st.sessions.find(key);
+        if (it == st.sessions.end()) {
+            return RecordXbtp("XbtpCloseSession", kHrHandle);
+        }
+        sess = std::move(it->second);
+        st.sessions.erase(it);
+        for (auto cit = st.channels.begin(); cit != st.channels.end(); ) {
+            if (cit->second && cit->second->parent_session == key) {
+                child_channels.push_back(std::move(cit->second));
+                cit = st.channels.erase(cit);
+            } else {
+                ++cit;
+            }
+        }
     }
+    // Close outside global lock so blocked readers wake and exit without deadlocking.
+    for (auto& ch : child_channels) {
+        CloseIocpQueue(ch->queues[0]);
+        CloseIocpQueue(ch->queues[1]);
+    }
+    CloseIocpQueue(sess->event_queue);
     return RecordXbtp("XbtpCloseSession", kHrOk);
 }
 
@@ -1814,35 +2479,70 @@ OS_DIAG_API int32_t OS_DIAG_CALL XbtpWriteEvent(
     uint32_t eventId,
     const void* payload,
     uint32_t payloadBytes) {
-    (void)eventId;
     if (!session) {
         return RecordXbtp("XbtpWriteEvent", kHrHandle);
     }
     if (payloadBytes > 0u && !payload) {
         return RecordXbtp("XbtpWriteEvent", kHrInvalidArg);
     }
-    auto& st = GetXbtp();
-    std::lock_guard<std::mutex> lk(st.mutex);
-    auto it = st.sessions.find(reinterpret_cast<uintptr_t>(session));
-    if (it == st.sessions.end()) {
-        return RecordXbtp("XbtpWriteEvent", kHrHandle);
+    std::shared_ptr<XbtpSession> sess;
+    {
+        auto& st = GetXbtp();
+        std::lock_guard<std::mutex> lk(st.mutex);
+        auto it = st.sessions.find(reinterpret_cast<uintptr_t>(session));
+        if (it == st.sessions.end()) {
+            return RecordXbtp("XbtpWriteEvent", kHrHandle);
+        }
+        sess = it->second;
     }
-    ++it->second.events_written;
-    it->second.bytes_written += payloadBytes;
-    return RecordXbtp("XbtpWriteEvent", kHrOk);
+    const int32_t hr = PostPacketToIocpQueue(sess->event_queue, eventId, payload, payloadBytes);
+    if (hr >= 0) {
+        sess->events_written.fetch_add(1u, std::memory_order_relaxed);
+        sess->bytes_written.fetch_add(payloadBytes, std::memory_order_relaxed);
+    }
+    return RecordXbtp("XbtpWriteEvent", hr);
+}
+
+OS_DIAG_API int32_t OS_DIAG_CALL XbtpReadEvent(
+    void* session,
+    uint32_t timeoutMs,
+    uint32_t* outEventId,
+    void* outPayload,
+    uint32_t payloadCap,
+    uint32_t* outPayloadBytes) {
+    if (!session) {
+        return RecordXbtp("XbtpReadEvent", kHrHandle);
+    }
+    std::shared_ptr<XbtpSession> sess;
+    {
+        auto& st = GetXbtp();
+        std::lock_guard<std::mutex> lk(st.mutex);
+        auto it = st.sessions.find(reinterpret_cast<uintptr_t>(session));
+        if (it == st.sessions.end()) {
+            return RecordXbtp("XbtpReadEvent", kHrHandle);
+        }
+        sess = it->second;
+    }
+    const int32_t hr = RecvPacketFromIocpQueue(
+        sess->event_queue, timeoutMs, outEventId, outPayload, payloadCap, outPayloadBytes);
+    return RecordXbtp("XbtpReadEvent", hr);
 }
 
 OS_DIAG_API int32_t OS_DIAG_CALL XbtpFlushSession(void* session) {
     if (!session) {
         return RecordXbtp("XbtpFlushSession", kHrHandle);
     }
-    auto& st = GetXbtp();
-    std::lock_guard<std::mutex> lk(st.mutex);
-    auto it = st.sessions.find(reinterpret_cast<uintptr_t>(session));
-    if (it == st.sessions.end()) {
-        return RecordXbtp("XbtpFlushSession", kHrHandle);
+    std::shared_ptr<XbtpSession> sess;
+    {
+        auto& st = GetXbtp();
+        std::lock_guard<std::mutex> lk(st.mutex);
+        auto it = st.sessions.find(reinterpret_cast<uintptr_t>(session));
+        if (it == st.sessions.end()) {
+            return RecordXbtp("XbtpFlushSession", kHrHandle);
+        }
+        sess = it->second;
     }
-    ++it->second.flush_count;
+    sess->flush_count.fetch_add(1u, std::memory_order_relaxed);
     return RecordXbtp("XbtpFlushSession", kHrOk);
 }
 
@@ -1854,16 +2554,163 @@ OS_DIAG_API int32_t OS_DIAG_CALL XbtpGetSessionStats(
     if (!session) {
         return RecordXbtp("XbtpGetSessionStats", kHrHandle);
     }
-    auto& st = GetXbtp();
-    std::lock_guard<std::mutex> lk(st.mutex);
-    auto it = st.sessions.find(reinterpret_cast<uintptr_t>(session));
-    if (it == st.sessions.end()) {
-        return RecordXbtp("XbtpGetSessionStats", kHrHandle);
+    std::shared_ptr<XbtpSession> sess;
+    {
+        auto& st = GetXbtp();
+        std::lock_guard<std::mutex> lk(st.mutex);
+        auto it = st.sessions.find(reinterpret_cast<uintptr_t>(session));
+        if (it == st.sessions.end()) {
+            return RecordXbtp("XbtpGetSessionStats", kHrHandle);
+        }
+        sess = it->second;
     }
-    if (outEventsWritten) *outEventsWritten = it->second.events_written;
-    if (outBytesWritten) *outBytesWritten = it->second.bytes_written;
-    if (outFlushCount) *outFlushCount = it->second.flush_count;
+    if (outEventsWritten) *outEventsWritten = sess->events_written.load(std::memory_order_relaxed);
+    if (outBytesWritten) *outBytesWritten = sess->bytes_written.load(std::memory_order_relaxed);
+    if (outFlushCount) *outFlushCount = sess->flush_count.load(std::memory_order_relaxed);
     return RecordXbtp("XbtpGetSessionStats", kHrOk);
+}
+
+OS_DIAG_API int32_t OS_DIAG_CALL XbtpOpenChannel(
+    void* session,
+    const char* channelName,
+    uint32_t channelNumber,
+    void** outChannel) {
+    if (!outChannel) {
+        return RecordXbtp("XbtpOpenChannel", kHrPointer);
+    }
+    *outChannel = nullptr;
+    const uintptr_t sess_key = reinterpret_cast<uintptr_t>(session);
+    if (session != nullptr) {
+        auto& st = GetXbtp();
+        std::lock_guard<std::mutex> lk(st.mutex);
+        if (st.sessions.find(sess_key) == st.sessions.end()) {
+            return RecordXbtp("XbtpOpenChannel", kHrHandle);
+        }
+    }
+    auto ch = std::make_shared<XbtpChannel>();
+    if (!InitIocpQueue(ch->queues[0])) {
+        return RecordXbtp("XbtpOpenChannel", kHrFail);
+    }
+    if (!InitIocpQueue(ch->queues[1])) {
+        CloseIocpQueue(ch->queues[0]);
+        return RecordXbtp("XbtpOpenChannel", kHrFail);
+    }
+    ch->parent_session = sess_key;
+    ch->name = (channelName && *channelName) ? channelName : "";
+    ch->channel_number = channelNumber;
+
+    uintptr_t h = 0u;
+    {
+        auto& st = GetXbtp();
+        std::lock_guard<std::mutex> lk(st.mutex);
+        h = st.next_channel++;
+        ch->handle = h;
+        st.channels.emplace(h, std::move(ch));
+    }
+    *outChannel = reinterpret_cast<void*>(h);
+    return RecordXbtp("XbtpOpenChannel", kHrOk);
+}
+
+OS_DIAG_API int32_t OS_DIAG_CALL XbtpSendPacket(
+    void* channel,
+    uint32_t direction,
+    uint32_t packetType,
+    const void* payload,
+    uint32_t payloadBytes) {
+    if (!channel) {
+        return RecordXbtp("XbtpSendPacket", kHrHandle);
+    }
+    if (payloadBytes > 0u && !payload) {
+        return RecordXbtp("XbtpSendPacket", kHrInvalidArg);
+    }
+    std::shared_ptr<XbtpChannel> ch;
+    {
+        auto& st = GetXbtp();
+        std::lock_guard<std::mutex> lk(st.mutex);
+        auto it = st.channels.find(reinterpret_cast<uintptr_t>(channel));
+        if (it == st.channels.end()) {
+            return RecordXbtp("XbtpSendPacket", kHrHandle);
+        }
+        ch = it->second;
+    }
+    const uint32_t idx = (direction == 0u) ? 0u : 1u;
+    const int32_t hr = PostPacketToIocpQueue(ch->queues[idx], packetType, payload, payloadBytes);
+    return RecordXbtp("XbtpSendPacket", hr);
+}
+
+OS_DIAG_API int32_t OS_DIAG_CALL XbtpReceivePacket(
+    void* channel,
+    uint32_t direction,
+    uint32_t timeoutMs,
+    uint32_t* outPacketType,
+    void* outPayload,
+    uint32_t payloadCap,
+    uint32_t* outPayloadBytes) {
+    if (!channel) {
+        return RecordXbtp("XbtpReceivePacket", kHrHandle);
+    }
+    std::shared_ptr<XbtpChannel> ch;
+    {
+        auto& st = GetXbtp();
+        std::lock_guard<std::mutex> lk(st.mutex);
+        auto it = st.channels.find(reinterpret_cast<uintptr_t>(channel));
+        if (it == st.channels.end()) {
+            return RecordXbtp("XbtpReceivePacket", kHrHandle);
+        }
+        ch = it->second;
+    }
+    const uint32_t idx = (direction == 0u) ? 0u : 1u;
+    const int32_t hr = RecvPacketFromIocpQueue(
+        ch->queues[idx], timeoutMs, outPacketType, outPayload, payloadCap, outPayloadBytes);
+    return RecordXbtp("XbtpReceivePacket", hr);
+}
+
+OS_DIAG_API int32_t OS_DIAG_CALL XbtpCloseChannel(void* channel) {
+    if (!channel) {
+        return RecordXbtp("XbtpCloseChannel", kHrHandle);
+    }
+    std::shared_ptr<XbtpChannel> ch;
+    {
+        auto& st = GetXbtp();
+        std::lock_guard<std::mutex> lk(st.mutex);
+        auto it = st.channels.find(reinterpret_cast<uintptr_t>(channel));
+        if (it == st.channels.end()) {
+            return RecordXbtp("XbtpCloseChannel", kHrHandle);
+        }
+        ch = std::move(it->second);
+        st.channels.erase(it);
+    }
+    CloseIocpQueue(ch->queues[0]);
+    CloseIocpQueue(ch->queues[1]);
+    return RecordXbtp("XbtpCloseChannel", kHrOk);
+}
+
+OS_DIAG_API int32_t OS_DIAG_CALL XbtpGetTransportStats(
+    uint32_t* outOpenSessions,
+    uint32_t* outOpenChannels,
+    uint64_t* outActiveIocpHandles,
+    uint64_t* outPacketsSent,
+    uint64_t* outPacketsReceived,
+    uint64_t* outPacketsDrained) {
+    auto& st = GetXbtp();
+    {
+        std::lock_guard<std::mutex> lk(st.mutex);
+        if (outOpenSessions) *outOpenSessions = static_cast<uint32_t>(st.sessions.size());
+        if (outOpenChannels) *outOpenChannels = static_cast<uint32_t>(st.channels.size());
+    }
+    if (outActiveIocpHandles) {
+        *outActiveIocpHandles = st.active_iocp_handles.load(std::memory_order_acquire);
+    }
+    if (outPacketsSent) {
+        *outPacketsSent = st.total_packets_sent.load(std::memory_order_relaxed);
+    }
+    if (outPacketsReceived) {
+        *outPacketsReceived = st.total_packets_received.load(std::memory_order_relaxed);
+    }
+    if (outPacketsDrained) {
+        *outPacketsDrained = st.total_packets_drained.load(std::memory_order_relaxed);
+    }
+    return RecordXbtp("XbtpGetTransportStats", kHrOk);
 }
 
 OS_DIAG_API int32_t OS_DIAG_CALL OpenScarlettXbtpGetTelemetryCount(

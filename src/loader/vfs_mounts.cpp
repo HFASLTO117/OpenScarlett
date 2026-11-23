@@ -1071,10 +1071,12 @@ std::wstring ResolveDefaultWorkDirW(std::wstring_view anchor_dir) {
         }
     }
 
-    // 3. Derive from anchor_dir (or running executable's directory) if writable.
-    std::wstring base_dir = anchor_dir.empty() ? GetRunningExeDirW() : NormalizePathRootW(anchor_dir);
-    if (!base_dir.empty()) {
-        std::filesystem::path p(base_dir);
+    // 3. Derive from anchor_dir (or running executable's directory) if off C:\ and writable.
+    auto try_anchor_dir = [](const std::wstring& dir_in, std::wstring& out_dir) -> bool {
+        if (dir_in.empty() || IsPathOnSystemDriveW(dir_in)) {
+            return false;
+        }
+        std::filesystem::path p(dir_in);
         std::wstring leaf_lo = ToLowerAsciiW(p.filename().wstring());
 
         // Handle multi-config build outputs such as "...\build\Release" or "...\bin\Debug".
@@ -1096,12 +1098,32 @@ std::wstring ResolveDefaultWorkDirW(std::wstring_view anchor_dir) {
             candidate = NormalizePathRootW((p / L".openscarlett_tmp").wstring());
         }
 
-        if (!candidate.empty() && IsDirectoryWritableW(candidate)) {
-            return candidate;
+        if (!candidate.empty() && !IsPathOnSystemDriveW(candidate) && IsDirectoryWritableW(candidate)) {
+            out_dir = std::move(candidate);
+            return true;
+        }
+        return false;
+    };
+
+    std::wstring resolved;
+    const std::wstring effective_anchor =
+        !anchor_dir.empty() ? NormalizePathRootW(anchor_dir) : GetRunningExeDirW();
+    if (!effective_anchor.empty() && try_anchor_dir(effective_anchor, resolved)) {
+        return resolved;
+    }
+
+    // 4. When no explicit unwritable anchor_dir was forced by the caller, prefer the
+    //    non-system-drive fallback (E:\OpenScarlett\.tmp\openscarlett_run) if writable
+    //    before EVER touching a C:\ %TEMP% directory.
+    if (anchor_dir.empty()) {
+        const std::wstring fallback(kDefaultWorkDirFallbackW);
+        if (!IsPathOnSystemDriveW(fallback) && IsDirectoryWritableW(fallback)) {
+            return fallback;
         }
     }
 
-    // 4. Only fall back to %TEMP%\openscarlett when the executable/anchor directory is read-only.
+    // 5. Fallback to %TEMP%\openscarlett ONLY when the anchor directory is unwritable
+    //    or on single-drive C:\-only machines (e.g. GitHub Actions CI runners).
     if (!env_temp.empty()) {
         return NormalizePathRootW(env_temp + L"\\openscarlett");
     }
@@ -1519,7 +1541,10 @@ VfsTranslateStatus VfsMounts::TranslateForAccessW(std::wstring_view virtual_path
                 if (base_is_dir) {
                     EnsureDirectoryTreeW(overlay_plain);
                 } else {
-                    CopyBaseFileToOverlay(base_plain, overlay_plain);
+                    if (!CopyBaseFileToOverlay(base_plain, overlay_plain)) {
+                        out_host_path.clear();
+                        return VfsTranslateStatus::ReadOnlyViolation;
+                    }
                 }
             }
         }
@@ -2275,6 +2300,226 @@ VfsTranslateStatus VfsMounts::ResolveGamePairW(std::wstring_view virtual_path,
     }
 #endif
     return VfsTranslateStatus::Translated;
+}
+
+bool VfsMounts::HasBaseGamePathW(std::wstring_view virtual_path, bool* out_is_dir) const {
+#if !defined(_WIN32)
+    (void)virtual_path;
+    (void)out_is_dir;
+    return false;
+#else
+    ParsedVirtualPath parsed;
+    if (ParseVirtualPathW(virtual_path, parsed) != VfsTranslateStatus::Translated ||
+        parsed.drive != VfsDrive::Game || (g_root_.empty() && g_sub_mounts_.empty()) ||
+        IsRealHostDrivePathW(parsed, g_root_, g_overlay_root_, t_root_, s_root_, g_sub_mounts_,
+                             preserve_host_drive_folders_, preserved_host_prefixes_)) {
+        return false;
+    }
+    std::wstring matched_base_root;
+    std::vector<std::wstring_view> base_rel_parts;
+    ResolveGameBaseTarget(g_root_, g_sub_mounts_, parsed.parts, matched_base_root, base_rel_parts);
+    if (matched_base_root.empty()) {
+        return false;
+    }
+    const std::wstring base_plain = JoinRootAndParts(matched_base_root, base_rel_parts, PathPrefixKind::None);
+    return HostPathExistsW(base_plain, out_is_dir);
+#endif
+}
+
+bool VfsMounts::WriteWhiteoutForVirtualPathW(std::wstring_view virtual_path) const {
+#if !defined(_WIN32)
+    (void)virtual_path;
+    return false;
+#else
+    if (g_overlay_root_.empty()) {
+        return false;
+    }
+    ParsedVirtualPath parsed;
+    if (ParseVirtualPathW(virtual_path, parsed) != VfsTranslateStatus::Translated ||
+        parsed.drive != VfsDrive::Game || parsed.parts.empty()) {
+        return false;
+    }
+    if (VerifyHostPathContainmentW(g_overlay_root_, parsed.parts, nullptr, true, forbid_system_drive_writes_) !=
+        VfsTranslateStatus::Translated) {
+        return false;
+    }
+    EnsureDirectoryTreeW(g_overlay_root_);
+    return WriteWhiteoutMarker(g_overlay_root_, parsed.parts);
+#endif
+}
+
+bool VfsMounts::ClearWhiteoutForVirtualPathW(std::wstring_view virtual_path) const {
+#if !defined(_WIN32)
+    (void)virtual_path;
+    return false;
+#else
+    if (g_overlay_root_.empty()) {
+        return false;
+    }
+    ParsedVirtualPath parsed;
+    if (ParseVirtualPathW(virtual_path, parsed) != VfsTranslateStatus::Translated ||
+        parsed.drive != VfsDrive::Game || parsed.parts.empty()) {
+        return false;
+    }
+    ClearWhiteoutMarkers(g_overlay_root_, parsed.parts);
+    return true;
+#endif
+}
+
+bool VfsMounts::TryMapHostPathToVirtualW(std::wstring_view host_path,
+                                         std::wstring& out_virtual_path,
+                                         bool* out_from_overlay) const {
+    out_virtual_path.clear();
+    if (out_from_overlay) {
+        *out_from_overlay = false;
+    }
+    if (host_path.empty()) {
+        return false;
+    }
+    auto clean_path = [](std::wstring_view p) {
+        std::wstring s(p);
+        for (wchar_t& c : s) {
+            if (c == L'/') c = L'\\';
+        }
+        if (IsNtGlobalDosDevicesPrefixW(s)) {
+            s.erase(0, 10);
+        } else if (IsNtDosDevicesPrefixW(s) || IsExtendedPrefixW(s)) {
+            s.erase(0, 4);
+        }
+        while (s.size() > 3 && s.back() == L'\\') {
+            s.pop_back();
+        }
+        return s;
+    };
+
+    const std::wstring norm_host = clean_path(host_path);
+    const std::wstring norm_host_lo = ToLowerAsciiW(norm_host);
+
+    auto match_root = [&](const std::wstring& root,
+                          const wchar_t* drive_prefix,
+                          const std::wstring& sub_prefix,
+                          bool is_overlay) -> bool {
+        if (root.empty()) {
+            return false;
+        }
+        const std::wstring norm_root = clean_path(root);
+        const std::wstring norm_root_lo = ToLowerAsciiW(norm_root);
+        if (norm_host_lo.size() < norm_root_lo.size() ||
+            norm_host_lo.compare(0, norm_root_lo.size(), norm_root_lo) != 0) {
+            return false;
+        }
+        if (norm_host_lo.size() > norm_root_lo.size() &&
+            norm_host_lo[norm_root_lo.size()] != L'\\') {
+            return false;
+        }
+        std::wstring rel;
+        if (norm_host_lo.size() > norm_root_lo.size()) {
+            rel = norm_host.substr(norm_root_lo.size() + 1u);
+        }
+        if (is_overlay && !rel.empty()) {
+            const std::wstring rel_lo = ToLowerAsciiW(rel);
+            if (rel_lo == kWhiteoutDirNameW ||
+                rel_lo.rfind(std::wstring(kWhiteoutDirNameW) + L"\\", 0u) == 0u) {
+                return false;
+            }
+        }
+        out_virtual_path = drive_prefix;
+        if (!sub_prefix.empty()) {
+            out_virtual_path.push_back(L'\\');
+            out_virtual_path.append(sub_prefix);
+        }
+        if (!rel.empty()) {
+            out_virtual_path.push_back(L'\\');
+            out_virtual_path.append(rel);
+        } else {
+            out_virtual_path.push_back(L'\\');
+        }
+        if (out_from_overlay) {
+            *out_from_overlay = is_overlay;
+        }
+        return true;
+    };
+
+    // Match overlay first so internal G_overlay prefixes are stripped cleanly.
+    if (match_root(g_overlay_root_, L"G:", L"", true)) return true;
+    for (const auto& sub : g_sub_mounts_) {
+        if (match_root(sub.host_root, L"G:", sub.virtual_prefix, false)) return true;
+    }
+    if (match_root(g_root_, L"G:", L"", false)) return true;
+    if (match_root(t_root_, L"T:", L"", false)) return true;
+    if (match_root(s_root_, L"S:", L"", false)) return true;
+    return false;
+}
+
+VfsTranslateStatus VfsMounts::PrepareOverlayTruncateW(std::wstring_view virtual_path,
+                                                      bool allow_create,
+                                                      std::wstring& out_host_path,
+                                                      bool* out_was_whiteout) const {
+    if (out_was_whiteout) {
+        *out_was_whiteout = false;
+    }
+    const VfsDrive drive = DetectVirtualDriveW(virtual_path);
+    if (drive != VfsDrive::Game) {
+        return TranslateForAccessW(
+            virtual_path,
+            allow_create ? VfsAccessMode::WriteCreate : VfsAccessMode::WriteModify,
+            out_host_path,
+            out_was_whiteout,
+            true);
+    }
+
+    // First verify traversal / whiteout / host-drive preservation.
+    std::wstring probe_host;
+    bool was_wo = false;
+    const VfsTranslateStatus ro_st =
+        TranslateForAccessW(virtual_path, VfsAccessMode::ReadOnly, probe_host, &was_wo, false);
+    if (ro_st == VfsTranslateStatus::NotVirtual ||
+        ro_st == VfsTranslateStatus::RejectedTraversal ||
+        ro_st == VfsTranslateStatus::UnconfiguredMount) {
+        out_host_path.clear();
+        return ro_st;
+    }
+    if (ro_st == VfsTranslateStatus::DeletedWhiteout) {
+        if (out_was_whiteout) {
+            *out_was_whiteout = true;
+        }
+        if (!allow_create) {
+            out_host_path.clear();
+            return VfsTranslateStatus::DeletedWhiteout;
+        }
+        return TranslateForAccessW(
+            virtual_path, VfsAccessMode::WriteCreate, out_host_path, out_was_whiteout, true);
+    }
+
+    // If the file is visible (either already in overlay OR un-overlaid in read-only base),
+    // trigger CoW copy-up into the writable overlay (stripping FILE_ATTRIBUTE_READONLY on
+    // the overlay copy) BEFORE the caller truncates the file!
+    if (IsVisibleGamePathW(virtual_path)) {
+        const VfsTranslateStatus mod_st = TranslateForAccessW(
+            virtual_path, VfsAccessMode::WriteModify, out_host_path, out_was_whiteout, true);
+#if defined(_WIN32)
+        if (mod_st == VfsTranslateStatus::Translated && !out_host_path.empty()) {
+            // Strip FILE_ATTRIBUTE_READONLY on the overlay copy so TRUNCATE_EXISTING /
+            // FILE_OVERWRITE / FILE_OVERWRITE_IF succeeds while g_root remains read-only!
+            std::wstring plain = out_host_path;
+            if (IsNtDosDevicesPrefixW(plain)) {
+                plain.erase(0, 4);
+            }
+            ClearReadOnlyAttrW(plain);
+        }
+#endif
+        return mod_st;
+    }
+
+    if (allow_create) {
+        return TranslateForAccessW(
+            virtual_path, VfsAccessMode::WriteCreate, out_host_path, out_was_whiteout, true);
+    }
+    // File does not exist in base or overlay and allow_create == false (TRUNCATE_EXISTING /
+    // FILE_OVERWRITE): return the non-existent overlay path so Win32/NT returns FILE_NOT_FOUND
+    // without touching g_root!
+    return TranslateForAccessW(
+        virtual_path, VfsAccessMode::WriteModify, out_host_path, out_was_whiteout, true);
 }
 
 }  // namespace openscarlett

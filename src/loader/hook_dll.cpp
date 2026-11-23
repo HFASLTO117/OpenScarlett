@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -28,9 +29,18 @@ namespace {
 // ---------------------------------------------------------------------------
 using OS_NTSTATUS = LONG;
 constexpr OS_NTSTATUS OS_STATUS_SUCCESS = 0x00000000L;
+constexpr OS_NTSTATUS OS_STATUS_BUFFER_OVERFLOW = static_cast<OS_NTSTATUS>(0x80000005UL);
+constexpr OS_NTSTATUS OS_STATUS_NO_MORE_FILES = static_cast<OS_NTSTATUS>(0x80000006UL);
+constexpr OS_NTSTATUS OS_STATUS_INVALID_INFO_CLASS = static_cast<OS_NTSTATUS>(0xC0000003UL);
+constexpr OS_NTSTATUS OS_STATUS_INFO_LENGTH_MISMATCH = static_cast<OS_NTSTATUS>(0xC0000004UL);
+constexpr OS_NTSTATUS OS_STATUS_INVALID_PARAMETER = static_cast<OS_NTSTATUS>(0xC000000DUL);
+constexpr OS_NTSTATUS OS_STATUS_NO_SUCH_FILE = static_cast<OS_NTSTATUS>(0xC000000FUL);
 constexpr OS_NTSTATUS OS_STATUS_ACCESS_DENIED = static_cast<OS_NTSTATUS>(0xC0000022UL);
+constexpr OS_NTSTATUS OS_STATUS_BUFFER_TOO_SMALL = static_cast<OS_NTSTATUS>(0xC0000023UL);
 constexpr OS_NTSTATUS OS_STATUS_OBJECT_NAME_NOT_FOUND = static_cast<OS_NTSTATUS>(0xC0000034UL);
+constexpr OS_NTSTATUS OS_STATUS_OBJECT_NAME_COLLISION = static_cast<OS_NTSTATUS>(0xC0000035UL);
 constexpr OS_NTSTATUS OS_STATUS_OBJECT_PATH_NOT_FOUND = static_cast<OS_NTSTATUS>(0xC000003AUL);
+constexpr OS_NTSTATUS OS_STATUS_NOT_A_DIRECTORY = static_cast<OS_NTSTATUS>(0xC0000103UL);
 
 constexpr ULONG OS_FILE_SUPERSEDE = 0x00000000UL;
 constexpr ULONG OS_FILE_OPEN = 0x00000001UL;
@@ -38,6 +48,26 @@ constexpr ULONG OS_FILE_CREATE = 0x00000002UL;
 constexpr ULONG OS_FILE_OPEN_IF = 0x00000003UL;
 constexpr ULONG OS_FILE_OVERWRITE = 0x00000004UL;
 constexpr ULONG OS_FILE_OVERWRITE_IF = 0x00000005UL;
+
+constexpr ULONG OS_FileDirectoryInformation = 1UL;
+constexpr ULONG OS_FileFullDirectoryInformation = 2UL;
+constexpr ULONG OS_FileBothDirectoryInformation = 3UL;
+constexpr ULONG OS_FileRenameInformation = 10UL;
+constexpr ULONG OS_FileNamesInformation = 12UL;
+constexpr ULONG OS_FileDispositionInformation = 13UL;
+constexpr ULONG OS_FileAllocationInformation = 19UL;
+constexpr ULONG OS_FileEndOfFileInformation = 20UL;
+constexpr ULONG OS_FileIdBothDirectoryInformation = 37UL;
+constexpr ULONG OS_FileIdFullDirectoryInformation = 38UL;
+constexpr ULONG OS_FileDispositionInformationEx = 64UL;
+constexpr ULONG OS_FileRenameInformationEx = 65UL;
+
+constexpr ULONG OS_SL_RESTART_SCAN = 0x00000001UL;
+constexpr ULONG OS_SL_RETURN_SINGLE_ENTRY = 0x00000002UL;
+constexpr ULONG OS_SL_NO_CURSOR_UPDATE = 0x00000010UL;
+
+constexpr ULONG OS_FILE_DISPOSITION_DELETE = 0x00000001UL;
+constexpr ULONG OS_FILE_RENAME_REPLACE_IF_EXISTS = 0x00000001UL;
 
 struct OS_UNICODE_STRING {
     USHORT Length;
@@ -70,6 +100,128 @@ struct OS_FILE_BASIC_INFORMATION {
     ULONG FileAttributes;
 };
 
+struct OS_FILE_DIRECTORY_INFORMATION {
+    ULONG NextEntryOffset;
+    ULONG FileIndex;
+    LARGE_INTEGER CreationTime;
+    LARGE_INTEGER LastAccessTime;
+    LARGE_INTEGER LastWriteTime;
+    LARGE_INTEGER ChangeTime;
+    LARGE_INTEGER EndOfFile;
+    LARGE_INTEGER AllocationSize;
+    ULONG FileAttributes;
+    ULONG FileNameLength;
+    WCHAR FileName[1];
+};
+static_assert(offsetof(OS_FILE_DIRECTORY_INFORMATION, FileName) == 64u, "NT ABI mismatch");
+
+struct OS_FILE_FULL_DIR_INFORMATION {
+    ULONG NextEntryOffset;
+    ULONG FileIndex;
+    LARGE_INTEGER CreationTime;
+    LARGE_INTEGER LastAccessTime;
+    LARGE_INTEGER LastWriteTime;
+    LARGE_INTEGER ChangeTime;
+    LARGE_INTEGER EndOfFile;
+    LARGE_INTEGER AllocationSize;
+    ULONG FileAttributes;
+    ULONG FileNameLength;
+    ULONG EaSize;
+    WCHAR FileName[1];
+};
+static_assert(offsetof(OS_FILE_FULL_DIR_INFORMATION, FileName) == 68u, "NT ABI mismatch");
+
+struct OS_FILE_BOTH_DIR_INFORMATION {
+    ULONG NextEntryOffset;
+    ULONG FileIndex;
+    LARGE_INTEGER CreationTime;
+    LARGE_INTEGER LastAccessTime;
+    LARGE_INTEGER LastWriteTime;
+    LARGE_INTEGER ChangeTime;
+    LARGE_INTEGER EndOfFile;
+    LARGE_INTEGER AllocationSize;
+    ULONG FileAttributes;
+    ULONG FileNameLength;
+    ULONG EaSize;
+    CCHAR ShortNameLength;
+    WCHAR ShortName[12];
+    WCHAR FileName[1];
+};
+static_assert(offsetof(OS_FILE_BOTH_DIR_INFORMATION, FileName) == 94u, "NT ABI mismatch");
+
+struct OS_FILE_ID_FULL_DIR_INFORMATION {
+    ULONG NextEntryOffset;
+    ULONG FileIndex;
+    LARGE_INTEGER CreationTime;
+    LARGE_INTEGER LastAccessTime;
+    LARGE_INTEGER LastWriteTime;
+    LARGE_INTEGER ChangeTime;
+    LARGE_INTEGER EndOfFile;
+    LARGE_INTEGER AllocationSize;
+    ULONG FileAttributes;
+    ULONG FileNameLength;
+    ULONG EaSize;
+    ULONG Reserved;
+    LARGE_INTEGER FileId;
+    WCHAR FileName[1];
+};
+static_assert(offsetof(OS_FILE_ID_FULL_DIR_INFORMATION, FileName) == 80u, "NT ABI mismatch");
+
+struct OS_FILE_ID_BOTH_DIR_INFORMATION {
+    ULONG NextEntryOffset;
+    ULONG FileIndex;
+    LARGE_INTEGER CreationTime;
+    LARGE_INTEGER LastAccessTime;
+    LARGE_INTEGER LastWriteTime;
+    LARGE_INTEGER ChangeTime;
+    LARGE_INTEGER EndOfFile;
+    LARGE_INTEGER AllocationSize;
+    ULONG FileAttributes;
+    ULONG FileNameLength;
+    ULONG EaSize;
+    CCHAR ShortNameLength;
+    WCHAR ShortName[12];
+    LARGE_INTEGER FileId;
+    WCHAR FileName[1];
+};
+static_assert(offsetof(OS_FILE_ID_BOTH_DIR_INFORMATION, FileName) == 104u, "NT ABI mismatch");
+
+struct OS_FILE_NAMES_INFORMATION {
+    ULONG NextEntryOffset;
+    ULONG FileIndex;
+    ULONG FileNameLength;
+    WCHAR FileName[1];
+};
+static_assert(offsetof(OS_FILE_NAMES_INFORMATION, FileName) == 12u, "NT ABI mismatch");
+
+struct OS_FILE_DISPOSITION_INFORMATION {
+    BOOLEAN DeleteFile;
+};
+
+struct OS_FILE_DISPOSITION_INFORMATION_EX {
+    ULONG Flags;
+};
+
+struct OS_FILE_ALLOCATION_INFORMATION {
+    LARGE_INTEGER AllocationSize;
+};
+
+struct OS_FILE_END_OF_FILE_INFORMATION {
+    LARGE_INTEGER EndOfFile;
+};
+
+struct OS_FILE_RENAME_INFORMATION {
+    union {
+        BOOLEAN ReplaceIfExists;
+        ULONG Flags;
+    };
+    HANDLE RootDirectory;
+    ULONG FileNameLength;
+    WCHAR FileName[1];
+};
+static_assert(offsetof(OS_FILE_RENAME_INFORMATION, RootDirectory) == sizeof(void*),
+              "NT rename ABI mismatch");
+
 struct OpenScarlettTlsSlot0Status {
     uint32_t initialized;
     uint32_t owned_by_hook;
@@ -97,6 +249,33 @@ using PfnNtOpenFile = OS_NTSTATUS(NTAPI*)(PHANDLE,
                                           ULONG);
 using PfnNtQueryAttributesFile = OS_NTSTATUS(NTAPI*)(OS_OBJECT_ATTRIBUTES*,
                                                      OS_FILE_BASIC_INFORMATION*);
+using PfnNtClose = OS_NTSTATUS(NTAPI*)(HANDLE);
+using PfnNtQueryDirectoryFile = OS_NTSTATUS(NTAPI*)(HANDLE,
+                                                    HANDLE,
+                                                    PVOID,
+                                                    PVOID,
+                                                    OS_IO_STATUS_BLOCK*,
+                                                    PVOID,
+                                                    ULONG,
+                                                    ULONG,
+                                                    BOOLEAN,
+                                                    OS_UNICODE_STRING*,
+                                                    BOOLEAN);
+using PfnNtQueryDirectoryFileEx = OS_NTSTATUS(NTAPI*)(HANDLE,
+                                                      HANDLE,
+                                                      PVOID,
+                                                      PVOID,
+                                                      OS_IO_STATUS_BLOCK*,
+                                                      PVOID,
+                                                      ULONG,
+                                                      ULONG,
+                                                      ULONG,
+                                                      OS_UNICODE_STRING*);
+using PfnNtSetInformationFile = OS_NTSTATUS(NTAPI*)(HANDLE,
+                                                    OS_IO_STATUS_BLOCK*,
+                                                    PVOID,
+                                                    ULONG,
+                                                    ULONG);
 
 // ---------------------------------------------------------------------------
 // Real Win32 API Function Pointer Types
@@ -114,7 +293,17 @@ using PfnGetModuleFileNameW = DWORD(WINAPI*)(HMODULE, LPWSTR, DWORD);
 using PfnGetProcAddress = FARPROC(WINAPI*)(HMODULE, LPCSTR);
 using PfnCreateFileA = HANDLE(WINAPI*)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 using PfnCreateFileW = HANDLE(WINAPI*)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
-using PfnCreateFile2 = HANDLE(WINAPI*)(LPCWSTR, DWORD, DWORD, DWORD, LPCREATEFILE2_EXTENDED_PARAMETERS);
+struct OS_CREATEFILE2_EXTENDED_PARAMETERS {
+    DWORD dwSize;
+    DWORD dwFileAttributes;
+    DWORD dwFileFlags;
+    DWORD dwSecurityQosFlags;
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes;
+    HANDLE hTemplateFile;
+};
+using PfnCreateFile2 = HANDLE(WINAPI*)(LPCWSTR, DWORD, DWORD, DWORD, OS_CREATEFILE2_EXTENDED_PARAMETERS*);
+using PfnCloseHandle = BOOL(WINAPI*)(HANDLE);
+using PfnGetFinalPathNameByHandleW = DWORD(WINAPI*)(HANDLE, LPWSTR, DWORD, DWORD);
 using PfnGetFileAttributesA = DWORD(WINAPI*)(LPCSTR);
 using PfnGetFileAttributesW = DWORD(WINAPI*)(LPCWSTR);
 using PfnGetFileAttributesExA = BOOL(WINAPI*)(LPCSTR, GET_FILEEX_INFO_LEVELS, LPVOID);
@@ -179,6 +368,8 @@ PfnGetProcAddress g_real_GetProcAddress = nullptr;
 PfnCreateFileA g_real_CreateFileA = nullptr;
 PfnCreateFileW g_real_CreateFileW = nullptr;
 PfnCreateFile2 g_real_CreateFile2 = nullptr;
+PfnCloseHandle g_real_CloseHandle = nullptr;
+PfnGetFinalPathNameByHandleW g_real_GetFinalPathNameByHandleW = nullptr;
 PfnGetFileAttributesA g_real_GetFileAttributesA = nullptr;
 PfnGetFileAttributesW g_real_GetFileAttributesW = nullptr;
 PfnGetFileAttributesExA g_real_GetFileAttributesExA = nullptr;
@@ -216,6 +407,10 @@ bool g_trace_ods = false;
 PfnNtCreateFile g_real_NtCreateFile = nullptr;
 PfnNtOpenFile g_real_NtOpenFile = nullptr;
 PfnNtQueryAttributesFile g_real_NtQueryAttributesFile = nullptr;
+PfnNtClose g_real_NtClose = nullptr;
+PfnNtQueryDirectoryFile g_real_NtQueryDirectoryFile = nullptr;
+PfnNtQueryDirectoryFileEx g_real_NtQueryDirectoryFileEx = nullptr;
+PfnNtSetInformationFile g_real_NtSetInformationFile = nullptr;
 
 // ---------------------------------------------------------------------------
 // Hook Runtime State
@@ -262,6 +457,27 @@ struct PatchedModuleKey {
 };
 std::unordered_map<HMODULE, PatchedModuleKey> g_patched_modules;
 std::unordered_map<HMODULE, PatchedModuleKey> g_patched_crt_vfs_modules;
+
+struct TrackedVfsDirEntry {
+    std::wstring name;
+    WIN32_FIND_DATAW fd{};
+};
+
+struct TrackedVfsHandle {
+    std::wstring virtual_path;
+    std::wstring host_path;
+    openscarlett::VfsDrive drive = openscarlett::VfsDrive::None;
+    bool is_overlay = false;
+    bool is_directory = false;
+    bool dir_enum_initialized = false;
+    std::wstring dir_enum_pattern;
+    size_t dir_enum_cursor = 0u;
+    std::vector<TrackedVfsDirEntry> dir_entries;
+};
+
+SRWLOCK g_vfs_handle_lock = SRWLOCK_INIT;
+std::unordered_map<HANDLE, TrackedVfsHandle> g_vfs_handles;
+std::atomic<uint32_t> g_vfs_handle_count{0u};
 
 thread_local uint32_t tl_forwarder_depth = 0;
 thread_local uint32_t tl_vfs_hook_depth = 0;
@@ -555,6 +771,43 @@ OS_NTSTATUS NTAPI Hook_NtOpenFile(PHANDLE FileHandle,
                                   ULONG OpenOptions);
 OS_NTSTATUS NTAPI Hook_NtQueryAttributesFile(OS_OBJECT_ATTRIBUTES* ObjectAttributes,
                                              OS_FILE_BASIC_INFORMATION* FileInformation);
+OS_NTSTATUS NTAPI Hook_NtClose(HANDLE Handle);
+OS_NTSTATUS NTAPI Hook_NtQueryDirectoryFile(HANDLE FileHandle,
+                                            HANDLE Event,
+                                            PVOID ApcRoutine,
+                                            PVOID ApcContext,
+                                            OS_IO_STATUS_BLOCK* IoStatusBlock,
+                                            PVOID FileInformation,
+                                            ULONG Length,
+                                            ULONG FileInformationClass,
+                                            BOOLEAN ReturnSingleEntry,
+                                            OS_UNICODE_STRING* FileName,
+                                            BOOLEAN RestartScan);
+OS_NTSTATUS NTAPI Hook_NtQueryDirectoryFileEx(HANDLE FileHandle,
+                                              HANDLE Event,
+                                              PVOID ApcRoutine,
+                                              PVOID ApcContext,
+                                              OS_IO_STATUS_BLOCK* IoStatusBlock,
+                                              PVOID FileInformation,
+                                              ULONG Length,
+                                              ULONG FileInformationClass,
+                                              ULONG QueryFlags,
+                                              OS_UNICODE_STRING* FileName);
+OS_NTSTATUS NTAPI Hook_NtSetInformationFile(HANDLE FileHandle,
+                                            OS_IO_STATUS_BLOCK* IoStatusBlock,
+                                            PVOID FileInformation,
+                                            ULONG Length,
+                                            ULONG FileInformationClass);
+HANDLE WINAPI Hook_CreateFile2(LPCWSTR lpFileName,
+                               DWORD dwDesiredAccess,
+                               DWORD dwShareMode,
+                               DWORD dwCreationDisposition,
+                               OS_CREATEFILE2_EXTENDED_PARAMETERS* pCreateExParams);
+BOOL WINAPI Hook_CloseHandle(HANDLE hObject);
+DWORD WINAPI Hook_GetFinalPathNameByHandleW(HANDLE hFile,
+                                            LPWSTR lpszFilePath,
+                                            DWORD cchFilePath,
+                                            DWORD dwFlags);
 BOOL WINAPI Hook_CreateProcessA(LPCSTR lpApplicationName,
                                 LPSTR lpCommandLine,
                                 LPSECURITY_ATTRIBUTES lpProcessAttributes,
@@ -1298,6 +1551,16 @@ FARPROC WINAPI Hook_GetProcAddress(HMODULE hModule, LPCSTR lpProcName) {
             if (g_real_CreateProcessA != nullptr && std::strcmp(lpProcName, "CreateProcessA") == 0) {
                 return reinterpret_cast<FARPROC>(&Hook_CreateProcessA);
             }
+            if (g_real_CreateFile2 != nullptr && std::strcmp(lpProcName, "CreateFile2") == 0) {
+                return reinterpret_cast<FARPROC>(&Hook_CreateFile2);
+            }
+            if (g_real_CloseHandle != nullptr && std::strcmp(lpProcName, "CloseHandle") == 0) {
+                return reinterpret_cast<FARPROC>(&Hook_CloseHandle);
+            }
+            if (g_real_GetFinalPathNameByHandleW != nullptr &&
+                std::strcmp(lpProcName, "GetFinalPathNameByHandleW") == 0) {
+                return reinterpret_cast<FARPROC>(&Hook_GetFinalPathNameByHandleW);
+            }
         } else if (g_ntdll_mod != nullptr && hModule == g_ntdll_mod) {
             if (g_real_NtCreateFile != nullptr && std::strcmp(lpProcName, "NtCreateFile") == 0) {
                 return reinterpret_cast<FARPROC>(&Hook_NtCreateFile);
@@ -1308,6 +1571,21 @@ FARPROC WINAPI Hook_GetProcAddress(HMODULE hModule, LPCSTR lpProcName) {
             if (g_real_NtQueryAttributesFile != nullptr &&
                 std::strcmp(lpProcName, "NtQueryAttributesFile") == 0) {
                 return reinterpret_cast<FARPROC>(&Hook_NtQueryAttributesFile);
+            }
+            if (g_real_NtClose != nullptr && std::strcmp(lpProcName, "NtClose") == 0) {
+                return reinterpret_cast<FARPROC>(&Hook_NtClose);
+            }
+            if (g_real_NtQueryDirectoryFile != nullptr &&
+                std::strcmp(lpProcName, "NtQueryDirectoryFile") == 0) {
+                return reinterpret_cast<FARPROC>(&Hook_NtQueryDirectoryFile);
+            }
+            if (g_real_NtQueryDirectoryFileEx != nullptr &&
+                std::strcmp(lpProcName, "NtQueryDirectoryFileEx") == 0) {
+                return reinterpret_cast<FARPROC>(&Hook_NtQueryDirectoryFileEx);
+            }
+            if (g_real_NtSetInformationFile != nullptr &&
+                std::strcmp(lpProcName, "NtSetInformationFile") == 0) {
+                return reinterpret_cast<FARPROC>(&Hook_NtSetInformationFile);
             }
         }
     }
@@ -1511,25 +1789,354 @@ bool ShouldPassThroughHostDDriveW(std::wstring_view raw_path) {
     return false;
 }
 
+std::wstring StripNtOrExtPrefixW(std::wstring_view in) {
+    if (in.size() >= 4u &&
+        (in.compare(0u, 4u, L"\\??\\") == 0 || in.compare(0u, 4u, L"\\\\?\\") == 0)) {
+        in.remove_prefix(4u);
+    }
+    return std::wstring(in);
+}
+
+std::wstring NormalizeCanonicalVirtualPathW(std::wstring_view raw) {
+    std::wstring s = StripNtOrExtPrefixW(raw);
+    for (wchar_t& c : s) {
+        if (c == L'/') c = L'\\';
+    }
+    if (s.size() >= 5u &&
+        (s[0] == L'G' || s[0] == L'g') &&
+        (s[1] == L'A' || s[1] == L'a') &&
+        (s[2] == L'M' || s[2] == L'm') &&
+        (s[3] == L'E' || s[3] == L'e') &&
+        s[4] == L':') {
+        s.replace(0u, 5u, L"G:");
+    }
+    if (s.size() >= 2u && s[1] == L':') {
+        if (s[0] >= L'a' && s[0] <= L'z') {
+            s[0] = static_cast<wchar_t>(s[0] - L'a' + L'A');
+        }
+        if (s.size() == 2u) {
+            s.push_back(L'\\');
+        } else if (s[2] != L'\\') {
+            s.insert(2u, 1u, L'\\');
+        }
+    }
+    std::wstring out;
+    out.reserve(s.size());
+    bool prev_bs = false;
+    for (wchar_t c : s) {
+        if (c == L'\\') {
+            if (!prev_bs) {
+                out.push_back(c);
+                prev_bs = true;
+            }
+        } else {
+            out.push_back(c);
+            prev_bs = false;
+        }
+    }
+    while (out.size() > 3u && out.back() == L'\\') {
+        out.pop_back();
+    }
+    return out;
+}
+
+bool IsHostPathUnderOverlayW(std::wstring_view host_path) {
+    const std::wstring& ov_root = g_vfs.GetGameOverlayRoot();
+    if (ov_root.empty()) {
+        return false;
+    }
+    std::wstring h = ToLowerAsciiW(StripNtOrExtPrefixW(host_path));
+    std::wstring ov = ToLowerAsciiW(StripNtOrExtPrefixW(ov_root));
+    for (wchar_t& c : h) {
+        if (c == L'/') c = L'\\';
+    }
+    for (wchar_t& c : ov) {
+        if (c == L'/') c = L'\\';
+    }
+    while (ov.size() > 3u && ov.back() == L'\\') {
+        ov.pop_back();
+    }
+    if (h.size() < ov.size() || h.compare(0u, ov.size(), ov) != 0) {
+        return false;
+    }
+    return h.size() == ov.size() || h[ov.size()] == L'\\';
+}
+
+void TrackVfsHandle(HANDLE h,
+                    std::wstring_view virtual_path,
+                    std::wstring_view host_path,
+                    openscarlett::VfsDrive drive) {
+    if (!h || h == INVALID_HANDLE_VALUE || drive == openscarlett::VfsDrive::None) {
+        return;
+    }
+    TrackedVfsHandle entry{};
+    entry.virtual_path = NormalizeCanonicalVirtualPathW(virtual_path);
+    entry.host_path = StripNtOrExtPrefixW(host_path);
+    entry.drive = drive;
+    entry.is_overlay = (drive == openscarlett::VfsDrive::Game) && IsHostPathUnderOverlayW(entry.host_path);
+    const DWORD attrs = g_real_GetFileAttributesW
+                            ? g_real_GetFileAttributesW(entry.host_path.c_str())
+                            : ::GetFileAttributesW(entry.host_path.c_str());
+    entry.is_directory = (attrs != INVALID_FILE_ATTRIBUTES) && ((attrs & FILE_ATTRIBUTE_DIRECTORY) != 0u);
+
+    ::AcquireSRWLockExclusive(&g_vfs_handle_lock);
+    g_vfs_handles[h] = std::move(entry);
+    g_vfs_handle_count.store(static_cast<uint32_t>(g_vfs_handles.size()), std::memory_order_release);
+    ::ReleaseSRWLockExclusive(&g_vfs_handle_lock);
+}
+
+void UntrackVfsHandle(HANDLE h) {
+    if (!h || h == INVALID_HANDLE_VALUE || g_vfs_handle_count.load(std::memory_order_acquire) == 0u) {
+        return;
+    }
+    ::AcquireSRWLockExclusive(&g_vfs_handle_lock);
+    g_vfs_handles.erase(h);
+    g_vfs_handle_count.store(static_cast<uint32_t>(g_vfs_handles.size()), std::memory_order_release);
+    ::ReleaseSRWLockExclusive(&g_vfs_handle_lock);
+}
+
+bool LookupTrackedVfsHandleSnapshot(HANDLE h, TrackedVfsHandle& out) {
+    if (!h || h == INVALID_HANDLE_VALUE || g_vfs_handle_count.load(std::memory_order_acquire) == 0u) {
+        return false;
+    }
+    ::AcquireSRWLockShared(&g_vfs_handle_lock);
+    auto it = g_vfs_handles.find(h);
+    const bool found = (it != g_vfs_handles.end());
+    if (found) {
+        out.virtual_path = it->second.virtual_path;
+        out.host_path = it->second.host_path;
+        out.drive = it->second.drive;
+        out.is_overlay = it->second.is_overlay;
+        out.is_directory = it->second.is_directory;
+    }
+    ::ReleaseSRWLockShared(&g_vfs_handle_lock);
+    return found;
+}
+
+bool MatchesNtWildcardW(std::wstring_view name, std::wstring_view pattern) {
+    if (pattern.empty() || pattern == L"*" || pattern == L"*.*") {
+        return true;
+    }
+    std::wstring n = ToLowerAsciiW(name);
+    std::wstring p = ToLowerAsciiW(pattern);
+    size_t ni = 0u;
+    size_t pi = 0u;
+    size_t star_p = std::wstring::npos;
+    size_t star_n = 0u;
+    while (ni < n.size()) {
+        if (pi < p.size() && (p[pi] == L'?' || p[pi] == L'>' || p[pi] == n[ni])) {
+            ++ni;
+            ++pi;
+        } else if (pi < p.size() && (p[pi] == L'*' || p[pi] == L'<')) {
+            star_p = pi++;
+            star_n = ni;
+        } else if (pi < p.size() && p[pi] == L'"' && n[ni] == L'.') {
+            ++ni;
+            ++pi;
+        } else if (star_p != std::wstring::npos) {
+            pi = star_p + 1u;
+            ni = ++star_n;
+        } else {
+            return false;
+        }
+    }
+    while (pi < p.size() && (p[pi] == L'*' || p[pi] == L'<' || p[pi] == L'"')) {
+        ++pi;
+    }
+    return pi == p.size();
+}
+
+bool IsWhiteoutMarkerFileNameW(std::wstring_view name) {
+    const std::wstring lo = ToLowerAsciiW(name);
+    constexpr std::wstring_view kSuffix = L".whiteout";
+    if (lo == kSuffix) {
+        return true;
+    }
+    return lo.size() >= kSuffix.size() &&
+           lo.compare(lo.size() - kSuffix.size(), kSuffix.size(), kSuffix) == 0;
+}
+
+std::wstring JoinVirtualChildW(std::wstring_view dir_vpath, std::wstring_view child_name) {
+    std::wstring res(dir_vpath);
+    if (!res.empty() && res.back() != L'\\') {
+        res.push_back(L'\\');
+    }
+    res.append(child_name);
+    return res;
+}
+
+std::vector<TrackedVfsDirEntry> BuildMergedGameDirEntries(const std::wstring& dir_vpath,
+                                                          const std::wstring& pattern) {
+    std::vector<TrackedVfsDirEntry> out;
+    std::wstring base_dir;
+    std::wstring overlay_dir;
+    std::wstring rel_dir;
+    bool was_wo = false;
+    const auto st = g_vfs.ResolveGamePairW(dir_vpath, base_dir, overlay_dir, rel_dir, &was_wo);
+    if (st != openscarlett::VfsTranslateStatus::Translated || was_wo) {
+        return out;
+    }
+
+    std::unordered_set<std::wstring> seen_lower;
+    auto scan_dir = [&](const std::wstring& host_dir, bool is_overlay) {
+        if (host_dir.empty()) {
+            return;
+        }
+        std::wstring glob = host_dir;
+        if (glob.back() != L'\\') glob.push_back(L'\\');
+        glob.push_back(L'*');
+
+        WIN32_FIND_DATAW fd{};
+        HANDLE fh = g_real_FindFirstFileW ? g_real_FindFirstFileW(glob.c_str(), &fd)
+                                          : ::FindFirstFileW(glob.c_str(), &fd);
+        if (fh == INVALID_HANDLE_VALUE) {
+            return;
+        }
+        do {
+            std::wstring_view fname(fd.cFileName);
+            if (is_overlay && IsWhiteoutMarkerFileNameW(fname)) {
+                continue;
+            }
+            const std::wstring lo = ToLowerAsciiW(fname);
+            if (seen_lower.find(lo) != seen_lower.end()) {
+                continue;
+            }
+            const bool is_dot = (fname == L"." || fname == L"..");
+            if (!is_overlay && !is_dot) {
+                const std::wstring child_v = JoinVirtualChildW(dir_vpath, fname);
+                if (g_vfs.IsWhiteoutedW(child_v)) {
+                    continue;
+                }
+            }
+            if (!MatchesNtWildcardW(fname, pattern)) {
+                continue;
+            }
+            seen_lower.insert(lo);
+            TrackedVfsDirEntry rec{};
+            rec.name.assign(fname);
+            rec.fd = fd;
+            out.push_back(std::move(rec));
+        } while (::FindNextFileW(fh, &fd));
+        ::FindClose(fh);
+    };
+
+    // Overlay entries take precedence over base entries (deduplication + shadowing).
+    scan_dir(overlay_dir, true);
+    scan_dir(base_dir, false);
+
+    // Include virtual sub-mount mount points directly under this directory.
+    std::wstring rel_lo = ToLowerAsciiW(rel_dir);
+    for (wchar_t& c : rel_lo) {
+        if (c == L'/') c = L'\\';
+    }
+    while (!rel_lo.empty() && rel_lo.back() == L'\\') rel_lo.pop_back();
+
+    for (const auto& sub : g_vfs.GetGameSubMounts()) {
+        std::wstring sub_rel = sub.virtual_prefix;
+        for (wchar_t& c : sub_rel) {
+            if (c == L'/') c = L'\\';
+        }
+        while (!sub_rel.empty() && sub_rel.back() == L'\\') sub_rel.pop_back();
+        if (sub_rel.empty()) continue;
+        std::wstring parent_rel;
+        std::wstring child_name;
+        const size_t slash = sub_rel.rfind(L'\\');
+        if (slash == std::wstring::npos) {
+            child_name = sub_rel;
+        } else {
+            parent_rel = ToLowerAsciiW(sub_rel.substr(0u, slash));
+            child_name = sub_rel.substr(slash + 1u);
+        }
+        if (parent_rel != rel_lo || child_name.empty()) {
+            continue;
+        }
+        const std::wstring lo = ToLowerAsciiW(child_name);
+        if (seen_lower.find(lo) != seen_lower.end()) {
+            continue;
+        }
+        const std::wstring child_v = JoinVirtualChildW(dir_vpath, child_name);
+        if (g_vfs.IsWhiteoutedW(child_v) || !MatchesNtWildcardW(child_name, pattern)) {
+            continue;
+        }
+        seen_lower.insert(lo);
+        TrackedVfsDirEntry rec{};
+        rec.name = child_name;
+        rec.fd.dwFileAttributes = FILE_ATTRIBUTE_DIRECTORY;
+        const size_t copy_n = std::min<size_t>(child_name.size(), MAX_PATH - 1u);
+        std::memcpy(rec.fd.cFileName, child_name.data(), copy_n * sizeof(wchar_t));
+        rec.fd.cFileName[copy_n] = L'\0';
+        out.push_back(std::move(rec));
+    }
+
+    std::sort(out.begin(), out.end(), [](const TrackedVfsDirEntry& a, const TrackedVfsDirEntry& b) {
+        auto rank = [](const std::wstring& s) -> int {
+            if (s == L".") return 0;
+            if (s == L"..") return 1;
+            return 2;
+        };
+        const int ra = rank(a.name);
+        const int rb = rank(b.name);
+        if (ra != rb) return ra < rb;
+        return ToLowerAsciiW(a.name) < ToLowerAsciiW(b.name);
+    });
+    return out;
+}
+
+uint64_t HashSyntheticFileId(std::wstring_view path) noexcept {
+    uint64_t h = 14695981039346656037ull;
+    for (wchar_t c : path) {
+        const wchar_t lc = (c >= L'A' && c <= L'Z') ? static_cast<wchar_t>(c - L'A' + L'a') : c;
+        h ^= static_cast<uint64_t>(static_cast<uint16_t>(lc));
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
 bool TryTranslateNtObjectPath(const OS_OBJECT_ATTRIBUTES* oa,
                               ACCESS_MASK desired_access,
                               ULONG create_disposition,
                               bool is_query_only,
                               const char* api_tag,
                               std::wstring& out_nt_host_path,
-                              OS_NTSTATUS& out_error_status) {
+                              OS_NTSTATUS& out_error_status,
+                              std::wstring* out_resolved_virtual = nullptr,
+                              openscarlett::VfsDrive* out_drive = nullptr) {
     out_nt_host_path.clear();
     out_error_status = OS_STATUS_SUCCESS;
-    if (!oa || oa->RootDirectory != nullptr || !oa->ObjectName ||
-        !oa->ObjectName->Buffer || oa->ObjectName->Length == 0) {
+    if (out_resolved_virtual) out_resolved_virtual->clear();
+    if (out_drive) *out_drive = openscarlett::VfsDrive::None;
+    if (!oa || !oa->ObjectName) {
         return false;
     }
 
-    const size_t char_count = static_cast<size_t>(oa->ObjectName->Length) / sizeof(wchar_t);
-    std::wstring_view raw_view(oa->ObjectName->Buffer, char_count);
-    while (!raw_view.empty() && raw_view.back() == L'\0') {
-        raw_view.remove_suffix(1);
+    std::wstring combined_virtual;
+    std::wstring_view raw_view;
+    if (oa->ObjectName->Buffer != nullptr && oa->ObjectName->Length > 0u) {
+        const size_t char_count = static_cast<size_t>(oa->ObjectName->Length) / sizeof(wchar_t);
+        raw_view = std::wstring_view(oa->ObjectName->Buffer, char_count);
+        while (!raw_view.empty() && raw_view.back() == L'\0') {
+            raw_view.remove_suffix(1u);
+        }
     }
+
+    if (oa->RootDirectory != nullptr) {
+        TrackedVfsHandle root_snap{};
+        if (!LookupTrackedVfsHandleSnapshot(oa->RootDirectory, root_snap)) {
+            return false;
+        }
+        if (raw_view.empty()) {
+            combined_virtual = root_snap.virtual_path;
+        } else if (openscarlett::VfsMounts::DetectVirtualDriveW(raw_view) != openscarlett::VfsDrive::None) {
+            combined_virtual = NormalizeCanonicalVirtualPathW(raw_view);
+        } else {
+            while (!raw_view.empty() && (raw_view.front() == L'\\' || raw_view.front() == L'/')) {
+                raw_view.remove_prefix(1u);
+            }
+            combined_virtual = JoinVirtualChildW(root_snap.virtual_path, raw_view);
+        }
+        raw_view = combined_virtual;
+    }
+
     if (raw_view.empty()) {
         return false;
     }
@@ -1538,6 +2145,8 @@ bool TryTranslateNtObjectPath(const OS_OBJECT_ATTRIBUTES* oa,
     if (drive == openscarlett::VfsDrive::None || ShouldPassThroughHostDDriveW(raw_view)) {
         return false;
     }
+    if (out_drive) *out_drive = drive;
+    if (out_resolved_virtual) *out_resolved_virtual = NormalizeCanonicalVirtualPathW(raw_view);
 
     constexpr ACCESS_MASK kNtWriteMask =
         GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA | FILE_APPEND_DATA |
@@ -1549,31 +2158,46 @@ bool TryTranslateNtObjectPath(const OS_OBJECT_ATTRIBUTES* oa,
                               create_disposition == OS_FILE_OVERWRITE ||
                               create_disposition == OS_FILE_OVERWRITE_IF);
 
-    openscarlett::VfsAccessMode mode = openscarlett::VfsAccessMode::ReadOnly;
-    if (!is_query_only && wants_write) {
-        if (drive == openscarlett::VfsDrive::Game) {
-            if (create_disposition == OS_FILE_SUPERSEDE ||
-                create_disposition == OS_FILE_CREATE ||
-                create_disposition == OS_FILE_OVERWRITE_IF) {
-                mode = openscarlett::VfsAccessMode::WriteCreate;
-            } else if (create_disposition == OS_FILE_OPEN_IF) {
-                mode = g_vfs.IsVisibleGamePathW(raw_view) ? openscarlett::VfsAccessMode::WriteModify
-                                                          : openscarlett::VfsAccessMode::WriteCreate;
-            } else {
-                mode = openscarlett::VfsAccessMode::WriteModify;
-            }
-        } else {
-            mode = openscarlett::VfsAccessMode::WriteCreate;
-        }
-    } else if (!is_query_only && drive == openscarlett::VfsDrive::Game &&
-               create_disposition == OS_FILE_OPEN_IF && !g_vfs.IsVisibleGamePathW(raw_view)) {
-        mode = openscarlett::VfsAccessMode::WriteCreate;
-    }
-
     std::wstring translated;
     bool was_wo = false;
-    const openscarlett::VfsTranslateStatus st =
-        g_vfs.TranslateForAccessW(raw_view, mode, translated, &was_wo, !is_query_only);
+    openscarlett::VfsTranslateStatus st = openscarlett::VfsTranslateStatus::NotVirtual;
+
+    if (!is_query_only && drive == openscarlett::VfsDrive::Game &&
+        (create_disposition == OS_FILE_OVERWRITE ||
+         create_disposition == OS_FILE_OVERWRITE_IF ||
+         create_disposition == OS_FILE_SUPERSEDE)) {
+        const bool allow_create = (create_disposition != OS_FILE_OVERWRITE);
+        st = g_vfs.PrepareOverlayTruncateW(raw_view, allow_create, translated, &was_wo);
+    } else {
+        openscarlett::VfsAccessMode mode = openscarlett::VfsAccessMode::ReadOnly;
+        if (!is_query_only && wants_write) {
+            if (drive == openscarlett::VfsDrive::Game) {
+                if (create_disposition == OS_FILE_CREATE) {
+                    mode = openscarlett::VfsAccessMode::WriteCreate;
+                } else if (create_disposition == OS_FILE_OPEN_IF) {
+                    mode = g_vfs.IsVisibleGamePathW(raw_view) ? openscarlett::VfsAccessMode::WriteModify
+                                                              : openscarlett::VfsAccessMode::WriteCreate;
+                } else {
+                    mode = openscarlett::VfsAccessMode::WriteModify;
+                }
+            } else {
+                mode = openscarlett::VfsAccessMode::WriteCreate;
+            }
+        } else if (!is_query_only && drive == openscarlett::VfsDrive::Game &&
+                   create_disposition == OS_FILE_OPEN_IF && !g_vfs.IsVisibleGamePathW(raw_view)) {
+            mode = openscarlett::VfsAccessMode::WriteCreate;
+        }
+        st = g_vfs.TranslateForAccessW(raw_view, mode, translated, &was_wo, !is_query_only);
+        if (st == openscarlett::VfsTranslateStatus::Translated && !is_query_only && wants_write &&
+            drive == openscarlett::VfsDrive::Game && IsHostPathUnderOverlayW(translated)) {
+            const DWORD attrs = g_real_GetFileAttributesW
+                                    ? g_real_GetFileAttributesW(translated.c_str())
+                                    : ::GetFileAttributesW(translated.c_str());
+            if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_READONLY) != 0u) {
+                ::SetFileAttributesW(translated.c_str(), attrs & ~FILE_ATTRIBUTE_READONLY);
+            }
+        }
+    }
 
     if (st == openscarlett::VfsTranslateStatus::NotVirtual) {
         return false;
@@ -1627,9 +2251,11 @@ OS_NTSTATUS NTAPI Hook_NtCreateFile(PHANDLE FileHandle,
                                     ULONG EaLength) {
     if (!g_shutting_down.load(std::memory_order_acquire) && ObjectAttributes != nullptr) {
         std::wstring host_nt;
+        std::wstring resolved_vpath;
+        openscarlett::VfsDrive drive = openscarlett::VfsDrive::None;
         OS_NTSTATUS err_status = OS_STATUS_SUCCESS;
         if (TryTranslateNtObjectPath(ObjectAttributes, DesiredAccess, CreateDisposition, false,
-                                     "NtCreateFile", host_nt, err_status)) {
+                                     "NtCreateFile", host_nt, err_status, &resolved_vpath, &drive)) {
             if (err_status != OS_STATUS_SUCCESS) {
                 if (IoStatusBlock) {
                     IoStatusBlock->Status = err_status;
@@ -1642,6 +2268,7 @@ OS_NTSTATUS NTAPI Hook_NtCreateFile(PHANDLE FileHandle,
             new_name.MaximumLength = static_cast<USHORT>((host_nt.size() + 1u) * sizeof(wchar_t));
             new_name.Buffer = host_nt.data();
             OS_OBJECT_ATTRIBUTES new_oa = *ObjectAttributes;
+            new_oa.RootDirectory = nullptr;
             new_oa.ObjectName = &new_name;
 
             const OS_NTSTATUS st = g_real_NtCreateFile(FileHandle,
@@ -1655,6 +2282,9 @@ OS_NTSTATUS NTAPI Hook_NtCreateFile(PHANDLE FileHandle,
                                                        CreateOptions,
                                                        EaBuffer,
                                                        EaLength);
+            if (st >= 0 && FileHandle != nullptr && *FileHandle != nullptr) {
+                TrackVfsHandle(*FileHandle, resolved_vpath, host_nt, drive);
+            }
             openscarlett::CallTelemetry::Global().Record(
                 "vfs",
                 "NtCreateFile",
@@ -1685,9 +2315,11 @@ OS_NTSTATUS NTAPI Hook_NtOpenFile(PHANDLE FileHandle,
                                   ULONG OpenOptions) {
     if (!g_shutting_down.load(std::memory_order_acquire) && ObjectAttributes != nullptr) {
         std::wstring host_nt;
+        std::wstring resolved_vpath;
+        openscarlett::VfsDrive drive = openscarlett::VfsDrive::None;
         OS_NTSTATUS err_status = OS_STATUS_SUCCESS;
         if (TryTranslateNtObjectPath(ObjectAttributes, DesiredAccess, OS_FILE_OPEN, false,
-                                     "NtOpenFile", host_nt, err_status)) {
+                                     "NtOpenFile", host_nt, err_status, &resolved_vpath, &drive)) {
             if (err_status != OS_STATUS_SUCCESS) {
                 if (IoStatusBlock) {
                     IoStatusBlock->Status = err_status;
@@ -1700,6 +2332,7 @@ OS_NTSTATUS NTAPI Hook_NtOpenFile(PHANDLE FileHandle,
             new_name.MaximumLength = static_cast<USHORT>((host_nt.size() + 1u) * sizeof(wchar_t));
             new_name.Buffer = host_nt.data();
             OS_OBJECT_ATTRIBUTES new_oa = *ObjectAttributes;
+            new_oa.RootDirectory = nullptr;
             new_oa.ObjectName = &new_name;
 
             const OS_NTSTATUS st = g_real_NtOpenFile(FileHandle,
@@ -1708,6 +2341,9 @@ OS_NTSTATUS NTAPI Hook_NtOpenFile(PHANDLE FileHandle,
                                                      IoStatusBlock,
                                                      ShareAccess,
                                                      OpenOptions);
+            if (st >= 0 && FileHandle != nullptr && *FileHandle != nullptr) {
+                TrackVfsHandle(*FileHandle, resolved_vpath, host_nt, drive);
+            }
             openscarlett::CallTelemetry::Global().Record(
                 "vfs",
                 "NtOpenFile",
@@ -1740,6 +2376,7 @@ OS_NTSTATUS NTAPI Hook_NtQueryAttributesFile(OS_OBJECT_ATTRIBUTES* ObjectAttribu
             new_name.MaximumLength = static_cast<USHORT>((host_nt.size() + 1u) * sizeof(wchar_t));
             new_name.Buffer = host_nt.data();
             OS_OBJECT_ATTRIBUTES new_oa = *ObjectAttributes;
+            new_oa.RootDirectory = nullptr;
             new_oa.ObjectName = &new_name;
 
             const OS_NTSTATUS st = g_real_NtQueryAttributesFile(&new_oa, FileInformation);
@@ -1755,25 +2392,636 @@ OS_NTSTATUS NTAPI Hook_NtQueryAttributesFile(OS_OBJECT_ATTRIBUTES* ObjectAttribu
     return g_real_NtQueryAttributesFile(ObjectAttributes, FileInformation);
 }
 
+OS_NTSTATUS NTAPI Hook_NtClose(HANDLE Handle) {
+    if (!g_shutting_down.load(std::memory_order_acquire)) {
+        UntrackVfsHandle(Handle);
+    }
+    return g_real_NtClose(Handle);
+}
+
+OS_NTSTATUS QueryVirtualGameDirectoryImpl(HANDLE FileHandle,
+                                          HANDLE Event,
+                                          OS_IO_STATUS_BLOCK* IoStatusBlock,
+                                          PVOID FileInformation,
+                                          ULONG Length,
+                                          ULONG FileInformationClass,
+                                          ULONG QueryFlags,
+                                          OS_UNICODE_STRING* FileName,
+                                          const char* api_tag) {
+    if (!IoStatusBlock || !FileInformation) {
+        return OS_STATUS_INVALID_PARAMETER;
+    }
+
+    size_t fixed_hdr_size = 0u;
+    switch (FileInformationClass) {
+        case OS_FileDirectoryInformation:
+            fixed_hdr_size = offsetof(OS_FILE_DIRECTORY_INFORMATION, FileName);
+            break;
+        case OS_FileFullDirectoryInformation:
+            fixed_hdr_size = offsetof(OS_FILE_FULL_DIR_INFORMATION, FileName);
+            break;
+        case OS_FileBothDirectoryInformation:
+            fixed_hdr_size = offsetof(OS_FILE_BOTH_DIR_INFORMATION, FileName);
+            break;
+        case OS_FileIdFullDirectoryInformation:
+            fixed_hdr_size = offsetof(OS_FILE_ID_FULL_DIR_INFORMATION, FileName);
+            break;
+        case OS_FileIdBothDirectoryInformation:
+            fixed_hdr_size = offsetof(OS_FILE_ID_BOTH_DIR_INFORMATION, FileName);
+            break;
+        case OS_FileNamesInformation:
+            fixed_hdr_size = offsetof(OS_FILE_NAMES_INFORMATION, FileName);
+            break;
+        default:
+            IoStatusBlock->Status = OS_STATUS_INVALID_INFO_CLASS;
+            IoStatusBlock->Information = 0u;
+            return OS_STATUS_INVALID_INFO_CLASS;
+    }
+
+    if (Length < fixed_hdr_size) {
+        IoStatusBlock->Status = OS_STATUS_INFO_LENGTH_MISMATCH;
+        IoStatusBlock->Information = 0u;
+        return OS_STATUS_INFO_LENGTH_MISMATCH;
+    }
+
+    std::wstring req_pattern;
+    if (FileName && FileName->Buffer && FileName->Length > 0u) {
+        req_pattern.assign(FileName->Buffer, static_cast<size_t>(FileName->Length) / sizeof(wchar_t));
+        while (!req_pattern.empty() && req_pattern.back() == L'\0') {
+            req_pattern.pop_back();
+        }
+    }
+
+    const bool restart_scan = (QueryFlags & OS_SL_RESTART_SCAN) != 0u;
+    const bool single_entry = (QueryFlags & OS_SL_RETURN_SINGLE_ENTRY) != 0u;
+    const bool no_cursor_update = (QueryFlags & OS_SL_NO_CURSOR_UPDATE) != 0u;
+
+    ::AcquireSRWLockExclusive(&g_vfs_handle_lock);
+    auto it = g_vfs_handles.find(FileHandle);
+    if (it == g_vfs_handles.end()) {
+        ::ReleaseSRWLockExclusive(&g_vfs_handle_lock);
+        return OS_STATUS_INVALID_PARAMETER;
+    }
+    TrackedVfsHandle& hstate = it->second;
+    if (!hstate.is_directory) {
+        ::ReleaseSRWLockExclusive(&g_vfs_handle_lock);
+        IoStatusBlock->Status = OS_STATUS_NOT_A_DIRECTORY;
+        IoStatusBlock->Information = 0u;
+        return OS_STATUS_NOT_A_DIRECTORY;
+    }
+
+    const bool first_call = !hstate.dir_enum_initialized;
+    if (first_call || restart_scan) {
+        if (!req_pattern.empty()) {
+            hstate.dir_enum_pattern = req_pattern;
+        } else if (first_call) {
+            hstate.dir_enum_pattern = L"*";
+        }
+        hstate.dir_entries = BuildMergedGameDirEntries(hstate.virtual_path, hstate.dir_enum_pattern);
+        hstate.dir_enum_cursor = 0u;
+        hstate.dir_enum_initialized = true;
+    }
+
+    if (hstate.dir_enum_cursor >= hstate.dir_entries.size()) {
+        const bool empty_first = first_call && hstate.dir_entries.empty();
+        ::ReleaseSRWLockExclusive(&g_vfs_handle_lock);
+        const OS_NTSTATUS st = empty_first ? OS_STATUS_NO_SUCH_FILE : OS_STATUS_NO_MORE_FILES;
+        IoStatusBlock->Status = st;
+        IoStatusBlock->Information = 0u;
+        if (Event != nullptr) {
+            ::SetEvent(Event);
+        }
+        return st;
+    }
+
+    auto* out_bytes = static_cast<uint8_t*>(FileInformation);
+    size_t write_offset = 0u;
+    size_t prev_offset = 0u;
+    size_t packed = 0u;
+
+    auto filetime_to_li = [](const FILETIME& ft) -> LARGE_INTEGER {
+        LARGE_INTEGER li{};
+        li.LowPart = ft.dwLowDateTime;
+        li.HighPart = static_cast<LONG>(ft.dwHighDateTime);
+        return li;
+    };
+
+    for (size_t idx = hstate.dir_enum_cursor; idx < hstate.dir_entries.size(); ++idx) {
+        const auto& rec = hstate.dir_entries[idx];
+        const size_t name_bytes = rec.name.size() * sizeof(wchar_t);
+        const size_t unaligned_size = fixed_hdr_size + name_bytes;
+        const size_t aligned_offset = (packed == 0u) ? 0u : ((write_offset + 7u) & ~size_t{7u});
+
+        if (aligned_offset + unaligned_size > static_cast<size_t>(Length)) {
+            if (packed == 0u) {
+                ::ReleaseSRWLockExclusive(&g_vfs_handle_lock);
+                IoStatusBlock->Status = OS_STATUS_BUFFER_OVERFLOW;
+                IoStatusBlock->Information = 0u;
+                return OS_STATUS_BUFFER_OVERFLOW;
+            }
+            break;
+        }
+
+        if (packed > 0u) {
+            // Patch previous record's NextEntryOffset.
+            const ULONG delta = static_cast<ULONG>(aligned_offset - prev_offset);
+            std::memcpy(out_bytes + prev_offset, &delta, sizeof(ULONG));
+        }
+
+        uint8_t* dst = out_bytes + aligned_offset;
+        std::memset(dst, 0, unaligned_size);
+
+        const LARGE_INTEGER ct = filetime_to_li(rec.fd.ftCreationTime);
+        const LARGE_INTEGER at = filetime_to_li(rec.fd.ftLastAccessTime);
+        const LARGE_INTEGER wt = filetime_to_li(rec.fd.ftLastWriteTime);
+        LARGE_INTEGER eof{};
+        eof.LowPart = rec.fd.nFileSizeLow;
+        eof.HighPart = static_cast<LONG>(rec.fd.nFileSizeHigh);
+        LARGE_INTEGER alloc{};
+        alloc.QuadPart = (eof.QuadPart + 4095LL) & ~4095LL;
+        const ULONG fname_len_bytes = static_cast<ULONG>(name_bytes);
+        const ULONG fidx = static_cast<ULONG>(idx + 1u);
+        LARGE_INTEGER fid{};
+        fid.QuadPart = static_cast<LONGLONG>(HashSyntheticFileId(JoinVirtualChildW(hstate.virtual_path, rec.name)));
+
+        switch (FileInformationClass) {
+            case OS_FileDirectoryInformation: {
+                auto* info = reinterpret_cast<OS_FILE_DIRECTORY_INFORMATION*>(dst);
+                info->FileIndex = fidx;
+                info->CreationTime = ct;
+                info->LastAccessTime = at;
+                info->LastWriteTime = wt;
+                info->ChangeTime = wt;
+                info->EndOfFile = eof;
+                info->AllocationSize = alloc;
+                info->FileAttributes = rec.fd.dwFileAttributes;
+                info->FileNameLength = fname_len_bytes;
+                if (name_bytes > 0u) std::memcpy(info->FileName, rec.name.data(), name_bytes);
+                break;
+            }
+            case OS_FileFullDirectoryInformation: {
+                auto* info = reinterpret_cast<OS_FILE_FULL_DIR_INFORMATION*>(dst);
+                info->FileIndex = fidx;
+                info->CreationTime = ct;
+                info->LastAccessTime = at;
+                info->LastWriteTime = wt;
+                info->ChangeTime = wt;
+                info->EndOfFile = eof;
+                info->AllocationSize = alloc;
+                info->FileAttributes = rec.fd.dwFileAttributes;
+                info->FileNameLength = fname_len_bytes;
+                if (name_bytes > 0u) std::memcpy(info->FileName, rec.name.data(), name_bytes);
+                break;
+            }
+            case OS_FileBothDirectoryInformation: {
+                auto* info = reinterpret_cast<OS_FILE_BOTH_DIR_INFORMATION*>(dst);
+                info->FileIndex = fidx;
+                info->CreationTime = ct;
+                info->LastAccessTime = at;
+                info->LastWriteTime = wt;
+                info->ChangeTime = wt;
+                info->EndOfFile = eof;
+                info->AllocationSize = alloc;
+                info->FileAttributes = rec.fd.dwFileAttributes;
+                info->FileNameLength = fname_len_bytes;
+                if (name_bytes > 0u) std::memcpy(info->FileName, rec.name.data(), name_bytes);
+                break;
+            }
+            case OS_FileIdFullDirectoryInformation: {
+                auto* info = reinterpret_cast<OS_FILE_ID_FULL_DIR_INFORMATION*>(dst);
+                info->FileIndex = fidx;
+                info->CreationTime = ct;
+                info->LastAccessTime = at;
+                info->LastWriteTime = wt;
+                info->ChangeTime = wt;
+                info->EndOfFile = eof;
+                info->AllocationSize = alloc;
+                info->FileAttributes = rec.fd.dwFileAttributes;
+                info->FileNameLength = fname_len_bytes;
+                info->FileId = fid;
+                if (name_bytes > 0u) std::memcpy(info->FileName, rec.name.data(), name_bytes);
+                break;
+            }
+            case OS_FileIdBothDirectoryInformation: {
+                auto* info = reinterpret_cast<OS_FILE_ID_BOTH_DIR_INFORMATION*>(dst);
+                info->FileIndex = fidx;
+                info->CreationTime = ct;
+                info->LastAccessTime = at;
+                info->LastWriteTime = wt;
+                info->ChangeTime = wt;
+                info->EndOfFile = eof;
+                info->AllocationSize = alloc;
+                info->FileAttributes = rec.fd.dwFileAttributes;
+                info->FileNameLength = fname_len_bytes;
+                info->FileId = fid;
+                if (name_bytes > 0u) std::memcpy(info->FileName, rec.name.data(), name_bytes);
+                break;
+            }
+            case OS_FileNamesInformation: {
+                auto* info = reinterpret_cast<OS_FILE_NAMES_INFORMATION*>(dst);
+                info->FileIndex = fidx;
+                info->FileNameLength = fname_len_bytes;
+                if (name_bytes > 0u) std::memcpy(info->FileName, rec.name.data(), name_bytes);
+                break;
+            }
+            default:
+                break;
+        }
+
+        prev_offset = aligned_offset;
+        write_offset = aligned_offset + unaligned_size;
+        ++packed;
+        if (single_entry) {
+            break;
+        }
+    }
+
+    if (!no_cursor_update) {
+        hstate.dir_enum_cursor += packed;
+    }
+    ::ReleaseSRWLockExclusive(&g_vfs_handle_lock);
+
+    IoStatusBlock->Status = OS_STATUS_SUCCESS;
+    IoStatusBlock->Information = static_cast<ULONG_PTR>(write_offset);
+    if (Event != nullptr) {
+        ::SetEvent(Event);
+    }
+    openscarlett::CallTelemetry::Global().Record(
+        "vfs", api_tag, openscarlett::CallOutcome::Ok, static_cast<int32_t>(packed), -1);
+    return OS_STATUS_SUCCESS;
+}
+
+OS_NTSTATUS NTAPI Hook_NtQueryDirectoryFile(HANDLE FileHandle,
+                                            HANDLE Event,
+                                            PVOID ApcRoutine,
+                                            PVOID ApcContext,
+                                            OS_IO_STATUS_BLOCK* IoStatusBlock,
+                                            PVOID FileInformation,
+                                            ULONG Length,
+                                            ULONG FileInformationClass,
+                                            BOOLEAN ReturnSingleEntry,
+                                            OS_UNICODE_STRING* FileName,
+                                            BOOLEAN RestartScan) {
+    if (!g_shutting_down.load(std::memory_order_acquire) && FileHandle != nullptr) {
+        TrackedVfsHandle snap{};
+        if (LookupTrackedVfsHandleSnapshot(FileHandle, snap) &&
+            snap.drive == openscarlett::VfsDrive::Game && snap.is_directory) {
+            ULONG flags = 0u;
+            if (RestartScan) flags |= OS_SL_RESTART_SCAN;
+            if (ReturnSingleEntry) flags |= OS_SL_RETURN_SINGLE_ENTRY;
+            return QueryVirtualGameDirectoryImpl(FileHandle,
+                                                 Event,
+                                                 IoStatusBlock,
+                                                 FileInformation,
+                                                 Length,
+                                                 FileInformationClass,
+                                                 flags,
+                                                 FileName,
+                                                 "NtQueryDirectoryFile");
+        }
+    }
+    return g_real_NtQueryDirectoryFile(FileHandle,
+                                       Event,
+                                       ApcRoutine,
+                                       ApcContext,
+                                       IoStatusBlock,
+                                       FileInformation,
+                                       Length,
+                                       FileInformationClass,
+                                       ReturnSingleEntry,
+                                       FileName,
+                                       RestartScan);
+}
+
+OS_NTSTATUS NTAPI Hook_NtQueryDirectoryFileEx(HANDLE FileHandle,
+                                              HANDLE Event,
+                                              PVOID ApcRoutine,
+                                              PVOID ApcContext,
+                                              OS_IO_STATUS_BLOCK* IoStatusBlock,
+                                              PVOID FileInformation,
+                                              ULONG Length,
+                                              ULONG FileInformationClass,
+                                              ULONG QueryFlags,
+                                              OS_UNICODE_STRING* FileName) {
+    if (!g_shutting_down.load(std::memory_order_acquire) && FileHandle != nullptr) {
+        TrackedVfsHandle snap{};
+        if (LookupTrackedVfsHandleSnapshot(FileHandle, snap) &&
+            snap.drive == openscarlett::VfsDrive::Game && snap.is_directory) {
+            return QueryVirtualGameDirectoryImpl(FileHandle,
+                                                 Event,
+                                                 IoStatusBlock,
+                                                 FileInformation,
+                                                 Length,
+                                                 FileInformationClass,
+                                                 QueryFlags,
+                                                 FileName,
+                                                 "NtQueryDirectoryFileEx");
+        }
+    }
+    return g_real_NtQueryDirectoryFileEx(FileHandle,
+                                         Event,
+                                         ApcRoutine,
+                                         ApcContext,
+                                         IoStatusBlock,
+                                         FileInformation,
+                                         Length,
+                                         FileInformationClass,
+                                         QueryFlags,
+                                         FileName);
+}
+
+OS_NTSTATUS NTAPI Hook_NtSetInformationFile(HANDLE FileHandle,
+                                            OS_IO_STATUS_BLOCK* IoStatusBlock,
+                                            PVOID FileInformation,
+                                            ULONG Length,
+                                            ULONG FileInformationClass) {
+    if (!g_shutting_down.load(std::memory_order_acquire) &&
+        FileHandle != nullptr && FileInformation != nullptr) {
+        TrackedVfsHandle snap{};
+        if (LookupTrackedVfsHandleSnapshot(FileHandle, snap) &&
+            snap.drive == openscarlett::VfsDrive::Game) {
+            if (FileInformationClass == OS_FileDispositionInformation ||
+                FileInformationClass == OS_FileDispositionInformationEx) {
+                bool mark_delete = false;
+                if (FileInformationClass == OS_FileDispositionInformation) {
+                    if (Length < sizeof(OS_FILE_DISPOSITION_INFORMATION)) {
+                        return OS_STATUS_INFO_LENGTH_MISMATCH;
+                    }
+                    mark_delete =
+                        static_cast<const OS_FILE_DISPOSITION_INFORMATION*>(FileInformation)->DeleteFile != 0;
+                } else {
+                    if (Length < sizeof(OS_FILE_DISPOSITION_INFORMATION_EX)) {
+                        return OS_STATUS_INFO_LENGTH_MISMATCH;
+                    }
+                    mark_delete =
+                        (static_cast<const OS_FILE_DISPOSITION_INFORMATION_EX*>(FileInformation)->Flags &
+                         OS_FILE_DISPOSITION_DELETE) != 0u;
+                }
+
+                if (mark_delete) {
+                    if (snap.is_overlay) {
+                        const DWORD attrs = g_real_GetFileAttributesW
+                                                ? g_real_GetFileAttributesW(snap.host_path.c_str())
+                                                : ::GetFileAttributesW(snap.host_path.c_str());
+                        if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_READONLY) != 0u) {
+                            ::SetFileAttributesW(snap.host_path.c_str(), attrs & ~FILE_ATTRIBUTE_READONLY);
+                        }
+                        const OS_NTSTATUS st = g_real_NtSetInformationFile(
+                            FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
+                        if (st >= 0 && g_vfs.HasBaseGamePathW(snap.virtual_path)) {
+                            (void)g_vfs.WriteWhiteoutForVirtualPathW(snap.virtual_path);
+                        }
+                        openscarlett::CallTelemetry::Global().Record(
+                            "vfs", "NtSetInformationFile:disposition_overlay",
+                            st >= 0 ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error,
+                            static_cast<int32_t>(st), -1);
+                        return st;
+                    }
+                    // Read-only base handle: NEVER delete base file; record whiteout in overlay instead!
+                    const bool wo_ok = g_vfs.WriteWhiteoutForVirtualPathW(snap.virtual_path);
+                    const OS_NTSTATUS st = wo_ok ? OS_STATUS_SUCCESS : OS_STATUS_ACCESS_DENIED;
+                    if (IoStatusBlock) {
+                        IoStatusBlock->Status = st;
+                        IoStatusBlock->Information = 0u;
+                    }
+                    openscarlett::CallTelemetry::Global().Record(
+                        "vfs", "NtSetInformationFile:disposition_whiteout",
+                        wo_ok ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error,
+                        static_cast<int32_t>(st), -1);
+                    return st;
+                } else {
+                    (void)g_vfs.ClearWhiteoutForVirtualPathW(snap.virtual_path);
+                    if (snap.is_overlay) {
+                        return g_real_NtSetInformationFile(
+                            FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
+                    }
+                    if (IoStatusBlock) {
+                        IoStatusBlock->Status = OS_STATUS_SUCCESS;
+                        IoStatusBlock->Information = 0u;
+                    }
+                    return OS_STATUS_SUCCESS;
+                }
+            }
+
+            if (FileInformationClass == OS_FileRenameInformation ||
+                FileInformationClass == OS_FileRenameInformationEx) {
+                const size_t hdr_bytes = offsetof(OS_FILE_RENAME_INFORMATION, FileName);
+                if (Length < hdr_bytes) {
+                    return OS_STATUS_INFO_LENGTH_MISMATCH;
+                }
+                const auto* rinfo = static_cast<const OS_FILE_RENAME_INFORMATION*>(FileInformation);
+                if (rinfo->FileNameLength == 0u || hdr_bytes + rinfo->FileNameLength > Length) {
+                    return OS_STATUS_INVALID_PARAMETER;
+                }
+                const bool replace_existing =
+                    (FileInformationClass == OS_FileRenameInformation)
+                        ? (rinfo->ReplaceIfExists != 0)
+                        : ((rinfo->Flags & OS_FILE_RENAME_REPLACE_IF_EXISTS) != 0u);
+
+                std::wstring raw_dst(rinfo->FileName,
+                                     static_cast<size_t>(rinfo->FileNameLength) / sizeof(wchar_t));
+                while (!raw_dst.empty() && raw_dst.back() == L'\0') {
+                    raw_dst.pop_back();
+                }
+
+                std::wstring dst_vpath;
+                if (rinfo->RootDirectory != nullptr) {
+                    TrackedVfsHandle root_snap{};
+                    if (LookupTrackedVfsHandleSnapshot(rinfo->RootDirectory, root_snap)) {
+                        std::wstring_view rv = raw_dst;
+                        while (!rv.empty() && (rv.front() == L'\\' || rv.front() == L'/')) {
+                            rv.remove_prefix(1u);
+                        }
+                        dst_vpath = NormalizeCanonicalVirtualPathW(
+                            JoinVirtualChildW(root_snap.virtual_path, rv));
+                    }
+                }
+                if (dst_vpath.empty()) {
+                    if (openscarlett::VfsMounts::DetectVirtualDriveW(raw_dst) !=
+                        openscarlett::VfsDrive::None) {
+                        dst_vpath = NormalizeCanonicalVirtualPathW(raw_dst);
+                    } else {
+                        // Relative name or host path: resolve relative to parent virtual dir.
+                        std::wstring mapped;
+                        if (g_vfs.TryMapHostPathToVirtualW(raw_dst, mapped, nullptr)) {
+                            dst_vpath = NormalizeCanonicalVirtualPathW(mapped);
+                        } else {
+                            std::wstring parent_v = snap.virtual_path;
+                            const size_t slash = parent_v.rfind(L'\\');
+                            if (slash != std::wstring::npos && slash >= 2u) {
+                                parent_v.resize(slash);
+                            }
+                            std::wstring_view rv = raw_dst;
+                            while (!rv.empty() && (rv.front() == L'\\' || rv.front() == L'/')) {
+                                rv.remove_prefix(1u);
+                            }
+                            dst_vpath = NormalizeCanonicalVirtualPathW(JoinVirtualChildW(parent_v, rv));
+                        }
+                    }
+                }
+
+                if (!replace_existing && g_vfs.IsVisibleGamePathW(dst_vpath)) {
+                    if (IoStatusBlock) {
+                        IoStatusBlock->Status = OS_STATUS_OBJECT_NAME_COLLISION;
+                        IoStatusBlock->Information = 0u;
+                    }
+                    return OS_STATUS_OBJECT_NAME_COLLISION;
+                }
+
+                std::wstring dst_host;
+                bool dst_wo = false;
+                const auto dst_st = g_vfs.TranslateForAccessW(
+                    dst_vpath, openscarlett::VfsAccessMode::WriteCreate, dst_host, &dst_wo, true);
+                if (dst_st == openscarlett::VfsTranslateStatus::RejectedTraversal ||
+                    dst_st == openscarlett::VfsTranslateStatus::ReadOnlyViolation) {
+                    if (IoStatusBlock) {
+                        IoStatusBlock->Status = OS_STATUS_ACCESS_DENIED;
+                        IoStatusBlock->Information = 0u;
+                    }
+                    return OS_STATUS_ACCESS_DENIED;
+                }
+                if (dst_st != openscarlett::VfsTranslateStatus::Translated) {
+                    if (IoStatusBlock) {
+                        IoStatusBlock->Status = OS_STATUS_OBJECT_PATH_NOT_FOUND;
+                        IoStatusBlock->Information = 0u;
+                    }
+                    return OS_STATUS_OBJECT_PATH_NOT_FOUND;
+                }
+
+                if (snap.is_overlay) {
+                    // Rewrite NT rename target to \??\<dst_overlay_host_path> so the live OS handle renames cleanly.
+                    std::wstring nt_dst = dst_host;
+                    if (nt_dst.size() >= 4u && nt_dst.compare(0u, 4u, L"\\\\?\\") == 0) {
+                        nt_dst[1] = L'?';
+                    } else if (nt_dst.size() < 4u || nt_dst.compare(0u, 4u, L"\\??\\") != 0) {
+                        nt_dst.insert(0u, L"\\??\\");
+                    }
+                    const size_t dst_bytes = nt_dst.size() * sizeof(wchar_t);
+                    std::vector<uint8_t> buf(hdr_bytes + dst_bytes, 0u);
+                    auto* rewritten = reinterpret_cast<OS_FILE_RENAME_INFORMATION*>(buf.data());
+                    if (FileInformationClass == OS_FileRenameInformation) {
+                        rewritten->ReplaceIfExists = rinfo->ReplaceIfExists;
+                    } else {
+                        rewritten->Flags = rinfo->Flags;
+                    }
+                    rewritten->RootDirectory = nullptr;
+                    rewritten->FileNameLength = static_cast<ULONG>(dst_bytes);
+                    std::memcpy(rewritten->FileName, nt_dst.data(), dst_bytes);
+
+                    const OS_NTSTATUS st = g_real_NtSetInformationFile(
+                        FileHandle,
+                        IoStatusBlock,
+                        buf.data(),
+                        static_cast<ULONG>(buf.size()),
+                        FileInformationClass);
+                    if (st >= 0) {
+                        if (g_vfs.HasBaseGamePathW(snap.virtual_path)) {
+                            (void)g_vfs.WriteWhiteoutForVirtualPathW(snap.virtual_path);
+                        }
+                        ::AcquireSRWLockExclusive(&g_vfs_handle_lock);
+                        auto hit = g_vfs_handles.find(FileHandle);
+                        if (hit != g_vfs_handles.end()) {
+                            hit->second.virtual_path = dst_vpath;
+                            hit->second.host_path = StripNtOrExtPrefixW(dst_host);
+                            hit->second.is_overlay = true;
+                        }
+                        ::ReleaseSRWLockExclusive(&g_vfs_handle_lock);
+                    }
+                    openscarlett::CallTelemetry::Global().Record(
+                        "vfs", "NtSetInformationFile:rename_overlay",
+                        st >= 0 ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error,
+                        static_cast<int32_t>(st), -1);
+                    return st;
+                }
+
+                // Read-only base handle: CoW copy to overlay dst + whiteout old virtual path (NEVER touch base!).
+                std::error_code ec;
+                std::filesystem::path dst_p(dst_host);
+                if (dst_p.has_parent_path()) {
+                    std::filesystem::create_directories(dst_p.parent_path(), ec);
+                }
+                const BOOL copied = ::CopyFileW(snap.host_path.c_str(), dst_host.c_str(), replace_existing ? FALSE : TRUE);
+                if (!copied) {
+                    const DWORD err = ::GetLastError();
+                    const OS_NTSTATUS st = (err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS)
+                                               ? OS_STATUS_OBJECT_NAME_COLLISION
+                                               : OS_STATUS_ACCESS_DENIED;
+                    if (IoStatusBlock) {
+                        IoStatusBlock->Status = st;
+                        IoStatusBlock->Information = 0u;
+                    }
+                    return st;
+                }
+                const DWORD dst_attrs = ::GetFileAttributesW(dst_host.c_str());
+                if (dst_attrs != INVALID_FILE_ATTRIBUTES && (dst_attrs & FILE_ATTRIBUTE_READONLY) != 0u) {
+                    ::SetFileAttributesW(dst_host.c_str(), dst_attrs & ~FILE_ATTRIBUTE_READONLY);
+                }
+                (void)g_vfs.WriteWhiteoutForVirtualPathW(snap.virtual_path);
+                ::AcquireSRWLockExclusive(&g_vfs_handle_lock);
+                auto hit = g_vfs_handles.find(FileHandle);
+                if (hit != g_vfs_handles.end()) {
+                    hit->second.virtual_path = dst_vpath;
+                }
+                ::ReleaseSRWLockExclusive(&g_vfs_handle_lock);
+                if (IoStatusBlock) {
+                    IoStatusBlock->Status = OS_STATUS_SUCCESS;
+                    IoStatusBlock->Information = 0u;
+                }
+                openscarlett::CallTelemetry::Global().Record(
+                    "vfs", "NtSetInformationFile:rename_cow", openscarlett::CallOutcome::Ok, 0, -1);
+                return OS_STATUS_SUCCESS;
+            }
+
+            if (FileInformationClass == OS_FileEndOfFileInformation ||
+                FileInformationClass == OS_FileAllocationInformation) {
+                if (Length < sizeof(LARGE_INTEGER)) {
+                    return OS_STATUS_INFO_LENGTH_MISMATCH;
+                }
+                if (!snap.is_overlay) {
+                    // Never allow mutating EOF/allocation of a raw read-only base handle.
+                    if (IoStatusBlock) {
+                        IoStatusBlock->Status = OS_STATUS_ACCESS_DENIED;
+                        IoStatusBlock->Information = 0u;
+                    }
+                    openscarlett::CallTelemetry::Global().Record(
+                        "vfs", "NtSetInformationFile:eof_base_blocked",
+                        openscarlett::CallOutcome::Error, static_cast<int32_t>(OS_STATUS_ACCESS_DENIED), -1);
+                    return OS_STATUS_ACCESS_DENIED;
+                }
+                const OS_NTSTATUS st = g_real_NtSetInformationFile(
+                    FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
+                openscarlett::CallTelemetry::Global().Record(
+                    "vfs", "NtSetInformationFile:eof_overlay",
+                    st >= 0 ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error,
+                    static_cast<int32_t>(st), -1);
+                return st;
+            }
+        }
+    }
+    return g_real_NtSetInformationFile(
+        FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
+}
+
 // ---------------------------------------------------------------------------
 // Hook Implementations: Read-Only CoW Overlay Virtual Drive VFS
 //   Supports G:\, GAME:\, D:\, T:\, S:\, P:\ (never mutates target game package dir!)
 // ---------------------------------------------------------------------------
-bool ResolveVirtualCreatePathW(std::wstring_view virtual_path,
-                               const char* api_tag,
-                               DWORD dwDesiredAccess,
-                               DWORD dwCreationDisposition,
-                               DWORD dwFlagsAndAttributes,
-                               std::wstring& out_host_path,
-                               DWORD& out_effective_disposition,
-                               bool& out_passthrough,
-                               DWORD& out_error) {
+bool ResolveVirtualOpenPathW(std::wstring_view virtual_path,
+                             const char* api_tag,
+                             DWORD dwDesiredAccess,
+                             DWORD dwCreationDisposition,
+                             DWORD dwFlagsAndAttributes,
+                             std::wstring& out_host_path,
+                             openscarlett::VfsDrive& out_drive,
+                             DWORD& out_effective_disposition,
+                             bool& out_passthrough,
+                             DWORD& out_error) {
     out_host_path.clear();
+    out_drive = openscarlett::VfsMounts::DetectVirtualDriveW(virtual_path);
     out_effective_disposition = dwCreationDisposition;
     out_passthrough = false;
     out_error = ERROR_SUCCESS;
 
-    const openscarlett::VfsDrive drive = openscarlett::VfsMounts::DetectVirtualDriveW(virtual_path);
     constexpr DWORD kWriteAccessMask =
         GENERIC_WRITE | GENERIC_ALL | FILE_WRITE_DATA | FILE_APPEND_DATA |
         FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA | DELETE | WRITE_DAC | WRITE_OWNER;
@@ -1786,7 +3034,7 @@ bool ResolveVirtualCreatePathW(std::wstring_view virtual_path,
     bool was_whiteout = false;
     openscarlett::VfsTranslateStatus st = openscarlett::VfsTranslateStatus::NotVirtual;
 
-    if (drive == openscarlett::VfsDrive::Game) {
+    if (out_drive == openscarlett::VfsDrive::Game) {
         if (!wants_write && dwCreationDisposition == OPEN_EXISTING) {
             st = g_vfs.TranslateForAccessW(
                 virtual_path, openscarlett::VfsAccessMode::ReadOnly, out_host_path, &was_whiteout, true);
@@ -1814,47 +3062,37 @@ bool ResolveVirtualCreatePathW(std::wstring_view virtual_path,
                     virtual_path, openscarlett::VfsAccessMode::WriteCreate, out_host_path, &was_whiteout, true);
             }
         } else if (dwCreationDisposition == CREATE_ALWAYS) {
-            st = g_vfs.TranslateForAccessW(
-                virtual_path, openscarlett::VfsAccessMode::WriteCreate, out_host_path, &was_whiteout, true);
+            // Prepare overlay for overwrite/create while stripping FILE_ATTRIBUTE_READONLY on
+            // any existing overlay copy and NEVER touching the read-only base game file.
+            st = g_vfs.PrepareOverlayTruncateW(virtual_path, true, out_host_path, &was_whiteout);
         } else if (dwCreationDisposition == TRUNCATE_EXISTING) {
-            // Validate traversal / whiteout / visibility before touching the overlay.
-            st = g_vfs.TranslateForAccessW(
-                virtual_path, openscarlett::VfsAccessMode::ReadOnly, out_host_path, &was_whiteout, true);
-            if (st == openscarlett::VfsTranslateStatus::Translated) {
-                // Win32 CreateFileW/CreateFile2 require GENERIC_WRITE (or GENERIC_ALL) for TRUNCATE_EXISTING.
-                if ((dwDesiredAccess & (GENERIC_WRITE | GENERIC_ALL)) == 0) {
-                    out_error = ERROR_INVALID_PARAMETER;
-                    return false;
-                }
-                bool is_dir = false;
-                if (!g_vfs.IsVisibleGamePathW(virtual_path, &is_dir)) {
-                    out_error = ERROR_FILE_NOT_FOUND;
-                    return false;
-                }
-                if (is_dir) {
-                    out_error = ((dwFlagsAndAttributes & FILE_FLAG_BACKUP_SEMANTICS) != 0)
-                                    ? ERROR_INVALID_PARAMETER
-                                    : ERROR_ACCESS_DENIED;
-                    return false;
-                }
-                // Route directly to the CoW overlay without copying the base file or creating
-                // a 0-byte placeholder ahead of time. If the file does not yet exist in the
-                // overlay, rewrite TRUNCATE_EXISTING -> CREATE_ALWAYS so the native open
-                // creates the truncated overlay file atomically on success.
-                std::wstring overlay_path;
-                st = g_vfs.TranslateForAccessW(
-                    virtual_path, openscarlett::VfsAccessMode::WriteCreate, overlay_path, &was_whiteout, true);
-                if (st == openscarlett::VfsTranslateStatus::Translated) {
-                    out_host_path = std::move(overlay_path);
-                    const DWORD ovl_attrs = ::GetFileAttributesW(out_host_path.c_str());
-                    if (ovl_attrs == INVALID_FILE_ATTRIBUTES) {
-                        out_effective_disposition = CREATE_ALWAYS;
-                    }
-                }
+            // Win32 CreateFileW/CreateFile2 require GENERIC_WRITE (or GENERIC_ALL) for TRUNCATE_EXISTING.
+            if ((dwDesiredAccess & (GENERIC_WRITE | GENERIC_ALL)) == 0) {
+                out_error = ERROR_INVALID_PARAMETER;
+                return false;
             }
+            bool is_dir = false;
+            if (g_vfs.IsVisibleGamePathW(virtual_path, &is_dir) && is_dir) {
+                out_error = ((dwFlagsAndAttributes & FILE_FLAG_BACKUP_SEMANTICS) != 0)
+                                ? ERROR_INVALID_PARAMETER
+                                : ERROR_ACCESS_DENIED;
+                return false;
+            }
+            // CoW copy-up un-overlaid read-only game files into overlay and strip READONLY
+            // BEFORE Win32 truncates the overlay copy to 0 bytes (base file stays 100% intact).
+            st = g_vfs.PrepareOverlayTruncateW(virtual_path, false, out_host_path, &was_whiteout);
         } else if (dwCreationDisposition == OPEN_EXISTING) {
             st = g_vfs.TranslateForAccessW(
                 virtual_path, openscarlett::VfsAccessMode::WriteModify, out_host_path, &was_whiteout, true);
+            if (st == openscarlett::VfsTranslateStatus::Translated &&
+                IsHostPathUnderOverlayW(out_host_path)) {
+                const DWORD attrs = g_real_GetFileAttributesW
+                                        ? g_real_GetFileAttributesW(out_host_path.c_str())
+                                        : ::GetFileAttributesW(out_host_path.c_str());
+                if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_READONLY) != 0u) {
+                    ::SetFileAttributesW(out_host_path.c_str(), attrs & ~FILE_ATTRIBUTE_READONLY);
+                }
+            }
         } else {
             st = g_vfs.TranslateForAccessW(
                 virtual_path, openscarlett::VfsAccessMode::ReadOnly, out_host_path, &was_whiteout, true);
@@ -1863,6 +3101,15 @@ bool ResolveVirtualCreatePathW(std::wstring_view virtual_path,
                                       ? openscarlett::VfsAccessMode::WriteModify
                                       : openscarlett::VfsAccessMode::WriteCreate;
                 st = g_vfs.TranslateForAccessW(virtual_path, mode, out_host_path, &was_whiteout, true);
+                if (st == openscarlett::VfsTranslateStatus::Translated &&
+                    IsHostPathUnderOverlayW(out_host_path)) {
+                    const DWORD attrs = g_real_GetFileAttributesW
+                                            ? g_real_GetFileAttributesW(out_host_path.c_str())
+                                            : ::GetFileAttributesW(out_host_path.c_str());
+                    if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_READONLY) != 0u) {
+                        ::SetFileAttributesW(out_host_path.c_str(), attrs & ~FILE_ATTRIBUTE_READONLY);
+                    }
+                }
             }
         }
     } else {
@@ -1894,7 +3141,7 @@ bool ResolveVirtualCreatePathW(std::wstring_view virtual_path,
     }
     if (st == openscarlett::VfsTranslateStatus::NotVirtual) {
         out_passthrough = true;
-        return false;
+        return true;
     }
     if (st != openscarlett::VfsTranslateStatus::Translated) {
         out_error = ERROR_PATH_NOT_FOUND;
@@ -1941,32 +3188,33 @@ HANDLE CreateVirtualFileW(std::wstring_view virtual_path,
                           DWORD dwFlagsAndAttributes,
                           HANDLE hTemplateFile) {
     std::wstring host_path;
+    openscarlett::VfsDrive drive = openscarlett::VfsDrive::None;
     DWORD effective_disposition = dwCreationDisposition;
     bool passthrough = false;
-    DWORD resolve_err = ERROR_SUCCESS;
+    DWORD err = ERROR_SUCCESS;
     PfnCreateFileW real_cfw = g_real_CreateFileW ? g_real_CreateFileW : &::CreateFileW;
-    if (!ResolveVirtualCreatePathW(virtual_path, api_tag, dwDesiredAccess, dwCreationDisposition,
-                                   dwFlagsAndAttributes, host_path, effective_disposition,
-                                   passthrough, resolve_err)) {
-        if (passthrough) {
-            const std::wstring passthrough_path(virtual_path);
-            HANDLE h = real_cfw(passthrough_path.c_str(),
-                                dwDesiredAccess,
-                                dwShareMode,
-                                lpSecurityAttributes,
-                                dwCreationDisposition,
-                                dwFlagsAndAttributes,
-                                hTemplateFile);
-            if (h == INVALID_HANDLE_VALUE) {
-                const DWORD e = ::GetLastError();
-                TraceVfsFailureW(api_tag, virtual_path, passthrough_path, dwDesiredAccess, dwCreationDisposition, e);
-                ::SetLastError(e);
-            }
-            return h;
-        }
-        TraceVfsFailureW(api_tag, virtual_path, L"<resolve_failed>", dwDesiredAccess, dwCreationDisposition, resolve_err);
-        ::SetLastError(resolve_err);
+    if (!ResolveVirtualOpenPathW(virtual_path, api_tag, dwDesiredAccess, dwCreationDisposition,
+                                 dwFlagsAndAttributes, host_path, drive, effective_disposition,
+                                 passthrough, err)) {
+        TraceVfsFailureW(api_tag, virtual_path, L"<resolve_failed>", dwDesiredAccess, dwCreationDisposition, err);
+        ::SetLastError(err);
         return INVALID_HANDLE_VALUE;
+    }
+    if (passthrough) {
+        const std::wstring passthrough_path(virtual_path);
+        HANDLE h = real_cfw(passthrough_path.c_str(),
+                            dwDesiredAccess,
+                            dwShareMode,
+                            lpSecurityAttributes,
+                            dwCreationDisposition,
+                            dwFlagsAndAttributes,
+                            hTemplateFile);
+        if (h == INVALID_HANDLE_VALUE) {
+            const DWORD e = ::GetLastError();
+            TraceVfsFailureW(api_tag, virtual_path, passthrough_path, dwDesiredAccess, dwCreationDisposition, e);
+            ::SetLastError(e);
+        }
+        return h;
     }
 
     HANDLE h = real_cfw(host_path.c_str(),
@@ -1976,8 +3224,10 @@ HANDLE CreateVirtualFileW(std::wstring_view virtual_path,
                         effective_disposition,
                         dwFlagsAndAttributes,
                         hTemplateFile);
-    DWORD err = ::GetLastError();
-    if (h == INVALID_HANDLE_VALUE) {
+    err = ::GetLastError();
+    if (h != INVALID_HANDLE_VALUE) {
+        TrackVfsHandle(h, virtual_path, host_path, drive);
+    } else {
         TraceVfsFailureW(api_tag, virtual_path, host_path, dwDesiredAccess, dwCreationDisposition, err);
     }
     openscarlett::CallTelemetry::Global().Record(
@@ -1988,6 +3238,134 @@ HANDLE CreateVirtualFileW(std::wstring_view virtual_path,
         -1);
     ::SetLastError(err);
     return h;
+}
+
+HANDLE WINAPI Hook_CreateFile2(LPCWSTR lpFileName,
+                               DWORD dwDesiredAccess,
+                               DWORD dwShareMode,
+                               DWORD dwCreationDisposition,
+                               OS_CREATEFILE2_EXTENDED_PARAMETERS* pCreateExParams) {
+    if (tl_vfs_hook_depth == 0 &&
+        !g_shutting_down.load(std::memory_order_acquire) &&
+        lpFileName != nullptr &&
+        openscarlett::VfsMounts::DetectVirtualDriveW(lpFileName) != openscarlett::VfsDrive::None &&
+        !ShouldPassThroughHostDDriveW(lpFileName)) {
+        ScopedVfsHookGuard guard;
+        std::wstring host_path;
+        openscarlett::VfsDrive drive = openscarlett::VfsDrive::None;
+        DWORD effective_disposition = dwCreationDisposition;
+        bool passthrough = false;
+        DWORD err = ERROR_SUCCESS;
+        const DWORD flags_and_attrs =
+            pCreateExParams ? (pCreateExParams->dwFileFlags | pCreateExParams->dwFileAttributes) : 0u;
+        if (!ResolveVirtualOpenPathW(lpFileName, "CreateFile2", dwDesiredAccess,
+                                     dwCreationDisposition, flags_and_attrs, host_path, drive,
+                                     effective_disposition, passthrough, err)) {
+            TraceVfsFailureW("CreateFile2", lpFileName, L"<resolve_failed>",
+                             dwDesiredAccess, dwCreationDisposition, err);
+            ::SetLastError(err);
+            return INVALID_HANDLE_VALUE;
+        }
+        if (!passthrough) {
+            HANDLE h = g_real_CreateFile2(host_path.c_str(),
+                                          dwDesiredAccess,
+                                          dwShareMode,
+                                          effective_disposition,
+                                          pCreateExParams);
+            err = ::GetLastError();
+            if (h != INVALID_HANDLE_VALUE) {
+                TrackVfsHandle(h, lpFileName, host_path, drive);
+            } else {
+                TraceVfsFailureW("CreateFile2", lpFileName, host_path,
+                                 dwDesiredAccess, dwCreationDisposition, err);
+            }
+            openscarlett::CallTelemetry::Global().Record(
+                "vfs",
+                "CreateFile2",
+                h != INVALID_HANDLE_VALUE ? openscarlett::CallOutcome::Ok
+                                          : openscarlett::CallOutcome::Error,
+                h != INVALID_HANDLE_VALUE ? 0 : static_cast<int32_t>(err),
+                -1);
+            ::SetLastError(err);
+            return h;
+        }
+    }
+    return g_real_CreateFile2(
+        lpFileName, dwDesiredAccess, dwShareMode, dwCreationDisposition, pCreateExParams);
+}
+
+BOOL WINAPI Hook_CloseHandle(HANDLE hObject) {
+    if (!g_shutting_down.load(std::memory_order_acquire)) {
+        UntrackVfsHandle(hObject);
+    }
+    return g_real_CloseHandle(hObject);
+}
+
+DWORD WINAPI Hook_GetFinalPathNameByHandleW(HANDLE hFile,
+                                            LPWSTR lpszFilePath,
+                                            DWORD cchFilePath,
+                                            DWORD dwFlags) {
+    if (!g_shutting_down.load(std::memory_order_acquire) &&
+        hFile != nullptr && hFile != INVALID_HANDLE_VALUE) {
+        std::wstring virtual_path;
+        TrackedVfsHandle snap{};
+        if (LookupTrackedVfsHandleSnapshot(hFile, snap) && !snap.virtual_path.empty()) {
+            virtual_path = snap.virtual_path;
+        } else if (g_real_GetFinalPathNameByHandleW != nullptr) {
+            std::wstring probe(512u, L'\0');
+            DWORD got = g_real_GetFinalPathNameByHandleW(
+                hFile, probe.data(), static_cast<DWORD>(probe.size()), 0u /*VOLUME_NAME_DOS*/);
+            if (got >= probe.size() && got > 0u) {
+                probe.resize(static_cast<size_t>(got) + 1u);
+                got = g_real_GetFinalPathNameByHandleW(
+                    hFile, probe.data(), static_cast<DWORD>(probe.size()), 0u);
+            }
+            if (got > 0u && got < probe.size()) {
+                probe.resize(got);
+                std::wstring mapped;
+                if (g_vfs.TryMapHostPathToVirtualW(probe, mapped, nullptr)) {
+                    virtual_path = NormalizeCanonicalVirtualPathW(mapped);
+                }
+            }
+        }
+
+        if (!virtual_path.empty()) {
+            std::wstring formatted;
+            const DWORD vol_mode = dwFlags & 0x7u;
+            if (vol_mode == 0x4u /*VOLUME_NAME_NONE*/) {
+                if (virtual_path.size() >= 2u && virtual_path[1] == L':') {
+                    formatted = virtual_path.substr(2u);
+                    if (formatted.empty()) formatted = L"\\";
+                } else {
+                    formatted = virtual_path;
+                }
+            } else if (vol_mode == 0x2u /*VOLUME_NAME_NT*/) {
+                wchar_t drv = (virtual_path.size() >= 2u && virtual_path[1] == L':') ? virtual_path[0] : L'G';
+                std::wstring rest = (virtual_path.size() >= 2u && virtual_path[1] == L':')
+                                        ? virtual_path.substr(2u)
+                                        : (L"\\" + virtual_path);
+                if (rest.empty()) rest = L"\\";
+                formatted = L"\\Device\\OpenScarlettVfs\\";
+                formatted.push_back(drv);
+                formatted.append(rest);
+            } else {
+                // VOLUME_NAME_DOS (default) or VOLUME_NAME_GUID: canonical \\?\<Drive>:\<rel>
+                formatted = L"\\\\?\\" + virtual_path;
+            }
+
+            openscarlett::CallTelemetry::Global().Record(
+                "vfs", "GetFinalPathNameByHandleW", openscarlett::CallOutcome::Ok, 0, -1);
+
+            if (lpszFilePath == nullptr || static_cast<size_t>(cchFilePath) <= formatted.size()) {
+                ::SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+                return static_cast<DWORD>(formatted.size() + 1u);
+            }
+            std::memcpy(lpszFilePath, formatted.c_str(), (formatted.size() + 1u) * sizeof(wchar_t));
+            ::SetLastError(ERROR_SUCCESS);
+            return static_cast<DWORD>(formatted.size());
+        }
+    }
+    return g_real_GetFinalPathNameByHandleW(hFile, lpszFilePath, cchFilePath, dwFlags);
 }
 
 HANDLE WINAPI Hook_CreateFileW(LPCWSTR lpFileName,
@@ -2027,54 +3405,6 @@ HANDLE WINAPI Hook_CreateFileW(LPCWSTR lpFileName,
         ::SetLastError(e);
     }
     return h;
-}
-
-HANDLE WINAPI Hook_CreateFile2(LPCWSTR lpFileName,
-                               DWORD dwDesiredAccess,
-                               DWORD dwShareMode,
-                               DWORD dwCreationDisposition,
-                               LPCREATEFILE2_EXTENDED_PARAMETERS pCreateExParams) {
-    if (tl_vfs_hook_depth == 0 &&
-        !g_shutting_down.load(std::memory_order_acquire) &&
-        lpFileName != nullptr &&
-        openscarlett::VfsMounts::DetectVirtualDriveW(lpFileName) != openscarlett::VfsDrive::None &&
-        !ShouldPassThroughHostDDriveW(lpFileName)) {
-        ScopedVfsHookGuard guard;
-        std::wstring host_path;
-        DWORD effective_disposition = dwCreationDisposition;
-        bool passthrough = false;
-        DWORD resolve_err = ERROR_SUCCESS;
-        const DWORD flags_and_attrs =
-            pCreateExParams ? (pCreateExParams->dwFileFlags | pCreateExParams->dwFileAttributes) : 0u;
-        if (!ResolveVirtualCreatePathW(lpFileName, "CreateFile2", dwDesiredAccess, dwCreationDisposition,
-                                       flags_and_attrs, host_path, effective_disposition,
-                                       passthrough, resolve_err)) {
-            if (!passthrough) {
-                ::SetLastError(resolve_err);
-                return INVALID_HANDLE_VALUE;
-            }
-        } else {
-            HANDLE h = g_real_CreateFile2(host_path.c_str(),
-                                          dwDesiredAccess,
-                                          dwShareMode,
-                                          effective_disposition,
-                                          pCreateExParams);
-            DWORD err = ::GetLastError();
-            openscarlett::CallTelemetry::Global().Record(
-                "vfs",
-                "CreateFile2",
-                h != INVALID_HANDLE_VALUE ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error,
-                h != INVALID_HANDLE_VALUE ? 0 : static_cast<int32_t>(err),
-                -1);
-            ::SetLastError(err);
-            return h;
-        }
-    }
-    return g_real_CreateFile2(lpFileName,
-                              dwDesiredAccess,
-                              dwShareMode,
-                              dwCreationDisposition,
-                              pCreateExParams);
 }
 
 HANDLE WINAPI Hook_CreateFileA(LPCSTR lpFileName,
@@ -3600,6 +4930,10 @@ void* ResolveVfsHookForSymbol(const char* name) {
          reinterpret_cast<void**>(&g_real_CreateFileW)},
         {"CreateFile2", reinterpret_cast<void*>(&Hook_CreateFile2),
          reinterpret_cast<void**>(&g_real_CreateFile2)},
+        {"CloseHandle", reinterpret_cast<void*>(&Hook_CloseHandle),
+         reinterpret_cast<void**>(&g_real_CloseHandle)},
+        {"GetFinalPathNameByHandleW", reinterpret_cast<void*>(&Hook_GetFinalPathNameByHandleW),
+         reinterpret_cast<void**>(&g_real_GetFinalPathNameByHandleW)},
         {"GetFileAttributesA", reinterpret_cast<void*>(&Hook_GetFileAttributesA),
          reinterpret_cast<void**>(&g_real_GetFileAttributesA)},
         {"GetFileAttributesW", reinterpret_cast<void*>(&Hook_GetFileAttributesW),
@@ -3676,6 +5010,8 @@ void* ResolveVfsHookForRealAddress(ULONGLONG addr) {
     if (void* p = match(g_real_CreateFileA, &Hook_CreateFileA)) return p;
     if (void* p = match(g_real_CreateFileW, &Hook_CreateFileW)) return p;
     if (void* p = match(g_real_CreateFile2, &Hook_CreateFile2)) return p;
+    if (void* p = match(g_real_CloseHandle, &Hook_CloseHandle)) return p;
+    if (void* p = match(g_real_GetFinalPathNameByHandleW, &Hook_GetFinalPathNameByHandleW)) return p;
     if (void* p = match(g_real_GetFileAttributesA, &Hook_GetFileAttributesA)) return p;
     if (void* p = match(g_real_GetFileAttributesW, &Hook_GetFileAttributesW)) return p;
     if (void* p = match(g_real_GetFileAttributesExA, &Hook_GetFileAttributesExA)) return p;
@@ -3750,6 +5086,14 @@ void* ResolveHookForSymbol(const char* name) {
          reinterpret_cast<void**>(&g_real_NtOpenFile)},
         {"NtQueryAttributesFile", reinterpret_cast<void*>(&Hook_NtQueryAttributesFile),
          reinterpret_cast<void**>(&g_real_NtQueryAttributesFile)},
+        {"NtClose", reinterpret_cast<void*>(&Hook_NtClose),
+         reinterpret_cast<void**>(&g_real_NtClose)},
+        {"NtQueryDirectoryFile", reinterpret_cast<void*>(&Hook_NtQueryDirectoryFile),
+         reinterpret_cast<void**>(&g_real_NtQueryDirectoryFile)},
+        {"NtQueryDirectoryFileEx", reinterpret_cast<void*>(&Hook_NtQueryDirectoryFileEx),
+         reinterpret_cast<void**>(&g_real_NtQueryDirectoryFileEx)},
+        {"NtSetInformationFile", reinterpret_cast<void*>(&Hook_NtSetInformationFile),
+         reinterpret_cast<void**>(&g_real_NtSetInformationFile)},
     };
     for (const auto& b : kBindings) {
         if (std::strcmp(name, b.symbol_name) == 0) {
@@ -3792,6 +5136,10 @@ void* ResolveHookForRealAddress(ULONGLONG addr) {
     if (void* p = match(g_real_NtCreateFile, &Hook_NtCreateFile)) return p;
     if (void* p = match(g_real_NtOpenFile, &Hook_NtOpenFile)) return p;
     if (void* p = match(g_real_NtQueryAttributesFile, &Hook_NtQueryAttributesFile)) return p;
+    if (void* p = match(g_real_NtClose, &Hook_NtClose)) return p;
+    if (void* p = match(g_real_NtQueryDirectoryFile, &Hook_NtQueryDirectoryFile)) return p;
+    if (void* p = match(g_real_NtQueryDirectoryFileEx, &Hook_NtQueryDirectoryFileEx)) return p;
+    if (void* p = match(g_real_NtSetInformationFile, &Hook_NtSetInformationFile)) return p;
     return nullptr;
 }
 
@@ -4405,6 +5753,9 @@ bool InitializeHookRuntime(HMODULE self_mod) {
     if (!g_real_CreateFile2 && g_kernelbase_mod != nullptr) {
         g_real_CreateFile2 = reinterpret_cast<PfnCreateFile2>(::GetProcAddress(g_kernelbase_mod, "CreateFile2"));
     }
+    g_real_CloseHandle = reinterpret_cast<PfnCloseHandle>(::GetProcAddress(k32, "CloseHandle"));
+    g_real_GetFinalPathNameByHandleW = reinterpret_cast<PfnGetFinalPathNameByHandleW>(
+        ::GetProcAddress(k32, "GetFinalPathNameByHandleW"));
     g_real_GetFileAttributesA = reinterpret_cast<PfnGetFileAttributesA>(::GetProcAddress(k32, "GetFileAttributesA"));
     g_real_GetFileAttributesW = reinterpret_cast<PfnGetFileAttributesW>(::GetProcAddress(k32, "GetFileAttributesW"));
     g_real_GetFileAttributesExA = reinterpret_cast<PfnGetFileAttributesExA>(::GetProcAddress(k32, "GetFileAttributesExA"));
@@ -4454,6 +5805,14 @@ bool InitializeHookRuntime(HMODULE self_mod) {
             reinterpret_cast<PfnNtOpenFile>(::GetProcAddress(g_ntdll_mod, "NtOpenFile"));
         g_real_NtQueryAttributesFile = reinterpret_cast<PfnNtQueryAttributesFile>(
             ::GetProcAddress(g_ntdll_mod, "NtQueryAttributesFile"));
+        g_real_NtClose =
+            reinterpret_cast<PfnNtClose>(::GetProcAddress(g_ntdll_mod, "NtClose"));
+        g_real_NtQueryDirectoryFile = reinterpret_cast<PfnNtQueryDirectoryFile>(
+            ::GetProcAddress(g_ntdll_mod, "NtQueryDirectoryFile"));
+        g_real_NtQueryDirectoryFileEx = reinterpret_cast<PfnNtQueryDirectoryFileEx>(
+            ::GetProcAddress(g_ntdll_mod, "NtQueryDirectoryFileEx"));
+        g_real_NtSetInformationFile = reinterpret_cast<PfnNtSetInformationFile>(
+            ::GetProcAddress(g_ntdll_mod, "NtSetInformationFile"));
     }
 
     // Resolve %SystemRoot% for Windows system DLL exclusion
@@ -4975,6 +6334,99 @@ __declspec(dllexport) BOOL WINAPI OpenScarlettHook_CopyFileA(
     LPCSTR lpNewFileName,
     BOOL bFailIfExists) {
     return Hook_CopyFileA(lpExistingFileName, lpNewFileName, bFailIfExists);
+}
+
+__declspec(dllexport) HANDLE WINAPI OpenScarlettHook_CreateFileW(
+    LPCWSTR lpFileName,
+    DWORD dwDesiredAccess,
+    DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    DWORD dwCreationDisposition,
+    DWORD dwFlagsAndAttributes,
+    HANDLE hTemplateFile) {
+    return Hook_CreateFileW(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
+                            dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+}
+
+__declspec(dllexport) HANDLE WINAPI OpenScarlettHook_CreateFileA(
+    LPCSTR lpFileName,
+    DWORD dwDesiredAccess,
+    DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    DWORD dwCreationDisposition,
+    DWORD dwFlagsAndAttributes,
+    HANDLE hTemplateFile) {
+    return Hook_CreateFileA(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
+                            dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+}
+
+__declspec(dllexport) HANDLE WINAPI OpenScarlettHook_CreateFile2(
+    LPCWSTR lpFileName,
+    DWORD dwDesiredAccess,
+    DWORD dwShareMode,
+    DWORD dwCreationDisposition,
+    OS_CREATEFILE2_EXTENDED_PARAMETERS* pCreateExParams) {
+    return Hook_CreateFile2(
+        lpFileName, dwDesiredAccess, dwShareMode, dwCreationDisposition, pCreateExParams);
+}
+
+__declspec(dllexport) BOOL WINAPI OpenScarlettHook_CloseHandle(HANDLE hObject) {
+    return Hook_CloseHandle(hObject);
+}
+
+__declspec(dllexport) DWORD WINAPI OpenScarlettHook_GetFinalPathNameByHandleW(
+    HANDLE hFile,
+    LPWSTR lpszFilePath,
+    DWORD cchFilePath,
+    DWORD dwFlags) {
+    return Hook_GetFinalPathNameByHandleW(hFile, lpszFilePath, cchFilePath, dwFlags);
+}
+
+__declspec(dllexport) OS_NTSTATUS NTAPI OpenScarlettHook_NtClose(HANDLE Handle) {
+    return Hook_NtClose(Handle);
+}
+
+__declspec(dllexport) OS_NTSTATUS NTAPI OpenScarlettHook_NtQueryDirectoryFile(
+    HANDLE FileHandle,
+    HANDLE Event,
+    PVOID ApcRoutine,
+    PVOID ApcContext,
+    OS_IO_STATUS_BLOCK* IoStatusBlock,
+    PVOID FileInformation,
+    ULONG Length,
+    ULONG FileInformationClass,
+    BOOLEAN ReturnSingleEntry,
+    OS_UNICODE_STRING* FileName,
+    BOOLEAN RestartScan) {
+    return Hook_NtQueryDirectoryFile(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                                     FileInformation, Length, FileInformationClass,
+                                     ReturnSingleEntry, FileName, RestartScan);
+}
+
+__declspec(dllexport) OS_NTSTATUS NTAPI OpenScarlettHook_NtQueryDirectoryFileEx(
+    HANDLE FileHandle,
+    HANDLE Event,
+    PVOID ApcRoutine,
+    PVOID ApcContext,
+    OS_IO_STATUS_BLOCK* IoStatusBlock,
+    PVOID FileInformation,
+    ULONG Length,
+    ULONG FileInformationClass,
+    ULONG QueryFlags,
+    OS_UNICODE_STRING* FileName) {
+    return Hook_NtQueryDirectoryFileEx(FileHandle, Event, ApcRoutine, ApcContext, IoStatusBlock,
+                                       FileInformation, Length, FileInformationClass,
+                                       QueryFlags, FileName);
+}
+
+__declspec(dllexport) OS_NTSTATUS NTAPI OpenScarlettHook_NtSetInformationFile(
+    HANDLE FileHandle,
+    OS_IO_STATUS_BLOCK* IoStatusBlock,
+    PVOID FileInformation,
+    ULONG Length,
+    ULONG FileInformationClass) {
+    return Hook_NtSetInformationFile(
+        FileHandle, IoStatusBlock, FileInformation, Length, FileInformationClass);
 }
 
 }  // extern "C"
