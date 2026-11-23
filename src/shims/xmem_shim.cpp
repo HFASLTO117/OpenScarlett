@@ -64,7 +64,8 @@ inline void RecordHresult(const char* sym, int32_t hr) {
 extern "C" {
 
 OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL XMemGetWorkingSetStatistics(
-    void* lpBuffer);
+    uintptr_t arg0,
+    void* arg1);
 
 void* OPENSCARLETT_KERNELX_CALL XMemShim_XMemAlloc(size_t dwSize, uint64_t dwAllocAttributes) {
     void* ptr = ::XMemAlloc(dwSize, dwAllocAttributes);
@@ -182,8 +183,10 @@ int32_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemUnmapPhysicalPages(
     return ok;
 }
 
-int32_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemGetWorkingSetStatistics(void* lpBuffer) {
-    const int32_t ok = ::XMemGetWorkingSetStatistics(lpBuffer);
+int32_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemGetWorkingSetStatistics(
+    uintptr_t arg0,
+    void* arg1) {
+    const int32_t ok = ::XMemGetWorkingSetStatistics(arg0, arg1);
     RecordOutcome("XMemGetWorkingSetStatistics", ok != 0);
     return ok;
 }

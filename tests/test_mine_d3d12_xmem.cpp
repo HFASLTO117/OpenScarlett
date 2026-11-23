@@ -214,6 +214,24 @@ void TestXMemTransferMemory() {
         OS_REQUIRE(ok_calls == 5ull);
     }
 
+    // 8. Real 2-arg Xbox Series X ABI for XMemGetWorkingSetStatistics(flags=0x20000001, outStats)
+    {
+        using PfnWs2 = int32_t(WINAPI*)(uintptr_t, void*);
+        auto ws_fn = reinterpret_cast<PfnWs2>(GetProcAddress(mod, "XMemGetWorkingSetStatistics"));
+        OS_REQUIRE(ws_fn != nullptr);
+        struct XboxWsStats32 {
+            uint64_t total_bytes;
+            uint64_t available_bytes;
+            uint64_t working_set_bytes;
+            uint64_t peak_working_set_bytes;
+        };
+        XboxWsStats32 st{};
+        std::memset(&st, 0xCC, sizeof(st));
+        OS_REQUIRE(ws_fn(0x20000001u, &st) != 0);
+        OS_REQUIRE(st.total_bytes > 0ull);
+        OS_REQUIRE(st.available_bytes <= st.total_bytes);
+    }
+
     OS_REQUIRE(FreeLibrary(mod) != FALSE);
 }
 #endif

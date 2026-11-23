@@ -2196,7 +2196,33 @@ struct XMEM_WORKING_SET_STATISTICS {
 };
 
 OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL XMemGetWorkingSetStatistics(
-    void* lpBuffer) {
+    uintptr_t arg0,
+    void* arg1) {
+    // Real Xbox Series X GDK titles (e.g. Minecraft Preview) call the 2-arg ABI:
+    //   BOOL XMemGetWorkingSetStatistics(DWORD flags, XMEM_WORKING_SET_STATISTICS* outStats)
+    // where arg0 is a non-pointer flag word (e.g. 0x20000001) and arg1 points to a 32-byte
+    // uninitialized stack struct whose first two QWORDs are (total_bytes, available_bytes).
+    // Preserve backwards compatibility with the 1-arg (void* lpBuffer) test ABI by probing
+    // whether arg0 is a committed readable/writable address.
+    bool is_two_arg_xbox_abi = false;
+#if defined(_WIN32)
+    if (arg0 != 0u) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        const SIZE_T q = ::VirtualQuery(reinterpret_cast<LPCVOID>(arg0), &mbi, sizeof(mbi));
+        const bool arg0_committed = (q != 0u && mbi.State == MEM_COMMIT &&
+                                     (mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY)) != 0u);
+        if (!arg0_committed && arg1 != nullptr) {
+            MEMORY_BASIC_INFORMATION mbi1{};
+            const SIZE_T q1 = ::VirtualQuery(arg1, &mbi1, sizeof(mbi1));
+            if (q1 != 0u && mbi1.State == MEM_COMMIT &&
+                (mbi1.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY)) != 0u) {
+                is_two_arg_xbox_abi = true;
+            }
+        }
+    }
+#endif
+
+    void* lpBuffer = is_two_arg_xbox_abi ? arg1 : reinterpret_cast<void*>(arg0);
     if (!lpBuffer) {
         SetHostLastError(87u);
         RecordTelemetry(__func__, CallOutcome::Error, kHrInvalidArg);
@@ -2204,11 +2230,13 @@ OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL XMemGetWorkingSetStat
     }
 
     uint64_t caller_size = 0ull;
-    std::memcpy(&caller_size, lpBuffer, sizeof(caller_size));
-    if (caller_size != 0ull && caller_size < sizeof(uint64_t)) {
-        SetHostLastError(87u);
-        RecordTelemetry(__func__, CallOutcome::Error, kHrInvalidArg);
-        return 0;
+    if (!is_two_arg_xbox_abi) {
+        std::memcpy(&caller_size, lpBuffer, sizeof(caller_size));
+        if (caller_size != 0ull && caller_size < sizeof(uint64_t)) {
+            SetHostLastError(87u);
+            RecordTelemetry(__func__, CallOutcome::Error, kHrInvalidArg);
+            return 0;
+        }
     }
 
     auto& state = KernelXState::Instance();
@@ -2284,14 +2312,29 @@ OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL XMemGetWorkingSetStat
     }
 #endif
 
-    const size_t copy_bytes =
-        (caller_size == 0ull || caller_size >= sizeof(XMEM_WORKING_SET_STATISTICS))
-            ? sizeof(XMEM_WORKING_SET_STATISTICS)
-            : static_cast<size_t>(caller_size);
-    if (copy_bytes < sizeof(XMEM_WORKING_SET_STATISTICS)) {
-        stats.Size = static_cast<uint64_t>(copy_bytes);
+    if (is_two_arg_xbox_abi) {
+        struct XboxWorkingSetStats32 {
+            uint64_t TotalBytes;
+            uint64_t AvailableBytes;
+            uint64_t WorkingSetBytes;
+            uint64_t PeakWorkingSetBytes;
+        };
+        XboxWorkingSetStats32 xb{};
+        xb.TotalBytes = stats.TotalPhysicalBytes;
+        xb.AvailableBytes = stats.AvailablePhysicalBytes;
+        xb.WorkingSetBytes = stats.WorkingSetBytes;
+        xb.PeakWorkingSetBytes = stats.PeakWorkingSetBytes;
+        std::memcpy(lpBuffer, &xb, sizeof(xb));
+    } else {
+        const size_t copy_bytes =
+            (caller_size == 0ull || caller_size >= sizeof(XMEM_WORKING_SET_STATISTICS))
+                ? sizeof(XMEM_WORKING_SET_STATISTICS)
+                : static_cast<size_t>(caller_size);
+        if (copy_bytes < sizeof(XMEM_WORKING_SET_STATISTICS)) {
+            stats.Size = static_cast<uint64_t>(copy_bytes);
+        }
+        std::memcpy(lpBuffer, &stats, copy_bytes);
     }
-    std::memcpy(lpBuffer, &stats, copy_bytes);
 
     SetHostLastError(0u);
     RecordTelemetry(__func__, CallOutcome::Ok, kHrOk);
