@@ -1,4 +1,5 @@
 #include "openscarlett/gpu/rdna2_xbox_container.h"
+#include "openscarlett/io/zlib_rfc1950.h"
 
 #include <algorithm>
 #include <array>
@@ -16,6 +17,132 @@ uint32_t ReadLe32(const uint8_t* p) noexcept {
     uint32_t v = 0;
     std::memcpy(&v, p, sizeof(v));
     return v;
+}
+
+uint64_t ReadLe64(const uint8_t* p) noexcept {
+    uint64_t v = 0;
+    std::memcpy(&v, p, sizeof(v));
+    return v;
+}
+
+// Extracts RDNA2 ISA words & stage metadata from a retail Xbox Series X|S DXIL chunk
+// carrying an XDAT -> XBCH (RFC 1950 zlib) -> FSSM microcode container.
+bool TryExtractFssmIsaFromXdatDxilChunk(
+    const std::vector<uint8_t>& dxil_data,
+    std::vector<uint32_t>& out_isa_words,
+    Xs2ShaderContainer& out_xs2,
+    bool& out_has_xs2) {
+    if (dxil_data.size() < 48u || std::memcmp(dxil_data.data() + 24u, "XDAT", 4u) != 0) {
+        return false;
+    }
+    const uint32_t entry_count = ReadLe32(dxil_data.data() + 28u);
+    const uint32_t entries_off = ReadLe32(dxil_data.data() + 32u);
+    if (entry_count == 0u || entry_count > 64u ||
+        static_cast<uint64_t>(entries_off) + static_cast<uint64_t>(entry_count) * 12ull > dxil_data.size()) {
+        return false;
+    }
+
+    const uint8_t* xbch = nullptr;
+    size_t xbch_sz = 0u;
+    for (uint32_t i = 0u; i < entry_count; ++i) {
+        const size_t eo = static_cast<size_t>(entries_off) + static_cast<size_t>(i) * 12u;
+        const uint32_t kind = ReadLe32(dxil_data.data() + eo);
+        const uint32_t off = ReadLe32(dxil_data.data() + eo + 4u);
+        const uint32_t sz = ReadLe32(dxil_data.data() + eo + 8u);
+        if (kind == 0x0Du && sz >= 28u &&
+            static_cast<uint64_t>(off) + static_cast<uint64_t>(sz) <= dxil_data.size() &&
+            std::memcmp(dxil_data.data() + off, "XBCH", 4u) == 0) {
+            xbch = dxil_data.data() + off;
+            xbch_sz = sz;
+            break;
+        }
+    }
+    if (!xbch) return false;
+
+    const uint64_t comp_sz = ReadLe64(xbch + 8u);
+    const uint64_t uncomp_sz = ReadLe64(xbch + 16u);
+    if (comp_sz < 6u || 24ull + comp_sz > xbch_sz || uncomp_sz < 0xD0u || uncomp_sz > 32ull * 1024ull * 1024ull) {
+        return false;
+    }
+
+    std::vector<uint8_t> fssm;
+    if (!zlib_rfc1950::Decompress(xbch + 24u, static_cast<size_t>(comp_sz),
+                                  static_cast<size_t>(uncomp_sz), fssm)) {
+        return false;
+    }
+    if (fssm.size() < 0xD0u || std::memcmp(fssm.data(), "FSSM", 4u) != 0) {
+        return false;
+    }
+
+    // Locate the active stage header slot in FSSM[0x18..0x78] (unused slots hold 0xDEADBEEFDEADBEEF).
+    constexpr uint64_t kDeadBeef = 0xDEADBEEFDEADBEEFull;
+    uint64_t stage_hdr_off = 0ull;
+    size_t stage_slot_off = 0u;
+    for (size_t off = 0x18u; off < 0x78u; off += 8u) {
+        const uint64_t v = ReadLe64(fssm.data() + off);
+        if (v != kDeadBeef && v >= 0x80u && v + 0x20u <= fssm.size()) {
+            stage_hdr_off = v;
+            stage_slot_off = off;
+            break;
+        }
+    }
+    if (stage_hdr_off == 0ull) return false;
+
+    const uint64_t isa_off = ReadLe64(fssm.data() + stage_hdr_off + 0x10u);
+    const uint64_t isa_sz = ReadLe64(fssm.data() + stage_hdr_off + 0x18u);
+    if (isa_sz < 44u || isa_off + isa_sz > fssm.size()) {
+        return false;
+    }
+
+    // Skip the 40-byte (0x28) FSSM zero+hash-embedded VOP3 NOP prologue.
+    size_t code_start = static_cast<size_t>(isa_off);
+    if (isa_sz >= 0x2Cu &&
+        ReadLe64(fssm.data() + code_start) == 0ull &&
+        ReadLe64(fssm.data() + code_start + 8u) == 0ull) {
+        code_start += 0x28u;
+    }
+    const size_t code_end = static_cast<size_t>(isa_off + isa_sz);
+    out_isa_words.clear();
+    out_isa_words.reserve((code_end - code_start) / 4u);
+    for (size_t pos = code_start; pos + 4u <= code_end; pos += 4u) {
+        const uint32_t w = ReadLe32(fssm.data() + pos);
+        out_isa_words.push_back(w);
+        if (w == 0xBF810000u) {  // s_endpgm
+            break;
+        }
+    }
+    if (out_isa_words.empty()) return false;
+
+    // Infer shader stage from DXIL header word 0 (high 16 bits: 0=PS, 1=VS, 2=GS, 3=HS, 4=DS, 5=CS, 13=MS, 14=AS)
+    // or fallback to FSSM stage slot offset.
+    ShaderStage stage = ShaderStage::Compute;
+    const uint16_t dxil_kind = static_cast<uint16_t>((ReadLe32(dxil_data.data()) >> 16u) & 0xFFFFu);
+    switch (dxil_kind) {
+        case 0u: stage = ShaderStage::Pixel; break;
+        case 1u: stage = ShaderStage::Vertex; break;
+        case 2u: stage = ShaderStage::Geometry; break;
+        case 3u: stage = ShaderStage::Hull; break;
+        case 4u: stage = ShaderStage::Domain; break;
+        case 5u: stage = ShaderStage::Compute; break;
+        case 13u: stage = ShaderStage::Mesh; break;
+        case 14u: stage = ShaderStage::Amplification; break;
+        default:
+            if (stage_slot_off == 0x38u) stage = ShaderStage::Vertex;
+            else if (stage_slot_off == 0x40u) stage = ShaderStage::Pixel;
+            break;
+    }
+
+    out_xs2 = Xs2ShaderContainer{};
+    out_xs2.stage = stage;
+    out_xs2.sgpr_count = 32u;
+    out_xs2.vgpr_count = 32u;
+    out_xs2.wave_size = 32u;
+    out_xs2.threadgroup_x = 1u;
+    out_xs2.threadgroup_y = 1u;
+    out_xs2.threadgroup_z = 1u;
+    out_xs2.code_words = out_isa_words;
+    out_has_xs2 = true;
+    return true;
 }
 
 float BitsToFloat(uint32_t bits) noexcept {
@@ -1445,6 +1572,13 @@ Status ParseFullXboxShaderContainer(const void* data, size_t size, XboxParsedSha
                    std::memcmp(chunk.fourcc, "SHEX", 4u) == 0 ||
                    std::memcmp(chunk.fourcc, "DXIL", 4u) == 0) {
             out_parsed.shdr_or_shex_payload = chunk.data;
+            if (std::memcmp(chunk.fourcc, "DXIL", 4u) == 0 && !out_parsed.has_raw_rdna_isa) {
+                if (TryExtractFssmIsaFromXdatDxilChunk(
+                        chunk.data, out_parsed.rdna_isa_words, out_parsed.xs2, out_parsed.has_xs2)) {
+                    out_parsed.has_raw_rdna_isa = !out_parsed.rdna_isa_words.empty();
+                    out_parsed.shader_payload_fourcc = "XDAT";
+                }
+            }
             if (out_parsed.shader_payload_fourcc.empty()) {
                 out_parsed.shader_payload_fourcc = chunk.fourcc;
             }

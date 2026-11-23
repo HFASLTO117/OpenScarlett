@@ -1469,7 +1469,27 @@ void STDMETHODCALLTYPE CommandListX::ResolveSubresource(
 
 void STDMETHODCALLTYPE CommandListX::IASetPrimitiveTopology(
     D3D12_PRIMITIVE_TOPOLOGY PrimitiveTopology) {
-    host_list_->IASetPrimitiveTopology(PrimitiveTopology);
+    D3D12_PRIMITIVE_TOPOLOGY clean_topo = PrimitiveTopology;
+    const uint32_t raw_t = static_cast<uint32_t>(PrimitiveTopology);
+    if (device_x_ && device_x_->IsRetailScarlettAbi()) {
+        // Xbox Scarlett console-only topologies (e.g. 19=RECTLIST, 18=QUADLIST, 17=LINELOOP,
+        // 20=TRIANGLEFAN, 0=UNDEFINED) are invalid in PC D3D12 and hang NVIDIA pushbuffers.
+        const bool valid_pc_topo =
+            (raw_t >= 1u && raw_t <= 5u) ||
+            (raw_t >= 10u && raw_t <= 13u) ||
+            (raw_t >= 33u && raw_t <= 64u);
+        if (!valid_pc_topo) {
+            static std::atomic<uint32_t> s_topo_log{0u};
+            if (s_topo_log.fetch_add(1u, std::memory_order_relaxed) < 5u) {
+                std::fprintf(stderr,
+                             "[OpenScarlett][d3d12_xs] IASetPrimitiveTopology: sanitized Xbox topology %u -> TRIANGLELIST\n",
+                             raw_t);
+                std::fflush(stderr);
+            }
+            clean_topo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
+        }
+    }
+    host_list_->IASetPrimitiveTopology(clean_topo);
     RecordList("ID3D12GraphicsCommandListX::IASetPrimitiveTopology", 20, S_OK);
 }
 

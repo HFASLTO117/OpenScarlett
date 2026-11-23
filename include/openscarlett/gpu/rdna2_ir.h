@@ -143,6 +143,7 @@ enum class IrOp : uint16_t {
     CvtNormI16F16,    // operands: [src0_u32], imm_u32 = op_sel|(neg<<8)|(abs<<12) -> u32 lo16 snorm16
     CvtNormU16F16,    // operands: [src0_u32], imm_u32 = op_sel|(neg<<8)|(abs<<12) -> u32 lo16 unorm16
     UnpackF16,        // operands: [src0_u32], imm_u32 = 0 (lo16) | 1 (hi16) -> f32 (compressed EXP unpack)
+    PackF16,          // operands: [src0_f32, src1_f32] -> u32 packed 2x f16 (v_cvt_pkrtz_f16_f32)
 
     // Comparisons (produce IrType::Bool)
     CmpEq,

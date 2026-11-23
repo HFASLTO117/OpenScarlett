@@ -2784,6 +2784,11 @@ private:
                        << ");\n";
                     break;
                 }
+                case IrOp::PackF16: {
+                    os << ind << "_v" << inst.id << " = (f32tof16(" << AsF32(inst.operands[0])
+                       << ") & 0xFFFFu) | ((f32tof16(" << AsF32(inst.operands[1]) << ") & 0xFFFFu) << 16u);\n";
+                    break;
+                }
                 case IrOp::FlbitU32:
                     os << ind << "{ uint _x = " << AsU32(inst.operands[0]) << "; _v" << inst.id
                        << " = (_x == 0u) ? 0xFFFFFFFFu : (31u - firstbithigh(_x)); }\n";
@@ -6855,6 +6860,12 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                     uint32_t v2 = alloc_id();
                     EmitSpvInst(sec_fn, SpvOpExtInst, {t_v2f32, v2, glsl_ext_id, GlslUnpackHalf2x16, get_as_u32(inst.operands[0])});
                     EmitSpvInst(sec_fn, SpvOpCompositeExtract, {t_f32, res, v2, (inst.imm_u32 & 1u) != 0u ? 1u : 0u});
+                    break;
+                }
+                case IrOp::PackF16: {
+                    uint32_t v2 = alloc_id();
+                    EmitSpvInst(sec_fn, SpvOpCompositeConstruct, {t_v2f32, v2, get_as_f32(inst.operands[0]), get_as_f32(inst.operands[1])});
+                    EmitSpvInst(sec_fn, SpvOpExtInst, {t_u32, res, glsl_ext_id, GlslPackHalf2x16, v2});
                     break;
                 }
                 case IrOp::FlbitU32:

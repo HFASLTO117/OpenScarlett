@@ -509,6 +509,7 @@ enum class Rdna2Opcode : uint16_t {
     V_READLANE_B32,
     V_CVT_PKNORM_I16_F16,
     V_CVT_PKNORM_U16_F16,
+    V_CVT_PKRTZ_F16_F32,
     V_CVT_PKNORM_I16_F32,
     V_CVT_PKNORM_U16_F32,
     V_ADD3_U32,

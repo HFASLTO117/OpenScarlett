@@ -1132,6 +1132,7 @@ const char* IrOpName(IrOp op) noexcept {
         case IrOp::CvtNormI16F16:   return "cvt_norm.i16.f16";
         case IrOp::CvtNormU16F16:   return "cvt_norm.u16.f16";
         case IrOp::UnpackF16:       return "unpack_f16";
+        case IrOp::PackF16:         return "pack_f16";
         case IrOp::CmpEq:         return "cmp.eq";
         case IrOp::CmpNe:         return "cmp.ne";
         case IrOp::CmpLt:         return "cmp.lt";
@@ -3558,6 +3559,13 @@ Status BuildRdna2Ir(
                     write_dst(inst.dst, emit_in_bb(IrOp::WaveReadLaneAt, t, {val, lane}));
                     break;
                 }
+                case Rdna2Opcode::V_CVT_PKRTZ_F16_F32: {
+                    write_dst(inst.dst, emit_in_bb(IrOp::PackF16, IrType::U32, {
+                        eval_operand(inst.src[0], true),
+                        eval_operand(inst.src[1], true),
+                    }));
+                    break;
+                }
                 case Rdna2Opcode::V_CVT_PKNORM_I16_F32:
                 case Rdna2Opcode::V_CVT_PKNORM_U16_F32: {
                     const IrOp iop = (inst.opcode == Rdna2Opcode::V_CVT_PKNORM_I16_F32)
@@ -5335,6 +5343,7 @@ Status OptimizeRdna2Ir(Rdna2IrModule& module, Rdna2IrOptStats* out_stats) {
                         }
                         break;
                     case IrOp::UnpackF16:
+                    case IrOp::PackF16:
                         if (get_const_u32(inst.operands[0], ua)) {
                             fold_to_f32(HalfBitsToFloat(SelectHalf16(ua, (inst.imm_u32 & 1u) != 0u)));
                         }
