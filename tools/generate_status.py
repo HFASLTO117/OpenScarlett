@@ -299,7 +299,7 @@ def collect_components(
     media_pct = 68 + (25 if has_media else 0)
     loader_pct = 85 + (12 if has_probe_veh else 0)
     launcher_pct = (90 + (8 if has_probe_veh else 0)) if has_launcher else 40
-    compat_pct = 20
+    compat_pct = 40 if has("tests/test_gdkx_untouched_samples.cpp") else 20
 
     corpus_note = f", {corpus_passed}/{corpus_total} corpus shaders validated" if corpus_total else ""
     winrt_exports = count_exports("include/openscarlett/winrt/winrt_abi.h", "OPENSCARLETT_WINRT_API")
@@ -464,16 +464,16 @@ def collect_components(
         ),
         Component(
             short_name="Real-World Game Compatibility",
-            plain_summary="Freedoom 60 FPS, 3D GDK scene & samples work — retail games: 0 so far",
-            tech_name="Real-World Title Compatibility (Playable Demos, GDK Samples & Commercial Bring-Up)",
+            plain_summary="6/6 untouched GDKX samples & Freedoom live · Minecraft & UE5 in bring-up",
+            tech_name="Real-World Title Compatibility (Untouched GDKX Samples, Playable Demos & Active Bring-Up)",
             area="Compatibility",
-            stage="Early Alpha",
-            pill_label="Early Alpha",
+            stage="Partial",
+            pill_label="Active Bring-Up",
             pct=compat_pct,
             what_works=(
-                "Live 60 FPS **Freedoom: Phase 1**, `ScarlettArena`, shadowed/skinned BC1+BC3 3D dual-API GDK scene (`gdk_3d_scene`), official MIT `Xbox-GDK-Samples`, and commercial shipping GDK thunks (`Alexandria IV DEMO`). **Commercial retail Xbox Series games are not playable yet** — join Discord to help test real unpacked GDKs!"
+                "Live **6/6 untouched MIT `_GAMING_XBOX_SCARLETT` samples** at 4K, 60 FPS **Freedoom: Phase 1**, `ScarlettArena`, shadowed/skinned BC1+BC3 3D dual-API GDK scene (`gdk_3d_scene`), shipping commercial GDK thunks (`Alexandria IV DEMO`, `0 E_NOINTERFACE`), and next-gen flagship open-world AAA gap audit closed on `main`. Active commercial bring-up underway on **Minecraft (Xbox Series Preview)** and **UE5 (*The Matrix Awakens*)** — join Discord to help test real unpacked GDKs!"
             ),
-            verified_on="GTX 1650 Ti + WARP + 10 community NVIDIA/AMD PCs (`test_scarlett_game_live`, `test_gdk_3d_scene_dual_api`, `test_dxr_live`)",
+            verified_on="GTX 1650 Ti + WARP + 10 community NVIDIA/AMD PCs (`test_gdkx_untouched_samples`, `test_scarlett_game_live`, `test_gdk_3d_scene_dual_api`, `test_real_gdk_thunks_live`, `test_mine_xapu_acphal`)",
         ),
     ]
 

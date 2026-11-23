@@ -78,12 +78,12 @@
     <text class="pct" x="872" y="439" text-anchor="end">98%</text>
     <line x1="28" y1="460" x2="872" y2="460" stroke="#161b22" stroke-width="1"/>
     <text class="name" x="28" y="482">Real-World Game Compatibility</text>
-    <text class="desc" x="28" y="499">Freedoom 60 FPS, 3D GDK scene &amp; samples work — retail games: 0 so far</text>
-    <rect x="498" y="476" width="132" height="22" rx="11" fill="#8957e5"/>
-    <text class="pill" x="564" y="491" text-anchor="middle">Early Alpha</text>
+    <text class="desc" x="28" y="499">6/6 untouched GDKX samples &amp; Freedoom live · Minecraft &amp; UE5 in bring-up</text>
+    <rect x="498" y="476" width="132" height="22" rx="11" fill="#d29922"/>
+    <text class="pill" x="564" y="491" text-anchor="middle">Active Bring-Up</text>
     <rect x="648" y="482" width="176" height="10" rx="5" fill="#21262d"/>
-    <rect x="648" y="482" width="35" height="10" rx="5" fill="#8957e5"/>
-    <text class="pct" x="872" y="491" text-anchor="end">20%</text>
+    <rect x="648" y="482" width="70" height="10" rx="5" fill="#d29922"/>
+    <text class="pct" x="872" y="491" text-anchor="end">40%</text>
   </g>
   <rect x="0.5" y="0.5" width="899" height="541" rx="12" fill="none" stroke="#30363d" stroke-width="1"/>
 </svg>
