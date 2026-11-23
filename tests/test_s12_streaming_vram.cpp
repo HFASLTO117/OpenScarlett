@@ -288,7 +288,7 @@ void TestDirectStorageStreamingHardening() {
         auto make_queue = [&](DSTORAGE_PRIORITY prio, const char* name) {
             DSTORAGE_QUEUE_DESC qd{};
             qd.SourceType = DSTORAGE_REQUEST_SOURCE_MEMORY;
-            qd.Capacity = DSTORAGE_MIN_QUEUE_CAPACITY;
+            qd.Capacity = 256u;  // Auto-submit threshold = 128 (> kNormCount = 96) so explicit Submit() starts all 4 queues together
             qd.Priority = prio;
             qd.Name = name;
             IDStorageQueueX* q = nullptr;
@@ -301,8 +301,8 @@ void TestDirectStorageStreamingHardening() {
         IDStorageQueueX* q_high = make_queue(DSTORAGE_PRIORITY_HIGH, "prio_high");
         IDStorageQueueX* q_rt = make_queue(DSTORAGE_PRIORITY_REALTIME, "prio_realtime");
 
-        constexpr uint32_t kNormCount = 40u;
-        constexpr uint32_t kLowCount = 16u;
+        constexpr uint32_t kNormCount = 96u;
+        constexpr uint32_t kLowCount = 48u;
         constexpr uint32_t kHighCount = 8u;
         constexpr uint32_t kRtCount = 8u;
 
@@ -326,6 +326,12 @@ void TestDirectStorageStreamingHardening() {
             }
         };
 
+        IDStorageStatusArrayX* st_prio = nullptr;
+        OS_REQUIRE(factory->CreateStatusArray(
+                       4u, "prio_status", &IID_IDStorageStatusArrayX,
+                       reinterpret_cast<void**>(&st_prio)) == OS_DSTORAGE_S_OK);
+        OS_REQUIRE(st_prio != nullptr);
+
         HANDLE ev_low = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         HANDLE ev_norm = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         HANDLE ev_high = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -333,15 +339,19 @@ void TestDirectStorageStreamingHardening() {
         OS_REQUIRE(ev_low && ev_norm && ev_high && ev_rt);
 
         enqueue_batch(q_low, low_dst);
+        q_low->EnqueueStatus(st_prio, 3u);
         q_low->EnqueueSetEvent(ev_low);
 
         enqueue_batch(q_norm, norm_dst);
+        q_norm->EnqueueStatus(st_prio, 2u);
         q_norm->EnqueueSetEvent(ev_norm);
 
         enqueue_batch(q_high, high_dst);
+        q_high->EnqueueStatus(st_prio, 1u);
         q_high->EnqueueSetEvent(ev_high);
 
         enqueue_batch(q_rt, rt_dst);
+        q_rt->EnqueueStatus(st_prio, 0u);
         q_rt->EnqueueSetEvent(ev_rt);
 
         // Submit LOW & NORMAL first, immediately followed by HIGH & REALTIME!
@@ -351,15 +361,27 @@ void TestDirectStorageStreamingHardening() {
         q_rt->Submit();
 
         // REALTIME must complete BEFORE NORMAL and LOW finish!
-        OS_REQUIRE(WaitForSingleObject(ev_rt, 10000u) == WAIT_OBJECT_0);
-        const bool norm_still_running = (WaitForSingleObject(ev_norm, 0u) == WAIT_TIMEOUT);
-        const bool low_still_running = (WaitForSingleObject(ev_low, 0u) == WAIT_TIMEOUT);
+        // Poll st_prio[0] with yield so Windows 15.6ms kernel wake-up latency on busy CI runners
+        // cannot mask preemption between SetEvent(ev_rt) and WaitForSingleObject returning.
+        const auto rt_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!st_prio->IsComplete(0u)) {
+            OS_REQUIRE(std::chrono::steady_clock::now() < rt_deadline);
+            std::this_thread::yield();
+        }
+        const bool norm_still_running = !st_prio->IsComplete(2u);
+        const bool low_still_running = !st_prio->IsComplete(3u);
         OS_REQUIRE(norm_still_running);
         OS_REQUIRE(low_still_running);
 
+        OS_REQUIRE(WaitForSingleObject(ev_rt, 10000u) == WAIT_OBJECT_0);
         OS_REQUIRE(WaitForSingleObject(ev_high, 10000u) == WAIT_OBJECT_0);
         OS_REQUIRE(WaitForSingleObject(ev_norm, 15000u) == WAIT_OBJECT_0);
         OS_REQUIRE(WaitForSingleObject(ev_low, 15000u) == WAIT_OBJECT_0);
+        OS_REQUIRE(st_prio->IsComplete(0u) && st_prio->GetHResult(0u) == OS_DSTORAGE_S_OK);
+        OS_REQUIRE(st_prio->IsComplete(1u) && st_prio->GetHResult(1u) == OS_DSTORAGE_S_OK);
+        OS_REQUIRE(st_prio->IsComplete(2u) && st_prio->GetHResult(2u) == OS_DSTORAGE_S_OK);
+        OS_REQUIRE(st_prio->IsComplete(3u) && st_prio->GetHResult(3u) == OS_DSTORAGE_S_OK);
+        st_prio->Release();
 
         for (const auto& d : rt_dst) OS_REQUIRE(d == heavy_plain);
         for (const auto& d : high_dst) OS_REQUIRE(d == heavy_plain);

@@ -1939,10 +1939,12 @@ public:
     }
 
     // Called by DStoragePriorityScheduler under scheduler mutex to test whether an item
-    // can be dispatched immediately (requests run concurrently; barriers wait for in-flight==0).
+    // can be dispatched immediately (requests run concurrently; barriers serialize strictly
+    // against both in-flight requests AND any preceding in-flight barrier so e.g. EnqueueStatus
+    // always completes before a subsequent EnqueueSetEvent fires).
     bool CanDispatchNow() {
         std::lock_guard<std::mutex> lk(mutex_);
-        if (active_.empty()) return false;
+        if (active_.empty() || in_flight_barriers_ > 0u) return false;
         if (active_.front().kind == QueueItem::Kind::Request) {
             return true;
         }
@@ -1962,7 +1964,7 @@ public:
         std::shared_ptr<InFlightRequestState> inflight;
         {
             std::lock_guard<std::mutex> lk(mutex_);
-            if (active_.empty()) {
+            if (active_.empty() || in_flight_barriers_ > 0u) {
                 return false;
             }
             if (active_.front().kind != QueueItem::Kind::Request && in_flight_requests_ > 0u) {
@@ -2086,14 +2088,21 @@ public:
             }
         }
 
+        bool wake_after_barrier = false;
         {
             std::lock_guard<std::mutex> lk(mutex_);
             if (in_flight_barriers_ > 0u) --in_flight_barriers_;
+            if (in_flight_barriers_ == 0u && !active_.empty()) {
+                wake_after_barrier = true;
+            }
             if (closed_ && active_.empty() && in_flight_requests_ == 0u && in_flight_barriers_ == 0u) {
                 drain_cv_.notify_all();
             }
         }
         space_cv_.notify_all();
+        if (wake_after_barrier) {
+            DStoragePriorityScheduler::Global().NotifyWorkAvailable();
+        }
         return true;
     }
 
