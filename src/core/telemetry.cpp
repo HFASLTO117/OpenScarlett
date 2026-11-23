@@ -91,20 +91,22 @@ void CallTelemetry::Record(const std::string& module_name,
                            int32_t hr,
                            int32_t vtable_slot) {
     std::string key = module_name + "!" + symbol_name + "#" + std::to_string(vtable_slot);
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto& e = entries_[key];
-    if (e.total_calls == 0) {
-        e.module_name = module_name;
-        e.symbol_name = symbol_name;
-        e.vtable_slot = vtable_slot;
-    }
-    ++e.total_calls;
-    e.last_hr = hr;
-    switch (outcome) {
-        case CallOutcome::Ok: ++e.ok_calls; break;
-        case CallOutcome::StubOk: ++e.stub_calls; break;
-        case CallOutcome::NotImplemented: ++e.not_impl_calls; break;
-        case CallOutcome::Error: ++e.error_calls; break;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto& e = entries_[key];
+        if (e.total_calls == 0) {
+            e.module_name = module_name;
+            e.symbol_name = symbol_name;
+            e.vtable_slot = vtable_slot;
+        }
+        ++e.total_calls;
+        e.last_hr = hr;
+        switch (outcome) {
+            case CallOutcome::Ok: ++e.ok_calls; break;
+            case CallOutcome::StubOk: ++e.stub_calls; break;
+            case CallOutcome::NotImplemented: ++e.not_impl_calls; break;
+            case CallOutcome::Error: ++e.error_calls; break;
+        }
     }
 #if defined(_WIN32)
     ForwardToHookDllIfPresent(module_name, symbol_name, outcome, hr, vtable_slot);

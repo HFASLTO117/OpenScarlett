@@ -20,6 +20,7 @@
 
 // Standard GameInput HRESULT codes.
 constexpr int32_t GAMEINPUT_S_OK = 0x00000000;
+constexpr int32_t GAMEINPUT_E_NOTIMPL = static_cast<int32_t>(0x80004001u);
 constexpr int32_t GAMEINPUT_E_NOINTERFACE = static_cast<int32_t>(0x80004002u);
 constexpr int32_t GAMEINPUT_E_POINTER = static_cast<int32_t>(0x80004003u);
 constexpr int32_t GAMEINPUT_E_INVALIDARG = static_cast<int32_t>(0x80070057u);
@@ -168,18 +169,73 @@ struct GameInputRumbleParams {
     float rightTrigger;
 };
 
+struct GameInputUsage {
+    uint16_t page;
+    uint16_t id;
+};
+
+struct GameInputVersion {
+    uint16_t major;
+    uint16_t minor;
+    uint16_t build;
+    uint16_t revision;
+};
+
+struct GameInputString {
+    uint32_t sizeInBytes;
+    uint32_t codePointCount;
+    const char* data;
+};
+
+// Official Microsoft GDK GameInputDeviceInfo layout (size = 0x140 = 320 bytes).
 struct GameInputDeviceInfo {
-    uint32_t infoSize;
-    uint16_t vendorId;
-    uint16_t productId;
-    uint16_t revisionNumber;
-    uint8_t interfaceNumber;
-    uint8_t collectionNumber;
-    uint8_t deviceId[32];
-    GameInputDeviceFamily deviceFamily;
-    uint32_t supportedInput;
-    uint32_t supportedRumbleMotors;
-    const char* displayName;
+    uint32_t infoSize;                   // +0x00
+    uint16_t vendorId;                   // +0x04
+    uint16_t productId;                  // +0x06
+    uint16_t revisionNumber;             // +0x08
+    uint8_t interfaceNumber;             // +0x0A
+    uint8_t collectionNumber;            // +0x0B
+    GameInputUsage usage;                // +0x0C
+    GameInputVersion hardwareVersion;    // +0x10
+    GameInputVersion firmwareVersion;    // +0x18
+    uint8_t deviceId[32];                // +0x20
+    uint8_t deviceRootId[32];            // +0x40
+    GameInputDeviceFamily deviceFamily;  // +0x60
+    uint32_t capabilities;               // +0x64
+    uint32_t supportedInput;             // +0x68
+    uint32_t supportedRumbleMotors;      // +0x6C
+    uint32_t inputReportCount;           // +0x70
+    uint32_t outputReportCount;          // +0x74
+    uint32_t featureReportCount;         // +0x78
+    uint32_t controllerAxisCount;        // +0x7C
+    uint32_t controllerButtonCount;      // +0x80
+    uint32_t controllerSwitchCount;      // +0x84
+    uint32_t touchPointCount;            // +0x88
+    uint32_t touchSensorCount;           // +0x8C
+    uint32_t forceFeedbackMotorCount;    // +0x90
+    uint32_t hapticFeedbackMotorCount;   // +0x94
+    uint32_t deviceStringCount;          // +0x98
+    uint32_t deviceDescriptorSize;       // +0x9C
+    const void* inputReportInfo;         // +0xA0
+    const void* outputReportInfo;        // +0xA8
+    const void* featureReportInfo;       // +0xB0
+    const void* controllerAxisInfo;      // +0xB8
+    const void* controllerButtonInfo;    // +0xC0
+    const void* controllerSwitchInfo;    // +0xC8
+    const void* keyboardInfo;            // +0xD0
+    const void* mouseInfo;               // +0xD8
+    const void* touchSensorInfo;         // +0xE0
+    const void* motionInfo;              // +0xE8
+    const void* arcadeStickInfo;         // +0xF0
+    const void* flightStickInfo;         // +0xF8
+    const void* gamepadInfo;             // +0x100
+    const void* racingWheelInfo;         // +0x108
+    const void* uiNavigationInfo;        // +0x110
+    const void* forceFeedbackMotorInfo;  // +0x118
+    const void* hapticFeedbackMotorInfo; // +0x120
+    const GameInputString* displayName;  // +0x128
+    const GameInputString* deviceStrings;// +0x130
+    const void* deviceDescriptorData;    // +0x138
 };
 
 // Forward declarations for COM interfaces.
@@ -187,54 +243,195 @@ struct IGameInputDevice;
 struct IGameInputReading;
 struct IGameInput;
 
+using GameInputReadingCallback = void(OPENSCARLETT_GAMEINPUT_CALL*)(
+    uint64_t callbackToken,
+    void* context,
+    IGameInputReading* reading,
+    bool hasOverrunOccurred);
+
+using GameInputDeviceCallback = void(OPENSCARLETT_GAMEINPUT_CALL*)(
+    uint64_t callbackToken,
+    void* context,
+    IGameInputDevice* device,
+    uint64_t timestamp,
+    uint32_t currentStatus,
+    uint32_t previousStatus);
+
+using GameInputSystemButtonCallback = void(OPENSCARLETT_GAMEINPUT_CALL*)(
+    uint64_t callbackToken,
+    void* context,
+    IGameInputDevice* device,
+    uint64_t timestamp,
+    uint32_t currentButtons,
+    uint32_t previousButtons);
+
+using GameInputKeyboardLayoutCallback = void(OPENSCARLETT_GAMEINPUT_CALL*)(
+    uint64_t callbackToken,
+    void* context,
+    IGameInputDevice* device,
+    uint64_t timestamp,
+    uint32_t currentLayout,
+    uint32_t previousLayout);
+
+// Official Microsoft GDK IGameInputDevice vtable (slots 0..21).
 struct IGameInputDevice {
     virtual int32_t OPENSCARLETT_GAMEINPUT_CALL QueryInterface(
-        const GameInputGuid* riid, void** ppvObject) = 0;
-    virtual uint32_t OPENSCARLETT_GAMEINPUT_CALL AddRef() = 0;
-    virtual uint32_t OPENSCARLETT_GAMEINPUT_CALL Release() = 0;
-    virtual const GameInputDeviceInfo* OPENSCARLETT_GAMEINPUT_CALL GetDeviceInfo() = 0;
-    virtual uint32_t OPENSCARLETT_GAMEINPUT_CALL GetDeviceStatus() = 0;
+        const GameInputGuid* riid, void** ppvObject) = 0;                          // 0 (+0x00)
+    virtual uint32_t OPENSCARLETT_GAMEINPUT_CALL AddRef() = 0;                     // 1 (+0x08)
+    virtual uint32_t OPENSCARLETT_GAMEINPUT_CALL Release() = 0;                    // 2 (+0x10)
+    virtual const GameInputDeviceInfo* OPENSCARLETT_GAMEINPUT_CALL GetDeviceInfo() = 0;  // 3 (+0x18)
+    virtual uint32_t OPENSCARLETT_GAMEINPUT_CALL GetDeviceStatus() = 0;            // 4 (+0x20)
+    virtual void OPENSCARLETT_GAMEINPUT_CALL GetBatteryState(void* state) = 0;     // 5 (+0x28)
+    virtual int32_t OPENSCARLETT_GAMEINPUT_CALL CreateForceFeedbackEffect(
+        uint32_t motorIndex, const void* params, void** effect) = 0;               // 6 (+0x30)
+    virtual bool OPENSCARLETT_GAMEINPUT_CALL IsForceFeedbackMotorPoweredOn(
+        uint32_t motorIndex) = 0;                                                  // 7 (+0x38)
+    virtual void OPENSCARLETT_GAMEINPUT_CALL SetForceFeedbackMotorGain(
+        uint32_t motorIndex, float masterGain) = 0;                                // 8 (+0x40)
+    virtual int32_t OPENSCARLETT_GAMEINPUT_CALL SetHapticMotorState(
+        uint32_t motorIndex, const void* params) = 0;                              // 9 (+0x48)
     virtual void OPENSCARLETT_GAMEINPUT_CALL SetRumbleState(
-        const GameInputRumbleParams* params) = 0;
+        const GameInputRumbleParams* params) = 0;                                  // 10 (+0x50)
+    virtual void OPENSCARLETT_GAMEINPUT_CALL SetInputSynchronizationState(
+        bool enabled) = 0;                                                         // 11 (+0x58)
+    virtual void OPENSCARLETT_GAMEINPUT_CALL SendInputSynchronizationHint() = 0;   // 12 (+0x60)
+    virtual void OPENSCARLETT_GAMEINPUT_CALL PowerOff() = 0;                       // 13 (+0x68)
+    virtual int32_t OPENSCARLETT_GAMEINPUT_CALL CreateRawDeviceReport(
+        uint32_t reportId, uint32_t reportKind, void** report) = 0;                // 14 (+0x70)
+    virtual int32_t OPENSCARLETT_GAMEINPUT_CALL GetRawDeviceFeature(
+        uint32_t reportId, void** report) = 0;                                     // 15 (+0x78)
+    virtual int32_t OPENSCARLETT_GAMEINPUT_CALL SetRawDeviceFeature(
+        void* report) = 0;                                                         // 16 (+0x80)
+    virtual int32_t OPENSCARLETT_GAMEINPUT_CALL SendRawDeviceOutput(
+        void* report) = 0;                                                         // 17 (+0x88)
+    virtual int32_t OPENSCARLETT_GAMEINPUT_CALL SendRawDeviceOutputWithResponse(
+        void* requestReport, void** responseReport) = 0;                           // 18 (+0x90)
+    virtual int32_t OPENSCARLETT_GAMEINPUT_CALL ExecuteRawDeviceIoControl(
+        uint32_t controlCode, size_t inputBufferSize, const void* inputBuffer,
+        size_t outputBufferSize, void* outputBuffer, size_t* outputSize) = 0;      // 19 (+0x98)
+    virtual bool OPENSCARLETT_GAMEINPUT_CALL AcquireExclusiveRawDeviceAccess(
+        uint64_t timeoutInMicroseconds) = 0;                                       // 20 (+0xA0)
+    virtual void OPENSCARLETT_GAMEINPUT_CALL ReleaseExclusiveRawDeviceAccess() = 0;// 21 (+0xA8)
 };
 
+// Official Microsoft GDK IGameInputReading vtable (slots 0..24).
 struct IGameInputReading {
     virtual int32_t OPENSCARLETT_GAMEINPUT_CALL QueryInterface(
-        const GameInputGuid* riid, void** ppvObject) = 0;
-    virtual uint32_t OPENSCARLETT_GAMEINPUT_CALL AddRef() = 0;
-    virtual uint32_t OPENSCARLETT_GAMEINPUT_CALL Release() = 0;
-    virtual GameInputKind OPENSCARLETT_GAMEINPUT_CALL GetInputKind() = 0;
-    virtual uint64_t OPENSCARLETT_GAMEINPUT_CALL GetSequenceNumber(GameInputKind inputKind) = 0;
-    virtual uint64_t OPENSCARLETT_GAMEINPUT_CALL GetTimestamp() = 0;
-    virtual void OPENSCARLETT_GAMEINPUT_CALL GetDevice(IGameInputDevice** device) = 0;
-    virtual bool OPENSCARLETT_GAMEINPUT_CALL GetGamepadState(GameInputGamepadState* state) = 0;
-    virtual uint32_t OPENSCARLETT_GAMEINPUT_CALL GetKeyCount() = 0;
+        const GameInputGuid* riid, void** ppvObject) = 0;                          // 0 (+0x00)
+    virtual uint32_t OPENSCARLETT_GAMEINPUT_CALL AddRef() = 0;                     // 1 (+0x08)
+    virtual uint32_t OPENSCARLETT_GAMEINPUT_CALL Release() = 0;                    // 2 (+0x10)
+    virtual GameInputKind OPENSCARLETT_GAMEINPUT_CALL GetInputKind() = 0;          // 3 (+0x18)
+    virtual uint64_t OPENSCARLETT_GAMEINPUT_CALL GetSequenceNumber(
+        GameInputKind inputKind) = 0;                                              // 4 (+0x20)
+    virtual uint64_t OPENSCARLETT_GAMEINPUT_CALL GetTimestamp() = 0;               // 5 (+0x28)
+    virtual void OPENSCARLETT_GAMEINPUT_CALL GetDevice(
+        IGameInputDevice** device) = 0;                                            // 6 (+0x30)
+    virtual bool OPENSCARLETT_GAMEINPUT_CALL GetRawReport(void** report) = 0;      // 7 (+0x38)
+    virtual uint32_t OPENSCARLETT_GAMEINPUT_CALL GetControllerAxisCount() = 0;     // 8 (+0x40)
+    virtual uint32_t OPENSCARLETT_GAMEINPUT_CALL GetControllerAxisState(
+        uint32_t stateArrayCount, float* stateArray) = 0;                          // 9 (+0x48)
+    virtual uint32_t OPENSCARLETT_GAMEINPUT_CALL GetControllerButtonCount() = 0;   // 10 (+0x50)
+    virtual uint32_t OPENSCARLETT_GAMEINPUT_CALL GetControllerButtonState(
+        uint32_t stateArrayCount, bool* stateArray) = 0;                           // 11 (+0x58)
+    virtual uint32_t OPENSCARLETT_GAMEINPUT_CALL GetControllerSwitchCount() = 0;   // 12 (+0x60)
+    virtual uint32_t OPENSCARLETT_GAMEINPUT_CALL GetControllerSwitchState(
+        uint32_t stateArrayCount, uint32_t* stateArray) = 0;                       // 13 (+0x68)
+    virtual uint32_t OPENSCARLETT_GAMEINPUT_CALL GetKeyCount() = 0;                // 14 (+0x70)
     virtual uint32_t OPENSCARLETT_GAMEINPUT_CALL GetKeyState(
-        uint32_t stateArrayCount, GameInputKeyState* stateArray) = 0;
-    virtual bool OPENSCARLETT_GAMEINPUT_CALL GetMouseState(GameInputMouseState* state) = 0;
+        uint32_t stateArrayCount, GameInputKeyState* stateArray) = 0;              // 15 (+0x78)
+    virtual bool OPENSCARLETT_GAMEINPUT_CALL GetMouseState(
+        GameInputMouseState* state) = 0;                                           // 16 (+0x80)
+    virtual uint32_t OPENSCARLETT_GAMEINPUT_CALL GetTouchCount() = 0;              // 17 (+0x88)
+    virtual uint32_t OPENSCARLETT_GAMEINPUT_CALL GetTouchState(
+        uint32_t stateArrayCount, void* stateArray) = 0;                           // 18 (+0x90)
+    virtual bool OPENSCARLETT_GAMEINPUT_CALL GetMotionState(void* state) = 0;      // 19 (+0x98)
+    virtual bool OPENSCARLETT_GAMEINPUT_CALL GetArcadeStickState(void* state) = 0; // 20 (+0xA0)
+    virtual bool OPENSCARLETT_GAMEINPUT_CALL GetFlightStickState(void* state) = 0; // 21 (+0xA8)
+    virtual bool OPENSCARLETT_GAMEINPUT_CALL GetGamepadState(
+        GameInputGamepadState* state) = 0;                                         // 22 (+0xB0)
+    virtual bool OPENSCARLETT_GAMEINPUT_CALL GetRacingWheelState(void* state) = 0; // 23 (+0xB8)
+    virtual bool OPENSCARLETT_GAMEINPUT_CALL GetUiNavigationState(void* state) = 0;// 24 (+0xC0)
 };
 
+// Official Microsoft GDK IGameInput vtable (slots 0..21).
 struct IGameInput {
     virtual int32_t OPENSCARLETT_GAMEINPUT_CALL QueryInterface(
-        const GameInputGuid* riid, void** ppvObject) = 0;
-    virtual uint32_t OPENSCARLETT_GAMEINPUT_CALL AddRef() = 0;
-    virtual uint32_t OPENSCARLETT_GAMEINPUT_CALL Release() = 0;
-    virtual uint64_t OPENSCARLETT_GAMEINPUT_CALL GetCurrentTimestamp() = 0;
+        const GameInputGuid* riid, void** ppvObject) = 0;                          // 0 (+0x00)
+    virtual uint32_t OPENSCARLETT_GAMEINPUT_CALL AddRef() = 0;                     // 1 (+0x08)
+    virtual uint32_t OPENSCARLETT_GAMEINPUT_CALL Release() = 0;                    // 2 (+0x10)
+    virtual uint64_t OPENSCARLETT_GAMEINPUT_CALL GetCurrentTimestamp() = 0;        // 3 (+0x18)
     virtual int32_t OPENSCARLETT_GAMEINPUT_CALL GetCurrentReading(
         GameInputKind inputKind,
         IGameInputDevice* device,
-        IGameInputReading** reading) = 0;
+        IGameInputReading** reading) = 0;                                          // 4 (+0x20)
     virtual int32_t OPENSCARLETT_GAMEINPUT_CALL GetNextReading(
         IGameInputReading* referenceReading,
         GameInputKind inputKind,
         IGameInputDevice* device,
-        IGameInputReading** reading) = 0;
+        IGameInputReading** reading) = 0;                                          // 5 (+0x28)
     virtual int32_t OPENSCARLETT_GAMEINPUT_CALL GetPreviousReading(
         IGameInputReading* referenceReading,
         GameInputKind inputKind,
         IGameInputDevice* device,
-        IGameInputReading** reading) = 0;
-    virtual void OPENSCARLETT_GAMEINPUT_CALL SetFocusPolicy(uint32_t policy) = 0;
+        IGameInputReading** reading) = 0;                                          // 6 (+0x30)
+    virtual int32_t OPENSCARLETT_GAMEINPUT_CALL GetTemporalReading(
+        uint64_t timestamp,
+        IGameInputDevice* device,
+        IGameInputReading** reading) = 0;                                          // 7 (+0x38)
+    virtual int32_t OPENSCARLETT_GAMEINPUT_CALL RegisterReadingCallback(
+        IGameInputDevice* device,
+        GameInputKind inputKind,
+        float analogThreshold,
+        void* context,
+        GameInputReadingCallback callbackFunc,
+        uint64_t* callbackToken) = 0;                                              // 8 (+0x40)
+    virtual int32_t OPENSCARLETT_GAMEINPUT_CALL RegisterDeviceCallback(
+        IGameInputDevice* device,
+        GameInputKind inputKind,
+        uint32_t statusFilter,
+        uint32_t enumerationKind,
+        void* context,
+        GameInputDeviceCallback callbackFunc,
+        uint64_t* callbackToken) = 0;                                              // 9 (+0x48)
+    virtual int32_t OPENSCARLETT_GAMEINPUT_CALL RegisterSystemButtonCallback(
+        IGameInputDevice* device,
+        uint32_t buttonFilter,
+        void* context,
+        GameInputSystemButtonCallback callbackFunc,
+        uint64_t* callbackToken) = 0;                                              // 10 (+0x50)
+    virtual int32_t OPENSCARLETT_GAMEINPUT_CALL RegisterKeyboardLayoutCallback(
+        IGameInputDevice* device,
+        void* context,
+        GameInputKeyboardLayoutCallback callbackFunc,
+        uint64_t* callbackToken) = 0;                                              // 11 (+0x58)
+    virtual void OPENSCARLETT_GAMEINPUT_CALL StopCallback(
+        uint64_t callbackToken) = 0;                                               // 12 (+0x60)
+    virtual bool OPENSCARLETT_GAMEINPUT_CALL UnregisterCallback(
+        uint64_t callbackToken,
+        uint64_t timeoutInMicroseconds) = 0;                                       // 13 (+0x68)
+    virtual int32_t OPENSCARLETT_GAMEINPUT_CALL CreateDispatcher(
+        void** dispatcher) = 0;                                                    // 14 (+0x70)
+    virtual int32_t OPENSCARLETT_GAMEINPUT_CALL CreateAggregateDevice(
+        GameInputKind inputKind,
+        IGameInputDevice** device) = 0;                                            // 15 (+0x78)
+    virtual int32_t OPENSCARLETT_GAMEINPUT_CALL FindDeviceFromId(
+        const void* value,
+        IGameInputDevice** device) = 0;                                            // 16 (+0x80)
+    virtual int32_t OPENSCARLETT_GAMEINPUT_CALL FindDeviceFromObject(
+        void* value,
+        IGameInputDevice** device) = 0;                                            // 17 (+0x88)
+    virtual int32_t OPENSCARLETT_GAMEINPUT_CALL FindDeviceFromPlatformHandle(
+        void* value,
+        IGameInputDevice** device) = 0;                                            // 18 (+0x90)
+    virtual int32_t OPENSCARLETT_GAMEINPUT_CALL FindDeviceFromPlatformString(
+        const wchar_t* value,
+        IGameInputDevice** device) = 0;                                            // 19 (+0x98)
+    virtual int32_t OPENSCARLETT_GAMEINPUT_CALL EnableOemDeviceSupport(
+        uint16_t vendorId,
+        uint16_t productId,
+        uint8_t interfaceNumber,
+        uint8_t collectionNumber) = 0;                                             // 20 (+0xA0)
+    virtual void OPENSCARLETT_GAMEINPUT_CALL SetFocusPolicy(uint32_t policy) = 0;  // 21 (+0xA8)
 };
 
 #ifdef __cplusplus

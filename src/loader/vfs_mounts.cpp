@@ -163,6 +163,7 @@ VfsDrive DriveCharToEnum(wchar_t c) noexcept {
         case L'd': return VfsDrive::Game;  // Xbox D:\ (title/disc package root) aliases Game drive
         case L't': return VfsDrive::Scratch;
         case L's': return VfsDrive::Save;
+        case L'p': return VfsDrive::Save;  // Xbox P:\ (Persistent Local Storage) aliases Save drive
         default: return VfsDrive::None;
     }
 }
@@ -1265,6 +1266,7 @@ VfsDrive VfsMounts::DetectVirtualDriveA(std::string_view path) noexcept {
         case 'd': return VfsDrive::Game;
         case 't': return VfsDrive::Scratch;
         case 's': return VfsDrive::Save;
+        case 'p': return VfsDrive::Save;
         default: return VfsDrive::None;
     }
 }

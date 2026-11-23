@@ -3333,11 +3333,21 @@ XGameResult OPENSCARLETT_GDK_CALL XTaskQueueGetPort(
     XTaskQueueHandle queue,
     XTaskQueuePort port,
     XTaskQueuePortHandle* portHandle) {
-    if (!queue || !portHandle || (port != XTaskQueuePort_Work && port != XTaskQueuePort_Completion)) {
+    if (!portHandle || (port != XTaskQueuePort_Work && port != XTaskQueuePort_Completion)) {
         return RecordHr("XTaskQueueGetPort", XGR_E_INVALIDARG);
     }
     *portHandle = nullptr;
+    XTaskQueueHandle owned_proc_q = nullptr;
+    if (!queue) {
+        if (!XTaskQueueGetCurrentProcessTaskQueue(&owned_proc_q) || !owned_proc_q) {
+            return RecordHr("XTaskQueueGetPort", XGR_E_INVALIDARG);
+        }
+        queue = owned_proc_q;
+    }
     auto obj = LookupQueue(queue);
+    if (owned_proc_q) {
+        XTaskQueueCloseHandle(owned_proc_q);
+    }
     if (!obj) {
         return RecordHr("XTaskQueueGetPort", XGR_E_HANDLE);
     }
@@ -10292,7 +10302,8 @@ enum RealComObjIndex : uint32_t {
     kComGameUi = 19,
     kComSystemConsole = 20,
     kComPls = 21,
-    kComObjCount = 22,
+    kComGameStreaming = 22,
+    kComObjCount = 23,
 };
 
 // Forward declare COM lookup so RealComQueryInterface can cross-QI on multi-IID classes.
@@ -10301,7 +10312,7 @@ const XgrGuid& GetRealComClsidByIndex(uint32_t idx) noexcept;
 
 std::atomic<uint32_t> g_real_com_refs[kComObjCount]{
     1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u,
-    1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u};
+    1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u, 1u};
 
 uint32_t OPENSCARLETT_GDK_CALL RealComAddRef(void* self) {
     RecordOk("IXgrComApi::AddRef");
@@ -10763,11 +10774,12 @@ const ComVtableSlot g_com_vtbl_game_ui[] = {
     /* 27 */ OS_COM_SLOT(XGameUiShowWebAuthenticationWithOptionsAsync),
 };
 
-// 21. CLSID={E349BD1A-FC20-4E40-B99C-4178CC6B409F} IID={67CE4BFC-B1D1-4AC7-BC3A-CB9219A97A85}
+// 21. CLSID={E349BD1A-FC20-4E40-B99C-4178CC6B409F} IID={67CE4BFC-B1D1-4AC7-BC3A-CB9219A97A85} / {6FD71F09-7513-49F0-89BC-BFAF5DF6F852}
 const ComVtableSlot g_com_vtbl_system_console[] = {
     OS_COM_IUNKNOWN_SLOTS,
     /*  3 */ OS_COM_SLOT(XSystemGetConsoleId),
     /*  4 */ OS_COM_SLOT(XSystemGetXboxLiveSandboxId),
+    /*  5 */ OS_COM_SLOT(XSystemGetAppSpecificDeviceId),
 };
 
 // 22. CLSID={F4FAF4D4-2D04-4FCE-B3E0-474A713A3E84} IID={D29411DF-0794-4553-8B27-95FC02D0F75D}
@@ -10778,6 +10790,39 @@ const ComVtableSlot g_com_vtbl_pls[] = {
     /*  5 */ OS_COM_SLOT(XPersistentLocalStorageGetSpaceInfo),
     /*  6 */ OS_COM_SLOT(XPersistentLocalStoragePromptUserForSpaceAsync),
     /*  7 */ OS_COM_SLOT(XPersistentLocalStoragePromptUserForSpaceResult),
+};
+
+// 23. CLSID={0A2192AA-B2D5-4D58-83BE-383B6D80799E} IID={5F5E5169-746C-4001-AD1C-DA728D01C9EB}
+XGameResult OPENSCARLETT_GDK_CALL ComThunk_XGameStreamingRegisterClientPropertiesChanged(
+    void* /*self*/,
+    XGameStreamingClientId /*client*/,
+    XTaskQueueHandle /*queue*/,
+    void* /*context*/,
+    void* /*callback*/,
+    XTaskQueueRegistrationToken* token) {
+    if (token) {
+        token->token = 1u;
+    }
+    return RecordHr("XGameStreamingRegisterClientPropertiesChanged", XGR_S_OK);
+}
+
+const ComVtableSlot g_com_vtbl_game_streaming[] = {
+    OS_COM_IUNKNOWN_SLOTS,
+    /*  3 */ OS_COM_SLOT(XGameStreamingInitialize),
+    /*  4 */ OS_COM_SLOT(XGameStreamingUninitialize),
+    /*  5 */ OS_COM_UNIMPL(),
+    /*  6 */ reinterpret_cast<ComVtableSlot>(&ComThunk_XGameStreamingRegisterClientPropertiesChanged),
+    /*  7 */ OS_COM_SLOT(XGameStreamingUnregisterConnectionStateChanged),
+    /*  8 */ OS_COM_SLOT(XGameStreamingGetStreamPhysicalDimensions),
+    /*  9 */ OS_COM_UNIMPL(),
+    /* 10 */ OS_COM_UNIMPL(),
+    /* 11 */ OS_COM_UNIMPL(),
+    /* 12 */ OS_COM_SLOT(XGameStreamingRegisterConnectionStateChanged),
+    /* 13 */ OS_COM_SLOT(XGameStreamingUnregisterConnectionStateChanged),
+    /* 14 */ OS_COM_SLOT(XGameStreamingGetConnectionState),
+    /* 15 */ OS_COM_UNIMPL(),
+    /* 16 */ OS_COM_UNIMPL(),
+    /* 17 */ OS_COM_SLOT(XGameStreamingIsStreaming),
 };
 
 #undef OS_COM_IUNKNOWN_SLOTS
@@ -10807,6 +10852,7 @@ XgrRealComObject g_real_com_objects[kComObjCount] = {
     {g_com_vtbl_game_ui, kComGameUi},
     {g_com_vtbl_system_console, kComSystemConsole},
     {g_com_vtbl_pls, kComPls},
+    {g_com_vtbl_game_streaming, kComGameStreaming},
 };
 
 struct RealComInterfaceMapping {
@@ -10816,9 +10862,12 @@ struct RealComInterfaceMapping {
 };
 
 constexpr RealComInterfaceMapping kRealComMappings[] = {
-    // 1. XUser main
+    // 1. XUser main (GDK 2022+ and legacy GDK 2021 IIDs)
     {{0x01ACD177u, 0x91F9u, 0x4763u, {0xA3, 0x8E, 0xCC, 0xBB, 0x55, 0xCE, 0x32, 0xE0}},
      {0x1BF2F8C5u, 0xD507u, 0x4E52u, {0xBB, 0x05, 0xF7, 0x26, 0xD0, 0xE7, 0x11, 0x61}},
+     kComUser},
+    {{0x01ACD177u, 0x91F9u, 0x4763u, {0xA3, 0x8E, 0xCC, 0xBB, 0x55, 0xCE, 0x32, 0xE0}},
+     {0xEB9BF948u, 0x18DCu, 0x4D82u, {0xBB, 0xCC, 0x40, 0xE0, 0xA8, 0x09, 0xC4, 0xC0}},
      kComUser},
     // 2. XUser gamertag
     {{0x01ACD177u, 0x91F9u, 0x4763u, {0xA3, 0x8E, 0xCC, 0xBB, 0x55, 0xCE, 0x32, 0xE0}},
@@ -10888,9 +10937,12 @@ constexpr RealComInterfaceMapping kRealComMappings[] = {
     {{0xA4F1AEE2u, 0x4BF1u, 0x4485u, {0xB0, 0x08, 0xA7, 0xC2, 0x6D, 0x52, 0xAC, 0x27}},
      {0x3A949778u, 0x772Eu, 0x4799u, {0xBD, 0xEA, 0x0A, 0x66, 0x39, 0xE9, 0x6B, 0xAA}},
      kComAppCapture},
-    // 17. XPackage
+    // 17. XPackage (GDK 2022+ and legacy GDK 2021 IIDs)
     {{0xAF406016u, 0xE850u, 0x4AA8u, {0xA8, 0x8D, 0x2F, 0x3D, 0xCB, 0x9D, 0xAC, 0x7E}},
      {0xF92D8712u, 0x2B27u, 0x4D8Au, {0xBF, 0x01, 0x11, 0xA6, 0xF8, 0xE3, 0xEB, 0x42}},
+     kComPackage},
+    {{0xAF406016u, 0xE850u, 0x4AA8u, {0xA8, 0x8D, 0x2F, 0x3D, 0xCB, 0x9D, 0xAC, 0x7E}},
+     {0x3720DE07u, 0xE8E4u, 0x44A3u, {0xAD, 0x32, 0xB3, 0x59, 0xE8, 0xAD, 0xBE, 0x55}},
      kComPackage},
     // 18. XSystemGetAnalyticsInfo
     {{0xB884675Du, 0xB738u, 0x4A9Cu, {0x81, 0x5D, 0x9A, 0x9A, 0x1E, 0x0C, 0x6C, 0x9B}},
@@ -10900,18 +10952,28 @@ constexpr RealComInterfaceMapping kRealComMappings[] = {
     {{0xBBFBDCC7u, 0xBFE7u, 0x409Bu, {0xA5, 0xCA, 0xED, 0xF0, 0x54, 0x96, 0x0B, 0x4D}},
      {0xBBFBDCC7u, 0xBFE7u, 0x409Bu, {0xA5, 0xCA, 0xED, 0xF0, 0x54, 0x96, 0x0B, 0x4D}},
      kComGameEvent},
-    // 20. XGameUi
+    // 20. XGameUi (GDK 2022+ and legacy GDK 2021 IIDs)
     {{0xDFCD4649u, 0x4FF8u, 0x4043u, {0xBA, 0x07, 0x35, 0xD6, 0x07, 0xDF, 0x98, 0xB0}},
      {0x72C4E70Fu, 0x4A67u, 0x481Bu, {0xBB, 0x84, 0xAA, 0x72, 0xED, 0xA1, 0x4F, 0xE5}},
      kComGameUi},
-    // 21. XSystem ConsoleId + SandboxId
+    {{0xDFCD4649u, 0x4FF8u, 0x4043u, {0xBA, 0x07, 0x35, 0xD6, 0x07, 0xDF, 0x98, 0xB0}},
+     {0xFC0B9BD0u, 0x8898u, 0x4643u, {0xBE, 0xE0, 0x4E, 0xE6, 0xEE, 0x03, 0x4C, 0xB6}},
+     kComGameUi},
+    // 21. XSystem ConsoleId + SandboxId + AppSpecificDeviceId
     {{0xE349BD1Au, 0xFC20u, 0x4E40u, {0xB9, 0x9C, 0x41, 0x78, 0xCC, 0x6B, 0x40, 0x9F}},
      {0x67CE4BFCu, 0xB1D1u, 0x4AC7u, {0xBC, 0x3A, 0xCB, 0x92, 0x19, 0xA9, 0x7A, 0x85}},
+     kComSystemConsole},
+    {{0xE349BD1Au, 0xFC20u, 0x4E40u, {0xB9, 0x9C, 0x41, 0x78, 0xCC, 0x6B, 0x40, 0x9F}},
+     {0x6FD71F09u, 0x7513u, 0x49F0u, {0x89, 0xBC, 0xBF, 0xAF, 0x5D, 0xF6, 0xF8, 0x52}},
      kComSystemConsole},
     // 22. XPersistentLocalStorage
     {{0xF4FAF4D4u, 0x2D04u, 0x4FCEu, {0xB3, 0xE0, 0x47, 0x4A, 0x71, 0x3A, 0x3E, 0x84}},
      {0xD29411DFu, 0x0794u, 0x4553u, {0x8B, 0x27, 0x95, 0xFC, 0x02, 0xD0, 0xF7, 0x5D}},
      kComPls},
+    // 23. XGameStreaming
+    {{0x0A2192AAu, 0xB2D5u, 0x4D58u, {0x83, 0xBE, 0x38, 0x3B, 0x6D, 0x80, 0x79, 0x9E}},
+     {0x5F5E5169u, 0x746Cu, 0x4001u, {0xAD, 0x1C, 0xDA, 0x72, 0x8D, 0x01, 0xC9, 0xEB}},
+     kComGameStreaming},
 };
 
 bool IsKnownRealGdkClsid(const XgrGuid& clsid) noexcept {

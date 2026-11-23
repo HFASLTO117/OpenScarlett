@@ -223,6 +223,9 @@ public:
     DeviceX(ID3D12Device* host_device,
             const D3D12AdapterInfo& adapter_info,
             HWND default_hwnd = nullptr);
+
+    void SetRetailScarlettAbi(bool enabled) noexcept { retail_scarlett_abi_ = enabled; }
+    bool IsRetailScarlettAbi() const noexcept { return retail_scarlett_abi_; }
     ~DeviceX();
 
     DeviceX(const DeviceX&) = delete;
@@ -365,6 +368,9 @@ public:
         uint64_t spirv_dispatches,
         uint64_t spirv_mesh_dispatches) noexcept;
     D3D12_GPU_VIRTUAL_ADDRESS TranslateGuestGpuVa(D3D12_GPU_VIRTUAL_ADDRESS address) const noexcept;
+    // Desktop D3D12 requires 256-byte alignment for CBV GPU VAs, while Xbox Series X allows
+    // 16-byte CBV alignment. Copies unaligned slices into a persistently-mapped 256B-aligned ring.
+    D3D12_GPU_VIRTUAL_ADDRESS AlignRootCbvGpuVaForDesktop(D3D12_GPU_VIRTUAL_ADDRESS translated_va);
     uint32_t FrameIntervalMicroseconds() const noexcept {
         return frame_interval_us_.load(std::memory_order_relaxed);
     }
@@ -1043,6 +1049,14 @@ private:
     std::atomic<uint64_t> pso_f16_links_reconciled_{0ull};
     std::atomic<uint64_t> pso_interp_validations_{0ull};
     std::atomic<uint64_t> pso_interp_matches_{0ull};
+    bool retail_scarlett_abi_ = false;
+
+    // 256-byte CBV alignment ring buffer for Xbox 16-byte-aligned root CBVs on desktop D3D12.
+    std::mutex cbv_align_mutex_;
+    ID3D12Resource* cbv_align_ring_ = nullptr;
+    uint8_t* cbv_align_ring_cpu_ = nullptr;
+    D3D12_GPU_VIRTUAL_ADDRESS cbv_align_ring_gpu_ = 0ull;
+    uint32_t cbv_align_ring_cursor_ = 0u;
 };
 
 }  // namespace openscarlett::d3d12_xs

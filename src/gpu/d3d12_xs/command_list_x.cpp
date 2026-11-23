@@ -394,6 +394,22 @@ CommandListX* CommandListX::TryFromCommandList(ID3D12CommandList* maybe_wrapped)
     return (it != reg.wrapper_map.end()) ? it->second : nullptr;
 }
 
+void CommandListX::RegisterExternalAlias(const void* alias_ptr, CommandListX* wrapper) noexcept {
+    if (!alias_ptr || !wrapper) return;
+    auto& reg = GetCommandListRegistry();
+    std::unique_lock<std::shared_mutex> lock(reg.mutex);
+    reg.map[alias_ptr] = wrapper->HostList();
+    reg.wrapper_map[alias_ptr] = wrapper;
+}
+
+void CommandListX::UnregisterExternalAlias(const void* alias_ptr) noexcept {
+    if (!alias_ptr) return;
+    auto& reg = GetCommandListRegistry();
+    std::unique_lock<std::shared_mutex> lock(reg.mutex);
+    reg.map.erase(alias_ptr);
+    reg.wrapper_map.erase(alias_ptr);
+}
+
 void CommandListX::CopyVulkanRecordedBatch(VulkanRecordedBatch& out_batch) const {
     std::lock_guard<std::mutex> lock(vk_rec_mutex_);
     out_batch = vk_batch_;
@@ -897,9 +913,33 @@ void STDMETHODCALLTYPE CommandListX::CopyTiles(
 void STDMETHODCALLTYPE CommandListX::ResolveSubresource(
     ID3D12Resource* pDstResource, UINT DstSubresource,
     ID3D12Resource* pSrcResource, UINT SrcSubresource, DXGI_FORMAT Format) {
+    ID3D12Resource* host_dst = UnwrapResource(pDstResource);
+    ID3D12Resource* host_src = UnwrapResource(pSrcResource);
+    if (host_dst && host_src && host_list1_) {
+        const D3D12_RESOURCE_DESC dd = host_dst->GetDesc();
+        const D3D12_RESOURCE_DESC sd = host_src->GetDesc();
+        const UINT dst_mip = DstSubresource % std::max<UINT>(1u, dd.MipLevels);
+        const UINT src_mip = SrcSubresource % std::max<UINT>(1u, sd.MipLevels);
+        const UINT dst_w = static_cast<UINT>(std::max<UINT64>(1ull, dd.Width >> dst_mip));
+        const UINT dst_h = std::max<UINT>(1u, dd.Height >> dst_mip);
+        const UINT src_w = static_cast<UINT>(std::max<UINT64>(1ull, sd.Width >> src_mip));
+        const UINT src_h = std::max<UINT>(1u, sd.Height >> src_mip);
+        if (src_w != dst_w || src_h != dst_h) {
+            D3D12_RECT rect{};
+            rect.left = 0;
+            rect.top = 0;
+            rect.right = static_cast<LONG>(std::min(src_w, dst_w));
+            rect.bottom = static_cast<LONG>(std::min(src_h, dst_h));
+            host_list1_->ResolveSubresourceRegion(
+                host_dst, DstSubresource, 0u, 0u,
+                host_src, SrcSubresource, &rect,
+                Format, D3D12_RESOLVE_MODE_AVERAGE);
+            RecordList("ID3D12GraphicsCommandListX::ResolveSubresource", 19, S_OK);
+            return;
+        }
+    }
     host_list_->ResolveSubresource(
-        UnwrapResource(pDstResource), DstSubresource,
-        UnwrapResource(pSrcResource), SrcSubresource, Format);
+        host_dst, DstSubresource, host_src, SrcSubresource, Format);
     RecordList("ID3D12GraphicsCommandListX::ResolveSubresource", 19, S_OK);
 }
 
@@ -990,6 +1030,33 @@ void STDMETHODCALLTYPE CommandListX::ResourceBarrier(
         switch (b.Type) {
             case D3D12_RESOURCE_BARRIER_TYPE_TRANSITION: {
                 b.Transition.pResource = UnwrapResource(pBarriers[i].Transition.pResource);
+                // Desktop D3D12 forbids state transitions on UPLOAD/READBACK heaps (unlike Xbox UMA).
+                if (b.Transition.pResource != nullptr) {
+                    D3D12_HEAP_PROPERTIES hp{};
+                    if (SUCCEEDED(b.Transition.pResource->GetHeapProperties(&hp, nullptr)) &&
+                        (hp.Type == D3D12_HEAP_TYPE_UPLOAD || hp.Type == D3D12_HEAP_TYPE_READBACK)) {
+                        emit = false;
+                        break;
+                    }
+                    // Desktop D3D12 forbids buffer-only state bits on texture resources
+                    // (Xbox titles sometimes pass GENERIC_READ or VB/IB bits on textures).
+                    const D3D12_RESOURCE_DESC rdesc = b.Transition.pResource->GetDesc();
+                    if (rdesc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+                        constexpr UINT kBufferOnlyBits =
+                            static_cast<UINT>(D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER) |
+                            static_cast<UINT>(D3D12_RESOURCE_STATE_INDEX_BUFFER) |
+                            static_cast<UINT>(D3D12_RESOURCE_STATE_STREAM_OUT) |
+                            static_cast<UINT>(D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+                        const UINT sb = static_cast<UINT>(b.Transition.StateBefore) & ~kBufferOnlyBits;
+                        const UINT sa = static_cast<UINT>(b.Transition.StateAfter) & ~kBufferOnlyBits;
+                        b.Transition.StateBefore = static_cast<D3D12_RESOURCE_STATES>(sb);
+                        b.Transition.StateAfter = static_cast<D3D12_RESOURCE_STATES>(sa);
+                        if (b.Transition.StateBefore == b.Transition.StateAfter) {
+                            emit = false;
+                            break;
+                        }
+                    }
+                }
                 if (device_x_ && b.Transition.pResource != nullptr) {
                     SamplerFeedbackMapInfo sf_info{};
                     if (device_x_->GetSamplerFeedbackManager().LookupFeedbackMap(
@@ -1590,8 +1657,11 @@ void STDMETHODCALLTYPE CommandListX::SetGraphicsRoot32BitConstants(
 
 void STDMETHODCALLTYPE CommandListX::SetComputeRootConstantBufferView(
     UINT RootParameterIndex, D3D12_GPU_VIRTUAL_ADDRESS BufferLocation) {
-    const D3D12_GPU_VIRTUAL_ADDRESS translated =
+    D3D12_GPU_VIRTUAL_ADDRESS translated =
         device_x_ ? device_x_->TranslateGuestGpuVa(BufferLocation) : BufferLocation;
+    if (device_x_ && (translated & 255ull) != 0ull) {
+        translated = device_x_->AlignRootCbvGpuVaForDesktop(translated);
+    }
     if (device_x_) {
         const uint32_t sgpr_slot = (RootParameterIndex * 2u) % 14u;
         (void)device_x_->GetDescriptorBridge().SetRootSgprTablePtr(sgpr_slot, translated);
@@ -1608,8 +1678,11 @@ void STDMETHODCALLTYPE CommandListX::SetComputeRootConstantBufferView(
 
 void STDMETHODCALLTYPE CommandListX::SetGraphicsRootConstantBufferView(
     UINT RootParameterIndex, D3D12_GPU_VIRTUAL_ADDRESS BufferLocation) {
-    const D3D12_GPU_VIRTUAL_ADDRESS translated =
+    D3D12_GPU_VIRTUAL_ADDRESS translated =
         device_x_ ? device_x_->TranslateGuestGpuVa(BufferLocation) : BufferLocation;
+    if (device_x_ && (translated & 255ull) != 0ull) {
+        translated = device_x_->AlignRootCbvGpuVaForDesktop(translated);
+    }
     if (device_x_) {
         const uint32_t sgpr_slot = (RootParameterIndex * 2u) % 14u;
         (void)device_x_->GetDescriptorBridge().SetRootSgprTablePtr(sgpr_slot, translated);
