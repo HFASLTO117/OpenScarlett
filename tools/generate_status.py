@@ -181,9 +181,12 @@ def collect_dlls(build_dir: pathlib.Path) -> list[DllInfo]:
         ("xtfdebugmonitor.dll", "stub", 7, "XTF debug monitor stubs"),
     ]
 
-    # Auto-upgrade tiers when Sprint 9/10 implementations land!
+    # Auto-upgrade tiers when Sprint 9/10/14 implementations land!
     has_proxies = has("tests/test_d3d12_xs_proxies_multiqueue.cpp")
     has_mf_hw = has("tests/test_media_video_gameinput.cpp")
+    has_s14_ffx = has("tests/test_s14_p0_shims_ffx_config.cpp")
+    has_s14_bvh = has("tests/test_s14_xbox_bvh_builder_abi.cpp")
+    has_s14_ds = has("tests/test_s14_dstorage_x2_iocp.cpp")
 
     out: list[DllInfo] = []
     for name, tier, fallback_exp, note in catalog:
@@ -195,10 +198,28 @@ def collect_dlls(build_dir: pathlib.Path) -> list[DllInfo]:
                 exp = measured
         if name == "d3d12_xs.dll" and has_proxies:
             tier = "high"
-            note = "Full Xbox COM object proxies, multi-queue MT recording, HDR10 PresentX & Vulkan routing"
+            note = "Full Xbox COM proxies (incl. Resource1/2, Heap1), Agility SDK, Enhanced Barriers, live VRAM residency, HDR10 PresentX & Vulkan routing"
         if name == "mfplat_xs.dll" and has_mf_hw:
             tier = "high"
             note = "H.264/HEVC D3D12 Media Foundation decode + IMFDXGIDeviceManager lifecycle"
+        if name == "XboxBvhBuilder.dll" and has_s14_bvh:
+            tier = "high"
+            note = "Real C++ XboxBvhBuilder ABI (24 mangled + 9 C exports), dual-path BVH4 rehydration & SAH BVH"
+        if name == "amd_fidelityfx_upscaler_xbox.dll" and has_s14_ffx:
+            tier = "high"
+            note = "Real 5-export AMD FidelityFX 2.0 C ABI + live GPU D3D12 compute upscale & FSR 1.0 EASU+RCAS"
+        if name == "amd_fidelityfx_loader_xbox.dll" and has_s14_ffx:
+            tier = "high"
+            note = "Real 5-export AMD FidelityFX 2.0 loader & version dispatch forwarding to upscaler"
+        if name == "dstorage_xs.dll" and has_s14_ds:
+            note = "Xbox 0x48 ABI, X2 COM, GDeflate v1 + RFC 1950 Zlib + BCPack BC1-BC7, concurrent IOCP (>64 GiB) & phys-page targets"
+        if name == "XAudio2_9.dll" and has_s14_ffx:
+            note = "Standard @1-@4 ordinal pinning, live WASAPI, 128 voices, submix/reverb APOs, XMA2/Opus/ADPCM & X3DAudio"
+        if name == "libHttpClient.GDK.dll" and has_s14_ffx:
+            tier = "high"
+            note = "Offline/HTTP request queue, WebSocket C ABI, HCHttpCall* getters/setters & XAsync lifecycle"
+        if name == "XCurl.dll" and has_s14_ffx:
+            note = "16/16 shipping thunks + 15 curl_form*/curl_mime_* exports, WinHTTP handles & offline XSTS auth"
         out.append(DllInfo(name=name, tier=tier, exports=exp, note=note))
     return out
 

@@ -5415,6 +5415,31 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateStateObject(
         }
     }
 
+    // Sprint 14 integration: auto-lift embedded Xbox RDNA2 / Xbox-DXBC DXIL_LIBRARY
+    // subobjects via LiftDxrStateObjectDesc (lib_6_5 / lib_6_6 + SBT remapping + DXR=0 fallback).
+    openscarlett::DxrLiftedStateObjectResult lifted_so{};
+    bool has_dxil_library = false;
+    if (desc_ptr && desc_ptr->pSubobjects && desc_ptr->NumSubobjects > 0u) {
+        for (UINT i = 0u; i < desc_ptr->NumSubobjects; ++i) {
+            if (desc_ptr->pSubobjects[i].Type == D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY &&
+                desc_ptr->pSubobjects[i].pDesc != nullptr) {
+                has_dxil_library = true;
+                break;
+            }
+        }
+    }
+    if (has_dxil_library) {
+        openscarlett::DxrStateObjectLiftOptions lift_opts{};
+        lift_opts.host_dxr_tier = adapter_info_.raytracing_tier;
+        lift_opts.prefer_sm66 = (adapter_info_.highest_shader_model >= 0x66u);
+        lift_opts.compile_with_dxc = true;
+        const openscarlett::Status lift_st =
+            openscarlett::LiftDxrStateObjectDesc(desc_ptr, lift_opts, lifted_so);
+        if (lift_st.ok() && lifted_so.modified && lifted_so.LiftedDesc() != nullptr) {
+            desc_ptr = lifted_so.LiftedDesc();
+        }
+    }
+
     if (!ppStateObject) {
         const HRESULT hr = host_dev5_->CreateStateObject(desc_ptr, riid, nullptr);
         RecordDev("ID3D12DeviceX::CreateStateObject", 62, hr);
@@ -5425,15 +5450,15 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateStateObject(
     HRESULT hr = host_dev5_->CreateStateObject(
         desc_ptr, OS_D3D12_IID(ID3D12StateObject), reinterpret_cast<void**>(&host_so));
     if ((FAILED(hr) || !host_so) &&
-        adapter_info_.raytracing_tier == 0u &&
-        pDesc != nullptr &&
-        pDesc->pSubobjects != nullptr &&
-        pDesc->NumSubobjects > 0u &&
-        (pDesc->Type == D3D12_STATE_OBJECT_TYPE_COLLECTION ||
-         pDesc->Type == D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE)) {
+        (adapter_info_.raytracing_tier == 0u || lifted_so.fallback_plan.requires_software_fallback) &&
+        desc_ptr != nullptr &&
+        desc_ptr->pSubobjects != nullptr &&
+        desc_ptr->NumSubobjects > 0u &&
+        (desc_ptr->Type == D3D12_STATE_OBJECT_TYPE_COLLECTION ||
+         desc_ptr->Type == D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE)) {
         // Non-DXR adapter (e.g. GTX 1650 Ti / Win10 WARP): provide software StateObjectXProxy
         // supporting ID3D12StateObject + ID3D12StateObjectProperties shader identifier queries.
-        auto* sw_proxy = new (std::nothrow) StateObjectXProxy(this, nullptr, pDesc);
+        auto* sw_proxy = new (std::nothrow) StateObjectXProxy(this, nullptr, desc_ptr);
         if (!sw_proxy) {
             RecordDev("ID3D12DeviceX::CreateStateObject", 62, E_OUTOFMEMORY);
             return E_OUTOFMEMORY;
@@ -5447,7 +5472,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateStateObject(
         RecordDev("ID3D12DeviceX::CreateStateObject", 62, hr);
         return hr;
     }
-    auto* proxy = new (std::nothrow) StateObjectXProxy(this, host_so, pDesc);
+    auto* proxy = new (std::nothrow) StateObjectXProxy(this, host_so, desc_ptr);
     host_so->Release();
     if (!proxy) {
         RecordDev("ID3D12DeviceX::CreateStateObject", 62, E_OUTOFMEMORY);
