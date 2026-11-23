@@ -813,6 +813,21 @@ void TestGameInputS12() {
                    nullptr, GameInputWinEventFocus, 1, 0) == GAMEINPUT_S_OK);
     OS_REQUIRE(OpenScarlettGameInputBroadcastWindowEvent(
                    nullptr, GameInputWinEventDeviceChange, 0, 0) == GAMEINPUT_S_OK);
+    // Verify GDK v1 GameInputEnableBackgroundInput (0x40) policy + live physical/fallback poll
+    // works cleanly when host C:\Windows\System32\GameInput.dll is co-resident with our shim.
+    gi_ev->SetFocusPolicy(0x00000040u);
+    {
+        IGameInputReading* live_gp_r = nullptr;
+        OS_REQUIRE(gi_ev->GetCurrentReading(GameInputKindGamepad, nullptr, &live_gp_r) == GAMEINPUT_S_OK &&
+                   live_gp_r != nullptr);
+        GameInputGamepadState live_gp{};
+        OS_REQUIRE(live_gp_r->GetGamepadState(&live_gp));
+        OS_REQUIRE(std::isfinite(live_gp.leftThumbstickX) && std::isfinite(live_gp.leftThumbstickY));
+        OS_REQUIRE(std::isfinite(live_gp.rightThumbstickX) && std::isfinite(live_gp.rightThumbstickY));
+        OS_REQUIRE(live_gp.leftTrigger >= 0.0f && live_gp.leftTrigger <= 1.0f);
+        OS_REQUIRE(live_gp.rightTrigger >= 0.0f && live_gp.rightTrigger <= 1.0f);
+        live_gp_r->Release();
+    }
     gi_ev->Release();
 
     // 4g. CallTelemetry thread-local hot-path cache: exact counts under contention + safe generation Reset().

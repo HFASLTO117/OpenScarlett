@@ -308,6 +308,40 @@ void TestVfsTruncateAndNtHooks(const fs::path& bin_dir, const fs::path& work_roo
     OS_REQUIRE((::GetFileAttributesW(f_ro1.c_str()) & FILE_ATTRIBUTE_READONLY) != 0u);
     OS_REQUIRE(ReadFileAll(g_ov / "Data" / "readonly.cfg") == "TRUNCATED_IN_OVERLAY");
 
+    // 1a-ext. Direct host handle opened under g_base (NOT via VFS) MUST keep its real host path
+    //         in GetFinalPathNameByHandleW (never silently rewritten to \\?\G:\...), whereas an
+    //         untracked handle opened inside g_ov MUST still normalize to \\?\G:\... without
+    //         leaking the internal overlay prefix.
+    {
+        HANDLE h_direct_base = ::CreateFileW(
+            f_ro1.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        OS_REQUIRE(h_direct_base != INVALID_HANDLE_VALUE);
+        if (h_direct_base != INVALID_HANDLE_VALUE) {
+            wchar_t fbuf[512]{};
+            const DWORD got = fn_final(h_direct_base, fbuf, 512u, 0u /*VOLUME_NAME_DOS*/);
+            OS_REQUIRE(got > 0u);
+            const std::wstring direct_s(fbuf, got);
+            OS_REQUIRE(direct_s.find(L"\\\\?\\G:\\") == std::wstring::npos);
+            OS_REQUIRE(direct_s.find(L"readonly.cfg") != std::wstring::npos);
+            ::CloseHandle(h_direct_base);
+        }
+
+        const fs::path ov_file = g_ov / "Data" / "readonly.cfg";
+        HANDLE h_direct_ov = ::CreateFileW(
+            ov_file.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        OS_REQUIRE(h_direct_ov != INVALID_HANDLE_VALUE);
+        if (h_direct_ov != INVALID_HANDLE_VALUE) {
+            wchar_t fbuf[512]{};
+            const DWORD got = fn_final(h_direct_ov, fbuf, 512u, 0u /*VOLUME_NAME_DOS*/);
+            OS_REQUIRE(got > 0u);
+            const std::wstring ov_s(fbuf, got);
+            OS_REQUIRE(ov_s == L"\\\\?\\G:\\Data\\readonly.cfg");
+            ::CloseHandle(h_direct_ov);
+        }
+    }
+
     // 1b. NtCreateFile(FILE_OVERWRITE) on un-overlaid READONLY game file
     {
         std::wstring nt_path = L"\\??\\G:\\Data\\nt_ro.bin";

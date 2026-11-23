@@ -1208,8 +1208,33 @@ HMODULE WINAPI Hook_LoadLibraryExA(LPCSTR lpLibFileName, HANDLE hFile, DWORD dwF
     return mod;
 }
 
+bool IsExplicitSystem32PathW(std::wstring_view raw_name) {
+    if (raw_name.empty() || g_windows_dir_lower_w.empty()) {
+        return false;
+    }
+    std::wstring lo = ToLowerAsciiW(raw_name);
+    for (wchar_t& c : lo) {
+        if (c == L'/') {
+            c = L'\\';
+        }
+    }
+    if (lo.size() >= 4u &&
+        (lo.compare(0u, 4u, L"\\\\?\\") == 0 || lo.compare(0u, 4u, L"\\??\\") == 0)) {
+        lo.erase(0u, 4u);
+    }
+    const std::wstring sys32 = g_windows_dir_lower_w + L"\\system32\\";
+    return lo.rfind(sys32, 0u) == 0u;
+}
+
 HMODULE WINAPI Hook_LoadLibraryExW(LPCWSTR lpLibFileName, HANDLE hFile, DWORD dwFlags) {
     if (!g_shutting_down.load(std::memory_order_acquire) && lpLibFileName != nullptr) {
+        // Explicit System32 loads with LOAD_LIBRARY_SEARCH_SYSTEM32 (e.g. our GameInput.dll
+        // shim loading host C:\Windows\System32\GameInput.dll for native GIP controller input)
+        // must bypass shim redirection so they never recurse back into the shim DLL.
+        if ((dwFlags & LOAD_LIBRARY_SEARCH_SYSTEM32) != 0u &&
+            IsExplicitSystem32PathW(lpLibFileName)) {
+            return g_real_LoadLibraryExW(lpLibFileName, hFile, dwFlags);
+        }
         openscarlett::DllRouteDecision decision;
         std::wstring target_path;
         if (MatchRoutedShimOrGuestDllW(lpLibFileName, decision, target_path)) {
@@ -1895,6 +1920,22 @@ void UntrackVfsHandle(HANDLE h) {
     ::ReleaseSRWLockExclusive(&g_vfs_handle_lock);
 }
 
+// Fast lock-contention-free cleanup on passthrough opens: if a tracked VFS handle was
+// closed via an unhooked Windows DLL and the OS reused its numeric HANDLE value for a
+// non-virtual file, clear the stale entry without taking an exclusive lock in the common case.
+void UntrackVfsHandleIfPresent(HANDLE h) {
+    if (!h || h == INVALID_HANDLE_VALUE || g_vfs_handle_count.load(std::memory_order_acquire) == 0u) {
+        return;
+    }
+    ::AcquireSRWLockShared(&g_vfs_handle_lock);
+    const bool present = (g_vfs_handles.find(h) != g_vfs_handles.end());
+    ::ReleaseSRWLockShared(&g_vfs_handle_lock);
+    if (!present) {
+        return;
+    }
+    UntrackVfsHandle(h);
+}
+
 bool LookupTrackedVfsHandleSnapshot(HANDLE h, TrackedVfsHandle& out) {
     if (!h || h == INVALID_HANDLE_VALUE || g_vfs_handle_count.load(std::memory_order_acquire) == 0u) {
         return false;
@@ -2294,17 +2335,22 @@ OS_NTSTATUS NTAPI Hook_NtCreateFile(PHANDLE FileHandle,
             return st;
         }
     }
-    return g_real_NtCreateFile(FileHandle,
-                               DesiredAccess,
-                               ObjectAttributes,
-                               IoStatusBlock,
-                               AllocationSize,
-                               FileAttributes,
-                               ShareAccess,
-                               CreateDisposition,
-                               CreateOptions,
-                               EaBuffer,
-                               EaLength);
+    const OS_NTSTATUS passthrough_st = g_real_NtCreateFile(FileHandle,
+                                                           DesiredAccess,
+                                                           ObjectAttributes,
+                                                           IoStatusBlock,
+                                                           AllocationSize,
+                                                           FileAttributes,
+                                                           ShareAccess,
+                                                           CreateDisposition,
+                                                           CreateOptions,
+                                                           EaBuffer,
+                                                           EaLength);
+    if (passthrough_st >= 0 && FileHandle != nullptr && *FileHandle != nullptr &&
+        !g_shutting_down.load(std::memory_order_acquire)) {
+        UntrackVfsHandleIfPresent(*FileHandle);
+    }
+    return passthrough_st;
 }
 
 OS_NTSTATUS NTAPI Hook_NtOpenFile(PHANDLE FileHandle,
@@ -2353,12 +2399,17 @@ OS_NTSTATUS NTAPI Hook_NtOpenFile(PHANDLE FileHandle,
             return st;
         }
     }
-    return g_real_NtOpenFile(FileHandle,
-                             DesiredAccess,
-                             ObjectAttributes,
-                             IoStatusBlock,
-                             ShareAccess,
-                             OpenOptions);
+    const OS_NTSTATUS passthrough_st = g_real_NtOpenFile(FileHandle,
+                                                         DesiredAccess,
+                                                         ObjectAttributes,
+                                                         IoStatusBlock,
+                                                         ShareAccess,
+                                                         OpenOptions);
+    if (passthrough_st >= 0 && FileHandle != nullptr && *FileHandle != nullptr &&
+        !g_shutting_down.load(std::memory_order_acquire)) {
+        UntrackVfsHandleIfPresent(*FileHandle);
+    }
+    return passthrough_st;
 }
 
 OS_NTSTATUS NTAPI Hook_NtQueryAttributesFile(OS_OBJECT_ATTRIBUTES* ObjectAttributes,
@@ -3209,11 +3260,13 @@ HANDLE CreateVirtualFileW(std::wstring_view virtual_path,
                             dwCreationDisposition,
                             dwFlagsAndAttributes,
                             hTemplateFile);
-        if (h == INVALID_HANDLE_VALUE) {
-            const DWORD e = ::GetLastError();
+        const DWORD e = ::GetLastError();
+        if (h != INVALID_HANDLE_VALUE) {
+            UntrackVfsHandleIfPresent(h);
+        } else {
             TraceVfsFailureW(api_tag, virtual_path, passthrough_path, dwDesiredAccess, dwCreationDisposition, e);
-            ::SetLastError(e);
         }
+        ::SetLastError(e);
         return h;
     }
 
@@ -3290,8 +3343,14 @@ HANDLE WINAPI Hook_CreateFile2(LPCWSTR lpFileName,
             return h;
         }
     }
-    return g_real_CreateFile2(
+    HANDLE h = g_real_CreateFile2(
         lpFileName, dwDesiredAccess, dwShareMode, dwCreationDisposition, pCreateExParams);
+    if (h != INVALID_HANDLE_VALUE && !g_shutting_down.load(std::memory_order_acquire)) {
+        const DWORD e = ::GetLastError();
+        UntrackVfsHandleIfPresent(h);
+        ::SetLastError(e);
+    }
+    return h;
 }
 
 BOOL WINAPI Hook_CloseHandle(HANDLE hObject) {
@@ -3312,6 +3371,9 @@ DWORD WINAPI Hook_GetFinalPathNameByHandleW(HANDLE hFile,
         if (LookupTrackedVfsHandleSnapshot(hFile, snap) && !snap.virtual_path.empty()) {
             virtual_path = snap.virtual_path;
         } else if (g_real_GetFinalPathNameByHandleW != nullptr) {
+            // Only normalize untracked handles if they point into the internal G_overlay
+            // directory (preventing overlay prefix leakage without rewriting direct host
+            // paths under g_root / t_root / s_root that were never opened via VFS).
             std::wstring probe(512u, L'\0');
             DWORD got = g_real_GetFinalPathNameByHandleW(
                 hFile, probe.data(), static_cast<DWORD>(probe.size()), 0u /*VOLUME_NAME_DOS*/);
@@ -3323,7 +3385,8 @@ DWORD WINAPI Hook_GetFinalPathNameByHandleW(HANDLE hFile,
             if (got > 0u && got < probe.size()) {
                 probe.resize(got);
                 std::wstring mapped;
-                if (g_vfs.TryMapHostPathToVirtualW(probe, mapped, nullptr)) {
+                bool from_overlay = false;
+                if (g_vfs.TryMapHostPathToVirtualW(probe, mapped, &from_overlay) && from_overlay) {
                     virtual_path = NormalizeCanonicalVirtualPathW(mapped);
                 }
             }
@@ -3397,12 +3460,17 @@ HANDLE WINAPI Hook_CreateFileW(LPCWSTR lpFileName,
                                   dwCreationDisposition,
                                   dwFlagsAndAttributes,
                                   hTemplateFile);
-    if (h == INVALID_HANDLE_VALUE && tl_vfs_hook_depth == 0 && lpFileName != nullptr &&
-        !g_shutting_down.load(std::memory_order_acquire)) {
-        const DWORD e = ::GetLastError();
-        ScopedVfsHookGuard guard;
-        TraceVfsFailureW("CreateFileW:direct", lpFileName, lpFileName, dwDesiredAccess, dwCreationDisposition, e);
-        ::SetLastError(e);
+    if (!g_shutting_down.load(std::memory_order_acquire)) {
+        if (h != INVALID_HANDLE_VALUE) {
+            const DWORD e = ::GetLastError();
+            UntrackVfsHandleIfPresent(h);
+            ::SetLastError(e);
+        } else if (tl_vfs_hook_depth == 0 && lpFileName != nullptr) {
+            const DWORD e = ::GetLastError();
+            ScopedVfsHookGuard guard;
+            TraceVfsFailureW("CreateFileW:direct", lpFileName, lpFileName, dwDesiredAccess, dwCreationDisposition, e);
+            ::SetLastError(e);
+        }
     }
     return h;
 }
@@ -3431,13 +3499,19 @@ HANDLE WINAPI Hook_CreateFileA(LPCSTR lpFileName,
                                       hTemplateFile);
         }
     }
-    return g_real_CreateFileA(lpFileName,
-                              dwDesiredAccess,
-                              dwShareMode,
-                              lpSecurityAttributes,
-                              dwCreationDisposition,
-                              dwFlagsAndAttributes,
-                              hTemplateFile);
+    HANDLE h = g_real_CreateFileA(lpFileName,
+                                  dwDesiredAccess,
+                                  dwShareMode,
+                                  lpSecurityAttributes,
+                                  dwCreationDisposition,
+                                  dwFlagsAndAttributes,
+                                  hTemplateFile);
+    if (h != INVALID_HANDLE_VALUE && !g_shutting_down.load(std::memory_order_acquire)) {
+        const DWORD e = ::GetLastError();
+        UntrackVfsHandleIfPresent(h);
+        ::SetLastError(e);
+    }
+    return h;
 }
 
 DWORD WINAPI Hook_GetFileAttributesW(LPCWSTR lpFileName) {

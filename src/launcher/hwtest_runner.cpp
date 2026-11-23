@@ -2004,6 +2004,9 @@ LauncherRunResult LaunchTargetWithProbeOption(
     const uint32_t outer_timeout_ms =
         (req.timeout_ms > 0) ? (req.timeout_ms + 3000u) : 0u;
 
+    // Permit the spawned guest title window to take foreground focus cleanly on startup.
+    ::AllowSetForegroundWindow(ASFW_ANY);
+
     const ProcessRunOutput proc = RunProcessCapture(
         cli_exe, cmd, bundle_dir, env_overrides, on_log_line, cancel_flag, outer_timeout_ms);
 

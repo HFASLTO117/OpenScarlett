@@ -382,7 +382,315 @@ struct XInputSlotTracker {
     uint32_t active_slot = 0u;
     std::atomic<bool> force_reprobe{true};
     std::atomic<bool> enable_refresh_pending{false};
+    std::atomic<bool> prefer_native_backend{true};
 };
+
+// ===========================================================================
+// Native Windows Host GameInput Backend (C:\Windows\System32\GameInput.dll)
+// ===========================================================================
+// On Windows 10/11, Xbox Series X|S GIP controllers managed by GameInputRedistService
+// can stall legacy xinput1_4.dll after window focus changes until USB replug, while
+// host C:\Windows\System32\GameInput.dll continues delivering live GIP readings and
+// native 4-motor rumble (including impulse triggers).
+#if defined(_WIN32)
+class NativeHostGameInputBackend {
+public:
+    static NativeHostGameInputBackend& Global() {
+        // Intentionally leaked singleton so teardown never touches COM/loader-lock during ExitProcess.
+        static NativeHostGameInputBackend* s_inst = new NativeHostGameInputBackend();
+        return *s_inst;
+    }
+
+    static bool HasActiveState(const GameInputGamepadState& gp) noexcept {
+        if (gp.buttons != GameInputGamepadNone) return true;
+        if (gp.leftTrigger > 0.12f || gp.rightTrigger > 0.12f) return true;
+        if (std::fabs(gp.leftThumbstickX) > 0.22f || std::fabs(gp.leftThumbstickY) > 0.22f) return true;
+        if (std::fabs(gp.rightThumbstickX) > 0.22f || std::fabs(gp.rightThumbstickY) > 0.22f) return true;
+        return false;
+    }
+
+    static void SanitizeGamepadState(GameInputGamepadState& gp) noexcept {
+        auto clamp01 = [](float v) noexcept -> float {
+            return std::isfinite(v) ? std::clamp(v, 0.0f, 1.0f) : 0.0f;
+        };
+        auto clamp11 = [](float v) noexcept -> float {
+            return std::isfinite(v) ? std::clamp(v, -1.0f, 1.0f) : 0.0f;
+        };
+        gp.leftTrigger = clamp01(gp.leftTrigger);
+        gp.rightTrigger = clamp01(gp.rightTrigger);
+        gp.leftThumbstickX = clamp11(gp.leftThumbstickX);
+        gp.leftThumbstickY = clamp11(gp.leftThumbstickY);
+        gp.rightThumbstickX = clamp11(gp.rightThumbstickX);
+        gp.rightThumbstickY = clamp11(gp.rightThumbstickY);
+    }
+
+    bool IsAvailable() {
+        EnsureInitialized();
+        return host_gi_ != nullptr;
+    }
+
+    void RefreshFocusPolicy() {
+        EnsureInitialized();
+        if (host_gi_) {
+            // Host Windows System32\GameInput.dll GameInputEnableBackgroundInput = 0x40.
+            // OpenScarlett's own GameInputImpl::ShouldAllowInput() enforces guest focus policy.
+            host_gi_->SetFocusPolicy(0x00000040u);
+        }
+    }
+
+    bool PollGamepad(
+        uint32_t preferred_slot,
+        GameInputGamepadState& out_gp,
+        bool& out_has_fresh_activity,
+        uint64_t* out_timestamp = nullptr) {
+        out_gp = GameInputGamepadState{};
+        out_has_fresh_activity = false;
+        if (out_timestamp) *out_timestamp = 0ull;
+
+        EnsureInitialized();
+        if (!host_gi_) {
+            return false;
+        }
+
+        std::vector<IGameInputDevice*> snapshot;
+        IGameInputDevice* prev_active = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            snapshot.reserve(connected_devices_.size());
+            for (IGameInputDevice* d : connected_devices_) {
+                if (d) {
+                    d->AddRef();
+                    snapshot.push_back(d);
+                }
+            }
+            prev_active = active_device_;
+        }
+
+        bool found = false;
+        GameInputGamepadState chosen_gp{};
+        uint64_t chosen_ts = 0ull;
+        IGameInputDevice* chosen_dev = nullptr;
+        bool chosen_fresh = false;
+
+        auto inspect_reading = [&](IGameInputDevice* dev, IGameInputReading* reading) {
+            GameInputGamepadState st{};
+            if (!reading->GetGamepadState(&st)) {
+                return;
+            }
+            SanitizeGamepadState(st);
+            const uint64_t ts = reading->GetTimestamp();
+            bool ts_advanced = false;
+            {
+                std::lock_guard<std::mutex> lk(mutex_);
+                auto it = last_dev_ts_.find(dev);
+                if (it != last_dev_ts_.end() && ts != it->second) {
+                    ts_advanced = true;
+                }
+                last_dev_ts_[dev] = ts;
+            }
+            const bool active_now = HasActiveState(st);
+            const bool fresh_now = active_now || ts_advanced;
+
+            if (!found || (fresh_now && !chosen_fresh) ||
+                (fresh_now == chosen_fresh && dev != nullptr && dev == prev_active)) {
+                found = true;
+                chosen_gp = st;
+                chosen_ts = ts;
+                chosen_dev = dev;
+                chosen_fresh = fresh_now;
+            }
+        };
+
+        // Try preferred slot device first if in range so multi-pad slot assignment stays stable.
+        if (preferred_slot < snapshot.size()) {
+            IGameInputDevice* pref_dev = snapshot[preferred_slot];
+            IGameInputReading* reading = nullptr;
+            if (host_gi_->GetCurrentReading(GameInputKindGamepad, pref_dev, &reading) >= 0 && reading) {
+                inspect_reading(pref_dev, reading);
+                reading->Release();
+            }
+        }
+        for (size_t i = 0; i < snapshot.size(); ++i) {
+            if (i == preferred_slot) continue;
+            IGameInputDevice* dev = snapshot[i];
+            IGameInputReading* reading = nullptr;
+            if (host_gi_->GetCurrentReading(GameInputKindGamepad, dev, &reading) >= 0 && reading) {
+                inspect_reading(dev, reading);
+                reading->Release();
+            }
+        }
+
+        // Fallback: query aggregate/any gamepad if device callback list was momentarily empty.
+        if (!found) {
+            IGameInputReading* reading = nullptr;
+            if (host_gi_->GetCurrentReading(GameInputKindGamepad, nullptr, &reading) >= 0 && reading) {
+                IGameInputDevice* rdev = nullptr;
+                reading->GetDevice(&rdev);
+                inspect_reading(rdev, reading);
+                if (rdev) rdev->Release();
+                reading->Release();
+            }
+        }
+
+        if (found && chosen_dev != nullptr) {
+            std::lock_guard<std::mutex> lk(mutex_);
+            if (std::find(connected_devices_.begin(), connected_devices_.end(), chosen_dev) !=
+                connected_devices_.end()) {
+                active_device_ = chosen_dev;
+            }
+        }
+
+        for (IGameInputDevice* d : snapshot) {
+            d->Release();
+        }
+
+        if (found) {
+            out_gp = chosen_gp;
+            out_has_fresh_activity = chosen_fresh;
+            if (out_timestamp) *out_timestamp = chosen_ts;
+        }
+        return found;
+    }
+
+    bool SetRumble(const GameInputRumbleParams& params) {
+        EnsureInitialized();
+        if (!host_gi_) {
+            return false;
+        }
+        IGameInputDevice* target = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            if (active_device_ != nullptr &&
+                std::find(connected_devices_.begin(), connected_devices_.end(), active_device_) !=
+                    connected_devices_.end()) {
+                target = active_device_;
+            } else if (!connected_devices_.empty()) {
+                target = connected_devices_.front();
+            }
+            if (target) {
+                target->AddRef();
+            }
+        }
+        if (!target) {
+            return false;
+        }
+        target->SetRumbleState(&params);
+        target->Release();
+        return true;
+    }
+
+private:
+    using PfnHostGameInputCreate = int32_t(OPENSCARLETT_GAMEINPUT_CALL*)(IGameInput**);
+
+    static void OPENSCARLETT_GAMEINPUT_CALL OnHostDeviceCallback(
+        uint64_t /*callbackToken*/,
+        void* context,
+        IGameInputDevice* device,
+        uint64_t /*timestamp*/,
+        uint32_t currentStatus,
+        uint32_t /*previousStatus*/) {
+        auto* self = static_cast<NativeHostGameInputBackend*>(context);
+        if (!self || !device) {
+            return;
+        }
+        std::lock_guard<std::mutex> lk(self->mutex_);
+        const bool connected = (currentStatus & GameInputDeviceConnected) != 0u;
+        auto it = std::find(self->connected_devices_.begin(), self->connected_devices_.end(), device);
+        if (connected) {
+            if (it == self->connected_devices_.end()) {
+                device->AddRef();
+                self->connected_devices_.push_back(device);
+                if (!self->active_device_) {
+                    self->active_device_ = device;
+                }
+            }
+        } else {
+            if (it != self->connected_devices_.end()) {
+                if (self->active_device_ == device) {
+                    self->active_device_ = nullptr;
+                }
+                self->last_dev_ts_.erase(device);
+                self->connected_devices_.erase(it);
+                device->Release();
+            }
+        }
+    }
+
+    void EnsureInitialized() {
+        std::call_once(init_once_, [this]() {
+            char disable_buf[16]{};
+            const DWORD dlen = ::GetEnvironmentVariableA(
+                "OPENSCARLETT_DISABLE_NATIVE_GAMEINPUT", disable_buf, sizeof(disable_buf));
+            if (dlen > 0u && dlen < sizeof(disable_buf) &&
+                (disable_buf[0] == '1' || disable_buf[0] == 't' || disable_buf[0] == 'T')) {
+                return;
+            }
+
+            HMODULE self_mod = nullptr;
+            (void)::GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCWSTR>(&NativeHostGameInputBackend::OnHostDeviceCallback),
+                &self_mod);
+
+            wchar_t sys_dir[MAX_PATH]{};
+            const UINT slen = ::GetSystemDirectoryW(sys_dir, MAX_PATH);
+            if (slen == 0u || slen >= MAX_PATH) {
+                return;
+            }
+            std::wstring host_gi_path(sys_dir, slen);
+            if (!host_gi_path.empty() && host_gi_path.back() != L'\\') {
+                host_gi_path.push_back(L'\\');
+            }
+            host_gi_path.append(L"GameInput.dll");
+
+            HMODULE host_mod = ::LoadLibraryExW(
+                host_gi_path.c_str(), nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+            if (!host_mod || host_mod == self_mod) {
+                return;
+            }
+
+            auto create_fn = reinterpret_cast<PfnHostGameInputCreate>(
+                reinterpret_cast<void*>(::GetProcAddress(host_mod, "GameInputCreate")));
+            if (!create_fn) {
+                return;
+            }
+
+            IGameInput* gi = nullptr;
+            if (create_fn(&gi) < 0 || !gi) {
+                return;
+            }
+
+            // Enable background input on the host GameInput instance so Alt-Tab / focus transitions
+            // never freeze physical controller polling; OpenScarlett's own ShouldAllowInput() gates
+            // visibility to the guest title according to the guest's SetFocusPolicy().
+            gi->SetFocusPolicy(0x00000040u);
+
+            uint64_t tok = 0ull;
+            (void)gi->RegisterDeviceCallback(
+                nullptr,
+                GameInputKindGamepad,
+                GameInputDeviceConnected,
+                kEnumBlocking,
+                this,
+                &NativeHostGameInputBackend::OnHostDeviceCallback,
+                &tok);
+
+            host_mod_ = host_mod;
+            host_gi_ = gi;
+            cb_token_ = tok;
+        });
+    }
+
+    std::once_flag init_once_;
+    HMODULE host_mod_ = nullptr;
+    IGameInput* host_gi_ = nullptr;
+    uint64_t cb_token_ = 0ull;
+    std::mutex mutex_;
+    std::vector<IGameInputDevice*> connected_devices_;
+    std::unordered_map<IGameInputDevice*, uint64_t> last_dev_ts_;
+    IGameInputDevice* active_device_ = nullptr;
+};
+#endif
 
 bool HasActiveGamepadInput(const OsXInputGamepad& g) noexcept {
     if (g.wButtons != 0u) return true;
@@ -424,9 +732,11 @@ bool PollPhysicalXInputGamepad(
     XInputSlotTracker& tracker,
     uint32_t preferred_slot,
     GameInputGamepadState& out_gamepad,
-    uint32_t& out_active_slot) {
+    uint32_t& out_active_slot,
+    bool* out_fresh_activity = nullptr) {
     out_gamepad = GameInputGamepadState{};
     out_active_slot = preferred_slot;
+    if (out_fresh_activity) *out_fresh_activity = false;
 #if defined(_WIN32)
     const XInputApi& xi = GetXInput();
     if (!xi.get_state) {
@@ -441,6 +751,7 @@ bool PollPhysicalXInputGamepad(
 
     OsXInputState states[4]{};
     bool polled_ok[4]{false, false, false, false};
+    bool slot_pkt_changed[4]{false, false, false, false};
     DWORD last_rc = ERROR_DEVICE_NOT_CONNECTED;
     uint32_t active_input_slot = 4u;
     uint32_t first_connected_slot = 4u;
@@ -471,6 +782,7 @@ bool PollPhysicalXInputGamepad(
                 }
                 const bool pkt_changed =
                     tracker.slot_has_pkt[slot] && (states[slot].dwPacketNumber != tracker.slot_last_pkt[slot]);
+                slot_pkt_changed[slot] = pkt_changed;
                 tracker.slot_last_pkt[slot] = states[slot].dwPacketNumber;
                 tracker.slot_has_pkt[slot] = true;
                 if (active_input_slot >= 4u && (pkt_changed || HasActiveGamepadInput(states[slot].Gamepad))) {
@@ -506,6 +818,68 @@ bool PollPhysicalXInputGamepad(
     if (physical_pad_found) {
         out_active_slot = chosen_slot;
         TranslateXInputToGameInput(states[chosen_slot].Gamepad, out_gamepad);
+        if (out_fresh_activity) {
+            *out_fresh_activity =
+                slot_pkt_changed[chosen_slot] || HasActiveGamepadInput(states[chosen_slot].Gamepad);
+        }
+    }
+    return physical_pad_found;
+#else
+    (void)tracker;
+    (void)preferred_slot;
+    return false;
+#endif
+}
+
+bool PollPhysicalGamepad(
+    XInputSlotTracker& tracker,
+    uint32_t preferred_slot,
+    GameInputGamepadState& out_gamepad,
+    uint32_t& out_active_slot) {
+    out_gamepad = GameInputGamepadState{};
+    out_active_slot = preferred_slot;
+#if defined(_WIN32)
+    GameInputGamepadState native_gp{};
+    bool native_fresh = false;
+    uint64_t native_ts = 0ull;
+    const bool native_found = NativeHostGameInputBackend::Global().PollGamepad(
+        preferred_slot, native_gp, native_fresh, &native_ts);
+
+    GameInputGamepadState xinput_gp{};
+    uint32_t xinput_slot = preferred_slot;
+    bool xinput_fresh = false;
+    const bool xinput_found = PollPhysicalXInputGamepad(
+        tracker, preferred_slot, xinput_gp, xinput_slot, &xinput_fresh);
+
+    bool use_native = false;
+    bool found = false;
+    if (native_found && xinput_found) {
+        found = true;
+        if (native_fresh) {
+            tracker.prefer_native_backend.store(true, std::memory_order_release);
+            use_native = true;
+        } else if (xinput_fresh) {
+            tracker.prefer_native_backend.store(false, std::memory_order_release);
+            use_native = false;
+        } else {
+            use_native = tracker.prefer_native_backend.load(std::memory_order_acquire);
+        }
+    } else if (native_found) {
+        found = true;
+        use_native = true;
+    } else if (xinput_found) {
+        found = true;
+        use_native = false;
+    }
+
+    if (found) {
+        if (use_native) {
+            out_gamepad = native_gp;
+            out_active_slot = preferred_slot;
+        } else {
+            out_gamepad = xinput_gp;
+            out_active_slot = xinput_slot;
+        }
     }
 
     static const std::string s_trace_gi_path = []() {
@@ -515,19 +889,24 @@ bool PollPhysicalXInputGamepad(
     }();
     if (!s_trace_gi_path.empty()) {
         static std::atomic<uint32_t> s_prev_state{0xFFFFFFFFu};
-        const uint32_t packed = (physical_pad_found ? 0x80000000u : 0u) |
-                                ((out_active_slot & 0xFu) << 16) |
-                                (physical_pad_found ? static_cast<uint32_t>(states[chosen_slot].Gamepad.wButtons)
-                                                    : (last_rc & 0xFFFFu));
+        const uint32_t packed = (found ? 0x80000000u : 0u) |
+                                (use_native ? 0x40000000u : 0u) |
+                                (native_found ? 0x20000000u : 0u) |
+                                (xinput_found ? 0x10000000u : 0u) |
+                                ((out_active_slot & 0xFu) << 20) |
+                                (out_gamepad.buttons & 0xFFFFFu);
         if (s_prev_state.exchange(packed, std::memory_order_relaxed) != packed) {
-            char msg[220];
+            char msg[256];
             std::snprintf(msg, sizeof(msg),
-                          "[GameInput] XInput found=%d slot=%u rc=%lu pkt=%u btn=0x%04X lx=%d ly=%d\n",
-                          physical_pad_found ? 1 : 0, out_active_slot, static_cast<unsigned long>(last_rc),
-                          physical_pad_found ? states[chosen_slot].dwPacketNumber : 0u,
-                          physical_pad_found ? states[chosen_slot].Gamepad.wButtons : 0u,
-                          physical_pad_found ? static_cast<int>(states[chosen_slot].Gamepad.sThumbLX) : 0,
-                          physical_pad_found ? static_cast<int>(states[chosen_slot].Gamepad.sThumbLY) : 0);
+                          "[GameInput] Pad found=%d src=%s (native=%d xinput=%d) slot=%u btn=0x%04X "
+                          "lt=%.2f rt=%.2f lx=%.2f ly=%.2f rx=%.2f ry=%.2f\n",
+                          found ? 1 : 0,
+                          !found ? "none" : (use_native ? "native_sys32" : "xinput"),
+                          native_found ? 1 : 0, xinput_found ? 1 : 0,
+                          out_active_slot, out_gamepad.buttons,
+                          out_gamepad.leftTrigger, out_gamepad.rightTrigger,
+                          out_gamepad.leftThumbstickX, out_gamepad.leftThumbstickY,
+                          out_gamepad.rightThumbstickX, out_gamepad.rightThumbstickY);
             ::OutputDebugStringA(msg);
             if (s_trace_gi_path != "1") {
                 FILE* f = nullptr;
@@ -538,7 +917,7 @@ bool PollPhysicalXInputGamepad(
             }
         }
     }
-    return physical_pad_found;
+    return found;
 #else
     (void)tracker;
     (void)preferred_slot;
@@ -779,12 +1158,16 @@ public:
 #if defined(_WIN32)
         if ((info_.supportedRumbleMotors != GameInputRumbleNone) &&
             (status_.load(std::memory_order_acquire) & GameInputDeviceConnected) != 0u) {
-            const XInputApi& xi = GetXInput();
-            if (xi.set_state) {
-                OsXInputVibration vib{};
-                vib.wLeftMotorSpeed = xi_left;
-                vib.wRightMotorSpeed = xi_right;
-                (void)xi.set_state(slot, &vib);  // Safely no-ops if no physical XInput pad is attached
+            // Send true 4-motor Xbox rumble (including impulse triggers) via native host
+            // System32\GameInput.dll when available; fall back to XInput otherwise.
+            if (!NativeHostGameInputBackend::Global().SetRumble(clamped)) {
+                const XInputApi& xi = GetXInput();
+                if (xi.set_state) {
+                    OsXInputVibration vib{};
+                    vib.wLeftMotorSpeed = xi_left;
+                    vib.wRightMotorSpeed = xi_right;
+                    (void)xi.set_state(slot, &vib);  // Safely no-ops if no physical XInput pad is attached
+                }
             }
         }
 #endif
@@ -1256,6 +1639,34 @@ public:
         return QueryTimestampMicros();
     }
 
+    static const std::string& GetTraceGameInputPath() {
+        static const std::string s_path = []() {
+#if defined(_WIN32)
+            char buf[512]{};
+            DWORD n = ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_GAMEINPUT", buf, sizeof(buf));
+            return (n > 0 && n < sizeof(buf)) ? std::string(buf, n) : std::string{};
+#else
+            return std::string{};
+#endif
+        }();
+        return s_path;
+    }
+
+    static void TraceGameInputLine(const char* line) {
+        const auto& p = GetTraceGameInputPath();
+        if (p.empty() || !line) return;
+#if defined(_WIN32)
+        ::OutputDebugStringA(line);
+        if (p != "1") {
+            FILE* f = nullptr;
+            if (::fopen_s(&f, p.c_str(), "a") == 0 && f) {
+                std::fputs(line, f);
+                std::fclose(f);
+            }
+        }
+#endif
+    }
+
     int32_t OPENSCARLETT_GAMEINPUT_CALL GetCurrentReading(
         GameInputKind inputKind,
         IGameInputDevice* device,
@@ -1287,6 +1698,29 @@ public:
             OnFocusGained();
         } else if (!input_allowed && was_allowed) {
             OnFocusLost();
+        }
+
+        if (!GetTraceGameInputPath().empty()) {
+            static std::atomic<uint32_t> s_gcr_logs{0u};
+            const uint32_t n = s_gcr_logs.fetch_add(1u, std::memory_order_relaxed);
+            if (n < 25u || input_allowed != was_allowed) {
+                char msg[256];
+                std::snprintf(
+                    msg, sizeof(msg),
+                    "[GameInput] GCR#%u kind=0x%X dev=%p devSup=0x%X allowed=%d policy=0x%X target=%p fg=%p\n",
+                    n, static_cast<unsigned>(inputKind), static_cast<void*>(target_dev),
+                    target_dev ? target_dev->SupportedInput() : 0u,
+                    input_allowed ? 1 : 0,
+                    focus_policy_.load(std::memory_order_relaxed),
+                    target_hwnd_.load(std::memory_order_relaxed),
+#if defined(_WIN32)
+                    static_cast<void*>(::GetForegroundWindow())
+#else
+                    nullptr
+#endif
+                );
+                TraceGameInputLine(msg);
+            }
         }
 
         const bool want_all = (inputKind == GameInputKindUnknown);
@@ -1351,7 +1785,7 @@ public:
             bool physical_pad_found = false;
             if (want_gamepad && (target_dev->SupportedInput() & GameInputKindGamepad) != 0u) {
                 uint32_t active_slot = target_dev->ActiveSlot();
-                physical_pad_found = PollPhysicalXInputGamepad(
+                physical_pad_found = PollPhysicalGamepad(
                     xinput_tracker_, active_slot, gp, active_slot);
                 if (target_dev == default_device_) {
                     target_dev->SetActiveSlot(active_slot);
@@ -1621,8 +2055,25 @@ public:
         }
 
         // Deliver initial enumeration callbacks outside internal locks
+        if (!GetTraceGameInputPath().empty()) {
+            char msg[220];
+            std::snprintf(
+                msg, sizeof(msg),
+                "[GameInput] RegisterDeviceCallback kind=0x%X status=0x%X enum=%u initial_count=%zu\n",
+                static_cast<unsigned>(inputKind), statusFilter, enumerationKind, initial_devices.size());
+            TraceGameInputLine(msg);
+        }
         const uint64_t ts = QueryTimestampMicros();
         for (auto* d : initial_devices) {
+            if (!GetTraceGameInputPath().empty()) {
+                char msg[220];
+                std::snprintf(
+                    msg, sizeof(msg),
+                    "[GameInput]   EnumDev dev=%p slot=%u sup=0x%X fam=%d status=0x%X\n",
+                    static_cast<void*>(d), d->ActiveSlot(), d->SupportedInput(),
+                    static_cast<int>(d->GetDeviceInfo()->deviceFamily), d->GetDeviceStatus());
+                TraceGameInputLine(msg);
+            }
             bool still_active = false;
             {
                 std::lock_guard<std::mutex> lk(mutex_);
@@ -1992,6 +2443,9 @@ public:
     void OnFocusGained() noexcept {
         xinput_tracker_.force_reprobe.store(true, std::memory_order_release);
         xinput_tracker_.enable_refresh_pending.store(true, std::memory_order_release);
+#if defined(_WIN32)
+        NativeHostGameInputBackend::Global().RefreshFocusPolicy();
+#endif
         std::lock_guard<std::mutex> lk(raw_mouse_mutex_);
         cursor_fallback_valid_ = false;
         abs_mouse_valid_ = false;
@@ -2196,7 +2650,7 @@ private:
 
     bool ShouldAllowInput() const noexcept {
         const uint32_t policy = focus_policy_.load(std::memory_order_acquire);
-        if ((policy & GameInputEnableBackgroundInput) != 0u) {
+        if ((policy & (GameInputEnableBackgroundInput | 0x00000040u)) != 0u) {
             return true;
         }
 #if defined(_WIN32)

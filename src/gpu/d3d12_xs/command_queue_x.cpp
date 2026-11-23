@@ -31,6 +31,7 @@ struct WindowCallbackState {
     std::atomic<bool> in_fullscreen_toggle{false};
     std::atomic<uint64_t> alt_enter_toggle_count{0ull};
     std::atomic<bool> raw_mouse_registered{false};
+    std::atomic<bool> gi_target_hwnd_sent{false};
     std::atomic<bool> cursor_clipped{false};
 
     std::mutex fullscreen_mutex;
@@ -66,24 +67,67 @@ GameInputBridgeCache& GetGameInputBridge() noexcept {
 
 void EnsureGameInputBridgeResolved() noexcept {
     auto& c = GetGameInputBridge();
-    if (c.mod.load(std::memory_order_acquire) != nullptr) {
+    if (c.win_fn.load(std::memory_order_acquire) != nullptr) {
         return;
     }
-    HMODULE m = GetModuleHandleW(L"GameInput.dll");
-    if (!m) {
-        return;
-    }
-    auto rfn = reinterpret_cast<PfnGiBroadcastRawInput>(
-        reinterpret_cast<void*>(GetProcAddress(m, "OpenScarlettGameInputBroadcastRawInput")));
-    auto wfn = reinterpret_cast<PfnGiBroadcastWindowEvent>(
-        reinterpret_cast<void*>(GetProcAddress(m, "OpenScarlettGameInputBroadcastWindowEvent")));
-    if (rfn) {
-        c.raw_fn.store(rfn, std::memory_order_release);
-    }
-    if (wfn) {
+
+    auto try_bind = [&](HMODULE m) noexcept -> bool {
+        if (!m) {
+            return false;
+        }
+        auto wfn = reinterpret_cast<PfnGiBroadcastWindowEvent>(
+            reinterpret_cast<void*>(GetProcAddress(m, "OpenScarlettGameInputBroadcastWindowEvent")));
+        if (!wfn) {
+            return false;
+        }
+        auto rfn = reinterpret_cast<PfnGiBroadcastRawInput>(
+            reinterpret_cast<void*>(GetProcAddress(m, "OpenScarlettGameInputBroadcastRawInput")));
+        if (rfn) {
+            c.raw_fn.store(rfn, std::memory_order_release);
+        }
         c.win_fn.store(wfn, std::memory_order_release);
+        c.mod.store(m, std::memory_order_release);
+        return true;
+    };
+
+    // Prefer our OpenScarlett GameInput.dll shim path explicitly so co-resident
+    // C:\Windows\System32\GameInput.dll (loaded as native host backend) never shadows it.
+    wchar_t shim_dir[MAX_PATH]{};
+    const DWORD slen = GetEnvironmentVariableW(L"OPENSCARLETT_SHIM_DIR", shim_dir, MAX_PATH);
+    if (slen > 0u && slen < MAX_PATH) {
+        std::wstring shim_gi(shim_dir, slen);
+        if (!shim_gi.empty() && shim_gi.back() != L'\\' && shim_gi.back() != L'/') {
+            shim_gi.push_back(L'\\');
+        }
+        shim_gi.append(L"GameInput.dll");
+        if (try_bind(GetModuleHandleW(shim_gi.c_str()))) {
+            return;
+        }
     }
-    c.mod.store(m, std::memory_order_release);
+
+    // Fallback: sibling GameInput.dll next to d3d12_xs.dll.
+    HMODULE self_mod = nullptr;
+    if (GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&EnsureGameInputBridgeResolved),
+            &self_mod) != FALSE &&
+        self_mod != nullptr) {
+        wchar_t self_path[MAX_PATH]{};
+        const DWORD plen = GetModuleFileNameW(self_mod, self_path, MAX_PATH);
+        if (plen > 0u && plen < MAX_PATH) {
+            std::wstring sibling(self_path, plen);
+            const size_t slash = sibling.find_last_of(L"\\/");
+            if (slash != std::wstring::npos) {
+                sibling.resize(slash + 1u);
+                sibling.append(L"GameInput.dll");
+                if (try_bind(GetModuleHandleW(sibling.c_str()))) {
+                    return;
+                }
+            }
+        }
+    }
+
+    (void)try_bind(GetModuleHandleW(L"GameInput.dll"));
 }
 
 void BroadcastRawInputToGameInput(void* h_raw_input) noexcept {
@@ -93,12 +137,13 @@ void BroadcastRawInputToGameInput(void* h_raw_input) noexcept {
     }
 }
 
-void BroadcastWindowEventToGameInput(
+bool BroadcastWindowEventToGameInput(
     HWND hwnd, uint32_t event_kind, int32_t p1 = 0, int32_t p2 = 0) noexcept {
     EnsureGameInputBridgeResolved();
     if (auto fn = GetGameInputBridge().win_fn.load(std::memory_order_acquire)) {
-        (void)fn(reinterpret_cast<void*>(hwnd), event_kind, p1, p2);
+        return fn(reinterpret_cast<void*>(hwnd), event_kind, p1, p2) >= 0;
     }
+    return false;
 }
 
 void TryRegisterRawMouseForWindow(HWND hwnd, WindowCallbackState& state) noexcept {
@@ -2301,7 +2346,10 @@ void CommandQueueX::AttachWindowSubclassLocked(HWND hwnd) {
     reg.map[hwnd].orig_proc = reinterpret_cast<WNDPROC>(prev);
     subclassed_hwnd_ = hwnd;
     TryRegisterRawMouseForWindow(hwnd, *window_state_);
-    BroadcastWindowEventToGameInput(hwnd, kGiWinEventTargetHwnd, 0, 0);
+    if (IsWindowVisible(hwnd) != FALSE &&
+        BroadcastWindowEventToGameInput(hwnd, kGiWinEventTargetHwnd, 0, 0)) {
+        window_state_->gi_target_hwnd_sent.store(true, std::memory_order_release);
+    }
 }
 
 void CommandQueueX::DetachWindowSubclassLocked() {
@@ -3400,11 +3448,16 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
         ((use_swapchain && !window_minimized) || fcap_override) &&
         !immediate_flag && frame_interval_us > 0u;
 
-    // Ensure Raw Input mouse & 3D hidden-cursor confinement stay synced on active retail windows.
+    // Ensure Raw Input mouse, GameInput target HWND, & 3D hidden-cursor confinement stay synced.
     if (do_swapchain_present && target_hwnd && window_state_) {
         if (!window_state_->raw_mouse_registered.load(std::memory_order_acquire)) {
             TryRegisterRawMouseForWindow(target_hwnd, *window_state_);
-            BroadcastWindowEventToGameInput(target_hwnd, kGiWinEventTargetHwnd, 0, 0);
+        }
+        if (!window_state_->gi_target_hwnd_sent.load(std::memory_order_acquire) &&
+            IsWindowVisible(target_hwnd) != FALSE) {
+            if (BroadcastWindowEventToGameInput(target_hwnd, kGiWinEventTargetHwnd, 0, 0)) {
+                window_state_->gi_target_hwnd_sent.store(true, std::memory_order_release);
+            }
         }
         if (async_swapchain_fast_path) {
             const bool focused =

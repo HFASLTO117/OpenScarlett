@@ -1982,6 +1982,15 @@ Status LaunchWithApcHook(const LaunchOptions& options, LaunchResult& out_result)
         return inject_st;
     }
 
+    // Permit the newly spawned guest title window to acquire foreground focus cleanly.
+    if (HMODULE u32 = ::GetModuleHandleW(L"user32.dll")) {
+        using PfnAllowSetForegroundWindow = BOOL(WINAPI*)(DWORD);
+        if (auto pfn_asfw = reinterpret_cast<PfnAllowSetForegroundWindow>(
+                reinterpret_cast<void*>(::GetProcAddress(u32, "AllowSetForegroundWindow")))) {
+            (void)pfn_asfw(pi.dwProcessId);
+        }
+    }
+
     if (::ResumeThread(pi.hThread) == static_cast<DWORD>(-1)) {
         return abort_child(StatusCode::DeviceError, "ResumeThread", ::GetLastError());
     }
