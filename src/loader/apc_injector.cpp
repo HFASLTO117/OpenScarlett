@@ -2,8 +2,11 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
+#include <cstring>
 #include <cwchar>
 #include <filesystem>
+#include <fstream>
 #include <queue>
 #include <string>
 #include <string_view>
@@ -272,8 +275,484 @@ bool IsTargetProcessCompatibleX64(HANDLE h_process, DWORD& out_win32_error) {
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// Static Missing-DLL PE32+ Stub Synthesizer (--probe-unknown-imports)
+// ---------------------------------------------------------------------------
+bool IsProbeUnknownImportsEnvEnabled() {
+    char buf[64]{};
+    const DWORD len = ::GetEnvironmentVariableA(
+        "OPENSCARLETT_PROBE_UNKNOWN_IMPORTS", buf, static_cast<DWORD>(sizeof(buf)));
+    if (len == 0 || len >= sizeof(buf)) {
+        return false;
+    }
+    std::string val(buf, len);
+    size_t b = 0;
+    while (b < val.size() && std::isspace(static_cast<unsigned char>(val[b])) != 0) ++b;
+    size_t e = val.size();
+    while (e > b && std::isspace(static_cast<unsigned char>(val[e - 1])) != 0) --e;
+    val = val.substr(b, e - b);
+    for (char& c : val) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+    return val == "1" || val == "true" || val == "yes" || val == "on";
+}
+
+bool IsOnSystemDriveCW(std::wstring_view path) noexcept {
+    return path.size() >= 2u &&
+           (path[0] == L'C' || path[0] == L'c') &&
+           path[1] == L':';
+}
+
+std::wstring GetProbeStubSessionDirW(std::wstring_view shim_dir_w, DWORD child_pid) {
+    std::wstring base_root;
+
+    // Prefer TEMP when it is NOT on C:\ (e.g. build_wt.cmd / build.cmd sets TEMP on E:\).
+    wchar_t temp_buf[MAX_PATH * 2]{};
+    const DWORD temp_len = ::GetTempPathW(
+        static_cast<DWORD>(sizeof(temp_buf) / sizeof(temp_buf[0])), temp_buf);
+    std::wstring temp_path;
+    if (temp_len > 0 && temp_len < sizeof(temp_buf) / sizeof(temp_buf[0])) {
+        temp_path.assign(temp_buf, temp_len);
+    }
+
+    if (!temp_path.empty() && !IsOnSystemDriveCW(temp_path)) {
+        base_root = (std::filesystem::path(temp_path) / L"openscarlett_probe_stubs").wstring();
+    } else if (!shim_dir_w.empty()) {
+        base_root = (std::filesystem::path(shim_dir_w) / L".probe_stubs").wstring();
+    } else if (!temp_path.empty()) {
+        base_root = (std::filesystem::path(temp_path) / L"openscarlett_probe_stubs").wstring();
+    }
+
+    if (base_root.empty()) {
+        return {};
+    }
+    const std::wstring pid_folder = L"pid_" + std::to_wstring(static_cast<unsigned long>(child_pid));
+    return (std::filesystem::path(base_root) / pid_folder).wstring();
+}
+
+std::string ExtractDllBasenameAscii(std::string_view raw) {
+    size_t b = 0;
+    while (b < raw.size() && std::isspace(static_cast<unsigned char>(raw[b])) != 0) ++b;
+    size_t e = raw.size();
+    while (e > b && std::isspace(static_cast<unsigned char>(raw[e - 1])) != 0) --e;
+    std::string_view trimmed = raw.substr(b, e - b);
+    const size_t slash = trimmed.find_last_of("\\/");
+    if (slash != std::string_view::npos) {
+        trimmed = trimmed.substr(slash + 1u);
+    }
+    return std::string(trimmed);
+}
+
+std::string ToLowerAsciiLocal(std::string_view s) {
+    std::string out(s);
+    for (char& c : out) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+    return out;
+}
+
+bool IsApiSetContractAscii(std::string_view basename_lower) noexcept {
+    return basename_lower.rfind("api-ms-", 0) == 0 || basename_lower.rfind("ext-ms-", 0) == 0;
+}
+
+bool DllExistsInDirectoryW(std::wstring_view dir_w, const std::wstring& filename_w) {
+    if (dir_w.empty() || filename_w.empty()) {
+        return false;
+    }
+    const std::filesystem::path full = std::filesystem::path(dir_w) / filename_w;
+    return FileExistsW(full.wstring());
+}
+
+std::wstring QueryProcessExeDirW(HANDLE h_process) {
+    wchar_t buf[MAX_PATH * 2]{};
+    DWORD sz = static_cast<DWORD>(sizeof(buf) / sizeof(buf[0]));
+    if (!::QueryFullProcessImageNameW(h_process, 0, buf, &sz) || sz == 0) {
+        return {};
+    }
+    return std::filesystem::path(std::wstring(buf, sz)).parent_path().wstring();
+}
+
+bool IsDllResolvableOnHost(std::string_view dll_name,
+                           std::wstring_view shim_dir_w,
+                           std::wstring_view guest_dir_w,
+                           std::wstring_view exe_dir_w) {
+    const std::string base = ExtractDllBasenameAscii(dll_name);
+    if (base.empty()) {
+        return true;
+    }
+    const std::string base_lo = ToLowerAsciiLocal(base);
+    if (IsApiSetContractAscii(base_lo) || IsWindowsKnownDll(base_lo)) {
+        return true;
+    }
+
+    const std::wstring base_w = Utf8ToWide(base);
+    if (DllExistsInDirectoryW(shim_dir_w, base_w) ||
+        DllExistsInDirectoryW(guest_dir_w, base_w) ||
+        DllExistsInDirectoryW(exe_dir_w, base_w)) {
+        return true;
+    }
+
+    wchar_t sys_dir[MAX_PATH]{};
+    const UINT sys_len = ::GetSystemDirectoryW(sys_dir, MAX_PATH);
+    if (sys_len > 0 && sys_len < MAX_PATH) {
+        if (DllExistsInDirectoryW(std::wstring_view(sys_dir, sys_len), base_w)) {
+            return true;
+        }
+    }
+
+    wchar_t win_dir[MAX_PATH]{};
+    const UINT win_len = ::GetWindowsDirectoryW(win_dir, MAX_PATH);
+    if (win_len > 0 && win_len < MAX_PATH) {
+        if (DllExistsInDirectoryW(std::wstring_view(win_dir, win_len), base_w)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+uint32_t AlignUpU32(uint32_t val, uint32_t align) noexcept {
+    return (val + align - 1u) & ~(align - 1u);
+}
+
+// Synthesizes a minimal, self-contained, spec-compliant PE32+ (x86-64) stub DLL
+// exporting every requested named and ordinal symbol as an E_NOTIMPL (0x80004001) trampoline
+// with a minimal DllMain returning TRUE (1).
+bool SynthesizeStaticStubDllPE64(const std::wstring& output_path_w,
+                                 const std::string& internal_dll_name,
+                                 const std::vector<std::string>& raw_named_imports,
+                                 const std::vector<uint16_t>& raw_ordinal_imports) {
+    // 1. Deduplicate and sort named imports in strict ascending ASCII byte order
+    //    (required by Windows ntdll LdrpNameToOrdinal binary search!).
+    std::vector<std::string> named = raw_named_imports;
+    std::sort(named.begin(), named.end(), [](const std::string& a, const std::string& b) {
+        const size_t n = std::min(a.size(), b.size());
+        for (size_t i = 0; i < n; ++i) {
+            const unsigned char ca = static_cast<unsigned char>(a[i]);
+            const unsigned char cb = static_cast<unsigned char>(b[i]);
+            if (ca != cb) return ca < cb;
+        }
+        return a.size() < b.size();
+    });
+    named.erase(std::unique(named.begin(), named.end()), named.end());
+
+    // 2. Deduplicate and sort ordinal imports.
+    std::vector<uint16_t> ordinals = raw_ordinal_imports;
+    std::sort(ordinals.begin(), ordinals.end());
+    ordinals.erase(std::unique(ordinals.begin(), ordinals.end()), ordinals.end());
+
+    // 3. Assign EAT (AddressOfFunctions) slots and ordinal Base.
+    const uint32_t ordinal_base = ordinals.empty() ? 1u : static_cast<uint32_t>(ordinals.front());
+    uint32_t eat_count = ordinals.empty()
+                             ? 0u
+                             : static_cast<uint32_t>(ordinals.back() - ordinals.front()) + 1u;
+
+    // Reserve slots for ordinal imports first, then place named imports in free slots
+    // (keeping every AddressOfNameOrdinals entry strictly within uint16_t range).
+    std::vector<uint32_t> eat_rvas(eat_count, 0u);
+    std::vector<uint8_t> slot_used(eat_count, 0u);
+
+    constexpr uint32_t kTextVAddr = 0x1000u;
+    constexpr uint32_t kTrampolineBaseOff = 0x10u;  // 0x00..0x0F holds DllMain
+    constexpr uint32_t kTrampolineStride = 8u;
+    uint32_t next_trampoline_idx = 0u;
+
+    for (uint16_t ord : ordinals) {
+        const uint32_t slot = static_cast<uint32_t>(ord) - ordinal_base;
+        if (slot < eat_rvas.size()) {
+            eat_rvas[slot] = kTextVAddr + kTrampolineBaseOff + next_trampoline_idx * kTrampolineStride;
+            slot_used[slot] = 1u;
+            ++next_trampoline_idx;
+        }
+    }
+
+    std::vector<uint16_t> name_ordinals;
+    name_ordinals.reserve(named.size());
+    uint32_t free_scan = 0u;
+    for (size_t i = 0; i < named.size(); ++i) {
+        while (free_scan < slot_used.size() && slot_used[free_scan] != 0u) {
+            ++free_scan;
+        }
+        uint32_t chosen_slot = free_scan;
+        if (chosen_slot >= eat_rvas.size()) {
+            chosen_slot = static_cast<uint32_t>(eat_rvas.size());
+            if (chosen_slot > 0xFFFFu) {
+                return false;
+            }
+            eat_rvas.push_back(0u);
+            slot_used.push_back(0u);
+        }
+        eat_rvas[chosen_slot] = kTextVAddr + kTrampolineBaseOff + next_trampoline_idx * kTrampolineStride;
+        slot_used[chosen_slot] = 1u;
+        name_ordinals.push_back(static_cast<uint16_t>(chosen_slot));
+        ++next_trampoline_idx;
+        ++free_scan;
+    }
+
+    // 4. Build .text section bytes:
+    //    - 0x00: DllMain -> mov eax, 1; ret
+    //    - 0x10 + i*8: E_NOTIMPL trampoline -> mov eax, 0x80004001; ret
+    constexpr uint32_t kFileAlign = 0x200u;
+    constexpr uint32_t kSectAlign = 0x1000u;
+    constexpr uint32_t kSizeOfHeaders = 0x200u;
+
+    const uint32_t text_vsize = kTrampolineBaseOff + next_trampoline_idx * kTrampolineStride;
+    const uint32_t text_raw_size = AlignUpU32(std::max<uint32_t>(text_vsize, 0x10u), kFileAlign);
+    std::vector<uint8_t> text_sec(text_raw_size, 0xCCu);
+
+    // DllMain: mov eax, 1; ret
+    static constexpr uint8_t kDllMainCode[6] = {0xB8, 0x01, 0x00, 0x00, 0x00, 0xC3};
+    std::memcpy(text_sec.data(), kDllMainCode, sizeof(kDllMainCode));
+
+    // Export trampolines: mov eax, 0x80004001 (E_NOTIMPL); ret
+    static constexpr uint8_t kNotImplCode[6] = {0xB8, 0x01, 0x40, 0x00, 0x80, 0xC3};
+    for (uint32_t i = 0; i < next_trampoline_idx; ++i) {
+        std::memcpy(text_sec.data() + kTrampolineBaseOff + i * kTrampolineStride,
+                    kNotImplCode, sizeof(kNotImplCode));
+    }
+
+    // 5. Build .edata section bytes (IMAGE_EXPORT_DIRECTORY + EAT + NamePtrs + NameOrds + strings).
+    const uint32_t edata_vaddr = kTextVAddr + AlignUpU32(std::max<uint32_t>(text_vsize, 0x10u), kSectAlign);
+
+    std::vector<uint8_t> edata_buf;
+    edata_buf.reserve(512u + eat_rvas.size() * 4u + named.size() * 32u);
+
+    auto append_zeros = [&](size_t count) {
+        edata_buf.insert(edata_buf.end(), count, 0u);
+    };
+    auto append_u32 = [&](uint32_t v) {
+        const size_t pos = edata_buf.size();
+        edata_buf.resize(pos + 4u);
+        std::memcpy(edata_buf.data() + pos, &v, 4u);
+    };
+    auto append_u16 = [&](uint16_t v) {
+        const size_t pos = edata_buf.size();
+        edata_buf.resize(pos + 2u);
+        std::memcpy(edata_buf.data() + pos, &v, 2u);
+    };
+    auto align_buf = [&](size_t a) {
+        const size_t rem = edata_buf.size() % a;
+        if (rem != 0u) {
+            append_zeros(a - rem);
+        }
+    };
+    auto append_cstr = [&](const std::string& s) -> uint32_t {
+        const uint32_t rva = edata_vaddr + static_cast<uint32_t>(edata_buf.size());
+        edata_buf.insert(edata_buf.end(), s.begin(), s.end());
+        edata_buf.push_back(0u);
+        return rva;
+    };
+
+    // Reserve 40-byte IMAGE_EXPORT_DIRECTORY at offset 0 of .edata.
+    append_zeros(sizeof(IMAGE_EXPORT_DIRECTORY));
+
+    // AddressOfFunctions (uint32_t[NumberOfFunctions])
+    align_buf(4u);
+    const uint32_t eat_rva = eat_rvas.empty()
+                                 ? 0u
+                                 : (edata_vaddr + static_cast<uint32_t>(edata_buf.size()));
+    for (uint32_t fn_rva : eat_rvas) {
+        append_u32(fn_rva);
+    }
+
+    // AddressOfNames (uint32_t[NumberOfNames]) - backfilled once strings are appended
+    align_buf(4u);
+    const size_t name_ptrs_off = edata_buf.size();
+    const uint32_t name_ptrs_rva = named.empty()
+                                       ? 0u
+                                       : (edata_vaddr + static_cast<uint32_t>(name_ptrs_off));
+    append_zeros(named.size() * 4u);
+
+    // AddressOfNameOrdinals (uint16_t[NumberOfNames])
+    align_buf(2u);
+    const uint32_t name_ords_rva = named.empty()
+                                       ? 0u
+                                       : (edata_vaddr + static_cast<uint32_t>(edata_buf.size()));
+    for (uint16_t ord_idx : name_ordinals) {
+        append_u16(ord_idx);
+    }
+
+    // DLL name string & export name strings
+    const std::string dll_label = internal_dll_name.empty() ? "probe_stub.dll" : internal_dll_name;
+    const uint32_t dll_name_rva = append_cstr(dll_label);
+    for (size_t i = 0; i < named.size(); ++i) {
+        const uint32_t sym_rva = append_cstr(named[i]);
+        std::memcpy(edata_buf.data() + name_ptrs_off + i * 4u, &sym_rva, 4u);
+    }
+
+    IMAGE_EXPORT_DIRECTORY exp_dir{};
+    exp_dir.Characteristics = 0u;
+    exp_dir.TimeDateStamp = 0x65000000u;
+    exp_dir.MajorVersion = 0u;
+    exp_dir.MinorVersion = 0u;
+    exp_dir.Name = dll_name_rva;
+    exp_dir.Base = ordinal_base;
+    exp_dir.NumberOfFunctions = static_cast<DWORD>(eat_rvas.size());
+    exp_dir.NumberOfNames = static_cast<DWORD>(named.size());
+    exp_dir.AddressOfFunctions = eat_rva;
+    exp_dir.AddressOfNames = name_ptrs_rva;
+    exp_dir.AddressOfNameOrdinals = name_ords_rva;
+    std::memcpy(edata_buf.data(), &exp_dir, sizeof(exp_dir));
+
+    const uint32_t edata_vsize = static_cast<uint32_t>(edata_buf.size());
+    const uint32_t edata_raw_size = AlignUpU32(edata_vsize, kFileAlign);
+    edata_buf.resize(edata_raw_size, 0u);
+
+    // 6. Assemble complete PE32+ headers + sections.
+    const uint32_t size_of_image = edata_vaddr + AlignUpU32(edata_vsize, kSectAlign);
+    const uint32_t total_file_size = kSizeOfHeaders + text_raw_size + edata_raw_size;
+    std::vector<uint8_t> image(total_file_size, 0u);
+
+    IMAGE_DOS_HEADER dos{};
+    dos.e_magic = IMAGE_DOS_SIGNATURE;
+    dos.e_lfanew = 0x40;
+    std::memcpy(image.data(), &dos, sizeof(dos));
+
+    IMAGE_NT_HEADERS64 nt{};
+    nt.Signature = IMAGE_NT_SIGNATURE;
+    nt.FileHeader.Machine = IMAGE_FILE_MACHINE_AMD64;
+    nt.FileHeader.NumberOfSections = 2u;
+    nt.FileHeader.TimeDateStamp = 0x65000000u;
+    nt.FileHeader.SizeOfOptionalHeader = sizeof(IMAGE_OPTIONAL_HEADER64);
+    nt.FileHeader.Characteristics =
+        IMAGE_FILE_EXECUTABLE_IMAGE | IMAGE_FILE_LARGE_ADDRESS_AWARE | IMAGE_FILE_DLL;
+
+    nt.OptionalHeader.Magic = IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+    nt.OptionalHeader.MajorLinkerVersion = 14u;
+    nt.OptionalHeader.MinorLinkerVersion = 0u;
+    nt.OptionalHeader.SizeOfCode = text_raw_size;
+    nt.OptionalHeader.SizeOfInitializedData = edata_raw_size;
+    nt.OptionalHeader.AddressOfEntryPoint = kTextVAddr;
+    nt.OptionalHeader.BaseOfCode = kTextVAddr;
+    nt.OptionalHeader.ImageBase = 0x0000000180000000ull;
+    nt.OptionalHeader.SectionAlignment = kSectAlign;
+    nt.OptionalHeader.FileAlignment = kFileAlign;
+    nt.OptionalHeader.MajorOperatingSystemVersion = 6u;
+    nt.OptionalHeader.MinorOperatingSystemVersion = 0u;
+    nt.OptionalHeader.MajorSubsystemVersion = 6u;
+    nt.OptionalHeader.MinorSubsystemVersion = 0u;
+    nt.OptionalHeader.SizeOfImage = size_of_image;
+    nt.OptionalHeader.SizeOfHeaders = kSizeOfHeaders;
+    nt.OptionalHeader.Subsystem = IMAGE_SUBSYSTEM_WINDOWS_CUI;
+    nt.OptionalHeader.DllCharacteristics =
+        IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA |
+        IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE |
+        IMAGE_DLLCHARACTERISTICS_NX_COMPAT;
+    nt.OptionalHeader.SizeOfStackReserve = 0x100000ull;
+    nt.OptionalHeader.SizeOfStackCommit = 0x1000ull;
+    nt.OptionalHeader.SizeOfHeapReserve = 0x100000ull;
+    nt.OptionalHeader.SizeOfHeapCommit = 0x1000ull;
+    nt.OptionalHeader.NumberOfRvaAndSizes = IMAGE_NUMBEROF_DIRECTORY_ENTRIES;
+    nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress = edata_vaddr;
+    nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size = edata_vsize;
+
+    const size_t nt_off = static_cast<size_t>(dos.e_lfanew);
+    std::memcpy(image.data() + nt_off, &nt, sizeof(nt));
+
+    IMAGE_SECTION_HEADER sec_text{};
+    std::memcpy(sec_text.Name, ".text", 5u);
+    sec_text.Misc.VirtualSize = text_vsize;
+    sec_text.VirtualAddress = kTextVAddr;
+    sec_text.SizeOfRawData = text_raw_size;
+    sec_text.PointerToRawData = kSizeOfHeaders;
+    sec_text.Characteristics = IMAGE_SCN_CNT_CODE | IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ;
+
+    IMAGE_SECTION_HEADER sec_edata{};
+    std::memcpy(sec_edata.Name, ".edata", 6u);
+    sec_edata.Misc.VirtualSize = edata_vsize;
+    sec_edata.VirtualAddress = edata_vaddr;
+    sec_edata.SizeOfRawData = edata_raw_size;
+    sec_edata.PointerToRawData = kSizeOfHeaders + text_raw_size;
+    sec_edata.Characteristics = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ;
+
+    const size_t sec_off = nt_off + sizeof(IMAGE_NT_HEADERS64);
+    std::memcpy(image.data() + sec_off, &sec_text, sizeof(sec_text));
+    std::memcpy(image.data() + sec_off + sizeof(IMAGE_SECTION_HEADER), &sec_edata, sizeof(sec_edata));
+
+    std::memcpy(image.data() + kSizeOfHeaders, text_sec.data(), text_sec.size());
+    std::memcpy(image.data() + kSizeOfHeaders + text_raw_size, edata_buf.data(), edata_buf.size());
+
+    // 7. Write PE32+ stub DLL to disk.
+    const std::filesystem::path out_p(output_path_w);
+    if (!out_p.parent_path().empty()) {
+        EnsureDirectoryTreeW(out_p.parent_path().wstring());
+    }
+    std::ofstream ofs(out_p, std::ios::binary | std::ios::trunc);
+    if (!ofs) {
+        return false;
+    }
+    ofs.write(reinterpret_cast<const char*>(image.data()), static_cast<std::streamsize>(image.size()));
+    return ofs.good();
+}
+
+void CollectRemoteDescriptorImports(HANDLE h_process,
+                                    uintptr_t image_base,
+                                    uint32_t image_size,
+                                    const IMAGE_IMPORT_DESCRIPTOR& desc,
+                                    std::vector<std::string>& out_named,
+                                    std::vector<uint16_t>& out_ordinals) {
+    const uint32_t thunk_rva =
+        (desc.OriginalFirstThunk != 0u && desc.OriginalFirstThunk < image_size)
+            ? desc.OriginalFirstThunk
+            : desc.FirstThunk;
+    if (thunk_rva == 0u || thunk_rva >= image_size) {
+        return;
+    }
+
+    const size_t max_entries =
+        std::min<size_t>(65536u, (static_cast<size_t>(image_size) - thunk_rva) / sizeof(uint64_t));
+    constexpr size_t kChunk = 128u;
+    uint64_t chunk_buf[kChunk]{};
+
+    for (size_t base_idx = 0; base_idx < max_entries; base_idx += kChunk) {
+        const size_t count = std::min<size_t>(kChunk, max_entries - base_idx);
+        SIZE_T rw = 0;
+        if (!::ReadProcessMemory(
+                h_process,
+                reinterpret_cast<LPCVOID>(image_base + thunk_rva + base_idx * sizeof(uint64_t)),
+                chunk_buf,
+                count * sizeof(uint64_t),
+                &rw) ||
+            rw < sizeof(uint64_t)) {
+            break;
+        }
+        const size_t read_entries = rw / sizeof(uint64_t);
+        for (size_t i = 0; i < read_entries; ++i) {
+            const uint64_t entry = chunk_buf[i];
+            if (entry == 0ull) {
+                return;
+            }
+            if ((entry & IMAGE_ORDINAL_FLAG64) != 0ull) {
+                out_ordinals.push_back(static_cast<uint16_t>(entry & 0xFFFFull));
+            } else if (entry + 2ull < static_cast<uint64_t>(image_size)) {
+                char sym_buf[512]{};
+                const size_t sym_rva = static_cast<size_t>(entry) + 2u;  // skip 2-byte Hint
+                const size_t max_sym = std::min<size_t>(sizeof(sym_buf) - 1u, image_size - sym_rva);
+                SIZE_T sym_rw = 0;
+                if (::ReadProcessMemory(h_process,
+                                        reinterpret_cast<LPCVOID>(image_base + sym_rva),
+                                        sym_buf,
+                                        max_sym,
+                                        &sym_rw) &&
+                    sym_rw > 0) {
+                    sym_buf[sym_rw] = '\0';
+                    if (sym_buf[0] != '\0') {
+                        out_named.emplace_back(sym_buf);
+                    }
+                }
+            }
+        }
+        if (read_entries < count) {
+            break;
+        }
+    }
+}
+
 // Redirect static PE imports of routed DLLs in the suspended child process BEFORE
 // LdrInitializeThunk runs using OpenScarlett's unified data-driven DllRoutingTable.
+// When OPENSCARLETT_PROBE_UNKNOWN_IMPORTS=1 (--probe-unknown-imports) is active,
+// also synthesizes spec-compliant PE32+ E_NOTIMPL stub DLLs for any missing non-Windows
+// static DLL imports so ntdll never aborts with STATUS_DLL_NOT_FOUND (0xC0000135).
 bool RedirectChildStaticXboxImports(HANDLE h_process,
                                     const std::wstring& shim_dir_w,
                                     const std::wstring& guest_dir_w) {
@@ -331,6 +810,8 @@ bool RedirectChildStaticXboxImports(HANDLE h_process,
     }
 
     const DllRoutingTable routing = DllRoutingTable::CreateWithEnvOverrides();
+    const bool probe_unknown_imports = IsProbeUnknownImportsEnvEnabled();
+    const std::wstring exe_dir_w = probe_unknown_imports ? QueryProcessExeDirW(h_process) : std::wstring{};
 
     std::vector<IMAGE_IMPORT_DESCRIPTOR> descs;
     std::vector<std::string> imported_names;
@@ -367,32 +848,120 @@ bool RedirectChildStaticXboxImports(HANDLE h_process,
         descs.push_back(d);
     }
 
-    std::vector<std::string> full_paths;
-    std::vector<int> priorities;
-    full_paths.reserve(descs.size());
-    priorities.reserve(descs.size());
+    std::vector<std::string> full_paths(descs.size());
+    std::vector<int> priorities(descs.size(), 10);
     bool any_redirected = false;
+
+    struct MissingDllGroup {
+        std::string display_name;
+        std::vector<size_t> desc_indices;
+        std::vector<std::string> named_imports;
+        std::vector<uint16_t> ordinal_imports;
+    };
+    std::unordered_map<std::string, size_t> missing_key_to_group;
+    std::vector<MissingDllGroup> missing_groups;
 
     for (size_t idx = 0; idx < descs.size(); ++idx) {
         const std::string& dll_name = imported_names[idx];
-        if (!dll_name.empty()) {
-            const DllRouteDecision decision =
-                routing.ResolveRoute(dll_name, shim_dir_w, guest_dir_w, has_console_exclusive_import);
-            const bool should_rewrite =
-                !decision.resolved_path.empty() &&
-                (decision.policy == DllRoutePolicy::Shim ||
-                 (decision.policy == DllRoutePolicy::NativeGuestDll && decision.from_override));
-            if (should_rewrite) {
-                full_paths.push_back(WideToUtf8(decision.resolved_path));
-                priorities.push_back(decision.load_priority);
-                any_redirected = true;
-            } else {
-                full_paths.emplace_back();
-                priorities.push_back(10);
+        if (dll_name.empty()) {
+            continue;
+        }
+
+        const DllRouteDecision decision =
+            routing.ResolveRoute(dll_name, shim_dir_w, guest_dir_w, has_console_exclusive_import);
+        const bool should_rewrite =
+            !decision.resolved_path.empty() &&
+            (decision.policy == DllRoutePolicy::Shim ||
+             (decision.policy == DllRoutePolicy::NativeGuestDll && decision.from_override));
+        if (should_rewrite) {
+            full_paths[idx] = WideToUtf8(decision.resolved_path);
+            priorities[idx] = decision.load_priority;
+            any_redirected = true;
+            continue;
+        }
+
+        // Probe-mode static missing-DLL synthesis: catch any unresolved non-Windows static DLL
+        // before ntdll aborts startup with STATUS_DLL_NOT_FOUND (0xC0000135).
+        if (probe_unknown_imports &&
+            !IsDllResolvableOnHost(dll_name, shim_dir_w, guest_dir_w, exe_dir_w)) {
+            const std::string base = ExtractDllBasenameAscii(dll_name);
+            const std::string key = ToLowerAsciiLocal(base);
+            auto it = missing_key_to_group.find(key);
+            if (it == missing_key_to_group.end()) {
+                const size_t g_idx = missing_groups.size();
+                missing_key_to_group.emplace(key, g_idx);
+                MissingDllGroup grp{};
+                grp.display_name = base;
+                missing_groups.push_back(std::move(grp));
+                it = missing_key_to_group.find(key);
             }
-        } else {
-            full_paths.emplace_back();
-            priorities.push_back(10);
+            MissingDllGroup& grp = missing_groups[it->second];
+            grp.desc_indices.push_back(idx);
+            CollectRemoteDescriptorImports(
+                h_process, image_base, image_size, descs[idx],
+                grp.named_imports, grp.ordinal_imports);
+        }
+    }
+
+    if (probe_unknown_imports && !missing_groups.empty()) {
+        const DWORD child_pid = ::GetProcessId(h_process);
+        const std::wstring session_dir_w = GetProbeStubSessionDirW(shim_dir_w, child_pid);
+        if (!session_dir_w.empty()) {
+            EnsureDirectoryTreeW(session_dir_w);
+            for (const auto& grp : missing_groups) {
+                std::string safe_file = SanitizeFolderSegment(grp.display_name);
+                if (safe_file.empty()) {
+                    safe_file = "probe_stub.dll";
+                }
+                const std::string safe_lo = ToLowerAsciiLocal(safe_file);
+                if (safe_lo.size() < 4u || safe_lo.compare(safe_lo.size() - 4u, 4u, ".dll") != 0) {
+                    safe_file.append(".dll");
+                }
+                const std::wstring stub_path_w =
+                    (std::filesystem::path(session_dir_w) / Utf8ToWide(safe_file)).wstring();
+
+                if (SynthesizeStaticStubDllPE64(
+                        stub_path_w, grp.display_name, grp.named_imports, grp.ordinal_imports)) {
+                    const std::string stub_path_u8 = WideToUtf8(stub_path_w);
+                    for (size_t d_idx : grp.desc_indices) {
+                        full_paths[d_idx] = stub_path_u8;
+                        priorities[d_idx] = 8;
+                    }
+                    any_redirected = true;
+
+                    CallTelemetry::Global().Record(
+                        "probe_stub",
+                        grp.display_name,
+                        CallOutcome::NotImplemented,
+                        static_cast<int32_t>(0x80004001u),
+                        -1);
+                    for (const auto& sym : grp.named_imports) {
+                        CallTelemetry::Global().Record(
+                            grp.display_name,
+                            sym,
+                            CallOutcome::NotImplemented,
+                            static_cast<int32_t>(0x80004001u),
+                            -1);
+                    }
+                    for (uint16_t ord : grp.ordinal_imports) {
+                        CallTelemetry::Global().Record(
+                            grp.display_name,
+                            "#" + std::to_string(ord),
+                            CallOutcome::NotImplemented,
+                            static_cast<int32_t>(0x80004001u),
+                            -1);
+                    }
+
+                    std::printf(
+                        "[OpenScarlett Probe] Synthesized static E_NOTIMPL stub DLL for missing import '%s' "
+                        "(%zu named, %zu ordinal) -> %s\n",
+                        grp.display_name.c_str(),
+                        grp.named_imports.size(),
+                        grp.ordinal_imports.size(),
+                        stub_path_u8.c_str());
+                    std::fflush(stdout);
+                }
+            }
         }
     }
 
@@ -1256,11 +1825,23 @@ Status LaunchWithApcHook(const LaunchOptions& options, LaunchResult& out_result)
 
     out_result.process_id = static_cast<uint32_t>(pi.dwProcessId);
 
+    auto cleanup_probe_stubs = [&]() {
+        if (!IsProbeUnknownImportsEnvEnabled()) {
+            return;
+        }
+        const std::wstring session_dir_w = GetProbeStubSessionDirW(shim_dir_w, pi.dwProcessId);
+        if (!session_dir_w.empty()) {
+            std::error_code ec;
+            std::filesystem::remove_all(std::filesystem::path(session_dir_w), ec);
+        }
+    };
+
     auto abort_child = [&](StatusCode code, const char* step, DWORD err) -> Status {
         ::TerminateProcess(pi.hProcess, 1);
         ::WaitForSingleObject(pi.hProcess, 2000);
         ::CloseHandle(pi.hThread);
         ::CloseHandle(pi.hProcess);
+        cleanup_probe_stubs();
         return Status::Error(code, FormatWin32Error(step, err));
     };
 
@@ -1272,6 +1853,7 @@ Status LaunchWithApcHook(const LaunchOptions& options, LaunchResult& out_result)
         ::WaitForSingleObject(pi.hProcess, 2000);
         ::CloseHandle(pi.hThread);
         ::CloseHandle(pi.hProcess);
+        cleanup_probe_stubs();
         return inject_st;
     }
 
@@ -1288,6 +1870,7 @@ Status LaunchWithApcHook(const LaunchOptions& options, LaunchResult& out_result)
         ::WaitForSingleObject(pi.hProcess, 3000);
         ::CloseHandle(pi.hThread);
         ::CloseHandle(pi.hProcess);
+        cleanup_probe_stubs();
         return Status::Error(StatusCode::DeviceError,
                              "Guest process timed out after " + std::to_string(options.timeout_ms) + " ms");
     }
@@ -1295,6 +1878,7 @@ Status LaunchWithApcHook(const LaunchOptions& options, LaunchResult& out_result)
         DWORD err = ::GetLastError();
         ::CloseHandle(pi.hThread);
         ::CloseHandle(pi.hProcess);
+        cleanup_probe_stubs();
         return Status::Error(StatusCode::DeviceError, FormatWin32Error("WaitForSingleObject", err));
     }
 
@@ -1303,12 +1887,14 @@ Status LaunchWithApcHook(const LaunchOptions& options, LaunchResult& out_result)
         DWORD err = ::GetLastError();
         ::CloseHandle(pi.hThread);
         ::CloseHandle(pi.hProcess);
+        cleanup_probe_stubs();
         return Status::Error(StatusCode::DeviceError, FormatWin32Error("GetExitCodeProcess", err));
     }
 
     out_result.exit_code = static_cast<uint32_t>(exit_code);
     ::CloseHandle(pi.hThread);
     ::CloseHandle(pi.hProcess);
+    cleanup_probe_stubs();
     return Status::Ok();
 #endif
 }
