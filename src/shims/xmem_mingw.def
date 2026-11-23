@@ -7,6 +7,8 @@ EXPORTS
     XMemFreeDefault = XMemShim_XMemFreeDefault
     XMemSize = XMemShim_XMemSize
     XMemSizeDefault = XMemShim_XMemSizeDefault
+    XMemSetAllocationHooks = XMemShim_XMemSetAllocationHooks
+    XMemCheckDefaultHeaps = XMemShim_XMemCheckDefaultHeaps
     XMemGetAuxiliaryTitleMemory = XMemShim_XMemGetAuxiliaryTitleMemory
     XMemReleaseAuxiliaryTitleMemory = XMemShim_XMemReleaseAuxiliaryTitleMemory
     XMemVirtualQuery = XMemShim_XMemVirtualQuery

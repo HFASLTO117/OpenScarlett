@@ -170,6 +170,11 @@ foreach(_os_module_cmake
     cmake/s15_w2_shaders.cmake
     cmake/s15_w3_graphics.cmake
     cmake/s15_w4_shims.cmake
+    cmake/ue5_dxc_xcrdapi_xg.cmake
+    cmake/ue5_d3d12_exports.cmake
+    cmake/ue5_acphal_xmem_mfplat.cmake
+    cmake/ue5_loader_probe.cmake
+    cmake/ue5_matrix_integration.cmake
     cmake/build_speedups.cmake
 )
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_os_module_cmake}")
