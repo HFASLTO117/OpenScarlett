@@ -1197,7 +1197,7 @@ bool ComputeTexture3DLayoutEx(
         out_summary->packed_mip_tail_start_level = out_layout.MipTailStartLevel;
         out_summary->packed_mip_count = packed_mip_count;
         out_summary->unpacked_mip_count = unpacked_mip_count;
-        out_summary->base_alignment_bytes = out_layout.BaseAlignmentBytes;
+        out_summary->base_alignment_bytes = static_cast<uint32_t>(out_layout.BaseAlignmentBytes);
         out_summary->mip_tail_offset_bytes = out_layout.MipTailOffsetBytes;
         out_summary->mip_tail_size_bytes =
             (packed_mip_count > 0u) ? out_layout.MipTailSlicePitchBytes : 0ull;
