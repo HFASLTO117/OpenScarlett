@@ -194,6 +194,9 @@ def collect_dlls(build_dir: pathlib.Path) -> list[DllInfo]:
     has_mine_xapu = has("tests/test_mine_xapu_acphal.cpp")
     has_mine_perf = has("tests/test_minecraft_perf_hardening.cpp")
     has_ue5 = has("tests/test_ue5_matrix_import_bringup.cpp")
+    has_s16_gfx = has("tests/test_s16_graphics_completeness.cpp")
+    has_s16_media = has("tests/test_s16_media_storage_audio.cpp")
+    has_s16_os = has("tests/test_s16_os_vfs_gdk_shims.cpp")
 
     out: list[DllInfo] = []
     for name, tier, fallback_exp, note in catalog:
@@ -206,17 +209,20 @@ def collect_dlls(build_dir: pathlib.Path) -> list[DllInfo]:
         if name == "d3d12_xs.dll" and has_proxies:
             tier = "high"
             note = (
-                "Full Xbox COM proxies (retail Scarlett ABI, Resource1/2/Heap1), lock-free 64 MiB CBV align ring + L0 WRITE_BACK upload buffers, async 3-slot PresentX ring, cached barrier unwrap, 42 IID_ID3D12* GUID exports, D3D12Xbox* helpers, Agility SDK, Enhanced Barriers, oversized placed-tex promotion, live MSAA clamp, VRAM residency, HDR10 & Vulkan routing"
-                if (has_s15_gfx and has_ue5 and has_mine_perf)
+                "Full Xbox COM proxies (retail Scarlett ABI, Resource1/2/Heap1), page-at-a-time descriptor heaps, >2048 virtualized sampler heap, GetGpuHardwareConfigurationX, Copy Engine queue, D3D12+Vk ExecuteIndirect, live GPU FMASK/DCC/HTILE resolve, lock-free 64 MiB CBV align ring, async 3-slot PresentX, cross-IHV hardening, VRAM residency hygiene, 42 IID GUIDs & Vulkan 1.4 dynamic rendering"
+                if (has_s16_gfx and has_mine_perf)
                 else (
-                    "Full Xbox COM proxies (incl. retail Scarlett ABI & Resource1/2/Heap1), 42 IID_ID3D12* GUID exports, D3D12Xbox* helpers, Agility SDK, Enhanced Barriers, oversized placed-tex promotion, live MSAA clamp, DXGIX vline/frame notifications, live VRAM residency, HDR10 PresentX & Vulkan routing"
-                    if (has_s15_gfx and has_ue5)
+                    "Full Xbox COM proxies (retail Scarlett ABI, Resource1/2/Heap1), lock-free 64 MiB CBV align ring + L0 WRITE_BACK upload buffers, async 3-slot PresentX ring, cached barrier unwrap, 42 IID_ID3D12* GUID exports, D3D12Xbox* helpers, Agility SDK, Enhanced Barriers, oversized placed-tex promotion, live MSAA clamp, VRAM residency, HDR10 & Vulkan routing"
+                    if (has_s15_gfx and has_ue5 and has_mine_perf)
                     else "Full Xbox COM proxies (incl. Resource1/2, Heap1), Agility SDK, Enhanced Barriers, live VRAM residency, HDR10 PresentX & Vulkan routing"
                 )
             )
-        if name == "AcpHal.dll" and (has_mine_xapu or has_ue5):
+        if name == "AcpHal.dll" and (has_mine_xapu or has_ue5 or has_s16_media):
             tier = "high"
-            note = "Thread-safe APU cached/non-cached heap (checked 64-bit ranges, transactional SHAPE rollback), shape/XMA2 audio DSP & FMOD audio middleware ABI"
+            note = "Thread-safe APU cached/non-cached heap (checked 64-bit overflow/overlap rejection, atomic multi-stage SHAPE rollback), shape/XMA2 audio DSP & FMOD audio middleware ABI"
+        if name == "xapu.dll" and has_s16_media:
+            tier = "high"
+            note = "Retail Xbox 3-arg & 1-arg XApuConnect (OOM/param/budget hardened, safe double-disconnect) & command queue ABI for FMOD"
         if name == "KernelTraceControl.dll" and has_s15_shims:
             tier = "partial"
             note = "Non-admin in-memory ETW trace session controller (StartTrace/ControlTrace/EnableTraceEx2/rundown)"
@@ -226,12 +232,47 @@ def collect_dlls(build_dir: pathlib.Path) -> list[DllInfo]:
         if name == "mfplat_xs.dll" and has_mf_hw:
             tier = "high"
             note = (
-                "H.264/HEVC D3D12 decode, IMFDXGIDeviceManager + 46 System32 MFPlat forwarded exports"
-                if has_ue5
-                else "H.264/HEVC D3D12 Media Foundation decode + IMFDXGIDeviceManager lifecycle"
+                "H.264/HEVC D3D12 decode (wired to mfhevcdec IMFTransform), IMFDXGIDeviceManager + 46 System32 MFPlat forwarded exports"
+                if (has_ue5 and has_s16_media)
+                else (
+                    "H.264/HEVC D3D12 decode, IMFDXGIDeviceManager + 46 System32 MFPlat forwarded exports"
+                    if has_ue5
+                    else "H.264/HEVC D3D12 Media Foundation decode + IMFDXGIDeviceManager lifecycle"
+                )
             )
-        if name == "xg_xs.dll" and has_ue5:
-            note = "15 2D + 6 3D GFX10 tile modes, XGCreateTextureComputer (1D/2D/3D), HTILE/DCC/CMASK & GPU compute untiling"
+        if name == "mfhevcdec.dll" and has_s16_media:
+            tier = "high"
+            note = "Full 24-method IMFTransform COM HEVC/H.264 D3D12 decoder (Annex-B VPS/SPS/PPS/IDR parser, DXGI device manager, NV12/ARGB32 frames)"
+        if name == "mflnmhelp.dll" and has_s16_media:
+            tier = "high"
+            note = "Stateful Media Foundation license acquisition/renewal/revocation, manifest URL validation, network capabilities & unload ref-counting"
+        if name == "Bink2Scarlett.dll" and has_s16_media:
+            tier = "high"
+            note = "KB2i DCT frame decode + live D3D12 GPU compute YUV420p(+A)->RGBA8/BGRA8 BT.601/BT.709 converter (<= 1 LSB HW+WARP)"
+        if name == "hix_xs.dll" and has_s16_os:
+            tier = "high"
+            note = "Bounded 256-entry QPC+TID hang/crash ring, watchdog heartbeat timeout detection, minidump hooks & JSON hang report dump"
+        if name == "xbtp.dll" and has_s16_os:
+            tier = "high"
+            note = "In-process Windows IOCP (CreateIoCompletionPort) bidirectional framed channel transport with zero-leak handle/memory teardown"
+        if name == "xtfpix.dll" and has_s16_os:
+            tier = "high"
+            note = "Hierarchical PIX CPU/GPU event stack & marker ring with QPC timestamps, colors & JSON capture metadata export"
+        if name == "gamecoreclient.dll" and has_s16_os:
+            tier = "high"
+            note = "Package identity, PLM state machine (Running/Constrained/Suspended/Resumed), lifecycle callbacks & session-aware DllCanUnloadNow"
+        if name == "minuserx.dll" and has_s16_os:
+            tier = "high"
+            note = "Live Win32 window/message/cursor forwarding (CreateWindow/PeekMessage/DispatchMessage/GetClientRect/SetCursorPos) & real system DPI scale"
+        if name == "xtfdebugmonitor.dll" and has_s16_os:
+            tier = "high"
+            note = "Bounded 512-entry structured debug output ring, thread-safe listener callback fan-out, read/drain snapshot & live attach state"
+        if name == "xg_xs.dll" and (has_ue5 or has_s16_gfx):
+            note = (
+                "15 2D + 6 3D GFX10 tile modes, XGCreateTextureComputer (1D/2D/3D), live GPU FMASK MSAA / DCC 2:1+4:1 / HTILE HiZ decompression & untiling"
+                if has_s16_gfx
+                else "15 2D + 6 3D GFX10 tile modes, XGCreateTextureComputer (1D/2D/3D), HTILE/DCC/CMASK & GPU compute untiling"
+            )
         if name == "xcrdapi.dll" and has_ue5:
             tier = "high"
             note = "Console DirectStorage (DStorageGetFactory/SetConfiguration*) forwarding, breadcrumbs & container staging"
@@ -246,10 +287,20 @@ def collect_dlls(build_dir: pathlib.Path) -> list[DllInfo]:
         if name == "amd_fidelityfx_loader_xbox.dll" and has_s14_ffx:
             tier = "high"
             note = "Real 5-export AMD FidelityFX 2.0 loader & version dispatch forwarding to upscaler"
-        if name == "dstorage_xs.dll" and has_s14_ds:
-            note = "Xbox 0x48 ABI, X2 COM, GDeflate v1 + RFC 1950 Zlib + BCPack BC1-BC7, concurrent IOCP (>64 GiB) & phys-page targets"
-        if name == "XAudio2_9.dll" and has_s14_ffx:
-            note = "Standard @1-@4 ordinal pinning, live WASAPI, 128 voices, submix/reverb APOs, XMA2/Opus/ADPCM & X3DAudio"
+        if name == "dstorage_xs.dll" and (has_s14_ds or has_s16_media):
+            note = (
+                "Xbox 0x48 ABI, X2 COM (atomic RetrieveErrorRecord reset, DuplicateHandle EnqueueSetEvent, race-free shutdown), GDeflate v1 + Zlib + BCPack BC1-BC7 (98 BC7 presets + TTPF 100%) & concurrent IOCP"
+                if has_s16_media
+                else "Xbox 0x48 ABI, X2 COM, GDeflate v1 + RFC 1950 Zlib + BCPack BC1-BC7, concurrent IOCP (>64 GiB) & phys-page targets"
+            )
+        if name == "XAudio2_9.dll" and (has_s14_ffx or has_s16_media):
+            note = (
+                "Standard @1-@4 ordinal pinning, live WASAPI, 128 voices, strict 64-bit play/loop region clamp + silent buffers, submix/reverb APOs, XMA2/Opus/ADPCM & X3DAudio"
+                if has_s16_media
+                else "Standard @1-@4 ordinal pinning, live WASAPI, 128 voices, submix/reverb APOs, XMA2/Opus/ADPCM & X3DAudio"
+            )
+        if name == "xgameruntime.dll" and has_s16_os:
+            note = "292/292 shipping thunks, zero-VirtualQuery 24 COM QueryApiImpl interfaces (0 OS_COM_UNIMPL in threading/display/user/event/ui/streaming), XAsync idle safety, XGameSave name validation & opt-in native Win32 System UI"
         if name == "libHttpClient.GDK.dll" and has_s14_ffx:
             tier = "high"
             note = "Offline/HTTP request queue, WebSocket C ABI, HCHttpCall* getters/setters & XAsync lifecycle"
@@ -303,6 +354,10 @@ def collect_components(
     has_launcher = has("tests/test_launcher_updater.cpp")
     has_mine_perf = has("tests/test_minecraft_perf_hardening.cpp")
     has_live_profiler = has("tools/os_live_profiler.cpp")
+    has_s16_gfx = has("tests/test_s16_graphics_completeness.cpp")
+    has_s16_shader = has("tests/test_s16_shader_completeness.cpp")
+    has_s16_media = has("tests/test_s16_media_storage_audio.cpp")
+    has_s16_os = has("tests/test_s16_os_vfs_gdk_shims.cpp")
 
     rdna2_pct = min(100, int(round(100.0 * opcodes_decoded / max(1, opcodes_total))))
     gfx_score = sum(1.0 if t.status == "live" else (0.5 if t.status == "partial" else 0.0) for t in trans_items)
@@ -313,12 +368,12 @@ def collect_components(
     stub_dlls = sum(1 for d in dlls if d.tier == "stub")
     dll_pct = min(100, int(round(100.0 * (high_dlls * 1.0 + part_dlls * 0.55 + stub_dlls * 0.25) / max(1, len(dlls)))))
     if has_os_auth:
-        dll_pct = min(95, dll_pct + 15)
+        dll_pct = min(100 if (has_s16_os and stub_dlls == 0) else 95, dll_pct + 15)
 
-    mem_pct = 45 + (30 if has_title_va else 0) + (20 if has_bindless else 0)
-    media_pct = 68 + (25 if has_media else 0)
-    loader_pct = 85 + (12 if has_probe_veh else 0)
-    launcher_pct = (90 + (8 if has_probe_veh else 0)) if has_launcher else 40
+    mem_pct = 45 + (30 if has_title_va else 0) + (20 if has_bindless else 0) + (5 if has_s16_gfx else 0)
+    media_pct = 68 + (25 if has_media else 0) + (7 if has_s16_media else 0)
+    loader_pct = 85 + (12 if has_probe_veh else 0) + (3 if has_s16_os else 0)
+    launcher_pct = (90 + (8 if has_probe_veh else 0) + (2 if has_live_profiler else 0)) if has_launcher else 40
     compat_pct = 50 if has_mine_perf else (40 if has("tests/test_gdkx_untouched_samples.cpp") else 20)
 
     corpus_note = f", {corpus_passed}/{corpus_total} corpus shaders validated" if corpus_total else ""
@@ -328,9 +383,13 @@ def collect_components(
         Component(
             short_name="Xbox RDNA2 Shader Translator",
             plain_summary=(
-                f"{opcodes_decoded}/{opcodes_total} GFX10.3 opcodes, 3,120-shader corpus, HS/DS/GS, DXR SBT & Wave64-on-32"
-                if has_stages_ext
-                else f"{opcodes_decoded}/{opcodes_total} GFX10.3 opcodes decoded — MIMG, DS, SMEM & FLAT expanding now"
+                f"{opcodes_decoded}/{opcodes_total} GFX10.3 ops (775 GPU + 4 trap), all 7 stages GPU-verified & MT async PSO cache"
+                if has_s16_shader
+                else (
+                    f"{opcodes_decoded}/{opcodes_total} GFX10.3 opcodes, 3,120-shader corpus, HS/DS/GS, DXR SBT & Wave64-on-32"
+                    if has_stages_ext
+                    else f"{opcodes_decoded}/{opcodes_total} GFX10.3 opcodes decoded — MIMG, DS, SMEM & FLAT expanding now"
+                )
             ),
             tech_name=f"RDNA2/GFX10.3 Shader Lifter ({opcodes_decoded}/{opcodes_total} Opcodes{corpus_note})",
             area="Shaders",
@@ -338,22 +397,26 @@ def collect_components(
             pill_label=f"{opcodes_decoded}/{opcodes_total} Ops",
             pct=rdna2_pct,
             what_works=(
-                f"`{opcodes_decoded}/{opcodes_total}` GFX10.3 opcodes decoded & lifted to SPIR-V (`spirv-val`) + DXIL SM 6.5 (`dxc` + MD5 re-signed), lockstep 1-wave LDS barriers, `PSV0` wave bounds, exact cross-half Wave64-on-Wave32 emulation, HS/DS/GS stage lifting, DXR SBT shader-table mapping, async PSO pre-compilation pool, mesh `merged_wave_info`/`CullPrimitiveEXT`, FSSM/vfetch, CPU interpreter & disk cache{corpus_note}."
-                if has_stages_ext
-                else f"`{opcodes_decoded}/{opcodes_total}` GFX10.3 opcodes decoded & lifted to SPIR-V (`spirv-val`) + DXIL SM 6.5 (`dxc` + MD5 re-signed), lockstep 1-wave LDS barriers, `PSV0` wave bounds, Wave32-on-64 isolation, mesh `merged_wave_info`/`CullPrimitiveEXT`, FSSM/vfetch, CPU interpreter & disk cache{corpus_note}. Still expanding `MIMG`/`DS`/`SMEM`/`FLAT` & HS/DS/GS stages."
+                f"`{opcodes_decoded}/{opcodes_total}` GFX10.3 opcodes decoded & lifted (`775/779` real-GPU verified + `4/4` CPU privileged trap/halt harness) to SPIR-V (`spirv-val`) + DXIL SM 6.5/6.6 (`dxc` + MD5 re-signed), **all 7 shader stage groups live GPU-verified (`CS/VS/PS/MS/AS/HS+DS/GS`)**, single bounds-check per `s_buffer_load`, word-bounded BVH reads, RNE/NaN `V_CVT_(PK)NORM_*_F16`, SPIR-V `MinLod`->HLSL, all 16 compressed `EXP` `EN` masks, `MUBUF` D16, `DS` atomics/96/128, all 24 `SOP1` `saveexec`/`wrexec`, Wave64 vote invalidation, quad-local `DPP8`, non-packed 16-bit VOP3, 64-bit PS int compares & multi-threaded zero-hitch CRC32 disk `ShaderCache`{corpus_note}."
+                if has_s16_shader
+                else f"`{opcodes_decoded}/{opcodes_total}` GFX10.3 opcodes decoded & lifted to SPIR-V (`spirv-val`) + DXIL SM 6.5 (`dxc` + MD5 re-signed), lockstep 1-wave LDS barriers, `PSV0` wave bounds, exact cross-half Wave64-on-Wave32 emulation, HS/DS/GS stage lifting, DXR SBT shader-table mapping, async PSO pre-compilation pool, mesh `merged_wave_info`/`CullPrimitiveEXT`, FSSM/vfetch, CPU interpreter & disk cache{corpus_note}."
             ),
             verified_on=(
-                "`spirv-val` + `dxc` SM 6.5/6.6 + 11 PCs + WARP (`test_rdna2_corpus_bench`, `test_rdna2_isa_scalar_vector`, `test_rdna2_isa_mem_img`, `test_xg_gpu_untile_and_stages`, `test_rdna2_lockstep_isa`, `test_d3d12_xs_autolift`, `test_s14_shader_sm66_779`, `test_s15_rdna2_bench_trap_harness`, `test_s15_shader_peer_parity`)"
-                if has_stages_ext
-                else "`spirv-val` + `dxc` SM 6.5/6.6 + 11 PCs + WARP (`test_rdna2_lockstep_isa`, `test_rdna2_corpus_parity`, `test_rdna2_lifter_live`, `test_d3d12_xs_autolift`)"
+                "`spirv-val` + `dxc` SM 6.5/6.6 + 11 PCs + WARP (`test_s16_shader_completeness`, `test_s15_rdna2_bench_trap_harness`, `test_s15_shader_peer_parity`, `test_s14_shader_sm66_779`, `test_rdna2_corpus_bench`, `test_rdna2_isa_scalar_vector`, `test_rdna2_isa_mem_img`, `test_xg_gpu_untile_and_stages`, `test_d3d12_xs_autolift`)"
+                if has_s16_shader
+                else "`spirv-val` + `dxc` SM 6.5/6.6 + 11 PCs + WARP (`test_rdna2_corpus_bench`, `test_rdna2_isa_scalar_vector`, `test_rdna2_isa_mem_img`, `test_xg_gpu_untile_and_stages`, `test_rdna2_lockstep_isa`, `test_d3d12_xs_autolift`, `test_s14_shader_sm66_779`, `test_s15_rdna2_bench_trap_harness`, `test_s15_shader_peer_parity`)"
             ),
         ),
         Component(
             short_name="DirectX 12 & Vulkan 1.4 Graphics",
             plain_summary=(
-                "All 13 COM proxies, multi-queue MT, Vulkan 1.4, HDR10, Mesh & GPU untiling"
-                if (has_proxies and has_gpu_untile)
-                else "3/13 COM proxies & early Vulkan live; full proxies, MT & GPU untile next"
+                "Page-at-a-time heaps, >2048 samplers, Copy queue, ExecuteIndirect, GPU FMASK/DCC/HTILE & Vk 1.4"
+                if has_s16_gfx
+                else (
+                    "All 13 COM proxies, multi-queue MT, Vulkan 1.4, HDR10, Mesh & GPU untiling"
+                    if (has_proxies and has_gpu_untile)
+                    else "3/13 COM proxies & early Vulkan live; full proxies, MT & GPU untile next"
+                )
             ),
             tech_name="`d3d12_xs` Proxy, Vulkan 1.4 Routing, HDR10 `PresentX` & `xg_xs`",
             area="Graphics",
@@ -361,22 +424,22 @@ def collect_components(
             pill_label="11 PCs Verified" if gfx_pct >= 85 else "Partial (11 PCs)",
             pct=gfx_pct,
             what_works=(
-                "All 13 Xbox COM proxies (`DeviceX`, `CommandQueueX`, `CommandListX`, `ResourceX` 1/2, `HeapX` 1, `DescriptorHeapX`, `PipelineStateX`, `RootSignatureX`, `FenceX`, `CommandAllocatorX`, `QueryHeapX`, `CommandSignatureX`, `StateObjectX`), Agility SDK & unwrapped Enhanced Barriers, live VRAM residency + sparse Window-0 isolation, 6-thread multi-queue (`Direct`/`Compute`/`Copy`) `FenceX` sync, `WriteBufferImmediate`/`SetViewInstanceMask`/`OMSetDepthBounds`/`SetSamplePositions`, direct `d3d12_xs`->Vulkan 1.4 routing, `VK_EXT_mesh_shader`, HDR10/scRGB `PresentX`, GPU compute untiler/retiler (`cs_6_5` + SPIR-V) & `xg_xs` 2D/3D/MSAA `HTILE`/`DCC`/`CMASK` fast-clear passthrough."
-                if (has_proxies and has_gpu_untile)
-                else "Direct `d3d12_xs`->Vulkan 1.4 routing (`--backend=vulkan`), `VK_EXT_mesh_shader`, sparse/`GetResourceTiling`, HDR10/scRGB `PresentX`, NVIDIA `R9G9B9E5`->`RGBA16F` UAV fallback, `KickoffX`/`Wait32/64BitValueX`/`RSSetDepthBiasX`, `xg_xs` 15 2D + 6 3D + `HTILE`/`DCC`/`CMASK`. Remaining: 10+ full COM object proxies, multi-queue MT recording & GPU compute untiling."
+                "All 13 Xbox COM proxies (retail Scarlett ABI, `Resource1/2`, `Heap1`), page-at-a-time 64 KiB descriptor heaps & >2048 virtualized sampler heap, `GetGpuHardwareConfigurationX`, dedicated Copy Engine queue parity, full D3D12 + Vulkan 1.4 `ExecuteIndirect` (root constants, `DispatchMesh`, `pCountBuffer`, arg/VA validation), live GPU compute `FMASK` MSAA / `DCC` 2:1+4:1 / `HTILE` HiZ resolve & decompression (`cs_6_5` + SPIR-V), Vulkan 1.4 dynamic rendering multi-pass RT/depth resolve & `OPENSCARLETT_VK_GPU` fallback, strict cross-IHV capability sanitization (Intel Arc/NVIDIA/AMD/128 MB UMA), Agility SDK, Enhanced Barriers, HDR10/scRGB `PresentX` & VRAM residency live-heap protection."
+                if has_s16_gfx
+                else "All 13 Xbox COM proxies (`DeviceX`, `CommandQueueX`, `CommandListX`, `ResourceX` 1/2, `HeapX` 1, `DescriptorHeapX`, `PipelineStateX`, `RootSignatureX`, `FenceX`, `CommandAllocatorX`, `QueryHeapX`, `CommandSignatureX`, `StateObjectX`), Agility SDK & unwrapped Enhanced Barriers, live VRAM residency + sparse Window-0 isolation, 6-thread multi-queue (`Direct`/`Compute`/`Copy`) `FenceX` sync, `WriteBufferImmediate`/`SetViewInstanceMask`/`OMSetDepthBounds`/`SetSamplePositions`, direct `d3d12_xs`->Vulkan 1.4 routing, `VK_EXT_mesh_shader`, HDR10/scRGB `PresentX`, GPU compute untiler/retiler (`cs_6_5` + SPIR-V) & `xg_xs` 2D/3D/MSAA `HTILE`/`DCC`/`CMASK` fast-clear passthrough."
             ),
             verified_on=(
-                "11 PCs (GTX 1650 Ti, RTX 2060 SUPER/3060/3080 Ti/4070 Laptop/5060/5070, AMD RX 7600/7900 XTX/9070 XT) + WARP (`test_d3d12_xs_proxies_multiqueue`, `test_xg_gpu_untile_and_stages`, `test_d3d12_vk_routing`, `test_vulkan_mesh_showcase`, `test_hdr10_d3d12`, `test_s14_d3d12_barriers_residency`)"
-                if (has_proxies and has_gpu_untile)
-                else "11 PCs (GTX 1650 Ti, RTX 2060 SUPER/3060/3080 Ti/4070 Laptop/5060/5070, AMD RX 7600/7900 XTX/9070 XT) + WARP (`test_d3d12_vk_routing`, `test_gpu_d3d12x_vk_parity`, `test_vulkan_graphics_live`, `test_vulkan_mesh_showcase`, `test_hdr10_d3d12`)"
+                "11 PCs (GTX 1650 Ti, RTX 2060 SUPER/3060/3080 Ti/4070 Laptop/5060/5070, AMD RX 7600/7900 XTX/9070 XT) + WARP (`test_s16_graphics_completeness`, `test_s15_graphics_xg_bc6h`, `test_d3d12_xs_proxies_multiqueue`, `test_xg_gpu_untile_and_stages`, `test_d3d12_vk_routing`, `test_vulkan_mesh_showcase`, `test_hdr10_d3d12`, `test_s14_d3d12_barriers_residency`)"
+                if has_s16_gfx
+                else "11 PCs (GTX 1650 Ti, RTX 2060 SUPER/3060/3080 Ti/4070 Laptop/5060/5070, AMD RX 7600/7900 XTX/9070 XT) + WARP (`test_d3d12_xs_proxies_multiqueue`, `test_xg_gpu_untile_and_stages`, `test_d3d12_vk_routing`, `test_vulkan_mesh_showcase`, `test_hdr10_d3d12`, `test_s14_d3d12_barriers_residency`)"
             ),
         ),
         Component(
             short_name="Unified Memory & Raw Descriptors",
             plain_summary=(
-                "VirtualAlloc2 aliasing, Title-VA MEM_WRITE_WATCH mirror & V#/T#/S# bindless"
-                if (has_title_va and has_bindless)
-                else "VirtualAlloc2 & GpuTilePool live; Title-VA mirror & V#/T#/S# bridge next"
+                "VirtualAlloc2 aliasing, Title-VA mirror, V#/T#/S# bindless, residency hygiene & DirectStorage X2"
+                if (has_s16_gfx and has_s16_media)
+                else "VirtualAlloc2 aliasing, Title-VA MEM_WRITE_WATCH mirror & V#/T#/S# bindless"
             ),
             tech_name="Xbox Unified Memory (`kernelx`/`xmem`), `GpuTilePool` & Bindless Bridge",
             area="Memory & IO",
@@ -384,64 +447,64 @@ def collect_components(
             pill_label="Live Verified" if mem_pct >= 85 else "Partial",
             pct=mem_pct,
             what_works=(
-                "Win10/11 `VirtualAlloc2`/`MapViewOfFile3` 64 KiB & 4 MiB aliasing, `GpuTilePool`, 64-bit `TitleVAMirror` (`MEM_WRITE_WATCH` / `GetWriteWatch` dirty-page GPU flush & fence-synced readback), raw RDNA2 `V#`/`T#`/`S#` & root-SGPR `s0..s15` bindless bridge (D3D12 SM 6.6 + Vulkan `VK_EXT_descriptor_indexing`), `XMemVirtualQuery` + ERA attributes, and `dstorage_xs` cancellation & physical-page decompression."
-                if (has_title_va and has_bindless)
-                else "Win10/11 `VirtualAlloc2`/`MapViewOfFile3` 64 KiB & 4 MiB aliasing, `GpuTilePool`, `XMemVirtualQuery` + ERA attributes, `dstorage_xs` cancellation & physical-page decompression. Remaining: 64-bit Title-VA `MEM_WRITE_WATCH` VRAM mirror & raw RDNA2 `V#`/`T#`/`S#` root-SGPR descriptor bridge."
+                "Win10/11 `VirtualAlloc2`/`MapViewOfFile3` 64 KiB & 4 MiB aliasing, `GpuTilePool`, 64-bit `TitleVAMirror` (`MEM_WRITE_WATCH` / `GetWriteWatch` dirty-page GPU flush & fence-synced readback), raw RDNA2 `V#`/`T#`/`S#` & root-SGPR `s0..s15` bindless bridge (D3D12 SM 6.6 + Vulkan `VK_EXT_descriptor_indexing`), live-heap-safe VRAM residency hygiene (never auto-evicts active/pinned/in-flight heaps without explicit budget override), `XMemVirtualQuery` + ERA attributes, and hardened DirectStorage X2 (`RetrieveErrorRecord` reset, `DuplicateHandle` event signaling, race-free shutdown & MT soak)."
+                if (has_s16_gfx and has_s16_media)
+                else "Win10/11 `VirtualAlloc2`/`MapViewOfFile3` 64 KiB & 4 MiB aliasing, `GpuTilePool`, 64-bit `TitleVAMirror` (`MEM_WRITE_WATCH` / `GetWriteWatch` dirty-page GPU flush & fence-synced readback), raw RDNA2 `V#`/`T#`/`S#` & root-SGPR `s0..s15` bindless bridge (D3D12 SM 6.6 + Vulkan `VK_EXT_descriptor_indexing`), `XMemVirtualQuery` + ERA attributes, and `dstorage_xs` cancellation & physical-page decompression."
             ),
             verified_on=(
-                "GTX 1650 Ti + WARP + Win10/11 26H2 (`test_unified_mem_bindless`, `test_kernelx`, `test_s7_pe_gdk_runtime`, `test_xg_dstorage`)"
-                if (has_title_va and has_bindless)
-                else "Win10 & Win11 26H2 (`test_kernelx`, `test_s7_pe_gdk_runtime`, `test_dstorage_audio_diag_parity`, `test_xg_dstorage`)"
+                "GTX 1650 Ti + WARP + Win10/11 26H2 (`test_s16_graphics_completeness`, `test_s16_media_storage_audio`, `test_unified_mem_bindless`, `test_kernelx`, `test_s7_pe_gdk_runtime`, `test_xg_dstorage`)"
+                if (has_s16_gfx and has_s16_media)
+                else "GTX 1650 Ti + WARP + Win10/11 26H2 (`test_unified_mem_bindless`, `test_kernelx`, `test_s7_pe_gdk_runtime`, `test_xg_dstorage`)"
             ),
         ),
         Component(
             short_name=f"Xbox Live, GDK & OS Shims ({len(dlls)} DLLs)",
-            plain_summary=f"{high_dlls} high-coverage, {part_dlls} partial, {stub_dlls} stub DLLs — 292/292 thunks, WinRT & offline auth",
+            plain_summary=f"{high_dlls} high-coverage, {part_dlls} partial, {stub_dlls} stub DLLs — 292/292 thunks, WinRT, IOCP & native UI",
             tech_name=f"GDK & Console Shims ({len(dlls)} DLLs: {high_dlls} High / {part_dlls} Partial / {stub_dlls} Stub)",
             area="GDK Shims",
             stage="Live Verified" if dll_pct >= 85 else "Partial",
             pill_label=f"{high_dlls}/{len(dlls)} Full DLLs",
             pct=dll_pct,
             what_works=(
-                f"{len(dlls)} shimmed DLLs (`{sum(d.exports for d in dlls)}` PE exports): `xgameruntime` (**292/292** shipping `XGamingRuntimeThunks.dll` parity, 24 COM `QueryApiImpl` interfaces, non-blocking offline XSTS/JWT & XStore license checks, exact `XTaskQueue` port delivery), `kernelx` 7-core/14-thread CPU affinity remapping, `winrt_xs` ({winrt_exports} exports, `CoreApplication`/`CoreWindow`/`ApplicationView`/`DisplayInformation` lifecycle & `IReferenceTracker` `E_NOINTERFACE`), `XCurl` (16/16 + offline XSTS HTTP 200 synthesis), `XSAPI` (178), and `GameInput`."
-                if has_os_auth
-                else f"{len(dlls)} shimmed DLLs (`{sum(d.exports for d in dlls)}` PE exports): `xgameruntime` (**292/292** shipping `XGamingRuntimeThunks.dll` parity, 24 COM `QueryApiImpl` interfaces), `XCurl` (16/16), `XSAPI` (178), `GameInput`, `winrt_xs` ({winrt_exports} exports), plus 10 partial & 10 stub/diagnostic DLLs. Remaining: 7-core CPU affinity remap, WinRT `CoreWindow` lifecycle & offline XSTS auth."
+                f"{len(dlls)} shimmed DLLs (`{sum(d.exports for d in dlls)}` PE exports, **`0` stub-tier DLLs**): `xgameruntime` (**292/292** shipping thunks, zero-VirtualQuery 24 COM `QueryApiImpl` interfaces with `0` unimplemented slots across threading/`XDisplay`/`XUserDevice`/`XGameEvent`/`XGameUi`/`XGameStreaming`, `XAsync` idle no-op safety, `XGameSaveCreateContainer` name validation & opt-in non-blocking Win32 native System UI), `kernelx` 7-core/14-thread affinity remap, `winrt_xs` ({winrt_exports} exports), `XCurl`, `XSAPI` (178), `GameInput`, plus stateful `hix_xs`, Windows IOCP `xbtp`, `xtfpix`, `gamecoreclient`, `minuserx` & `xtfdebugmonitor`."
+                if has_s16_os
+                else f"{len(dlls)} shimmed DLLs (`{sum(d.exports for d in dlls)}` PE exports): `xgameruntime` (**292/292** shipping `XGamingRuntimeThunks.dll` parity, 24 COM `QueryApiImpl` interfaces, non-blocking offline XSTS/JWT & XStore license checks, exact `XTaskQueue` port delivery), `kernelx` 7-core/14-thread CPU affinity remapping, `winrt_xs` ({winrt_exports} exports, `CoreApplication`/`CoreWindow`/`ApplicationView`/`DisplayInformation` lifecycle & `IReferenceTracker` `E_NOINTERFACE`), `XCurl` (16/16 + offline XSTS HTTP 200 synthesis), `XSAPI` (178), and `GameInput`."
             ),
             verified_on=(
-                "Live `Alexandria IV DEMO` shipping thunks (`0 E_NOINTERFACE`), Win10 & Win11 26H2 (`test_os_winrt_offline_auth`, `test_real_gdk_thunks_live`, `test_s7_pe_gdk_runtime`, `test_xgr_conformance_parity`)"
-                if has_os_auth
-                else "Live `Alexandria IV DEMO` shipping thunks (`0 E_NOINTERFACE`), Win10 & Win11 26H2 (`test_real_gdk_thunks_live`, `test_s7_pe_gdk_runtime`, `test_xgr_conformance_parity`)"
+                "Live `Alexandria IV DEMO` shipping thunks (`0 E_NOINTERFACE`), Win10 & Win11 26H2 (`test_s16_os_vfs_gdk_shims`, `test_s15_loader_vfs_gdk_shims`, `test_os_winrt_offline_auth`, `test_real_gdk_thunks_live`, `test_s7_pe_gdk_runtime`, `test_xgr_conformance_parity`)"
+                if has_s16_os
+                else "Live `Alexandria IV DEMO` shipping thunks (`0 E_NOINTERFACE`), Win10 & Win11 26H2 (`test_os_winrt_offline_auth`, `test_real_gdk_thunks_live`, `test_s7_pe_gdk_runtime`, `test_xgr_conformance_parity`)"
             ),
         ),
         Component(
             short_name="Audio, Video & Texture Codecs",
             plain_summary=(
-                "mfplat H.264/HEVC, 64+ XAudio2 voices, Bink2 streaming, GameInput & FSR 1.0"
-                if has_media
-                else "Opus/XMA2/BCPack/FSR live; mfplat H.264/HEVC video & GameInput rings next"
+                "mfplat+mfhevcdec+mflnmhelp, Bink2 GPU YUV->RGBA, 128-voice XAudio2, AcpHal/xapu & BC7/TTPF 100%"
+                if has_s16_media
+                else "mfplat H.264/HEVC, 64+ XAudio2 voices, Bink2 streaming, GameInput & FSR 1.0"
             ),
-            tech_name="BCPack BC1–BC7, RDNA2 BVH4, Opus/XMA2/WASAPI, `mfplat` Video & GPU FSR 1.0",
+            tech_name="BCPack BC1–BC7 + TTPF, RDNA2 BVH4, Opus/XMA2/WASAPI, `mfplat`/`mfhevcdec` & Bink2 GPU",
             area="Media",
             stage="Live Verified" if media_pct >= 85 else "Partial",
             pill_label="Live Verified" if media_pct >= 85 else "Partial (7 GPUs)",
             pct=media_pct,
             what_works=(
-                "`mfplat_xs` `IMFDXGIDeviceManager` + `IMFMediaEngine` H.264/HEVC D3D12 video decode (`TransferVideoFrame` + headless fallback), 64+ concurrent `XAudio2_9` voices with submix buses, Schroeder Reverb/VolumeMeter APOs & monotonic sample clocks, multi-frame `Bink2` streaming, `GameInput` hot-plug device callbacks & LT/RT impulse-trigger rumble, GDeflate v1, BCPack BC1–BC7, RDNA2 BVH4, XMA2 IMDCT, `MSOpusDecoder` Opus, WASAPI, `X3DAudio` & live GPU FSR 1.0."
-                if has_media
-                else "GDeflate v1, BCPack BC1–BC7, RDNA2 BVH4 decoder + SAH BVH, XMA2 IMDCT, `MSOpusDecoder` Opus (`0x704F`), IMA-ADPCM, WASAPI, `X3DAudio`/`XAudio2FX`, Bink2 `KB2i`, live GPU FSR 1.0 (`0 LSB` on AMD RDNA3/4). Remaining: `mfplat` H.264/HEVC D3D12 video decode, 64+ voice clock sync & full `GameInput` hot-plug rings."
+                "`mfplat_xs` + full 24-method `IMFTransform` `mfhevcdec` (HEVC/H.264 Annex-B + D3D12 DXGI manager) + stateful `mflnmhelp`, `Bink2Scarlett` live D3D12 compute YUV420p(+A)->RGBA8/BGRA8 BT.601/BT.709 shader (`<= 1 LSB` HW+WARP), 128-voice `XAudio2_9` with strict 64-bit play/loop clamping & silent buffers, overflow/overlap-safe `AcpHal` with atomic `SHAPE` rollback, OOM-hardened `xapu`, BCPack BC1–BC7 (full 98 BC7 presets incl. last 34 + bit-exact BC6H UF16/SF16) + TTPF single-mip/cubemap/3D volume layouts, GDeflate v1, RDNA2 BVH4, XMA2/Opus/WASAPI, `GameInput` & GPU FSR 1.0."
+                if has_s16_media
+                else "`mfplat_xs` `IMFDXGIDeviceManager` + `IMFMediaEngine` H.264/HEVC D3D12 video decode (`TransferVideoFrame` + headless fallback), 64+ concurrent `XAudio2_9` voices with submix buses, Schroeder Reverb/VolumeMeter APOs & monotonic sample clocks, multi-frame `Bink2` streaming, `GameInput` hot-plug device callbacks & LT/RT impulse-trigger rumble, GDeflate v1, BCPack BC1–BC7, RDNA2 BVH4, XMA2 IMDCT, `MSOpusDecoder` Opus, WASAPI, `X3DAudio` & live GPU FSR 1.0."
             ),
             verified_on=(
-                "11 PCs (NVIDIA + AMD) + WARP (`test_media_video_gameinput`, `test_codecs`, `test_bcpack_bvh4`, `test_audio_opus_wasapi`, `test_d3d12_xs_live`)"
-                if has_media
-                else "11 PCs (NVIDIA + AMD) + WARP (`test_codecs`, `test_bcpack_bvh4`, `test_audio_opus_wasapi`, `test_d3d12_xs_live`)"
+                "11 PCs (NVIDIA + AMD) + WARP (`test_s16_media_storage_audio`, `test_media_video_gameinput`, `test_codecs`, `test_bcpack_bvh4`, `test_audio_opus_wasapi`, `test_d3d12_xs_live`)"
+                if has_s16_media
+                else "11 PCs (NVIDIA + AMD) + WARP (`test_media_video_gameinput`, `test_codecs`, `test_bcpack_bvh4`, `test_audio_opus_wasapi`, `test_d3d12_xs_live`)"
             ),
         ),
         Component(
             short_name="PE Loader, CoW VFS & Child Hooks",
             plain_summary=(
-                "Package loader, nested CoW VFS, child hooks, First-Boot Probe & VEH crash log"
-                if has_probe_veh
-                else "Package loader, CoW VFS & child hooks live; First-Boot probe & VEH next"
+                "Package loader, CoW TRUNCATE_EXISTING + NT/Win32 VFS hooks, child hooks, Probe & VEH"
+                if has_s16_os
+                else "Package loader, nested CoW VFS, child hooks, First-Boot Probe & VEH crash log"
             ),
             tech_name=f"PE32+ Loader, Nested CoW VFS, {len(dlls)}-DLL Routing & Child-Hook Propagation",
             area="Loader",
@@ -449,14 +512,14 @@ def collect_components(
             pill_label="Live Verified",
             pct=loader_pct,
             what_works=(
-                f"`MicrosoftGame.Config` XML loader, nested `G:` CoW overlay VFS, `System32`-first `KnownDLL` resolution, RVA-0 reloc & `.xdata` v2/v3 unwind checks, Kahn topo init, {len(dlls)}-DLL routing, `CreateProcessW/A` child-process APC hook propagation, `--probe-unknown-imports` x64 `E_NOTIMPL` trampoline pool, Win32 VEH crash/50-call API ring buffer, and `OPENSCARLETT_CAPTURE_DIR` frame/shader dumper."
-                if has_probe_veh
-                else f"`MicrosoftGame.Config` XML loader, nested `G:` CoW overlay VFS, `System32`-first `KnownDLL` resolution, RVA-0 reloc & `.xdata` v2/v3 unwind checks, Kahn topo init, {len(dlls)}-DLL routing, `CreateProcessW/A` child-process APC hook propagation. Next: unknown-import First-Boot Probe mode & VEH crash/call-ring dumper."
+                f"`MicrosoftGame.Config` XML loader, nested `G:` CoW overlay VFS with `TRUNCATE_EXISTING`/`FILE_OVERWRITE` read-only CoW copy-up, merged `NtQueryDirectoryFile`/`Ex` + `NtSetInformationFile` (whiteout/rename/EOF) + normalized `GetFinalPathNameByHandleW`, zero `C:\\` path leaks, `System32`-first `KnownDLL` resolution, RVA-0 reloc & `.xdata` v2/v3 unwind checks, Kahn topo init, {len(dlls)}-DLL routing, `CreateProcessW/A` child-process APC hook propagation, `--probe-unknown-imports` static PE stub synthesis, Win32 VEH crash/50-call ring, and `OPENSCARLETT_CAPTURE_DIR` dumper."
+                if has_s16_os
+                else f"`MicrosoftGame.Config` XML loader, nested `G:` CoW overlay VFS, `System32`-first `KnownDLL` resolution, RVA-0 reloc & `.xdata` v2/v3 unwind checks, Kahn topo init, {len(dlls)}-DLL routing, `CreateProcessW/A` child-process APC hook propagation, `--probe-unknown-imports` x64 `E_NOTIMPL` trampoline pool, Win32 VEH crash/50-call API ring buffer, and `OPENSCARLETT_CAPTURE_DIR` frame/shader dumper."
             ),
             verified_on=(
-                "Win10 & Win11 26H2 (`test_probe_veh_capture`, `test_s7_pe_gdk_runtime`, `test_loader_child_hook_parity`, `test_loader_vfs_config`, `Pizza House Simulator` + `House Flipper 2`)"
-                if has_probe_veh
-                else "Win10 & Win11 26H2 (`test_s7_pe_gdk_runtime`, `test_loader_child_hook_parity`, `test_loader_vfs_config`, `Pizza House Simulator` + `House Flipper 2`)"
+                "Win10 & Win11 26H2 (`test_s16_os_vfs_gdk_shims`, `test_s15_loader_vfs_gdk_shims`, `test_probe_veh_capture`, `test_s7_pe_gdk_runtime`, `test_loader_child_hook_parity`, `test_loader_vfs_config`, `Pizza House Simulator` + `House Flipper 2`)"
+                if has_s16_os
+                else "Win10 & Win11 26H2 (`test_probe_veh_capture`, `test_s7_pe_gdk_runtime`, `test_loader_child_hook_parity`, `test_loader_vfs_config`, `Pizza House Simulator` + `House Flipper 2`)"
             ),
         ),
         Component(

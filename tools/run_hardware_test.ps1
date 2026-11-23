@@ -1,4 +1,4 @@
-﻿# OpenScarlett — 1-Click Portable Hardware & Self-Test Runner
+# OpenScarlett — 1-Click Portable Hardware & Self-Test Runner
 # Runs host GPU/OS probes + all OpenScarlett live tests, shows clear live results,
 # saves a privacy-sanitized Markdown report, and optionally opens a pre-filled GitHub Issue.
 
@@ -184,6 +184,11 @@ $TestDescriptions = @{
     'test_ue5_acphal_xmem_mfplat.exe'  = 'UE5 Scarlett bringup: AcpHal thread-safe APU heap, XMem allocation hooks & 46 System32 MFPlat forwarded exports'
     'test_ue5_probe_static_stub.exe'   = 'UE5 Scarlett bringup: dxcompiler_xs routing, --probe-unknown-imports PE32+ static stub synthesis & Launcher report copy'
     'test_ue5_matrix_import_bringup.exe' = 'UE5 Matrix Awakens E2E: isolated 7-DLL guest PE (zero guest DLLs) booted via openscarlett run on HW GPU & WARP (0 missing exports)'
+    'test_minecraft_perf_hardening.exe' = 'Minecraft Preview perf hardening: lock-free CBV align ring, L0 WRITE_BACK uploads, zero-VirtualQuery QueryApiImpl & VFS LevelDB parity'
+    'test_s16_graphics_completeness.exe' = 'Sprint 16 Graphics 100%: page-at-a-time descriptor heaps, >2048 sampler heap, Copy queue, D3D12+Vk ExecuteIndirect, live GPU FMASK/DCC/HTILE resolve, Vk 1.4 dynamic rendering, cross-IHV & residency hygiene'
+    'test_s16_shader_completeness.exe' = 'Sprint 16 Shaders 100%: single s_buffer_load bounds check, BVH clamping, last-mile ISA accuracy, all 7 stages (CS/VS/PS/MS/AS/HS+DS/GS) live GPU verified & MT async PSO cache'
+    'test_s16_media_storage_audio.exe' = 'Sprint 16 Storage/Media/Audio 100%: DirectStorage X2 hardening & MT soak, BC7 98 presets/TTPF, XAudio2/AcpHal/xapu hardening, mfhevcdec IMFTransform, mflnmhelp & Bink2 GPU YUV->RGBA'
+    'test_s16_os_vfs_gdk_shims.exe'    = 'Sprint 16 OS/VFS/GDK/Shims 100%: VFS TRUNCATE_EXISTING CoW + NT/Win32 hooks, XAsync/threading/GameSave/offline COM + native Win32 UI & all 6 retired stub DLLs (hix_xs/xbtp IOCP/xtfpix/gamecoreclient/minuserx/xtfdebugmonitor)'
 }
 
 Write-Host ''

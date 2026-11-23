@@ -170,6 +170,17 @@ set(_openscarlett_known_targets
     test_s15_shader_peer_parity
     test_s15_graphics_xg_bc6h
     test_s15_loader_vfs_gdk_shims
+    dxcompiler_xs
+    mflnmhelp
+    mfhevcdec
+    gamecoreclient
+    minuserx
+    xtfpix
+    xtfdebugmonitor
+    test_s16_graphics_completeness
+    test_s16_shader_completeness
+    test_s16_media_storage_audio
+    test_s16_os_vfs_gdk_shims
 )
 
 foreach(_tgt IN LISTS _openscarlett_known_targets)
@@ -192,7 +203,19 @@ if(OPENSCARLETT_IS_MINGW)
         target_link_libraries(winrt_xs PRIVATE ole32 uuid)
     endif()
     if(TARGET xgameruntime)
-        target_link_libraries(xgameruntime PRIVATE ole32 uuid user32)
+        target_link_libraries(xgameruntime PRIVATE ole32 uuid user32 gdi32)
+    endif()
+    if(TARGET minuserx)
+        target_link_libraries(minuserx PRIVATE user32 gdi32)
+    endif()
+    if(TARGET mfhevcdec)
+        target_link_libraries(mfhevcdec PRIVATE ole32 uuid)
+    endif()
+    if(TARGET mflnmhelp)
+        target_link_libraries(mflnmhelp PRIVATE ole32 uuid)
+    endif()
+    if(TARGET Bink2Scarlett)
+        target_link_libraries(Bink2Scarlett PRIVATE d3d12 dxgi d3dcompiler ole32 uuid)
     endif()
     if(TARGET kernelx AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/shims/kernelx_mingw.def")
         target_sources(kernelx PRIVATE src/shims/kernelx_mingw.def)

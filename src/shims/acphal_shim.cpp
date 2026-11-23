@@ -997,10 +997,7 @@ int32_t OPENSCARLETT_ACPHAL_CALL AcpHalAllocateShapeContexts(
             const uint64_t total64 =
                 static_cast<uint64_t>(stages[i].count) * static_cast<uint64_t>(stages[i].elem_bytes);
             if (total64 > kMaxShapeStageBytes || total64 > 0xFFFFFFFFull) {
-                for (size_t j = 0u; j < 6u; ++j) {
-                    *stages[j].out_slot = nullptr;
-                }
-                return RecordHr("AcpHalAllocateShapeContexts", ACPHAL_E_INVALIDARG);
+                return RecordHr("AcpHalAllocateShapeContexts", ACPHAL_E_OUTOFMEMORY);
             }
             stage_bytes[i] = static_cast<uint32_t>(total64);
         }
@@ -1018,15 +1015,12 @@ int32_t OPENSCARLETT_ACPHAL_CALL AcpHalAllocateShapeContexts(
                 ApuHeapManager::Instance().Alloc(&va, &pa, stage_bytes[i], 64u, APU_ALLOC_CACHED);
             if (hr != ACPHAL_S_OK || !va) {
                 fail_hr = (hr < 0) ? hr : ACPHAL_E_OUTOFMEMORY;
-                // Atomic rollback of stages 0..(i-1): zero leaked APU buffers!
+                // Atomic rollback of stages 0..(i-1) without clobbering caller slots.
                 for (size_t r = i; r > 0u; --r) {
                     if (allocated_ptrs[r - 1u]) {
                         (void)ApuHeapManager::Instance().Free(allocated_ptrs[r - 1u]);
                         allocated_ptrs[r - 1u] = nullptr;
                     }
-                }
-                for (size_t j = 0u; j < 6u; ++j) {
-                    *stages[j].out_slot = nullptr;
                 }
                 return RecordHr("AcpHalAllocateShapeContexts", fail_hr);
             }

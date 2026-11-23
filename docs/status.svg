@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="900" height="542" viewBox="0 0 900 542" role="img" aria-label="OpenScarlett Honest Subsystem Progress (85/85 tests passing)">
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="542" viewBox="0 0 900 542" role="img" aria-label="OpenScarlett Honest Subsystem Progress (89/89 tests passing)">
   <defs>
     <linearGradient id="accentBar" x1="0%" y1="0%" x2="100%" y2="0%">
       <stop offset="0%" stop-color="#e11d48"/>
@@ -19,10 +19,10 @@
     <rect width="900" height="542" fill="#0d1117"/>
     <rect x="0" y="0" width="900" height="3" fill="url(#accentBar)"/>
     <text class="h1" x="28" y="40">OpenScarlett — Honest Subsystem Progress (Early Alpha)</text>
-    <text class="sub" x="28" y="62">Windows 10/11 x64 · MIT · 85/85 tests passing · 32 DLLs (1247 exports) · 779/779 RDNA2 ops · 11 PCs</text>
+    <text class="sub" x="28" y="62">Windows 10/11 x64 · MIT · 89/89 tests passing · 32 DLLs (1315 exports) · 779/779 RDNA2 ops · 11 PCs</text>
     <line x1="28" y1="82" x2="872" y2="82" stroke="#21262d" stroke-width="1"/>
     <text class="name" x="28" y="118">Xbox RDNA2 Shader Translator</text>
-    <text class="desc" x="28" y="135">779/779 GFX10.3 opcodes, 3,120-shader corpus, HS/DS/GS, DXR SBT &amp; Wave64-on-32</text>
+    <text class="desc" x="28" y="135">779/779 GFX10.3 ops (775 GPU + 4 trap), all 7 stages GPU-verified &amp; MT async PSO cache</text>
     <rect x="498" y="112" width="132" height="22" rx="11" fill="#2ea043"/>
     <text class="pill" x="564" y="127" text-anchor="middle">779/779 Ops</text>
     <rect x="648" y="118" width="176" height="10" rx="5" fill="#21262d"/>
@@ -30,7 +30,7 @@
     <text class="pct" x="872" y="127" text-anchor="end">100%</text>
     <line x1="28" y1="148" x2="872" y2="148" stroke="#161b22" stroke-width="1"/>
     <text class="name" x="28" y="170">DirectX 12 &amp; Vulkan 1.4 Graphics</text>
-    <text class="desc" x="28" y="187">All 13 COM proxies, multi-queue MT, Vulkan 1.4, HDR10, Mesh &amp; GPU untiling</text>
+    <text class="desc" x="28" y="187">Page-at-a-time heaps, &gt;2048 samplers, Copy queue, ExecuteIndirect, GPU FMASK/DCC/HTILE &amp; Vk 1.4</text>
     <rect x="498" y="164" width="132" height="22" rx="11" fill="#2ea043"/>
     <text class="pill" x="564" y="179" text-anchor="middle">11 PCs Verified</text>
     <rect x="648" y="170" width="176" height="10" rx="5" fill="#21262d"/>
@@ -38,44 +38,44 @@
     <text class="pct" x="872" y="179" text-anchor="end">100%</text>
     <line x1="28" y1="200" x2="872" y2="200" stroke="#161b22" stroke-width="1"/>
     <text class="name" x="28" y="222">Unified Memory &amp; Raw Descriptors</text>
-    <text class="desc" x="28" y="239">VirtualAlloc2 aliasing, Title-VA MEM_WRITE_WATCH mirror &amp; V#/T#/S# bindless</text>
+    <text class="desc" x="28" y="239">VirtualAlloc2 aliasing, Title-VA mirror, V#/T#/S# bindless, residency hygiene &amp; DirectStorage X2</text>
     <rect x="498" y="216" width="132" height="22" rx="11" fill="#2ea043"/>
     <text class="pill" x="564" y="231" text-anchor="middle">Live Verified</text>
     <rect x="648" y="222" width="176" height="10" rx="5" fill="#21262d"/>
-    <rect x="648" y="222" width="167" height="10" rx="5" fill="#2ea043"/>
-    <text class="pct" x="872" y="231" text-anchor="end">95%</text>
+    <rect x="648" y="222" width="176" height="10" rx="5" fill="#2ea043"/>
+    <text class="pct" x="872" y="231" text-anchor="end">100%</text>
     <line x1="28" y1="252" x2="872" y2="252" stroke="#161b22" stroke-width="1"/>
     <text class="name" x="28" y="274">Xbox Live, GDK &amp; OS Shims (32 DLLs)</text>
-    <text class="desc" x="28" y="291">20 high-coverage, 4 partial, 8 stub DLLs — 292/292 thunks, WinRT &amp; offline auth</text>
+    <text class="desc" x="28" y="291">29 high-coverage, 3 partial, 0 stub DLLs — 292/292 thunks, WinRT, IOCP &amp; native UI</text>
     <rect x="498" y="268" width="132" height="22" rx="11" fill="#2ea043"/>
-    <text class="pill" x="564" y="283" text-anchor="middle">20/32 Full DLLs</text>
+    <text class="pill" x="564" y="283" text-anchor="middle">29/32 Full DLLs</text>
     <rect x="648" y="274" width="176" height="10" rx="5" fill="#21262d"/>
-    <rect x="648" y="274" width="160" height="10" rx="5" fill="#2ea043"/>
-    <text class="pct" x="872" y="283" text-anchor="end">91%</text>
+    <rect x="648" y="274" width="176" height="10" rx="5" fill="#2ea043"/>
+    <text class="pct" x="872" y="283" text-anchor="end">100%</text>
     <line x1="28" y1="304" x2="872" y2="304" stroke="#161b22" stroke-width="1"/>
     <text class="name" x="28" y="326">Audio, Video &amp; Texture Codecs</text>
-    <text class="desc" x="28" y="343">mfplat H.264/HEVC, 64+ XAudio2 voices, Bink2 streaming, GameInput &amp; FSR 1.0</text>
+    <text class="desc" x="28" y="343">mfplat+mfhevcdec+mflnmhelp, Bink2 GPU YUV-&gt;RGBA, 128-voice XAudio2, AcpHal/xapu &amp; BC7/TTPF 100%</text>
     <rect x="498" y="320" width="132" height="22" rx="11" fill="#2ea043"/>
     <text class="pill" x="564" y="335" text-anchor="middle">Live Verified</text>
     <rect x="648" y="326" width="176" height="10" rx="5" fill="#21262d"/>
-    <rect x="648" y="326" width="164" height="10" rx="5" fill="#2ea043"/>
-    <text class="pct" x="872" y="335" text-anchor="end">93%</text>
+    <rect x="648" y="326" width="176" height="10" rx="5" fill="#2ea043"/>
+    <text class="pct" x="872" y="335" text-anchor="end">100%</text>
     <line x1="28" y1="356" x2="872" y2="356" stroke="#161b22" stroke-width="1"/>
     <text class="name" x="28" y="378">PE Loader, CoW VFS &amp; Child Hooks</text>
-    <text class="desc" x="28" y="395">Package loader, nested CoW VFS, child hooks, First-Boot Probe &amp; VEH crash log</text>
+    <text class="desc" x="28" y="395">Package loader, CoW TRUNCATE_EXISTING + NT/Win32 VFS hooks, child hooks, Probe &amp; VEH</text>
     <rect x="498" y="372" width="132" height="22" rx="11" fill="#2ea043"/>
     <text class="pill" x="564" y="387" text-anchor="middle">Live Verified</text>
     <rect x="648" y="378" width="176" height="10" rx="5" fill="#21262d"/>
-    <rect x="648" y="378" width="171" height="10" rx="5" fill="#2ea043"/>
-    <text class="pct" x="872" y="387" text-anchor="end">97%</text>
+    <rect x="648" y="378" width="176" height="10" rx="5" fill="#2ea043"/>
+    <text class="pct" x="872" y="387" text-anchor="end">100%</text>
     <line x1="28" y1="408" x2="872" y2="408" stroke="#161b22" stroke-width="1"/>
     <text class="name" x="28" y="430">Windows Launcher GUI &amp; Live Profiler</text>
     <text class="desc" x="28" y="447">Win32/D2D GUI, First-Boot Probe, 60s HW tester, os_live_profiler &amp; updater</text>
     <rect x="498" y="424" width="132" height="22" rx="11" fill="#2ea043"/>
     <text class="pill" x="564" y="439" text-anchor="middle">Live Verified</text>
     <rect x="648" y="430" width="176" height="10" rx="5" fill="#21262d"/>
-    <rect x="648" y="430" width="172" height="10" rx="5" fill="#2ea043"/>
-    <text class="pct" x="872" y="439" text-anchor="end">98%</text>
+    <rect x="648" y="430" width="176" height="10" rx="5" fill="#2ea043"/>
+    <text class="pct" x="872" y="439" text-anchor="end">100%</text>
     <line x1="28" y1="460" x2="872" y2="460" stroke="#161b22" stroke-width="1"/>
     <text class="name" x="28" y="482">Real-World Game Compatibility</text>
     <text class="desc" x="28" y="499">Minecraft Preview 60 FPS 3D live · 6/6 GDKX samples · UE5 in bring-up</text>

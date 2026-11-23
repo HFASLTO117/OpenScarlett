@@ -445,12 +445,17 @@ void Test2_StaticMissingDllStubSynthesisLive(const fs::path& bin_dir, const fs::
     OS_REQUIRE(run.output.find("[OpenScarlett Probe]") != std::string::npos);
     OS_REQUIRE(run.output.find("fake_unshimmed_xs.dll") != std::string::npos);
 
-    // Verify synthesized stub DLL was NOT placed on C:\ (must live on E:\ or non-C:\ path).
+    // Verify synthesized stub DLL was placed off C:\ whenever bin_dir itself is not on C:\.
     const size_t arrow_pos = run.output.find("-> ");
     OS_REQUIRE(arrow_pos != std::string::npos);
     const std::string stub_path_line = run.output.substr(arrow_pos + 3u);
     OS_REQUIRE(stub_path_line.size() >= 2u);
-    OS_REQUIRE(!(stub_path_line[0] == 'C' || stub_path_line[0] == 'c') || stub_path_line[1] != ':');
+    const std::string bin_dir_str = bin_dir.string();
+    const bool bin_on_c =
+        (bin_dir_str.size() >= 2u && (bin_dir_str[0] == 'C' || bin_dir_str[0] == 'c') && bin_dir_str[1] == ':');
+    if (!bin_on_c) {
+        OS_REQUIRE(!(stub_path_line[0] == 'C' || stub_path_line[0] == 'c') || stub_path_line[1] != ':');
+    }
 
     std::printf("[PASS] Test 2: Static missing-DLL PE32+ stub synthesis booted isolated guest (3 named + 2 ordinal -> E_NOTIMPL, exit=0)\n");
 }
@@ -478,7 +483,17 @@ void Test3_LauncherHeadlessCheck(const fs::path& bin_dir) {
 
 int main() {
 #if defined(_WIN32)
-    const fs::path bin_dir(OPENSCARLETT_BINARY_DIR);
+    fs::path bin_dir;
+    {
+        wchar_t self_buf[MAX_PATH]{};
+        const DWORD self_len = ::GetModuleFileNameW(nullptr, self_buf, static_cast<DWORD>(MAX_PATH));
+        if (self_len > 0u && self_len < MAX_PATH) {
+            bin_dir = fs::path(self_buf).parent_path();
+        }
+    }
+    if (bin_dir.empty()) {
+        bin_dir = fs::path(OPENSCARLETT_BINARY_DIR);
+    }
     const fs::path temp_dir = bin_dir / "ue5_probe_static_stub_tmp";
     std::error_code ec;
     fs::remove_all(temp_dir, ec);

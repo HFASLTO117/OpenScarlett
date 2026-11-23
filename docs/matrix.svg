@@ -25,7 +25,7 @@
     <text class="lbl" x="26" y="123">VOP (Vector ALU / VOP3P)</text>
     <rect x="224" y="115" width="156" height="9" rx="4.5" fill="#21262d"/>
     <rect x="224" y="115" width="156" height="9" rx="4.5" fill="#2ea043"/>
-    <text class="mono" x="440" y="123" text-anchor="end">472/330</text>
+    <text class="mono" x="440" y="123" text-anchor="end">476/330</text>
     <text class="lbl" x="458" y="123">SOP (Scalar ALU / Ctrl)</text>
     <rect x="656" y="115" width="156" height="9" rx="4.5" fill="#21262d"/>
     <rect x="656" y="115" width="156" height="9" rx="4.5" fill="#2ea043"/>
@@ -33,7 +33,7 @@
     <text class="lbl" x="26" y="155">MIMG (Images / Samplers / BVH)</text>
     <rect x="224" y="147" width="156" height="9" rx="4.5" fill="#21262d"/>
     <rect x="224" y="147" width="156" height="9" rx="4.5" fill="#2ea043"/>
-    <text class="mono" x="440" y="155" text-anchor="end">98/85</text>
+    <text class="mono" x="440" y="155" text-anchor="end">99/85</text>
     <text class="lbl" x="458" y="155">FLAT / GLOBAL / SCRATCH</text>
     <rect x="656" y="147" width="156" height="9" rx="4.5" fill="#21262d"/>
     <rect x="656" y="147" width="156" height="9" rx="4.5" fill="#2ea043"/>
@@ -105,11 +105,11 @@
     <text class="lbl" x="620" y="405">GPU Compute Untiling</text>
     <text class="tiny" x="864" y="404.5" text-anchor="end" fill="#2ea043" font-weight="700">LIVE</text>
     <line x1="26" y1="430" x2="874" y2="430" stroke="#21262d" stroke-width="1"/>
-    <text class="h2" x="26" y="454">3. All 32 Shimmed Xbox / GDK DLLs (20 high coverage · 4 partial · 8 stub / telemetry)</text>
+    <text class="h2" x="26" y="454">3. All 32 Shimmed Xbox / GDK DLLs (29 high coverage · 3 partial · 0 stub / telemetry)</text>
     <rect x="26" y="468" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="26" y="468" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="36" y="482">xgameruntime</text>
-    <text class="tiny" x="36" y="493">351 exports · high</text>
+    <text class="tiny" x="36" y="493">367 exports · high</text>
     <rect x="197" y="468" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="197" y="468" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="207" y="482">XSAPI.GDK.C</text>
@@ -141,7 +141,7 @@
     <rect x="539" y="506" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="539" y="506" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="549" y="520">GameInput</text>
-    <text class="tiny" x="549" y="531">18 exports · high</text>
+    <text class="tiny" x="549" y="531">20 exports · high</text>
     <rect x="710" y="506" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="710" y="506" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="720" y="520">dstorage_xs</text>
@@ -153,7 +153,7 @@
     <rect x="197" y="544" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="197" y="544" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="207" y="558">d3d12_xs</text>
-    <text class="tiny" x="207" y="569">107 exports · high</text>
+    <text class="tiny" x="207" y="569">109 exports · high</text>
     <rect x="368" y="544" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="368" y="544" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="378" y="558">libHttpClient</text>
@@ -170,10 +170,10 @@
     <rect x="26" y="582" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="36" y="596">xcrdapi</text>
     <text class="tiny" x="36" y="607">16 exports · high</text>
-    <rect x="197" y="582" width="163" height="30" rx="6" fill="#261e10" stroke="#30363d" stroke-width="1"/>
-    <rect x="197" y="582" width="3.5" height="30" rx="2" fill="#d29922"/>
+    <rect x="197" y="582" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
+    <rect x="197" y="582" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="207" y="596">Bink2Scarlett</text>
-    <text class="tiny" x="207" y="607">12 exports · partial</text>
+    <text class="tiny" x="207" y="607">14 exports · high</text>
     <rect x="368" y="582" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="368" y="582" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="378" y="596">XboxBvhBuild</text>
@@ -189,7 +189,7 @@
     <rect x="26" y="620" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="26" y="620" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="36" y="634">AcpHal</text>
-    <text class="tiny" x="36" y="645">10 exports · high</text>
+    <text class="tiny" x="36" y="645">12 exports · high</text>
     <rect x="197" y="620" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="197" y="620" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="207" y="634">xapu</text>
@@ -198,42 +198,42 @@
     <rect x="368" y="620" width="3.5" height="30" rx="2" fill="#d29922"/>
     <text class="mono" x="378" y="634">pixevt</text>
     <text class="tiny" x="378" y="645">18 exports · partial</text>
-    <rect x="539" y="620" width="163" height="30" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
-    <rect x="539" y="620" width="3.5" height="30" rx="2" fill="#6e7681"/>
+    <rect x="539" y="620" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
+    <rect x="539" y="620" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="549" y="634">hix_xs</text>
-    <text class="tiny" x="549" y="645">11 exports · stub</text>
+    <text class="tiny" x="549" y="645">21 exports · high</text>
     <rect x="710" y="620" width="163" height="30" rx="6" fill="#261e10" stroke="#30363d" stroke-width="1"/>
     <rect x="710" y="620" width="3.5" height="30" rx="2" fill="#d29922"/>
     <text class="mono" x="720" y="634">KernelTrace</text>
     <text class="tiny" x="720" y="645">18 exports · partial</text>
-    <rect x="26" y="658" width="163" height="30" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
-    <rect x="26" y="658" width="3.5" height="30" rx="2" fill="#6e7681"/>
+    <rect x="26" y="658" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
+    <rect x="26" y="658" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="36" y="672">xtfpix</text>
-    <text class="tiny" x="36" y="683">9 exports · stub</text>
-    <rect x="197" y="658" width="163" height="30" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
-    <rect x="197" y="658" width="3.5" height="30" rx="2" fill="#6e7681"/>
+    <text class="tiny" x="36" y="683">11 exports · high</text>
+    <rect x="197" y="658" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
+    <rect x="197" y="658" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="207" y="672">xbtp</text>
-    <text class="tiny" x="207" y="683">8 exports · stub</text>
-    <rect x="368" y="658" width="163" height="30" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
-    <rect x="368" y="658" width="3.5" height="30" rx="2" fill="#6e7681"/>
+    <text class="tiny" x="207" y="683">14 exports · high</text>
+    <rect x="368" y="658" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
+    <rect x="368" y="658" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="378" y="672">mflnmhelp</text>
-    <text class="tiny" x="378" y="683">8 exports · stub</text>
-    <rect x="539" y="658" width="163" height="30" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
-    <rect x="539" y="658" width="3.5" height="30" rx="2" fill="#6e7681"/>
+    <text class="tiny" x="378" y="683">14 exports · high</text>
+    <rect x="539" y="658" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
+    <rect x="539" y="658" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="549" y="672">mfhevcdec</text>
-    <text class="tiny" x="549" y="683">8 exports · stub</text>
-    <rect x="710" y="658" width="163" height="30" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
-    <rect x="710" y="658" width="3.5" height="30" rx="2" fill="#6e7681"/>
+    <text class="tiny" x="549" y="683">9 exports · high</text>
+    <rect x="710" y="658" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
+    <rect x="710" y="658" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="720" y="672">gamecorecli</text>
-    <text class="tiny" x="720" y="683">8 exports · stub</text>
-    <rect x="26" y="696" width="163" height="30" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
-    <rect x="26" y="696" width="3.5" height="30" rx="2" fill="#6e7681"/>
+    <text class="tiny" x="720" y="683">14 exports · high</text>
+    <rect x="26" y="696" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
+    <rect x="26" y="696" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="36" y="710">minuserx</text>
-    <text class="tiny" x="36" y="721">7 exports · stub</text>
-    <rect x="197" y="696" width="163" height="30" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
-    <rect x="197" y="696" width="3.5" height="30" rx="2" fill="#6e7681"/>
+    <text class="tiny" x="36" y="721">15 exports · high</text>
+    <rect x="197" y="696" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
+    <rect x="197" y="696" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="207" y="710">xtfdebugmon</text>
-    <text class="tiny" x="207" y="721">7 exports · stub</text>
+    <text class="tiny" x="207" y="721">12 exports · high</text>
   </g>
   <rect x="0.5" y="0.5" width="899" height="753" rx="12" fill="none" stroke="#30363d" stroke-width="1"/>
 </svg>

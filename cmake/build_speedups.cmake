@@ -66,6 +66,10 @@ _openscarlett_set_test_cost(test_gdk_hdr_cubemap 22)
 _openscarlett_set_test_cost(test_rdna2_corpus_parity 22)
 _openscarlett_set_test_cost(test_d3d12_vk_routing 20)
 _openscarlett_set_test_cost(test_s14_xbox_bvh_builder_abi 20)
+_openscarlett_set_test_cost(test_s16_shader_completeness 35)
+_openscarlett_set_test_cost(test_s16_graphics_completeness 30)
+_openscarlett_set_test_cost(test_s16_media_storage_audio 25)
+_openscarlett_set_test_cost(test_s16_os_vfs_gdk_shims 25)
 
 # 2. Strict wall-clock benchmark / timing-sensitive tests run uncontended.
 if(TEST test_s14_shader_sm66_779)
@@ -86,6 +90,7 @@ foreach(_win_test
     test_vulkan_graphics_live
     test_vulkan_mesh_showcase
     test_s13_live_xbox_shader_e2e
+    test_s16_os_vfs_gdk_shims
 )
     _openscarlett_add_test_lock(${_win_test} window)
 endforeach()
@@ -97,6 +102,7 @@ foreach(_heavy_cpu_test
     test_rdna2_gpu_accuracy
     test_rdna2_corpus_bench
     test_rdna2_as_task_spirv
+    test_s16_shader_completeness
 )
     _openscarlett_add_test_lock(${_heavy_cpu_test} heavy_cpu)
 endforeach()
@@ -105,6 +111,7 @@ endforeach()
 foreach(_audio_test
     test_audio_opus_wasapi
     test_media_video_gameinput
+    test_s16_media_storage_audio
 )
     _openscarlett_add_test_lock(${_audio_test} audio)
 endforeach()
@@ -117,6 +124,7 @@ foreach(_vfs_test
     test_s12_os_loader_gameinput
     test_gdkx_untouched_samples
     test_minecraft_perf_hardening
+    test_s16_os_vfs_gdk_shims
 )
     _openscarlett_add_test_lock(${_vfs_test} vfs_saves)
 endforeach()
