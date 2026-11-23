@@ -1721,6 +1721,7 @@ DeviceX::DeviceX(
 
         // Sprint 14: Initialize live VRAM Residency Manager profile, DXGI Adapter3 memory info,
         // and Sparse VRAM Window-0 isolator (Descriptor Heaps Window 0 vs Title Buffers Window 1+).
+        sanitized_ihv_caps_ = openscarlett::SanitizeCrossIhvCapabilities(adapter_info_);
         sparse_window_iso_ = openscarlett::CreateSparseVramWindowIsolator();
         console_profile_ = openscarlett::SelectXboxConsoleMemoryProfileFromHostVram(
             adapter_info_.dedicated_video_memory_bytes, nullptr);
@@ -1849,6 +1850,23 @@ void DeviceX::NotifyHeapDestroyed(ID3D12Heap* host_heap) noexcept {
 
 void DeviceX::NotifyDescriptorHeapDestroyed(ID3D12DescriptorHeap* host_heap) noexcept {
     if (!host_heap) return;
+    {
+        std::lock_guard<std::mutex> lock(paged_desc_mutex_);
+        auto pit = paged_desc_heaps_.find(host_heap);
+        if (pit != paged_desc_heaps_.end()) {
+            for (auto& page : pit->second.pages) {
+                if (page.isolated_shadow_heap) {
+                    page.isolated_shadow_heap->Release();
+                    page.isolated_shadow_heap = nullptr;
+                }
+            }
+            paged_desc_heaps_.erase(pit);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(virt_sampler_mutex_);
+        virtual_sampler_heaps_.erase(host_heap);
+    }
     std::lock_guard<std::mutex> lock(residency_mutex_);
     auto it = desc_heap_window0_vas_.find(host_heap);
     if (it != desc_heap_window0_vas_.end()) {
@@ -2180,7 +2198,29 @@ DeviceX::~DeviceX() {
         }
     }
     {
+        std::lock_guard<std::mutex> lock(paged_desc_mutex_);
+        for (auto& kv : paged_desc_heaps_) {
+            for (auto& page : kv.second.pages) {
+                if (page.isolated_shadow_heap) {
+                    page.isolated_shadow_heap->Release();
+                    page.isolated_shadow_heap = nullptr;
+                }
+            }
+        }
+        paged_desc_heaps_.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(virt_sampler_mutex_);
+        virtual_sampler_heaps_.clear();
+    }
+    {
         std::lock_guard<std::mutex> lock(residency_mutex_);
+        for (auto& kv : residency_entries_) {
+            if (kv.second.in_flight_fence) {
+                kv.second.in_flight_fence->Release();
+                kv.second.in_flight_fence = nullptr;
+            }
+        }
         residency_entries_.clear();
         residency_lru_.clear();
         desc_heap_window0_vas_.clear();
@@ -2315,6 +2355,12 @@ HRESULT STDMETHODCALLTYPE DeviceX::QueryInterface(REFIID riid, void** ppvObject)
         RecordDev("ID3D12DeviceX::QueryInterface", 0, S_OK);
         return S_OK;
     }
+    if (IsEqualIID(riid, IID_IOpenScarlettGraphicsCompleteness)) {
+        *ppvObject = static_cast<IOpenScarlettGraphicsCompleteness*>(this);
+        AddRef();
+        RecordDev("ID3D12DeviceX::QueryInterface", 0, S_OK);
+        return S_OK;
+    }
 
     // NEVER fall through to raw host_dev_->QueryInterface() for any ID3D12Device* IID!
     if (IsKnownD3D12DeviceIid(riid)) {
@@ -2383,11 +2429,35 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommandQueue(
         return E_POINTER;
     }
     *ppCommandQueue = nullptr;
+    D3D12_COMMAND_QUEUE_DESC clean_desc{};
+    const D3D12_COMMAND_QUEUE_DESC* desc_ptr = pDesc;
+    const bool requested_copy = (pDesc && pDesc->Type == D3D12_COMMAND_LIST_TYPE_COPY);
+    if (pDesc) {
+        clean_desc = *pDesc;
+        // Strip Xbox console-private upper queue flags while preserving genuine D3D12_COMMAND_LIST_TYPE_COPY.
+        clean_desc.Flags = static_cast<D3D12_COMMAND_QUEUE_FLAGS>(
+            static_cast<uint32_t>(clean_desc.Flags) &
+            static_cast<uint32_t>(D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT));
+        desc_ptr = &clean_desc;
+    }
     ID3D12CommandQueue* host_q = nullptr;
-    HRESULT hr = host_dev_->CreateCommandQueue(pDesc, IID_PPV_ARGS(&host_q));
+    HRESULT hr = host_dev_->CreateCommandQueue(desc_ptr, OS_D3D12_IID(ID3D12CommandQueue),
+                                               reinterpret_cast<void**>(&host_q));
+    bool genuine_copy_queue = (requested_copy && SUCCEEDED(hr) && host_q != nullptr);
+    if ((FAILED(hr) || !host_q) && requested_copy && desc_ptr) {
+        // Only fall back to DIRECT if the host genuinely failed to create a Copy Engine queue.
+        D3D12_COMMAND_QUEUE_DESC fb_desc = *desc_ptr;
+        fb_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+        hr = host_dev_->CreateCommandQueue(&fb_desc, OS_D3D12_IID(ID3D12CommandQueue),
+                                           reinterpret_cast<void**>(&host_q));
+    }
     if (FAILED(hr) || !host_q) {
         RecordDev("ID3D12DeviceX::CreateCommandQueue", 8, hr);
         return hr;
+    }
+    if (genuine_copy_queue) {
+        dedicated_copy_queues_created_.fetch_add(1ull, std::memory_order_relaxed);
+        RecordDev("ID3D12DeviceX::CreateCommandQueue[DedicatedCopyEngine]", 8, S_OK);
     }
     auto* wrapper = new (std::nothrow) CommandQueueX(this, host_q, DefaultWindow());
     host_q->Release();
@@ -3284,6 +3354,26 @@ HRESULT STDMETHODCALLTYPE DeviceX::CheckFeatureSupport(
     D3D12_FEATURE Feature, void* pFeatureSupportData, UINT FeatureSupportDataSize) {
     const HRESULT hr = host_dev_->CheckFeatureSupport(
         Feature, pFeatureSupportData, FeatureSupportDataSize);
+    if (SUCCEEDED(hr) && pFeatureSupportData != nullptr) {
+        // Cross-IHV capability sanitization (Sprint 16): ensure wave sizes, DXR tiers,
+        // and Mesh Shader tiers are accurately sanitized and never over-reported.
+        if (Feature == D3D12_FEATURE_D3D12_OPTIONS1 &&
+            FeatureSupportDataSize >= sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS1)) {
+            auto* o1 = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS1*>(pFeatureSupportData);
+            if (o1->WaveOps) {
+                o1->WaveLaneCountMin = sanitized_ihv_caps_.wave_lane_min;
+                o1->WaveLaneCountMax = sanitized_ihv_caps_.wave_lane_max;
+            }
+        } else if (Feature == D3D12_FEATURE_D3D12_OPTIONS5 &&
+                   FeatureSupportDataSize >= sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS5)) {
+            auto* o5 = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS5*>(pFeatureSupportData);
+            o5->RaytracingTier = static_cast<D3D12_RAYTRACING_TIER>(sanitized_ihv_caps_.raytracing_tier);
+        } else if (Feature == D3D12_FEATURE_D3D12_OPTIONS7 &&
+                   FeatureSupportDataSize >= sizeof(D3D12_FEATURE_DATA_D3D12_OPTIONS7)) {
+            auto* o7 = static_cast<D3D12_FEATURE_DATA_D3D12_OPTIONS7*>(pFeatureSupportData);
+            o7->MeshShaderTier = static_cast<D3D12_MESH_SHADER_TIER>(sanitized_ihv_caps_.mesh_shader_tier);
+        }
+    }
     RecordDev("ID3D12DeviceX::CheckFeatureSupport", 13, hr);
     return hr;
 }
@@ -3296,9 +3386,27 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateDescriptorHeap(
         return hr;
     }
     *ppvHeap = nullptr;
+
+    // Sprint 16: Unbounded Sampler Heap Virtualization (> 2048 console sampler limit).
+    // Desktop D3D12 caps shader-visible SAMPLER heaps at 2048 descriptors. Virtualize arbitrarily
+    // large console sampler heaps over a deduplicated 2048-slot backing host heap!
+    constexpr UINT kDesktopMaxSamplers = 2048u;
+    const bool is_unbounded_sampler =
+        (pDescriptorHeapDesc != nullptr) &&
+        (pDescriptorHeapDesc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER) &&
+        (pDescriptorHeapDesc->NumDescriptors > kDesktopMaxSamplers);
+
+    D3D12_DESCRIPTOR_HEAP_DESC host_desc{};
+    const D3D12_DESCRIPTOR_HEAP_DESC* host_desc_ptr = pDescriptorHeapDesc;
+    if (is_unbounded_sampler) {
+        host_desc = *pDescriptorHeapDesc;
+        host_desc.NumDescriptors = kDesktopMaxSamplers;
+        host_desc_ptr = &host_desc;
+    }
+
     ID3D12DescriptorHeap* host_heap = nullptr;
     HRESULT hr = host_dev_->CreateDescriptorHeap(
-        pDescriptorHeapDesc, OS_D3D12_IID(ID3D12DescriptorHeap), reinterpret_cast<void**>(&host_heap));
+        host_desc_ptr, OS_D3D12_IID(ID3D12DescriptorHeap), reinterpret_cast<void**>(&host_heap));
     if (FAILED(hr) || !host_heap) {
         RecordDev("ID3D12DeviceX::CreateDescriptorHeap", 14, hr);
         return hr;
@@ -3312,7 +3420,77 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateDescriptorHeap(
             desc_heap_window0_vas_[host_heap] = w0_va;
         }
     }
-    auto* proxy = new (std::nothrow) DescriptorHeapXProxy(this, host_heap);
+
+    DescriptorHeapXProxy* proxy = nullptr;
+    if (is_unbounded_sampler) {
+        const UINT inc = std::max<UINT>(
+            1u, host_dev_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER));
+        const uint64_t range_bytes =
+            ((static_cast<uint64_t>(pDescriptorHeapDesc->NumDescriptors) * inc) + 65535ull) & ~65535ull;
+        D3D12_CPU_DESCRIPTOR_HANDLE virt_cpu{0u};
+        D3D12_GPU_DESCRIPTOR_HANDLE virt_gpu{0ull};
+        {
+            std::lock_guard<std::mutex> lock(virt_sampler_mutex_);
+            virt_cpu.ptr = static_cast<SIZE_T>(next_virtual_sampler_cpu_base_);
+            next_virtual_sampler_cpu_base_ += range_bytes;
+            if ((pDescriptorHeapDesc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0) {
+                virt_gpu.ptr = next_virtual_sampler_gpu_base_;
+                next_virtual_sampler_gpu_base_ += range_bytes;
+            }
+            VirtualSamplerHeapState vs{};
+            vs.host_heap = host_heap;
+            vs.virtual_desc = *pDescriptorHeapDesc;
+            vs.virt_cpu_start = virt_cpu;
+            vs.virt_gpu_start = virt_gpu;
+            vs.host_cpu_start = host_heap->GetCPUDescriptorHandleForHeapStart();
+            if ((pDescriptorHeapDesc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0) {
+                vs.host_gpu_start = host_heap->GetGPUDescriptorHandleForHeapStart();
+            }
+            vs.inc_size = inc;
+            vs.host_capacity = kDesktopMaxSamplers;
+            vs.virt_to_host_slot.assign(pDescriptorHeapDesc->NumDescriptors, 0u);
+            vs.virt_slot_keys.resize(pDescriptorHeapDesc->NumDescriptors);
+            vs.virt_slot_valid.assign(pDescriptorHeapDesc->NumDescriptors, 0u);
+            virtual_sampler_heaps_[host_heap] = std::move(vs);
+        }
+        unbounded_sampler_heaps_created_.fetch_add(1ull, std::memory_order_relaxed);
+        RecordDev("ID3D12DeviceX::CreateDescriptorHeap[UnboundedSampler]", 14, S_OK);
+        proxy = new (std::nothrow) DescriptorHeapXProxy(
+            this, host_heap, pDescriptorHeapDesc, virt_cpu, virt_gpu);
+    } else {
+        // Sprint 16: Page-at-a-Time Console Descriptor Heap Manager (xcl #84) for shader-visible CBV/SRV/UAV.
+        if (pDescriptorHeapDesc &&
+            pDescriptorHeapDesc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
+            (pDescriptorHeapDesc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0 &&
+            pDescriptorHeapDesc->NumDescriptors > 0u) {
+            const UINT inc = std::max<UINT>(
+                1u, host_dev_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
+            const UINT descs_per_page = std::max<UINT>(1u, 65536u / std::max<UINT>(inc, 32u));
+            const UINT page_count = std::max<UINT>(
+                1u, (pDescriptorHeapDesc->NumDescriptors + descs_per_page - 1u) / descs_per_page);
+            PagedDescriptorHeapState ps{};
+            ps.primary_host_heap = host_heap;
+            ps.cpu_start = host_heap->GetCPUDescriptorHandleForHeapStart();
+            ps.gpu_start = host_heap->GetGPUDescriptorHandleForHeapStart();
+            ps.inc_size = inc;
+            ps.num_descriptors = pDescriptorHeapDesc->NumDescriptors;
+            ps.descriptors_per_page = descs_per_page;
+            ps.pages.resize(page_count);
+            for (UINT p = 0u; p < page_count; ++p) {
+                ps.pages[p].page_index = p;
+                ps.pages[p].generation = 1ull;
+                ps.pages[p].in_flight = false;
+            }
+            {
+                std::lock_guard<std::mutex> lock(paged_desc_mutex_);
+                paged_desc_heaps_[host_heap] = std::move(ps);
+            }
+            paged_descriptor_heaps_created_.fetch_add(1ull, std::memory_order_relaxed);
+            descriptor_pages_allocated_.fetch_add(page_count, std::memory_order_relaxed);
+        }
+        proxy = new (std::nothrow) DescriptorHeapXProxy(this, host_heap);
+    }
+
     host_heap->Release();
     if (!proxy) {
         RecordDev("ID3D12DeviceX::CreateDescriptorHeap", 14, E_OUTOFMEMORY);
@@ -3382,6 +3560,7 @@ void STDMETHODCALLTYPE DeviceX::CreateConstantBufferView(
         }
     }
     host_dev_->CreateConstantBufferView(desc_ptr, DestDescriptor);
+    TrackPagedDescriptorWrite(DestDescriptor);
     if (const auto hook = descriptor_create_hook_.load(std::memory_order_acquire)) {
         hook(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, DestDescriptor, nullptr, gpu_va,
              descriptor_create_ctx_.load(std::memory_order_acquire));
@@ -3465,6 +3644,7 @@ void STDMETHODCALLTYPE DeviceX::CreateShaderResourceView(
         }
     }
     host_dev_->CreateShaderResourceView(host_res, pDesc, DestDescriptor);
+    TrackPagedDescriptorWrite(DestDescriptor);
     notify_hook();
     RecordDev("ID3D12DeviceX::CreateShaderResourceView", 18, S_OK);
 }
@@ -3488,6 +3668,7 @@ void STDMETHODCALLTYPE DeviceX::CreateUnorderedAccessView(
         RecordDev("ID3D12DeviceX::CreateUnorderedAccessView[R9G9B9E5Fallback]", 19, S_OK);
     }
     host_dev_->CreateUnorderedAccessView(host_res, host_counter, desc_ptr, DestDescriptor);
+    TrackPagedDescriptorWrite(DestDescriptor);
     if (const auto hook = descriptor_create_hook_.load(std::memory_order_acquire)) {
         const D3D12_GPU_VIRTUAL_ADDRESS va =
             (host_res && host_res->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
@@ -3576,7 +3757,9 @@ void STDMETHODCALLTYPE DeviceX::CreateDepthStencilView(
 
 void STDMETHODCALLTYPE DeviceX::CreateSampler(
     const D3D12_SAMPLER_DESC* pDesc, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
-    host_dev_->CreateSampler(pDesc, DestDescriptor);
+    if (!TryHandleVirtualSamplerCreate(pDesc, DestDescriptor)) {
+        host_dev_->CreateSampler(pDesc, DestDescriptor);
+    }
     if (const auto hook = descriptor_create_hook_.load(std::memory_order_acquire)) {
         hook(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, DestDescriptor, nullptr, 0ull,
              descriptor_create_ctx_.load(std::memory_order_acquire));
@@ -3592,6 +3775,14 @@ void STDMETHODCALLTYPE DeviceX::CopyDescriptors(
     const D3D12_CPU_DESCRIPTOR_HANDLE* pSrcDescriptorRangeStarts,
     const UINT* pSrcDescriptorRangeSizes,
     D3D12_DESCRIPTOR_HEAP_TYPE DescriptorHeapsType) {
+    if (DescriptorHeapsType == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER &&
+        TryHandleVirtualSamplerCopy(
+            NumDestDescriptorRanges, pDestDescriptorRangeStarts, pDestDescriptorRangeSizes,
+            NumSrcDescriptorRanges, pSrcDescriptorRangeStarts, pSrcDescriptorRangeSizes)) {
+        RecordDev("ID3D12DeviceX::CopyDescriptors[UnboundedSampler]", 23, S_OK);
+        RecordDev("ID3D12DeviceX::CopyDescriptors", 23, S_OK);
+        return;
+    }
     host_dev_->CopyDescriptors(
         NumDestDescriptorRanges, pDestDescriptorRangeStarts, pDestDescriptorRangeSizes,
         NumSrcDescriptorRanges, pSrcDescriptorRangeStarts, pSrcDescriptorRangeSizes,
@@ -3612,6 +3803,7 @@ void STDMETHODCALLTYPE DeviceX::CopyDescriptors(
             D3D12_CPU_DESCRIPTOR_HANDLE src_h{
                 pSrcDescriptorRangeStarts[src_r].ptr + static_cast<SIZE_T>(src_i) * inc};
             sampler_feedback_mgr_.CopyPreservedView(dst_h, src_h);
+            TrackPagedDescriptorWrite(dst_h);
             ++dst_i;
             ++src_i;
         }
@@ -3624,6 +3816,15 @@ void STDMETHODCALLTYPE DeviceX::CopyDescriptorsSimple(
     D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptorRangeStart,
     D3D12_CPU_DESCRIPTOR_HANDLE SrcDescriptorRangeStart,
     D3D12_DESCRIPTOR_HEAP_TYPE DescriptorHeapsType) {
+    if (DescriptorHeapsType == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER && NumDescriptors > 0u) {
+        if (TryHandleVirtualSamplerCopy(
+                1u, &DestDescriptorRangeStart, &NumDescriptors,
+                1u, &SrcDescriptorRangeStart, &NumDescriptors)) {
+            RecordDev("ID3D12DeviceX::CopyDescriptorsSimple[UnboundedSampler]", 24, S_OK);
+            RecordDev("ID3D12DeviceX::CopyDescriptorsSimple", 24, S_OK);
+            return;
+        }
+    }
     host_dev_->CopyDescriptorsSimple(
         NumDescriptors, DestDescriptorRangeStart, SrcDescriptorRangeStart, DescriptorHeapsType);
     if (DescriptorHeapsType == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && NumDescriptors > 0u) {
@@ -3635,6 +3836,7 @@ void STDMETHODCALLTYPE DeviceX::CopyDescriptorsSimple(
                 SrcDescriptorRangeStart.ptr + static_cast<SIZE_T>(i) * inc};
             sampler_feedback_mgr_.CopyPreservedView(dst_h, src_h);
         }
+        TrackPagedDescriptorWrite(DestDescriptorRangeStart);
     }
     RecordDev("ID3D12DeviceX::CopyDescriptorsSimple", 24, S_OK);
 }
@@ -3902,7 +4104,9 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateHeap(
         heap_ptr ? heap_ptr->Properties.Type : D3D12_HEAP_TYPE_DEFAULT,
         /*is_placed_suballocation=*/false,
         did_l0_spill,
-        sparse_va);
+        sparse_va,
+        /*is_heap=*/true,
+        /*parent_heap=*/nullptr);
     auto* proxy = new (std::nothrow) HeapXProxy(this, host_heap, sparse_va);
     host_heap->Release();
     if (!proxy) {
@@ -3995,7 +4199,12 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResource(
         const bool align_incompatible =
             ((HeapOffset % eff_align) != 0ull) ||
             (hd.Alignment > 0ull && eff_align > hd.Alignment && (hd.Alignment % eff_align) != 0ull);
-        should_promote_oversized = size_exceeds_heap || align_incompatible;
+        const bool uma_large_texture_promo =
+            sanitized_ihv_caps_.promote_large_placed_textures_to_committed &&
+            sanitized_ihv_caps_.large_placed_texture_threshold_bytes > 0ull &&
+            req_alloc.SizeInBytes != UINT64_MAX &&
+            req_alloc.SizeInBytes >= sanitized_ihv_caps_.large_placed_texture_threshold_bytes;
+        should_promote_oversized = size_exceeds_heap || align_incompatible || uma_large_texture_promo;
     }
 
     ID3D12Resource* host_res = nullptr;
@@ -4055,13 +4264,16 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResource(
             (sparse_window_iso_ && est_bytes > 0ull)
                 ? openscarlett::SparseVramAllocateTitleWindow(sparse_window_iso_, est_bytes)
                 : 0ull;
+        const bool is_placed = !(placed_used_shadow_fallback || promoted_oversized_placed);
         TrackLiveResidencyObject(
             static_cast<ID3D12Pageable*>(host_res),
             est_bytes,
             promoted_oversized_placed ? promoted_hp.Type : D3D12_HEAP_TYPE_DEFAULT,
-            /*is_placed_suballocation=*/!(placed_used_shadow_fallback || promoted_oversized_placed),
+            /*is_placed_suballocation=*/is_placed,
             /*spilled_to_l0=*/false,
-            sparse_va);
+            sparse_va,
+            /*is_heap=*/false,
+            /*parent_heap=*/is_placed ? static_cast<ID3D12Pageable*>(host_heap) : nullptr);
     }
     TrackFallbackResource(host_res, did_r9g9b9e5_fallback);
     if (did_r9g9b9e5_fallback) {
@@ -4481,6 +4693,51 @@ HRESULT STDMETHODCALLTYPE DeviceX::SetStablePowerState(BOOL Enable) {
 HRESULT STDMETHODCALLTYPE DeviceX::CreateCommandSignature(
     const D3D12_COMMAND_SIGNATURE_DESC* pDesc, ID3D12RootSignature* pRootSignature,
     REFIID riid, void** ppvCommandSignature) {
+    if (!pDesc || pDesc->NumArgumentDescs == 0u || !pDesc->pArgumentDescs) {
+        RecordDev("ID3D12DeviceX::CreateCommandSignature", 41, E_INVALIDARG);
+        return E_INVALIDARG;
+    }
+    // Validate indirect argument layout and minimum byte stride before forwarding to host D3D12.
+    UINT min_stride = 0u;
+    bool has_dispatch_mesh = false;
+    for (UINT i = 0u; i < pDesc->NumArgumentDescs; ++i) {
+        const auto& a = pDesc->pArgumentDescs[i];
+        switch (a.Type) {
+            case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: min_stride += 16u; break;
+            case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: min_stride += 20u; break;
+            case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: min_stride += 12u; break;
+            case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW: min_stride += 16u; break;
+            case D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW: min_stride += 12u; break;
+            case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT:
+                if (a.Constant.Num32BitValuesToSet == 0u) {
+                    RecordDev("ID3D12DeviceX::CreateCommandSignature", 41, E_INVALIDARG);
+                    return E_INVALIDARG;
+                }
+                min_stride += a.Constant.Num32BitValuesToSet * 4u;
+                break;
+            case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW:
+            case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW:
+            case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW:
+                min_stride += 8u;
+                break;
+            default:
+                if (static_cast<UINT>(a.Type) == 10u) {
+                    has_dispatch_mesh = true;
+                    min_stride += 12u;
+                } else if (static_cast<UINT>(a.Type) == 9u) {
+                    min_stride += 104u;
+                } else {
+                    RecordDev("ID3D12DeviceX::CreateCommandSignature", 41, E_INVALIDARG);
+                    return E_INVALIDARG;
+                }
+                break;
+        }
+    }
+    if (pDesc->ByteStride < min_stride) {
+        RecordDev("ID3D12DeviceX::CreateCommandSignature[InvalidStride]", 41, E_INVALIDARG);
+        return E_INVALIDARG;
+    }
+
     ID3D12RootSignature* host_rs = UnwrapRootSignature(pRootSignature);
     if (!ppvCommandSignature) {
         const HRESULT hr = host_dev_->CreateCommandSignature(pDesc, host_rs, riid, nullptr);
@@ -4491,14 +4748,20 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommandSignature(
     ID3D12CommandSignature* host_sig = nullptr;
     HRESULT hr = host_dev_->CreateCommandSignature(
         pDesc, host_rs, OS_D3D12_IID(ID3D12CommandSignature), reinterpret_cast<void**>(&host_sig));
-    if (FAILED(hr) || !host_sig) {
+    bool virtual_mesh_fallback = false;
+    if ((FAILED(hr) || !host_sig) && has_dispatch_mesh && sanitized_ihv_caps_.mesh_shader_tier < 10u) {
+        // WARP / MeshTier=0 fallback: create validated virtual CommandSignatureXProxy so titles
+        // initializing DispatchMesh indirect signatures do not fail device startup.
+        virtual_mesh_fallback = true;
+        hr = S_OK;
+        RecordDev("ID3D12DeviceX::CreateCommandSignature[DispatchMeshVirtualFallback]", 41, S_OK);
+    }
+    if (FAILED(hr) || (!host_sig && !virtual_mesh_fallback)) {
         RecordDev("ID3D12DeviceX::CreateCommandSignature", 41, hr);
         return hr;
     }
-    const UINT stride = pDesc ? pDesc->ByteStride : 0u;
-    const UINT num_args = pDesc ? pDesc->NumArgumentDescs : 0u;
-    auto* proxy = new (std::nothrow) CommandSignatureXProxy(this, host_sig, stride, num_args);
-    host_sig->Release();
+    auto* proxy = new (std::nothrow) CommandSignatureXProxy(this, host_sig, pDesc, virtual_mesh_fallback);
+    if (host_sig) host_sig->Release();
     if (!proxy) {
         RecordDev("ID3D12DeviceX::CreateCommandSignature", 41, E_OUTOFMEMORY);
         return E_OUTOFMEMORY;
@@ -5587,7 +5850,9 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateHeap1(
         heap_ptr ? heap_ptr->Properties.Type : D3D12_HEAP_TYPE_DEFAULT,
         /*is_placed_suballocation=*/false,
         /*spilled_to_l0=*/false,
-        sparse_va);
+        sparse_va,
+        /*is_heap=*/true,
+        /*parent_heap=*/nullptr);
     auto* proxy = new (std::nothrow) HeapXProxy(this, host_heap, sparse_va);
     host_heap->Release();
     if (!proxy) {
@@ -6686,6 +6951,55 @@ HRESULT STDMETHODCALLTYPE DeviceX::GetGpuHardwareInfoX(D3D12XBOX_GPU_HARDWARE_IN
     }
     pOutInfo->AdapterName[copy_len] = '\0';
     RecordDev("ID3D12DeviceX::GetGpuHardwareInfoX", 79, S_OK);
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE DeviceX::GetGpuHardwareConfigurationX(
+    D3D12XBOX_GPU_HARDWARE_CONFIGURATION* pOutConfig) {
+    if (!pOutConfig) {
+        RecordDev("ID3D12DeviceX::GetGpuHardwareConfigurationX", 80, E_POINTER);
+        return E_POINTER;
+    }
+    std::memset(pOutConfig, 0, sizeof(*pOutConfig));
+    uint32_t profile_id = 0u;
+    uint64_t console_vram = 0ull;
+    uint64_t eff_budget = 0ull;
+    {
+        std::lock_guard<std::mutex> lock(residency_mutex_);
+        profile_id = console_profile_.profile_id;
+        console_vram = console_profile_.target_console_vram_bytes;
+        eff_budget = EffectiveResidencyBudgetBytesLocked();
+    }
+    pOutConfig->StructSize = static_cast<uint32_t>(sizeof(*pOutConfig));
+    pOutConfig->ConsoleProfile = profile_id;
+    pOutConfig->ComputeUnitCount = (profile_id == 1u) ? 52u : 20u;
+    pOutConfig->ShaderEngineCount = (profile_id == 1u) ? 4u : 2u;
+    pOutConfig->GpuClockMhz = (profile_id == 1u) ? 1825u : 1565u;
+    pOutConfig->HostVendorClass = static_cast<uint32_t>(sanitized_ihv_caps_.vendor_class);
+    pOutConfig->HostVendorId = sanitized_ihv_caps_.vendor_id;
+    pOutConfig->HostDeviceId = sanitized_ihv_caps_.device_id;
+    pOutConfig->HostWaveLaneMin = sanitized_ihv_caps_.wave_lane_min;
+    pOutConfig->HostWaveLaneMax = sanitized_ihv_caps_.wave_lane_max;
+    pOutConfig->PreferredWaveSize = sanitized_ihv_caps_.preferred_wave_size;
+    pOutConfig->HostRaytracingTier = sanitized_ihv_caps_.raytracing_tier;
+    pOutConfig->HostMeshShaderTier = sanitized_ihv_caps_.mesh_shader_tier;
+    pOutConfig->HostHighestShaderModel = sanitized_ihv_caps_.highest_shader_model;
+    pOutConfig->IsWarp = sanitized_ihv_caps_.is_warp ? 1u : 0u;
+    pOutConfig->IsUmaLowVram = sanitized_ihv_caps_.is_uma_low_vram ? 1u : 0u;
+    pOutConfig->RequiresWave64Emulation = sanitized_ihv_caps_.requires_wave64_emulation ? 1u : 0u;
+    pOutConfig->SupportsPageIsolatedDescriptorHeaps = 1u;
+    pOutConfig->SupportsUnboundedSamplerHeaps = 1u;
+    pOutConfig->SupportsDedicatedCopyEngine = 1u;
+    pOutConfig->ConsoleVramBudgetBytes = console_vram;
+    pOutConfig->HostDedicatedVramBytes = sanitized_ihv_caps_.dedicated_video_memory_bytes;
+    pOutConfig->EffectiveVramBudgetBytes =
+        (eff_budget > 0ull) ? eff_budget : sanitized_ihv_caps_.effective_vram_budget_bytes;
+    const size_t n = std::min(sanitized_ihv_caps_.description.size(), sizeof(pOutConfig->AdapterName) - 1u);
+    if (n > 0u) {
+        std::memcpy(pOutConfig->AdapterName, sanitized_ihv_caps_.description.data(), n);
+    }
+    pOutConfig->AdapterName[n] = '\0';
+    RecordDev("ID3D12DeviceX::GetGpuHardwareConfigurationX", 80, S_OK);
     return S_OK;
 }
 
@@ -8746,13 +9060,25 @@ uint64_t DeviceX::EffectiveResidencyBudgetBytesLocked() const noexcept {
     return console_profile_.target_console_vram_bytes;
 }
 
+bool DeviceX::IsResidencyEntryLiveProtectedLocked(const LiveResidencyEntry& e) const noexcept {
+    if (e.priority == D3D12_RESIDENCY_PRIORITY_MAXIMUM) return true;
+    if (e.active_pin_count > 0u) return true;
+    if (e.residency_ref_count > 1u) return true;  // Explicitly pinned via MakeResident
+    if (e.is_heap && e.placed_child_count > 0u) return true;  // Live heap backing placed resources
+    if (e.in_flight_fence != nullptr &&
+        e.in_flight_fence->GetCompletedValue() < e.in_flight_fence_value) {
+        return true;  // Referenced by in-flight GPU work
+    }
+    return false;
+}
+
 uint64_t DeviceX::EvictLruVictimsLocked(uint64_t bytes_needed, ID3D12Pageable* protect_obj) noexcept {
     if (!host_dev_ || bytes_needed == 0ull || residency_lru_.empty()) return 0ull;
     uint64_t freed = 0ull;
 
-    // Two-pass priority-aware LRU eviction:
-    // Pass 0 evicts MINIMUM/LOW/NORMAL priority victims first; Pass 1 evicts HIGH if still over budget.
-    // MAXIMUM priority objects are never auto-evicted.
+    // Two-pass priority-aware LRU eviction with Sprint 16 live-heap hygiene:
+    // NEVER auto-evict actively-referenced, MakeResident-pinned, placed-child-backing,
+    // MAXIMUM-priority, or in-flight GPU heaps/resources!
     for (int pass = 0; pass < 2 && freed < bytes_needed; ++pass) {
         std::vector<ID3D12Pageable*> victims;
         for (auto it = residency_lru_.rbegin(); it != residency_lru_.rend() && freed < bytes_needed; ++it) {
@@ -8762,7 +9088,10 @@ uint64_t DeviceX::EvictLruVictimsLocked(uint64_t bytes_needed, ID3D12Pageable* p
             if (eit == residency_entries_.end()) continue;
             const auto& e = eit->second;
             if (!e.is_resident || e.is_placed_suballocation || e.spilled_to_l0) continue;
-            if (e.priority == D3D12_RESIDENCY_PRIORITY_MAXIMUM) continue;
+            if (IsResidencyEntryLiveProtectedLocked(e)) {
+                if (pass == 0) ++skipped_active_live_heaps_;
+                continue;
+            }
             if (pass == 0 && e.priority == D3D12_RESIDENCY_PRIORITY_HIGH) continue;
             victims.push_back(cand);
             freed += e.size_bytes;
@@ -8771,6 +9100,10 @@ uint64_t DeviceX::EvictLruVictimsLocked(uint64_t bytes_needed, ID3D12Pageable* p
             auto eit = residency_entries_.find(v);
             if (eit == residency_entries_.end() || !eit->second.is_resident) continue;
             auto& e = eit->second;
+            if (IsResidencyEntryLiveProtectedLocked(e)) {
+                ++skipped_active_live_heaps_;
+                continue;
+            }
             const HRESULT ev_hr = host_dev_->Evict(1u, &v);
             if (SUCCEEDED(ev_hr)) {
                 e.is_resident = false;
@@ -8798,6 +9131,9 @@ void DeviceX::PrepareResidencyBudgetForAllocation(
     if (requested_bytes == 0ull) return;
 
     std::lock_guard<std::mutex> lock(residency_mutex_);
+    // Sprint 16 VRAM Residency Hygiene:
+    // Never auto-evict live heaps unless an explicit budget cap is actually exceeded
+    // (or real tracked usage exceeds the host DXGI / console VRAM budget).
     const uint64_t budget = EffectiveResidencyBudgetBytesLocked();
     if (budget == 0ull) return;
 
@@ -8805,7 +9141,7 @@ void DeviceX::PrepareResidencyBudgetForAllocation(
         const uint64_t over = (tracked_resident_bytes_ + requested_bytes) - budget;
         (void)EvictLruVictimsLocked(over, nullptr);
     }
-    // If still over budget after evicting eligible LRU victims, spill this cold allocation to L0 system RAM!
+    // If still over budget after evicting eligible unpinned LRU victims, spill cold allocation to L0.
     if (allow_l0_spill && (tracked_resident_bytes_ + requested_bytes > budget)) {
         out_should_spill_l0 = true;
     }
@@ -8817,13 +9153,25 @@ void DeviceX::TrackLiveResidencyObject(
     D3D12_HEAP_TYPE heap_type,
     bool is_placed_suballocation,
     bool spilled_to_l0,
-    uint64_t sparse_window_va) {
+    uint64_t sparse_window_va,
+    bool is_heap,
+    ID3D12Pageable* parent_heap) {
     if (!host_obj) return;
     std::lock_guard<std::mutex> lock(residency_mutex_);
     auto it = residency_entries_.find(host_obj);
     if (it != residency_entries_.end()) {
         if (it->second.in_lru) {
             residency_lru_.erase(it->second.lru_it);
+        }
+        if (it->second.in_flight_fence) {
+            it->second.in_flight_fence->Release();
+            it->second.in_flight_fence = nullptr;
+        }
+        if (it->second.parent_heap) {
+            auto pit = residency_entries_.find(it->second.parent_heap);
+            if (pit != residency_entries_.end() && pit->second.placed_child_count > 0u) {
+                --pit->second.placed_child_count;
+            }
         }
         if (it->second.sparse_window_va != 0ull && sparse_window_iso_) {
             openscarlett::SparseVramFree(sparse_window_iso_, it->second.sparse_window_va);
@@ -8838,9 +9186,17 @@ void DeviceX::TrackLiveResidencyObject(
     e.heap_type = heap_type;
     e.priority = D3D12_RESIDENCY_PRIORITY_NORMAL;
     e.residency_ref_count = 1u;
+    e.is_heap = is_heap;
+    e.parent_heap = parent_heap;
     e.is_resident = true;
     e.is_placed_suballocation = is_placed_suballocation;
     e.spilled_to_l0 = spilled_to_l0;
+    if (parent_heap) {
+        auto pit = residency_entries_.find(parent_heap);
+        if (pit != residency_entries_.end()) {
+            ++pit->second.placed_child_count;
+        }
+    }
     if (!is_placed_suballocation) {
         if (spilled_to_l0) {
             l0_spilled_bytes_ += size_bytes;
@@ -8860,9 +9216,19 @@ void DeviceX::UntrackLiveResidencyObject(ID3D12Pageable* host_obj) noexcept {
     std::lock_guard<std::mutex> lock(residency_mutex_);
     auto it = residency_entries_.find(host_obj);
     if (it == residency_entries_.end()) return;
-    const auto& e = it->second;
+    auto& e = it->second;
     if (e.in_lru) {
         residency_lru_.erase(e.lru_it);
+    }
+    if (e.in_flight_fence) {
+        e.in_flight_fence->Release();
+        e.in_flight_fence = nullptr;
+    }
+    if (e.parent_heap) {
+        auto pit = residency_entries_.find(e.parent_heap);
+        if (pit != residency_entries_.end() && pit->second.placed_child_count > 0u) {
+            --pit->second.placed_child_count;
+        }
     }
     if (e.sparse_window_va != 0ull && sparse_window_iso_) {
         openscarlett::SparseVramFree(sparse_window_iso_, e.sparse_window_va);
@@ -8923,6 +9289,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::GetVramResidencyStats(
         out_stats->window1_title_buffer_bytes);
     out_stats->promoted_oversized_placed_resources =
         promoted_oversized_placed_resources_.load(std::memory_order_relaxed);
+    out_stats->skipped_active_live_heaps = skipped_active_live_heaps_;
     return S_OK;
 }
 
@@ -9124,6 +9491,563 @@ HRESULT STDMETHODCALLTYPE DeviceX::GetGraphicsParityStats(
         vline_notifications_signaled_.load(std::memory_order_relaxed);
     out_stats->frame_notifications_signaled =
         frame_notifications_signaled_.load(std::memory_order_relaxed);
+    return S_OK;
+}
+
+// ============================================================================
+// Sprint 16: Page-at-a-Time Descriptor Heaps, Unbounded Sampler Heap (>2048),
+// Live GPU FMASK/DCC/HTILE Resolve Wiring, & Active Residency Protection
+// ============================================================================
+
+DeviceX::SamplerDescKey DeviceX::CanonicalizeSamplerDesc(const D3D12_SAMPLER_DESC& desc) noexcept {
+    D3D12_SAMPLER_DESC c = desc;
+    auto norm_f = [](FLOAT f) noexcept -> FLOAT { return (f == 0.0f) ? 0.0f : f; };
+    c.MipLODBias = norm_f(c.MipLODBias);
+    c.MinLOD = norm_f(c.MinLOD);
+    c.MaxLOD = norm_f(c.MaxLOD);
+    for (int i = 0; i < 4; ++i) c.BorderColor[i] = norm_f(c.BorderColor[i]);
+    if (c.AddressU != D3D12_TEXTURE_ADDRESS_MODE_BORDER &&
+        c.AddressV != D3D12_TEXTURE_ADDRESS_MODE_BORDER &&
+        c.AddressW != D3D12_TEXTURE_ADDRESS_MODE_BORDER) {
+        c.BorderColor[0] = c.BorderColor[1] = c.BorderColor[2] = c.BorderColor[3] = 0.0f;
+    }
+    SamplerDescKey key{};
+    std::memcpy(key.bytes, &c, sizeof(c));
+    return key;
+}
+
+bool DeviceX::TryHandleVirtualSamplerCreate(
+    const D3D12_SAMPLER_DESC* pDesc,
+    D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) noexcept {
+    if (!pDesc || DestDescriptor.ptr == 0u) return false;
+    std::lock_guard<std::mutex> lock(virt_sampler_mutex_);
+    for (auto& [host_heap, vs] : virtual_sampler_heaps_) {
+        (void)host_heap;
+        const uint64_t base = static_cast<uint64_t>(vs.virt_cpu_start.ptr);
+        const uint64_t end = base + static_cast<uint64_t>(vs.virtual_desc.NumDescriptors) * vs.inc_size;
+        const uint64_t ptr = static_cast<uint64_t>(DestDescriptor.ptr);
+        if (ptr < base || ptr >= end) continue;
+        const uint32_t virt_slot = static_cast<uint32_t>((ptr - base) / vs.inc_size);
+        if (virt_slot >= vs.virtual_desc.NumDescriptors) return true;
+
+        const SamplerDescKey key = CanonicalizeSamplerDesc(*pDesc);
+        unbounded_sampler_writes_.fetch_add(1ull, std::memory_order_relaxed);
+        auto it = vs.dedup_map.find(key);
+        uint16_t host_slot = 0u;
+        if (it != vs.dedup_map.end()) {
+            host_slot = it->second;
+            unbounded_sampler_dedup_hits_.fetch_add(1ull, std::memory_order_relaxed);
+        } else {
+            if (vs.next_host_slot < vs.host_capacity) {
+                host_slot = static_cast<uint16_t>(vs.next_host_slot++);
+                unbounded_sampler_unique_host_slots_.fetch_add(1ull, std::memory_order_relaxed);
+            } else {
+                // Beyond 2048 truly distinct sampler states: wrap deterministically into backing slots.
+                host_slot = static_cast<uint16_t>(virt_slot % vs.host_capacity);
+            }
+            D3D12_CPU_DESCRIPTOR_HANDLE host_dst{
+                vs.host_cpu_start.ptr + static_cast<SIZE_T>(host_slot) * vs.inc_size};
+            host_dev_->CreateSampler(pDesc, host_dst);
+            vs.dedup_map[key] = host_slot;
+        }
+        vs.virt_to_host_slot[virt_slot] = host_slot;
+        vs.virt_slot_keys[virt_slot] = key;
+        vs.virt_slot_valid[virt_slot] = 1u;
+        return true;
+    }
+    return false;
+}
+
+bool DeviceX::TryHandleVirtualSamplerCopy(
+    UINT NumDestDescriptorRanges,
+    const D3D12_CPU_DESCRIPTOR_HANDLE* pDestDescriptorRangeStarts,
+    const UINT* pDestDescriptorRangeSizes,
+    UINT NumSrcDescriptorRanges,
+    const D3D12_CPU_DESCRIPTOR_HANDLE* pSrcDescriptorRangeStarts,
+    const UINT* pSrcDescriptorRangeSizes) noexcept {
+    if (!pDestDescriptorRangeStarts || !pSrcDescriptorRangeStarts ||
+        NumDestDescriptorRanges == 0u || NumSrcDescriptorRanges == 0u) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(virt_sampler_mutex_);
+    if (virtual_sampler_heaps_.empty()) return false;
+
+    auto find_virtual = [&](SIZE_T ptr, VirtualSamplerHeapState*& out_vs, uint32_t& out_slot) -> bool {
+        for (auto& [host_heap, vs] : virtual_sampler_heaps_) {
+            (void)host_heap;
+            const uint64_t base = static_cast<uint64_t>(vs.virt_cpu_start.ptr);
+            const uint64_t end = base + static_cast<uint64_t>(vs.virtual_desc.NumDescriptors) * vs.inc_size;
+            if (static_cast<uint64_t>(ptr) >= base && static_cast<uint64_t>(ptr) < end) {
+                out_vs = &vs;
+                out_slot = static_cast<uint32_t>((static_cast<uint64_t>(ptr) - base) / vs.inc_size);
+                return true;
+            }
+        }
+        return false;
+    };
+
+    bool any_virtual = false;
+    for (UINT r = 0u; r < NumDestDescriptorRanges && !any_virtual; ++r) {
+        VirtualSamplerHeapState* vs = nullptr;
+        uint32_t slot = 0u;
+        if (find_virtual(pDestDescriptorRangeStarts[r].ptr, vs, slot)) any_virtual = true;
+    }
+    for (UINT r = 0u; r < NumSrcDescriptorRanges && !any_virtual; ++r) {
+        VirtualSamplerHeapState* vs = nullptr;
+        uint32_t slot = 0u;
+        if (find_virtual(pSrcDescriptorRangeStarts[r].ptr, vs, slot)) any_virtual = true;
+    }
+    if (!any_virtual) return false;
+
+    const UINT inc = std::max<UINT>(
+        1u, host_dev_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER));
+    UINT dst_r = 0u, dst_i = 0u, src_r = 0u, src_i = 0u;
+    while (dst_r < NumDestDescriptorRanges && src_r < NumSrcDescriptorRanges) {
+        const UINT dst_cnt = pDestDescriptorRangeSizes ? pDestDescriptorRangeSizes[dst_r] : 1u;
+        const UINT src_cnt = pSrcDescriptorRangeSizes ? pSrcDescriptorRangeSizes[src_r] : 1u;
+        if (dst_i >= dst_cnt) { ++dst_r; dst_i = 0u; continue; }
+        if (src_i >= src_cnt) { ++src_r; src_i = 0u; continue; }
+
+        const D3D12_CPU_DESCRIPTOR_HANDLE dst_h{
+            pDestDescriptorRangeStarts[dst_r].ptr + static_cast<SIZE_T>(dst_i) * inc};
+        const D3D12_CPU_DESCRIPTOR_HANDLE src_h{
+            pSrcDescriptorRangeStarts[src_r].ptr + static_cast<SIZE_T>(src_i) * inc};
+
+        VirtualSamplerHeapState* dst_vs = nullptr;
+        VirtualSamplerHeapState* src_vs = nullptr;
+        uint32_t dst_slot = 0u, src_slot = 0u;
+        const bool dst_is_virt = find_virtual(dst_h.ptr, dst_vs, dst_slot);
+        const bool src_is_virt = find_virtual(src_h.ptr, src_vs, src_slot);
+
+        if (dst_is_virt && src_is_virt) {
+            if (src_slot < src_vs->virt_slot_valid.size() && src_vs->virt_slot_valid[src_slot]) {
+                const SamplerDescKey& key = src_vs->virt_slot_keys[src_slot];
+                D3D12_SAMPLER_DESC sdesc{};
+                std::memcpy(&sdesc, key.bytes, sizeof(sdesc));
+                auto dit = dst_vs->dedup_map.find(key);
+                uint16_t hslot = 0u;
+                if (dit != dst_vs->dedup_map.end()) {
+                    hslot = dit->second;
+                    unbounded_sampler_dedup_hits_.fetch_add(1ull, std::memory_order_relaxed);
+                } else {
+                    hslot = (dst_vs->next_host_slot < dst_vs->host_capacity)
+                                ? static_cast<uint16_t>(dst_vs->next_host_slot++)
+                                : static_cast<uint16_t>(dst_slot % dst_vs->host_capacity);
+                    D3D12_CPU_DESCRIPTOR_HANDLE hdst{
+                        dst_vs->host_cpu_start.ptr + static_cast<SIZE_T>(hslot) * dst_vs->inc_size};
+                    host_dev_->CreateSampler(&sdesc, hdst);
+                    dst_vs->dedup_map[key] = hslot;
+                    unbounded_sampler_unique_host_slots_.fetch_add(1ull, std::memory_order_relaxed);
+                }
+                dst_vs->virt_to_host_slot[dst_slot] = hslot;
+                dst_vs->virt_slot_keys[dst_slot] = key;
+                dst_vs->virt_slot_valid[dst_slot] = 1u;
+                unbounded_sampler_writes_.fetch_add(1ull, std::memory_order_relaxed);
+            }
+        } else if (!dst_is_virt && src_is_virt) {
+            if (src_slot < src_vs->virt_slot_valid.size() && src_vs->virt_slot_valid[src_slot]) {
+                D3D12_SAMPLER_DESC sdesc{};
+                std::memcpy(&sdesc, src_vs->virt_slot_keys[src_slot].bytes, sizeof(sdesc));
+                host_dev_->CreateSampler(&sdesc, dst_h);
+            }
+        } else if (dst_is_virt && !src_is_virt) {
+            const uint16_t hslot = (dst_vs->next_host_slot < dst_vs->host_capacity)
+                                       ? static_cast<uint16_t>(dst_vs->next_host_slot++)
+                                       : static_cast<uint16_t>(dst_slot % dst_vs->host_capacity);
+            D3D12_CPU_DESCRIPTOR_HANDLE hdst{
+                dst_vs->host_cpu_start.ptr + static_cast<SIZE_T>(hslot) * dst_vs->inc_size};
+            host_dev_->CopyDescriptorsSimple(1u, hdst, src_h, D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER);
+            dst_vs->virt_to_host_slot[dst_slot] = hslot;
+            unbounded_sampler_writes_.fetch_add(1ull, std::memory_order_relaxed);
+        }
+        ++dst_i;
+        ++src_i;
+    }
+    return true;
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE DeviceX::TranslateGpuDescriptorHandle(
+    D3D12_GPU_DESCRIPTOR_HANDLE handle) noexcept {
+    if (handle.ptr == 0ull) return handle;
+    std::lock_guard<std::mutex> lock(virt_sampler_mutex_);
+    for (const auto& [host_heap, vs] : virtual_sampler_heaps_) {
+        (void)host_heap;
+        if (vs.virt_gpu_start.ptr == 0ull) continue;
+        const uint64_t base = vs.virt_gpu_start.ptr;
+        const uint64_t end = base + static_cast<uint64_t>(vs.virtual_desc.NumDescriptors) * vs.inc_size;
+        if (handle.ptr >= base && handle.ptr < end) {
+            const uint32_t virt_slot = static_cast<uint32_t>((handle.ptr - base) / vs.inc_size);
+            const uint16_t host_slot = (virt_slot < vs.virt_to_host_slot.size())
+                                           ? vs.virt_to_host_slot[virt_slot]
+                                           : 0u;
+            unbounded_sampler_table_translations_.fetch_add(1ull, std::memory_order_relaxed);
+            D3D12_GPU_DESCRIPTOR_HANDLE out{};
+            out.ptr = vs.host_gpu_start.ptr + static_cast<uint64_t>(host_slot) * vs.inc_size;
+            return out;
+        }
+    }
+    return handle;
+}
+
+void DeviceX::NotifyDescriptorHeapBoundOnCommandList(ID3D12DescriptorHeap* host_heap) noexcept {
+    if (!host_heap) return;
+    std::lock_guard<std::mutex> lock(paged_desc_mutex_);
+    auto it = paged_desc_heaps_.find(host_heap);
+    if (it == paged_desc_heaps_.end()) return;
+    for (auto& page : it->second.pages) {
+        page.in_flight = true;
+    }
+}
+
+void DeviceX::TrackPagedDescriptorWrite(D3D12_CPU_DESCRIPTOR_HANDLE dest_cpu) noexcept {
+    if (dest_cpu.ptr == 0u) return;
+    std::lock_guard<std::mutex> lock(paged_desc_mutex_);
+    for (auto& [host_heap, ps] : paged_desc_heaps_) {
+        (void)host_heap;
+        const uint64_t base = static_cast<uint64_t>(ps.cpu_start.ptr);
+        const uint64_t end = base + static_cast<uint64_t>(ps.num_descriptors) * ps.inc_size;
+        const uint64_t ptr = static_cast<uint64_t>(dest_cpu.ptr);
+        if (ptr < base || ptr >= end) continue;
+        const uint32_t slot = static_cast<uint32_t>((ptr - base) / ps.inc_size);
+        const uint32_t pidx = slot / std::max<UINT>(1u, ps.descriptors_per_page);
+        if (pidx < ps.pages.size()) {
+            auto& page = ps.pages[pidx];
+            if (page.in_flight) {
+                ++page.generation;
+                page.in_flight = false;
+                descriptor_page_generations_advanced_.fetch_add(1ull, std::memory_order_relaxed);
+                descriptor_page_rotations_.fetch_add(1ull, std::memory_order_relaxed);
+            }
+        }
+        return;
+    }
+}
+
+HRESULT STDMETHODCALLTYPE DeviceX::GetGraphicsCompletenessStats(
+    D3D12XBOX_GRAPHICS_COMPLETENESS_STATS* out_stats) {
+    if (!out_stats) return E_POINTER;
+    std::memset(out_stats, 0, sizeof(*out_stats));
+    out_stats->paged_descriptor_heaps_created =
+        paged_descriptor_heaps_created_.load(std::memory_order_relaxed);
+    out_stats->descriptor_pages_allocated =
+        descriptor_pages_allocated_.load(std::memory_order_relaxed);
+    out_stats->descriptor_page_rotations =
+        descriptor_page_rotations_.load(std::memory_order_relaxed);
+    out_stats->descriptor_page_generations_advanced =
+        descriptor_page_generations_advanced_.load(std::memory_order_relaxed);
+    out_stats->unbounded_sampler_heaps_created =
+        unbounded_sampler_heaps_created_.load(std::memory_order_relaxed);
+    out_stats->unbounded_sampler_writes =
+        unbounded_sampler_writes_.load(std::memory_order_relaxed);
+    out_stats->unbounded_sampler_dedup_hits =
+        unbounded_sampler_dedup_hits_.load(std::memory_order_relaxed);
+    out_stats->unbounded_sampler_unique_host_slots =
+        unbounded_sampler_unique_host_slots_.load(std::memory_order_relaxed);
+    out_stats->unbounded_sampler_table_translations =
+        unbounded_sampler_table_translations_.load(std::memory_order_relaxed);
+    out_stats->dedicated_copy_queues_created =
+        dedicated_copy_queues_created_.load(std::memory_order_relaxed);
+    out_stats->copy_queue_barriers_sanitized =
+        copy_queue_barriers_sanitized_.load(std::memory_order_relaxed);
+    out_stats->copy_queue_uav_barriers_suppressed =
+        copy_queue_uav_barriers_suppressed_.load(std::memory_order_relaxed);
+    out_stats->execute_indirect_calls =
+        execute_indirect_calls_.load(std::memory_order_relaxed);
+    out_stats->execute_indirect_with_count_buffer =
+        execute_indirect_with_count_buffer_.load(std::memory_order_relaxed);
+    out_stats->execute_indirect_with_root_constants =
+        execute_indirect_with_root_constants_.load(std::memory_order_relaxed);
+    out_stats->execute_indirect_dispatch_mesh =
+        execute_indirect_dispatch_mesh_.load(std::memory_order_relaxed);
+    out_stats->execute_indirect_bounds_clamped =
+        execute_indirect_bounds_clamped_.load(std::memory_order_relaxed);
+    out_stats->execute_indirect_rejected =
+        execute_indirect_rejected_.load(std::memory_order_relaxed);
+    out_stats->execute_indirect_va_translated =
+        execute_indirect_va_translated_.load(std::memory_order_relaxed);
+    out_stats->execute_indirect_vulkan_routed =
+        execute_indirect_vulkan_routed_.load(std::memory_order_relaxed);
+    out_stats->gpu_fmask_resolves =
+        gpu_fmask_resolves_.load(std::memory_order_relaxed);
+    out_stats->gpu_dcc_decompresses =
+        gpu_dcc_decompresses_.load(std::memory_order_relaxed);
+    out_stats->gpu_htile_decompresses =
+        gpu_htile_decompresses_.load(std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(residency_mutex_);
+        out_stats->skipped_active_live_heaps = skipped_active_live_heaps_;
+        uint64_t prot = 0ull;
+        for (const auto& [ptr, e] : residency_entries_) {
+            (void)ptr;
+            if (e.is_resident && IsResidencyEntryLiveProtectedLocked(e)) ++prot;
+        }
+        out_stats->active_protected_objects = prot;
+    }
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE DeviceX::AllocateDescriptorHeapPage(
+    ID3D12DescriptorHeap* heap,
+    uint32_t* out_page_index,
+    uint64_t* out_generation,
+    uint64_t* out_page_gpu_base) {
+    if (!heap || !out_page_index || !out_generation || !out_page_gpu_base) return E_POINTER;
+    ID3D12DescriptorHeap* host_heap = UnwrapDescriptorHeap(heap);
+    if (!host_heap) return E_INVALIDARG;
+
+    std::lock_guard<std::mutex> lock(paged_desc_mutex_);
+    auto it = paged_desc_heaps_.find(host_heap);
+    if (it == paged_desc_heaps_.end()) return E_INVALIDARG;
+
+    auto& ps = it->second;
+    // Find an idle page or allocate a fresh isolated shadow page so active in-flight pages
+    // are never overwritten mid-frame (xcl #84 NVIDIA flicker fix).
+    for (auto& page : ps.pages) {
+        if (!page.in_flight) {
+            page.in_flight = true;
+            ++page.generation;
+            descriptor_page_generations_advanced_.fetch_add(1ull, std::memory_order_relaxed);
+            *out_page_index = page.page_index;
+            *out_generation = page.generation;
+            *out_page_gpu_base =
+                ps.gpu_start.ptr +
+                static_cast<uint64_t>(page.page_index) * ps.descriptors_per_page * ps.inc_size;
+            return S_OK;
+        }
+    }
+
+    // All existing pages are in-flight: allocate a genuine isolated shadow host descriptor page.
+    D3D12_DESCRIPTOR_HEAP_DESC shadow_desc{};
+    shadow_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    shadow_desc.NumDescriptors = ps.descriptors_per_page;
+    shadow_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    ID3D12DescriptorHeap* shadow_heap = nullptr;
+    const HRESULT hr = host_dev_->CreateDescriptorHeap(
+        &shadow_desc, OS_D3D12_IID(ID3D12DescriptorHeap), reinterpret_cast<void**>(&shadow_heap));
+    if (FAILED(hr) || !shadow_heap) return hr;
+
+    DescriptorPageSlot new_slot{};
+    new_slot.page_index = static_cast<uint32_t>(ps.pages.size());
+    new_slot.generation = 1ull;
+    new_slot.in_flight = true;
+    new_slot.isolated_shadow_heap = shadow_heap;
+    const uint64_t gpu_base = shadow_heap->GetGPUDescriptorHandleForHeapStart().ptr;
+    ps.pages.push_back(new_slot);
+    descriptor_pages_allocated_.fetch_add(1ull, std::memory_order_relaxed);
+    descriptor_page_rotations_.fetch_add(1ull, std::memory_order_relaxed);
+    descriptor_page_generations_advanced_.fetch_add(1ull, std::memory_order_relaxed);
+
+    *out_page_index = new_slot.page_index;
+    *out_generation = new_slot.generation;
+    *out_page_gpu_base = gpu_base;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE DeviceX::RetireDescriptorHeapPage(
+    ID3D12DescriptorHeap* heap,
+    uint32_t page_index) {
+    if (!heap) return E_POINTER;
+    ID3D12DescriptorHeap* host_heap = UnwrapDescriptorHeap(heap);
+    if (!host_heap) return E_INVALIDARG;
+    std::lock_guard<std::mutex> lock(paged_desc_mutex_);
+    auto it = paged_desc_heaps_.find(host_heap);
+    if (it == paged_desc_heaps_.end() || page_index >= it->second.pages.size()) {
+        return E_INVALIDARG;
+    }
+    it->second.pages[page_index].in_flight = false;
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE DeviceX::ExecuteGpuResolveFmask(
+    uint32_t width,
+    uint32_t height,
+    uint32_t sample_count,
+    uint32_t resolve_mode,
+    uint32_t clear_rgba8,
+    const uint8_t* msaa_color_bytes,
+    uint32_t msaa_color_size,
+    const uint8_t* fmask_bytes,
+    uint32_t fmask_size,
+    uint8_t* out_rgba8,
+    uint32_t out_size,
+    uint32_t* out_used_gpu) {
+    if (!msaa_color_bytes || !fmask_bytes || !out_rgba8 || width == 0u || height == 0u) {
+        return E_INVALIDARG;
+    }
+    if (out_used_gpu) *out_used_gpu = 0u;
+    openscarlett::XgGpuResolveParams params{};
+    params.op = static_cast<uint32_t>(openscarlett::XgGpuResolveOp::FmaskMsaaResolve);
+    params.width = width;
+    params.height = height;
+    params.sample_count = sample_count;
+    params.mode = resolve_mode;
+    params.bpe = 4u;
+    params.src_row_pitch = width * sample_count * 4u;
+    params.dst_row_pitch = width * 4u;
+    params.clear_reg_0 = clear_rgba8;
+
+    std::vector<uint8_t> src_vec(msaa_color_bytes, msaa_color_bytes + msaa_color_size);
+    std::vector<uint8_t> meta_vec(fmask_bytes, fmask_bytes + fmask_size);
+    std::vector<uint8_t> dst_vec(out_size, 0u);
+
+    openscarlett::Status st = openscarlett::Status::Error(openscarlett::StatusCode::DeviceError, "Untiler unavailable");
+    if (EnsureXgGpuUntilerReady()) {
+        std::lock_guard<std::mutex> ulk(xg_untiler_mutex_);
+        if (xg_untiler_ && xg_untiler_->IsD3D12Ready()) {
+            st = xg_untiler_->ExecuteResolveD3D12(params, src_vec, meta_vec, dst_vec, nullptr);
+            if (st.ok() && out_used_gpu) *out_used_gpu = 1u;
+        }
+    }
+    if (!st.ok()) {
+        st = openscarlett::ResolveFmaskCpuReference(params, src_vec, meta_vec, dst_vec);
+        if (!st.ok()) return E_FAIL;
+    }
+    std::memcpy(out_rgba8, dst_vec.data(), std::min<size_t>(out_size, dst_vec.size()));
+    gpu_fmask_resolves_.fetch_add(1ull, std::memory_order_relaxed);
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE DeviceX::ExecuteGpuDecompressDcc(
+    uint32_t width,
+    uint32_t height,
+    uint32_t pipe_aligned,
+    uint32_t num_pipes,
+    uint32_t clear_rgba8,
+    const uint8_t* src_blocks,
+    uint32_t src_size,
+    const uint8_t* dcc_keys,
+    uint32_t dcc_size,
+    uint8_t* out_rgba8,
+    uint32_t out_size,
+    uint32_t* out_used_gpu) {
+    if (!src_blocks || !dcc_keys || !out_rgba8 || width == 0u || height == 0u) {
+        return E_INVALIDARG;
+    }
+    if (out_used_gpu) *out_used_gpu = 0u;
+    openscarlett::XgGpuResolveParams params{};
+    params.op = static_cast<uint32_t>(openscarlett::XgGpuResolveOp::DccDecompress);
+    params.width = width;
+    params.height = height;
+    params.sample_count = 1u;
+    params.mode = (pipe_aligned != 0u) ? 1u : 0u;
+    params.bpe = 4u;
+    params.src_row_pitch = width * 4u;
+    params.dst_row_pitch = width * 4u;
+    params.meta_blocks_x = (width + 7u) / 8u;
+    params.meta_num_pipes = (num_pipes > 0u) ? num_pipes : 16u;
+    params.meta_slice_pitch = dcc_size;
+    params.clear_reg_0 = clear_rgba8;
+
+    std::vector<uint8_t> src_vec(src_blocks, src_blocks + src_size);
+    std::vector<uint8_t> meta_vec(dcc_keys, dcc_keys + dcc_size);
+    std::vector<uint8_t> dst_vec(out_size, 0u);
+
+    openscarlett::Status st = openscarlett::Status::Error(openscarlett::StatusCode::DeviceError, "Untiler unavailable");
+    if (EnsureXgGpuUntilerReady()) {
+        std::lock_guard<std::mutex> ulk(xg_untiler_mutex_);
+        if (xg_untiler_ && xg_untiler_->IsD3D12Ready()) {
+            st = xg_untiler_->ExecuteResolveD3D12(params, src_vec, meta_vec, dst_vec, nullptr);
+            if (st.ok() && out_used_gpu) *out_used_gpu = 1u;
+        }
+    }
+    if (!st.ok()) {
+        st = openscarlett::DecompressDccCpuReference(params, src_vec, meta_vec, dst_vec);
+        if (!st.ok()) return E_FAIL;
+    }
+    std::memcpy(out_rgba8, dst_vec.data(), std::min<size_t>(out_size, dst_vec.size()));
+    gpu_dcc_decompresses_.fetch_add(1ull, std::memory_order_relaxed);
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE DeviceX::ExecuteGpuDecompressHtile(
+    uint32_t width,
+    uint32_t height,
+    uint32_t mode_flags,
+    uint32_t clear_reg0,
+    uint32_t clear_reg1,
+    const uint8_t* src_tiles,
+    uint32_t src_size,
+    const uint8_t* htile_words,
+    uint32_t htile_size,
+    uint8_t* out_depth_and_hiz,
+    uint32_t out_size,
+    uint32_t* out_used_gpu) {
+    if (!src_tiles || !htile_words || !out_depth_and_hiz || width == 0u || height == 0u) {
+        return E_INVALIDARG;
+    }
+    if (out_used_gpu) *out_used_gpu = 0u;
+    openscarlett::XgGpuResolveParams params{};
+    params.op = static_cast<uint32_t>(openscarlett::XgGpuResolveOp::HtileDecompress);
+    params.width = width;
+    params.height = height;
+    params.sample_count = 1u;
+    params.mode = mode_flags;
+    params.bpe = 4u;
+    params.src_row_pitch = width * 4u;
+    params.dst_row_pitch = width * 4u;
+    params.meta_blocks_x = (width + 7u) / 8u;
+    params.clear_reg_0 = clear_reg0;
+    params.clear_reg_1 = clear_reg1;
+    params.spv_aux_word_offset = width * height;
+
+    std::vector<uint8_t> src_vec(src_tiles, src_tiles + src_size);
+    std::vector<uint8_t> meta_vec(htile_words, htile_words + htile_size);
+    std::vector<uint8_t> dst_vec(out_size, 0u);
+
+    openscarlett::Status st = openscarlett::Status::Error(openscarlett::StatusCode::DeviceError, "Untiler unavailable");
+    if (EnsureXgGpuUntilerReady()) {
+        std::lock_guard<std::mutex> ulk(xg_untiler_mutex_);
+        if (xg_untiler_ && xg_untiler_->IsD3D12Ready()) {
+            st = xg_untiler_->ExecuteResolveD3D12(params, src_vec, meta_vec, dst_vec, nullptr);
+            if (st.ok() && out_used_gpu) *out_used_gpu = 1u;
+        }
+    }
+    if (!st.ok()) {
+        st = openscarlett::DecompressHtileCpuReference(params, src_vec, meta_vec, dst_vec, nullptr);
+        if (!st.ok()) return E_FAIL;
+    }
+    std::memcpy(out_depth_and_hiz, dst_vec.data(), std::min<size_t>(out_size, dst_vec.size()));
+    gpu_htile_decompresses_.fetch_add(1ull, std::memory_order_relaxed);
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE DeviceX::MarkResidencyObjectActive(
+    ID3D12Pageable* obj,
+    int32_t delta_ref) {
+    if (!obj) return E_INVALIDARG;
+    ID3D12Pageable* host_obj = UnwrapProxyPageable(obj);
+    if (!host_obj) return E_INVALIDARG;
+    std::lock_guard<std::mutex> lock(residency_mutex_);
+    auto it = residency_entries_.find(host_obj);
+    if (it == residency_entries_.end()) return E_INVALIDARG;
+    auto& e = it->second;
+    if (delta_ref > 0) {
+        e.active_pin_count += static_cast<uint32_t>(delta_ref);
+    } else if (delta_ref < 0) {
+        const uint32_t sub = static_cast<uint32_t>(-delta_ref);
+        e.active_pin_count = (e.active_pin_count >= sub) ? (e.active_pin_count - sub) : 0u;
+    }
+    return S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE DeviceX::MarkResidencyObjectInFlight(
+    ID3D12Pageable* obj,
+    ID3D12Fence* fence,
+    uint64_t fence_value) {
+    if (!obj) return E_INVALIDARG;
+    ID3D12Pageable* host_obj = UnwrapProxyPageable(obj);
+    ID3D12Fence* host_fence = UnwrapFence(fence);
+    if (!host_obj) return E_INVALIDARG;
+    std::lock_guard<std::mutex> lock(residency_mutex_);
+    auto it = residency_entries_.find(host_obj);
+    if (it == residency_entries_.end()) return E_INVALIDARG;
+    auto& e = it->second;
+    if (e.in_flight_fence != host_fence) {
+        if (e.in_flight_fence) e.in_flight_fence->Release();
+        e.in_flight_fence = host_fence;
+        if (e.in_flight_fence) e.in_flight_fence->AddRef();
+    }
+    e.in_flight_fence_value = fence_value;
     return S_OK;
 }
 

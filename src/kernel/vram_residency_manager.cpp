@@ -105,6 +105,8 @@ struct VramResidencyManager::Impl {
         bool is_resident = false;
         bool gpu_evicted_flag = false;
         uint32_t pin_count = 0u;
+        uint32_t active_ref_count = 0u;
+        uint64_t in_flight_fence_value = 0ull;
         uint64_t eviction_count = 0ull;
         uint64_t page_in_count = 0ull;
         uint64_t last_touch_tick = 0ull;
@@ -131,6 +133,7 @@ struct VramResidencyManager::Impl {
     uint64_t evicted_bytes = 0ull;
     uint64_t total_virtual_bytes = 0ull;
     uint64_t pinned_bytes = 0ull;
+    uint64_t active_referenced_bytes = 0ull;
     uint64_t peak_resident_bytes = 0ull;
     uint64_t peak_virtual_bytes = 0ull;
     uint64_t resident_allocations = 0ull;
@@ -143,6 +146,8 @@ struct VramResidencyManager::Impl {
     uint64_t d3d12_evict_calls = 0ull;
     uint64_t d3d12_make_resident_calls = 0ull;
     uint64_t oom_prevented_count = 0ull;
+    uint64_t skipped_active_live_heaps = 0ull;
+    uint64_t completed_fence_value = 0ull;
 
     bool is_warp = false;
     std::string adapter_name;
@@ -313,10 +318,18 @@ struct VramResidencyManager::Impl {
         }
     }
 
+    bool IsEntryLiveProtectedLocked(const Entry& e) const noexcept {
+        return e.pin_count > 0u ||
+               e.active_ref_count > 0u ||
+               e.in_flight_fence_value > completed_fence_value;
+    }
+
     Status EvictEntryLocked(Entry& e, bool force_release_gpu) {
         if (!e.is_resident) return Status::Ok();
-        if (e.pin_count > 0u) {
-            return Status::Error(StatusCode::InvalidArgument, "Cannot evict pinned VRAM allocation");
+        if (IsEntryLiveProtectedLocked(e)) {
+            ++skipped_active_live_heaps;
+            return Status::Error(StatusCode::InvalidArgument,
+                                 "Cannot evict pinned, actively-referenced, or in-flight VRAM allocation");
         }
 
         // 1. Copy GPU contents back to system RAM backing store before evicting so no bytes are lost.
@@ -373,13 +386,15 @@ struct VramResidencyManager::Impl {
 
         while (resident_bytes > target_budget_bytes) {
             uint64_t victim_handle = 0ull;
-            // Scan from LRU (back) to MRU (front) for an unpinned resident victim.
+            // Scan from LRU (back) to MRU (front) for an unpinned, unreferenced, idle resident victim.
             for (auto it = lru_list.rbegin(); it != lru_list.rend(); ++it) {
                 if (*it == protect_handle) continue;
                 auto found = entries.find(*it);
-                if (found != entries.end() &&
-                    found->second.is_resident &&
-                    found->second.pin_count == 0u) {
+                if (found != entries.end() && found->second.is_resident) {
+                    if (IsEntryLiveProtectedLocked(found->second)) {
+                        ++skipped_active_live_heaps;
+                        continue;
+                    }
                     victim_handle = *it;
                     break;
                 }
@@ -605,6 +620,7 @@ void VramResidencyManager::Shutdown() {
     impl_->evicted_bytes = 0ull;
     impl_->total_virtual_bytes = 0ull;
     impl_->pinned_bytes = 0ull;
+    impl_->active_referenced_bytes = 0ull;
     impl_->peak_resident_bytes = 0ull;
     impl_->peak_virtual_bytes = 0ull;
     impl_->resident_allocations = 0ull;
@@ -617,6 +633,8 @@ void VramResidencyManager::Shutdown() {
     impl_->d3d12_evict_calls = 0ull;
     impl_->d3d12_make_resident_calls = 0ull;
     impl_->oom_prevented_count = 0ull;
+    impl_->skipped_active_live_heaps = 0ull;
+    impl_->completed_fence_value = 0ull;
     impl_->initialized = false;
 }
 
@@ -769,6 +787,13 @@ Status VramResidencyManager::Free(uint64_t handle) {
         if (impl_->pinned_bytes >= e.aligned_size_bytes) impl_->pinned_bytes -= e.aligned_size_bytes;
         else impl_->pinned_bytes = 0ull;
     }
+    if (e.active_ref_count > 0u) {
+        if (impl_->active_referenced_bytes >= e.aligned_size_bytes) {
+            impl_->active_referenced_bytes -= e.aligned_size_bytes;
+        } else {
+            impl_->active_referenced_bytes = 0ull;
+        }
+    }
     if (impl_->total_virtual_bytes >= e.aligned_size_bytes) {
         impl_->total_virtual_bytes -= e.aligned_size_bytes;
     } else {
@@ -824,6 +849,70 @@ Status VramResidencyManager::Unpin(uint64_t handle) {
         else impl_->pinned_bytes = 0ull;
     }
     return Status::Ok();
+}
+
+Status VramResidencyManager::AddActiveRef(uint64_t handle) {
+    std::lock_guard<std::mutex> lk(impl_->mutex);
+    auto it = impl_->entries.find(handle);
+    if (it == impl_->entries.end()) {
+        return Status::Error(StatusCode::NotFound, "VRAM allocation handle not found");
+    }
+    Impl::Entry& e = it->second;
+    Status st = impl_->MakeEntryResidentLocked(e);
+    if (!st.ok()) return st;
+    if (e.active_ref_count == 0u) {
+        impl_->active_referenced_bytes += e.aligned_size_bytes;
+    }
+    ++e.active_ref_count;
+    return Status::Ok();
+}
+
+Status VramResidencyManager::ReleaseActiveRef(uint64_t handle) {
+    std::lock_guard<std::mutex> lk(impl_->mutex);
+    auto it = impl_->entries.find(handle);
+    if (it == impl_->entries.end()) {
+        return Status::Error(StatusCode::NotFound, "VRAM allocation handle not found");
+    }
+    Impl::Entry& e = it->second;
+    if (e.active_ref_count == 0u) {
+        return Status::Error(StatusCode::InvalidArgument, "VRAM allocation has no active reference");
+    }
+    --e.active_ref_count;
+    if (e.active_ref_count == 0u) {
+        if (impl_->active_referenced_bytes >= e.aligned_size_bytes) {
+            impl_->active_referenced_bytes -= e.aligned_size_bytes;
+        } else {
+            impl_->active_referenced_bytes = 0ull;
+        }
+    }
+    return Status::Ok();
+}
+
+Status VramResidencyManager::MarkInFlight(uint64_t handle, uint64_t fence_value) {
+    std::lock_guard<std::mutex> lk(impl_->mutex);
+    auto it = impl_->entries.find(handle);
+    if (it == impl_->entries.end()) {
+        return Status::Error(StatusCode::NotFound, "VRAM allocation handle not found");
+    }
+    Impl::Entry& e = it->second;
+    if (fence_value > e.in_flight_fence_value) {
+        e.in_flight_fence_value = fence_value;
+    }
+    return Status::Ok();
+}
+
+void VramResidencyManager::NotifyFenceCompleted(uint64_t completed_fence_value) {
+    std::lock_guard<std::mutex> lk(impl_->mutex);
+    if (completed_fence_value > impl_->completed_fence_value) {
+        impl_->completed_fence_value = completed_fence_value;
+    }
+}
+
+bool VramResidencyManager::IsAllocationLiveProtected(uint64_t handle) const {
+    std::lock_guard<std::mutex> lk(impl_->mutex);
+    auto it = impl_->entries.find(handle);
+    if (it == impl_->entries.end()) return false;
+    return impl_->IsEntryLiveProtectedLocked(it->second);
 }
 
 Status VramResidencyManager::EvictToBudget(
@@ -927,6 +1016,9 @@ bool VramResidencyManager::GetAllocationInfo(uint64_t handle, VramAllocationInfo
     out_info.debug_name = e.debug_name;
     out_info.is_resident = e.is_resident;
     out_info.pin_count = e.pin_count;
+    out_info.active_ref_count = e.active_ref_count;
+    out_info.in_flight_fence_value = e.in_flight_fence_value;
+    out_info.is_in_flight = (e.in_flight_fence_value > impl_->completed_fence_value);
 #if defined(_WIN32)
     out_info.gpu_va = (e.is_resident && e.gpu_resource) ? e.gpu_resource->GetGPUVirtualAddress() : 0ull;
 #else
@@ -946,6 +1038,7 @@ VramResidencyStats VramResidencyManager::GetStats() const {
     s.evicted_bytes = impl_->evicted_bytes;
     s.total_virtual_bytes = impl_->total_virtual_bytes;
     s.pinned_bytes = impl_->pinned_bytes;
+    s.active_referenced_bytes = impl_->active_referenced_bytes;
     s.peak_resident_bytes = impl_->peak_resident_bytes;
     s.peak_virtual_bytes = impl_->peak_virtual_bytes;
     s.active_allocations = static_cast<uint64_t>(impl_->entries.size());
@@ -959,6 +1052,7 @@ VramResidencyStats VramResidencyManager::GetStats() const {
     s.d3d12_evict_calls = impl_->d3d12_evict_calls;
     s.d3d12_make_resident_calls = impl_->d3d12_make_resident_calls;
     s.oom_prevented_count = impl_->oom_prevented_count;
+    s.skipped_active_live_heaps = impl_->skipped_active_live_heaps;
 #if defined(_WIN32)
     s.using_d3d12_device = (impl_->device != nullptr);
 #else

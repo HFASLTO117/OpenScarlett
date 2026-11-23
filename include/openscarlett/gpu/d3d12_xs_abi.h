@@ -448,6 +448,8 @@ struct OPENSCARLETT_COM_UUID("4F534431-3258-4445-5600-000000000001") ID3D12Devic
     virtual HRESULT STDMETHODCALLTYPE SuspendX(uint32_t Flags) = 0;
     virtual HRESULT STDMETHODCALLTYPE ResumeX() = 0;
     virtual HRESULT STDMETHODCALLTYPE GetGpuHardwareInfoX(D3D12XBOX_GPU_HARDWARE_INFO* pOutInfo) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetGpuHardwareConfigurationX(
+        struct D3D12XBOX_GPU_HARDWARE_CONFIGURATION* pOutConfig) = 0;
 };
 #ifdef __CRT_UUID_DECL
 __CRT_UUID_DECL(ID3D12DeviceX, 0x4F534431, 0x3258, 0x4445, 0x56, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01)
@@ -889,7 +891,143 @@ OPENSCARLETT_D3D12_API HRESULT WINAPI DXGIXSetFrameNotification(
     UINT FrameCounter,
     HANDLE hEvent);
 
+// Sprint 16: Hardware configuration query (GetGpuHardwareConfigurationX C exports).
+struct D3D12XBOX_GPU_HARDWARE_CONFIGURATION {
+    uint32_t StructSize = 0u;
+    uint32_t ConsoleProfile = 0u;            // 0 = Series S (Lockhart), 1 = Series X (Anaconda)
+    uint32_t ComputeUnitCount = 0u;          // 20 (Series S) or 52 (Series X)
+    uint32_t ShaderEngineCount = 0u;         // 2 (Series S) or 4 (Series X)
+    uint32_t GpuClockMhz = 0u;               // 1565 (Series S) or 1825 (Series X)
+    uint32_t HostVendorClass = 0u;           // openscarlett::GpuVendorClass
+    uint32_t HostVendorId = 0u;
+    uint32_t HostDeviceId = 0u;
+    uint32_t HostWaveLaneMin = 32u;
+    uint32_t HostWaveLaneMax = 32u;
+    uint32_t PreferredWaveSize = 32u;
+    uint32_t HostRaytracingTier = 0u;        // Sanitized strictly to {0, 10, 11, 12}
+    uint32_t HostMeshShaderTier = 0u;        // Sanitized strictly to {0, 10}
+    uint32_t HostHighestShaderModel = 0x51u;
+    uint32_t IsWarp = 0u;
+    uint32_t IsUmaLowVram = 0u;              // 1 on <= 256 MB dedicated VRAM iGPUs
+    uint32_t RequiresWave64Emulation = 0u;
+    uint32_t SupportsPageIsolatedDescriptorHeaps = 1u;
+    uint32_t SupportsUnboundedSamplerHeaps = 1u;
+    uint32_t SupportsDedicatedCopyEngine = 1u;
+    uint64_t ConsoleVramBudgetBytes = 0ull;
+    uint64_t HostDedicatedVramBytes = 0ull;
+    uint64_t EffectiveVramBudgetBytes = 0ull;
+    char AdapterName[128] = {};
+};
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxGetGpuHardwareConfiguration(
+    ID3D12Device* device,
+    D3D12XBOX_GPU_HARDWARE_CONFIGURATION* out_config);
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12GetGpuHardwareConfigurationX(
+    ID3D12Device* device,
+    D3D12XBOX_GPU_HARDWARE_CONFIGURATION* out_config);
+
 }  // extern "C"
+
+// Sprint 16 Graphics Completeness COM diagnostics & live resolve interface.
+// {4F534431-3258-5331-3600-000000000036}
+inline constexpr GUID IID_IOpenScarlettGraphicsCompleteness = {
+    0x4F534431u, 0x3258u, 0x5331u,
+    {0x36u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x00u, 0x36u}
+};
+
+struct D3D12XBOX_GRAPHICS_COMPLETENESS_STATS {
+    // Page-at-a-time descriptor heap manager (xcl #84)
+    uint64_t paged_descriptor_heaps_created = 0ull;
+    uint64_t descriptor_pages_allocated = 0ull;
+    uint64_t descriptor_page_rotations = 0ull;
+    uint64_t descriptor_page_generations_advanced = 0ull;
+    // Unbounded sampler heap (> 2048 virtualized over 2048-slot backing host heap)
+    uint64_t unbounded_sampler_heaps_created = 0ull;
+    uint64_t unbounded_sampler_writes = 0ull;
+    uint64_t unbounded_sampler_dedup_hits = 0ull;
+    uint64_t unbounded_sampler_unique_host_slots = 0ull;
+    uint64_t unbounded_sampler_table_translations = 0ull;
+    // Dedicated Copy Engine queue parity (xvalkyrie 90ef28a)
+    uint64_t dedicated_copy_queues_created = 0ull;
+    uint64_t copy_queue_barriers_sanitized = 0ull;
+    uint64_t copy_queue_uav_barriers_suppressed = 0ull;
+    // ExecuteIndirect completeness
+    uint64_t execute_indirect_calls = 0ull;
+    uint64_t execute_indirect_with_count_buffer = 0ull;
+    uint64_t execute_indirect_with_root_constants = 0ull;
+    uint64_t execute_indirect_dispatch_mesh = 0ull;
+    uint64_t execute_indirect_bounds_clamped = 0ull;
+    uint64_t execute_indirect_rejected = 0ull;
+    uint64_t execute_indirect_va_translated = 0ull;
+    uint64_t execute_indirect_vulkan_routed = 0ull;
+    // Live GPU Compute FMASK / DCC / HTILE resolve & decompression
+    uint64_t gpu_fmask_resolves = 0ull;
+    uint64_t gpu_dcc_decompresses = 0ull;
+    uint64_t gpu_htile_decompresses = 0ull;
+    // VRAM residency hygiene
+    uint64_t skipped_active_live_heaps = 0ull;
+    uint64_t active_protected_objects = 0ull;
+};
+
+struct IOpenScarlettGraphicsCompleteness : public IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE GetGraphicsCompletenessStats(
+        D3D12XBOX_GRAPHICS_COMPLETENESS_STATS* out_stats) = 0;
+    virtual HRESULT STDMETHODCALLTYPE AllocateDescriptorHeapPage(
+        ID3D12DescriptorHeap* heap,
+        uint32_t* out_page_index,
+        uint64_t* out_generation,
+        uint64_t* out_page_gpu_base) = 0;
+    virtual HRESULT STDMETHODCALLTYPE RetireDescriptorHeapPage(
+        ID3D12DescriptorHeap* heap,
+        uint32_t page_index) = 0;
+    virtual HRESULT STDMETHODCALLTYPE ExecuteGpuResolveFmask(
+        uint32_t width,
+        uint32_t height,
+        uint32_t sample_count,
+        uint32_t resolve_mode,
+        uint32_t clear_rgba8,
+        const uint8_t* msaa_color_bytes,
+        uint32_t msaa_color_size,
+        const uint8_t* fmask_bytes,
+        uint32_t fmask_size,
+        uint8_t* out_rgba8,
+        uint32_t out_size,
+        uint32_t* out_used_gpu) = 0;
+    virtual HRESULT STDMETHODCALLTYPE ExecuteGpuDecompressDcc(
+        uint32_t width,
+        uint32_t height,
+        uint32_t pipe_aligned,
+        uint32_t num_pipes,
+        uint32_t clear_rgba8,
+        const uint8_t* src_blocks,
+        uint32_t src_size,
+        const uint8_t* dcc_keys,
+        uint32_t dcc_size,
+        uint8_t* out_rgba8,
+        uint32_t out_size,
+        uint32_t* out_used_gpu) = 0;
+    virtual HRESULT STDMETHODCALLTYPE ExecuteGpuDecompressHtile(
+        uint32_t width,
+        uint32_t height,
+        uint32_t mode_flags,
+        uint32_t clear_reg0,
+        uint32_t clear_reg1,
+        const uint8_t* src_tiles,
+        uint32_t src_size,
+        const uint8_t* htile_words,
+        uint32_t htile_size,
+        uint8_t* out_depth_and_hiz,
+        uint32_t out_size,
+        uint32_t* out_used_gpu) = 0;
+    virtual HRESULT STDMETHODCALLTYPE MarkResidencyObjectActive(
+        ID3D12Pageable* obj,
+        int32_t delta_ref) = 0;
+    virtual HRESULT STDMETHODCALLTYPE MarkResidencyObjectInFlight(
+        ID3D12Pageable* obj,
+        ID3D12Fence* fence,
+        uint64_t fence_value) = 0;
+};
 
 // Sprint 15 Graphics / D3D12X Parity diagnostics interface.
 // {4F534431-3258-5331-3500-000000000035}

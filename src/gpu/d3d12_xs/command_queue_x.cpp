@@ -1360,11 +1360,13 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
     std::vector<uint64_t> pending_writeback_vas;
     std::vector<DeferredCpuWrite32> deferred_writes;
     std::vector<DeferredCpuWait> deferred_waits;
+    std::vector<CommandListX::DeferredStateTransition> deferred_state_transitions;
     for (UINT i = 0; i < NumCommandLists; ++i) {
         raw_lists[i] = CommandListX::UnwrapHostList(ppCommandLists[i]);
         if (CommandListX* clx = CommandListX::TryFromCommandList(ppCommandLists[i])) {
             clx->ExtractPendingMirrorWritebacks(pending_writeback_vas);
             clx->ExtractDeferredCpuOps(deferred_writes, deferred_waits);
+            clx->ExtractDeferredStateTransitions(deferred_state_transitions);
         }
     }
 
@@ -1383,6 +1385,17 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
     }
 
     host_queue_->ExecuteCommandLists(NumCommandLists, raw_lists);
+
+    // Apply deferred unified-texture / TitleVAMirror resource state transitions AFTER
+    // host_queue_->ExecuteCommandLists so pre-submit SyncAllUnifiedResourcesBeforeSubmit
+    // sees the true pre-submission resource states (fixing WARP & D3D12 Debug Layer barrier errors).
+    if (device_x_ && !deferred_state_transitions.empty()) {
+        for (const auto& st : deferred_state_transitions) {
+            if (st.host_resource) {
+                device_x_->NotifyResourceStateTransition(st.host_resource, st.after_state);
+            }
+        }
+    }
 
     // Schedule fence-tracked GPU->CPU writeback for any TitleVAMirror resources written by these lists.
     if (device_x_ && !pending_writeback_vas.empty() &&
@@ -1750,6 +1763,190 @@ void CommandQueueX::ExecuteVulkanRecordedBatch(const VulkanRecordedBatch& batch)
                         } else {
                             std::fprintf(stderr, "[OpenScarlett][d3d12_xs] Vulkan DispatchMesh failed: %s\n",
                                          mst.message.c_str());
+                        }
+                    }
+                }
+                break;
+            }
+            case VulkanRecordedOpKind::ExecuteIndirect: {
+                const bool is_dispatch =
+                    (op.indirect_action_type == static_cast<uint32_t>(D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH));
+                const bool is_mesh = (op.indirect_action_type == 10u);
+                const bool is_indexed =
+                    (op.indirect_action_type == static_cast<uint32_t>(D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED));
+                if (is_dispatch) ++dispatches_cnt;
+                else if (is_mesh) ++mesh_cnt;
+                else if (is_indexed) ++indexed_draws_cnt;
+                else ++draws_cnt;
+
+                openscarlett::VulkanCommandItem item{};
+                item.op = is_dispatch ? openscarlett::VulkanCommandOp::Dispatch : openscarlett::VulkanCommandOp::Nop;
+                item.x = std::max<uint32_t>(1u, op.indirect_max_count);
+                item.y = 1u;
+                item.z = 1u;
+                vk_cl_desc.commands.push_back(item);
+
+                if (op.is_spirv_direct && op.pso && op.indirect_arg_resource) {
+                    VulkanPipelineInfo pi{};
+                    if (device_x_->LookupVulkanPipeline(op.pso, pi)) {
+                        const D3D12_RESOURCE_DESC ad = op.indirect_arg_resource->GetDesc();
+                        std::vector<uint8_t> arg_bytes;
+                        if (device_x_->ReadVulkanBufferData(
+                                op.indirect_arg_resource, 0ull, ad.Width, arg_bytes) &&
+                            !arg_bytes.empty()) {
+                            if (is_dispatch && !pi.cs_spirv.empty()) {
+                                openscarlett::VulkanIndirectComputeDesc cdesc{};
+                                cdesc.spirv = pi.cs_spirv;
+                                cdesc.argument_buffer_bytes = std::move(arg_bytes);
+                                cdesc.argument_buffer_offset = op.indirect_arg_offset;
+                                uint64_t in_off = 0ull, out_off = 0ull;
+                                ID3D12Resource* in_res =
+                                    !op.root_srvs.empty()
+                                        ? device_x_->ResolveVulkanBufferByGpuVa(op.root_srvs[0], &in_off)
+                                        : nullptr;
+                                ID3D12Resource* out_res =
+                                    !op.root_uavs.empty()
+                                        ? device_x_->ResolveVulkanBufferByGpuVa(op.root_uavs[0], &out_off)
+                                        : nullptr;
+                                if (in_res) {
+                                    std::vector<uint8_t> raw_in;
+                                    const uint64_t in_sz = in_res->GetDesc().Width - in_off;
+                                    if (device_x_->ReadVulkanBufferData(in_res, in_off, in_sz, raw_in)) {
+                                        cdesc.input_u32.resize(raw_in.size() / 4u);
+                                        if (!cdesc.input_u32.empty()) {
+                                            std::memcpy(cdesc.input_u32.data(), raw_in.data(),
+                                                        cdesc.input_u32.size() * 4u);
+                                        }
+                                    }
+                                }
+                                if (out_res) {
+                                    cdesc.output_word_count =
+                                        static_cast<uint32_t>((out_res->GetDesc().Width - out_off) / 4ull);
+                                }
+                                openscarlett::VulkanIndirectComputeResult cres{};
+                                if (vk->ExecuteIndirectCompute(cdesc, cres).ok()) {
+                                    ++spirv_dispatches_cnt;
+                                    if (cres.executed_on_vulkan_icd) ++icd_execs_cnt;
+                                    if (out_res && !cres.output_u32.empty()) {
+                                        device_x_->WriteVulkanBufferData(
+                                            out_res, out_off, cres.output_u32.data(),
+                                            cres.output_u32.size() * sizeof(uint32_t));
+                                    }
+                                }
+                            } else if ((!is_mesh && !pi.vs_spirv.empty() && !pi.ps_spirv.empty()) ||
+                                       (is_mesh && !pi.ms_spirv.empty() && !pi.ps_spirv.empty())) {
+                                openscarlett::VulkanIndirectDrawDesc idesc{};
+                                idesc.kind = is_mesh ? openscarlett::VulkanIndirectCommandKind::DrawMeshTasks
+                                                     : (is_indexed ? openscarlett::VulkanIndirectCommandKind::DrawIndexed
+                                                                   : openscarlett::VulkanIndirectCommandKind::Draw);
+                                idesc.argument_buffer_bytes = std::move(arg_bytes);
+                                idesc.argument_buffer_offset = op.indirect_arg_offset;
+                                idesc.command_stride = op.indirect_stride;
+                                idesc.max_command_count = op.indirect_max_count;
+                                idesc.draw_arg_offset_in_stride = op.indirect_action_offset;
+                                idesc.indirect_push_constant_arg_offset = op.indirect_const_arg_offset;
+                                idesc.indirect_push_constant_bytes = op.indirect_const_bytes;
+                                idesc.indirect_push_constant_dst_offset = op.indirect_const_dst_offset;
+                                if (op.indirect_count_resource) {
+                                    std::vector<uint8_t> cnt_bytes;
+                                    if (device_x_->ReadVulkanBufferData(
+                                            op.indirect_count_resource, op.indirect_count_offset, 4ull, cnt_bytes) &&
+                                        cnt_bytes.size() >= 4u) {
+                                        idesc.use_count_buffer = true;
+                                        std::memcpy(&idesc.count_buffer_value, cnt_bytes.data(), 4u);
+                                        idesc.count_buffer_offset = 0ull;
+                                    }
+                                }
+                                uint32_t w = (op.viewport_width > 0u) ? op.viewport_width : 64u;
+                                uint32_t h = (op.viewport_height > 0u) ? op.viewport_height : 64u;
+                                if (op.rtv_resource) {
+                                    const D3D12_RESOURCE_DESC rdesc = op.rtv_resource->GetDesc();
+                                    w = static_cast<uint32_t>(std::max<UINT64>(1ull, rdesc.Width));
+                                    h = std::max<UINT>(1u, rdesc.Height);
+                                }
+                                if (is_mesh) {
+                                    idesc.mesh.task_spirv = pi.as_spirv;
+                                    idesc.mesh.mesh_spirv = pi.ms_spirv;
+                                    idesc.mesh.fragment_spirv = pi.ps_spirv;
+                                    idesc.mesh.task_entry = pi.as_entry;
+                                    idesc.mesh.mesh_entry = pi.ms_entry;
+                                    idesc.mesh.fragment_entry = pi.ps_entry;
+                                    idesc.mesh.width = w;
+                                    idesc.mesh.height = h;
+                                    idesc.mesh.color_format = pi.color_format;
+                                    idesc.mesh.enable_depth = pi.enable_depth;
+                                    if (op.has_clear_color) {
+                                        std::memcpy(idesc.mesh.clear_color, op.clear_color, sizeof(op.clear_color));
+                                    }
+                                    idesc.mesh.clear_depth = op.clear_depth;
+                                    if (!op.root_constants.empty()) {
+                                        idesc.mesh.push_constants.resize(op.root_constants.size() * 4u);
+                                        std::memcpy(idesc.mesh.push_constants.data(), op.root_constants.data(),
+                                                    idesc.mesh.push_constants.size());
+                                    }
+                                } else {
+                                    idesc.graphics.vertex_spirv = pi.vs_spirv;
+                                    idesc.graphics.fragment_spirv = pi.ps_spirv;
+                                    idesc.graphics.vertex_entry = pi.vs_entry;
+                                    idesc.graphics.fragment_entry = pi.ps_entry;
+                                    idesc.graphics.width = w;
+                                    idesc.graphics.height = h;
+                                    idesc.graphics.color_format = pi.color_format;
+                                    idesc.graphics.enable_depth = pi.enable_depth;
+                                    idesc.graphics.depth_write = pi.depth_write;
+                                    if (op.has_clear_color) {
+                                        std::memcpy(idesc.graphics.clear_color, op.clear_color, sizeof(op.clear_color));
+                                    }
+                                    idesc.graphics.clear_depth = op.clear_depth;
+                                    if (op.has_vbv && op.vbv.BufferLocation != 0ull && op.vbv.SizeInBytes > 0u) {
+                                        uint64_t vb_off = 0ull;
+                                        ID3D12Resource* vb_res =
+                                            device_x_->ResolveVulkanBufferByGpuVa(op.vbv.BufferLocation, &vb_off);
+                                        if (vb_res) {
+                                            device_x_->ReadVulkanBufferData(
+                                                vb_res, vb_off, op.vbv.SizeInBytes, idesc.graphics.vertex_bytes);
+                                        }
+                                        idesc.graphics.vertex_stride =
+                                            (op.vbv.StrideInBytes > 0u) ? op.vbv.StrideInBytes : pi.vertex_stride_hint;
+                                        idesc.graphics.vertex_attributes = pi.vertex_attrs;
+                                    }
+                                    if (is_indexed && op.has_ibv && op.ibv.BufferLocation != 0ull && op.ibv.SizeInBytes > 0u) {
+                                        uint64_t ib_off = 0ull;
+                                        ID3D12Resource* ib_res =
+                                            device_x_->ResolveVulkanBufferByGpuVa(op.ibv.BufferLocation, &ib_off);
+                                        std::vector<uint8_t> raw_ib;
+                                        if (ib_res && device_x_->ReadVulkanBufferData(ib_res, ib_off, op.ibv.SizeInBytes, raw_ib)) {
+                                            if (op.ibv.Format == DXGI_FORMAT_R16_UINT) {
+                                                const size_t cnt = raw_ib.size() / 2u;
+                                                idesc.graphics.indices.resize(cnt);
+                                                for (size_t k = 0; k < cnt; ++k) {
+                                                    uint16_t v16 = 0u;
+                                                    std::memcpy(&v16, raw_ib.data() + k * 2u, 2u);
+                                                    idesc.graphics.indices[k] = static_cast<uint32_t>(v16);
+                                                }
+                                            } else {
+                                                const size_t cnt = raw_ib.size() / 4u;
+                                                idesc.graphics.indices.resize(cnt);
+                                                std::memcpy(idesc.graphics.indices.data(), raw_ib.data(), cnt * 4u);
+                                            }
+                                        }
+                                    }
+                                    if (!op.root_constants.empty()) {
+                                        idesc.graphics.push_constants.resize(op.root_constants.size() * 4u);
+                                        std::memcpy(idesc.graphics.push_constants.data(), op.root_constants.data(),
+                                                    idesc.graphics.push_constants.size());
+                                    }
+                                }
+                                openscarlett::VulkanIndirectDrawResult ires{};
+                                if (vk->ExecuteIndirectGraphicsDraw(idesc, ires).ok()) {
+                                    if (is_mesh) ++spirv_mesh_cnt;
+                                    else ++spirv_draws_cnt;
+                                    if (ires.executed_on_vulkan_icd) ++icd_execs_cnt;
+                                    if (op.rtv_resource) {
+                                        device_x_->StoreVulkanRenderTargetFramebuffer(op.rtv_resource, ires.framebuffer);
+                                    }
+                                }
+                            }
                         }
                     }
                 }

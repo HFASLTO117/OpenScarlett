@@ -281,13 +281,22 @@ class DescriptorHeapXProxy final
     : public ID3D12DescriptorHeap,
       public IOpenScarlettProxyInspect {
 public:
-    DescriptorHeapXProxy(DeviceX* parent_device, ID3D12DescriptorHeap* host_heap);
+    DescriptorHeapXProxy(
+        DeviceX* parent_device,
+        ID3D12DescriptorHeap* host_heap,
+        const D3D12_DESCRIPTOR_HEAP_DESC* virtual_desc_override = nullptr,
+        D3D12_CPU_DESCRIPTOR_HANDLE virtual_cpu_start = {0u},
+        D3D12_GPU_DESCRIPTOR_HANDLE virtual_gpu_start = {0ull});
     ~DescriptorHeapXProxy();
 
     DescriptorHeapXProxy(const DescriptorHeapXProxy&) = delete;
     DescriptorHeapXProxy& operator=(const DescriptorHeapXProxy&) = delete;
 
     ID3D12DescriptorHeap* HostDescriptorHeap() const noexcept { return host_heap_; }
+    bool IsVirtualUnboundedSamplerHeap() const noexcept { return is_virtual_sampler_heap_; }
+    const D3D12_DESCRIPTOR_HEAP_DESC& CachedDesc() const noexcept { return cached_desc_; }
+    D3D12_CPU_DESCRIPTOR_HANDLE VirtualCpuStart() const noexcept { return cpu_start_; }
+    D3D12_GPU_DESCRIPTOR_HANDLE VirtualGpuStart() const noexcept { return gpu_start_; }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override;
     ULONG STDMETHODCALLTYPE AddRef() override;
@@ -330,7 +339,9 @@ private:
     DeviceX* device_x_ = nullptr;
     ID3D12DescriptorHeap* host_heap_ = nullptr;
     D3D12_DESCRIPTOR_HEAP_DESC cached_desc_{};
+    D3D12_CPU_DESCRIPTOR_HANDLE cpu_start_{0u};
     D3D12_GPU_DESCRIPTOR_HANDLE gpu_start_{0ull};
+    bool is_virtual_sampler_heap_ = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -576,8 +587,8 @@ public:
     CommandSignatureXProxy(
         DeviceX* parent_device,
         ID3D12CommandSignature* host_sig,
-        UINT byte_stride = 0u,
-        UINT num_arg_descs = 0u);
+        const D3D12_COMMAND_SIGNATURE_DESC* desc = nullptr,
+        bool is_virtual_mesh_fallback = false);
     ~CommandSignatureXProxy();
 
     CommandSignatureXProxy(const CommandSignatureXProxy&) = delete;
@@ -586,6 +597,18 @@ public:
     ID3D12CommandSignature* HostCommandSignature() const noexcept { return host_sig_; }
     UINT ByteStride() const noexcept { return byte_stride_; }
     UINT NumArgumentDescs() const noexcept { return num_arg_descs_; }
+    UINT MinRequiredStride() const noexcept { return min_required_stride_; }
+    const std::vector<D3D12_INDIRECT_ARGUMENT_DESC>& ArgumentDescs() const noexcept { return arg_descs_; }
+    const std::vector<UINT>& ArgumentOffsets() const noexcept { return arg_offsets_; }
+    bool HasDispatchMesh() const noexcept { return has_dispatch_mesh_; }
+    bool HasRootConstants() const noexcept { return has_root_constants_; }
+    bool HasGpuVaArgs() const noexcept { return has_gpu_va_args_; }
+    bool IsVirtualMeshFallback() const noexcept { return is_virtual_mesh_fallback_; }
+    D3D12_INDIRECT_ARGUMENT_TYPE PrimaryActionType() const noexcept { return primary_action_type_; }
+    UINT PrimaryActionOffset() const noexcept { return primary_action_offset_; }
+    UINT FirstConstantArgOffset() const noexcept { return first_const_arg_offset_; }
+    UINT FirstConstantBytes() const noexcept { return first_const_bytes_; }
+    UINT FirstConstantDestOffsetBytes() const noexcept { return first_const_dest_offset_bytes_; }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override;
     ULONG STDMETHODCALLTYPE AddRef() override;
@@ -613,6 +636,18 @@ private:
     ID3D12CommandSignature* host_sig_ = nullptr;
     UINT byte_stride_ = 0u;
     UINT num_arg_descs_ = 0u;
+    UINT min_required_stride_ = 0u;
+    std::vector<D3D12_INDIRECT_ARGUMENT_DESC> arg_descs_;
+    std::vector<UINT> arg_offsets_;
+    bool has_dispatch_mesh_ = false;
+    bool has_root_constants_ = false;
+    bool has_gpu_va_args_ = false;
+    bool is_virtual_mesh_fallback_ = false;
+    D3D12_INDIRECT_ARGUMENT_TYPE primary_action_type_ = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
+    UINT primary_action_offset_ = 0u;
+    UINT first_const_arg_offset_ = 0u;
+    UINT first_const_bytes_ = 0u;
+    UINT first_const_dest_offset_bytes_ = 0u;
 };
 
 // ---------------------------------------------------------------------------
@@ -705,6 +740,8 @@ ID3D12Fence* UnwrapFence(ID3D12Fence* maybe_wrapped) noexcept;
 ID3D12CommandAllocator* UnwrapCommandAllocator(ID3D12CommandAllocator* maybe_wrapped) noexcept;
 ID3D12QueryHeap* UnwrapQueryHeap(ID3D12QueryHeap* maybe_wrapped) noexcept;
 ID3D12CommandSignature* UnwrapCommandSignature(ID3D12CommandSignature* maybe_wrapped) noexcept;
+CommandSignatureXProxy* TryGetCommandSignatureProxy(ID3D12CommandSignature* maybe_wrapped) noexcept;
+DescriptorHeapXProxy* TryGetDescriptorHeapProxy(ID3D12DescriptorHeap* maybe_wrapped) noexcept;
 ID3D12StateObject* UnwrapStateObject(ID3D12StateObject* maybe_wrapped) noexcept;
 ID3D12Pageable* UnwrapProxyPageable(ID3D12Pageable* maybe_wrapped) noexcept;
 ID3D12DeviceChild* UnwrapProxyDeviceChild(ID3D12DeviceChild* maybe_wrapped) noexcept;

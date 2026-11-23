@@ -358,6 +358,9 @@ struct VramAllocationInfo {
     std::string debug_name;
     bool is_resident = false;
     uint32_t pin_count = 0u;
+    uint32_t active_ref_count = 0u;
+    uint64_t in_flight_fence_value = 0ull;
+    bool is_in_flight = false;
     uint64_t gpu_va = 0ull;
     uint64_t eviction_count = 0ull;
     uint64_t page_in_count = 0ull;
@@ -370,6 +373,7 @@ struct VramResidencyStats {
     uint64_t evicted_bytes = 0ull;
     uint64_t total_virtual_bytes = 0ull;
     uint64_t pinned_bytes = 0ull;
+    uint64_t active_referenced_bytes = 0ull;
     uint64_t peak_resident_bytes = 0ull;
     uint64_t peak_virtual_bytes = 0ull;
     uint64_t active_allocations = 0ull;
@@ -383,6 +387,7 @@ struct VramResidencyStats {
     uint64_t d3d12_evict_calls = 0ull;
     uint64_t d3d12_make_resident_calls = 0ull;
     uint64_t oom_prevented_count = 0ull;
+    uint64_t skipped_active_live_heaps = 0ull;
     bool using_d3d12_device = false;
     bool is_warp = false;
     std::string adapter_name;
@@ -418,6 +423,14 @@ public:
     // Ref-counted pinning prevents eviction while an allocation is bound to active GPU work.
     Status Pin(uint64_t handle);
     Status Unpin(uint64_t handle);
+
+    // Active reference & in-flight GPU fence protection (Sprint 16 VRAM residency hygiene):
+    // live actively-referenced or in-flight GPU allocations are NEVER auto-evicted.
+    Status AddActiveRef(uint64_t handle);
+    Status ReleaseActiveRef(uint64_t handle);
+    Status MarkInFlight(uint64_t handle, uint64_t fence_value);
+    void NotifyFenceCompleted(uint64_t completed_fence_value);
+    bool IsAllocationLiveProtected(uint64_t handle) const;
 
     // Evicts LRU unpinned resident allocations until resident_bytes <= target_budget_bytes.
     // Preserves exact byte contents in system RAM backing store before evicting from GPU VRAM.
