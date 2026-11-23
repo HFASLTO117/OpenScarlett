@@ -402,9 +402,9 @@ def collect_components(
                 else f"`{opcodes_decoded}/{opcodes_total}` GFX10.3 opcodes decoded & lifted to SPIR-V (`spirv-val`) + DXIL SM 6.5 (`dxc` + MD5 re-signed), lockstep 1-wave LDS barriers, `PSV0` wave bounds, exact cross-half Wave64-on-Wave32 emulation, HS/DS/GS stage lifting, DXR SBT shader-table mapping, async PSO pre-compilation pool, mesh `merged_wave_info`/`CullPrimitiveEXT`, FSSM/vfetch, CPU interpreter & disk cache{corpus_note}."
             ),
             verified_on=(
-                "`spirv-val` + `dxc` SM 6.5/6.6 + 11 PCs + WARP (`test_s16_shader_completeness`, `test_s15_rdna2_bench_trap_harness`, `test_s15_shader_peer_parity`, `test_s14_shader_sm66_779`, `test_rdna2_corpus_bench`, `test_rdna2_isa_scalar_vector`, `test_rdna2_isa_mem_img`, `test_xg_gpu_untile_and_stages`, `test_d3d12_xs_autolift`)"
+                "`spirv-val` + `dxc` SM 6.5/6.6 + 12 PCs + WARP (`test_s16_shader_completeness`, `test_s15_rdna2_bench_trap_harness`, `test_s15_shader_peer_parity`, `test_s14_shader_sm66_779`, `test_rdna2_corpus_bench`, `test_rdna2_isa_scalar_vector`, `test_rdna2_isa_mem_img`, `test_xg_gpu_untile_and_stages`, `test_d3d12_xs_autolift`)"
                 if has_s16_shader
-                else "`spirv-val` + `dxc` SM 6.5/6.6 + 11 PCs + WARP (`test_rdna2_corpus_bench`, `test_rdna2_isa_scalar_vector`, `test_rdna2_isa_mem_img`, `test_xg_gpu_untile_and_stages`, `test_rdna2_lockstep_isa`, `test_d3d12_xs_autolift`, `test_s14_shader_sm66_779`, `test_s15_rdna2_bench_trap_harness`, `test_s15_shader_peer_parity`)"
+                else "`spirv-val` + `dxc` SM 6.5/6.6 + 12 PCs + WARP (`test_rdna2_corpus_bench`, `test_rdna2_isa_scalar_vector`, `test_rdna2_isa_mem_img`, `test_xg_gpu_untile_and_stages`, `test_rdna2_lockstep_isa`, `test_d3d12_xs_autolift`, `test_s14_shader_sm66_779`, `test_s15_rdna2_bench_trap_harness`, `test_s15_shader_peer_parity`)"
             ),
         ),
         Component(
@@ -421,7 +421,7 @@ def collect_components(
             tech_name="`d3d12_xs` Proxy, Vulkan 1.4 Routing, HDR10 `PresentX` & `xg_xs`",
             area="Graphics",
             stage="Live Verified" if gfx_pct >= 85 else "Partial",
-            pill_label="11 PCs Verified" if gfx_pct >= 85 else "Partial (11 PCs)",
+            pill_label="12 PCs Verified" if gfx_pct >= 85 else "Partial (12 PCs)",
             pct=gfx_pct,
             what_works=(
                 "All 13 Xbox COM proxies (retail Scarlett ABI, `Resource1/2`, `Heap1`), page-at-a-time 64 KiB descriptor heaps & >2048 virtualized sampler heap, `GetGpuHardwareConfigurationX`, dedicated Copy Engine queue parity, full D3D12 + Vulkan 1.4 `ExecuteIndirect` (root constants, `DispatchMesh`, `pCountBuffer`, arg/VA validation), live GPU compute `FMASK` MSAA / `DCC` 2:1+4:1 / `HTILE` HiZ resolve & decompression (`cs_6_5` + SPIR-V), Vulkan 1.4 dynamic rendering multi-pass RT/depth resolve & `OPENSCARLETT_VK_GPU` fallback, strict cross-IHV capability sanitization (Intel Arc/NVIDIA/AMD/128 MB UMA), Agility SDK, Enhanced Barriers, HDR10/scRGB `PresentX` & VRAM residency live-heap protection."
@@ -429,9 +429,9 @@ def collect_components(
                 else "All 13 Xbox COM proxies (`DeviceX`, `CommandQueueX`, `CommandListX`, `ResourceX` 1/2, `HeapX` 1, `DescriptorHeapX`, `PipelineStateX`, `RootSignatureX`, `FenceX`, `CommandAllocatorX`, `QueryHeapX`, `CommandSignatureX`, `StateObjectX`), Agility SDK & unwrapped Enhanced Barriers, live VRAM residency + sparse Window-0 isolation, 6-thread multi-queue (`Direct`/`Compute`/`Copy`) `FenceX` sync, `WriteBufferImmediate`/`SetViewInstanceMask`/`OMSetDepthBounds`/`SetSamplePositions`, direct `d3d12_xs`->Vulkan 1.4 routing, `VK_EXT_mesh_shader`, HDR10/scRGB `PresentX`, GPU compute untiler/retiler (`cs_6_5` + SPIR-V) & `xg_xs` 2D/3D/MSAA `HTILE`/`DCC`/`CMASK` fast-clear passthrough."
             ),
             verified_on=(
-                "11 PCs (GTX 1650 Ti, RTX 2060 SUPER/3060/3080 Ti/4070 Laptop/5060/5070, AMD RX 7600/7900 XTX/9070 XT) + WARP (`test_s16_graphics_completeness`, `test_s15_graphics_xg_bc6h`, `test_d3d12_xs_proxies_multiqueue`, `test_xg_gpu_untile_and_stages`, `test_d3d12_vk_routing`, `test_vulkan_mesh_showcase`, `test_hdr10_d3d12`, `test_s14_d3d12_barriers_residency`)"
+                "12 PCs (GTX 1650 Ti, RTX 2060 SUPER/3060/3080 Ti/4070 Laptop/5060/5070/5090, AMD RX 7600/7900 XTX/9070 XT) + WARP (`test_s16_graphics_completeness`, `test_s15_graphics_xg_bc6h`, `test_d3d12_xs_proxies_multiqueue`, `test_xg_gpu_untile_and_stages`, `test_d3d12_vk_routing`, `test_vulkan_mesh_showcase`, `test_hdr10_d3d12`, `test_s14_d3d12_barriers_residency`)"
                 if has_s16_gfx
-                else "11 PCs (GTX 1650 Ti, RTX 2060 SUPER/3060/3080 Ti/4070 Laptop/5060/5070, AMD RX 7600/7900 XTX/9070 XT) + WARP (`test_d3d12_xs_proxies_multiqueue`, `test_xg_gpu_untile_and_stages`, `test_d3d12_vk_routing`, `test_vulkan_mesh_showcase`, `test_hdr10_d3d12`, `test_s14_d3d12_barriers_residency`)"
+                else "12 PCs (GTX 1650 Ti, RTX 2060 SUPER/3060/3080 Ti/4070 Laptop/5060/5070/5090, AMD RX 7600/7900 XTX/9070 XT) + WARP (`test_d3d12_xs_proxies_multiqueue`, `test_xg_gpu_untile_and_stages`, `test_d3d12_vk_routing`, `test_vulkan_mesh_showcase`, `test_hdr10_d3d12`, `test_s14_d3d12_barriers_residency`)"
             ),
         ),
         Component(
@@ -494,9 +494,9 @@ def collect_components(
                 else "`mfplat_xs` `IMFDXGIDeviceManager` + `IMFMediaEngine` H.264/HEVC D3D12 video decode (`TransferVideoFrame` + headless fallback), 64+ concurrent `XAudio2_9` voices with submix buses, Schroeder Reverb/VolumeMeter APOs & monotonic sample clocks, multi-frame `Bink2` streaming, `GameInput` hot-plug device callbacks & LT/RT impulse-trigger rumble, GDeflate v1, BCPack BC1–BC7, RDNA2 BVH4, XMA2 IMDCT, `MSOpusDecoder` Opus, WASAPI, `X3DAudio` & live GPU FSR 1.0."
             ),
             verified_on=(
-                "11 PCs (NVIDIA + AMD) + WARP (`test_s16_media_storage_audio`, `test_media_video_gameinput`, `test_codecs`, `test_bcpack_bvh4`, `test_audio_opus_wasapi`, `test_d3d12_xs_live`)"
+                "12 PCs (NVIDIA + AMD) + WARP (`test_s16_media_storage_audio`, `test_media_video_gameinput`, `test_codecs`, `test_bcpack_bvh4`, `test_audio_opus_wasapi`, `test_d3d12_xs_live`)"
                 if has_s16_media
-                else "11 PCs (NVIDIA + AMD) + WARP (`test_media_video_gameinput`, `test_codecs`, `test_bcpack_bvh4`, `test_audio_opus_wasapi`, `test_d3d12_xs_live`)"
+                else "12 PCs (NVIDIA + AMD) + WARP (`test_media_video_gameinput`, `test_codecs`, `test_bcpack_bvh4`, `test_audio_opus_wasapi`, `test_d3d12_xs_live`)"
             ),
         ),
         Component(
@@ -575,9 +575,9 @@ def collect_components(
                 else "Live **6/6 untouched MIT `_GAMING_XBOX_SCARLETT` samples** at 4K, 60 FPS **Freedoom: Phase 1**, `ScarlettArena`, shadowed/skinned BC1+BC3 3D dual-API GDK scene (`gdk_3d_scene`), shipping commercial GDK thunks (`Alexandria IV DEMO`, `0 E_NOINTERFACE`), and next-gen flagship open-world AAA gap audit closed on `main`. Active commercial bring-up underway on **Minecraft (Xbox Series Preview)** and **UE5 (*The Matrix Awakens*)** — join Discord to help test real unpacked GDKs!"
             ),
             verified_on=(
-                "GTX 1650 Ti + WARP + 10 community NVIDIA/AMD PCs (live retail Minecraft Preview `1.18.3064.0`, `test_minecraft_perf_hardening`, `test_mine_xapu_acphal`, `test_ue5_matrix_import_bringup`, `test_gdkx_untouched_samples`, `test_scarlett_game_live`, `test_gdk_3d_scene_dual_api`, `test_real_gdk_thunks_live`)"
+                "GTX 1650 Ti + WARP + 11 community NVIDIA/AMD PCs (live retail Minecraft Preview `1.18.3064.0`, `test_minecraft_perf_hardening`, `test_mine_xapu_acphal`, `test_ue5_matrix_import_bringup`, `test_gdkx_untouched_samples`, `test_scarlett_game_live`, `test_gdk_3d_scene_dual_api`, `test_real_gdk_thunks_live`)"
                 if has_mine_perf
-                else "GTX 1650 Ti + WARP + 10 community NVIDIA/AMD PCs (`test_gdkx_untouched_samples`, `test_scarlett_game_live`, `test_gdk_3d_scene_dual_api`, `test_real_gdk_thunks_live`, `test_mine_xapu_acphal`)"
+                else "GTX 1650 Ti + WARP + 11 community NVIDIA/AMD PCs (`test_gdkx_untouched_samples`, `test_scarlett_game_live`, `test_gdk_3d_scene_dual_api`, `test_real_gdk_thunks_live`, `test_mine_xapu_acphal`)"
             ),
         ),
     ]
@@ -646,7 +646,7 @@ def render_status_svg(
         f'    <rect width="{W}" height="{H}" fill="#0d1117"/>',
         f'    <rect x="0" y="0" width="{W}" height="3" fill="url(#accentBar)"/>',
         '    <text class="h1" x="28" y="40">OpenScarlett — Honest Subsystem Progress (Early Alpha)</text>',
-        f'    <text class="sub" x="28" y="62">Windows 10/11 x64 · MIT · {html.escape(test_str)} · {len(dlls)} DLLs ({tot_exp} exports) · {opcodes_decoded}/{opcodes_total} RDNA2 ops · 11 PCs</text>',
+        f'    <text class="sub" x="28" y="62">Windows 10/11 x64 · MIT · {html.escape(test_str)} · {len(dlls)} DLLs ({tot_exp} exports) · {opcodes_decoded}/{opcodes_total} RDNA2 ops · 12 PCs</text>',
         '    <line x1="28" y1="82" x2="872" y2="82" stroke="#21262d" stroke-width="1"/>',
     ]
 
@@ -821,7 +821,7 @@ def render_markdown(
     corpus_part = f" · **Validated Shader Corpus:** `{corpus_passed}/{corpus_total}`" if corpus_total else ""
     rows = [
         "<!-- OPENSCARLETT_STATUS_START -->",
-        f"**Automated Tests:** {test_str} · **Shimmed DLLs:** `{len(dlls)}` (`{tot_exp}` PE exports) · **Shipping GDK Thunks:** `292/292` · **RDNA2 Opcodes Decoded:** `{opcodes_decoded}/{opcodes_total}`{corpus_part} · **Verified Hardware:** `11 PCs` (`NVIDIA` + `AMD`)",
+        f"**Automated Tests:** {test_str} · **Shimmed DLLs:** `{len(dlls)}` (`{tot_exp}` PE exports) · **Shipping GDK Thunks:** `292/292` · **RDNA2 Opcodes Decoded:** `{opcodes_decoded}/{opcodes_total}`{corpus_part} · **Verified Hardware:** `12 PCs` (`NVIDIA` + `AMD`)",
         "",
         "| Subsystem | Area | Status | Honest Progress | Technical Coverage | Verified On |",
         "| :--- | :--- | :--- | :---: | :--- | :--- |",
@@ -874,12 +874,12 @@ def render_dashboard_html(
             {"tier": "NVIDIA Turing", "status": "verified", "detail": "GTX 1650 Ti (Win10 22H2) · RTX 2060 SUPER (Win11 26H2, DXR=12)"},
             {"tier": "NVIDIA Ampere", "status": "verified", "detail": "RTX 3060 · RTX 3080 Ti (Win11 25H2, DXR=12, Vulkan 1.4.357, 67/67 Pass)"},
             {"tier": "NVIDIA Ada Lovelace", "status": "verified", "detail": "RTX 4070 Laptop GPU (Win11 26H2, SM 6.7, DXR=12, Vulkan 1.4.357, 67/67 Pass)"},
-            {"tier": "NVIDIA Blackwell", "status": "verified", "detail": "RTX 5060 · RTX 5070 (Win11 25H2/26H2, DXR=12, Vulkan 1.4.357)"},
+            {"tier": "NVIDIA Blackwell", "status": "verified", "detail": "RTX 5060 · RTX 5070 · RTX 5090 (Win11 25H2/26H2, DXR=12, Vulkan 1.4.351–357, 67/67 Pass)"},
             {"tier": "AMD RDNA 3 & 4", "status": "verified", "detail": "RX 7600 · RX 7900 XTX · RX 9070 XT (Win11 26H2, Wave64, DXR=11, 67/67 Pass)"},
             {"tier": "Software Fallback", "status": "verified", "detail": "D3D12 WARP (Windows 10/11 & CI runners)"},
             {"tier": "AMD RX 6000 (RDNA2)", "status": "needed", "detail": "RX 6750 XT tested (60/62; RDNA2 fixes landed — re-test welcome)"},
             {"tier": "Intel Arc (A / B)", "status": "needed", "detail": "Arc B390 Battlemage tested (60/67; mesh PSO, Vulkan subpass & VOPC fixes landed — re-test welcome)"},
-            {"tier": "Handheld APUs", "status": "needed", "detail": "ROG Ally / Legion Go / Steam Deck Windows — tester needed"},
+            {"tier": "Handheld APUs", "status": "needed", "detail": "Ryzen Z1 Extreme / Radeon 780M tested (64/67; sv64_vopc_p1 fix landed — re-test welcome; Steam Deck Windows needed)"},
         ]
     )
 
@@ -975,7 +975,7 @@ def render_dashboard_html(
       <div class="kpi"><div class="val">{len(dlls)}</div><div class="lbl">Xbox / GDK DLLs ({tot_exp} Exports)</div></div>
       <div class="kpi"><div class="val">{html.escape(op_label)}</div><div class="lbl">RDNA2 GFX10.3 Opcodes</div></div>
       <div class="kpi"><div class="val">292/292</div><div class="lbl">Shipping GDK Thunks</div></div>
-      <div class="kpi"><div class="val">11 PCs</div><div class="lbl">NVIDIA &amp; AMD Verified</div></div>
+      <div class="kpi"><div class="val">12 PCs</div><div class="lbl">NVIDIA &amp; AMD Verified</div></div>
     </div>
 
     <div class="section">
