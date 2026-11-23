@@ -159,7 +159,12 @@ struct VulkanRecordedOp {
     uint64_t dst_offset = 0ull;
     uint64_t src_offset = 0ull;
     uint64_t num_bytes = 0ull;
+    uint32_t copy_dst_x = 0u;
+    uint32_t copy_dst_y = 0u;
+    uint32_t copy_dst_z = 0u;
+    uint64_t copy_footprint_offset = 0ull;
     uint32_t barrier_count = 0u;
+    uint32_t global_uav_barrier_count = 0u;
 };
 
 struct VulkanRecordedBatch {
@@ -505,6 +510,10 @@ public:
     // IOpenScarlettEnhancedBarrierStats
     HRESULT STDMETHODCALLTYPE GetEnhancedBarrierStats(
         D3D12XBOX_ENHANCED_BARRIER_STATS* out_stats) const noexcept override;
+
+    // Sprint 15: Record an unsupported/unrecognized console command-list extension cleanly
+    // without poisoning or aborting subsequent supported Draw/Dispatch/Copy/Barrier commands.
+    void RecordUnsupportedExtensionIgnored(const char* ext_name, int32_t slot);
 
 private:
     friend class CommandListExtendedProxy;

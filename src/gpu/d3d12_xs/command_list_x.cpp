@@ -268,36 +268,46 @@ public:
     void STDMETHODCALLTYPE OMSetFrontAndBackStencilRef(UINT FrontStencilRef, UINT BackStencilRef) override {
         if (parent_->host_list8_) {
             parent_->host_list8_->OMSetFrontAndBackStencilRef(FrontStencilRef, BackStencilRef);
+            RecordList("ID3D12GraphicsCommandListX::OMSetFrontAndBackStencilRef", 81, S_OK);
+        } else {
+            parent_->RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::OMSetFrontAndBackStencilRef", 81);
         }
-        RecordList("ID3D12GraphicsCommandListX::OMSetFrontAndBackStencilRef", 81, parent_->host_list8_ ? S_OK : E_NOINTERFACE);
     }
 #endif
 #ifdef __ID3D12GraphicsCommandList9_INTERFACE_DEFINED__
     void STDMETHODCALLTYPE RSSetDepthBias(FLOAT DepthBias, FLOAT DepthBiasClamp, FLOAT SlopeScaledDepthBias) override {
         if (parent_->host_list9_) {
             parent_->host_list9_->RSSetDepthBias(DepthBias, DepthBiasClamp, SlopeScaledDepthBias);
+            RecordList("ID3D12GraphicsCommandListX::RSSetDepthBias", 82, S_OK);
+        } else {
+            parent_->RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::RSSetDepthBias", 82);
         }
-        RecordList("ID3D12GraphicsCommandListX::RSSetDepthBias", 82, parent_->host_list9_ ? S_OK : E_NOINTERFACE);
     }
     void STDMETHODCALLTYPE IASetIndexBufferStripCutValue(D3D12_INDEX_BUFFER_STRIP_CUT_VALUE IBStripCutValue) override {
         if (parent_->host_list9_) {
             parent_->host_list9_->IASetIndexBufferStripCutValue(IBStripCutValue);
+            RecordList("ID3D12GraphicsCommandListX::IASetIndexBufferStripCutValue", 83, S_OK);
+        } else {
+            parent_->RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::IASetIndexBufferStripCutValue", 83);
         }
-        RecordList("ID3D12GraphicsCommandListX::IASetIndexBufferStripCutValue", 83, parent_->host_list9_ ? S_OK : E_NOINTERFACE);
     }
 #endif
 #ifdef __ID3D12GraphicsCommandList10_INTERFACE_DEFINED__
     void STDMETHODCALLTYPE SetProgram(const D3D12_SET_PROGRAM_DESC* pDesc) override {
         if (parent_->host_list10_) {
             parent_->host_list10_->SetProgram(pDesc);
+            RecordList("ID3D12GraphicsCommandListX::SetProgram", 84, S_OK);
+        } else {
+            parent_->RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::SetProgram", 84);
         }
-        RecordList("ID3D12GraphicsCommandListX::SetProgram", 84, parent_->host_list10_ ? S_OK : E_NOINTERFACE);
     }
     void STDMETHODCALLTYPE DispatchGraph(const D3D12_DISPATCH_GRAPH_DESC* pDesc) override {
         if (parent_->host_list10_) {
             parent_->host_list10_->DispatchGraph(pDesc);
+            RecordList("ID3D12GraphicsCommandListX::DispatchGraph", 85, S_OK);
+        } else {
+            parent_->RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::DispatchGraph", 85);
         }
-        RecordList("ID3D12GraphicsCommandListX::DispatchGraph", 85, parent_->host_list10_ ? S_OK : E_NOINTERFACE);
     }
 #endif
 
@@ -685,6 +695,11 @@ void STDMETHODCALLTYPE CommandListX::ClearState(ID3D12PipelineState* pPipelineSt
 void STDMETHODCALLTYPE CommandListX::DrawInstanced(
     UINT VertexCountPerInstance, UINT InstanceCount,
     UINT StartVertexLocation, UINT StartInstanceLocation) {
+    if (VertexCountPerInstance == 0u || InstanceCount == 0u) {
+        if (device_x_) device_x_->RecordZeroCountNoop();
+        RecordList("ID3D12GraphicsCommandListX::DrawInstanced[ZeroNoop]", 12, S_OK);
+        return;
+    }
     bool skip_host = false;
     if (device_x_ && device_x_->IsVulkanRoutingActive()) {
         std::lock_guard<std::mutex> lock(vk_rec_mutex_);
@@ -722,6 +737,11 @@ void STDMETHODCALLTYPE CommandListX::DrawInstanced(
 void STDMETHODCALLTYPE CommandListX::DrawIndexedInstanced(
     UINT IndexCountPerInstance, UINT InstanceCount, UINT StartIndexLocation,
     INT BaseVertexLocation, UINT StartInstanceLocation) {
+    if (IndexCountPerInstance == 0u || InstanceCount == 0u) {
+        if (device_x_) device_x_->RecordZeroCountNoop();
+        RecordList("ID3D12GraphicsCommandListX::DrawIndexedInstanced[ZeroNoop]", 13, S_OK);
+        return;
+    }
     bool skip_host = false;
     if (device_x_ && device_x_->IsVulkanRoutingActive()) {
         std::lock_guard<std::mutex> lock(vk_rec_mutex_);
@@ -762,6 +782,11 @@ void STDMETHODCALLTYPE CommandListX::DrawIndexedInstanced(
 
 void STDMETHODCALLTYPE CommandListX::Dispatch(
     UINT ThreadGroupCountX, UINT ThreadGroupCountY, UINT ThreadGroupCountZ) {
+    if (ThreadGroupCountX == 0u || ThreadGroupCountY == 0u || ThreadGroupCountZ == 0u) {
+        if (device_x_) device_x_->RecordZeroCountNoop();
+        RecordList("ID3D12GraphicsCommandListX::Dispatch[ZeroNoop]", 14, S_OK);
+        return;
+    }
     bool skip_host = false;
     if (device_x_ && device_x_->IsVulkanRoutingActive()) {
         std::lock_guard<std::mutex> lock(vk_rec_mutex_);
@@ -808,43 +833,181 @@ void STDMETHODCALLTYPE CommandListX::CopyBufferRegion(
     RecordList("ID3D12GraphicsCommandListX::CopyBufferRegion", 15, S_OK);
 }
 
+namespace {
+
+bool IsPlanarDepthStencilTextureFormat(DXGI_FORMAT fmt) noexcept {
+    switch (fmt) {
+        case DXGI_FORMAT_D24_UNORM_S8_UINT:
+        case DXGI_FORMAT_R24G8_TYPELESS:
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+        case DXGI_FORMAT_R32G8X24_TYPELESS:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool IsAnyDepthStencilTextureFormat(DXGI_FORMAT fmt) noexcept {
+    switch (fmt) {
+        case DXGI_FORMAT_D16_UNORM:
+        case DXGI_FORMAT_D32_FLOAT:
+        case DXGI_FORMAT_D24_UNORM_S8_UINT:
+        case DXGI_FORMAT_R24G8_TYPELESS:
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+        case DXGI_FORMAT_R32G8X24_TYPELESS:
+        case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+        case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
+        case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+        case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
+            return true;
+        default:
+            return false;
+    }
+}
+
+DXGI_FORMAT NormalizePlanarDepthStencilFootprintFormat(
+    ID3D12Device* host_dev,
+    const D3D12_RESOURCE_DESC& tdesc,
+    uint32_t subresource_index,
+    uint32_t plane_slice,
+    DXGI_FORMAT cur_fp_fmt) noexcept {
+    // Query host D3D12 runtime's exact canonical copyable footprint format for this planar subresource
+    // (e.g. R32_TYPELESS for D24S8/D32S8 plane 0, R8_TYPELESS for stencil plane 1).
+    DXGI_FORMAT canonical = DXGI_FORMAT_UNKNOWN;
+    if (host_dev) {
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+        host_dev->GetCopyableFootprints(&tdesc, subresource_index, 1u, 0ull, &fp, nullptr, nullptr, nullptr);
+        canonical = fp.Footprint.Format;
+    }
+    if (canonical == DXGI_FORMAT_UNKNOWN) {
+        canonical = (plane_slice == 0u) ? DXGI_FORMAT_R32_TYPELESS : DXGI_FORMAT_R8_TYPELESS;
+    }
+    switch (cur_fp_fmt) {
+        case DXGI_FORMAT_UNKNOWN:
+        case DXGI_FORMAT_D24_UNORM_S8_UINT:
+        case DXGI_FORMAT_R24G8_TYPELESS:
+        case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+        case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+        case DXGI_FORMAT_R32G8X24_TYPELESS:
+        case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+        case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
+            return canonical;
+        default:
+            return cur_fp_fmt;
+    }
+}
+
+uint64_t ComputePlacedFootprintByteSize(const D3D12_SUBRESOURCE_FOOTPRINT& fp) noexcept {
+    const uint32_t block_h =
+        (fp.Format >= DXGI_FORMAT_BC1_TYPELESS && fp.Format <= DXGI_FORMAT_BC7_UNORM_SRGB) ? 4u : 1u;
+    const uint64_t rows = std::max<uint64_t>(1ull, (static_cast<uint64_t>(fp.Height) + block_h - 1ull) / block_h);
+    const uint64_t depth = std::max<uint64_t>(1ull, static_cast<uint64_t>(fp.Depth));
+    return static_cast<uint64_t>(fp.RowPitch) * rows * depth;
+}
+
+}  // namespace
+
 void STDMETHODCALLTYPE CommandListX::CopyTextureRegion(
     const D3D12_TEXTURE_COPY_LOCATION* pDst, UINT DstX, UINT DstY, UINT DstZ,
     const D3D12_TEXTURE_COPY_LOCATION* pSrc, const D3D12_BOX* pSrcBox) {
-    D3D12_TEXTURE_COPY_LOCATION dst_loc{};
-    D3D12_TEXTURE_COPY_LOCATION src_loc{};
-    const D3D12_TEXTURE_COPY_LOCATION* dst_ptr = pDst;
-    const D3D12_TEXTURE_COPY_LOCATION* src_ptr = pSrc;
-    if (pDst) {
-        dst_loc = *pDst;
-        dst_loc.pResource = UnwrapResource(pDst->pResource);
-        dst_ptr = &dst_loc;
+    if (!pDst || !pSrc) {
+        if (device_x_) device_x_->RecordZeroCountNoop();
+        RecordList("ID3D12GraphicsCommandListX::CopyTextureRegion[NullNoop]", 16, S_OK);
+        return;
     }
-    if (pSrc) {
-        src_loc = *pSrc;
-        src_loc.pResource = UnwrapResource(pSrc->pResource);
-        src_ptr = &src_loc;
+    if (pSrcBox &&
+        (pSrcBox->left >= pSrcBox->right ||
+         pSrcBox->top >= pSrcBox->bottom ||
+         pSrcBox->front >= pSrcBox->back)) {
+        if (device_x_) device_x_->RecordZeroCountNoop();
+        RecordList("ID3D12GraphicsCommandListX::CopyTextureRegion[EmptyBoxNoop]", 16, S_OK);
+        return;
     }
+
+    D3D12_TEXTURE_COPY_LOCATION dst_loc = *pDst;
+    D3D12_TEXTURE_COPY_LOCATION src_loc = *pSrc;
+    dst_loc.pResource = UnwrapResource(pDst->pResource);
+    src_loc.pResource = UnwrapResource(pSrc->pResource);
+    if (!dst_loc.pResource || !src_loc.pResource) {
+        if (device_x_) device_x_->RecordZeroCountNoop();
+        RecordList("ID3D12GraphicsCommandListX::CopyTextureRegion[NullResNoop]", 16, S_OK);
+        return;
+    }
+    D3D12_TEXTURE_COPY_LOCATION* dst_ptr = &dst_loc;
+    D3D12_TEXTURE_COPY_LOCATION* src_ptr = &src_loc;
+
+    // Normalize depth/stencil planar footprint formats and track depth/stencil plane + footprint-offset copies (AnyBox #54/#57/#67).
+    bool is_depth_stencil_copy = false;
+    bool has_footprint_offset = false;
+    auto inspect_tex_and_normalize_fp = [&](const D3D12_TEXTURE_COPY_LOCATION& tex_loc,
+                                            D3D12_TEXTURE_COPY_LOCATION& fp_loc) {
+        if (tex_loc.Type != D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX || !tex_loc.pResource) return;
+        const D3D12_RESOURCE_DESC tdesc = tex_loc.pResource->GetDesc();
+        if (IsAnyDepthStencilTextureFormat(tdesc.Format)) {
+            is_depth_stencil_copy = true;
+        }
+        if (fp_loc.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
+            if (fp_loc.PlacedFootprint.Offset != 0ull) {
+                has_footprint_offset = true;
+            }
+            if (IsPlanarDepthStencilTextureFormat(tdesc.Format)) {
+                const uint32_t mips = std::max<uint32_t>(1u, tdesc.MipLevels);
+                const uint32_t arr =
+                    (tdesc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+                        ? 1u
+                        : std::max<uint32_t>(1u, tdesc.DepthOrArraySize);
+                const uint32_t plane_slice = tex_loc.SubresourceIndex / (mips * arr);
+                fp_loc.PlacedFootprint.Footprint.Format = NormalizePlanarDepthStencilFootprintFormat(
+                    device_x_ ? device_x_->HostDevice() : nullptr,
+                    tdesc, tex_loc.SubresourceIndex, plane_slice,
+                    fp_loc.PlacedFootprint.Footprint.Format);
+            }
+        }
+    };
+    inspect_tex_and_normalize_fp(dst_loc, src_loc);
+    inspect_tex_and_normalize_fp(src_loc, dst_loc);
+    if (dst_loc.Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
+        src_loc.Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX) {
+        if (IsAnyDepthStencilTextureFormat(dst_loc.pResource->GetDesc().Format) ||
+            IsAnyDepthStencilTextureFormat(src_loc.pResource->GetDesc().Format)) {
+            is_depth_stencil_copy = true;
+        }
+    }
+    if (is_depth_stencil_copy && device_x_) {
+        device_x_->RecordDepthStencilPlaneCopy();
+    }
+    if (has_footprint_offset && device_x_) {
+        device_x_->RecordFootprintOffsetCopy();
+    }
+
     if (device_x_ && device_x_->IsVulkanRoutingActive()) {
         std::lock_guard<std::mutex> lock(vk_rec_mutex_);
         VulkanRecordedOp op{};
         op.kind = VulkanRecordedOpKind::CopyTexture;
-        op.dst_resource = dst_ptr ? dst_ptr->pResource : nullptr;
-        op.src_resource = src_ptr ? src_ptr->pResource : nullptr;
+        op.dst_resource = dst_ptr->pResource;
+        op.src_resource = src_ptr->pResource;
+        op.copy_dst_x = DstX;
+        op.copy_dst_y = DstY;
+        op.copy_dst_z = DstZ;
+        if (src_loc.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
+            op.copy_footprint_offset = src_loc.PlacedFootprint.Offset;
+        } else if (dst_loc.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
+            op.copy_footprint_offset = dst_loc.PlacedFootprint.Offset;
+        }
         vk_batch_.ops.push_back(std::move(op));
         vk_batch_.has_host_commands = true;
     }
 
     // Sprint 13 placed tiled texture bridge (64KB tile-pool mapping, subresource pitch, untile/retile).
-    if (dst_ptr && src_ptr &&
-        TryBridgePlacedTiledCopyTextureRegion(*dst_ptr, DstX, DstY, DstZ, *src_ptr, pSrcBox)) {
+    if (TryBridgePlacedTiledCopyTextureRegion(*dst_ptr, DstX, DstY, DstZ, *src_ptr, pSrcBox)) {
         RecordList("ID3D12GraphicsCommandListX::CopyTextureRegion[PlacedTiled]", 16, S_OK);
         RecordList("ID3D12GraphicsCommandListX::CopyTextureRegion", 16, S_OK);
         return;
     }
 
     // Live XgGpuUntiler intercept when source or destination uses a GFX10 swizzle layout.
-    if (device_x_ && dst_ptr && src_ptr &&
+    if (device_x_ &&
         dst_ptr->Type == D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX &&
         src_ptr->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
         const XG_TILE_MODE src_mode = device_x_->GetTrackedResourceTileMode(src_ptr->pResource);
@@ -856,6 +1019,92 @@ void STDMETHODCALLTYPE CommandListX::CopyTextureRegion(
                 if (last_host_compute_rs_) host_list_->SetComputeRootSignature(last_host_compute_rs_);
                 if (last_host_pso_) host_list_->SetPipelineState(last_host_pso_);
                 RecordList("ID3D12GraphicsCommandListX::CopyTextureRegion[XgGpuUntile]", 16, S_OK);
+                RecordList("ID3D12GraphicsCommandListX::CopyTextureRegion", 16, S_OK);
+                return;
+            }
+        }
+    }
+
+    // Xbox allows sub-512B buffer placement offsets in CopyTextureRegion, whereas PC D3D12 strictly
+    // requires D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT (512B). Stage unaligned footprint offsets transparently.
+    if (device_x_ && device_x_->HostDevice() &&
+        src_loc.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT &&
+        (src_loc.PlacedFootprint.Offset & (D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1ull)) != 0ull) {
+        const uint64_t fp_bytes = ComputePlacedFootprintByteSize(src_loc.PlacedFootprint.Footprint);
+        if (fp_bytes > 0ull) {
+            D3D12_HEAP_PROPERTIES def_hp{};
+            def_hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC stage_desc{};
+            stage_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            stage_desc.Width = (fp_bytes + 511ull) & ~511ull;
+            stage_desc.Height = 1u;
+            stage_desc.DepthOrArraySize = 1u;
+            stage_desc.MipLevels = 1u;
+            stage_desc.SampleDesc.Count = 1u;
+            stage_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            ID3D12Resource* stage_buf = nullptr;
+            if (SUCCEEDED(device_x_->HostDevice()->CreateCommittedResource(
+                    &def_hp, D3D12_HEAP_FLAG_NONE, &stage_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                    OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&stage_buf))) &&
+                stage_buf) {
+                // TrackTiledTransientResource takes ownership of stage_buf (released on Reset/dtor).
+                TrackTiledTransientResource(stage_buf);
+                host_list_->CopyBufferRegion(stage_buf, 0ull, src_loc.pResource, src_loc.PlacedFootprint.Offset, fp_bytes);
+                D3D12_RESOURCE_BARRIER tb{};
+                tb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                tb.Transition.pResource = stage_buf;
+                tb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                tb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                tb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                host_list_->ResourceBarrier(1u, &tb);
+                D3D12_TEXTURE_COPY_LOCATION aligned_src = src_loc;
+                aligned_src.pResource = stage_buf;
+                aligned_src.PlacedFootprint.Offset = 0ull;
+                host_list_->CopyTextureRegion(dst_ptr, DstX, DstY, DstZ, &aligned_src, pSrcBox);
+                RecordList("ID3D12GraphicsCommandListX::CopyTextureRegion[AlignedFootprintStage]", 16, S_OK);
+                RecordList("ID3D12GraphicsCommandListX::CopyTextureRegion", 16, S_OK);
+                return;
+            }
+        }
+    }
+
+    if (device_x_ && device_x_->HostDevice() &&
+        dst_loc.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT &&
+        (dst_loc.PlacedFootprint.Offset & (D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1ull)) != 0ull) {
+        const uint64_t fp_bytes = ComputePlacedFootprintByteSize(dst_loc.PlacedFootprint.Footprint);
+        if (fp_bytes > 0ull) {
+            D3D12_HEAP_PROPERTIES def_hp{};
+            def_hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+            D3D12_RESOURCE_DESC stage_desc{};
+            stage_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            stage_desc.Width = (fp_bytes + 511ull) & ~511ull;
+            stage_desc.Height = 1u;
+            stage_desc.DepthOrArraySize = 1u;
+            stage_desc.MipLevels = 1u;
+            stage_desc.SampleDesc.Count = 1u;
+            stage_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            ID3D12Resource* stage_buf = nullptr;
+            if (SUCCEEDED(device_x_->HostDevice()->CreateCommittedResource(
+                    &def_hp, D3D12_HEAP_FLAG_NONE, &stage_desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                    OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&stage_buf))) &&
+                stage_buf) {
+                // TrackTiledTransientResource takes ownership of stage_buf (released on Reset/dtor).
+                TrackTiledTransientResource(stage_buf);
+                D3D12_TEXTURE_COPY_LOCATION aligned_dst = dst_loc;
+                aligned_dst.pResource = stage_buf;
+                aligned_dst.PlacedFootprint.Offset = 0ull;
+                host_list_->CopyTextureRegion(&aligned_dst, DstX, DstY, DstZ, src_ptr, pSrcBox);
+                D3D12_RESOURCE_BARRIER tb{};
+                tb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                tb.Transition.pResource = stage_buf;
+                tb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                tb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+                tb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                host_list_->ResourceBarrier(1u, &tb);
+                host_list_->CopyBufferRegion(dst_loc.pResource, dst_loc.PlacedFootprint.Offset, stage_buf, 0ull, fp_bytes);
+                RecordList("ID3D12GraphicsCommandListX::CopyTextureRegion[AlignedFootprintStage]", 16, S_OK);
                 RecordList("ID3D12GraphicsCommandListX::CopyTextureRegion", 16, S_OK);
                 return;
             }
@@ -951,7 +1200,12 @@ void STDMETHODCALLTYPE CommandListX::IASetPrimitiveTopology(
 
 void STDMETHODCALLTYPE CommandListX::RSSetViewports(
     UINT NumViewports, const D3D12_VIEWPORT* pViewports) {
-    if (device_x_ && device_x_->IsVulkanRoutingActive() && NumViewports > 0u && pViewports) {
+    if (NumViewports == 0u || !pViewports) {
+        if (device_x_) device_x_->RecordZeroCountNoop();
+        RecordList("ID3D12GraphicsCommandListX::RSSetViewports[ZeroNoop]", 21, S_OK);
+        return;
+    }
+    if (device_x_ && device_x_->IsVulkanRoutingActive()) {
         std::lock_guard<std::mutex> lock(vk_rec_mutex_);
         vk_vp_width_ = static_cast<uint32_t>(std::max(0.0f, pViewports[0].Width));
         vk_vp_height_ = static_cast<uint32_t>(std::max(0.0f, pViewports[0].Height));
@@ -962,6 +1216,11 @@ void STDMETHODCALLTYPE CommandListX::RSSetViewports(
 
 void STDMETHODCALLTYPE CommandListX::RSSetScissorRects(
     UINT NumRects, const D3D12_RECT* pRects) {
+    if (NumRects == 0u || !pRects) {
+        if (device_x_) device_x_->RecordZeroCountNoop();
+        RecordList("ID3D12GraphicsCommandListX::RSSetScissorRects[ZeroNoop]", 22, S_OK);
+        return;
+    }
     host_list_->RSSetScissorRects(NumRects, pRects);
     RecordList("ID3D12GraphicsCommandListX::RSSetScissorRects", 22, S_OK);
 }
@@ -996,8 +1255,8 @@ void STDMETHODCALLTYPE CommandListX::SetPipelineState(ID3D12PipelineState* pPipe
 void STDMETHODCALLTYPE CommandListX::ResourceBarrier(
     UINT NumBarriers, const D3D12_RESOURCE_BARRIER* pBarriers) {
     if (!pBarriers || NumBarriers == 0u) {
-        host_list_->ResourceBarrier(NumBarriers, pBarriers);
-        RecordList("ID3D12GraphicsCommandListX::ResourceBarrier", 26, S_OK);
+        if (device_x_) device_x_->RecordZeroCountNoop();
+        RecordList("ID3D12GraphicsCommandListX::ResourceBarrier[ZeroNoop]", 26, S_OK);
         return;
     }
 
@@ -1024,6 +1283,7 @@ void STDMETHODCALLTYPE CommandListX::ResourceBarrier(
     };
 
     UINT out_count = 0u;
+    uint32_t global_uav_barriers = 0u;
     for (UINT i = 0u; i < NumBarriers; ++i) {
         D3D12_RESOURCE_BARRIER b = pBarriers[i];
         bool emit = true;
@@ -1098,6 +1358,15 @@ void STDMETHODCALLTYPE CommandListX::ResourceBarrier(
                 b.UAV.pResource = UnwrapResource(pBarriers[i].UAV.pResource);
                 if (b.UAV.pResource != nullptr) {
                     RecordMirroredResourceGpuWrite(b.UAV.pResource);
+                } else {
+                    // Console global UAV barrier (UAV.pResource == nullptr, xcl #68):
+                    // valid on DIRECT/COMPUTE lists in D3D12 and maps conservatively to a full
+                    // VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT barrier on Vulkan.
+                    ++global_uav_barriers;
+                    if (device_x_) device_x_->RecordGlobalUavBarrier();
+                    if (list_type_ == D3D12_COMMAND_LIST_TYPE_COPY) {
+                        emit = false;
+                    }
                 }
                 break;
             default:
@@ -1117,7 +1386,10 @@ void STDMETHODCALLTYPE CommandListX::ResourceBarrier(
         std::lock_guard<std::mutex> lock(vk_rec_mutex_);
         VulkanRecordedOp op{};
         op.kind = VulkanRecordedOpKind::Barrier;
-        op.barrier_count = out_count + static_cast<uint32_t>(extra_tiled_barriers.size());
+        op.barrier_count = std::max<uint32_t>(
+            out_count + static_cast<uint32_t>(extra_tiled_barriers.size()),
+            global_uav_barriers);
+        op.global_uav_barrier_count = global_uav_barriers;
         vk_batch_.ops.push_back(std::move(op));
         vk_batch_.has_host_commands = true;
     }
@@ -1777,7 +2049,12 @@ void STDMETHODCALLTYPE CommandListX::IASetIndexBuffer(const D3D12_INDEX_BUFFER_V
 
 void STDMETHODCALLTYPE CommandListX::IASetVertexBuffers(
     UINT StartSlot, UINT NumViews, const D3D12_VERTEX_BUFFER_VIEW* pViews) {
-    if (device_x_ && device_x_->IsVulkanRoutingActive() && StartSlot == 0u && NumViews > 0u && pViews) {
+    if (NumViews == 0u) {
+        if (device_x_) device_x_->RecordZeroCountNoop();
+        RecordList("ID3D12GraphicsCommandListX::IASetVertexBuffers[ZeroNoop]", 44, S_OK);
+        return;
+    }
+    if (device_x_ && device_x_->IsVulkanRoutingActive() && StartSlot == 0u && pViews) {
         std::lock_guard<std::mutex> lock(vk_rec_mutex_);
         vk_cur_vbv_ = pViews[0];
         vk_has_vbv_ = true;
@@ -2049,9 +2326,10 @@ void STDMETHODCALLTYPE CommandListX::AtomicCopyBufferUINT(
         host_list1_->AtomicCopyBufferUINT(
             UnwrapResource(pDstBuffer), DstOffset, UnwrapResource(pSrcBuffer), SrcOffset,
             Dependencies, dep_ptr, pDependentSubresourceRanges);
+        RecordList("ID3D12GraphicsCommandListX::AtomicCopyBufferUINT", 60, S_OK);
+    } else {
+        RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::AtomicCopyBufferUINT", 60);
     }
-    RecordList("ID3D12GraphicsCommandListX::AtomicCopyBufferUINT",
-               60, host_list1_ ? S_OK : E_NOINTERFACE);
 }
 
 void STDMETHODCALLTYPE CommandListX::AtomicCopyBufferUINT64(
@@ -2072,9 +2350,10 @@ void STDMETHODCALLTYPE CommandListX::AtomicCopyBufferUINT64(
         host_list1_->AtomicCopyBufferUINT64(
             UnwrapResource(pDstBuffer), DstOffset, UnwrapResource(pSrcBuffer), SrcOffset,
             Dependencies, dep_ptr, pDependentSubresourceRanges);
+        RecordList("ID3D12GraphicsCommandListX::AtomicCopyBufferUINT64", 61, S_OK);
+    } else {
+        RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::AtomicCopyBufferUINT64", 61);
     }
-    RecordList("ID3D12GraphicsCommandListX::AtomicCopyBufferUINT64",
-               61, host_list1_ ? S_OK : E_NOINTERFACE);
 }
 
 void STDMETHODCALLTYPE CommandListX::OMSetDepthBounds(FLOAT Min, FLOAT Max) {
@@ -2170,9 +2449,10 @@ void STDMETHODCALLTYPE CommandListX::ResolveSubresourceRegion(
         host_list1_->ResolveSubresourceRegion(
             host_dst, DstSubresource, DstX, DstY,
             host_src, SrcSubresource, pSrcRect, Format, ResolveMode);
+        RecordList("ID3D12GraphicsCommandListX::ResolveSubresourceRegion", 64, S_OK);
+    } else {
+        RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::ResolveSubresourceRegion", 64);
     }
-    RecordList("ID3D12GraphicsCommandListX::ResolveSubresourceRegion",
-               64, host_list1_ ? S_OK : E_NOINTERFACE);
 }
 
 void STDMETHODCALLTYPE CommandListX::SetViewInstanceMask(UINT Mask) {
@@ -2189,6 +2469,7 @@ void STDMETHODCALLTYPE CommandListX::WriteBufferImmediate(
     UINT Count, const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER* pParams,
     const D3D12_WRITEBUFFERIMMEDIATE_MODE* pModes) {
     if (Count == 0u || !pParams) {
+        if (device_x_) device_x_->RecordZeroCountNoop();
         RecordList("ID3D12GraphicsCommandListX::WriteBufferImmediate", 66, S_OK);
         return;
     }
@@ -2249,9 +2530,12 @@ void STDMETHODCALLTYPE CommandListX::WriteBufferImmediate(
 // ID3D12GraphicsCommandList3 (slot 67)
 void STDMETHODCALLTYPE CommandListX::SetProtectedResourceSession(
     ID3D12ProtectedResourceSession* pProtectedResourceSession) {
-    if (host_list3_) host_list3_->SetProtectedResourceSession(pProtectedResourceSession);
-    RecordList("ID3D12GraphicsCommandListX::SetProtectedResourceSession",
-               67, host_list3_ ? S_OK : E_NOINTERFACE);
+    if (host_list3_) {
+        host_list3_->SetProtectedResourceSession(pProtectedResourceSession);
+        RecordList("ID3D12GraphicsCommandListX::SetProtectedResourceSession", 67, S_OK);
+    } else {
+        RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::SetProtectedResourceSession", 67);
+    }
 }
 
 // ID3D12GraphicsCommandList4 (slots 68..76)
@@ -2282,104 +2566,129 @@ void STDMETHODCALLTYPE CommandListX::BeginRenderPass(
             }
         }
         host_list4_->BeginRenderPass(NumRenderTargets, rt_ptr, pDepthStencil, Flags);
+        RecordList("ID3D12GraphicsCommandListX::BeginRenderPass", 68, S_OK);
+    } else {
+        RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::BeginRenderPass", 68);
     }
-    RecordList("ID3D12GraphicsCommandListX::BeginRenderPass",
-               68, host_list4_ ? S_OK : E_NOINTERFACE);
 }
 
 void STDMETHODCALLTYPE CommandListX::EndRenderPass() {
-    if (host_list4_) host_list4_->EndRenderPass();
-    RecordList("ID3D12GraphicsCommandListX::EndRenderPass",
-               69, host_list4_ ? S_OK : E_NOINTERFACE);
+    if (host_list4_) {
+        host_list4_->EndRenderPass();
+        RecordList("ID3D12GraphicsCommandListX::EndRenderPass", 69, S_OK);
+    } else {
+        RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::EndRenderPass", 69);
+    }
 }
 
 void STDMETHODCALLTYPE CommandListX::InitializeMetaCommand(
     ID3D12MetaCommand* pMetaCommand, const void* pInitializationParametersData,
     SIZE_T InitializationParametersDataSizeInBytes) {
-    if (host_list4_) {
+    if (host_list4_ && pMetaCommand) {
         host_list4_->InitializeMetaCommand(
             pMetaCommand, pInitializationParametersData, InitializationParametersDataSizeInBytes);
+        RecordList("ID3D12GraphicsCommandListX::InitializeMetaCommand", 70, S_OK);
+    } else {
+        RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::InitializeMetaCommand", 70);
     }
-    RecordList("ID3D12GraphicsCommandListX::InitializeMetaCommand",
-               70, host_list4_ ? S_OK : E_NOINTERFACE);
 }
 
 void STDMETHODCALLTYPE CommandListX::ExecuteMetaCommand(
     ID3D12MetaCommand* pMetaCommand, const void* pExecutionParametersData,
     SIZE_T ExecutionParametersDataSizeInBytes) {
-    if (host_list4_) {
+    if (host_list4_ && pMetaCommand) {
         host_list4_->ExecuteMetaCommand(
             pMetaCommand, pExecutionParametersData, ExecutionParametersDataSizeInBytes);
+        RecordList("ID3D12GraphicsCommandListX::ExecuteMetaCommand", 71, S_OK);
+    } else {
+        RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::ExecuteMetaCommand", 71);
     }
-    RecordList("ID3D12GraphicsCommandListX::ExecuteMetaCommand",
-               71, host_list4_ ? S_OK : E_NOINTERFACE);
 }
 
 void STDMETHODCALLTYPE CommandListX::BuildRaytracingAccelerationStructure(
     const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* pDesc,
     UINT NumPostbuildInfoDescs,
     const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* pPostbuildInfoDescs) {
-    if (host_list4_) {
+    const bool rt_supported = !device_x_ || device_x_->AdapterInfo().raytracing_tier >= 10u;
+    if (host_list4_ && rt_supported && pDesc) {
         host_list4_->BuildRaytracingAccelerationStructure(
             pDesc, NumPostbuildInfoDescs, pPostbuildInfoDescs);
+        RecordList("ID3D12GraphicsCommandListX::BuildRaytracingAccelerationStructure", 72, S_OK);
+    } else {
+        RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::BuildRaytracingAccelerationStructure", 72);
     }
-    RecordList("ID3D12GraphicsCommandListX::BuildRaytracingAccelerationStructure",
-               72, host_list4_ ? S_OK : E_NOINTERFACE);
 }
 
 void STDMETHODCALLTYPE CommandListX::EmitRaytracingAccelerationStructurePostbuildInfo(
     const D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC* pDesc,
     UINT NumSourceAccelerationStructures,
     const D3D12_GPU_VIRTUAL_ADDRESS* pSourceAccelerationStructureData) {
-    if (host_list4_) {
+    const bool rt_supported = !device_x_ || device_x_->AdapterInfo().raytracing_tier >= 10u;
+    if (host_list4_ && rt_supported && pDesc && NumSourceAccelerationStructures > 0u) {
         host_list4_->EmitRaytracingAccelerationStructurePostbuildInfo(
             pDesc, NumSourceAccelerationStructures, pSourceAccelerationStructureData);
+        RecordList("ID3D12GraphicsCommandListX::EmitRaytracingAccelerationStructurePostbuildInfo", 73, S_OK);
+    } else {
+        RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::EmitRaytracingAccelerationStructurePostbuildInfo", 73);
     }
-    RecordList("ID3D12GraphicsCommandListX::EmitRaytracingAccelerationStructurePostbuildInfo",
-               73, host_list4_ ? S_OK : E_NOINTERFACE);
 }
 
 void STDMETHODCALLTYPE CommandListX::CopyRaytracingAccelerationStructure(
     D3D12_GPU_VIRTUAL_ADDRESS DestAccelerationStructureData,
     D3D12_GPU_VIRTUAL_ADDRESS SourceAccelerationStructureData,
     D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE Mode) {
-    if (host_list4_) {
+    const bool rt_supported = !device_x_ || device_x_->AdapterInfo().raytracing_tier >= 10u;
+    if (host_list4_ && rt_supported && DestAccelerationStructureData != 0ull && SourceAccelerationStructureData != 0ull) {
         host_list4_->CopyRaytracingAccelerationStructure(
             DestAccelerationStructureData, SourceAccelerationStructureData, Mode);
+        RecordList("ID3D12GraphicsCommandListX::CopyRaytracingAccelerationStructure", 74, S_OK);
+    } else {
+        RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::CopyRaytracingAccelerationStructure", 74);
     }
-    RecordList("ID3D12GraphicsCommandListX::CopyRaytracingAccelerationStructure",
-               74, host_list4_ ? S_OK : E_NOINTERFACE);
 }
 
 void STDMETHODCALLTYPE CommandListX::SetPipelineState1(ID3D12StateObject* pStateObject) {
     ID3D12StateObject* host_so = UnwrapStateObject(pStateObject);
     const bool is_sw_proxy = (pStateObject != nullptr && host_so == nullptr);
-    if (host_list4_ && !is_sw_proxy) {
+    if (host_list4_ && !is_sw_proxy && host_so) {
         host_list4_->SetPipelineState1(host_so);
+        RecordList("ID3D12GraphicsCommandListX::SetPipelineState1", 75, S_OK);
+    } else if (is_sw_proxy) {
+        RecordList("ID3D12GraphicsCommandListX::SetPipelineState1", 75, S_OK);
+    } else {
+        RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::SetPipelineState1", 75);
     }
-    RecordList("ID3D12GraphicsCommandListX::SetPipelineState1",
-               75, (host_list4_ || is_sw_proxy) ? S_OK : E_NOINTERFACE);
 }
 
 void STDMETHODCALLTYPE CommandListX::DispatchRays(const D3D12_DISPATCH_RAYS_DESC* pDesc) {
-    if (host_list4_) host_list4_->DispatchRays(pDesc);
-    RecordList("ID3D12GraphicsCommandListX::DispatchRays",
-               76, host_list4_ ? S_OK : E_NOINTERFACE);
+    const bool rt_supported = !device_x_ || device_x_->AdapterInfo().raytracing_tier >= 10u;
+    if (host_list4_ && rt_supported && pDesc) {
+        host_list4_->DispatchRays(pDesc);
+        RecordList("ID3D12GraphicsCommandListX::DispatchRays", 76, S_OK);
+    } else {
+        RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::DispatchRays", 76);
+    }
 }
 
 // ID3D12GraphicsCommandList5 (slots 77..78)
 void STDMETHODCALLTYPE CommandListX::RSSetShadingRate(
     D3D12_SHADING_RATE baseShadingRate,
     const D3D12_SHADING_RATE_COMBINER* combiners) {
-    if (host_list5_) host_list5_->RSSetShadingRate(baseShadingRate, combiners);
-    RecordList("ID3D12GraphicsCommandListX::RSSetShadingRate",
-               77, host_list5_ ? S_OK : E_NOINTERFACE);
+    if (host_list5_) {
+        host_list5_->RSSetShadingRate(baseShadingRate, combiners);
+        RecordList("ID3D12GraphicsCommandListX::RSSetShadingRate", 77, S_OK);
+    } else {
+        RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::RSSetShadingRate", 77);
+    }
 }
 
 void STDMETHODCALLTYPE CommandListX::RSSetShadingRateImage(ID3D12Resource* shadingRateImage) {
-    if (host_list5_) host_list5_->RSSetShadingRateImage(UnwrapResource(shadingRateImage));
-    RecordList("ID3D12GraphicsCommandListX::RSSetShadingRateImage",
-               78, host_list5_ ? S_OK : E_NOINTERFACE);
+    if (host_list5_) {
+        host_list5_->RSSetShadingRateImage(UnwrapResource(shadingRateImage));
+        RecordList("ID3D12GraphicsCommandListX::RSSetShadingRateImage", 78, S_OK);
+    } else {
+        RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::RSSetShadingRateImage", 78);
+    }
 }
 
 // ID3D12GraphicsCommandList6 (slot 79)
@@ -2390,7 +2699,8 @@ void STDMETHODCALLTYPE CommandListX::DispatchMesh(
             ThreadGroupCountX, ThreadGroupCountY, ThreadGroupCountZ);
     }
     if (ThreadGroupCountX == 0u || ThreadGroupCountY == 0u || ThreadGroupCountZ == 0u) {
-        RecordList("ID3D12GraphicsCommandListX::DispatchMesh", 79, S_OK);
+        if (device_x_) device_x_->RecordZeroCountNoop();
+        RecordList("ID3D12GraphicsCommandListX::DispatchMesh[ZeroNoop]", 79, S_OK);
         return;
     }
     bool skip_host = false;
@@ -2427,9 +2737,26 @@ void STDMETHODCALLTYPE CommandListX::DispatchMesh(
         const UINT gy = std::min<UINT>(ThreadGroupCountY, kMaxDim);
         const UINT gz = std::min<UINT>(ThreadGroupCountZ, kMaxDim);
         host_list6_->DispatchMesh(gx, gy, gz);
+        RecordList("ID3D12GraphicsCommandListX::DispatchMesh", 79, S_OK);
+    } else if (skip_host) {
+        RecordList("ID3D12GraphicsCommandListX::DispatchMesh", 79, S_OK);
+    } else {
+        RecordUnsupportedExtensionIgnored("ID3D12GraphicsCommandListX::DispatchMesh", 79);
     }
-    RecordList("ID3D12GraphicsCommandListX::DispatchMesh",
-               79, (skip_host || host_list6_) ? S_OK : E_NOINTERFACE);
+}
+
+void CommandListX::RecordUnsupportedExtensionIgnored(const char* ext_name, int32_t slot) {
+    // Leonida #3958: Log telemetry cleanly for unsupported/unrecognized console command-list
+    // extensions WITHOUT poisoning or aborting subsequent supported Draw/Dispatch/Copy/Barrier commands.
+    if (device_x_) {
+        device_x_->RecordUnsupportedCmdListExtensionIgnored();
+    }
+    openscarlett::CallTelemetry::Global().Record(
+        "d3d12_xs.dll",
+        (ext_name && ext_name[0] != '\0') ? ext_name : "ID3D12GraphicsCommandListX::UnsupportedExtension",
+        openscarlett::CallOutcome::NotImplemented,
+        E_NOTIMPL,
+        slot);
 }
 
 // ID3D12GraphicsCommandListX (slots 80..88)
