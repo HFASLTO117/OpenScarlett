@@ -107,6 +107,7 @@ struct D3D12XBOX_VRAM_RESIDENCY_STATS {
     uint64_t window1_title_buffer_allocs = 0ull;
     uint64_t window1_title_buffer_bytes = 0ull;
     uint64_t promoted_oversized_placed_resources = 0ull;
+    uint64_t skipped_active_live_heaps = 0ull;
 };
 
 struct D3D12XBOX_AGILITY_SDK_INFO {
@@ -230,7 +231,8 @@ class DeviceX final
       public IOpenScarlettVulkanRouting,
       public IOpenScarlettAaaRuntime,
       public IOpenScarlettVramResidencyControl,
-      public IOpenScarlettGraphicsParity {
+      public IOpenScarlettGraphicsParity,
+      public IOpenScarlettGraphicsCompleteness {
 public:
     DeviceX(ID3D12Device* host_device,
             const D3D12AdapterInfo& adapter_info,
@@ -699,6 +701,8 @@ public:
     HRESULT STDMETHODCALLTYPE SuspendX(uint32_t Flags) override;
     HRESULT STDMETHODCALLTYPE ResumeX() override;
     HRESULT STDMETHODCALLTYPE GetGpuHardwareInfoX(D3D12XBOX_GPU_HARDWARE_INFO* pOutInfo) override;
+    HRESULT STDMETHODCALLTYPE GetGpuHardwareConfigurationX(
+        D3D12XBOX_GPU_HARDWARE_CONFIGURATION* pOutConfig) override;
 
     // IOpenScarlettUnifiedMemory
     HRESULT STDMETHODCALLTYPE RegisterUnifiedTexture(
@@ -803,6 +807,101 @@ public:
     // IOpenScarlettGraphicsParity
     HRESULT STDMETHODCALLTYPE GetGraphicsParityStats(
         D3D12XBOX_GRAPHICS_PARITY_STATS* out_stats) override;
+
+    // IOpenScarlettGraphicsCompleteness (Sprint 16)
+    HRESULT STDMETHODCALLTYPE GetGraphicsCompletenessStats(
+        D3D12XBOX_GRAPHICS_COMPLETENESS_STATS* out_stats) override;
+    HRESULT STDMETHODCALLTYPE AllocateDescriptorHeapPage(
+        ID3D12DescriptorHeap* heap,
+        uint32_t* out_page_index,
+        uint64_t* out_generation,
+        uint64_t* out_page_gpu_base) override;
+    HRESULT STDMETHODCALLTYPE RetireDescriptorHeapPage(
+        ID3D12DescriptorHeap* heap,
+        uint32_t page_index) override;
+    HRESULT STDMETHODCALLTYPE ExecuteGpuResolveFmask(
+        uint32_t width,
+        uint32_t height,
+        uint32_t sample_count,
+        uint32_t resolve_mode,
+        uint32_t clear_rgba8,
+        const uint8_t* msaa_color_bytes,
+        uint32_t msaa_color_size,
+        const uint8_t* fmask_bytes,
+        uint32_t fmask_size,
+        uint8_t* out_rgba8,
+        uint32_t out_size,
+        uint32_t* out_used_gpu) override;
+    HRESULT STDMETHODCALLTYPE ExecuteGpuDecompressDcc(
+        uint32_t width,
+        uint32_t height,
+        uint32_t pipe_aligned,
+        uint32_t num_pipes,
+        uint32_t clear_rgba8,
+        const uint8_t* src_blocks,
+        uint32_t src_size,
+        const uint8_t* dcc_keys,
+        uint32_t dcc_size,
+        uint8_t* out_rgba8,
+        uint32_t out_size,
+        uint32_t* out_used_gpu) override;
+    HRESULT STDMETHODCALLTYPE ExecuteGpuDecompressHtile(
+        uint32_t width,
+        uint32_t height,
+        uint32_t mode_flags,
+        uint32_t clear_reg0,
+        uint32_t clear_reg1,
+        const uint8_t* src_tiles,
+        uint32_t src_size,
+        const uint8_t* htile_words,
+        uint32_t htile_size,
+        uint8_t* out_depth_and_hiz,
+        uint32_t out_size,
+        uint32_t* out_used_gpu) override;
+    HRESULT STDMETHODCALLTYPE MarkResidencyObjectActive(
+        ID3D12Pageable* obj,
+        int32_t delta_ref) override;
+    HRESULT STDMETHODCALLTYPE MarkResidencyObjectInFlight(
+        ID3D12Pageable* obj,
+        ID3D12Fence* fence,
+        uint64_t fence_value) override;
+
+    // Sprint 16 helpers for CommandListX / CommandQueueX
+    D3D12_GPU_DESCRIPTOR_HANDLE TranslateGpuDescriptorHandle(
+        D3D12_GPU_DESCRIPTOR_HANDLE handle) noexcept;
+    void NotifyDescriptorHeapBoundOnCommandList(ID3D12DescriptorHeap* host_heap) noexcept;
+    void RecordCopyQueueBarrierSanitized(bool was_uav_suppressed = false) noexcept {
+        copy_queue_barriers_sanitized_.fetch_add(1ull, std::memory_order_relaxed);
+        if (was_uav_suppressed) {
+            copy_queue_uav_barriers_suppressed_.fetch_add(1ull, std::memory_order_relaxed);
+        }
+    }
+    void RecordExecuteIndirectStats(
+        bool has_count,
+        bool has_root_consts,
+        bool is_dispatch_mesh,
+        bool bounds_clamped,
+        bool rejected,
+        bool va_translated,
+        bool vulkan_routed) noexcept {
+        execute_indirect_calls_.fetch_add(1ull, std::memory_order_relaxed);
+        if (has_count) execute_indirect_with_count_buffer_.fetch_add(1ull, std::memory_order_relaxed);
+        if (has_root_consts) execute_indirect_with_root_constants_.fetch_add(1ull, std::memory_order_relaxed);
+        if (is_dispatch_mesh) execute_indirect_dispatch_mesh_.fetch_add(1ull, std::memory_order_relaxed);
+        if (bounds_clamped) execute_indirect_bounds_clamped_.fetch_add(1ull, std::memory_order_relaxed);
+        if (rejected) execute_indirect_rejected_.fetch_add(1ull, std::memory_order_relaxed);
+        if (va_translated) execute_indirect_va_translated_.fetch_add(1ull, std::memory_order_relaxed);
+        if (vulkan_routed) execute_indirect_vulkan_routed_.fetch_add(1ull, std::memory_order_relaxed);
+    }
+    bool HasActiveGuestVaTranslation() const noexcept {
+        return va_translator_hook_.load(std::memory_order_acquire) != nullptr ||
+               mirrored_va_count_.load(std::memory_order_acquire) > 0u ||
+               xmem_allocation_count_.load(std::memory_order_acquire) > 0u;
+    }
+    const openscarlett::SanitizedIhvCapabilities& SanitizedIhvCaps() const noexcept {
+        return sanitized_ihv_caps_;
+    }
+    void TrackCommandListTransientResource(ID3D12Resource* res) { TrackTransientGpuResource(res); }
 
     // Sprint 15: Live MSAA quality clamping, console flag stripping, and parity telemetry hooks.
     bool ClampMsaaSampleDescForFormat(DXGI_FORMAT format, DXGI_SAMPLE_DESC& sample_desc) noexcept;
@@ -1043,6 +1142,12 @@ private:
         D3D12_HEAP_TYPE heap_type = D3D12_HEAP_TYPE_DEFAULT;
         D3D12_RESIDENCY_PRIORITY priority = D3D12_RESIDENCY_PRIORITY_NORMAL;
         uint32_t residency_ref_count = 1u;
+        uint32_t active_pin_count = 0u;
+        uint32_t placed_child_count = 0u;
+        ID3D12Pageable* parent_heap = nullptr;
+        ID3D12Fence* in_flight_fence = nullptr;
+        uint64_t in_flight_fence_value = 0ull;
+        bool is_heap = false;
         bool is_resident = true;
         bool is_placed_suballocation = false;
         bool spilled_to_l0 = false;
@@ -1061,11 +1166,110 @@ private:
         D3D12_HEAP_TYPE heap_type,
         bool is_placed_suballocation,
         bool spilled_to_l0,
-        uint64_t sparse_window_va = 0ull);
+        uint64_t sparse_window_va = 0ull,
+        bool is_heap = false,
+        ID3D12Pageable* parent_heap = nullptr);
     void UntrackLiveResidencyObject(ID3D12Pageable* host_obj) noexcept;
     void RefreshDxgiVideoMemoryInfoLocked() noexcept;
     uint64_t EffectiveResidencyBudgetBytesLocked() const noexcept;
     uint64_t EvictLruVictimsLocked(uint64_t bytes_needed, ID3D12Pageable* protect_obj) noexcept;
+    bool IsResidencyEntryLiveProtectedLocked(const LiveResidencyEntry& e) const noexcept;
+
+    // Sprint 16: Page-at-a-Time Console Descriptor Heap Manager (xcl #84)
+    struct DescriptorPageSlot {
+        uint32_t page_index = 0u;
+        uint64_t generation = 1ull;
+        bool in_flight = false;
+        ID3D12DescriptorHeap* isolated_shadow_heap = nullptr;
+    };
+    struct PagedDescriptorHeapState {
+        ID3D12DescriptorHeap* primary_host_heap = nullptr;
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu_start{0u};
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu_start{0ull};
+        UINT inc_size = 32u;
+        UINT num_descriptors = 0u;
+        UINT descriptors_per_page = 2048u;
+        std::vector<DescriptorPageSlot> pages;
+    };
+
+    // Sprint 16: Unbounded Sampler Heap Virtualization (> 2048 -> 2048 deduplicated host heap)
+    struct SamplerDescKey {
+        uint8_t bytes[sizeof(D3D12_SAMPLER_DESC)]{};
+        bool operator==(const SamplerDescKey& o) const noexcept {
+            return std::memcmp(bytes, o.bytes, sizeof(bytes)) == 0;
+        }
+    };
+    struct SamplerDescKeyHash {
+        size_t operator()(const SamplerDescKey& k) const noexcept {
+            uint64_t h = 14695981039346656037ull;
+            for (uint8_t b : k.bytes) {
+                h ^= static_cast<uint64_t>(b);
+                h *= 1099511628211ull;
+            }
+            return static_cast<size_t>(h);
+        }
+    };
+    struct VirtualSamplerHeapState {
+        ID3D12DescriptorHeap* host_heap = nullptr;
+        D3D12_DESCRIPTOR_HEAP_DESC virtual_desc{};
+        D3D12_CPU_DESCRIPTOR_HANDLE virt_cpu_start{0u};
+        D3D12_GPU_DESCRIPTOR_HANDLE virt_gpu_start{0ull};
+        D3D12_CPU_DESCRIPTOR_HANDLE host_cpu_start{0u};
+        D3D12_GPU_DESCRIPTOR_HANDLE host_gpu_start{0ull};
+        UINT inc_size = 32u;
+        UINT host_capacity = 2048u;
+        UINT next_host_slot = 0u;
+        std::vector<uint16_t> virt_to_host_slot;
+        std::vector<SamplerDescKey> virt_slot_keys;
+        std::vector<uint8_t> virt_slot_valid;
+        std::unordered_map<SamplerDescKey, uint16_t, SamplerDescKeyHash> dedup_map;
+    };
+
+    static SamplerDescKey CanonicalizeSamplerDesc(const D3D12_SAMPLER_DESC& desc) noexcept;
+    bool TryHandleVirtualSamplerCreate(
+        const D3D12_SAMPLER_DESC* pDesc,
+        D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) noexcept;
+    bool TryHandleVirtualSamplerCopy(
+        UINT NumDestDescriptorRanges,
+        const D3D12_CPU_DESCRIPTOR_HANDLE* pDestDescriptorRangeStarts,
+        const UINT* pDestDescriptorRangeSizes,
+        UINT NumSrcDescriptorRanges,
+        const D3D12_CPU_DESCRIPTOR_HANDLE* pSrcDescriptorRangeStarts,
+        const UINT* pSrcDescriptorRangeSizes) noexcept;
+    void TrackPagedDescriptorWrite(D3D12_CPU_DESCRIPTOR_HANDLE dest_cpu) noexcept;
+
+    openscarlett::SanitizedIhvCapabilities sanitized_ihv_caps_{};
+    mutable std::mutex paged_desc_mutex_;
+    std::unordered_map<ID3D12DescriptorHeap*, PagedDescriptorHeapState> paged_desc_heaps_;
+    mutable std::mutex virt_sampler_mutex_;
+    std::unordered_map<ID3D12DescriptorHeap*, VirtualSamplerHeapState> virtual_sampler_heaps_;
+    uint64_t next_virtual_sampler_cpu_base_ = 0x7F00000000000000ull;
+    uint64_t next_virtual_sampler_gpu_base_ = 0x7E00000000000000ull;
+
+    std::atomic<uint64_t> paged_descriptor_heaps_created_{0ull};
+    std::atomic<uint64_t> descriptor_pages_allocated_{0ull};
+    std::atomic<uint64_t> descriptor_page_rotations_{0ull};
+    std::atomic<uint64_t> descriptor_page_generations_advanced_{0ull};
+    std::atomic<uint64_t> unbounded_sampler_heaps_created_{0ull};
+    std::atomic<uint64_t> unbounded_sampler_writes_{0ull};
+    std::atomic<uint64_t> unbounded_sampler_dedup_hits_{0ull};
+    std::atomic<uint64_t> unbounded_sampler_unique_host_slots_{0ull};
+    std::atomic<uint64_t> unbounded_sampler_table_translations_{0ull};
+    std::atomic<uint64_t> dedicated_copy_queues_created_{0ull};
+    std::atomic<uint64_t> copy_queue_barriers_sanitized_{0ull};
+    std::atomic<uint64_t> copy_queue_uav_barriers_suppressed_{0ull};
+    std::atomic<uint64_t> execute_indirect_calls_{0ull};
+    std::atomic<uint64_t> execute_indirect_with_count_buffer_{0ull};
+    std::atomic<uint64_t> execute_indirect_with_root_constants_{0ull};
+    std::atomic<uint64_t> execute_indirect_dispatch_mesh_{0ull};
+    std::atomic<uint64_t> execute_indirect_bounds_clamped_{0ull};
+    std::atomic<uint64_t> execute_indirect_rejected_{0ull};
+    std::atomic<uint64_t> execute_indirect_va_translated_{0ull};
+    std::atomic<uint64_t> execute_indirect_vulkan_routed_{0ull};
+    std::atomic<uint64_t> gpu_fmask_resolves_{0ull};
+    std::atomic<uint64_t> gpu_dcc_decompresses_{0ull};
+    std::atomic<uint64_t> gpu_htile_decompresses_{0ull};
+    uint64_t skipped_active_live_heaps_ = 0ull;
 
     mutable std::mutex residency_mutex_;
     openscarlett::XboxConsoleProfileSelection console_profile_{};

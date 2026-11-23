@@ -2582,6 +2582,70 @@ OPENSCARLETT_D3D12_API HRESULT WINAPI DXGIXSetFrameNotification(
     return S_OK;
 }
 
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12GetGpuHardwareConfigurationX(
+    ID3D12Device* device,
+    D3D12XBOX_GPU_HARDWARE_CONFIGURATION* out_config) {
+    if (!out_config) {
+        RecordExport("OpenScarlettD3D12GetGpuHardwareConfigurationX", E_POINTER);
+        return E_POINTER;
+    }
+    std::memset(out_config, 0, sizeof(*out_config));
+    if (!device) {
+        RecordExport("OpenScarlettD3D12GetGpuHardwareConfigurationX", E_INVALIDARG);
+        return E_INVALIDARG;
+    }
+    ID3D12DeviceX* dev_x = nullptr;
+    if (SUCCEEDED(device->QueryInterface(IID_ID3D12DeviceX, reinterpret_cast<void**>(&dev_x))) && dev_x) {
+        const HRESULT hr = dev_x->GetGpuHardwareConfigurationX(out_config);
+        dev_x->Release();
+        RecordExport("OpenScarlettD3D12GetGpuHardwareConfigurationX", hr);
+        return hr;
+    }
+    // Fallback for raw desktop ID3D12Device*: synthesize sanitized IHV configuration directly.
+    openscarlett::D3D12AdapterInfo raw_info{};
+    (void)openscarlett::QueryD3D12DeviceAdapterInfo(device, nullptr, raw_info);
+    const openscarlett::SanitizedIhvCapabilities caps =
+        openscarlett::SanitizeCrossIhvCapabilities(raw_info);
+    const auto profile = openscarlett::SelectXboxConsoleMemoryProfileFromHostVram(
+        raw_info.dedicated_video_memory_bytes, nullptr);
+    out_config->StructSize = static_cast<uint32_t>(sizeof(*out_config));
+    out_config->ConsoleProfile = profile.profile_id;
+    out_config->ComputeUnitCount = (profile.profile_id == 1u) ? 52u : 20u;
+    out_config->ShaderEngineCount = (profile.profile_id == 1u) ? 4u : 2u;
+    out_config->GpuClockMhz = (profile.profile_id == 1u) ? 1825u : 1565u;
+    out_config->HostVendorClass = static_cast<uint32_t>(caps.vendor_class);
+    out_config->HostVendorId = caps.vendor_id;
+    out_config->HostDeviceId = caps.device_id;
+    out_config->HostWaveLaneMin = caps.wave_lane_min;
+    out_config->HostWaveLaneMax = caps.wave_lane_max;
+    out_config->PreferredWaveSize = caps.preferred_wave_size;
+    out_config->HostRaytracingTier = caps.raytracing_tier;
+    out_config->HostMeshShaderTier = caps.mesh_shader_tier;
+    out_config->HostHighestShaderModel = caps.highest_shader_model;
+    out_config->IsWarp = caps.is_warp ? 1u : 0u;
+    out_config->IsUmaLowVram = caps.is_uma_low_vram ? 1u : 0u;
+    out_config->RequiresWave64Emulation = caps.requires_wave64_emulation ? 1u : 0u;
+    out_config->SupportsPageIsolatedDescriptorHeaps = 1u;
+    out_config->SupportsUnboundedSamplerHeaps = 1u;
+    out_config->SupportsDedicatedCopyEngine = 1u;
+    out_config->ConsoleVramBudgetBytes = profile.target_console_vram_bytes;
+    out_config->HostDedicatedVramBytes = caps.dedicated_video_memory_bytes;
+    out_config->EffectiveVramBudgetBytes = caps.effective_vram_budget_bytes;
+    const size_t n = std::min(caps.description.size(), sizeof(out_config->AdapterName) - 1u);
+    if (n > 0u) std::memcpy(out_config->AdapterName, caps.description.data(), n);
+    out_config->AdapterName[n] = '\0';
+    RecordExport("OpenScarlettD3D12GetGpuHardwareConfigurationX", S_OK);
+    return S_OK;
+}
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxGetGpuHardwareConfiguration(
+    ID3D12Device* device,
+    D3D12XBOX_GPU_HARDWARE_CONFIGURATION* out_config) {
+    const HRESULT hr = OpenScarlettD3D12GetGpuHardwareConfigurationX(device, out_config);
+    RecordExport("D3D12XboxGetGpuHardwareConfiguration", hr);
+    return hr;
+}
+
 }  // extern "C"
 
 namespace openscarlett::d3d12_xs {

@@ -65,6 +65,8 @@ EXPORTS
     OpenScarlettD3D12GetGpuTimeLimit
     OpenScarlettD3D12GetReportedErrorCount
     OpenScarlettD3D12ResetTrackedDevice
+    D3D12XboxGetGpuHardwareConfiguration
+    OpenScarlettD3D12GetGpuHardwareConfigurationX
     IID_ID3D12Object = OS_IID_ID3D12Object DATA
     IID_ID3D12DeviceChild = OS_IID_ID3D12DeviceChild DATA
     IID_ID3D12Pageable = OS_IID_ID3D12Pageable DATA

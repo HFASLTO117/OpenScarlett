@@ -120,6 +120,7 @@ enum class VulkanRecordedOpKind : uint8_t {
     DrawIndexedInstanced = 7,
     Dispatch = 8,
     DispatchMesh = 9,
+    ExecuteIndirect = 10,
 };
 
 struct VulkanRecordedOp {
@@ -165,6 +166,19 @@ struct VulkanRecordedOp {
     uint64_t copy_footprint_offset = 0ull;
     uint32_t barrier_count = 0u;
     uint32_t global_uav_barrier_count = 0u;
+
+    // Sprint 16 ExecuteIndirect snapshot for Vulkan 1.4 routing
+    ID3D12Resource* indirect_arg_resource = nullptr;
+    ID3D12Resource* indirect_count_resource = nullptr;
+    uint64_t indirect_arg_offset = 0ull;
+    uint64_t indirect_count_offset = 0ull;
+    uint32_t indirect_max_count = 0u;
+    uint32_t indirect_stride = 0u;
+    uint32_t indirect_action_type = 0u;  // D3D12_INDIRECT_ARGUMENT_TYPE
+    uint32_t indirect_action_offset = 0u;
+    uint32_t indirect_const_arg_offset = 0u;
+    uint32_t indirect_const_bytes = 0u;
+    uint32_t indirect_const_dst_offset = 0u;
 };
 
 struct VulkanRecordedBatch {
@@ -233,9 +247,15 @@ public:
     static void UnregisterExternalAlias(const void* alias_ptr) noexcept;
     void CopyVulkanRecordedBatch(VulkanRecordedBatch& out_batch) const;
     void ExtractPendingMirrorWritebacks(std::vector<uint64_t>& out_vas) const;
+    struct DeferredStateTransition {
+        ID3D12Resource* host_resource = nullptr;
+        D3D12_RESOURCE_STATES after_state = D3D12_RESOURCE_STATE_COMMON;
+    };
     void ExtractDeferredCpuOps(
         std::vector<DeferredCpuWrite32>& out_writes,
         std::vector<DeferredCpuWait>& out_waits) const;
+    void ExtractDeferredStateTransitions(
+        std::vector<DeferredStateTransition>& out_transitions) const;
 
     // IUnknown (slots 0..2)
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override;
@@ -594,6 +614,7 @@ private:
     std::vector<uint64_t> written_mirrored_vas_;
     std::vector<DeferredCpuWrite32> deferred_cpu_writes_;
     std::vector<DeferredCpuWait> deferred_cpu_waits_;
+    std::vector<DeferredStateTransition> deferred_state_transitions_;
     void RecordMirroredResourceGpuWrite(ID3D12Resource* host_resource);
 
     // Sprint 13 placed tiled texture transient buffers & bridge helpers (Leonida #1674)

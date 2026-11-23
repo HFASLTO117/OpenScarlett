@@ -60,6 +60,7 @@ struct VulkanDeviceInfo {
     // OPENSCARLETT_VK_GPU / OPENSCARLETT_VK_DEVICE adapter selection diagnostics
     std::string selected_device_filter;
     bool matched_device_filter = false;
+    bool numeric_selector_fell_back = false;
     uint64_t device_local_vram_bytes = 0;
     uint64_t device_rank_score = 0;
     uint32_t enumerated_device_index = 0;
@@ -70,6 +71,13 @@ struct VulkanDeviceInfo {
     bool supports_custom_border_color = false;
     bool supports_custom_border_color_without_format = false;
     uint32_t max_custom_border_color_samplers = 0;
+
+    // Sprint 16: Vulkan 1.2/1.3/1.4 Indirect Execution & Dynamic Rendering capabilities
+    bool supports_multi_draw_indirect = false;
+    bool supports_draw_indirect_count = false;
+    bool supports_dynamic_rendering = false;
+    uint32_t supported_depth_resolve_modes = 0;
+    uint32_t supported_stencil_resolve_modes = 0;
 };
 
 // Clean-room portable D3D12 OPTIONS2 / OPTIONS7 tier enums matching Windows D3D12 ABI values.
@@ -609,6 +617,115 @@ struct VulkanReservedResourceHandle {
     bool executed_on_vulkan_icd = false;
 };
 
+// ============================================================================
+// Sprint 16: Vulkan 1.4 Indirect Execution & Dynamic Rendering Multi-Pass
+// ============================================================================
+
+enum class VulkanIndirectCommandKind : uint32_t {
+    Draw = 0u,           // VkDrawIndirectCommand (16 bytes)
+    DrawIndexed = 1u,    // VkDrawIndexedIndirectCommand (20 bytes)
+    Dispatch = 2u,       // VkDispatchIndirectCommand (12 bytes)
+    DrawMeshTasks = 3u,  // VkDrawMeshTasksIndirectCommandEXT (12 bytes)
+};
+
+struct VulkanIndirectDrawDesc {
+    VulkanIndirectCommandKind kind = VulkanIndirectCommandKind::Draw;
+    VulkanGraphicsDrawDesc graphics{};
+    VulkanMeshDrawDesc mesh{};
+    std::vector<uint8_t> argument_buffer_bytes;
+    uint64_t argument_buffer_offset = 0ull;
+    uint32_t command_stride = 0u;  // 0 => auto tightly packed for kind (+ push constants)
+    uint32_t max_command_count = 1u;
+    bool use_count_buffer = false;
+    uint32_t count_buffer_value = 0u;
+    uint64_t count_buffer_offset = 0ull;
+    // Optional indirect root/push-constant replay inside each argument stride record:
+    // if > 0, `indirect_push_constant_bytes` bytes at `indirect_push_constant_arg_offset`
+    // within each command record are uploaded via vkCmdPushConstants before the indirect draw.
+    uint32_t indirect_push_constant_arg_offset = 0u;
+    uint32_t indirect_push_constant_bytes = 0u;
+    uint32_t indirect_push_constant_dst_offset = 0u;
+    uint32_t draw_arg_offset_in_stride = 0u;
+};
+
+struct VulkanIndirectDrawResult {
+    FrameBufferRgba8 framebuffer;
+    std::vector<uint16_t> raw_fp16_rgba;
+    uint64_t fnv1a_hash = 0ull;
+    uint32_t effective_command_count = 0u;
+    uint32_t validated_stride = 0u;
+    bool executed_on_vulkan_icd = false;
+    bool used_indirect_count_cmd = false;
+    bool used_indirect_push_constants = false;
+    bool used_mesh_indirect_ext = false;
+    bool clamped_max_count = false;
+};
+
+struct VulkanIndirectComputeDesc {
+    std::vector<uint32_t> spirv;
+    std::vector<uint32_t> input_u32;
+    std::vector<uint8_t> argument_buffer_bytes;  // VkDispatchIndirectCommand {x, y, z}
+    uint64_t argument_buffer_offset = 0ull;
+    uint32_t output_word_count = 0u;
+};
+
+struct VulkanIndirectComputeResult {
+    std::vector<uint32_t> output_u32;
+    uint32_t dispatched_x = 0u;
+    uint32_t dispatched_y = 0u;
+    uint32_t dispatched_z = 0u;
+    bool executed_on_vulkan_icd = false;
+};
+
+enum class VulkanDepthResolveMode : uint32_t {
+    None = 0u,
+    SampleZero = 1u,
+    Min = 4u,
+    Max = 8u,
+};
+
+struct VulkanDynamicRenderingPassDesc {
+    std::vector<uint32_t> vertex_spirv;
+    std::vector<uint32_t> fragment_spirv;
+    std::string vertex_entry = "main";
+    std::string fragment_entry = "main";
+    std::vector<uint8_t> vertex_buffer_bytes;
+    uint32_t vertex_stride = 0u;
+    uint32_t vertex_count = 3u;
+    std::vector<VulkanVertexAttribute> vertex_attributes;
+    std::vector<uint32_t> index_buffer_u32;
+    std::vector<uint8_t> push_constants;
+    bool clear_color_on_load = false;
+    float clear_color[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    bool clear_depth_on_load = false;
+    float clear_depth = 1.0f;
+    bool depth_test = true;
+    bool depth_write = true;
+};
+
+struct VulkanDynamicRenderingMultiPassDesc {
+    uint32_t width = 64u;
+    uint32_t height = 64u;
+    VulkanImageFormat color_format = VulkanImageFormat::Rgba8Unorm;
+    bool enable_msaa_4x = false;
+    bool enable_depth = true;
+    VulkanDepthResolveMode depth_resolve_mode = VulkanDepthResolveMode::Min;
+    bool readback_depth = true;
+    std::vector<VulkanDynamicRenderingPassDesc> passes;
+};
+
+struct VulkanDynamicRenderingMultiPassResult {
+    FrameBufferRgba8 framebuffer;
+    std::vector<float> depth_readback;
+    uint64_t fnv1a_hash = 0ull;
+    uint32_t passes_executed = 0u;
+    bool executed_on_vulkan_icd = false;
+    bool used_vk_cmd_begin_rendering = false;
+    bool resolved_msaa_color = false;
+    bool resolved_msaa_depth = false;
+    VulkanDepthResolveMode effective_depth_resolve_mode = VulkanDepthResolveMode::None;
+};
+
 // Dynamic Vulkan 1.2/1.3/1.4 backend with zero Vulkan SDK header dependencies.
 // Dynamically loads vulkan-1.dll at runtime via LoadLibraryA + vkGetInstanceProcAddr,
 // executes real hardware/ICD compute, graphics rasterization, VK_EXT_mesh_shader,
@@ -652,6 +769,14 @@ public:
         const std::string& gpu_selector,
         VulkanPhysicalDeviceCandidate& out_selected,
         bool* out_matched_selector = nullptr);
+    // Extended selector (xcl #82): when gpu_selector is a numeric index out of range or negative,
+    // falls back cleanly to the highest-ranked GPU and sets *out_numeric_fell_back = true.
+    static bool SelectPhysicalDeviceCandidateWithNumericFallback(
+        const std::vector<VulkanPhysicalDeviceCandidate>& candidates,
+        const std::string& gpu_selector,
+        VulkanPhysicalDeviceCandidate& out_selected,
+        bool* out_matched_selector = nullptr,
+        bool* out_numeric_fell_back = nullptr);
     // Enumerates and ranks all compute-capable physical devices on the live Vulkan ICD.
     static Status EnumerateRankedPhysicalDevices(
         std::vector<VulkanPhysicalDeviceCandidate>& out_ranked_devices);
@@ -757,6 +882,18 @@ public:
 
     // Destroys a previously created reserved/sparse image and releases its backing memory.
     Status DestroyReservedImage(uint64_t reserved_handle);
+
+    // Sprint 16: Real Vulkan 1.4 Indirect Execution (vkCmdDrawIndirect / vkCmdDrawIndexedIndirect /
+    // vkCmdDrawIndirectCount / vkCmdDrawIndexedIndirectCount / vkCmdDispatchIndirect /
+    // vkCmdDrawMeshTasksIndirectEXT / vkCmdDrawMeshTasksIndirectCountEXT + indirect push-constants).
+    Status ExecuteIndirectGraphicsDraw(const VulkanIndirectDrawDesc& desc,
+                                       VulkanIndirectDrawResult& out_result);
+    Status ExecuteIndirectCompute(const VulkanIndirectComputeDesc& desc,
+                                  VulkanIndirectComputeResult& out_result);
+
+    // Sprint 16: Vulkan 1.3/1.4 Dynamic Rendering multi-pass RT, MSAA resolve & depth resolve.
+    Status ExecuteDynamicRenderingMultiPass(const VulkanDynamicRenderingMultiPassDesc& desc,
+                                            VulkanDynamicRenderingMultiPassResult& out_result);
 
 private:
     struct Impl;

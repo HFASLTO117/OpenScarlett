@@ -2140,7 +2140,10 @@ struct XgGpuUntiler::Impl {
     uint64_t fence_value = 0ull;
     ComPtr<ID3D12RootSignature> root_sig;
     ComPtr<ID3D12PipelineState> pso;
+    ComPtr<ID3D12PipelineState> resolve_pso;
     std::vector<uint8_t> dxil;
+    std::vector<uint8_t> resolve_dxil;
+    std::string dxc_path_cached;
     std::string adapter_name;
     std::string shader_target;
     bool is_warp = false;
@@ -2148,12 +2151,14 @@ struct XgGpuUntiler::Impl {
 #endif
     VulkanBackend vk_backend;
     std::vector<uint32_t> spirv;
+    std::vector<uint32_t> resolve_spirv;
     std::string vk_device_name;
     bool vk_ready = false;
     bool vk_is_hw = false;
 
     void ReleaseD3D12() {
 #if defined(_WIN32)
+        resolve_pso.Reset();
         pso.Reset();
         root_sig.Reset();
         cmd_list.Reset();
@@ -2166,6 +2171,7 @@ struct XgGpuUntiler::Impl {
         }
         device.Reset();
         dxil.clear();
+        resolve_dxil.clear();
         d3d12_ready = false;
 #endif
     }
@@ -2209,6 +2215,7 @@ Status XgGpuUntiler::InitializeD3D12WithDevice(
                                    ? target_profile_override
                                    : ((info.highest_shader_model >= 0x65u && !info.is_warp) ? "cs_6_5" : "cs_6_2");
     impl_->shader_target = target;
+    impl_->dxc_path_cached = dxc_path;
 
     std::string diag;
     Status st = CompileXgGpuUntileDxil(target, impl_->dxil, diag, dxc_path);
@@ -3277,6 +3284,1799 @@ bool ScatterPlacedTiledPool64KB(
         std::memcpy(dst + dst_off, src + src_off, tile_size_bytes);
     }
     return true;
+}
+
+// ============================================================================
+// Sprint 16: Live FMASK / DCC (2:1 & 4:1) / HTILE GPU Compute Resolve & Decompression
+// ============================================================================
+
+namespace {
+
+constexpr uint32_t kResolveSpvHeaderWords = 16u;
+
+inline uint32_t ReadU32Le(const std::vector<uint8_t>& buf, size_t byte_off) noexcept {
+    if (byte_off + 4u > buf.size()) return 0u;
+    uint32_t v = 0u;
+    std::memcpy(&v, buf.data() + byte_off, 4u);
+    return v;
+}
+
+inline void WriteU32Le(std::vector<uint8_t>& buf, size_t byte_off, uint32_t v) noexcept {
+    if (byte_off + 4u > buf.size()) return;
+    std::memcpy(buf.data() + byte_off, &v, 4u);
+}
+
+inline uint32_t ApplyBiasedDeltaU32(
+    uint32_t base_ch,
+    uint32_t raw_delta,
+    uint32_t bias,
+    uint32_t shift,
+    uint32_t max_val) noexcept {
+    const uint32_t pos = base_ch + (raw_delta << shift);
+    const uint32_t neg = bias << shift;
+    if (pos < neg) return 0u;
+    const uint32_t diff = pos - neg;
+    return (diff > max_val) ? max_val : diff;
+}
+
+inline uint32_t FloatBitsFromZ24(uint32_t z24) noexcept {
+    // 1.0f / 16777216.0f = 2^-24: exact exponent subtraction for every 24-bit integer [0..0xFFFFFF]
+    // with zero mantissa rounding error across x86 CPU, D3D12 HLSL, and Vulkan SPIR-V.
+    const float f = static_cast<float>(z24) * (1.0f / 16777216.0f);
+    uint32_t bits = 0u;
+    std::memcpy(&bits, &f, 4u);
+    return bits;
+}
+
+// Minimal self-contained SPIR-V 1.3 builder for FMASK / DCC / HTILE resolve compute shader.
+class SpvResolveBuilder {
+public:
+    enum : uint16_t {
+        OpCapability = 17,
+        OpMemoryModel = 14,
+        OpEntryPoint = 15,
+        OpExecutionMode = 16,
+        OpTypeVoid = 19,
+        OpTypeBool = 20,
+        OpTypeInt = 21,
+        OpTypeFloat = 22,
+        OpTypeVector = 23,
+        OpTypeRuntimeArray = 29,
+        OpTypeStruct = 30,
+        OpTypePointer = 32,
+        OpTypeFunction = 33,
+        OpConstant = 43,
+        OpFunction = 54,
+        OpFunctionParameter = 55,
+        OpFunctionEnd = 56,
+        OpFunctionCall = 57,
+        OpVariable = 59,
+        OpLoad = 61,
+        OpStore = 62,
+        OpAccessChain = 65,
+        OpDecorate = 71,
+        OpMemberDecorate = 72,
+        OpConvertUToF = 112,
+        OpBitcast = 124,
+        OpIAdd = 128,
+        OpISub = 130,
+        OpIMul = 132,
+        OpFMul = 133,
+        OpUDiv = 134,
+        OpUMod = 137,
+        OpLogicalOr = 166,
+        OpLogicalAnd = 167,
+        OpLogicalNot = 168,
+        OpSelect = 169,
+        OpIEqual = 170,
+        OpINotEqual = 171,
+        OpUGreaterThan = 172,
+        OpUGreaterThanEqual = 174,
+        OpULessThan = 176,
+        OpULessThanEqual = 178,
+        OpShiftRightLogical = 194,
+        OpShiftLeftLogical = 196,
+        OpBitwiseOr = 197,
+        OpBitwiseXor = 198,
+        OpBitwiseAnd = 199,
+        OpLoopMerge = 246,
+        OpSelectionMerge = 247,
+        OpLabel = 248,
+        OpBranch = 249,
+        OpBranchConditional = 250,
+        OpReturn = 253,
+        OpReturnValue = 254,
+    };
+
+    uint32_t NewId() { return next_id_++; }
+
+    static void Emit(std::vector<uint32_t>& dst, uint16_t op, std::initializer_list<uint32_t> ops) {
+        const uint32_t wc = static_cast<uint32_t>(ops.size() + 1u);
+        dst.push_back((wc << 16u) | static_cast<uint32_t>(op));
+        dst.insert(dst.end(), ops.begin(), ops.end());
+    }
+
+    static void EmitVec(std::vector<uint32_t>& dst, uint16_t op, const std::vector<uint32_t>& ops) {
+        const uint32_t wc = static_cast<uint32_t>(ops.size() + 1u);
+        dst.push_back((wc << 16u) | static_cast<uint32_t>(op));
+        dst.insert(dst.end(), ops.begin(), ops.end());
+    }
+
+    uint32_t ConstU32(uint32_t v) {
+        auto it = u32_consts_.find(v);
+        if (it != u32_consts_.end()) return it->second;
+        const uint32_t id = NewId();
+        Emit(types_consts_, OpConstant, {ty_u32_, id, v});
+        u32_consts_[v] = id;
+        return id;
+    }
+
+    uint32_t Bin(std::vector<uint32_t>& b, uint16_t op, uint32_t ty, uint32_t a, uint32_t c) {
+        const uint32_t r = NewId();
+        Emit(b, op, {ty, r, a, c});
+        return r;
+    }
+
+    uint32_t Un(std::vector<uint32_t>& b, uint16_t op, uint32_t ty, uint32_t a) {
+        const uint32_t r = NewId();
+        Emit(b, op, {ty, r, a});
+        return r;
+    }
+
+    uint32_t Sel(std::vector<uint32_t>& b, uint32_t cond, uint32_t t_val, uint32_t f_val) {
+        const uint32_t r = NewId();
+        Emit(b, OpSelect, {ty_u32_, r, cond, t_val, f_val});
+        return r;
+    }
+
+    uint32_t LoadIn(std::vector<uint32_t>& b, uint32_t idx) {
+        const uint32_t ptr = NewId();
+        Emit(b, OpAccessChain, {ty_ptr_sb_u32_, ptr, var_in_, ConstU32(0u), idx});
+        const uint32_t val = NewId();
+        Emit(b, OpLoad, {ty_u32_, val, ptr});
+        return val;
+    }
+
+    void StoreOut(std::vector<uint32_t>& b, uint32_t idx, uint32_t val) {
+        const uint32_t ptr = NewId();
+        Emit(b, OpAccessChain, {ty_ptr_sb_u32_, ptr, var_out_, ConstU32(0u), idx});
+        Emit(b, OpStore, {ptr, val});
+    }
+
+    uint32_t LoadVar(std::vector<uint32_t>& b, uint32_t var_ptr) {
+        const uint32_t val = NewId();
+        Emit(b, OpLoad, {ty_u32_, val, var_ptr});
+        return val;
+    }
+
+    void StoreVar(std::vector<uint32_t>& b, uint32_t var_ptr, uint32_t val) {
+        Emit(b, OpStore, {var_ptr, val});
+    }
+
+    uint32_t FuncVar(std::vector<uint32_t>& b) {
+        const uint32_t v = NewId();
+        Emit(b, OpVariable, {ty_ptr_fn_u32_, v, 7u});
+        return v;
+    }
+
+    // uint ReadByte(uint base_word_off, uint byte_off)
+    uint32_t BuildReadByteFunc() {
+        const uint32_t ty_fn = NewId();
+        Emit(types_consts_, OpTypeFunction, {ty_fn, ty_u32_, ty_u32_, ty_u32_});
+        const uint32_t fn = NewId();
+        Emit(funcs_, OpFunction, {ty_u32_, fn, 0u, ty_fn});
+        const uint32_t p_base = NewId(), p_boff = NewId();
+        Emit(funcs_, OpFunctionParameter, {ty_u32_, p_base});
+        Emit(funcs_, OpFunctionParameter, {ty_u32_, p_boff});
+        Emit(funcs_, OpLabel, {NewId()});
+        const uint32_t widx = Bin(funcs_, OpIAdd, ty_u32_, p_base,
+                                  Bin(funcs_, OpShiftRightLogical, ty_u32_, p_boff, ConstU32(2u)));
+        const uint32_t w = LoadIn(funcs_, widx);
+        const uint32_t sh = Bin(funcs_, OpShiftLeftLogical, ty_u32_,
+                                Bin(funcs_, OpBitwiseAnd, ty_u32_, p_boff, ConstU32(3u)), ConstU32(3u));
+        const uint32_t res = Bin(funcs_, OpBitwiseAnd, ty_u32_,
+                                 Bin(funcs_, OpShiftRightLogical, ty_u32_, w, sh), ConstU32(0xFFu));
+        Emit(funcs_, OpReturnValue, {res});
+        Emit(funcs_, OpFunctionEnd, {});
+        return fn;
+    }
+
+    // uint ApplyDelta(uint base_ch, uint raw_delta, uint bias, uint shift, uint max_val)
+    uint32_t BuildApplyDeltaFunc() {
+        const uint32_t ty_fn = NewId();
+        Emit(types_consts_, OpTypeFunction,
+             {ty_fn, ty_u32_, ty_u32_, ty_u32_, ty_u32_, ty_u32_, ty_u32_});
+        const uint32_t fn = NewId();
+        Emit(funcs_, OpFunction, {ty_u32_, fn, 0u, ty_fn});
+        const uint32_t p_base = NewId(), p_raw = NewId(), p_bias = NewId();
+        const uint32_t p_sh = NewId(), p_max = NewId();
+        Emit(funcs_, OpFunctionParameter, {ty_u32_, p_base});
+        Emit(funcs_, OpFunctionParameter, {ty_u32_, p_raw});
+        Emit(funcs_, OpFunctionParameter, {ty_u32_, p_bias});
+        Emit(funcs_, OpFunctionParameter, {ty_u32_, p_sh});
+        Emit(funcs_, OpFunctionParameter, {ty_u32_, p_max});
+        Emit(funcs_, OpLabel, {NewId()});
+        const uint32_t pos = Bin(funcs_, OpIAdd, ty_u32_, p_base,
+                                 Bin(funcs_, OpShiftLeftLogical, ty_u32_, p_raw, p_sh));
+        const uint32_t neg = Bin(funcs_, OpShiftLeftLogical, ty_u32_, p_bias, p_sh);
+        const uint32_t under = Bin(funcs_, OpULessThan, ty_bool_, pos, neg);
+        const uint32_t diff = Bin(funcs_, OpISub, ty_u32_, pos, neg);
+        const uint32_t over = Bin(funcs_, OpUGreaterThan, ty_bool_, diff, p_max);
+        const uint32_t clamped = Sel(funcs_, over, p_max, diff);
+        const uint32_t res = Sel(funcs_, under, ConstU32(0u), clamped);
+        Emit(funcs_, OpReturnValue, {res});
+        Emit(funcs_, OpFunctionEnd, {});
+        return fn;
+    }
+
+    std::vector<uint32_t> Build() {
+        ty_void_ = NewId();
+        ty_bool_ = NewId();
+        ty_u32_ = NewId();
+        ty_f32_ = NewId();
+        ty_v3u32_ = NewId();
+        ty_rt_u32_ = NewId();
+        ty_buf_struct_ = NewId();
+        ty_ptr_sb_struct_ = NewId();
+        ty_ptr_sb_u32_ = NewId();
+        ty_ptr_in_v3u32_ = NewId();
+        ty_ptr_in_u32_ = NewId();
+        ty_ptr_fn_u32_ = NewId();
+        ty_main_fn_ = NewId();
+
+        Emit(types_consts_, OpTypeVoid, {ty_void_});
+        Emit(types_consts_, OpTypeBool, {ty_bool_});
+        Emit(types_consts_, OpTypeInt, {ty_u32_, 32u, 0u});
+        Emit(types_consts_, OpTypeFloat, {ty_f32_, 32u});
+        Emit(types_consts_, OpTypeVector, {ty_v3u32_, ty_u32_, 3u});
+        Emit(types_consts_, OpTypeRuntimeArray, {ty_rt_u32_, ty_u32_});
+        Emit(types_consts_, OpTypeStruct, {ty_buf_struct_, ty_rt_u32_});
+        Emit(types_consts_, OpTypePointer, {ty_ptr_sb_struct_, 12u, ty_buf_struct_});
+        Emit(types_consts_, OpTypePointer, {ty_ptr_sb_u32_, 12u, ty_u32_});
+        Emit(types_consts_, OpTypePointer, {ty_ptr_in_v3u32_, 1u, ty_v3u32_});
+        Emit(types_consts_, OpTypePointer, {ty_ptr_in_u32_, 1u, ty_u32_});
+        Emit(types_consts_, OpTypePointer, {ty_ptr_fn_u32_, 7u, ty_u32_});
+        Emit(types_consts_, OpTypeFunction, {ty_main_fn_, ty_void_});
+
+        const uint32_t c_inv_2_24 = NewId();
+        Emit(types_consts_, OpConstant, {ty_f32_, c_inv_2_24, 0x33800000u});  // 2^-24
+
+        var_in_ = NewId();
+        var_out_ = NewId();
+        var_gid_ = NewId();
+        Emit(types_consts_, OpVariable, {ty_ptr_sb_struct_, var_in_, 12u});
+        Emit(types_consts_, OpVariable, {ty_ptr_sb_struct_, var_out_, 12u});
+        Emit(types_consts_, OpVariable, {ty_ptr_in_v3u32_, var_gid_, 1u});
+
+        Emit(decorations_, OpDecorate, {ty_rt_u32_, 6u, 4u});
+        Emit(decorations_, OpDecorate, {ty_buf_struct_, 2u});
+        Emit(decorations_, OpMemberDecorate, {ty_buf_struct_, 0u, 35u, 0u});
+        Emit(decorations_, OpDecorate, {var_in_, 34u, 0u});
+        Emit(decorations_, OpDecorate, {var_in_, 33u, 0u});
+        Emit(decorations_, OpDecorate, {var_in_, 24u});
+        Emit(decorations_, OpDecorate, {var_out_, 34u, 0u});
+        Emit(decorations_, OpDecorate, {var_out_, 33u, 1u});
+        Emit(decorations_, OpDecorate, {var_gid_, 11u, 28u});
+
+        const uint32_t fn_read_byte = BuildReadByteFunc();
+        const uint32_t fn_apply_delta = BuildApplyDeltaFunc();
+
+        const uint32_t main_fn = NewId();
+        Emit(funcs_, OpFunction, {ty_void_, main_fn, 0u, ty_main_fn_});
+
+        const uint32_t l_entry = NewId();
+        Emit(funcs_, OpLabel, {l_entry});
+
+        // All Function-storage variables MUST be declared at the top of the entry block.
+        const uint32_t v_s = FuncVar(funcs_);
+        const uint32_t v_sr = FuncVar(funcs_);
+        const uint32_t v_sg = FuncVar(funcs_);
+        const uint32_t v_sb = FuncVar(funcs_);
+        const uint32_t v_sa = FuncVar(funcs_);
+        const uint32_t v_centroid = FuncVar(funcs_);
+        const uint32_t v_has_valid = FuncVar(funcs_);
+        const uint32_t v_out_word = FuncVar(funcs_);
+
+        // GlobalInvocationID.x
+        const uint32_t gid_x_ptr = NewId();
+        Emit(funcs_, OpAccessChain, {ty_ptr_in_u32_, gid_x_ptr, var_gid_, ConstU32(0u)});
+        const uint32_t tid = NewId();
+        Emit(funcs_, OpLoad, {ty_u32_, tid, gid_x_ptr});
+
+        // Load XgGpuResolveParams header (16 dwords)
+        const uint32_t h_op = LoadIn(funcs_, ConstU32(0u));
+        const uint32_t h_w = LoadIn(funcs_, ConstU32(1u));
+        const uint32_t h_h = LoadIn(funcs_, ConstU32(2u));
+        const uint32_t h_samples = LoadIn(funcs_, ConstU32(3u));
+        const uint32_t h_mode = LoadIn(funcs_, ConstU32(4u));
+        const uint32_t h_dst_pitch = LoadIn(funcs_, ConstU32(7u));
+        const uint32_t h_meta_bx = LoadIn(funcs_, ConstU32(8u));
+        const uint32_t h_pipes = LoadIn(funcs_, ConstU32(9u));
+        const uint32_t h_meta_pitch = LoadIn(funcs_, ConstU32(10u));
+        const uint32_t h_clear0 = LoadIn(funcs_, ConstU32(11u));
+        const uint32_t h_clear1 = LoadIn(funcs_, ConstU32(12u));
+        const uint32_t h_src_woff = LoadIn(funcs_, ConstU32(13u));
+        const uint32_t h_meta_woff = LoadIn(funcs_, ConstU32(14u));
+        const uint32_t h_aux_woff = LoadIn(funcs_, ConstU32(15u));
+
+        const uint32_t total = Bin(funcs_, OpIMul, ty_u32_, h_w, h_h);
+        const uint32_t in_bounds = Bin(funcs_, OpULessThan, ty_bool_, tid, total);
+        const uint32_t l_body = NewId(), l_done = NewId();
+        Emit(funcs_, OpSelectionMerge, {l_done, 0u});
+        Emit(funcs_, OpBranchConditional, {in_bounds, l_body, l_done});
+
+        Emit(funcs_, OpLabel, {l_body});
+        const uint32_t y = Bin(funcs_, OpUDiv, ty_u32_, tid, h_w);
+        const uint32_t x = Bin(funcs_, OpUMod, ty_u32_, tid, h_w);
+        const uint32_t dst_stride_w = Bin(funcs_, OpShiftRightLogical, ty_u32_, h_dst_pitch, ConstU32(2u));
+        const uint32_t dst_pix_idx = Bin(funcs_, OpIAdd, ty_u32_,
+                                         Bin(funcs_, OpIMul, ty_u32_, y, dst_stride_w), x);
+
+        const uint32_t is_fmask = Bin(funcs_, OpIEqual, ty_bool_, h_op, ConstU32(0u));
+        const uint32_t l_fmask = NewId(), l_not_fmask = NewId(), l_after_op = NewId();
+        Emit(funcs_, OpSelectionMerge, {l_after_op, 0u});
+        Emit(funcs_, OpBranchConditional, {is_fmask, l_fmask, l_not_fmask});
+
+        // ---------------- OP 0: FMASK MSAA Resolve & Decompress ----------------
+        Emit(funcs_, OpLabel, {l_fmask});
+        const uint32_t fmask_word = LoadIn(funcs_, Bin(funcs_, OpIAdd, ty_u32_, h_meta_woff, tid));
+        const uint32_t base_pix_samp = Bin(funcs_, OpIMul, ty_u32_, tid, h_samples);
+        StoreVar(funcs_, v_s, ConstU32(0u));
+        StoreVar(funcs_, v_sr, ConstU32(0u));
+        StoreVar(funcs_, v_sg, ConstU32(0u));
+        StoreVar(funcs_, v_sb, ConstU32(0u));
+        StoreVar(funcs_, v_sa, ConstU32(0u));
+        StoreVar(funcs_, v_centroid, h_clear0);
+        StoreVar(funcs_, v_has_valid, ConstU32(0u));
+
+        const uint32_t l_floop_hdr = NewId(), l_floop_body = NewId();
+        const uint32_t l_floop_cont = NewId(), l_floop_exit = NewId();
+        Emit(funcs_, OpBranch, {l_floop_hdr});
+
+        Emit(funcs_, OpLabel, {l_floop_hdr});
+        const uint32_t cur_s = LoadVar(funcs_, v_s);
+        const uint32_t s_lt = Bin(funcs_, OpULessThan, ty_bool_, cur_s, h_samples);
+        Emit(funcs_, OpLoopMerge, {l_floop_exit, l_floop_cont, 0u});
+        Emit(funcs_, OpBranchConditional, {s_lt, l_floop_body, l_floop_exit});
+
+        Emit(funcs_, OpLabel, {l_floop_body});
+        const uint32_t s_sh = Bin(funcs_, OpShiftLeftLogical, ty_u32_, cur_s, ConstU32(2u));
+        const uint32_t fidx = Bin(funcs_, OpBitwiseAnd, ty_u32_,
+                                  Bin(funcs_, OpShiftRightLogical, ty_u32_, fmask_word, s_sh), ConstU32(0xFu));
+        const uint32_t is_ge = Bin(funcs_, OpUGreaterThanEqual, ty_bool_, fidx, h_samples);
+        const uint32_t is_e = Bin(funcs_, OpIEqual, ty_bool_, fidx, ConstU32(0xEu));
+        const uint32_t is_f = Bin(funcs_, OpIEqual, ty_bool_, fidx, ConstU32(0xFu));
+        const uint32_t is_sent = Bin(funcs_, OpLogicalOr, ty_bool_, is_ge,
+                                     Bin(funcs_, OpLogicalOr, ty_bool_, is_e, is_f));
+        const uint32_t safe_fidx = Sel(funcs_, is_sent, ConstU32(0u), fidx);
+        const uint32_t src_col = LoadIn(funcs_, Bin(funcs_, OpIAdd, ty_u32_, h_src_woff,
+                                                    Bin(funcs_, OpIAdd, ty_u32_, base_pix_samp, safe_fidx)));
+        const uint32_t scol = Sel(funcs_, is_sent, h_clear0, src_col);
+
+        const uint32_t cr = Bin(funcs_, OpBitwiseAnd, ty_u32_, scol, ConstU32(0xFFu));
+        const uint32_t cg = Bin(funcs_, OpBitwiseAnd, ty_u32_,
+                                Bin(funcs_, OpShiftRightLogical, ty_u32_, scol, ConstU32(8u)), ConstU32(0xFFu));
+        const uint32_t cb = Bin(funcs_, OpBitwiseAnd, ty_u32_,
+                                Bin(funcs_, OpShiftRightLogical, ty_u32_, scol, ConstU32(16u)), ConstU32(0xFFu));
+        const uint32_t ca = Bin(funcs_, OpBitwiseAnd, ty_u32_,
+                                Bin(funcs_, OpShiftRightLogical, ty_u32_, scol, ConstU32(24u)), ConstU32(0xFFu));
+
+        StoreVar(funcs_, v_sr, Bin(funcs_, OpIAdd, ty_u32_, LoadVar(funcs_, v_sr), cr));
+        StoreVar(funcs_, v_sg, Bin(funcs_, OpIAdd, ty_u32_, LoadVar(funcs_, v_sg), cg));
+        StoreVar(funcs_, v_sb, Bin(funcs_, OpIAdd, ty_u32_, LoadVar(funcs_, v_sb), cb));
+        StoreVar(funcs_, v_sa, Bin(funcs_, OpIAdd, ty_u32_, LoadVar(funcs_, v_sa), ca));
+
+        const uint32_t hv_prev = LoadVar(funcs_, v_has_valid);
+        const uint32_t take_c = Bin(funcs_, OpLogicalAnd, ty_bool_,
+                                    Bin(funcs_, OpIEqual, ty_bool_, hv_prev, ConstU32(0u)),
+                                    Un(funcs_, OpLogicalNot, ty_bool_, is_sent));
+        StoreVar(funcs_, v_centroid, Sel(funcs_, take_c, scol, LoadVar(funcs_, v_centroid)));
+        StoreVar(funcs_, v_has_valid, Sel(funcs_, take_c, ConstU32(1u), hv_prev));
+
+        const uint32_t is_persamp = Bin(funcs_, OpIEqual, ty_bool_, h_mode, ConstU32(2u));
+        const uint32_t l_ps_wr = NewId(), l_ps_end = NewId();
+        Emit(funcs_, OpSelectionMerge, {l_ps_end, 0u});
+        Emit(funcs_, OpBranchConditional, {is_persamp, l_ps_wr, l_ps_end});
+        Emit(funcs_, OpLabel, {l_ps_wr});
+        StoreOut(funcs_, Bin(funcs_, OpIAdd, ty_u32_, base_pix_samp, cur_s), scol);
+        Emit(funcs_, OpBranch, {l_ps_end});
+        Emit(funcs_, OpLabel, {l_ps_end});
+        Emit(funcs_, OpBranch, {l_floop_cont});
+
+        Emit(funcs_, OpLabel, {l_floop_cont});
+        StoreVar(funcs_, v_s, Bin(funcs_, OpIAdd, ty_u32_, cur_s, ConstU32(1u)));
+        Emit(funcs_, OpBranch, {l_floop_hdr});
+
+        Emit(funcs_, OpLabel, {l_floop_exit});
+        const uint32_t not_ps = Bin(funcs_, OpINotEqual, ty_bool_, h_mode, ConstU32(2u));
+        const uint32_t l_fm_wr = NewId(), l_fm_end = NewId();
+        Emit(funcs_, OpSelectionMerge, {l_fm_end, 0u});
+        Emit(funcs_, OpBranchConditional, {not_ps, l_fm_wr, l_fm_end});
+
+        Emit(funcs_, OpLabel, {l_fm_wr});
+        const uint32_t half_s = Bin(funcs_, OpShiftRightLogical, ty_u32_, h_samples, ConstU32(1u));
+        const uint32_t ar = Bin(funcs_, OpUDiv, ty_u32_,
+                                Bin(funcs_, OpIAdd, ty_u32_, LoadVar(funcs_, v_sr), half_s), h_samples);
+        const uint32_t ag = Bin(funcs_, OpUDiv, ty_u32_,
+                                Bin(funcs_, OpIAdd, ty_u32_, LoadVar(funcs_, v_sg), half_s), h_samples);
+        const uint32_t ab = Bin(funcs_, OpUDiv, ty_u32_,
+                                Bin(funcs_, OpIAdd, ty_u32_, LoadVar(funcs_, v_sb), half_s), h_samples);
+        const uint32_t aa = Bin(funcs_, OpUDiv, ty_u32_,
+                                Bin(funcs_, OpIAdd, ty_u32_, LoadVar(funcs_, v_sa), half_s), h_samples);
+        const uint32_t avg_col = Bin(funcs_, OpBitwiseOr, ty_u32_, ar,
+                                     Bin(funcs_, OpBitwiseOr, ty_u32_,
+                                         Bin(funcs_, OpShiftLeftLogical, ty_u32_, ag, ConstU32(8u)),
+                                         Bin(funcs_, OpBitwiseOr, ty_u32_,
+                                             Bin(funcs_, OpShiftLeftLogical, ty_u32_, ab, ConstU32(16u)),
+                                             Bin(funcs_, OpShiftLeftLogical, ty_u32_, aa, ConstU32(24u)))));
+        const uint32_t is_cent = Bin(funcs_, OpIEqual, ty_bool_, h_mode, ConstU32(1u));
+        const uint32_t fm_final = Sel(funcs_, is_cent, LoadVar(funcs_, v_centroid), avg_col);
+        StoreOut(funcs_, dst_pix_idx, fm_final);
+        Emit(funcs_, OpBranch, {l_fm_end});
+
+        Emit(funcs_, OpLabel, {l_fm_end});
+        Emit(funcs_, OpBranch, {l_after_op});
+
+        // ---------------- OP 1 (DCC) vs OP 2 (HTILE) ----------------
+        Emit(funcs_, OpLabel, {l_not_fmask});
+        const uint32_t bx = Bin(funcs_, OpShiftRightLogical, ty_u32_, x, ConstU32(3u));
+        const uint32_t by = Bin(funcs_, OpShiftRightLogical, ty_u32_, y, ConstU32(3u));
+        const uint32_t lx = Bin(funcs_, OpBitwiseAnd, ty_u32_, x, ConstU32(7u));
+        const uint32_t ly = Bin(funcs_, OpBitwiseAnd, ty_u32_, y, ConstU32(7u));
+        const uint32_t pix_in_blk = Bin(funcs_, OpBitwiseOr, ty_u32_,
+                                        Bin(funcs_, OpShiftLeftLogical, ty_u32_, ly, ConstU32(3u)), lx);
+        const uint32_t blk_idx = Bin(funcs_, OpIAdd, ty_u32_,
+                                     Bin(funcs_, OpIMul, ty_u32_, by, h_meta_bx), bx);
+        const uint32_t blk_wbase = Bin(funcs_, OpIAdd, ty_u32_, h_src_woff,
+                                       Bin(funcs_, OpShiftLeftLogical, ty_u32_, blk_idx, ConstU32(6u)));
+
+        const uint32_t is_dcc = Bin(funcs_, OpIEqual, ty_bool_, h_op, ConstU32(1u));
+        const uint32_t l_dcc = NewId(), l_htile = NewId(), l_after_dh = NewId();
+        Emit(funcs_, OpSelectionMerge, {l_after_dh, 0u});
+        Emit(funcs_, OpBranchConditional, {is_dcc, l_dcc, l_htile});
+
+        // ---------------- OP 1: DCC Compressed Block Decompression ----------------
+        Emit(funcs_, OpLabel, {l_dcc});
+        const uint32_t pa_on = Bin(funcs_, OpINotEqual, ty_bool_,
+                                   Bin(funcs_, OpBitwiseAnd, ty_u32_, h_mode, ConstU32(1u)), ConstU32(0u));
+        const uint32_t pitch_ok = Bin(funcs_, OpUGreaterThanEqual, ty_bool_, h_meta_pitch, ConstU32(256u));
+        const uint32_t use_pa = Bin(funcs_, OpLogicalAnd, ty_bool_, pa_on, pitch_ok);
+        const uint32_t pmask = Sel(funcs_, Bin(funcs_, OpUGreaterThan, ty_bool_, h_pipes, ConstU32(1u)),
+                                   Bin(funcs_, OpISub, ty_u32_, h_pipes, ConstU32(1u)), ConstU32(0u));
+        const uint32_t xorb = Bin(funcs_, OpBitwiseAnd, ty_u32_,
+                                  Bin(funcs_, OpBitwiseXor, ty_u32_,
+                                      Bin(funcs_, OpShiftRightLogical, ty_u32_, bx, ConstU32(2u)),
+                                      Bin(funcs_, OpShiftRightLogical, ty_u32_, by, ConstU32(2u))),
+                                  pmask);
+        const uint32_t cand_moff = Bin(funcs_, OpBitwiseXor, ty_u32_, blk_idx, xorb);
+        const uint32_t cand_ok = Bin(funcs_, OpLogicalAnd, ty_bool_, use_pa,
+                                     Bin(funcs_, OpULessThan, ty_bool_, cand_moff, h_meta_pitch));
+        const uint32_t moff = Sel(funcs_, cand_ok, cand_moff, blk_idx);
+
+        const uint32_t dcc_key = NewId();
+        Emit(funcs_, OpFunctionCall, {ty_u32_, dcc_key, fn_read_byte, h_meta_woff, moff});
+
+        // Default uncompressed fallback
+        StoreVar(funcs_, v_out_word, LoadIn(funcs_, Bin(funcs_, OpIAdd, ty_u32_, blk_wbase, pix_in_blk)));
+
+        // Fast-clear sentinels
+        const uint32_t k00 = Bin(funcs_, OpIEqual, ty_bool_, dcc_key, ConstU32(0x00u));
+        const uint32_t k40 = Bin(funcs_, OpIEqual, ty_bool_, dcc_key, ConstU32(0x40u));
+        const uint32_t k80 = Bin(funcs_, OpIEqual, ty_bool_, dcc_key, ConstU32(0x80u));
+        const uint32_t kc0 = Bin(funcs_, OpIEqual, ty_bool_, dcc_key, ConstU32(0xC0u));
+        const uint32_t k20 = Bin(funcs_, OpIEqual, ty_bool_, dcc_key, ConstU32(0x20u));
+
+        const uint32_t is_4to1 = Bin(funcs_, OpLogicalAnd, ty_bool_,
+                                     Bin(funcs_, OpUGreaterThanEqual, ty_bool_, dcc_key, ConstU32(0x02u)),
+                                     Bin(funcs_, OpULessThanEqual, ty_bool_, dcc_key, ConstU32(0x07u)));
+        const uint32_t is_2to1 = Bin(funcs_, OpLogicalAnd, ty_bool_,
+                                     Bin(funcs_, OpUGreaterThanEqual, ty_bool_, dcc_key, ConstU32(0x08u)),
+                                     Bin(funcs_, OpULessThanEqual, ty_bool_, dcc_key, ConstU32(0x12u)));
+        const uint32_t is_comp = Bin(funcs_, OpLogicalOr, ty_bool_, is_4to1, is_2to1);
+
+        const uint32_t l_dcc_comp = NewId(), l_dcc_after_comp = NewId();
+        Emit(funcs_, OpSelectionMerge, {l_dcc_after_comp, 0u});
+        Emit(funcs_, OpBranchConditional, {is_comp, l_dcc_comp, l_dcc_after_comp});
+
+        Emit(funcs_, OpLabel, {l_dcc_comp});
+        const uint32_t base_rgba = LoadIn(funcs_, blk_wbase);
+        const uint32_t sh_word = LoadIn(funcs_, Bin(funcs_, OpIAdd, ty_u32_, blk_wbase, ConstU32(1u)));
+        const uint32_t r0 = Bin(funcs_, OpBitwiseAnd, ty_u32_, base_rgba, ConstU32(0xFFu));
+        const uint32_t g0 = Bin(funcs_, OpBitwiseAnd, ty_u32_,
+                                Bin(funcs_, OpShiftRightLogical, ty_u32_, base_rgba, ConstU32(8u)), ConstU32(0xFFu));
+        const uint32_t b0 = Bin(funcs_, OpBitwiseAnd, ty_u32_,
+                                Bin(funcs_, OpShiftRightLogical, ty_u32_, base_rgba, ConstU32(16u)), ConstU32(0xFFu));
+        const uint32_t a0 = Bin(funcs_, OpBitwiseAnd, ty_u32_,
+                                Bin(funcs_, OpShiftRightLogical, ty_u32_, base_rgba, ConstU32(24u)), ConstU32(0xFFu));
+        const uint32_t sh_r = Bin(funcs_, OpBitwiseAnd, ty_u32_, sh_word, ConstU32(0xFFu));
+        const uint32_t sh_g = Bin(funcs_, OpBitwiseAnd, ty_u32_,
+                                  Bin(funcs_, OpShiftRightLogical, ty_u32_, sh_word, ConstU32(8u)), ConstU32(0xFFu));
+        const uint32_t sh_b = Bin(funcs_, OpBitwiseAnd, ty_u32_,
+                                  Bin(funcs_, OpShiftRightLogical, ty_u32_, sh_word, ConstU32(16u)), ConstU32(0xFFu));
+        const uint32_t sh_a = Bin(funcs_, OpBitwiseAnd, ty_u32_,
+                                  Bin(funcs_, OpShiftRightLogical, ty_u32_, sh_word, ConstU32(24u)), ConstU32(0xFFu));
+
+        const uint32_t w4 = Bin(funcs_, OpShiftRightLogical, ty_u32_, pix_in_blk, ConstU32(3u));
+        const uint32_t b4 = Bin(funcs_, OpShiftLeftLogical, ty_u32_,
+                                Bin(funcs_, OpBitwiseAnd, ty_u32_, pix_in_blk, ConstU32(7u)), ConstU32(2u));
+        const uint32_t w2 = Bin(funcs_, OpShiftRightLogical, ty_u32_, pix_in_blk, ConstU32(4u));
+        const uint32_t b2 = Bin(funcs_, OpShiftLeftLogical, ty_u32_,
+                                Bin(funcs_, OpBitwiseAnd, ty_u32_, pix_in_blk, ConstU32(15u)), ConstU32(1u));
+        const uint32_t w1 = Bin(funcs_, OpShiftRightLogical, ty_u32_, pix_in_blk, ConstU32(5u));
+        const uint32_t b1 = Bin(funcs_, OpBitwiseAnd, ty_u32_, pix_in_blk, ConstU32(31u));
+
+        // 2:1 raw deltas
+        const uint32_t dr2 = Bin(funcs_, OpBitwiseAnd, ty_u32_,
+                                 Bin(funcs_, OpShiftRightLogical, ty_u32_,
+                                     LoadIn(funcs_, Bin(funcs_, OpIAdd, ty_u32_, blk_wbase,
+                                                        Bin(funcs_, OpIAdd, ty_u32_, ConstU32(2u), w4))),
+                                     b4),
+                                 ConstU32(0xFu));
+        const uint32_t dg2 = Bin(funcs_, OpBitwiseAnd, ty_u32_,
+                                 Bin(funcs_, OpShiftRightLogical, ty_u32_,
+                                     LoadIn(funcs_, Bin(funcs_, OpIAdd, ty_u32_, blk_wbase,
+                                                        Bin(funcs_, OpIAdd, ty_u32_, ConstU32(10u), w4))),
+                                     b4),
+                                 ConstU32(0xFu));
+        const uint32_t db2 = Bin(funcs_, OpBitwiseAnd, ty_u32_,
+                                 Bin(funcs_, OpShiftRightLogical, ty_u32_,
+                                     LoadIn(funcs_, Bin(funcs_, OpIAdd, ty_u32_, blk_wbase,
+                                                        Bin(funcs_, OpIAdd, ty_u32_, ConstU32(18u), w4))),
+                                     b4),
+                                 ConstU32(0xFu));
+        const uint32_t da2 = Bin(funcs_, OpBitwiseAnd, ty_u32_,
+                                 Bin(funcs_, OpShiftRightLogical, ty_u32_,
+                                     LoadIn(funcs_, Bin(funcs_, OpIAdd, ty_u32_, blk_wbase,
+                                                        Bin(funcs_, OpIAdd, ty_u32_, ConstU32(26u), w2))),
+                                     b2),
+                                 ConstU32(0x3u));
+
+        // 4:1 raw deltas
+        const uint32_t dr4 = Bin(funcs_, OpBitwiseAnd, ty_u32_,
+                                 Bin(funcs_, OpShiftRightLogical, ty_u32_,
+                                     LoadIn(funcs_, Bin(funcs_, OpIAdd, ty_u32_, blk_wbase,
+                                                        Bin(funcs_, OpIAdd, ty_u32_, ConstU32(2u), w2))),
+                                     b2),
+                                 ConstU32(0x3u));
+        const uint32_t dg4 = Bin(funcs_, OpBitwiseAnd, ty_u32_,
+                                 Bin(funcs_, OpShiftRightLogical, ty_u32_,
+                                     LoadIn(funcs_, Bin(funcs_, OpIAdd, ty_u32_, blk_wbase,
+                                                        Bin(funcs_, OpIAdd, ty_u32_, ConstU32(6u), w2))),
+                                     b2),
+                                 ConstU32(0x3u));
+        const uint32_t db4 = Bin(funcs_, OpBitwiseAnd, ty_u32_,
+                                 Bin(funcs_, OpShiftRightLogical, ty_u32_,
+                                     LoadIn(funcs_, Bin(funcs_, OpIAdd, ty_u32_, blk_wbase,
+                                                        Bin(funcs_, OpIAdd, ty_u32_, ConstU32(10u), w2))),
+                                     b2),
+                                 ConstU32(0x3u));
+        const uint32_t da4 = Bin(funcs_, OpBitwiseAnd, ty_u32_,
+                                 Bin(funcs_, OpShiftRightLogical, ty_u32_,
+                                     LoadIn(funcs_, Bin(funcs_, OpIAdd, ty_u32_, blk_wbase,
+                                                        Bin(funcs_, OpIAdd, ty_u32_, ConstU32(14u), w1))),
+                                     b1),
+                                 ConstU32(0x1u));
+
+        const uint32_t dr_sel = Sel(funcs_, is_4to1, dr4, dr2);
+        const uint32_t dg_sel = Sel(funcs_, is_4to1, dg4, dg2);
+        const uint32_t db_sel = Sel(funcs_, is_4to1, db4, db2);
+        const uint32_t da_sel = Sel(funcs_, is_4to1, da4, da2);
+        const uint32_t rgb_bias = Sel(funcs_, is_4to1, ConstU32(2u), ConstU32(8u));
+        const uint32_t a_bias = Sel(funcs_, is_4to1, ConstU32(0u), ConstU32(2u));
+
+        const uint32_t rr = NewId(), gg = NewId(), bb = NewId(), aa_d = NewId();
+        Emit(funcs_, OpFunctionCall, {ty_u32_, rr, fn_apply_delta, r0, dr_sel, rgb_bias, sh_r, ConstU32(255u)});
+        Emit(funcs_, OpFunctionCall, {ty_u32_, gg, fn_apply_delta, g0, dg_sel, rgb_bias, sh_g, ConstU32(255u)});
+        Emit(funcs_, OpFunctionCall, {ty_u32_, bb, fn_apply_delta, b0, db_sel, rgb_bias, sh_b, ConstU32(255u)});
+        Emit(funcs_, OpFunctionCall, {ty_u32_, aa_d, fn_apply_delta, a0, da_sel, a_bias, sh_a, ConstU32(255u)});
+        const uint32_t dec_col = Bin(funcs_, OpBitwiseOr, ty_u32_, rr,
+                                     Bin(funcs_, OpBitwiseOr, ty_u32_,
+                                         Bin(funcs_, OpShiftLeftLogical, ty_u32_, gg, ConstU32(8u)),
+                                         Bin(funcs_, OpBitwiseOr, ty_u32_,
+                                             Bin(funcs_, OpShiftLeftLogical, ty_u32_, bb, ConstU32(16u)),
+                                             Bin(funcs_, OpShiftLeftLogical, ty_u32_, aa_d, ConstU32(24u)))));
+        StoreVar(funcs_, v_out_word, dec_col);
+        Emit(funcs_, OpBranch, {l_dcc_after_comp});
+
+        Emit(funcs_, OpLabel, {l_dcc_after_comp});
+        uint32_t dcc_col = LoadVar(funcs_, v_out_word);
+        dcc_col = Sel(funcs_, k00, ConstU32(0x00000000u), dcc_col);
+        dcc_col = Sel(funcs_, k40, ConstU32(0xFF000000u), dcc_col);
+        dcc_col = Sel(funcs_, k80, ConstU32(0x00FFFFFFu), dcc_col);
+        dcc_col = Sel(funcs_, kc0, ConstU32(0xFFFFFFFFu), dcc_col);
+        dcc_col = Sel(funcs_, k20, h_clear0, dcc_col);
+        StoreOut(funcs_, dst_pix_idx, dcc_col);
+        Emit(funcs_, OpBranch, {l_after_dh});
+
+        // ---------------- OP 2: HTILE Depth/Stencil Decompression & HiZ Bounds ----------------
+        Emit(funcs_, OpLabel, {l_htile});
+        const uint32_t hword = LoadIn(funcs_, Bin(funcs_, OpIAdd, ty_u32_, h_meta_woff, blk_idx));
+        const uint32_t zmask = Bin(funcs_, OpBitwiseAnd, ty_u32_, hword, ConstU32(0xFu));
+        const uint32_t is_d24s8 = Bin(funcs_, OpINotEqual, ty_bool_,
+                                      Bin(funcs_, OpBitwiseAnd, ty_u32_, h_mode, ConstU32(2u)), ConstU32(0u));
+        const uint32_t clear_d24s8 = Bin(funcs_, OpBitwiseOr, ty_u32_,
+                                         Bin(funcs_, OpBitwiseAnd, ty_u32_, h_clear0, ConstU32(0x00FFFFFFu)),
+                                         Bin(funcs_, OpShiftLeftLogical, ty_u32_,
+                                             Bin(funcs_, OpBitwiseAnd, ty_u32_, h_clear1, ConstU32(0xFFu)),
+                                             ConstU32(24u)));
+        const uint32_t clear_depth_w = Sel(funcs_, is_d24s8, clear_d24s8, h_clear0);
+
+        const uint32_t is_zclear = Bin(funcs_, OpIEqual, ty_bool_, zmask, ConstU32(0u));
+        const uint32_t is_zexp = Bin(funcs_, OpIEqual, ty_bool_, zmask, ConstU32(15u));
+        const uint32_t is_zcomp = Bin(funcs_, OpLogicalAnd, ty_bool_,
+                                      Un(funcs_, OpLogicalNot, ty_bool_, is_zclear),
+                                      Un(funcs_, OpLogicalNot, ty_bool_, is_zexp));
+
+        StoreVar(funcs_, v_out_word,
+                 Sel(funcs_, is_zclear, clear_depth_w,
+                     LoadIn(funcs_, Bin(funcs_, OpIAdd, ty_u32_, blk_wbase, pix_in_blk))));
+
+        const uint32_t l_ht_comp = NewId(), l_ht_after_comp = NewId();
+        Emit(funcs_, OpSelectionMerge, {l_ht_after_comp, 0u});
+        Emit(funcs_, OpBranchConditional, {is_zcomp, l_ht_comp, l_ht_after_comp});
+
+        Emit(funcs_, OpLabel, {l_ht_comp});
+        const uint32_t hdr0 = LoadIn(funcs_, blk_wbase);
+        const uint32_t hdr1 = LoadIn(funcs_, Bin(funcs_, OpIAdd, ty_u32_, blk_wbase, ConstU32(1u)));
+        const uint32_t base_z = Bin(funcs_, OpBitwiseAnd, ty_u32_, hdr0, ConstU32(0x00FFFFFFu));
+        const uint32_t stencil = Bin(funcs_, OpBitwiseAnd, ty_u32_,
+                                     Bin(funcs_, OpShiftRightLogical, ty_u32_, hdr0, ConstU32(24u)), ConstU32(0xFFu));
+        const uint32_t raw_dx = Bin(funcs_, OpBitwiseAnd, ty_u32_, hdr1, ConstU32(0xFFFFu));
+        const uint32_t raw_dy = Bin(funcs_, OpBitwiseAnd, ty_u32_,
+                                    Bin(funcs_, OpShiftRightLogical, ty_u32_, hdr1, ConstU32(16u)), ConstU32(0xFFFFu));
+        const uint32_t rw_idx = Bin(funcs_, OpIAdd, ty_u32_, blk_wbase,
+                                    Bin(funcs_, OpIAdd, ty_u32_, ConstU32(2u),
+                                        Bin(funcs_, OpShiftRightLogical, ty_u32_, pix_in_blk, ConstU32(3u))));
+        const uint32_t rshift_bit = Bin(funcs_, OpShiftLeftLogical, ty_u32_,
+                                        Bin(funcs_, OpBitwiseAnd, ty_u32_, pix_in_blk, ConstU32(7u)), ConstU32(2u));
+        const uint32_t raw_res = Bin(funcs_, OpBitwiseAnd, ty_u32_,
+                                     Bin(funcs_, OpShiftRightLogical, ty_u32_, LoadIn(funcs_, rw_idx), rshift_bit),
+                                     ConstU32(0xFu));
+        const uint32_t rshift = Bin(funcs_, OpISub, ty_u32_, zmask, ConstU32(1u));
+        const uint32_t pos_z = Bin(funcs_, OpIAdd, ty_u32_, base_z,
+                                   Bin(funcs_, OpIAdd, ty_u32_,
+                                       Bin(funcs_, OpIAdd, ty_u32_,
+                                           Bin(funcs_, OpIMul, ty_u32_, lx, raw_dx),
+                                           Bin(funcs_, OpIMul, ty_u32_, ly, raw_dy)),
+                                       Bin(funcs_, OpShiftLeftLogical, ty_u32_, raw_res, rshift)));
+        const uint32_t neg_z = Bin(funcs_, OpIAdd, ty_u32_,
+                                   Bin(funcs_, OpIMul, ty_u32_,
+                                       Bin(funcs_, OpIAdd, ty_u32_, lx, ly), ConstU32(32768u)),
+                                   Bin(funcs_, OpShiftLeftLogical, ty_u32_, ConstU32(8u), rshift));
+        const uint32_t under_z = Bin(funcs_, OpULessThan, ty_bool_, pos_z, neg_z);
+        const uint32_t diff_z = Bin(funcs_, OpISub, ty_u32_, pos_z, neg_z);
+        const uint32_t over_z = Bin(funcs_, OpUGreaterThan, ty_bool_, diff_z, ConstU32(0x00FFFFFFu));
+        const uint32_t z24 = Sel(funcs_, under_z, ConstU32(0u),
+                                 Sel(funcs_, over_z, ConstU32(0x00FFFFFFu), diff_z));
+        const uint32_t d24s8_val = Bin(funcs_, OpBitwiseOr, ty_u32_, z24,
+                                       Bin(funcs_, OpShiftLeftLogical, ty_u32_, stencil, ConstU32(24u)));
+        const uint32_t z_f32 = Un(funcs_, OpConvertUToF, ty_f32_, z24);
+        const uint32_t z_norm = Bin(funcs_, OpFMul, ty_f32_, z_f32, c_inv_2_24);
+        const uint32_t d32f_val = Un(funcs_, OpBitcast, ty_u32_, z_norm);
+        StoreVar(funcs_, v_out_word, Sel(funcs_, is_d24s8, d24s8_val, d32f_val));
+        Emit(funcs_, OpBranch, {l_ht_after_comp});
+
+        Emit(funcs_, OpLabel, {l_ht_after_comp});
+        StoreOut(funcs_, dst_pix_idx, LoadVar(funcs_, v_out_word));
+
+        const uint32_t emit_hiz = Bin(funcs_, OpINotEqual, ty_bool_,
+                                      Bin(funcs_, OpBitwiseAnd, ty_u32_, h_mode, ConstU32(1u)), ConstU32(0u));
+        const uint32_t is_tile0 = Bin(funcs_, OpLogicalAnd, ty_bool_,
+                                      Bin(funcs_, OpIEqual, ty_bool_, lx, ConstU32(0u)),
+                                      Bin(funcs_, OpIEqual, ty_bool_, ly, ConstU32(0u)));
+        const uint32_t do_hiz = Bin(funcs_, OpLogicalAnd, ty_bool_, emit_hiz, is_tile0);
+        const uint32_t l_hiz_wr = NewId(), l_hiz_end = NewId();
+        Emit(funcs_, OpSelectionMerge, {l_hiz_end, 0u});
+        Emit(funcs_, OpBranchConditional, {do_hiz, l_hiz_wr, l_hiz_end});
+
+        Emit(funcs_, OpLabel, {l_hiz_wr});
+        const uint32_t min14 = Bin(funcs_, OpBitwiseAnd, ty_u32_,
+                                   Bin(funcs_, OpShiftRightLogical, ty_u32_, hword, ConstU32(4u)), ConstU32(0x3FFFu));
+        const uint32_t max14 = Bin(funcs_, OpBitwiseAnd, ty_u32_,
+                                   Bin(funcs_, OpShiftRightLogical, ty_u32_, hword, ConstU32(18u)), ConstU32(0x3FFFu));
+        const uint32_t hiz_w = Bin(funcs_, OpBitwiseOr, ty_u32_, min14,
+                                   Bin(funcs_, OpShiftLeftLogical, ty_u32_, max14, ConstU32(16u)));
+        StoreOut(funcs_, Bin(funcs_, OpIAdd, ty_u32_, h_aux_woff, blk_idx), hiz_w);
+        Emit(funcs_, OpBranch, {l_hiz_end});
+
+        Emit(funcs_, OpLabel, {l_hiz_end});
+        Emit(funcs_, OpBranch, {l_after_dh});
+
+        Emit(funcs_, OpLabel, {l_after_dh});
+        Emit(funcs_, OpBranch, {l_after_op});
+
+        Emit(funcs_, OpLabel, {l_after_op});
+        Emit(funcs_, OpBranch, {l_done});
+
+        Emit(funcs_, OpLabel, {l_done});
+        Emit(funcs_, OpReturn, {});
+        Emit(funcs_, OpFunctionEnd, {});
+
+        std::vector<uint32_t> spv;
+        spv.push_back(0x07230203u);
+        spv.push_back(0x00010300u);  // SPIR-V 1.3
+        spv.push_back(0u);
+        spv.push_back(next_id_);
+        spv.push_back(0u);
+
+        Emit(spv, OpCapability, {1u});  // Shader
+        Emit(spv, OpMemoryModel, {0u, 1u});  // Logical GLSL450
+        EmitVec(spv, OpEntryPoint, {5u, main_fn, 0x6E69616Du, 0x00000000u, var_gid_});
+        Emit(spv, OpExecutionMode, {main_fn, 17u, kUntileGroupSize, 1u, 1u});
+        spv.insert(spv.end(), decorations_.begin(), decorations_.end());
+        spv.insert(spv.end(), types_consts_.begin(), types_consts_.end());
+        spv.insert(spv.end(), funcs_.begin(), funcs_.end());
+        return spv;
+    }
+
+private:
+    uint32_t next_id_ = 1u;
+    uint32_t ty_void_ = 0u, ty_bool_ = 0u, ty_u32_ = 0u, ty_f32_ = 0u, ty_v3u32_ = 0u;
+    uint32_t ty_rt_u32_ = 0u, ty_buf_struct_ = 0u;
+    uint32_t ty_ptr_sb_struct_ = 0u, ty_ptr_sb_u32_ = 0u;
+    uint32_t ty_ptr_in_v3u32_ = 0u, ty_ptr_in_u32_ = 0u, ty_ptr_fn_u32_ = 0u, ty_main_fn_ = 0u;
+    uint32_t var_in_ = 0u, var_out_ = 0u, var_gid_ = 0u;
+    std::unordered_map<uint32_t, uint32_t> u32_consts_;
+    std::vector<uint32_t> decorations_;
+    std::vector<uint32_t> types_consts_;
+    std::vector<uint32_t> funcs_;
+};
+
+}  // namespace
+
+Gfx10HtileDecoded DecodeGfx10HtileWord(uint32_t htile_word, bool has_stencil) noexcept {
+    Gfx10HtileDecoded out{};
+    out.zmask = htile_word & 0xFu;
+    if (has_stencil) {
+        out.smem = (htile_word >> 4u) & 0x3u;
+        out.tc_compat = ((htile_word >> 10u) & 0x1u) != 0u;
+        out.min_z_14 = ((htile_word >> 12u) & 0x3Fu) << 8u;
+        out.max_z_14 = (htile_word >> 18u) & 0x3FFFu;
+    } else {
+        out.smem = 0x3u;
+        out.tc_compat = false;
+        out.min_z_14 = (htile_word >> 4u) & 0x3FFFu;
+        out.max_z_14 = (htile_word >> 18u) & 0x3FFFu;
+    }
+    out.min_z_float = static_cast<float>(out.min_z_14) / 16383.0f;
+    out.max_z_float = static_cast<float>(out.max_z_14) / 16383.0f;
+    return out;
+}
+
+uint32_t EncodeGfx10HtileWord(
+    uint32_t zmask,
+    uint32_t min_z_14,
+    uint32_t max_z_14,
+    uint32_t smem,
+    bool tc_compat,
+    bool has_stencil) noexcept {
+    const uint32_t zm = zmask & 0xFu;
+    const uint32_t mn = min_z_14 & 0x3FFFu;
+    const uint32_t mx = max_z_14 & 0x3FFFu;
+    if (has_stencil) {
+        const uint32_t zbase6 = (mn >> 8u) & 0x3Fu;
+        return zm |
+               ((smem & 0x3u) << 4u) |
+               (tc_compat ? (1u << 10u) : 0u) |
+               (zbase6 << 12u) |
+               (mx << 18u);
+    }
+    return zm | (mn << 4u) | (mx << 18u);
+}
+
+uint32_t PackGfx10FmaskPixelWord(const uint8_t* sample_frags, uint32_t sample_count) noexcept {
+    if (!sample_frags) return 0xFFFFFFFFu;
+    const uint32_t n = std::min<uint32_t>(sample_count, 8u);
+    uint32_t word = 0u;
+    for (uint32_t s = 0u; s < n; ++s) {
+        word |= (static_cast<uint32_t>(sample_frags[s] & 0xFu) << (s * 4u));
+    }
+    return word;
+}
+
+Status ResolveFmaskCpuReference(
+    const XgGpuResolveParams& params,
+    const std::vector<uint8_t>& msaa_color_bytes,
+    const std::vector<uint8_t>& fmask_bytes,
+    std::vector<uint8_t>& out_rgba8) {
+    if (params.width == 0u || params.height == 0u ||
+        (params.sample_count != 2u && params.sample_count != 4u && params.sample_count != 8u)) {
+        return Status::Error(StatusCode::InvalidArgument, "ResolveFmaskCpuReference: invalid dimensions or sample_count");
+    }
+    const size_t total_pixels = static_cast<size_t>(params.width) * params.height;
+    const uint32_t dst_pitch = (params.dst_row_pitch >= params.width * 4u) ? params.dst_row_pitch : (params.width * 4u);
+    const bool per_sample = (params.mode == static_cast<uint32_t>(XgFmaskResolveMode::PerSampleExpand));
+    const size_t expected_out = per_sample
+                                    ? (total_pixels * params.sample_count * 4u)
+                                    : (static_cast<size_t>(params.height) * dst_pitch);
+    out_rgba8.assign(expected_out, 0u);
+
+    for (uint32_t y = 0u; y < params.height; ++y) {
+        for (uint32_t x = 0u; x < params.width; ++x) {
+            const size_t tid = static_cast<size_t>(y) * params.width + x;
+            const uint32_t fmask_word = ReadU32Le(fmask_bytes, tid * 4u);
+            uint32_t sr = 0u, sg = 0u, sb = 0u, sa = 0u;
+            uint32_t centroid_col = params.clear_reg_0;
+            bool has_valid = false;
+
+            for (uint32_t s = 0u; s < params.sample_count; ++s) {
+                const uint32_t fidx = (fmask_word >> (s * 4u)) & 0xFu;
+                const bool is_sent = (fidx >= params.sample_count || fidx == 0xEu || fidx == 0xFu);
+                const uint32_t scol =
+                    is_sent ? params.clear_reg_0
+                            : ReadU32Le(msaa_color_bytes, (tid * params.sample_count + fidx) * 4u);
+                sr += (scol & 0xFFu);
+                sg += ((scol >> 8u) & 0xFFu);
+                sb += ((scol >> 16u) & 0xFFu);
+                sa += ((scol >> 24u) & 0xFFu);
+                if (!has_valid && !is_sent) {
+                    centroid_col = scol;
+                    has_valid = true;
+                }
+                if (per_sample) {
+                    WriteU32Le(out_rgba8, (tid * params.sample_count + s) * 4u, scol);
+                }
+            }
+            if (!per_sample) {
+                const uint32_t half_s = params.sample_count >> 1u;
+                const uint32_t avg = ((sr + half_s) / params.sample_count) |
+                                     (((sg + half_s) / params.sample_count) << 8u) |
+                                     (((sb + half_s) / params.sample_count) << 16u) |
+                                     (((sa + half_s) / params.sample_count) << 24u);
+                const uint32_t final_col =
+                    (params.mode == static_cast<uint32_t>(XgFmaskResolveMode::Sample0Centroid))
+                        ? centroid_col
+                        : avg;
+                WriteU32Le(out_rgba8, static_cast<size_t>(y) * dst_pitch + static_cast<size_t>(x) * 4u, final_col);
+            }
+        }
+    }
+    return Status::Ok();
+}
+
+Status EncodeDccCompressedSurface2D(
+    uint32_t width,
+    uint32_t height,
+    const std::vector<uint8_t>& linear_rgba8,
+    uint32_t clear_reg_rgba8,
+    bool pipe_aligned,
+    uint32_t num_pipes,
+    std::vector<uint8_t>& out_compressed_blocks,
+    std::vector<uint8_t>& out_dcc_keys,
+    uint32_t* out_fast_clear_blocks,
+    uint32_t* out_blocks_4to1,
+    uint32_t* out_blocks_2to1,
+    uint32_t* out_blocks_uncompressed) {
+    if (width == 0u || height == 0u || linear_rgba8.size() < static_cast<size_t>(width) * height * 4u) {
+        return Status::Error(StatusCode::InvalidArgument, "EncodeDccCompressedSurface2D: invalid input dimensions");
+    }
+    const uint32_t blocks_x = (width + 7u) / 8u;
+    const uint32_t blocks_y = (height + 7u) / 8u;
+    const uint32_t total_blocks = blocks_x * blocks_y;
+    const uint32_t meta_pitch = std::max<uint32_t>(total_blocks, pipe_aligned ? 256u : total_blocks);
+
+    out_compressed_blocks.assign(static_cast<size_t>(total_blocks) * 256u, 0u);
+    out_dcc_keys.assign(meta_pitch, 0xFFu);
+
+    uint32_t cnt_clear = 0u, cnt_4to1 = 0u, cnt_2to1 = 0u, cnt_uncomp = 0u;
+    const uint32_t pipe_mask = (num_pipes > 1u) ? (num_pipes - 1u) : 0u;
+
+    for (uint32_t by = 0u; by < blocks_y; ++by) {
+        for (uint32_t bx = 0u; bx < blocks_x; ++bx) {
+            const uint32_t blk_idx = by * blocks_x + bx;
+            uint32_t pixels[64]{};
+            uint32_t min_ch[4] = {255u, 255u, 255u, 255u};
+            uint32_t max_ch[4] = {0u, 0u, 0u, 0u};
+            bool all_same = true;
+            uint32_t first_col = 0u;
+
+            for (uint32_t ly = 0u; ly < 8u; ++ly) {
+                for (uint32_t lx = 0u; lx < 8u; ++lx) {
+                    const uint32_t px = std::min(bx * 8u + lx, width - 1u);
+                    const uint32_t py = std::min(by * 8u + ly, height - 1u);
+                    const uint32_t col = ReadU32Le(linear_rgba8, (static_cast<size_t>(py) * width + px) * 4u);
+                    const uint32_t p = ly * 8u + lx;
+                    pixels[p] = col;
+                    if (p == 0u) first_col = col;
+                    else if (col != first_col) all_same = false;
+                    for (uint32_t c = 0u; c < 4u; ++c) {
+                        const uint32_t v = (col >> (c * 8u)) & 0xFFu;
+                        min_ch[c] = std::min(min_ch[c], v);
+                        max_ch[c] = std::max(max_ch[c], v);
+                    }
+                }
+            }
+
+            uint32_t moff = blk_idx;
+            if (pipe_aligned && meta_pitch >= 256u) {
+                const uint32_t xorb = ((bx >> 2u) ^ (by >> 2u)) & pipe_mask;
+                const uint32_t cand = blk_idx ^ xorb;
+                if (cand < meta_pitch) moff = cand;
+            }
+
+            const size_t blk_base = static_cast<size_t>(blk_idx) * 256u;
+
+            // 1. Check fast-clear sentinels
+            if (all_same) {
+                uint8_t fc_key = 0xFFu;
+                if (first_col == 0x00000000u) fc_key = 0x00u;
+                else if (first_col == 0xFF000000u) fc_key = 0x40u;
+                else if (first_col == 0x00FFFFFFu) fc_key = 0x80u;
+                else if (first_col == 0xFFFFFFFFu) fc_key = 0xC0u;
+                else if (first_col == clear_reg_rgba8) fc_key = 0x20u;
+                if (fc_key != 0xFFu) {
+                    out_dcc_keys[moff] = fc_key;
+                    ++cnt_clear;
+                    continue;
+                }
+            }
+
+            // 2. Check lossless 4:1 delta-block compression (RGB span <= 3, A span <= 1)
+            const bool fits_4to1 =
+                (max_ch[0] - min_ch[0] <= 3u) &&
+                (max_ch[1] - min_ch[1] <= 3u) &&
+                (max_ch[2] - min_ch[2] <= 3u) &&
+                (max_ch[3] - min_ch[3] <= 1u);
+            if (fits_4to1) {
+                const uint32_t r0 = std::min<uint32_t>(min_ch[0] + 2u, 255u);
+                const uint32_t g0 = std::min<uint32_t>(min_ch[1] + 2u, 255u);
+                const uint32_t b0 = std::min<uint32_t>(min_ch[2] + 2u, 255u);
+                const uint32_t a0 = min_ch[3];
+                // Verify exact round-trip (base near 255 could clip if min_ch == 254 -> base 255 -> delta +2..+1)
+                bool exact = true;
+                uint32_t rw[4]{}, gw[4]{}, bw[4]{}, aw[2]{};
+                for (uint32_t p = 0u; p < 64u; ++p) {
+                    const uint32_t cr = pixels[p] & 0xFFu;
+                    const uint32_t cg = (pixels[p] >> 8u) & 0xFFu;
+                    const uint32_t cb = (pixels[p] >> 16u) & 0xFFu;
+                    const uint32_t ca = (pixels[p] >> 24u) & 0xFFu;
+                    const int32_t dr = static_cast<int32_t>(cr) - static_cast<int32_t>(r0) + 2;
+                    const int32_t dg = static_cast<int32_t>(cg) - static_cast<int32_t>(g0) + 2;
+                    const int32_t db = static_cast<int32_t>(cb) - static_cast<int32_t>(b0) + 2;
+                    const int32_t da = static_cast<int32_t>(ca) - static_cast<int32_t>(a0);
+                    if (dr < 0 || dr > 3 || dg < 0 || dg > 3 || db < 0 || db > 3 || da < 0 || da > 1) {
+                        exact = false;
+                        break;
+                    }
+                    const uint32_t sh2 = (p & 15u) * 2u;
+                    rw[p >> 4u] |= (static_cast<uint32_t>(dr) << sh2);
+                    gw[p >> 4u] |= (static_cast<uint32_t>(dg) << sh2);
+                    bw[p >> 4u] |= (static_cast<uint32_t>(db) << sh2);
+                    aw[p >> 5u] |= (static_cast<uint32_t>(da) << (p & 31u));
+                }
+                if (exact) {
+                    out_dcc_keys[moff] = 0x04u;  // XG_DCC_STATE_COMPRESSED_4TO1
+                    WriteU32Le(out_compressed_blocks, blk_base + 0u, r0 | (g0 << 8u) | (b0 << 16u) | (a0 << 24u));
+                    WriteU32Le(out_compressed_blocks, blk_base + 4u, 0u);
+                    for (uint32_t i = 0u; i < 4u; ++i) {
+                        WriteU32Le(out_compressed_blocks, blk_base + 8u + i * 4u, rw[i]);
+                        WriteU32Le(out_compressed_blocks, blk_base + 24u + i * 4u, gw[i]);
+                        WriteU32Le(out_compressed_blocks, blk_base + 40u + i * 4u, bw[i]);
+                    }
+                    for (uint32_t i = 0u; i < 2u; ++i) {
+                        WriteU32Le(out_compressed_blocks, blk_base + 56u + i * 4u, aw[i]);
+                    }
+                    ++cnt_4to1;
+                    continue;
+                }
+            }
+
+            // 3. Check lossless 2:1 delta-block compression (RGB span <= 15, A span <= 3)
+            const bool fits_2to1 =
+                (max_ch[0] - min_ch[0] <= 15u) &&
+                (max_ch[1] - min_ch[1] <= 15u) &&
+                (max_ch[2] - min_ch[2] <= 15u) &&
+                (max_ch[3] - min_ch[3] <= 3u);
+            if (fits_2to1) {
+                const uint32_t r0 = std::min<uint32_t>(min_ch[0] + 8u, 255u);
+                const uint32_t g0 = std::min<uint32_t>(min_ch[1] + 8u, 255u);
+                const uint32_t b0 = std::min<uint32_t>(min_ch[2] + 8u, 255u);
+                const uint32_t a0 = std::min<uint32_t>(min_ch[3] + 2u, 255u);
+                bool exact = true;
+                uint32_t rw[8]{}, gw[8]{}, bw[8]{}, aw[4]{};
+                for (uint32_t p = 0u; p < 64u; ++p) {
+                    const uint32_t cr = pixels[p] & 0xFFu;
+                    const uint32_t cg = (pixels[p] >> 8u) & 0xFFu;
+                    const uint32_t cb = (pixels[p] >> 16u) & 0xFFu;
+                    const uint32_t ca = (pixels[p] >> 24u) & 0xFFu;
+                    const int32_t dr = static_cast<int32_t>(cr) - static_cast<int32_t>(r0) + 8;
+                    const int32_t dg = static_cast<int32_t>(cg) - static_cast<int32_t>(g0) + 8;
+                    const int32_t db = static_cast<int32_t>(cb) - static_cast<int32_t>(b0) + 8;
+                    const int32_t da = static_cast<int32_t>(ca) - static_cast<int32_t>(a0) + 2;
+                    if (dr < 0 || dr > 15 || dg < 0 || dg > 15 || db < 0 || db > 15 || da < 0 || da > 3) {
+                        exact = false;
+                        break;
+                    }
+                    const uint32_t sh4 = (p & 7u) * 4u;
+                    const uint32_t sh2 = (p & 15u) * 2u;
+                    rw[p >> 3u] |= (static_cast<uint32_t>(dr) << sh4);
+                    gw[p >> 3u] |= (static_cast<uint32_t>(dg) << sh4);
+                    bw[p >> 3u] |= (static_cast<uint32_t>(db) << sh4);
+                    aw[p >> 4u] |= (static_cast<uint32_t>(da) << sh2);
+                }
+                if (exact) {
+                    out_dcc_keys[moff] = 0x0Cu;  // XG_DCC_STATE_COMPRESSED_2TO1
+                    WriteU32Le(out_compressed_blocks, blk_base + 0u, r0 | (g0 << 8u) | (b0 << 16u) | (a0 << 24u));
+                    WriteU32Le(out_compressed_blocks, blk_base + 4u, 0u);
+                    for (uint32_t i = 0u; i < 8u; ++i) {
+                        WriteU32Le(out_compressed_blocks, blk_base + 8u + i * 4u, rw[i]);
+                        WriteU32Le(out_compressed_blocks, blk_base + 40u + i * 4u, gw[i]);
+                        WriteU32Le(out_compressed_blocks, blk_base + 72u + i * 4u, bw[i]);
+                    }
+                    for (uint32_t i = 0u; i < 4u; ++i) {
+                        WriteU32Le(out_compressed_blocks, blk_base + 104u + i * 4u, aw[i]);
+                    }
+                    ++cnt_2to1;
+                    continue;
+                }
+            }
+
+            // 4. Uncompressed fallback (0xFF)
+            out_dcc_keys[moff] = 0xFFu;
+            for (uint32_t p = 0u; p < 64u; ++p) {
+                WriteU32Le(out_compressed_blocks, blk_base + p * 4u, pixels[p]);
+            }
+            ++cnt_uncomp;
+        }
+    }
+
+    if (out_fast_clear_blocks) *out_fast_clear_blocks = cnt_clear;
+    if (out_blocks_4to1) *out_blocks_4to1 = cnt_4to1;
+    if (out_blocks_2to1) *out_blocks_2to1 = cnt_2to1;
+    if (out_blocks_uncompressed) *out_blocks_uncompressed = cnt_uncomp;
+    return Status::Ok();
+}
+
+Status DecompressDccCpuReference(
+    const XgGpuResolveParams& params,
+    const std::vector<uint8_t>& src_blocks,
+    const std::vector<uint8_t>& dcc_keys,
+    std::vector<uint8_t>& out_rgba8) {
+    if (params.width == 0u || params.height == 0u) {
+        return Status::Error(StatusCode::InvalidArgument, "DecompressDccCpuReference: zero dimensions");
+    }
+    const uint32_t dst_pitch = (params.dst_row_pitch >= params.width * 4u) ? params.dst_row_pitch : (params.width * 4u);
+    out_rgba8.assign(static_cast<size_t>(params.height) * dst_pitch, 0u);
+    const uint32_t pipe_mask = (params.meta_num_pipes > 1u) ? (params.meta_num_pipes - 1u) : 0u;
+    const bool pipe_aligned = ((params.mode & 1u) != 0u) && (params.meta_slice_pitch >= 256u);
+
+    for (uint32_t y = 0u; y < params.height; ++y) {
+        for (uint32_t x = 0u; x < params.width; ++x) {
+            const uint32_t bx = x >> 3u;
+            const uint32_t by = y >> 3u;
+            const uint32_t lx = x & 7u;
+            const uint32_t ly = y & 7u;
+            const uint32_t pix_in_blk = (ly << 3u) | lx;
+            const uint32_t blk_idx = by * params.meta_blocks_x + bx;
+            uint32_t moff = blk_idx;
+            if (pipe_aligned) {
+                const uint32_t xorb = ((bx >> 2u) ^ (by >> 2u)) & pipe_mask;
+                const uint32_t cand = blk_idx ^ xorb;
+                if (cand < params.meta_slice_pitch) moff = cand;
+            }
+            const uint8_t key = (moff < dcc_keys.size()) ? dcc_keys[moff] : 0xFFu;
+            const size_t blk_base = static_cast<size_t>(blk_idx) * 256u;
+
+            uint32_t col = 0u;
+            if (key == 0x00u) col = 0x00000000u;
+            else if (key == 0x40u) col = 0xFF000000u;
+            else if (key == 0x80u) col = 0x00FFFFFFu;
+            else if (key == 0xC0u) col = 0xFFFFFFFFu;
+            else if (key == 0x20u) col = params.clear_reg_0;
+            else if (key >= 0x02u && key <= 0x12u) {
+                const bool is_4to1 = (key <= 0x07u);
+                const uint32_t base_rgba = ReadU32Le(src_blocks, blk_base + 0u);
+                const uint32_t sh_word = ReadU32Le(src_blocks, blk_base + 4u);
+                const uint32_t r0 = base_rgba & 0xFFu;
+                const uint32_t g0 = (base_rgba >> 8u) & 0xFFu;
+                const uint32_t b0 = (base_rgba >> 16u) & 0xFFu;
+                const uint32_t a0 = (base_rgba >> 24u) & 0xFFu;
+                const uint32_t sr = sh_word & 0xFFu;
+                const uint32_t sg = (sh_word >> 8u) & 0xFFu;
+                const uint32_t sb = (sh_word >> 16u) & 0xFFu;
+                const uint32_t sa = (sh_word >> 24u) & 0xFFu;
+
+                uint32_t dr = 0u, dg = 0u, db = 0u, da = 0u;
+                if (is_4to1) {
+                    const uint32_t w2 = pix_in_blk >> 4u;
+                    const uint32_t b2 = (pix_in_blk & 15u) * 2u;
+                    const uint32_t w1 = pix_in_blk >> 5u;
+                    const uint32_t b1 = pix_in_blk & 31u;
+                    dr = (ReadU32Le(src_blocks, blk_base + 8u + w2 * 4u) >> b2) & 0x3u;
+                    dg = (ReadU32Le(src_blocks, blk_base + 24u + w2 * 4u) >> b2) & 0x3u;
+                    db = (ReadU32Le(src_blocks, blk_base + 40u + w2 * 4u) >> b2) & 0x3u;
+                    da = (ReadU32Le(src_blocks, blk_base + 56u + w1 * 4u) >> b1) & 0x1u;
+                    col = ApplyBiasedDeltaU32(r0, dr, 2u, sr, 255u) |
+                          (ApplyBiasedDeltaU32(g0, dg, 2u, sg, 255u) << 8u) |
+                          (ApplyBiasedDeltaU32(b0, db, 2u, sb, 255u) << 16u) |
+                          (ApplyBiasedDeltaU32(a0, da, 0u, sa, 255u) << 24u);
+                } else {
+                    const uint32_t w4 = pix_in_blk >> 3u;
+                    const uint32_t b4 = (pix_in_blk & 7u) * 4u;
+                    const uint32_t w2 = pix_in_blk >> 4u;
+                    const uint32_t b2 = (pix_in_blk & 15u) * 2u;
+                    dr = (ReadU32Le(src_blocks, blk_base + 8u + w4 * 4u) >> b4) & 0xFu;
+                    dg = (ReadU32Le(src_blocks, blk_base + 40u + w4 * 4u) >> b4) & 0xFu;
+                    db = (ReadU32Le(src_blocks, blk_base + 72u + w4 * 4u) >> b4) & 0xFu;
+                    da = (ReadU32Le(src_blocks, blk_base + 104u + w2 * 4u) >> b2) & 0x3u;
+                    col = ApplyBiasedDeltaU32(r0, dr, 8u, sr, 255u) |
+                          (ApplyBiasedDeltaU32(g0, dg, 8u, sg, 255u) << 8u) |
+                          (ApplyBiasedDeltaU32(b0, db, 8u, sb, 255u) << 16u) |
+                          (ApplyBiasedDeltaU32(a0, da, 2u, sa, 255u) << 24u);
+                }
+            } else {
+                col = ReadU32Le(src_blocks, blk_base + pix_in_blk * 4u);
+            }
+            WriteU32Le(out_rgba8, static_cast<size_t>(y) * dst_pitch + static_cast<size_t>(x) * 4u, col);
+        }
+    }
+    return Status::Ok();
+}
+
+Status EncodeHtileCompressedSurface2D(
+    uint32_t width,
+    uint32_t height,
+    const std::vector<float>& depth_f32,
+    const std::vector<uint8_t>* stencil_s8,
+    float clear_depth,
+    uint8_t clear_stencil,
+    bool output_d24s8,
+    std::vector<uint8_t>& out_compressed_tiles,
+    std::vector<uint8_t>& out_htile_words,
+    uint32_t* out_clear_tiles,
+    uint32_t* out_compressed_tile_count,
+    uint32_t* out_expanded_tiles) {
+    if (width == 0u || height == 0u || depth_f32.size() < static_cast<size_t>(width) * height) {
+        return Status::Error(StatusCode::InvalidArgument, "EncodeHtileCompressedSurface2D: invalid input dimensions");
+    }
+    const uint32_t blocks_x = (width + 7u) / 8u;
+    const uint32_t blocks_y = (height + 7u) / 8u;
+    const uint32_t total_tiles = blocks_x * blocks_y;
+    out_compressed_tiles.assign(static_cast<size_t>(total_tiles) * 256u, 0u);
+    out_htile_words.assign(static_cast<size_t>(total_tiles) * 4u, 0u);
+
+    uint32_t cnt_clear = 0u, cnt_comp = 0u, cnt_exp = 0u;
+    const auto to_z24 = [](float d) noexcept -> uint32_t {
+        const float c = std::clamp(d, 0.0f, 1.0f);
+        const uint32_t v = static_cast<uint32_t>(c * 16777216.0f + 0.5f);
+        return std::min<uint32_t>(v, 0x00FFFFFFu);
+    };
+    const uint32_t clear_z24 = to_z24(clear_depth);
+
+    for (uint32_t by = 0u; by < blocks_y; ++by) {
+        for (uint32_t bx = 0u; bx < blocks_x; ++bx) {
+            const uint32_t tile_idx = by * blocks_x + bx;
+            const size_t tile_base = static_cast<size_t>(tile_idx) * 256u;
+            uint32_t z24_pix[64]{};
+            uint8_t s_pix[64]{};
+            uint32_t min_z24 = 0x00FFFFFFu;
+            uint32_t max_z24 = 0u;
+            bool all_clear = true;
+            bool same_stencil = true;
+
+            for (uint32_t ly = 0u; ly < 8u; ++ly) {
+                for (uint32_t lx = 0u; lx < 8u; ++lx) {
+                    const uint32_t px = std::min(bx * 8u + lx, width - 1u);
+                    const uint32_t py = std::min(by * 8u + ly, height - 1u);
+                    const size_t src_i = static_cast<size_t>(py) * width + px;
+                    const uint32_t p = ly * 8u + lx;
+                    const uint32_t zv = to_z24(depth_f32[src_i]);
+                    const uint8_t sv = (stencil_s8 && src_i < stencil_s8->size()) ? (*stencil_s8)[src_i] : clear_stencil;
+                    z24_pix[p] = zv;
+                    s_pix[p] = sv;
+                    min_z24 = std::min(min_z24, zv);
+                    max_z24 = std::max(max_z24, zv);
+                    if (zv != clear_z24 || sv != clear_stencil) all_clear = false;
+                    if (sv != s_pix[0]) same_stencil = false;
+                }
+            }
+
+            const uint32_t min14 = (min_z24 >> 10u) & 0x3FFFu;
+            const uint32_t max14 = std::min<uint32_t>(0x3FFFu, (max_z24 + 0x3FFu) >> 10u);
+
+            if (all_clear) {
+                const uint32_t qz = (clear_z24 >> 10u) & 0x3FFFu;
+                const uint32_t hword = EncodeGfx10HtileWord(0u, qz, qz, 0u, false, false);
+                WriteU32Le(out_htile_words, static_cast<size_t>(tile_idx) * 4u, hword);
+                ++cnt_clear;
+                continue;
+            }
+
+            // Try planar + 4-bit residual compression (zmask in 1..14) when stencil is uniform across tile.
+            if (same_stencil) {
+                const int32_t base_z = static_cast<int32_t>(z24_pix[0]);
+                const int32_t dz_dx = static_cast<int32_t>(z24_pix[1]) - base_z;
+                const int32_t dz_dy = static_cast<int32_t>(z24_pix[8]) - base_z;
+                if (dz_dx >= -32768 && dz_dx <= 32767 && dz_dy >= -32768 && dz_dy <= 32767) {
+                    int32_t residuals[64]{};
+                    bool exact_plane = true;
+                    uint32_t chosen_zmask = 0u;
+                    for (uint32_t zm = 1u; zm <= 14u; ++zm) {
+                        const uint32_t rshift = zm - 1u;
+                        const uint32_t step = 1u << rshift;
+                        exact_plane = true;
+                        for (uint32_t ly = 0u; ly < 8u && exact_plane; ++ly) {
+                            for (uint32_t lx = 0u; lx < 8u; ++lx) {
+                                const uint32_t p = ly * 8u + lx;
+                                const int32_t pred = base_z + static_cast<int32_t>(lx) * dz_dx +
+                                                     static_cast<int32_t>(ly) * dz_dy;
+                                const int32_t diff = static_cast<int32_t>(z24_pix[p]) - pred;
+                                if ((diff % static_cast<int32_t>(step)) != 0) {
+                                    exact_plane = false;
+                                    break;
+                                }
+                                const int32_t q = (diff / static_cast<int32_t>(step)) + 8;
+                                if (q < 0 || q > 15) {
+                                    exact_plane = false;
+                                    break;
+                                }
+                                residuals[p] = q;
+                            }
+                        }
+                        if (exact_plane) {
+                            chosen_zmask = zm;
+                            break;
+                        }
+                    }
+                    if (chosen_zmask != 0u) {
+                        const uint32_t hword = EncodeGfx10HtileWord(chosen_zmask, min14, max14, 0x3u, false, false);
+                        WriteU32Le(out_htile_words, static_cast<size_t>(tile_idx) * 4u, hword);
+                        WriteU32Le(out_compressed_tiles, tile_base + 0u,
+                                   (static_cast<uint32_t>(base_z) & 0x00FFFFFFu) |
+                                       (static_cast<uint32_t>(s_pix[0]) << 24u));
+                        WriteU32Le(out_compressed_tiles, tile_base + 4u,
+                                   static_cast<uint32_t>(dz_dx + 32768) |
+                                       (static_cast<uint32_t>(dz_dy + 32768) << 16u));
+                        uint32_t rw[8]{};
+                        for (uint32_t p = 0u; p < 64u; ++p) {
+                            rw[p >> 3u] |= (static_cast<uint32_t>(residuals[p]) << ((p & 7u) * 4u));
+                        }
+                        for (uint32_t i = 0u; i < 8u; ++i) {
+                            WriteU32Le(out_compressed_tiles, tile_base + 8u + i * 4u, rw[i]);
+                        }
+                        ++cnt_comp;
+                        continue;
+                    }
+                }
+            }
+
+            // Expanded tile fallback (zmask == 15)
+            const uint32_t hword = EncodeGfx10HtileWord(15u, min14, max14, 0x3u, false, false);
+            WriteU32Le(out_htile_words, static_cast<size_t>(tile_idx) * 4u, hword);
+            for (uint32_t p = 0u; p < 64u; ++p) {
+                const uint32_t val = output_d24s8
+                                         ? ((static_cast<uint32_t>(s_pix[p]) << 24u) | z24_pix[p])
+                                         : FloatBitsFromZ24(z24_pix[p]);
+                WriteU32Le(out_compressed_tiles, tile_base + p * 4u, val);
+            }
+            ++cnt_exp;
+        }
+    }
+
+    if (out_clear_tiles) *out_clear_tiles = cnt_clear;
+    if (out_compressed_tile_count) *out_compressed_tile_count = cnt_comp;
+    if (out_expanded_tiles) *out_expanded_tiles = cnt_exp;
+    return Status::Ok();
+}
+
+Status DecompressHtileCpuReference(
+    const XgGpuResolveParams& params,
+    const std::vector<uint8_t>& src_tiles,
+    const std::vector<uint8_t>& htile_words,
+    std::vector<uint8_t>& out_depth_bytes,
+    std::vector<uint32_t>* out_hiz_bounds) {
+    if (params.width == 0u || params.height == 0u) {
+        return Status::Error(StatusCode::InvalidArgument, "DecompressHtileCpuReference: zero dimensions");
+    }
+    const uint32_t dst_pitch = (params.dst_row_pitch >= params.width * 4u) ? params.dst_row_pitch : (params.width * 4u);
+    const uint32_t blocks_x = params.meta_blocks_x;
+    const uint32_t blocks_y = (params.height + 7u) / 8u;
+    const bool emit_hiz = ((params.mode & 1u) != 0u);
+    const bool is_d24s8 = ((params.mode & 2u) != 0u);
+
+    const size_t pix_bytes = static_cast<size_t>(params.height) * dst_pitch;
+    const size_t total_bytes = emit_hiz ? (pix_bytes + static_cast<size_t>(blocks_x) * blocks_y * 4u) : pix_bytes;
+    out_depth_bytes.assign(total_bytes, 0u);
+    if (out_hiz_bounds) {
+        out_hiz_bounds->assign(static_cast<size_t>(blocks_x) * blocks_y, 0u);
+    }
+
+    const uint32_t clear_w = is_d24s8
+                                 ? (((params.clear_reg_1 & 0xFFu) << 24u) | (params.clear_reg_0 & 0x00FFFFFFu))
+                                 : params.clear_reg_0;
+
+    for (uint32_t y = 0u; y < params.height; ++y) {
+        for (uint32_t x = 0u; x < params.width; ++x) {
+            const uint32_t bx = x >> 3u;
+            const uint32_t by = y >> 3u;
+            const uint32_t lx = x & 7u;
+            const uint32_t ly = y & 7u;
+            const uint32_t pix_in_tile = (ly << 3u) | lx;
+            const uint32_t tile_idx = by * blocks_x + bx;
+            const uint32_t hword = ReadU32Le(htile_words, static_cast<size_t>(tile_idx) * 4u);
+            const uint32_t zmask = hword & 0xFu;
+            const size_t tile_base = static_cast<size_t>(tile_idx) * 256u;
+
+            uint32_t out_w = 0u;
+            if (zmask == 0u) {
+                out_w = clear_w;
+            } else if (zmask < 15u) {
+                const uint32_t hdr0 = ReadU32Le(src_tiles, tile_base + 0u);
+                const uint32_t hdr1 = ReadU32Le(src_tiles, tile_base + 4u);
+                const uint32_t base_z = hdr0 & 0x00FFFFFFu;
+                const uint32_t stencil = (hdr0 >> 24u) & 0xFFu;
+                const uint32_t raw_dx = hdr1 & 0xFFFFu;
+                const uint32_t raw_dy = (hdr1 >> 16u) & 0xFFFFu;
+                const uint32_t rword = ReadU32Le(src_tiles, tile_base + 8u + (pix_in_tile >> 3u) * 4u);
+                const uint32_t raw_res = (rword >> ((pix_in_tile & 7u) * 4u)) & 0xFu;
+                const uint32_t rshift = zmask - 1u;
+                const uint32_t pos = base_z + lx * raw_dx + ly * raw_dy + (raw_res << rshift);
+                const uint32_t neg = (lx + ly) * 32768u + (8u << rshift);
+                const uint32_t z24 = (pos < neg) ? 0u : std::min<uint32_t>(pos - neg, 0x00FFFFFFu);
+                out_w = is_d24s8 ? ((stencil << 24u) | z24) : FloatBitsFromZ24(z24);
+            } else {
+                out_w = ReadU32Le(src_tiles, tile_base + pix_in_tile * 4u);
+            }
+            WriteU32Le(out_depth_bytes, static_cast<size_t>(y) * dst_pitch + static_cast<size_t>(x) * 4u, out_w);
+
+            if (emit_hiz && lx == 0u && ly == 0u) {
+                const uint32_t min14 = (hword >> 4u) & 0x3FFFu;
+                const uint32_t max14 = (hword >> 18u) & 0x3FFFu;
+                const uint32_t hiz_w = (max14 << 16u) | min14;
+                WriteU32Le(out_depth_bytes, pix_bytes + static_cast<size_t>(tile_idx) * 4u, hiz_w);
+                if (out_hiz_bounds && tile_idx < out_hiz_bounds->size()) {
+                    (*out_hiz_bounds)[tile_idx] = hiz_w;
+                }
+            }
+        }
+    }
+    return Status::Ok();
+}
+
+std::string GenerateXgGpuResolveHlsl() {
+    return R"HLSL(
+cbuffer ResolveParams : register(b0) {
+    uint g_op;
+    uint g_width;
+    uint g_height;
+    uint g_sample_count;
+    uint g_mode;
+    uint g_bpe;
+    uint g_src_row_pitch;
+    uint g_dst_row_pitch;
+    uint g_meta_blocks_x;
+    uint g_meta_num_pipes;
+    uint g_meta_slice_pitch;
+    uint g_clear_reg_0;
+    uint g_clear_reg_1;
+    uint g_spv_src_woff;
+    uint g_spv_meta_woff;
+    uint g_aux_word_offset;
+};
+
+ByteAddressBuffer g_Src : register(t0);
+ByteAddressBuffer g_Meta : register(t1);
+RWByteAddressBuffer g_Dst : register(u0);
+
+uint ReadByteAt(ByteAddressBuffer buf, uint byte_off) {
+    uint w = buf.Load(byte_off & ~3u);
+    return (w >> ((byte_off & 3u) * 8u)) & 0xFFu;
+}
+
+uint ApplyBiasedDelta(uint base_ch, uint raw_delta, uint bias, uint shift, uint max_val) {
+    uint pos = base_ch + (raw_delta << shift);
+    uint neg = bias << shift;
+    if (pos < neg) return 0u;
+    uint diff = pos - neg;
+    return (diff > max_val) ? max_val : diff;
+}
+
+[numthreads(64, 1, 1)]
+void main(uint3 gid : SV_DispatchThreadID) {
+    uint total = g_width * g_height;
+    uint tid = gid.x;
+    if (tid >= total) return;
+
+    uint y = tid / g_width;
+    uint x = tid % g_width;
+    uint dst_byte_off = y * g_dst_row_pitch + x * 4u;
+
+    if (g_op == 0u) {
+        // FMASK MSAA Resolve & Decompress (2x/4x/8x)
+        uint fmask_word = g_Meta.Load(tid * 4u);
+        uint sr = 0u, sg = 0u, sb = 0u, sa = 0u;
+        uint centroid_col = g_clear_reg_0;
+        bool has_valid = false;
+        uint base_samp = tid * g_sample_count;
+        for (uint s = 0u; s < g_sample_count; ++s) {
+            uint fidx = (fmask_word >> (s * 4u)) & 0xFu;
+            bool is_sent = (fidx >= g_sample_count || fidx == 0xEu || fidx == 0xFu);
+            uint scol = is_sent ? g_clear_reg_0 : g_Src.Load((base_samp + fidx) * 4u);
+            sr += (scol & 0xFFu);
+            sg += ((scol >> 8u) & 0xFFu);
+            sb += ((scol >> 16u) & 0xFFu);
+            sa += ((scol >> 24u) & 0xFFu);
+            if (!has_valid && !is_sent) {
+                centroid_col = scol;
+                has_valid = true;
+            }
+            if (g_mode == 2u) {
+                g_Dst.Store((base_samp + s) * 4u, scol);
+            }
+        }
+        if (g_mode != 2u) {
+            uint half_s = g_sample_count >> 1u;
+            uint avg = ((sr + half_s) / g_sample_count) |
+                       (((sg + half_s) / g_sample_count) << 8u) |
+                       (((sb + half_s) / g_sample_count) << 16u) |
+                       (((sa + half_s) / g_sample_count) << 24u);
+            g_Dst.Store(dst_byte_off, (g_mode == 1u) ? centroid_col : avg);
+        }
+        return;
+    }
+
+    uint bx = x >> 3u;
+    uint by = y >> 3u;
+    uint lx = x & 7u;
+    uint ly = y & 7u;
+    uint pix_in_blk = (ly << 3u) | lx;
+    uint blk_idx = by * g_meta_blocks_x + bx;
+    uint blk_byte_base = blk_idx * 256u;
+
+    if (g_op == 1u) {
+        // DCC Compressed Block Decompression (fast-clear + 4:1 + 2:1 + uncompressed)
+        uint moff = blk_idx;
+        if ((g_mode & 1u) != 0u && g_meta_slice_pitch >= 256u) {
+            uint pipe_mask = (g_meta_num_pipes > 1u) ? (g_meta_num_pipes - 1u) : 0u;
+            uint xorb = ((bx >> 2u) ^ (by >> 2u)) & pipe_mask;
+            uint cand = blk_idx ^ xorb;
+            if (cand < g_meta_slice_pitch) moff = cand;
+        }
+        uint key = ReadByteAt(g_Meta, moff);
+        uint col = 0u;
+        if (key == 0x00u)      col = 0x00000000u;
+        else if (key == 0x40u) col = 0xFF000000u;
+        else if (key == 0x80u) col = 0x00FFFFFFu;
+        else if (key == 0xC0u) col = 0xFFFFFFFFu;
+        else if (key == 0x20u) col = g_clear_reg_0;
+        else if (key >= 0x02u && key <= 0x12u) {
+            bool is_4to1 = (key <= 0x07u);
+            uint base_rgba = g_Src.Load(blk_byte_base);
+            uint sh_word = g_Src.Load(blk_byte_base + 4u);
+            uint r0 = base_rgba & 0xFFu;
+            uint g0 = (base_rgba >> 8u) & 0xFFu;
+            uint b0 = (base_rgba >> 16u) & 0xFFu;
+            uint a0 = (base_rgba >> 24u) & 0xFFu;
+            uint sr = sh_word & 0xFFu;
+            uint sg = (sh_word >> 8u) & 0xFFu;
+            uint sb = (sh_word >> 16u) & 0xFFu;
+            uint sa = (sh_word >> 24u) & 0xFFu;
+            if (is_4to1) {
+                uint w2 = pix_in_blk >> 4u;
+                uint b2 = (pix_in_blk & 15u) * 2u;
+                uint w1 = pix_in_blk >> 5u;
+                uint b1 = pix_in_blk & 31u;
+                uint dr = (g_Src.Load(blk_byte_base + 8u + w2 * 4u) >> b2) & 0x3u;
+                uint dg = (g_Src.Load(blk_byte_base + 24u + w2 * 4u) >> b2) & 0x3u;
+                uint db = (g_Src.Load(blk_byte_base + 40u + w2 * 4u) >> b2) & 0x3u;
+                uint da = (g_Src.Load(blk_byte_base + 56u + w1 * 4u) >> b1) & 0x1u;
+                col = ApplyBiasedDelta(r0, dr, 2u, sr, 255u) |
+                      (ApplyBiasedDelta(g0, dg, 2u, sg, 255u) << 8u) |
+                      (ApplyBiasedDelta(b0, db, 2u, sb, 255u) << 16u) |
+                      (ApplyBiasedDelta(a0, da, 0u, sa, 255u) << 24u);
+            } else {
+                uint w4 = pix_in_blk >> 3u;
+                uint b4 = (pix_in_blk & 7u) * 4u;
+                uint w2 = pix_in_blk >> 4u;
+                uint b2 = (pix_in_blk & 15u) * 2u;
+                uint dr = (g_Src.Load(blk_byte_base + 8u + w4 * 4u) >> b4) & 0xFu;
+                uint dg = (g_Src.Load(blk_byte_base + 40u + w4 * 4u) >> b4) & 0xFu;
+                uint db = (g_Src.Load(blk_byte_base + 72u + w4 * 4u) >> b4) & 0xFu;
+                uint da = (g_Src.Load(blk_byte_base + 104u + w2 * 4u) >> b2) & 0x3u;
+                col = ApplyBiasedDelta(r0, dr, 8u, sr, 255u) |
+                      (ApplyBiasedDelta(g0, dg, 8u, sg, 255u) << 8u) |
+                      (ApplyBiasedDelta(b0, db, 8u, sb, 255u) << 16u) |
+                      (ApplyBiasedDelta(a0, da, 2u, sa, 255u) << 24u);
+            }
+        } else {
+            col = g_Src.Load(blk_byte_base + pix_in_blk * 4u);
+        }
+        g_Dst.Store(dst_byte_off, col);
+        return;
+    }
+
+    // OP 2: HTILE Depth/Stencil Decompression & HiZ Bounds Resolve
+    uint hword = g_Meta.Load(blk_idx * 4u);
+    uint zmask = hword & 0xFu;
+    bool is_d24s8 = ((g_mode & 2u) != 0u);
+    uint out_w = 0u;
+    if (zmask == 0u) {
+        out_w = is_d24s8 ? (((g_clear_reg_1 & 0xFFu) << 24u) | (g_clear_reg_0 & 0x00FFFFFFu)) : g_clear_reg_0;
+    } else if (zmask < 15u) {
+        uint hdr0 = g_Src.Load(blk_byte_base);
+        uint hdr1 = g_Src.Load(blk_byte_base + 4u);
+        uint base_z = hdr0 & 0x00FFFFFFu;
+        uint stencil = (hdr0 >> 24u) & 0xFFu;
+        uint raw_dx = hdr1 & 0xFFFFu;
+        uint raw_dy = (hdr1 >> 16u) & 0xFFFFu;
+        uint rword = g_Src.Load(blk_byte_base + 8u + (pix_in_blk >> 3u) * 4u);
+        uint raw_res = (rword >> ((pix_in_blk & 7u) * 4u)) & 0xFu;
+        uint rshift = zmask - 1u;
+        uint pos = base_z + lx * raw_dx + ly * raw_dy + (raw_res << rshift);
+        uint neg = (lx + ly) * 32768u + (8u << rshift);
+        uint z24 = (pos < neg) ? 0u : min(pos - neg, 0x00FFFFFFu);
+        out_w = is_d24s8 ? ((stencil << 24u) | z24) : asuint(float(z24) * (1.0f / 16777216.0f));
+    } else {
+        out_w = g_Src.Load(blk_byte_base + pix_in_blk * 4u);
+    }
+    g_Dst.Store(dst_byte_off, out_w);
+
+    if ((g_mode & 1u) != 0u && lx == 0u && ly == 0u) {
+        uint min14 = (hword >> 4u) & 0x3FFFu;
+        uint max14 = (hword >> 18u) & 0x3FFFu;
+        g_Dst.Store((g_aux_word_offset + blk_idx) * 4u, (max14 << 16u) | min14);
+    }
+}
+)HLSL";
+}
+
+Status CompileXgGpuResolveDxil(
+    const std::string& target_profile,
+    std::vector<uint8_t>& out_dxil,
+    std::string& out_diagnostics,
+    const std::string& dxc_path) {
+    const std::string target = target_profile.empty() ? "cs_6_5" : target_profile;
+    Status st = CompileHlslWithDxc(GenerateXgGpuResolveHlsl(), target, "main", out_dxil, out_diagnostics, dxc_path);
+    if (!st.ok()) return st;
+    return ResignDxilContainer(out_dxil);
+}
+
+Status EmitXgGpuResolveSpirv(std::vector<uint32_t>& out_spirv) {
+    SpvResolveBuilder builder;
+    out_spirv = builder.Build();
+    return VulkanBackend::ValidateSpirvBinary(out_spirv);
+}
+
+#if defined(_WIN32)
+Status XgGpuUntiler::RecordResolveDispatchD3D12(
+    ID3D12GraphicsCommandList* cmd_list,
+    const XgGpuResolveParams& params,
+    uint64_t cbv_gpu_va,
+    uint64_t src_srv_gpu_va,
+    uint64_t meta_srv_gpu_va,
+    uint64_t dst_uav_gpu_va) {
+    if (!impl_->d3d12_ready || !cmd_list) {
+        return Status::Error(StatusCode::DeviceError, "RecordResolveDispatchD3D12: untiler or command list not ready");
+    }
+    if (!impl_->resolve_pso) {
+        std::string diag;
+        Status st = CompileXgGpuResolveDxil(impl_->shader_target, impl_->resolve_dxil, diag, impl_->dxc_path_cached);
+        if (!st.ok()) {
+            return Status::Error(StatusCode::ShaderError, "Failed to compile resolve DXIL: " + diag);
+        }
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc{};
+        pso_desc.pRootSignature = impl_->root_sig.Get();
+        pso_desc.CS.pShaderBytecode = impl_->resolve_dxil.data();
+        pso_desc.CS.BytecodeLength = impl_->resolve_dxil.size();
+        const HRESULT hr = impl_->device->CreateComputePipelineState(
+            &pso_desc, OS_UUIDOF(ID3D12PipelineState), impl_->resolve_pso.PutVoid());
+        if (FAILED(hr) || !impl_->resolve_pso) {
+            return Status::Error(StatusCode::ShaderError, "CreateComputePipelineState(resolve) failed");
+        }
+    }
+    const uint64_t total_pixels = static_cast<uint64_t>(params.width) * static_cast<uint64_t>(params.height);
+    if (total_pixels == 0ull) {
+        return Status::Error(StatusCode::InvalidArgument, "RecordResolveDispatchD3D12: zero pixels");
+    }
+    const uint32_t groups_x = static_cast<uint32_t>((total_pixels + kUntileGroupSize - 1ull) / kUntileGroupSize);
+    cmd_list->SetComputeRootSignature(impl_->root_sig.Get());
+    cmd_list->SetPipelineState(impl_->resolve_pso.Get());
+    cmd_list->SetComputeRootConstantBufferView(0, cbv_gpu_va);
+    cmd_list->SetComputeRootShaderResourceView(1, src_srv_gpu_va);
+    cmd_list->SetComputeRootShaderResourceView(2, meta_srv_gpu_va != 0ull ? meta_srv_gpu_va : src_srv_gpu_va);
+    cmd_list->SetComputeRootUnorderedAccessView(3, dst_uav_gpu_va);
+    cmd_list->Dispatch(groups_x, 1u, 1u);
+    return Status::Ok();
+}
+
+Status XgGpuUntiler::ExecuteResolveD3D12(
+    const XgGpuResolveParams& params,
+    const std::vector<uint8_t>& src_bytes,
+    const std::vector<uint8_t>& meta_bytes,
+    std::vector<uint8_t>& dst_bytes,
+    XgGpuDispatchMetrics* out_metrics) {
+    if (!impl_->d3d12_ready) {
+        return Status::Error(StatusCode::DeviceError, "XgGpuUntiler D3D12 backend not initialized");
+    }
+    if (params.width == 0u || params.height == 0u || dst_bytes.empty()) {
+        return Status::Error(StatusCode::InvalidArgument, "ExecuteResolveD3D12: invalid dimensions or empty dst_bytes");
+    }
+
+    XgGpuResolveParams eff = params;
+    if (eff.dst_row_pitch < eff.width * 4u) eff.dst_row_pitch = eff.width * 4u;
+    if (eff.op == static_cast<uint32_t>(XgGpuResolveOp::HtileDecompress) &&
+        (eff.mode & 1u) != 0u && eff.spv_aux_word_offset == 0u) {
+        eff.spv_aux_word_offset = (eff.dst_row_pitch * eff.height) / 4u;
+    }
+
+    const uint64_t src_sz = AlignUpU64(std::max<size_t>(src_bytes.size(), 256u), 256ull);
+    const uint64_t meta_sz = AlignUpU64(std::max<size_t>(meta_bytes.size(), 256u), 256ull);
+    const uint64_t dst_sz = AlignUpU64(dst_bytes.size(), 256ull);
+
+    ComPtr<ID3D12Resource> cb_up, src_up, src_gpu, meta_up, meta_gpu, dst_gpu, dst_rb;
+    if (auto st = CreateBufferResource(impl_->device.Get(), D3D12_HEAP_TYPE_UPLOAD, 256ull,
+                                       D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, cb_up); !st.ok()) return st;
+    if (auto st = CreateBufferResource(impl_->device.Get(), D3D12_HEAP_TYPE_UPLOAD, src_sz,
+                                       D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, src_up); !st.ok()) return st;
+    if (auto st = CreateBufferResource(impl_->device.Get(), D3D12_HEAP_TYPE_DEFAULT, src_sz,
+                                       D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, src_gpu); !st.ok()) return st;
+    if (auto st = CreateBufferResource(impl_->device.Get(), D3D12_HEAP_TYPE_UPLOAD, meta_sz,
+                                       D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ, meta_up); !st.ok()) return st;
+    if (auto st = CreateBufferResource(impl_->device.Get(), D3D12_HEAP_TYPE_DEFAULT, meta_sz,
+                                       D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, meta_gpu); !st.ok()) return st;
+    if (auto st = CreateBufferResource(impl_->device.Get(), D3D12_HEAP_TYPE_DEFAULT, dst_sz,
+                                       D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, dst_gpu); !st.ok()) return st;
+    if (auto st = CreateBufferResource(impl_->device.Get(), D3D12_HEAP_TYPE_READBACK, dst_sz,
+                                       D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST, dst_rb); !st.ok()) return st;
+
+    auto upload = [](ID3D12Resource* res, const void* data, size_t len, uint64_t total_sz) -> Status {
+        void* mapped = nullptr;
+        D3D12_RANGE r{0, 0};
+        if (FAILED(res->Map(0, &r, &mapped)) || !mapped) {
+            return Status::Error(StatusCode::DeviceError, "Map(upload) failed");
+        }
+        std::memset(mapped, 0, static_cast<size_t>(total_sz));
+        if (data && len > 0) std::memcpy(mapped, data, len);
+        res->Unmap(0, nullptr);
+        return Status::Ok();
+    };
+
+    if (auto st = upload(cb_up.Get(), &eff, sizeof(eff), 256ull); !st.ok()) return st;
+    if (auto st = upload(src_up.Get(), src_bytes.data(), src_bytes.size(), src_sz); !st.ok()) return st;
+    if (auto st = upload(meta_up.Get(), meta_bytes.data(), meta_bytes.size(), meta_sz); !st.ok()) return st;
+
+    impl_->allocator->Reset();
+    impl_->cmd_list->Reset(impl_->allocator.Get(), nullptr);
+    impl_->cmd_list->CopyBufferRegion(src_gpu.Get(), 0, src_up.Get(), 0, src_sz);
+    impl_->cmd_list->CopyBufferRegion(meta_gpu.Get(), 0, meta_up.Get(), 0, meta_sz);
+
+    D3D12_RESOURCE_BARRIER pre[2]{};
+    pre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    pre[0].Transition = {src_gpu.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                         D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+    pre[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    pre[1].Transition = {meta_gpu.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                         D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+    impl_->cmd_list->ResourceBarrier(2, pre);
+
+    Status rec = RecordResolveDispatchD3D12(
+        impl_->cmd_list.Get(), eff,
+        cb_up->GetGPUVirtualAddress(),
+        src_gpu->GetGPUVirtualAddress(),
+        meta_gpu->GetGPUVirtualAddress(),
+        dst_gpu->GetGPUVirtualAddress());
+    if (!rec.ok()) return rec;
+
+    D3D12_RESOURCE_BARRIER post[2]{};
+    post[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    post[0].UAV.pResource = dst_gpu.Get();
+    post[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    post[1].Transition = {dst_gpu.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE};
+    impl_->cmd_list->ResourceBarrier(2, post);
+
+    impl_->cmd_list->CopyBufferRegion(dst_rb.Get(), 0, dst_gpu.Get(), 0, dst_sz);
+    if (FAILED(impl_->cmd_list->Close())) {
+        return Status::Error(StatusCode::DeviceError, "Close(cmd_list) failed");
+    }
+
+    ID3D12CommandList* lists[] = {impl_->cmd_list.Get()};
+    impl_->queue->ExecuteCommandLists(1, lists);
+    const uint64_t wait_val = ++impl_->fence_value;
+    if (FAILED(impl_->queue->Signal(impl_->fence.Get(), wait_val))) {
+        return Status::Error(StatusCode::DeviceError, "Queue::Signal failed");
+    }
+    if (impl_->fence->GetCompletedValue() < wait_val) {
+        impl_->fence->SetEventOnCompletion(wait_val, impl_->fence_event);
+        WaitForSingleObject(impl_->fence_event, 15000);
+    }
+
+    void* mapped = nullptr;
+    D3D12_RANGE rr{0, dst_bytes.size()};
+    if (FAILED(dst_rb->Map(0, &rr, &mapped)) || !mapped) {
+        return Status::Error(StatusCode::DeviceError, "Map(readback) failed");
+    }
+    std::memcpy(dst_bytes.data(), mapped, dst_bytes.size());
+    D3D12_RANGE wr{0, 0};
+    dst_rb->Unmap(0, &wr);
+
+    if (out_metrics) {
+        const uint32_t total = eff.width * eff.height;
+        out_metrics->backend_name = impl_->is_warp ? "D3D12-WARP" : "D3D12-HW";
+        out_metrics->adapter_name = impl_->adapter_name;
+        out_metrics->shader_target = impl_->shader_target;
+        out_metrics->dispatch_groups_x = (total + kUntileGroupSize - 1u) / kUntileGroupSize;
+        out_metrics->total_elements = total;
+        out_metrics->bytes_per_element = 4u;
+        out_metrics->executed_on_hardware_gpu = !impl_->is_warp;
+        out_metrics->used_warp = impl_->is_warp;
+        out_metrics->used_vulkan_icd = false;
+    }
+    return Status::Ok();
+}
+#endif
+
+Status XgGpuUntiler::ExecuteResolveVulkan(
+    const XgGpuResolveParams& params,
+    const std::vector<uint8_t>& src_bytes,
+    const std::vector<uint8_t>& meta_bytes,
+    std::vector<uint8_t>& dst_bytes,
+    XgGpuDispatchMetrics* out_metrics) {
+    if (!impl_->vk_ready) {
+        return Status::Error(StatusCode::DeviceError, "XgGpuUntiler Vulkan backend not initialized");
+    }
+    if (!impl_->vk_is_hw) {
+        return Status::Error(StatusCode::NotImplemented,
+                             "Vulkan hardware ICD required for SPIR-V resolve compute execution");
+    }
+    if (params.width == 0u || params.height == 0u || dst_bytes.empty()) {
+        return Status::Error(StatusCode::InvalidArgument, "ExecuteResolveVulkan: invalid dimensions or empty dst_bytes");
+    }
+    if (impl_->resolve_spirv.empty()) {
+        Status st = EmitXgGpuResolveSpirv(impl_->resolve_spirv);
+        if (!st.ok()) return st;
+    }
+
+    const uint32_t src_words = static_cast<uint32_t>((std::max<size_t>(src_bytes.size(), 4u) + 3u) / 4u);
+    const uint32_t meta_words = static_cast<uint32_t>((std::max<size_t>(meta_bytes.size(), 4u) + 3u) / 4u);
+    const uint32_t dst_words = static_cast<uint32_t>((dst_bytes.size() + 3u) / 4u);
+
+    XgGpuResolveParams hdr = params;
+    if (hdr.dst_row_pitch < hdr.width * 4u) hdr.dst_row_pitch = hdr.width * 4u;
+    hdr.spv_src_word_offset = kResolveSpvHeaderWords;
+    hdr.spv_meta_word_offset = kResolveSpvHeaderWords + src_words;
+    if (hdr.op == static_cast<uint32_t>(XgGpuResolveOp::HtileDecompress) &&
+        (hdr.mode & 1u) != 0u && hdr.spv_aux_word_offset == 0u) {
+        hdr.spv_aux_word_offset = (hdr.dst_row_pitch * hdr.height) / 4u;
+    }
+
+    const uint32_t total_in_words = std::max(kResolveSpvHeaderWords + src_words + meta_words, dst_words);
+    std::vector<uint32_t> input_u32(total_in_words, 0u);
+    std::memcpy(input_u32.data(), &hdr, sizeof(hdr));
+    if (!src_bytes.empty()) {
+        std::memcpy(input_u32.data() + hdr.spv_src_word_offset, src_bytes.data(), src_bytes.size());
+    }
+    if (!meta_bytes.empty()) {
+        std::memcpy(input_u32.data() + hdr.spv_meta_word_offset, meta_bytes.data(), meta_bytes.size());
+    }
+
+    const uint32_t total_pixels = hdr.width * hdr.height;
+    const uint32_t groups_x = std::max(1u, (total_pixels + kUntileGroupSize - 1u) / kUntileGroupSize);
+
+    std::vector<uint32_t> output_u32;
+    VulkanComputeDispatchOptions vk_opts{};
+    VulkanComputeDispatchResult vk_res{};
+    Status st = impl_->vk_backend.ExecuteComputeShaderEx(
+        impl_->resolve_spirv, input_u32, output_u32, groups_x, vk_opts, vk_res);
+    if (!st.ok()) return st;
+
+    if (output_u32.size() * sizeof(uint32_t) < dst_bytes.size()) {
+        return Status::Error(StatusCode::DeviceError, "Vulkan resolve output buffer smaller than expected");
+    }
+    std::memcpy(dst_bytes.data(), output_u32.data(), dst_bytes.size());
+
+    if (out_metrics) {
+        out_metrics->backend_name = "Vulkan-SPIRV";
+        out_metrics->adapter_name = impl_->vk_device_name;
+        out_metrics->shader_target = "spirv_1_3";
+        out_metrics->dispatch_groups_x = groups_x;
+        out_metrics->total_elements = total_pixels;
+        out_metrics->bytes_per_element = 4u;
+        out_metrics->executed_on_hardware_gpu = vk_res.executed_on_vulkan_icd;
+        out_metrics->used_warp = false;
+        out_metrics->used_vulkan_icd = vk_res.executed_on_vulkan_icd;
+    }
+    return Status::Ok();
 }
 
 }  // namespace openscarlett

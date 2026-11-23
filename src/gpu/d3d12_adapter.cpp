@@ -13,6 +13,162 @@
 
 namespace openscarlett {
 
+GpuVendorClass ClassifyGpuVendor(uint32_t vendor_id, bool is_warp) noexcept {
+    if (is_warp || vendor_id == 0x1414u) return GpuVendorClass::MicrosoftWarp;
+    switch (vendor_id) {
+        case 0x10DEu: return GpuVendorClass::Nvidia;
+        case 0x1002u: return GpuVendorClass::Amd;
+        case 0x8086u: return GpuVendorClass::Intel;
+        case 0x5143u:
+        case 0x4D4Fu: return GpuVendorClass::Qualcomm;
+        default: return GpuVendorClass::Unknown;
+    }
+}
+
+SanitizedIhvCapabilities SanitizeCrossIhvCapabilities(const D3D12AdapterInfo& raw_info) noexcept {
+    SanitizedIhvCapabilities out{};
+    out.vendor_id = raw_info.vendor_id;
+    out.device_id = raw_info.device_id;
+    out.description = raw_info.description;
+    out.is_warp = raw_info.is_warp || (raw_info.vendor_id == 0x1414u);
+    out.vendor_class = ClassifyGpuVendor(raw_info.vendor_id, out.is_warp);
+    out.dedicated_video_memory_bytes = raw_info.dedicated_video_memory_bytes;
+    out.shared_system_memory_bytes = raw_info.shared_system_memory_bytes;
+    out.supports_r9g9b9e5_uav = raw_info.supports_r9g9b9e5_uav;
+
+    // Sanitize feature level & shader model.
+    out.feature_level = (raw_info.feature_level >= 0xB000u) ? raw_info.feature_level : 0xC000u;
+    out.highest_shader_model = (raw_info.highest_shader_model >= 0x51u) ? raw_info.highest_shader_model : 0x51u;
+
+    // Sanitize raytracing tier strictly into valid D3D12 enum steps {0, 10, 11, 12}.
+    uint32_t rt_tier = 0u;
+    if (raw_info.raytracing_tier >= 12u) {
+        rt_tier = 12u;
+    } else if (raw_info.raytracing_tier >= 11u) {
+        rt_tier = 11u;
+    } else if (raw_info.raytracing_tier >= 10u) {
+        rt_tier = 10u;
+    }
+    if (out.highest_shader_model < 0x63u) {
+        rt_tier = 0u;
+    }
+    out.raytracing_tier = rt_tier;
+
+    // Sanitize mesh shader tier strictly into {0, 10}.
+    uint32_t mesh_tier = (raw_info.mesh_shader_tier >= 10u) ? 10u : 0u;
+    if (out.highest_shader_model < 0x65u) {
+        mesh_tier = 0u;
+    }
+    out.mesh_shader_tier = mesh_tier;
+
+    // Sanitize wave lane counts per IHV architecture.
+    uint32_t wmin = raw_info.wave_lane_min;
+    uint32_t wmax = raw_info.wave_lane_max;
+    if (wmin == 0u && wmax == 0u) {
+        switch (out.vendor_class) {
+            case GpuVendorClass::Intel:
+                wmin = 16u;
+                wmax = 32u;
+                break;
+            case GpuVendorClass::Amd:
+                wmin = 32u;
+                wmax = 64u;
+                break;
+            case GpuVendorClass::Nvidia:
+            case GpuVendorClass::MicrosoftWarp:
+            case GpuVendorClass::Qualcomm:
+            case GpuVendorClass::Unknown:
+            default:
+                wmin = 32u;
+                wmax = 32u;
+                break;
+        }
+    }
+    if (wmin == 0u) wmin = wmax;
+    if (wmax < wmin) wmax = wmin;
+
+    switch (out.vendor_class) {
+        case GpuVendorClass::Nvidia:
+            // NVIDIA Turing through Blackwell are strictly Wave32.
+            wmin = 32u;
+            wmax = 32u;
+            out.preferred_wave_size = 32u;
+            out.requires_page_isolated_descriptor_heaps = true;
+            break;
+        case GpuVendorClass::Intel:
+            // Intel Arc Alchemist / Battlemage (Xe/Xe2) support SIMD16..SIMD32 (or SIMD8..32 on legacy iGPU).
+            wmin = std::clamp<uint32_t>(wmin, 8u, 32u);
+            wmax = std::clamp<uint32_t>(wmax, wmin, 32u);
+            if (wmin < 16u && wmax >= 16u && raw_info.dedicated_video_memory_bytes >= (256ull * 1024ull * 1024ull)) {
+                wmin = 16u;
+            }
+            out.preferred_wave_size = (wmax >= 32u) ? 32u : wmin;
+            out.requires_page_isolated_descriptor_heaps = true;
+            break;
+        case GpuVendorClass::Amd:
+            // AMD RDNA2/3/4 execute native Wave32 and Wave64.
+            wmin = std::clamp<uint32_t>(wmin, 32u, 64u);
+            wmax = std::clamp<uint32_t>(wmax, wmin, 64u);
+            out.preferred_wave_size = (wmax >= 64u) ? 64u : 32u;
+            out.requires_page_isolated_descriptor_heaps = false;
+            break;
+        case GpuVendorClass::MicrosoftWarp:
+            wmin = std::clamp<uint32_t>(wmin, 4u, 64u);
+            wmax = std::clamp<uint32_t>(wmax, wmin, 64u);
+            out.preferred_wave_size = (wmin <= 32u && wmax >= 32u) ? 32u : wmin;
+            out.requires_page_isolated_descriptor_heaps = true;
+            break;
+        default:
+            wmin = std::clamp<uint32_t>(wmin, 4u, 64u);
+            wmax = std::clamp<uint32_t>(wmax, wmin, 64u);
+            out.preferred_wave_size = (wmax >= 32u) ? 32u : wmin;
+            out.requires_page_isolated_descriptor_heaps = true;
+            break;
+    }
+
+    out.wave_lane_min = wmin;
+    out.wave_lane_max = wmax;
+    out.requires_wave64_emulation = (out.wave_lane_max < 64u);
+
+    // Detect 128 MB / low-dedicated-VRAM UMA iGPUs and sanitize effective VRAM budget + placement policy.
+    constexpr uint64_t kMiB = 1024ull * 1024ull;
+    constexpr uint64_t kGiB = 1024ull * 1024ull * 1024ull;
+    constexpr uint64_t kUmaThresholdBytes = 256ull * kMiB;
+
+    out.is_uma_low_vram = (!out.is_warp) && (raw_info.dedicated_video_memory_bytes <= kUmaThresholdBytes);
+    if (out.is_uma_low_vram) {
+        // Clamp budget safely to dedicated + 50% of shared system memory (capped at 4 GiB)
+        // and promote large placed textures to committed allocations to avoid small-aperture heap failures.
+        const uint64_t shared_contrib =
+            std::min<uint64_t>(raw_info.shared_system_memory_bytes / 2ull, 4ull * kGiB);
+        const uint64_t combined = raw_info.dedicated_video_memory_bytes + shared_contrib;
+        out.effective_vram_budget_bytes =
+            (combined >= 128ull * kMiB) ? combined : std::max<uint64_t>(raw_info.dedicated_video_memory_bytes, 64ull * kMiB);
+        out.promote_large_placed_textures_to_committed = true;
+        out.large_placed_texture_threshold_bytes = 16ull * kMiB;
+        out.recommend_series_x_profile = false;
+    } else if (out.is_warp) {
+        const uint64_t shared_contrib =
+            std::min<uint64_t>(raw_info.shared_system_memory_bytes / 2ull, 2ull * kGiB);
+        out.effective_vram_budget_bytes =
+            (shared_contrib >= 256ull * kMiB) ? shared_contrib : (512ull * kMiB);
+        out.promote_large_placed_textures_to_committed = false;
+        out.large_placed_texture_threshold_bytes = 0ull;
+        out.recommend_series_x_profile = false;
+    } else {
+        // Discrete GPU: reserve 15% headroom for WDDM/OS compositor.
+        out.effective_vram_budget_bytes = (raw_info.dedicated_video_memory_bytes * 85ull) / 100ull;
+        if (out.effective_vram_budget_bytes < 128ull * kMiB) {
+            out.effective_vram_budget_bytes = std::max<uint64_t>(raw_info.dedicated_video_memory_bytes, 128ull * kMiB);
+        }
+        out.promote_large_placed_textures_to_committed = false;
+        out.large_placed_texture_threshold_bytes = 0ull;
+        out.recommend_series_x_profile = (raw_info.dedicated_video_memory_bytes >= 12ull * kGiB);
+    }
+
+    return out;
+}
+
 #if defined(_WIN32)
 
 namespace {

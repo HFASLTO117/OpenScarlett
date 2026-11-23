@@ -179,6 +179,26 @@ ID3D12CommandSignature* UnwrapCommandSignature(ID3D12CommandSignature* maybe_wra
     return maybe_wrapped;
 }
 
+CommandSignatureXProxy* TryGetCommandSignatureProxy(ID3D12CommandSignature* maybe_wrapped) noexcept {
+    if (!maybe_wrapped) return nullptr;
+    ProxyRegistryEntry entry{};
+    if (LookupProxy(static_cast<const void*>(maybe_wrapped), entry) &&
+        entry.kind == D3D12XProxyKind::CommandSignature) {
+        return static_cast<CommandSignatureXProxy*>(maybe_wrapped);
+    }
+    return nullptr;
+}
+
+DescriptorHeapXProxy* TryGetDescriptorHeapProxy(ID3D12DescriptorHeap* maybe_wrapped) noexcept {
+    if (!maybe_wrapped) return nullptr;
+    ProxyRegistryEntry entry{};
+    if (LookupProxy(static_cast<const void*>(maybe_wrapped), entry) &&
+        entry.kind == D3D12XProxyKind::DescriptorHeap) {
+        return static_cast<DescriptorHeapXProxy*>(maybe_wrapped);
+    }
+    return nullptr;
+}
+
 ID3D12StateObject* UnwrapStateObject(ID3D12StateObject* maybe_wrapped) noexcept {
     if (!maybe_wrapped) return nullptr;
     ProxyRegistryEntry entry{};
@@ -687,15 +707,29 @@ HRESULT STDMETHODCALLTYPE HeapXProxy::GetProtectedResourceSession(
 // ---------------------------------------------------------------------------
 // 3. DescriptorHeapXProxy
 // ---------------------------------------------------------------------------
-DescriptorHeapXProxy::DescriptorHeapXProxy(DeviceX* parent_device, ID3D12DescriptorHeap* host_heap)
-    : device_x_(parent_device), host_heap_(host_heap) {
+DescriptorHeapXProxy::DescriptorHeapXProxy(
+    DeviceX* parent_device,
+    ID3D12DescriptorHeap* host_heap,
+    const D3D12_DESCRIPTOR_HEAP_DESC* virtual_desc_override,
+    D3D12_CPU_DESCRIPTOR_HANDLE virtual_cpu_start,
+    D3D12_GPU_DESCRIPTOR_HANDLE virtual_gpu_start)
+    : device_x_(parent_device),
+      host_heap_(host_heap),
+      cpu_start_(virtual_cpu_start),
+      gpu_start_(virtual_gpu_start),
+      is_virtual_sampler_heap_(virtual_desc_override != nullptr) {
     if (device_x_) device_x_->AddRef();
     if (host_heap_) {
         host_heap_->AddRef();
-        cached_desc_ = host_heap_->GetDesc();
-        if ((cached_desc_.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0) {
-            gpu_start_ = host_heap_->GetGPUDescriptorHandleForHeapStart();
+        cached_desc_ = virtual_desc_override ? *virtual_desc_override : host_heap_->GetDesc();
+        if (!is_virtual_sampler_heap_) {
+            cpu_start_ = host_heap_->GetCPUDescriptorHandleForHeapStart();
+            if ((cached_desc_.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0) {
+                gpu_start_ = host_heap_->GetGPUDescriptorHandleForHeapStart();
+            }
         }
+    } else if (virtual_desc_override) {
+        cached_desc_ = *virtual_desc_override;
     }
     RegisterProxy(
         static_cast<const ID3D12DescriptorHeap*>(this),
@@ -717,18 +751,27 @@ DescriptorHeapXProxy::DescriptorHeapXProxy(DeviceX* parent_device, ID3D12Descrip
                 self = static_cast<DescriptorHeapXProxy*>(arg1);
             }
             if (out && self) {
-                *out = self->HostDescriptorHeap() ? self->HostDescriptorHeap()->GetDesc()
-                                                  : D3D12_DESCRIPTOR_HEAP_DESC{};
+                if (self->IsVirtualUnboundedSamplerHeap() || !self->HostDescriptorHeap()) {
+                    *out = self->CachedDesc();
+                } else {
+                    *out = self->HostDescriptorHeap()->GetDesc();
+                }
             }
             return out;
         };
         auto thunk_cpu_start = +[](DescriptorHeapXProxy* self) -> SIZE_T {
-            if (!self || !self->HostDescriptorHeap()) return 0u;
-            return self->HostDescriptorHeap()->GetCPUDescriptorHandleForHeapStart().ptr;
+            if (!self) return 0u;
+            if (self->IsVirtualUnboundedSamplerHeap()) return self->VirtualCpuStart().ptr;
+            return self->HostDescriptorHeap()
+                       ? self->HostDescriptorHeap()->GetCPUDescriptorHandleForHeapStart().ptr
+                       : 0u;
         };
         auto thunk_gpu_start = +[](DescriptorHeapXProxy* self) -> UINT64 {
-            if (!self || !self->HostDescriptorHeap()) return 0ull;
-            return self->HostDescriptorHeap()->GetGPUDescriptorHandleForHeapStart().ptr;
+            if (!self) return 0ull;
+            if (self->IsVirtualUnboundedSamplerHeap()) return self->VirtualGpuStart().ptr;
+            return self->HostDescriptorHeap()
+                       ? self->HostDescriptorHeap()->GetGPUDescriptorHandleForHeapStart().ptr
+                       : 0ull;
         };
         const void* const* raw_vtbl = *reinterpret_cast<const void* const* const*>(this);
         std::call_once(s_dh_once, [raw_vtbl, thunk_get_desc, thunk_cpu_start, thunk_gpu_start]() {
@@ -806,10 +849,10 @@ HRESULT STDMETHODCALLTYPE DescriptorHeapXProxy::GetDevice(REFIID riid, void** pp
 D3D12_DESCRIPTOR_HEAP_DESC* STDMETHODCALLTYPE DescriptorHeapXProxy::GetDesc(
     D3D12_DESCRIPTOR_HEAP_DESC* pRet) {
     if (!pRet) return nullptr;
-    if (host_heap_) {
-        host_heap_->GetDesc(pRet);
-    } else {
+    if (is_virtual_sampler_heap_ || !host_heap_) {
         *pRet = cached_desc_;
+    } else {
+        host_heap_->GetDesc(pRet);
     }
     return pRet;
 }
@@ -817,7 +860,9 @@ D3D12_DESCRIPTOR_HEAP_DESC* STDMETHODCALLTYPE DescriptorHeapXProxy::GetDesc(
 D3D12_CPU_DESCRIPTOR_HANDLE* STDMETHODCALLTYPE DescriptorHeapXProxy::GetCPUDescriptorHandleForHeapStart(
     D3D12_CPU_DESCRIPTOR_HANDLE* pRet) {
     if (!pRet) return nullptr;
-    if (host_heap_) {
+    if (is_virtual_sampler_heap_) {
+        *pRet = cpu_start_;
+    } else if (host_heap_) {
         host_heap_->GetCPUDescriptorHandleForHeapStart(pRet);
     } else {
         pRet->ptr = 0u;
@@ -828,7 +873,9 @@ D3D12_CPU_DESCRIPTOR_HANDLE* STDMETHODCALLTYPE DescriptorHeapXProxy::GetCPUDescr
 D3D12_GPU_DESCRIPTOR_HANDLE* STDMETHODCALLTYPE DescriptorHeapXProxy::GetGPUDescriptorHandleForHeapStart(
     D3D12_GPU_DESCRIPTOR_HANDLE* pRet) {
     if (!pRet) return nullptr;
-    if (host_heap_) {
+    if (is_virtual_sampler_heap_) {
+        *pRet = gpu_start_;
+    } else if (host_heap_) {
         host_heap_->GetGPUDescriptorHandleForHeapStart(pRet);
     } else {
         pRet->ptr = 0ull;
@@ -837,15 +884,17 @@ D3D12_GPU_DESCRIPTOR_HANDLE* STDMETHODCALLTYPE DescriptorHeapXProxy::GetGPUDescr
 }
 #else
 D3D12_DESCRIPTOR_HEAP_DESC STDMETHODCALLTYPE DescriptorHeapXProxy::GetDesc() {
-    return host_heap_ ? host_heap_->GetDesc() : cached_desc_;
+    return (is_virtual_sampler_heap_ || !host_heap_) ? cached_desc_ : host_heap_->GetDesc();
 }
 
 D3D12_CPU_DESCRIPTOR_HANDLE STDMETHODCALLTYPE DescriptorHeapXProxy::GetCPUDescriptorHandleForHeapStart() {
+    if (is_virtual_sampler_heap_) return cpu_start_;
     D3D12_CPU_DESCRIPTOR_HANDLE h{0u};
     return host_heap_ ? host_heap_->GetCPUDescriptorHandleForHeapStart() : h;
 }
 
 D3D12_GPU_DESCRIPTOR_HANDLE STDMETHODCALLTYPE DescriptorHeapXProxy::GetGPUDescriptorHandleForHeapStart() {
+    if (is_virtual_sampler_heap_) return gpu_start_;
     D3D12_GPU_DESCRIPTOR_HANDLE h{0ull};
     return host_heap_ ? host_heap_->GetGPUDescriptorHandleForHeapStart() : h;
 }
@@ -1251,14 +1300,84 @@ HRESULT STDMETHODCALLTYPE QueryHeapXProxy::GetDevice(REFIID riid, void** ppvDevi
 CommandSignatureXProxy::CommandSignatureXProxy(
     DeviceX* parent_device,
     ID3D12CommandSignature* host_sig,
-    UINT byte_stride,
-    UINT num_arg_descs)
+    const D3D12_COMMAND_SIGNATURE_DESC* desc,
+    bool is_virtual_mesh_fallback)
     : device_x_(parent_device),
       host_sig_(host_sig),
-      byte_stride_(byte_stride),
-      num_arg_descs_(num_arg_descs) {
+      byte_stride_(desc ? desc->ByteStride : 0u),
+      num_arg_descs_(desc ? desc->NumArgumentDescs : 0u),
+      is_virtual_mesh_fallback_(is_virtual_mesh_fallback) {
     if (device_x_) device_x_->AddRef();
     if (host_sig_) host_sig_->AddRef();
+    if (desc && desc->pArgumentDescs && desc->NumArgumentDescs > 0u) {
+        arg_descs_.assign(desc->pArgumentDescs, desc->pArgumentDescs + desc->NumArgumentDescs);
+        arg_offsets_.reserve(desc->NumArgumentDescs);
+        UINT cur_off = 0u;
+        bool saw_const = false;
+        for (const auto& a : arg_descs_) {
+            arg_offsets_.push_back(cur_off);
+            UINT sz = 0u;
+            switch (a.Type) {
+                case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW:
+                    sz = 16u;
+                    primary_action_type_ = a.Type;
+                    primary_action_offset_ = cur_off;
+                    break;
+                case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED:
+                    sz = 20u;
+                    primary_action_type_ = a.Type;
+                    primary_action_offset_ = cur_off;
+                    break;
+                case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH:
+                    sz = 12u;
+                    primary_action_type_ = a.Type;
+                    primary_action_offset_ = cur_off;
+                    break;
+                case D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW:
+                    sz = 16u;
+                    has_gpu_va_args_ = true;
+                    break;
+                case D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW:
+                    sz = 12u;
+                    has_gpu_va_args_ = true;
+                    break;
+                case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT:
+                    sz = a.Constant.Num32BitValuesToSet * 4u;
+                    has_root_constants_ = true;
+                    if (!saw_const) {
+                        saw_const = true;
+                        first_const_arg_offset_ = cur_off;
+                        first_const_bytes_ = sz;
+                        first_const_dest_offset_bytes_ = a.Constant.DestOffsetIn32BitValues * 4u;
+                    }
+                    break;
+                case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW:
+                case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW:
+                case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW:
+                    sz = 8u;
+                    has_gpu_va_args_ = true;
+                    break;
+                default:
+                    // D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH == 10 (12 bytes: {X, Y, Z})
+                    if (static_cast<UINT>(a.Type) == 10u) {
+                        sz = 12u;
+                        has_dispatch_mesh_ = true;
+                        primary_action_type_ = a.Type;
+                        primary_action_offset_ = cur_off;
+                    } else if (static_cast<UINT>(a.Type) == 9u) {
+                        // D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_RAYS (104 bytes)
+                        sz = 104u;
+                        has_gpu_va_args_ = true;
+                        primary_action_type_ = a.Type;
+                        primary_action_offset_ = cur_off;
+                    }
+                    break;
+            }
+            cur_off += sz;
+        }
+        min_required_stride_ = cur_off;
+        if (byte_stride_ == 0u) byte_stride_ = min_required_stride_;
+    }
     RegisterProxy(
         static_cast<const ID3D12CommandSignature*>(this),
         D3D12XProxyKind::CommandSignature,

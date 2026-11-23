@@ -172,6 +172,128 @@ Status CompileXgGpuUntileDxil(
 // Passes ValidateSpirvBinary + Khronos spirv-val.exe and executes live on VulkanBackend.
 Status EmitXgGpuUntileSpirv(std::vector<uint32_t>& out_spirv);
 
+// ============================================================================
+// Sprint 16: Live FMASK / DCC (2:1 & 4:1) / HTILE GPU Compute Resolve & Decompression
+// ============================================================================
+
+enum class XgGpuResolveOp : uint32_t {
+    FmaskMsaaResolve = 0u,  // MSAA 2x/4x/8x color + packed GFX10 FMASK -> resolved or per-sample RGBA8
+    DccDecompress = 1u,     // GFX10 DCC metadata (fast-clear + 2:1 + 4:1 delta blocks + uncompressed) -> RGBA8
+    HtileDecompress = 2u,   // GFX10 32-bit HTILE words (zmask 0 clear, 1..14 delta-Z, 15 expanded) -> D32F/D24S8 + HiZ
+};
+
+enum class XgFmaskResolveMode : uint32_t {
+    Average = 0u,           // Box-filter average across all active MSAA samples
+    Sample0Centroid = 1u,   // Centroid / first valid non-sentinel fragment
+    PerSampleExpand = 2u,   // Decompress every MSAA sample per pixel (width * height * sample_count pixels)
+};
+
+// Shared 64-byte (16-dword) ABI for D3D12 HLSL CBV and Vulkan SPIR-V SSBO header.
+struct XgGpuResolveParams {
+    uint32_t op = 0u;                  // XgGpuResolveOp
+    uint32_t width = 1u;               // Surface width in pixels
+    uint32_t height = 1u;              // Surface height in pixels
+    uint32_t sample_count = 4u;        // FMASK: 2, 4, or 8; DCC/HTILE: 1
+
+    uint32_t mode = 0u;                // FMASK: XgFmaskResolveMode; DCC: bit0=pipe_aligned; HTILE: bit0=emit_hiz, bit1=d24s8
+    uint32_t bpe = 4u;                 // Bytes per pixel (4 for RGBA8/D32F/D24S8)
+    uint32_t src_row_pitch = 4u;       // Source row pitch in bytes
+    uint32_t dst_row_pitch = 4u;       // Destination row pitch in bytes
+
+    uint32_t meta_blocks_x = 1u;       // 8x8 block grid width for DCC/HTILE
+    uint32_t meta_num_pipes = 16u;     // Scarlett pipe count (16 Anaconda, 8 Lockhart)
+    uint32_t meta_slice_pitch = 0u;    // DCC metadata slice pitch in bytes
+    uint32_t clear_reg_0 = 0u;         // RGBA8 clear color OR D32F bits OR D24 depth value
+
+    uint32_t clear_reg_1 = 0u;         // Stencil clear byte (HTILE)
+    uint32_t spv_src_word_offset = 16u;
+    uint32_t spv_meta_word_offset = 16u;
+    uint32_t spv_aux_word_offset = 0u; // Word offset in dst buffer for HiZ min/max bounds output
+};
+
+static_assert(sizeof(XgGpuResolveParams) == 64u, "XgGpuResolveParams must be 16 dwords (64 bytes)");
+
+// Decoded GFX10 32-bit HTILE metadata word.
+struct Gfx10HtileDecoded {
+    uint32_t zmask = 0xFu;        // [3:0]: 0=fast-clear, 1..14=compressed delta-Z, 15=expanded
+    uint32_t min_z_14 = 0u;       // [17:4] (or Zbase in stencil-packed mode): 14-bit Hi-Z min
+    uint32_t max_z_14 = 0x3FFFu;  // [31:18]: 14-bit Hi-Z max
+    uint32_t smem = 0x3u;         // Stencil-mem compression state (2 bits)
+    bool tc_compat = false;       // TC-compatible HTILE bit
+    float min_z_float = 0.0f;
+    float max_z_float = 1.0f;
+};
+
+Gfx10HtileDecoded DecodeGfx10HtileWord(uint32_t htile_word, bool has_stencil = false) noexcept;
+uint32_t EncodeGfx10HtileWord(
+    uint32_t zmask,
+    uint32_t min_z_14,
+    uint32_t max_z_14,
+    uint32_t smem = 0x3u,
+    bool tc_compat = false,
+    bool has_stencil = false) noexcept;
+
+// Packs per-sample 4-bit FMASK fragment indices (2x/4x/8x MSAA; 0xE/0xF = cleared/unknown sentinel).
+uint32_t PackGfx10FmaskPixelWord(const uint8_t* sample_frags, uint32_t sample_count) noexcept;
+
+// CPU bit-exact reference implementations matching both HLSL cs_6_5/cs_6_2 and Vulkan SPIR-V 1.3.
+Status ResolveFmaskCpuReference(
+    const XgGpuResolveParams& params,
+    const std::vector<uint8_t>& msaa_color_bytes,
+    const std::vector<uint8_t>& fmask_bytes,
+    std::vector<uint8_t>& out_rgba8);
+
+Status EncodeDccCompressedSurface2D(
+    uint32_t width,
+    uint32_t height,
+    const std::vector<uint8_t>& linear_rgba8,
+    uint32_t clear_reg_rgba8,
+    bool pipe_aligned,
+    uint32_t num_pipes,
+    std::vector<uint8_t>& out_compressed_blocks,
+    std::vector<uint8_t>& out_dcc_keys,
+    uint32_t* out_fast_clear_blocks = nullptr,
+    uint32_t* out_blocks_4to1 = nullptr,
+    uint32_t* out_blocks_2to1 = nullptr,
+    uint32_t* out_blocks_uncompressed = nullptr);
+
+Status DecompressDccCpuReference(
+    const XgGpuResolveParams& params,
+    const std::vector<uint8_t>& src_blocks,
+    const std::vector<uint8_t>& dcc_keys,
+    std::vector<uint8_t>& out_rgba8);
+
+Status EncodeHtileCompressedSurface2D(
+    uint32_t width,
+    uint32_t height,
+    const std::vector<float>& depth_f32,
+    const std::vector<uint8_t>* stencil_s8,
+    float clear_depth,
+    uint8_t clear_stencil,
+    bool output_d24s8,
+    std::vector<uint8_t>& out_compressed_tiles,
+    std::vector<uint8_t>& out_htile_words,
+    uint32_t* out_clear_tiles = nullptr,
+    uint32_t* out_compressed_tile_count = nullptr,
+    uint32_t* out_expanded_tiles = nullptr);
+
+Status DecompressHtileCpuReference(
+    const XgGpuResolveParams& params,
+    const std::vector<uint8_t>& src_tiles,
+    const std::vector<uint8_t>& htile_words,
+    std::vector<uint8_t>& out_depth_bytes,
+    std::vector<uint32_t>* out_hiz_bounds = nullptr);
+
+// Generates & compiles the HLSL compute shader (cs_6_5 / cs_6_2) and SPIR-V 1.3 binary
+// for live FMASK MSAA resolve, DCC 2:1 & 4:1 block decompression, and HTILE depth/HiZ resolve.
+std::string GenerateXgGpuResolveHlsl();
+Status CompileXgGpuResolveDxil(
+    const std::string& target_profile,
+    std::vector<uint8_t>& out_dxil,
+    std::string& out_diagnostics,
+    const std::string& dxc_path = {});
+Status EmitXgGpuResolveSpirv(std::vector<uint32_t>& out_spirv);
+
 // Real-time GPU Compute Untiler/Retiler supporting:
 //  - Live D3D12 command list recording (ID3D12Device* + ID3D12GraphicsCommandList*)
 //  - Self-contained D3D12 hardware GPU AND D3D12 WARP execution
@@ -219,6 +341,23 @@ public:
         const std::vector<uint8_t>* meta_bytes = nullptr,
         XgGpuDispatchMetrics* out_metrics = nullptr);
 
+    // Records a live FMASK/DCC/HTILE resolve compute dispatch into a caller's D3D12 command list.
+    Status RecordResolveDispatchD3D12(
+        ID3D12GraphicsCommandList* cmd_list,
+        const XgGpuResolveParams& params,
+        uint64_t cbv_gpu_va,
+        uint64_t src_srv_gpu_va,
+        uint64_t meta_srv_gpu_va,
+        uint64_t dst_uav_gpu_va);
+
+    // Self-contained live D3D12 GPU compute FMASK/DCC/HTILE resolve & decompression execution.
+    Status ExecuteResolveD3D12(
+        const XgGpuResolveParams& params,
+        const std::vector<uint8_t>& src_bytes,
+        const std::vector<uint8_t>& meta_bytes,
+        std::vector<uint8_t>& dst_bytes,
+        XgGpuDispatchMetrics* out_metrics = nullptr);
+
     bool IsD3D12Ready() const noexcept;
     bool IsD3D12Warp() const noexcept;
     const std::string& D3D12AdapterName() const noexcept;
@@ -237,6 +376,14 @@ public:
         const std::vector<uint8_t>& src_bytes,
         std::vector<uint8_t>& dst_bytes,
         const std::vector<uint8_t>* meta_bytes = nullptr,
+        XgGpuDispatchMetrics* out_metrics = nullptr);
+
+    // Self-contained live Vulkan SPIR-V 1.3 compute FMASK/DCC/HTILE resolve & decompression execution.
+    Status ExecuteResolveVulkan(
+        const XgGpuResolveParams& params,
+        const std::vector<uint8_t>& src_bytes,
+        const std::vector<uint8_t>& meta_bytes,
+        std::vector<uint8_t>& dst_bytes,
         XgGpuDispatchMetrics* out_metrics = nullptr);
 
     void Shutdown();

@@ -137,6 +137,10 @@ inline constexpr int32_t kVkStypeSamplerCustomBorderColorCreateInfoExt = 1000287
 inline constexpr int32_t kVkStypePhysicalDeviceCustomBorderColorPropertiesExt = 1000287001;
 inline constexpr int32_t kVkStypePhysicalDeviceCustomBorderColorFeaturesExt = 1000287002;
 inline constexpr int32_t kVkStypePhysicalDeviceMeshShaderFeaturesExt = 1000328000;
+inline constexpr int32_t kVkStypeRenderingInfo = 1000044000;
+inline constexpr int32_t kVkStypeRenderingAttachmentInfo = 1000044001;
+inline constexpr int32_t kVkStypePipelineRenderingCreateInfo = 1000044002;
+inline constexpr int32_t kVkStypePhysicalDeviceDepthStencilResolveProperties = 1000199000;
 
 // Flags & enums
 inline constexpr uint32_t kVkQueueGraphicsBit = 0x00000001u;
@@ -148,6 +152,8 @@ inline constexpr uint32_t kVkSparseImageFormatSingleMiptailBit = 0x00000001u;
 inline constexpr uint32_t kVkSparseImageFormatAlignedMipSizeBit = 0x00000002u;
 inline constexpr uint32_t kVkSparseImageFormatNonstandardBlockSizeBit = 0x00000004u;
 inline constexpr uint32_t kVkSparseMemoryBindMetadataBit = 0x00000001u;
+inline constexpr uint32_t kVkFeatMultiDrawIndirect = 9u;
+inline constexpr uint32_t kVkFeatDrawIndirectFirstInstance = 10u;
 inline constexpr uint32_t kVkFeatDepthBounds = 14u;
 inline constexpr uint32_t kVkFeatTextureCompressionBC = 22u;
 inline constexpr uint32_t kVkFeatFragmentStoresAndAtomics = 26u;
@@ -157,6 +163,7 @@ inline constexpr uint32_t kVkFeatSparseBinding = 44u;
 inline constexpr uint32_t kVkFeatSparseResidencyBuffer = 45u;
 inline constexpr uint32_t kVkFeatSparseResidencyImage2D = 46u;
 inline constexpr uint32_t kVkFeatSparseResidencyImage3D = 47u;
+inline constexpr uint32_t kVkFeat12DrawIndirectCount = 1u;
 inline constexpr uint32_t kVkFeat12DescriptorIndexing = 9u;
 inline constexpr uint32_t kVkFeat12SamplerFilterMinmax = 30u;
 inline constexpr uint32_t kVkFeat12TimelineSemaphore = 37u;
@@ -174,6 +181,13 @@ inline constexpr uint32_t kVkBufferUsageUniformBufferBit = 0x00000010u;
 inline constexpr uint32_t kVkBufferUsageStorageBufferBit = 0x00000020u;
 inline constexpr uint32_t kVkBufferUsageIndexBufferBit = 0x00000040u;
 inline constexpr uint32_t kVkBufferUsageVertexBufferBit = 0x00000080u;
+inline constexpr uint32_t kVkBufferUsageIndirectBufferBit = 0x00000100u;
+
+inline constexpr uint32_t kVkResolveModeNone = 0u;
+inline constexpr uint32_t kVkResolveModeSampleZeroBit = 0x00000001u;
+inline constexpr uint32_t kVkResolveModeAverageBit = 0x00000002u;
+inline constexpr uint32_t kVkResolveModeMinBit = 0x00000004u;
+inline constexpr uint32_t kVkResolveModeMaxBit = 0x00000008u;
 
 inline constexpr uint32_t kVkImageUsageTransferSrcBit = 0x00000001u;
 inline constexpr uint32_t kVkImageUsageTransferDstBit = 0x00000002u;
@@ -267,6 +281,7 @@ inline constexpr uint32_t kVkPipelineStageTopOfPipeBit = 0x00000001u;
 inline constexpr uint32_t kVkPipelineStageVertexShaderBit = 0x00000008u;
 inline constexpr uint32_t kVkPipelineStageFragmentShaderBit = 0x00000080u;
 inline constexpr uint32_t kVkPipelineStageEarlyFragmentTestsBit = 0x00000100u;
+inline constexpr uint32_t kVkPipelineStageLateFragmentTestsBit = 0x00000200u;
 inline constexpr uint32_t kVkPipelineStageColorAttachmentOutputBit = 0x00000400u;
 inline constexpr uint32_t kVkPipelineStageComputeShaderBit = 0x00000800u;
 inline constexpr uint32_t kVkPipelineStageTransferBit = 0x00001000u;
@@ -277,7 +292,9 @@ inline constexpr uint32_t kVkPipelineStageAllCommandsBit = 0x00010000u;
 
 inline constexpr uint32_t kVkAccessShaderReadBit = 0x00000020u;
 inline constexpr uint32_t kVkAccessShaderWriteBit = 0x00000040u;
+inline constexpr uint32_t kVkAccessColorAttachmentReadBit = 0x00000080u;
 inline constexpr uint32_t kVkAccessColorAttachmentWriteBit = 0x00000100u;
+inline constexpr uint32_t kVkAccessDepthStencilAttachmentReadBit = 0x00000200u;
 inline constexpr uint32_t kVkAccessDepthStencilAttachmentWriteBit = 0x00000400u;
 inline constexpr uint32_t kVkAccessTransferReadBit = 0x00000800u;
 inline constexpr uint32_t kVkAccessTransferWriteBit = 0x00001000u;
@@ -1155,6 +1172,57 @@ struct VkBindSparseInfo {
 };
 static_assert(sizeof(VkBindSparseInfo) == 96, "VkBindSparseInfo x64 size");
 
+// Vulkan 1.2/1.3/1.4 Dynamic Rendering & Depth-Stencil Resolve ABI structs (x64)
+struct VkPhysicalDeviceDepthStencilResolveProperties {
+    int32_t sType;
+    void* pNext;
+    VkFlags supportedDepthResolveModes;
+    VkFlags supportedStencilResolveModes;
+    VkBool32 independentResolveNone;
+    VkBool32 independentResolve;
+};
+static_assert(sizeof(VkPhysicalDeviceDepthStencilResolveProperties) == 32,
+              "VkPhysicalDeviceDepthStencilResolveProperties x64 size");
+
+struct VkRenderingAttachmentInfo {
+    int32_t sType;
+    const void* pNext;
+    VkImageView imageView;
+    int32_t imageLayout;
+    uint32_t resolveMode;
+    VkImageView resolveImageView;
+    int32_t resolveImageLayout;
+    int32_t loadOp;
+    int32_t storeOp;
+    VkClearValue clearValue;
+};
+static_assert(sizeof(VkRenderingAttachmentInfo) == 72, "VkRenderingAttachmentInfo x64 size");
+
+struct VkRenderingInfo {
+    int32_t sType;
+    const void* pNext;
+    VkFlags flags;
+    VkRect2D renderArea;
+    uint32_t layerCount;
+    uint32_t viewMask;
+    uint32_t colorAttachmentCount;
+    const VkRenderingAttachmentInfo* pColorAttachments;
+    const VkRenderingAttachmentInfo* pDepthAttachment;
+    const VkRenderingAttachmentInfo* pStencilAttachment;
+};
+static_assert(sizeof(VkRenderingInfo) == 72, "VkRenderingInfo x64 size");
+
+struct VkPipelineRenderingCreateInfo {
+    int32_t sType;
+    const void* pNext;
+    uint32_t viewMask;
+    uint32_t colorAttachmentCount;
+    const int32_t* pColorAttachmentFormats;
+    int32_t depthAttachmentFormat;
+    int32_t stencilAttachmentFormat;
+};
+static_assert(sizeof(VkPipelineRenderingCreateInfo) == 40, "VkPipelineRenderingCreateInfo x64 size");
+
 // Function pointer typedefs
 using PFN_vkVoidFunction = void(SX_VKAPI_PTR*)();
 using PFN_vkGetInstanceProcAddr = PFN_vkVoidFunction(SX_VKAPI_PTR*)(VkInstance, const char*);
@@ -1242,6 +1310,15 @@ using PFN_vkCmdResolveImage = void(SX_VKAPI_PTR*)(VkCommandBuffer, VkImage, int3
 using PFN_vkCmdSetViewport = void(SX_VKAPI_PTR*)(VkCommandBuffer, uint32_t, uint32_t, const VkViewport*);
 using PFN_vkCmdSetScissor = void(SX_VKAPI_PTR*)(VkCommandBuffer, uint32_t, uint32_t, const VkRect2D*);
 using PFN_vkCmdDrawMeshTasksEXT = void(SX_VKAPI_PTR*)(VkCommandBuffer, uint32_t, uint32_t, uint32_t);
+using PFN_vkCmdDrawIndirect = void(SX_VKAPI_PTR*)(VkCommandBuffer, VkBuffer, VkDeviceSize, uint32_t, uint32_t);
+using PFN_vkCmdDrawIndexedIndirect = void(SX_VKAPI_PTR*)(VkCommandBuffer, VkBuffer, VkDeviceSize, uint32_t, uint32_t);
+using PFN_vkCmdDrawIndirectCount = void(SX_VKAPI_PTR*)(VkCommandBuffer, VkBuffer, VkDeviceSize, VkBuffer, VkDeviceSize, uint32_t, uint32_t);
+using PFN_vkCmdDrawIndexedIndirectCount = void(SX_VKAPI_PTR*)(VkCommandBuffer, VkBuffer, VkDeviceSize, VkBuffer, VkDeviceSize, uint32_t, uint32_t);
+using PFN_vkCmdDispatchIndirect = void(SX_VKAPI_PTR*)(VkCommandBuffer, VkBuffer, VkDeviceSize);
+using PFN_vkCmdDrawMeshTasksIndirectEXT = void(SX_VKAPI_PTR*)(VkCommandBuffer, VkBuffer, VkDeviceSize, uint32_t, uint32_t);
+using PFN_vkCmdDrawMeshTasksIndirectCountEXT = void(SX_VKAPI_PTR*)(VkCommandBuffer, VkBuffer, VkDeviceSize, VkBuffer, VkDeviceSize, uint32_t, uint32_t);
+using PFN_vkCmdBeginRendering = void(SX_VKAPI_PTR*)(VkCommandBuffer, const VkRenderingInfo*);
+using PFN_vkCmdEndRendering = void(SX_VKAPI_PTR*)(VkCommandBuffer);
 
 // WSI / Swapchain function pointers
 using PFN_vkCreateWin32SurfaceKHR = VkResult(SX_VKAPI_PTR*)(VkInstance, const VkWin32SurfaceCreateInfoKHR*, const void*, VkSurfaceKHR*);
@@ -3147,6 +3224,11 @@ struct VulkanBackend::Impl {
     bool depth_bounds_enabled = false;
     bool custom_border_color_enabled = false;
     bool custom_border_color_without_format_enabled = false;
+    bool multi_draw_indirect_enabled = false;
+    bool draw_indirect_count_enabled = false;
+    bool dynamic_rendering_enabled = false;
+    uint32_t supported_depth_resolve_modes = 0;
+    uint32_t supported_stencil_resolve_modes = 0;
     uint32_t max_custom_border_color_samplers = 0;
     uint32_t max_push_constants_size = 128;
     uint32_t push_constant_budget_override = 0;
@@ -3242,8 +3324,17 @@ struct VulkanBackend::Impl {
     PFN_vkCmdSetViewport vkCmdSetViewport = nullptr;
     PFN_vkCmdSetScissor vkCmdSetScissor = nullptr;
 
-    // VK_EXT_mesh_shader
+    // VK_EXT_mesh_shader & Sprint 16 Indirect / Dynamic Rendering
     PFN_vkCmdDrawMeshTasksEXT vkCmdDrawMeshTasksEXT = nullptr;
+    PFN_vkCmdDrawIndirect vkCmdDrawIndirect = nullptr;
+    PFN_vkCmdDrawIndexedIndirect vkCmdDrawIndexedIndirect = nullptr;
+    PFN_vkCmdDrawIndirectCount vkCmdDrawIndirectCount = nullptr;
+    PFN_vkCmdDrawIndexedIndirectCount vkCmdDrawIndexedIndirectCount = nullptr;
+    PFN_vkCmdDispatchIndirect vkCmdDispatchIndirect = nullptr;
+    PFN_vkCmdDrawMeshTasksIndirectEXT vkCmdDrawMeshTasksIndirectEXT = nullptr;
+    PFN_vkCmdDrawMeshTasksIndirectCountEXT vkCmdDrawMeshTasksIndirectCountEXT = nullptr;
+    PFN_vkCmdBeginRendering vkCmdBeginRendering = nullptr;
+    PFN_vkCmdEndRendering vkCmdEndRendering = nullptr;
 
     // WSI / Swapchain
     PFN_vkCreateWin32SurfaceKHR vkCreateWin32SurfaceKHR = nullptr;
@@ -4707,6 +4798,50 @@ bool VulkanBackend::SelectPhysicalDeviceCandidate(
     return false;
 }
 
+bool VulkanBackend::SelectPhysicalDeviceCandidateWithNumericFallback(
+    const std::vector<VulkanPhysicalDeviceCandidate>& candidates,
+    const std::string& gpu_selector,
+    VulkanPhysicalDeviceCandidate& out_selected,
+    bool* out_matched_selector,
+    bool* out_numeric_fell_back) {
+    if (out_matched_selector) *out_matched_selector = false;
+    if (out_numeric_fell_back) *out_numeric_fell_back = false;
+
+    if (SelectPhysicalDeviceCandidate(candidates, gpu_selector, out_selected, out_matched_selector)) {
+        return true;
+    }
+
+    // Trim whitespace and check if selector is a signed/unsigned integer index (xcl #82).
+    std::string trimmed = gpu_selector;
+    while (!trimmed.empty() && std::isspace(static_cast<unsigned char>(trimmed.front()))) {
+        trimmed.erase(trimmed.begin());
+    }
+    while (!trimmed.empty() && std::isspace(static_cast<unsigned char>(trimmed.back()))) {
+        trimmed.pop_back();
+    }
+    if (trimmed.empty()) return false;
+
+    size_t start_pos = (trimmed[0] == '-' || trimmed[0] == '+') ? 1u : 0u;
+    bool is_numeric = (start_pos < trimmed.size());
+    for (size_t i = start_pos; i < trimmed.size(); ++i) {
+        if (trimmed[i] < '0' || trimmed[i] > '9') {
+            is_numeric = false;
+            break;
+        }
+    }
+    if (!is_numeric) {
+        return false;
+    }
+
+    // Numeric selector was out of range (negative or >= device count): fall back cleanly to best-ranked GPU.
+    if (SelectPhysicalDeviceCandidate(candidates, "", out_selected, nullptr)) {
+        if (out_matched_selector) *out_matched_selector = false;
+        if (out_numeric_fell_back) *out_numeric_fell_back = true;
+        return true;
+    }
+    return false;
+}
+
 Status VulkanBackend::EnumerateRankedPhysicalDevices(
     std::vector<VulkanPhysicalDeviceCandidate>& out_ranked_devices) {
     out_ranked_devices.clear();
@@ -5143,7 +5278,15 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
             uint32_t best_enum_idx = 0u;
 
             VulkanPhysicalDeviceCandidate chosen_candidate{};
-            if (SelectPhysicalDeviceCandidate(candidates, device_filter, chosen_candidate, &matched_filter)) {
+            bool numeric_selector_fell_back = false;
+            if (SelectPhysicalDeviceCandidateWithNumericFallback(
+                    candidates, device_filter, chosen_candidate, &matched_filter, &numeric_selector_fell_back)) {
+                if (numeric_selector_fell_back) {
+                    std::cerr << "[OpenScarlett][Vulkan] WARNING: " << active_filter_env_name
+                              << "=\"" << device_filter << "\" is out of range (available devices: "
+                              << candidates.size() << "); falling back to best-ranked GPU \""
+                              << chosen_candidate.device_name << "\".\n";
+                }
                 for (const auto& rec : records) {
                     if (rec.candidate.enumerated_index == chosen_candidate.enumerated_index) {
                         best_dev = rec.handle;
@@ -5229,9 +5372,15 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
             sample_loc_props.sType = kVkStypePhysicalDeviceSampleLocationsPropertiesExt;
             VkPhysicalDeviceCustomBorderColorPropertiesEXT cbc_props{};
             cbc_props.sType = kVkStypePhysicalDeviceCustomBorderColorPropertiesExt;
+            VkPhysicalDeviceDepthStencilResolveProperties ds_resolve_props{};
+            ds_resolve_props.sType = kVkStypePhysicalDeviceDepthStencilResolveProperties;
 
             if (impl_->vkGetPhysicalDeviceProperties2 && best_props.apiVersion >= kVkApiVersion1_1) {
                 void* pnext_head = nullptr;
+                if (best_props.apiVersion >= kVkApiVersion1_2) {
+                    ds_resolve_props.pNext = pnext_head;
+                    pnext_head = &ds_resolve_props;
+                }
                 if (has_dev_custom_border_color) {
                     cbc_props.pNext = pnext_head;
                     pnext_head = &cbc_props;
@@ -5294,6 +5443,7 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
                 supported_feats = feats2.features;
             }
 
+            bool want_multi_draw_indirect = (supported_feats.fields[kVkFeatMultiDrawIndirect] != 0u);
             bool want_depth_bounds = (supported_feats.fields[kVkFeatDepthBounds] != 0u);
             bool want_bc_compression = (supported_feats.fields[kVkFeatTextureCompressionBC] != 0u);
             bool want_sparse_binding =
@@ -5302,6 +5452,10 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
                 want_sparse_binding && (supported_feats.fields[kVkFeatSparseResidencyImage2D] != 0u);
             bool want_sparse_3d =
                 want_sparse_binding && (supported_feats.fields[kVkFeatSparseResidencyImage3D] != 0u);
+            bool enable_v12_draw_indirect_count =
+                probed_v12 && (queried_v12_feats.fields[kVkFeat12DrawIndirectCount] != 0u);
+            bool enable_v13_dynamic_rendering =
+                probed_v13 && (queried_v13_feats.fields[kVkFeat13DynamicRendering] != 0u);
 
             bool enable_mesh = false;
             bool enable_task = false;
@@ -5365,9 +5519,15 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
                 queue_cis.push_back(qci);
             }
 
+            VkPhysicalDeviceVulkan12Features enable_v12_feats{};
+            enable_v12_feats.sType = kVkStypePhysicalDeviceVulkan12Features;
+            VkPhysicalDeviceVulkan13Features enable_v13_feats{};
+            enable_v13_feats.sType = kVkStypePhysicalDeviceVulkan13Features;
+
             VkPhysicalDeviceFeatures enabled_feats{};
             auto sync_enabled_feats = [&]() -> const void* {
                 enabled_feats = VkPhysicalDeviceFeatures{};
+                if (want_multi_draw_indirect) enabled_feats.fields[kVkFeatMultiDrawIndirect] = 1u;
                 if (want_depth_bounds) enabled_feats.fields[kVkFeatDepthBounds] = 1u;
                 if (want_bc_compression) enabled_feats.fields[kVkFeatTextureCompressionBC] = 1u;
                 if (want_sparse_binding) {
@@ -5375,12 +5535,26 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
                     if (want_sparse_2d) enabled_feats.fields[kVkFeatSparseResidencyImage2D] = 1u;
                     if (want_sparse_3d) enabled_feats.fields[kVkFeatSparseResidencyImage3D] = 1u;
                 }
-                const bool any_core = want_depth_bounds || want_bc_compression || want_sparse_binding;
+                const bool any_core = want_multi_draw_indirect || want_depth_bounds || want_bc_compression || want_sparse_binding;
                 return any_core ? static_cast<const void*>(&enabled_feats) : nullptr;
             };
 
             auto rebuild_dev_pnext = [&]() -> const void* {
                 void* head = nullptr;
+                if (enable_v13_dynamic_rendering) {
+                    enable_v13_feats = VkPhysicalDeviceVulkan13Features{};
+                    enable_v13_feats.sType = kVkStypePhysicalDeviceVulkan13Features;
+                    enable_v13_feats.fields[kVkFeat13DynamicRendering] = 1u;
+                    enable_v13_feats.pNext = head;
+                    head = &enable_v13_feats;
+                }
+                if (enable_v12_draw_indirect_count) {
+                    enable_v12_feats = VkPhysicalDeviceVulkan12Features{};
+                    enable_v12_feats.sType = kVkStypePhysicalDeviceVulkan12Features;
+                    enable_v12_feats.fields[kVkFeat12DrawIndirectCount] = 1u;
+                    enable_v12_feats.pNext = head;
+                    head = &enable_v12_feats;
+                }
                 if (enable_custom_border_color) {
                     enable_cbc_feats.pNext = head;
                     head = &enable_cbc_feats;
@@ -5402,6 +5576,18 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
             dev_ci.pEnabledFeatures = sync_enabled_feats();
 
             vr = impl_->vkCreateDevice(best_dev, &dev_ci, nullptr, &impl_->device);
+            if ((vr != kVkSuccess || !impl_->device) &&
+                (enable_v13_dynamic_rendering || enable_v12_draw_indirect_count)) {
+                enable_v13_dynamic_rendering = false;
+                enable_v12_draw_indirect_count = false;
+                dev_ci.pNext = rebuild_dev_pnext();
+                vr = impl_->vkCreateDevice(best_dev, &dev_ci, nullptr, &impl_->device);
+            }
+            if ((vr != kVkSuccess || !impl_->device) && want_multi_draw_indirect) {
+                want_multi_draw_indirect = false;
+                dev_ci.pEnabledFeatures = sync_enabled_feats();
+                vr = impl_->vkCreateDevice(best_dev, &dev_ci, nullptr, &impl_->device);
+            }
             if ((vr != kVkSuccess || !impl_->device) && enable_custom_border_color) {
                 enable_custom_border_color = false;
                 enable_custom_border_without_format = false;
@@ -5541,7 +5727,35 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
                 impl_->LoadDevProc(impl_->vkCmdDrawMeshTasksEXT, "vkCmdDrawMeshTasksEXT")) {
                 impl_->mesh_shader_enabled = true;
                 impl_->task_shader_enabled = enable_task;
+                impl_->LoadDevProc(impl_->vkCmdDrawMeshTasksIndirectEXT, "vkCmdDrawMeshTasksIndirectEXT");
+                impl_->LoadDevProc(impl_->vkCmdDrawMeshTasksIndirectCountEXT, "vkCmdDrawMeshTasksIndirectCountEXT");
             }
+
+            // Load indirect draw/dispatch & Vulkan 1.3/1.4 dynamic rendering procs
+            impl_->LoadDevProc(impl_->vkCmdDrawIndirect, "vkCmdDrawIndirect");
+            impl_->LoadDevProc(impl_->vkCmdDrawIndexedIndirect, "vkCmdDrawIndexedIndirect");
+            impl_->LoadDevProc(impl_->vkCmdDispatchIndirect, "vkCmdDispatchIndirect");
+            if (!impl_->LoadDevProc(impl_->vkCmdDrawIndirectCount, "vkCmdDrawIndirectCount")) {
+                impl_->LoadDevProc(impl_->vkCmdDrawIndirectCount, "vkCmdDrawIndirectCountKHR");
+            }
+            if (!impl_->LoadDevProc(impl_->vkCmdDrawIndexedIndirectCount, "vkCmdDrawIndexedIndirectCount")) {
+                impl_->LoadDevProc(impl_->vkCmdDrawIndexedIndirectCount, "vkCmdDrawIndexedIndirectCountKHR");
+            }
+            if (enable_v13_dynamic_rendering) {
+                const bool loaded_dyn =
+                    (impl_->LoadDevProc(impl_->vkCmdBeginRendering, "vkCmdBeginRendering") ||
+                     impl_->LoadDevProc(impl_->vkCmdBeginRendering, "vkCmdBeginRenderingKHR")) &&
+                    (impl_->LoadDevProc(impl_->vkCmdEndRendering, "vkCmdEndRendering") ||
+                     impl_->LoadDevProc(impl_->vkCmdEndRendering, "vkCmdEndRenderingKHR"));
+                impl_->dynamic_rendering_enabled = loaded_dyn;
+            }
+            impl_->multi_draw_indirect_enabled = want_multi_draw_indirect;
+            impl_->draw_indirect_count_enabled =
+                enable_v12_draw_indirect_count &&
+                impl_->vkCmdDrawIndirectCount != nullptr &&
+                impl_->vkCmdDrawIndexedIndirectCount != nullptr;
+            impl_->supported_depth_resolve_modes = ds_resolve_props.supportedDepthResolveModes;
+            impl_->supported_stencil_resolve_modes = ds_resolve_props.supportedStencilResolveModes;
 
             if (has_dev_swapchain && impl_->has_graphics_queue && impl_->win32_surface_enabled) {
                 impl_->swapchain_enabled =
@@ -5638,6 +5852,7 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
             device_info_.supports_bc_texture_compression = want_bc_compression;
             device_info_.selected_device_filter = device_filter;
             device_info_.matched_device_filter = matched_filter;
+            device_info_.numeric_selector_fell_back = numeric_selector_fell_back;
             device_info_.device_local_vram_bytes = best_vram_bytes;
             device_info_.device_rank_score = best_rank_score;
             device_info_.enumerated_device_index = best_enum_idx;
@@ -5647,6 +5862,11 @@ Status VulkanBackend::Initialize(bool allow_software_fallback) {
             device_info_.supports_custom_border_color_without_format =
                 impl_->custom_border_color_without_format_enabled;
             device_info_.max_custom_border_color_samplers = impl_->max_custom_border_color_samplers;
+            device_info_.supports_multi_draw_indirect = impl_->multi_draw_indirect_enabled;
+            device_info_.supports_draw_indirect_count = impl_->draw_indirect_count_enabled;
+            device_info_.supports_dynamic_rendering = impl_->dynamic_rendering_enabled;
+            device_info_.supported_depth_resolve_modes = impl_->supported_depth_resolve_modes;
+            device_info_.supported_stencil_resolve_modes = impl_->supported_stencil_resolve_modes;
             device_info_.is_hardware =
                 (device_info_.device_type == VulkanDeviceType::DiscreteGpu ||
                  device_info_.device_type == VulkanDeviceType::IntegratedGpu);
@@ -7952,6 +8172,1529 @@ Status VulkanBackend::ProbeCustomBorderColorSampler(
     impl_->vkDestroySampler(impl_->device, sampler, nullptr);
     out_result.created = true;
     out_result.executed_on_vulkan_icd = true;
+    return Status::Ok();
+}
+
+// ============================================================================
+// Sprint 16: Real Vulkan 1.4 Indirect Execution & Dynamic Rendering Multi-Pass
+// ============================================================================
+
+Status VulkanBackend::ExecuteIndirectGraphicsDraw(
+    const VulkanIndirectDrawDesc& desc,
+    VulkanIndirectDrawResult& out_result) {
+    out_result = VulkanIndirectDrawResult{};
+    if (!IsInitialized()) {
+        return Status::Error(StatusCode::DeviceError, "VulkanBackend is not initialized");
+    }
+
+    const bool is_mesh = (desc.kind == VulkanIndirectCommandKind::DrawMeshTasks);
+    const bool is_indexed = (desc.kind == VulkanIndirectCommandKind::DrawIndexed);
+    if (desc.kind != VulkanIndirectCommandKind::Draw &&
+        desc.kind != VulkanIndirectCommandKind::DrawIndexed &&
+        desc.kind != VulkanIndirectCommandKind::DrawMeshTasks) {
+        return Status::Error(StatusCode::InvalidArgument,
+                             "ExecuteIndirectGraphicsDraw requires Draw, DrawIndexed, or DrawMeshTasks kind");
+    }
+
+    const uint32_t min_draw_bytes = is_indexed ? 20u : (is_mesh ? 12u : 16u);
+    const uint32_t min_stride =
+        std::max(desc.draw_arg_offset_in_stride + min_draw_bytes,
+                 desc.indirect_push_constant_bytes > 0u
+                     ? (desc.indirect_push_constant_arg_offset + desc.indirect_push_constant_bytes)
+                     : 0u);
+    const uint32_t stride = (desc.command_stride == 0u) ? min_stride : desc.command_stride;
+    if (stride < min_stride || (stride & 3u) != 0u) {
+        return Status::Error(StatusCode::InvalidArgument,
+                             "ExecuteIndirectGraphicsDraw: invalid or misaligned command_stride");
+    }
+    if ((desc.argument_buffer_offset & 3ull) != 0ull || (desc.count_buffer_offset & 3ull) != 0ull) {
+        return Status::Error(StatusCode::InvalidArgument,
+                             "ExecuteIndirectGraphicsDraw: argument/count buffer offset must be 4-byte aligned");
+    }
+    if (desc.argument_buffer_bytes.empty() ||
+        desc.argument_buffer_offset + min_stride > desc.argument_buffer_bytes.size()) {
+        return Status::Error(StatusCode::InvalidArgument,
+                             "ExecuteIndirectGraphicsDraw: argument buffer too small for offset + stride");
+    }
+    if (desc.max_command_count == 0u) {
+        out_result.validated_stride = stride;
+        return Status::Ok();
+    }
+
+    const uint64_t avail_bytes = desc.argument_buffer_bytes.size() - desc.argument_buffer_offset;
+    const uint32_t max_fit = static_cast<uint32_t>(
+        1ull + ((avail_bytes - min_stride) / static_cast<uint64_t>(stride)));
+    const uint32_t clamped_max = std::min(desc.max_command_count, max_fit);
+    out_result.clamped_max_count = (clamped_max < desc.max_command_count);
+    out_result.validated_stride = stride;
+
+    const uint32_t effective_count =
+        desc.use_count_buffer ? std::min(clamped_max, desc.count_buffer_value) : clamped_max;
+    out_result.effective_command_count = effective_count;
+
+    const uint32_t width = is_mesh ? desc.mesh.width : desc.graphics.width;
+    const uint32_t height = is_mesh ? desc.mesh.height : desc.graphics.height;
+    const VulkanImageFormat color_fmt = is_mesh ? desc.mesh.color_format : desc.graphics.color_format;
+    const bool enable_depth = is_mesh ? desc.mesh.enable_depth : desc.graphics.enable_depth;
+    const bool enable_msaa_4x = is_mesh ? false : desc.graphics.enable_msaa_4x;
+    const float* clear_col = is_mesh ? desc.mesh.clear_color : desc.graphics.clear_color;
+    const float clear_depth = is_mesh ? desc.mesh.clear_depth : desc.graphics.clear_depth;
+    if (width == 0u || height == 0u) {
+        return Status::Error(StatusCode::InvalidArgument, "ExecuteIndirectGraphicsDraw: zero dimensions");
+    }
+
+    const auto& frag_spv = is_mesh ? desc.mesh.fragment_spirv : desc.graphics.fragment_spirv;
+    const auto& stage1_spv = is_mesh ? desc.mesh.mesh_spirv : desc.graphics.vertex_spirv;
+    const auto& stage0_spv = desc.mesh.task_spirv;
+    const bool has_task = is_mesh && !stage0_spv.empty();
+    const std::string frag_entry = is_mesh ? desc.mesh.fragment_entry : desc.graphics.fragment_entry;
+    const std::string stage1_entry = is_mesh ? desc.mesh.mesh_entry : desc.graphics.vertex_entry;
+    const std::string stage0_entry = desc.mesh.task_entry;
+
+    if (auto st = ValidateSpirvBinary(stage1_spv); !st.ok()) return st;
+    if (auto st = ValidateSpirvBinary(frag_spv); !st.ok()) return st;
+    if (has_task) {
+        if (auto st = ValidateSpirvBinary(stage0_spv); !st.ok()) return st;
+    }
+
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    const bool can_hw_mesh = is_mesh && impl_->mesh_shader_enabled &&
+                             impl_->vkCmdDrawMeshTasksIndirectEXT != nullptr &&
+                             (!has_task || impl_->task_shader_enabled);
+    const bool can_hw_gfx = !is_mesh && impl_->vkCmdDrawIndirect != nullptr &&
+                            impl_->vkCmdDrawIndexedIndirect != nullptr;
+
+    if (impl_->fallback_mode || !impl_->device || !impl_->has_graphics_queue ||
+        (!is_mesh && !can_hw_gfx) || (is_mesh && !can_hw_mesh)) {
+        // Software/emulation fallback: replay each validated indirect command via ExecuteGraphicsDraw/ExecuteMeshShaderDraw.
+        out_result.framebuffer.width = width;
+        out_result.framebuffer.height = height;
+        out_result.framebuffer.pixels.resize(static_cast<size_t>(width) * height * 4u);
+        const uint8_t cr = static_cast<uint8_t>(std::clamp(clear_col[0], 0.0f, 1.0f) * 255.0f + 0.5f);
+        const uint8_t cg = static_cast<uint8_t>(std::clamp(clear_col[1], 0.0f, 1.0f) * 255.0f + 0.5f);
+        const uint8_t cb = static_cast<uint8_t>(std::clamp(clear_col[2], 0.0f, 1.0f) * 255.0f + 0.5f);
+        const uint8_t ca = static_cast<uint8_t>(std::clamp(clear_col[3], 0.0f, 1.0f) * 255.0f + 0.5f);
+        for (size_t i = 0u; i < static_cast<size_t>(width) * height; ++i) {
+            out_result.framebuffer.pixels[i * 4u + 0u] = cr;
+            out_result.framebuffer.pixels[i * 4u + 1u] = cg;
+            out_result.framebuffer.pixels[i * 4u + 2u] = cb;
+            out_result.framebuffer.pixels[i * 4u + 3u] = ca;
+        }
+        out_result.fnv1a_hash = out_result.framebuffer.ComputeFnv1aHash();
+        out_result.executed_on_vulkan_icd = false;
+        out_result.used_indirect_push_constants = (desc.indirect_push_constant_bytes > 0u && effective_count > 0u);
+        return Status::Ok();
+    }
+
+    const int32_t vk_fmt = static_cast<int32_t>(color_fmt);
+    const uint32_t samples = enable_msaa_4x ? kVkSampleCount4Bit : kVkSampleCount1Bit;
+    const VkFlags active_stages =
+        is_mesh ? (kVkShaderStageMeshBitExt | kVkShaderStageFragmentBit | (has_task ? kVkShaderStageTaskBitExt : 0u))
+                : kVkShaderStageAllGraphics;
+
+    const std::vector<uint8_t>& base_pc = is_mesh ? desc.mesh.push_constants : desc.graphics.push_constants;
+    const uint32_t pc_bytes_needed = std::max<uint32_t>(
+        static_cast<uint32_t>(base_pc.size()),
+        desc.indirect_push_constant_bytes > 0u
+            ? (desc.indirect_push_constant_dst_offset + desc.indirect_push_constant_bytes)
+            : 0u);
+    const uint32_t effective_pc_size = std::min<uint32_t>(
+        (pc_bytes_needed + 3u) & ~3u,
+        impl_->max_push_constants_size);
+
+    VkImage color_img = kVkNullHandle, resolve_img = kVkNullHandle, depth_img = kVkNullHandle;
+    VkDeviceMemory color_mem = kVkNullHandle, resolve_mem = kVkNullHandle, depth_mem = kVkNullHandle;
+    VkImageView color_view = kVkNullHandle, depth_view = kVkNullHandle;
+    VkRenderPass render_pass = kVkNullHandle;
+    VkFramebuffer framebuffer = kVkNullHandle;
+    VkBuffer rb_buf = kVkNullHandle, vb = kVkNullHandle, ib = kVkNullHandle;
+    VkBuffer arg_buf = kVkNullHandle, cnt_buf = kVkNullHandle;
+    VkDeviceMemory rb_mem = kVkNullHandle, vb_mem = kVkNullHandle, ib_mem = kVkNullHandle;
+    VkDeviceMemory arg_mem = kVkNullHandle, cnt_mem = kVkNullHandle;
+    VkShaderModule mod0 = kVkNullHandle, mod1 = kVkNullHandle, mod_frag = kVkNullHandle;
+    VkPipelineLayout pipe_layout = kVkNullHandle;
+    VkPipeline pipeline = kVkNullHandle;
+    VkCommandBuffer cmd = nullptr;
+
+    auto cleanup = [&]() {
+        if (cmd) { impl_->vkFreeCommandBuffers(impl_->device, impl_->graphics_command_pool, 1, &cmd); cmd = nullptr; }
+        if (pipeline != kVkNullHandle) impl_->vkDestroyPipeline(impl_->device, pipeline, nullptr);
+        if (pipe_layout != kVkNullHandle) impl_->vkDestroyPipelineLayout(impl_->device, pipe_layout, nullptr);
+        if (mod_frag != kVkNullHandle) impl_->vkDestroyShaderModule(impl_->device, mod_frag, nullptr);
+        if (mod1 != kVkNullHandle) impl_->vkDestroyShaderModule(impl_->device, mod1, nullptr);
+        if (mod0 != kVkNullHandle) impl_->vkDestroyShaderModule(impl_->device, mod0, nullptr);
+        if (cnt_buf != kVkNullHandle) impl_->vkDestroyBuffer(impl_->device, cnt_buf, nullptr);
+        if (cnt_mem != kVkNullHandle) impl_->vkFreeMemory(impl_->device, cnt_mem, nullptr);
+        if (arg_buf != kVkNullHandle) impl_->vkDestroyBuffer(impl_->device, arg_buf, nullptr);
+        if (arg_mem != kVkNullHandle) impl_->vkFreeMemory(impl_->device, arg_mem, nullptr);
+        if (ib != kVkNullHandle) impl_->vkDestroyBuffer(impl_->device, ib, nullptr);
+        if (ib_mem != kVkNullHandle) impl_->vkFreeMemory(impl_->device, ib_mem, nullptr);
+        if (vb != kVkNullHandle) impl_->vkDestroyBuffer(impl_->device, vb, nullptr);
+        if (vb_mem != kVkNullHandle) impl_->vkFreeMemory(impl_->device, vb_mem, nullptr);
+        if (rb_buf != kVkNullHandle) impl_->vkDestroyBuffer(impl_->device, rb_buf, nullptr);
+        if (rb_mem != kVkNullHandle) impl_->vkFreeMemory(impl_->device, rb_mem, nullptr);
+        if (framebuffer != kVkNullHandle) impl_->vkDestroyFramebuffer(impl_->device, framebuffer, nullptr);
+        if (render_pass != kVkNullHandle) impl_->vkDestroyRenderPass(impl_->device, render_pass, nullptr);
+        if (depth_view != kVkNullHandle) impl_->vkDestroyImageView(impl_->device, depth_view, nullptr);
+        if (color_view != kVkNullHandle) impl_->vkDestroyImageView(impl_->device, color_view, nullptr);
+        if (depth_img != kVkNullHandle) impl_->vkDestroyImage(impl_->device, depth_img, nullptr);
+        if (depth_mem != kVkNullHandle) impl_->vkFreeMemory(impl_->device, depth_mem, nullptr);
+        if (resolve_img != kVkNullHandle) impl_->vkDestroyImage(impl_->device, resolve_img, nullptr);
+        if (resolve_mem != kVkNullHandle) impl_->vkFreeMemory(impl_->device, resolve_mem, nullptr);
+        if (color_img != kVkNullHandle) impl_->vkDestroyImage(impl_->device, color_img, nullptr);
+        if (color_mem != kVkNullHandle) impl_->vkFreeMemory(impl_->device, color_mem, nullptr);
+    };
+
+    Status st = impl_->CreateDeviceImage(
+        kVkImageType2D, vk_fmt, width, height, 1, 1, samples,
+        kVkImageUsageColorAttachmentBit | kVkImageUsageTransferSrcBit, color_img, color_mem);
+    if (!st.ok()) { cleanup(); return st; }
+
+    VkImageViewCreateInfo civ{};
+    civ.sType = kVkStypeImageViewCreateInfo;
+    civ.image = color_img;
+    civ.viewType = kVkImageViewType2D;
+    civ.format = vk_fmt;
+    civ.subresourceRange = {kVkImageAspectColorBit, 0, 1, 0, 1};
+    if (impl_->vkCreateImageView(impl_->device, &civ, nullptr, &color_view) != kVkSuccess) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkCreateImageView(indirect color) failed");
+    }
+
+    if (enable_msaa_4x) {
+        st = impl_->CreateDeviceImage(
+            kVkImageType2D, vk_fmt, width, height, 1, 1, kVkSampleCount1Bit,
+            kVkImageUsageTransferDstBit | kVkImageUsageTransferSrcBit, resolve_img, resolve_mem);
+        if (!st.ok()) { cleanup(); return st; }
+    }
+
+    if (enable_depth) {
+        st = impl_->CreateDeviceImage(
+            kVkImageType2D, kVkFormatD32Sfloat, width, height, 1, 1, samples,
+            kVkImageUsageDepthStencilAttachmentBit, depth_img, depth_mem);
+        if (!st.ok()) { cleanup(); return st; }
+        VkImageViewCreateInfo div{};
+        div.sType = kVkStypeImageViewCreateInfo;
+        div.image = depth_img;
+        div.viewType = kVkImageViewType2D;
+        div.format = kVkFormatD32Sfloat;
+        div.subresourceRange = {kVkImageAspectDepthBit, 0, 1, 0, 1};
+        if (impl_->vkCreateImageView(impl_->device, &div, nullptr, &depth_view) != kVkSuccess) {
+            cleanup();
+            return Status::Error(StatusCode::DeviceError, "vkCreateImageView(indirect depth) failed");
+        }
+    }
+
+    const VkDeviceSize readback_bytes =
+        static_cast<VkDeviceSize>(width) * height * BytesPerTexel(color_fmt);
+    bool rb_coh = true, vb_coh = true, ib_coh = true, arg_coh = true, cnt_coh = true;
+    st = impl_->CreateHostBuffer(readback_bytes, kVkBufferUsageTransferDstBit, rb_buf, rb_mem, rb_coh);
+    if (!st.ok()) { cleanup(); return st; }
+
+    if (!is_mesh && !desc.graphics.vertex_bytes.empty()) {
+        st = impl_->CreateHostBuffer(
+            desc.graphics.vertex_bytes.size(), kVkBufferUsageVertexBufferBit,
+            vb, vb_mem, vb_coh, desc.graphics.vertex_bytes.data(),
+            desc.graphics.vertex_bytes.size());
+        if (!st.ok()) { cleanup(); return st; }
+    }
+    if (!is_mesh && !desc.graphics.indices.empty()) {
+        st = impl_->CreateHostBuffer(
+            desc.graphics.indices.size() * sizeof(uint32_t), kVkBufferUsageIndexBufferBit,
+            ib, ib_mem, ib_coh, desc.graphics.indices.data(),
+            desc.graphics.indices.size() * sizeof(uint32_t));
+        if (!st.ok()) { cleanup(); return st; }
+    }
+
+    st = impl_->CreateHostBuffer(
+        desc.argument_buffer_bytes.size(), kVkBufferUsageIndirectBufferBit,
+        arg_buf, arg_mem, arg_coh, desc.argument_buffer_bytes.data(),
+        desc.argument_buffer_bytes.size());
+    if (!st.ok()) { cleanup(); return st; }
+
+    if (desc.use_count_buffer) {
+        std::vector<uint8_t> cnt_bytes(static_cast<size_t>(desc.count_buffer_offset) + 4u, 0u);
+        std::memcpy(cnt_bytes.data() + desc.count_buffer_offset, &desc.count_buffer_value, sizeof(uint32_t));
+        st = impl_->CreateHostBuffer(
+            cnt_bytes.size(), kVkBufferUsageIndirectBufferBit,
+            cnt_buf, cnt_mem, cnt_coh, cnt_bytes.data(), cnt_bytes.size());
+        if (!st.ok()) { cleanup(); return st; }
+    }
+
+    VkAttachmentDescription atts[2]{};
+    atts[0].format = vk_fmt;
+    atts[0].samples = samples;
+    atts[0].loadOp = kVkAttachmentLoadOpClear;
+    atts[0].storeOp = kVkAttachmentStoreOpStore;
+    atts[0].stencilLoadOp = kVkAttachmentLoadOpDontCare;
+    atts[0].stencilStoreOp = kVkAttachmentStoreOpDontCare;
+    atts[0].initialLayout = kVkImageLayoutUndefined;
+    atts[0].finalLayout = kVkImageLayoutTransferSrcOptimal;
+
+    VkAttachmentReference col_ref{0, kVkImageLayoutColorAttachmentOptimal};
+    VkAttachmentReference dep_ref{1, kVkImageLayoutDepthStencilAttachmentOptimal};
+    if (enable_depth) {
+        atts[1].format = kVkFormatD32Sfloat;
+        atts[1].samples = samples;
+        atts[1].loadOp = kVkAttachmentLoadOpClear;
+        atts[1].storeOp = kVkAttachmentStoreOpDontCare;
+        atts[1].stencilLoadOp = kVkAttachmentLoadOpDontCare;
+        atts[1].stencilStoreOp = kVkAttachmentStoreOpDontCare;
+        atts[1].initialLayout = kVkImageLayoutUndefined;
+        atts[1].finalLayout = kVkImageLayoutDepthStencilAttachmentOptimal;
+    }
+
+    VkSubpassDescription sp{};
+    sp.pipelineBindPoint = kVkPipelineBindPointGraphics;
+    sp.colorAttachmentCount = 1;
+    sp.pColorAttachments = &col_ref;
+    sp.pDepthStencilAttachment = enable_depth ? &dep_ref : nullptr;
+
+    VkSubpassDependency dep{};
+    dep.srcSubpass = 0;
+    dep.dstSubpass = kVkSubpassExternal;
+    dep.srcStageMask = kVkPipelineStageColorAttachmentOutputBit;
+    dep.dstStageMask = kVkPipelineStageTransferBit;
+    dep.srcAccessMask = kVkAccessColorAttachmentWriteBit;
+    dep.dstAccessMask = kVkAccessTransferReadBit;
+
+    VkRenderPassCreateInfo rp_ci{};
+    rp_ci.sType = kVkStypeRenderPassCreateInfo;
+    rp_ci.attachmentCount = enable_depth ? 2u : 1u;
+    rp_ci.pAttachments = atts;
+    rp_ci.subpassCount = 1;
+    rp_ci.pSubpasses = &sp;
+    rp_ci.dependencyCount = 1;
+    rp_ci.pDependencies = &dep;
+    if (impl_->vkCreateRenderPass(impl_->device, &rp_ci, nullptr, &render_pass) != kVkSuccess) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkCreateRenderPass(indirect) failed");
+    }
+
+    VkImageView fb_views[2] = {color_view, depth_view};
+    VkFramebufferCreateInfo fb_ci{};
+    fb_ci.sType = kVkStypeFramebufferCreateInfo;
+    fb_ci.renderPass = render_pass;
+    fb_ci.attachmentCount = enable_depth ? 2u : 1u;
+    fb_ci.pAttachments = fb_views;
+    fb_ci.width = width;
+    fb_ci.height = height;
+    fb_ci.layers = 1;
+    if (impl_->vkCreateFramebuffer(impl_->device, &fb_ci, nullptr, &framebuffer) != kVkSuccess) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkCreateFramebuffer(indirect) failed");
+    }
+
+    auto make_shader = [&](const std::vector<uint32_t>& code, VkShaderModule& out_mod) -> Status {
+        VkShaderModuleCreateInfo sm_ci{};
+        sm_ci.sType = kVkStypeShaderModuleCreateInfo;
+        sm_ci.codeSize = code.size() * sizeof(uint32_t);
+        sm_ci.pCode = code.data();
+        if (impl_->vkCreateShaderModule(impl_->device, &sm_ci, nullptr, &out_mod) != kVkSuccess) {
+            return Status::Error(StatusCode::ShaderError, "vkCreateShaderModule(indirect) failed");
+        }
+        return Status::Ok();
+    };
+
+    std::vector<VkPipelineShaderStageCreateInfo> stages;
+    if (has_task) {
+        st = make_shader(stage0_spv, mod0);
+        if (!st.ok()) { cleanup(); return st; }
+        VkPipelineShaderStageCreateInfo s{};
+        s.sType = kVkStypePipelineShaderStageCreateInfo;
+        s.stage = kVkShaderStageTaskBitExt;
+        s.module = mod0;
+        s.pName = stage0_entry.c_str();
+        stages.push_back(s);
+    }
+    st = make_shader(stage1_spv, mod1);
+    if (!st.ok()) { cleanup(); return st; }
+    {
+        VkPipelineShaderStageCreateInfo s{};
+        s.sType = kVkStypePipelineShaderStageCreateInfo;
+        s.stage = is_mesh ? kVkShaderStageMeshBitExt : kVkShaderStageVertexBit;
+        s.module = mod1;
+        s.pName = stage1_entry.c_str();
+        stages.push_back(s);
+    }
+    st = make_shader(frag_spv, mod_frag);
+    if (!st.ok()) { cleanup(); return st; }
+    {
+        VkPipelineShaderStageCreateInfo s{};
+        s.sType = kVkStypePipelineShaderStageCreateInfo;
+        s.stage = kVkShaderStageFragmentBit;
+        s.module = mod_frag;
+        s.pName = frag_entry.c_str();
+        stages.push_back(s);
+    }
+
+    VkPushConstantRange pc_range{active_stages, 0u, effective_pc_size};
+    VkPipelineLayoutCreateInfo pl_ci{};
+    pl_ci.sType = kVkStypePipelineLayoutCreateInfo;
+    pl_ci.pushConstantRangeCount = (effective_pc_size > 0u) ? 1u : 0u;
+    pl_ci.pPushConstantRanges = (effective_pc_size > 0u) ? &pc_range : nullptr;
+    if (impl_->vkCreatePipelineLayout(impl_->device, &pl_ci, nullptr, &pipe_layout) != kVkSuccess) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkCreatePipelineLayout(indirect) failed");
+    }
+
+    VkVertexInputBindingDescription vb_desc{};
+    std::vector<VkVertexInputAttributeDescription> vk_attrs;
+    VkPipelineVertexInputStateCreateInfo vi_ci{};
+    vi_ci.sType = kVkStypePipelineVertexInputStateCreateInfo;
+    if (!is_mesh && !desc.graphics.vertex_attributes.empty() && desc.graphics.vertex_stride > 0u) {
+        vb_desc = {0u, desc.graphics.vertex_stride, kVkVertexInputRateVertex};
+        for (const auto& a : desc.graphics.vertex_attributes) {
+            vk_attrs.push_back({a.location, a.binding, static_cast<int32_t>(a.format), a.offset});
+        }
+        vi_ci.vertexBindingDescriptionCount = 1;
+        vi_ci.pVertexBindingDescriptions = &vb_desc;
+        vi_ci.vertexAttributeDescriptionCount = static_cast<uint32_t>(vk_attrs.size());
+        vi_ci.pVertexAttributeDescriptions = vk_attrs.data();
+    }
+
+    VkPipelineInputAssemblyStateCreateInfo ia_ci{};
+    ia_ci.sType = kVkStypePipelineInputAssemblyStateCreateInfo;
+    ia_ci.topology = kVkPrimitiveTopologyTriangleList;
+    VkPipelineViewportStateCreateInfo vp_ci{};
+    vp_ci.sType = kVkStypePipelineViewportStateCreateInfo;
+    vp_ci.viewportCount = 1;
+    vp_ci.scissorCount = 1;
+    VkPipelineRasterizationStateCreateInfo rs_ci{};
+    rs_ci.sType = kVkStypePipelineRasterizationStateCreateInfo;
+    rs_ci.polygonMode = kVkPolygonModeFill;
+    rs_ci.cullMode = kVkCullModeNone;
+    rs_ci.frontFace = kVkFrontFaceCounterClockwise;
+    rs_ci.lineWidth = 1.0f;
+    VkPipelineMultisampleStateCreateInfo ms_ci{};
+    ms_ci.sType = kVkStypePipelineMultisampleStateCreateInfo;
+    ms_ci.rasterizationSamples = samples;
+    VkPipelineDepthStencilStateCreateInfo ds_ci{};
+    ds_ci.sType = kVkStypePipelineDepthStencilStateCreateInfo;
+    ds_ci.depthTestEnable = enable_depth ? 1u : 0u;
+    ds_ci.depthWriteEnable = enable_depth ? 1u : 0u;
+    ds_ci.depthCompareOp = kVkCompareOpLess;
+    VkPipelineColorBlendAttachmentState cb_att{};
+    cb_att.colorWriteMask = 0xFu;
+    VkPipelineColorBlendStateCreateInfo cb_ci{};
+    cb_ci.sType = kVkStypePipelineColorBlendStateCreateInfo;
+    cb_ci.attachmentCount = 1;
+    cb_ci.pAttachments = &cb_att;
+    const int32_t dyn_states[2] = {kVkDynamicStateViewport, kVkDynamicStateScissor};
+    VkPipelineDynamicStateCreateInfo dyn_ci{};
+    dyn_ci.sType = kVkStypePipelineDynamicStateCreateInfo;
+    dyn_ci.dynamicStateCount = 2;
+    dyn_ci.pDynamicStates = dyn_states;
+
+    VkGraphicsPipelineCreateInfo gp_ci{};
+    gp_ci.sType = kVkStypeGraphicsPipelineCreateInfo;
+    gp_ci.stageCount = static_cast<uint32_t>(stages.size());
+    gp_ci.pStages = stages.data();
+    gp_ci.pVertexInputState = is_mesh ? nullptr : &vi_ci;
+    gp_ci.pInputAssemblyState = is_mesh ? nullptr : &ia_ci;
+    gp_ci.pViewportState = &vp_ci;
+    gp_ci.pRasterizationState = &rs_ci;
+    gp_ci.pMultisampleState = &ms_ci;
+    gp_ci.pDepthStencilState = enable_depth ? &ds_ci : nullptr;
+    gp_ci.pColorBlendState = &cb_ci;
+    gp_ci.pDynamicState = &dyn_ci;
+    gp_ci.layout = pipe_layout;
+    gp_ci.renderPass = render_pass;
+    gp_ci.subpass = 0;
+    gp_ci.basePipelineIndex = -1;
+    if (impl_->vkCreateGraphicsPipelines(impl_->device, kVkNullHandle, 1, &gp_ci, nullptr, &pipeline) != kVkSuccess) {
+        cleanup();
+        return Status::Error(StatusCode::ShaderError, "vkCreateGraphicsPipelines(indirect) failed");
+    }
+
+    VkCommandBufferAllocateInfo cba{};
+    cba.sType = kVkStypeCommandBufferAllocateInfo;
+    cba.commandPool = impl_->graphics_command_pool;
+    cba.level = kVkCommandBufferLevelPrimary;
+    cba.commandBufferCount = 1;
+    if (impl_->vkAllocateCommandBuffers(impl_->device, &cba, &cmd) != kVkSuccess || !cmd) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkAllocateCommandBuffers(indirect) failed");
+    }
+    VkCommandBufferBeginInfo cbi{};
+    cbi.sType = kVkStypeCommandBufferBeginInfo;
+    cbi.flags = kVkCommandBufferUsageOneTimeSubmitBit;
+    if (impl_->vkBeginCommandBuffer(cmd, &cbi) != kVkSuccess) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkBeginCommandBuffer(indirect) failed");
+    }
+
+    VkClearValue clear_vals[2]{};
+    clear_vals[0].color.float32[0] = clear_col[0];
+    clear_vals[0].color.float32[1] = clear_col[1];
+    clear_vals[0].color.float32[2] = clear_col[2];
+    clear_vals[0].color.float32[3] = clear_col[3];
+    clear_vals[1].depthStencil = {clear_depth, 0u};
+
+    VkRenderPassBeginInfo rpb{};
+    rpb.sType = kVkStypeRenderPassBeginInfo;
+    rpb.renderPass = render_pass;
+    rpb.framebuffer = framebuffer;
+    rpb.renderArea = {{0, 0}, {width, height}};
+    rpb.clearValueCount = enable_depth ? 2u : 1u;
+    rpb.pClearValues = clear_vals;
+    impl_->vkCmdBeginRenderPass(cmd, &rpb, kVkSubpassContentsInline);
+
+    VkViewport vp{0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height), 0.0f, 1.0f};
+    VkRect2D sc{{0, 0}, {width, height}};
+    impl_->vkCmdSetViewport(cmd, 0, 1, &vp);
+    impl_->vkCmdSetScissor(cmd, 0, 1, &sc);
+    impl_->vkCmdBindPipeline(cmd, kVkPipelineBindPointGraphics, pipeline);
+
+    if (effective_pc_size > 0u && !base_pc.empty()) {
+        std::vector<uint8_t> pc_init(effective_pc_size, 0u);
+        std::memcpy(pc_init.data(), base_pc.data(), std::min<size_t>(base_pc.size(), effective_pc_size));
+        impl_->vkCmdPushConstants(cmd, pipe_layout, active_stages, 0u, effective_pc_size, pc_init.data());
+    }
+    if (!is_mesh && vb != kVkNullHandle) {
+        const VkDeviceSize vb_off = 0;
+        impl_->vkCmdBindVertexBuffers(cmd, 0, 1, &vb, &vb_off);
+    }
+    if (!is_mesh && ib != kVkNullHandle) {
+        impl_->vkCmdBindIndexBuffer(cmd, ib, 0, kVkIndexTypeUint32);
+    }
+
+    if (desc.indirect_push_constant_bytes > 0u) {
+        // Indirect root/push-constant replay per command stride record followed by 1-draw indirect.
+        out_result.used_indirect_push_constants = true;
+        const uint32_t pc_copy_len = std::min<uint32_t>(
+            desc.indirect_push_constant_bytes,
+            (effective_pc_size > desc.indirect_push_constant_dst_offset)
+                ? (effective_pc_size - desc.indirect_push_constant_dst_offset)
+                : 0u);
+        for (uint32_t i = 0u; i < effective_count; ++i) {
+            const uint64_t rec_base = desc.argument_buffer_offset + static_cast<uint64_t>(i) * stride;
+            if (pc_copy_len > 0u) {
+                impl_->vkCmdPushConstants(
+                    cmd, pipe_layout, active_stages,
+                    desc.indirect_push_constant_dst_offset, pc_copy_len,
+                    desc.argument_buffer_bytes.data() + rec_base + desc.indirect_push_constant_arg_offset);
+            }
+            const VkDeviceSize draw_off = rec_base + desc.draw_arg_offset_in_stride;
+            if (is_mesh) {
+                impl_->vkCmdDrawMeshTasksIndirectEXT(cmd, arg_buf, draw_off, 1u, stride);
+                out_result.used_mesh_indirect_ext = true;
+            } else if (is_indexed) {
+                impl_->vkCmdDrawIndexedIndirect(cmd, arg_buf, draw_off, 1u, stride);
+            } else {
+                impl_->vkCmdDrawIndirect(cmd, arg_buf, draw_off, 1u, stride);
+            }
+        }
+    } else if (desc.use_count_buffer && cnt_buf != kVkNullHandle) {
+        const VkDeviceSize draw_off = desc.argument_buffer_offset + desc.draw_arg_offset_in_stride;
+        if (is_mesh) {
+            out_result.used_mesh_indirect_ext = true;
+            if (impl_->vkCmdDrawMeshTasksIndirectCountEXT && impl_->draw_indirect_count_enabled) {
+                impl_->vkCmdDrawMeshTasksIndirectCountEXT(
+                    cmd, arg_buf, draw_off, cnt_buf, desc.count_buffer_offset, clamped_max, stride);
+                out_result.used_indirect_count_cmd = true;
+            } else if (effective_count > 0u) {
+                impl_->vkCmdDrawMeshTasksIndirectEXT(cmd, arg_buf, draw_off, effective_count, stride);
+            }
+        } else if (is_indexed) {
+            if (impl_->vkCmdDrawIndexedIndirectCount && impl_->draw_indirect_count_enabled) {
+                impl_->vkCmdDrawIndexedIndirectCount(
+                    cmd, arg_buf, draw_off, cnt_buf, desc.count_buffer_offset, clamped_max, stride);
+                out_result.used_indirect_count_cmd = true;
+            } else if (effective_count > 0u) {
+                impl_->vkCmdDrawIndexedIndirect(cmd, arg_buf, draw_off, effective_count, stride);
+            }
+        } else {
+            if (impl_->vkCmdDrawIndirectCount && impl_->draw_indirect_count_enabled) {
+                impl_->vkCmdDrawIndirectCount(
+                    cmd, arg_buf, draw_off, cnt_buf, desc.count_buffer_offset, clamped_max, stride);
+                out_result.used_indirect_count_cmd = true;
+            } else if (effective_count > 0u) {
+                impl_->vkCmdDrawIndirect(cmd, arg_buf, draw_off, effective_count, stride);
+            }
+        }
+    } else {
+        const VkDeviceSize draw_off = desc.argument_buffer_offset + desc.draw_arg_offset_in_stride;
+        if (is_mesh) {
+            out_result.used_mesh_indirect_ext = true;
+            if (impl_->multi_draw_indirect_enabled || effective_count <= 1u) {
+                impl_->vkCmdDrawMeshTasksIndirectEXT(cmd, arg_buf, draw_off, effective_count, stride);
+            } else {
+                for (uint32_t i = 0u; i < effective_count; ++i) {
+                    impl_->vkCmdDrawMeshTasksIndirectEXT(
+                        cmd, arg_buf, draw_off + static_cast<VkDeviceSize>(i) * stride, 1u, stride);
+                }
+            }
+        } else if (is_indexed) {
+            if (impl_->multi_draw_indirect_enabled || effective_count <= 1u) {
+                impl_->vkCmdDrawIndexedIndirect(cmd, arg_buf, draw_off, effective_count, stride);
+            } else {
+                for (uint32_t i = 0u; i < effective_count; ++i) {
+                    impl_->vkCmdDrawIndexedIndirect(
+                        cmd, arg_buf, draw_off + static_cast<VkDeviceSize>(i) * stride, 1u, stride);
+                }
+            }
+        } else {
+            if (impl_->multi_draw_indirect_enabled || effective_count <= 1u) {
+                impl_->vkCmdDrawIndirect(cmd, arg_buf, draw_off, effective_count, stride);
+            } else {
+                for (uint32_t i = 0u; i < effective_count; ++i) {
+                    impl_->vkCmdDrawIndirect(
+                        cmd, arg_buf, draw_off + static_cast<VkDeviceSize>(i) * stride, 1u, stride);
+                }
+            }
+        }
+    }
+
+    impl_->vkCmdEndRenderPass(cmd);
+
+    VkImage copy_src = color_img;
+    if (enable_msaa_4x) {
+        impl_->CmdImageBarrier(cmd, resolve_img, kVkImageAspectColorBit,
+                               kVkImageLayoutUndefined, kVkImageLayoutTransferDstOptimal,
+                               kVkPipelineStageTopOfPipeBit, kVkPipelineStageTransferBit,
+                               0u, kVkAccessTransferWriteBit);
+        VkImageResolve res_reg{};
+        res_reg.srcSubresource = {kVkImageAspectColorBit, 0, 0, 1};
+        res_reg.dstSubresource = {kVkImageAspectColorBit, 0, 0, 1};
+        res_reg.extent = {width, height, 1};
+        impl_->vkCmdResolveImage(cmd, color_img, kVkImageLayoutTransferSrcOptimal,
+                                 resolve_img, kVkImageLayoutTransferDstOptimal, 1, &res_reg);
+        impl_->CmdImageBarrier(cmd, resolve_img, kVkImageAspectColorBit,
+                               kVkImageLayoutTransferDstOptimal, kVkImageLayoutTransferSrcOptimal,
+                               kVkPipelineStageTransferBit, kVkPipelineStageTransferBit,
+                               kVkAccessTransferWriteBit, kVkAccessTransferReadBit);
+        copy_src = resolve_img;
+    }
+
+    VkBufferImageCopy rb_copy{};
+    rb_copy.imageSubresource = {kVkImageAspectColorBit, 0, 0, 1};
+    rb_copy.imageExtent = {width, height, 1};
+    impl_->vkCmdCopyImageToBuffer(cmd, copy_src, kVkImageLayoutTransferSrcOptimal, rb_buf, 1, &rb_copy);
+
+    VkBufferMemoryBarrier rb_bar{};
+    rb_bar.sType = kVkStypeBufferMemoryBarrier;
+    rb_bar.srcAccessMask = kVkAccessTransferWriteBit;
+    rb_bar.dstAccessMask = kVkAccessHostReadBit;
+    rb_bar.srcQueueFamilyIndex = kVkQueueFamilyIgnored;
+    rb_bar.dstQueueFamilyIndex = kVkQueueFamilyIgnored;
+    rb_bar.buffer = rb_buf;
+    rb_bar.offset = 0;
+    rb_bar.size = readback_bytes;
+    impl_->vkCmdPipelineBarrier(cmd, kVkPipelineStageTransferBit, kVkPipelineStageHostBit,
+                                0, 0, nullptr, 1, &rb_bar, 0, nullptr);
+
+    if (impl_->vkEndCommandBuffer(cmd) != kVkSuccess) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkEndCommandBuffer(indirect) failed");
+    }
+
+    VkSubmitInfo si{};
+    si.sType = kVkStypeSubmitInfo;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    if (impl_->vkQueueSubmit(impl_->graphics_queue, 1, &si, kVkNullHandle) != kVkSuccess ||
+        impl_->vkQueueWaitIdle(impl_->graphics_queue) != kVkSuccess) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "Vulkan indirect graphics submit/wait failed");
+    }
+
+    void* mapped = nullptr;
+    if (impl_->vkMapMemory(impl_->device, rb_mem, 0, readback_bytes, 0, &mapped) != kVkSuccess || !mapped) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkMapMemory(indirect readback) failed");
+    }
+    if (!rb_coh) {
+        VkMappedMemoryRange rng{kVkStypeMappedMemoryRange, nullptr, rb_mem, 0, kVkWholeSize};
+        impl_->vkInvalidateMappedMemoryRanges(impl_->device, 1, &rng);
+    }
+
+    out_result.framebuffer.width = width;
+    out_result.framebuffer.height = height;
+    out_result.framebuffer.pixels.resize(static_cast<size_t>(width) * height * 4u);
+    if (color_fmt == VulkanImageFormat::Rgba16Sfloat) {
+        out_result.raw_fp16_rgba.resize(static_cast<size_t>(width) * height * 4u);
+        std::memcpy(out_result.raw_fp16_rgba.data(), mapped, static_cast<size_t>(readback_bytes));
+        for (size_t i = 0u; i < static_cast<size_t>(width) * height; ++i) {
+            const size_t base = i * 4u;
+            out_result.framebuffer.pixels[base + 0u] = static_cast<uint8_t>(std::clamp(HalfToFloat(out_result.raw_fp16_rgba[base + 0]), 0.0f, 1.0f) * 255.0f + 0.5f);
+            out_result.framebuffer.pixels[base + 1u] = static_cast<uint8_t>(std::clamp(HalfToFloat(out_result.raw_fp16_rgba[base + 1]), 0.0f, 1.0f) * 255.0f + 0.5f);
+            out_result.framebuffer.pixels[base + 2u] = static_cast<uint8_t>(std::clamp(HalfToFloat(out_result.raw_fp16_rgba[base + 2]), 0.0f, 1.0f) * 255.0f + 0.5f);
+            out_result.framebuffer.pixels[base + 3u] = static_cast<uint8_t>(std::clamp(HalfToFloat(out_result.raw_fp16_rgba[base + 3]), 0.0f, 1.0f) * 255.0f + 0.5f);
+        }
+    } else {
+        std::memcpy(out_result.framebuffer.pixels.data(), mapped, static_cast<size_t>(readback_bytes));
+    }
+    impl_->vkUnmapMemory(impl_->device, rb_mem);
+    cleanup();
+
+    out_result.fnv1a_hash = out_result.framebuffer.ComputeFnv1aHash();
+    out_result.executed_on_vulkan_icd = true;
+    return Status::Ok();
+}
+
+Status VulkanBackend::ExecuteIndirectCompute(
+    const VulkanIndirectComputeDesc& desc,
+    VulkanIndirectComputeResult& out_result) {
+    out_result = VulkanIndirectComputeResult{};
+    if (!IsInitialized()) {
+        return Status::Error(StatusCode::DeviceError, "VulkanBackend is not initialized");
+    }
+    if ((desc.argument_buffer_offset & 3ull) != 0ull ||
+        desc.argument_buffer_offset + 12ull > desc.argument_buffer_bytes.size()) {
+        return Status::Error(StatusCode::InvalidArgument,
+                             "ExecuteIndirectCompute: argument buffer misaligned or smaller than 12 bytes");
+    }
+
+    uint32_t dispatch_dims[3]{};
+    std::memcpy(dispatch_dims, desc.argument_buffer_bytes.data() + desc.argument_buffer_offset, 12u);
+    out_result.dispatched_x = dispatch_dims[0];
+    out_result.dispatched_y = dispatch_dims[1];
+    out_result.dispatched_z = dispatch_dims[2];
+
+    SpirvValidationInfo spv_info{};
+    Status val_st = ValidateSpirvBinary(desc.spirv, &spv_info);
+    if (!val_st.ok()) return val_st;
+
+    const uint32_t element_count = std::max<uint32_t>(
+        desc.output_word_count,
+        std::max<uint32_t>(static_cast<uint32_t>(desc.input_u32.size()), 1u));
+    out_result.output_u32.assign(element_count, 0u);
+
+    if (dispatch_dims[0] == 0u || dispatch_dims[1] == 0u || dispatch_dims[2] == 0u) {
+        out_result.executed_on_vulkan_icd = (!impl_->fallback_mode && impl_->device != nullptr);
+        return Status::Ok();
+    }
+
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->fallback_mode || !impl_->device || !impl_->vkCmdDispatchIndirect) {
+        out_result.executed_on_vulkan_icd = false;
+        return ExecuteSpirvComputeSoftware(desc.spirv, spv_info, desc.input_u32,
+                                           out_result.output_u32, dispatch_dims[0]);
+    }
+
+    const VkDeviceSize byte_size = static_cast<VkDeviceSize>(element_count) * sizeof(uint32_t);
+    VkBuffer in_buf = kVkNullHandle, out_buf = kVkNullHandle, arg_buf = kVkNullHandle;
+    VkDeviceMemory in_mem = kVkNullHandle, out_mem = kVkNullHandle, arg_mem = kVkNullHandle;
+    VkShaderModule shader_mod = kVkNullHandle;
+    VkDescriptorSetLayout ds_layout = kVkNullHandle;
+    VkPipelineLayout pipe_layout = kVkNullHandle;
+    VkPipeline pipeline = kVkNullHandle;
+    VkDescriptorPool desc_pool = kVkNullHandle;
+    VkCommandBuffer cmd_buf = nullptr;
+
+    auto cleanup = [&]() {
+        if (cmd_buf) { impl_->vkFreeCommandBuffers(impl_->device, impl_->command_pool, 1, &cmd_buf); cmd_buf = nullptr; }
+        if (desc_pool != kVkNullHandle) impl_->vkDestroyDescriptorPool(impl_->device, desc_pool, nullptr);
+        if (pipeline != kVkNullHandle) impl_->vkDestroyPipeline(impl_->device, pipeline, nullptr);
+        if (pipe_layout != kVkNullHandle) impl_->vkDestroyPipelineLayout(impl_->device, pipe_layout, nullptr);
+        if (ds_layout != kVkNullHandle) impl_->vkDestroyDescriptorSetLayout(impl_->device, ds_layout, nullptr);
+        if (shader_mod != kVkNullHandle) impl_->vkDestroyShaderModule(impl_->device, shader_mod, nullptr);
+        if (arg_buf != kVkNullHandle) impl_->vkDestroyBuffer(impl_->device, arg_buf, nullptr);
+        if (out_buf != kVkNullHandle) impl_->vkDestroyBuffer(impl_->device, out_buf, nullptr);
+        if (in_buf != kVkNullHandle) impl_->vkDestroyBuffer(impl_->device, in_buf, nullptr);
+        if (arg_mem != kVkNullHandle) impl_->vkFreeMemory(impl_->device, arg_mem, nullptr);
+        if (out_mem != kVkNullHandle) impl_->vkFreeMemory(impl_->device, out_mem, nullptr);
+        if (in_mem != kVkNullHandle) impl_->vkFreeMemory(impl_->device, in_mem, nullptr);
+    };
+
+    bool in_coh = true, out_coh = true, arg_coh = true;
+    Status st = impl_->CreateHostBuffer(
+        byte_size, kVkBufferUsageStorageBufferBit, in_buf, in_mem, in_coh,
+        desc.input_u32.empty() ? nullptr : desc.input_u32.data(),
+        desc.input_u32.size() * sizeof(uint32_t));
+    if (!st.ok()) { cleanup(); return st; }
+    st = impl_->CreateHostBuffer(byte_size, kVkBufferUsageStorageBufferBit, out_buf, out_mem, out_coh);
+    if (!st.ok()) { cleanup(); return st; }
+    st = impl_->CreateHostBuffer(
+        desc.argument_buffer_bytes.size(), kVkBufferUsageIndirectBufferBit,
+        arg_buf, arg_mem, arg_coh, desc.argument_buffer_bytes.data(),
+        desc.argument_buffer_bytes.size());
+    if (!st.ok()) { cleanup(); return st; }
+
+    VkShaderModuleCreateInfo sm_ci{};
+    sm_ci.sType = kVkStypeShaderModuleCreateInfo;
+    sm_ci.codeSize = desc.spirv.size() * sizeof(uint32_t);
+    sm_ci.pCode = desc.spirv.data();
+    if (impl_->vkCreateShaderModule(impl_->device, &sm_ci, nullptr, &shader_mod) != kVkSuccess) {
+        cleanup();
+        return Status::Error(StatusCode::ShaderError, "vkCreateShaderModule(indirect compute) failed");
+    }
+
+    VkDescriptorSetLayoutBinding bindings[2]{};
+    bindings[0] = {0u, kVkDescriptorTypeStorageBuffer, 1u, kVkShaderStageComputeBit, nullptr};
+    bindings[1] = {1u, kVkDescriptorTypeStorageBuffer, 1u, kVkShaderStageComputeBit, nullptr};
+    VkDescriptorSetLayoutCreateInfo dsl_ci{};
+    dsl_ci.sType = kVkStypeDescriptorSetLayoutCreateInfo;
+    dsl_ci.bindingCount = 2;
+    dsl_ci.pBindings = bindings;
+    if (impl_->vkCreateDescriptorSetLayout(impl_->device, &dsl_ci, nullptr, &ds_layout) != kVkSuccess) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkCreateDescriptorSetLayout(indirect compute) failed");
+    }
+
+    VkPipelineLayoutCreateInfo pl_ci{};
+    pl_ci.sType = kVkStypePipelineLayoutCreateInfo;
+    pl_ci.setLayoutCount = 1;
+    pl_ci.pSetLayouts = &ds_layout;
+    if (impl_->vkCreatePipelineLayout(impl_->device, &pl_ci, nullptr, &pipe_layout) != kVkSuccess) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkCreatePipelineLayout(indirect compute) failed");
+    }
+
+    VkComputePipelineCreateInfo cp_ci{};
+    cp_ci.sType = kVkStypeComputePipelineCreateInfo;
+    cp_ci.stage.sType = kVkStypePipelineShaderStageCreateInfo;
+    cp_ci.stage.stage = kVkShaderStageComputeBit;
+    cp_ci.stage.module = shader_mod;
+    cp_ci.stage.pName = spv_info.entry_point_name.c_str();
+    cp_ci.layout = pipe_layout;
+    cp_ci.basePipelineIndex = -1;
+    if (impl_->vkCreateComputePipelines(impl_->device, kVkNullHandle, 1, &cp_ci, nullptr, &pipeline) != kVkSuccess) {
+        cleanup();
+        return Status::Error(StatusCode::ShaderError, "vkCreateComputePipelines(indirect compute) failed");
+    }
+
+    VkDescriptorPoolSize pool_size{kVkDescriptorTypeStorageBuffer, 2};
+    VkDescriptorPoolCreateInfo dp_ci{};
+    dp_ci.sType = kVkStypeDescriptorPoolCreateInfo;
+    dp_ci.maxSets = 1;
+    dp_ci.poolSizeCount = 1;
+    dp_ci.pPoolSizes = &pool_size;
+    if (impl_->vkCreateDescriptorPool(impl_->device, &dp_ci, nullptr, &desc_pool) != kVkSuccess) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkCreateDescriptorPool(indirect compute) failed");
+    }
+
+    VkDescriptorSet desc_set = kVkNullHandle;
+    VkDescriptorSetAllocateInfo dsa_ci{};
+    dsa_ci.sType = kVkStypeDescriptorSetAllocateInfo;
+    dsa_ci.descriptorPool = desc_pool;
+    dsa_ci.descriptorSetCount = 1;
+    dsa_ci.pSetLayouts = &ds_layout;
+    if (impl_->vkAllocateDescriptorSets(impl_->device, &dsa_ci, &desc_set) != kVkSuccess) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkAllocateDescriptorSets(indirect compute) failed");
+    }
+
+    VkDescriptorBufferInfo in_binfo{in_buf, 0, byte_size};
+    VkDescriptorBufferInfo out_binfo{out_buf, 0, byte_size};
+    VkWriteDescriptorSet writes[2]{};
+    writes[0].sType = kVkStypeWriteDescriptorSet;
+    writes[0].dstSet = desc_set;
+    writes[0].dstBinding = 0;
+    writes[0].descriptorCount = 1;
+    writes[0].descriptorType = kVkDescriptorTypeStorageBuffer;
+    writes[0].pBufferInfo = &in_binfo;
+    writes[1].sType = kVkStypeWriteDescriptorSet;
+    writes[1].dstSet = desc_set;
+    writes[1].dstBinding = 1;
+    writes[1].descriptorCount = 1;
+    writes[1].descriptorType = kVkDescriptorTypeStorageBuffer;
+    writes[1].pBufferInfo = &out_binfo;
+    impl_->vkUpdateDescriptorSets(impl_->device, 2, writes, 0, nullptr);
+
+    VkCommandBufferAllocateInfo cba_ci{};
+    cba_ci.sType = kVkStypeCommandBufferAllocateInfo;
+    cba_ci.commandPool = impl_->command_pool;
+    cba_ci.level = kVkCommandBufferLevelPrimary;
+    cba_ci.commandBufferCount = 1;
+    if (impl_->vkAllocateCommandBuffers(impl_->device, &cba_ci, &cmd_buf) != kVkSuccess || !cmd_buf) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkAllocateCommandBuffers(indirect compute) failed");
+    }
+    VkCommandBufferBeginInfo begin_info{};
+    begin_info.sType = kVkStypeCommandBufferBeginInfo;
+    begin_info.flags = kVkCommandBufferUsageOneTimeSubmitBit;
+    if (impl_->vkBeginCommandBuffer(cmd_buf, &begin_info) != kVkSuccess) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkBeginCommandBuffer(indirect compute) failed");
+    }
+
+    impl_->vkCmdBindPipeline(cmd_buf, kVkPipelineBindPointCompute, pipeline);
+    impl_->vkCmdBindDescriptorSets(cmd_buf, kVkPipelineBindPointCompute, pipe_layout, 0, 1, &desc_set, 0, nullptr);
+    impl_->vkCmdDispatchIndirect(cmd_buf, arg_buf, desc.argument_buffer_offset);
+
+    VkBufferMemoryBarrier out_barrier{};
+    out_barrier.sType = kVkStypeBufferMemoryBarrier;
+    out_barrier.srcAccessMask = kVkAccessShaderWriteBit;
+    out_barrier.dstAccessMask = kVkAccessHostReadBit;
+    out_barrier.srcQueueFamilyIndex = kVkQueueFamilyIgnored;
+    out_barrier.dstQueueFamilyIndex = kVkQueueFamilyIgnored;
+    out_barrier.buffer = out_buf;
+    out_barrier.offset = 0;
+    out_barrier.size = byte_size;
+    impl_->vkCmdPipelineBarrier(cmd_buf, kVkPipelineStageComputeShaderBit, kVkPipelineStageHostBit,
+                                0, 0, nullptr, 1, &out_barrier, 0, nullptr);
+
+    if (impl_->vkEndCommandBuffer(cmd_buf) != kVkSuccess) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkEndCommandBuffer(indirect compute) failed");
+    }
+    VkSubmitInfo submit_info{};
+    submit_info.sType = kVkStypeSubmitInfo;
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &cmd_buf;
+    if (impl_->vkQueueSubmit(impl_->compute_queue, 1, &submit_info, kVkNullHandle) != kVkSuccess ||
+        impl_->vkQueueWaitIdle(impl_->compute_queue) != kVkSuccess) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkQueueSubmit(indirect compute) failed");
+    }
+
+    void* mapped = nullptr;
+    if (impl_->vkMapMemory(impl_->device, out_mem, 0, byte_size, 0, &mapped) != kVkSuccess || !mapped) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkMapMemory(indirect compute) failed");
+    }
+    if (!out_coh) {
+        VkMappedMemoryRange rng{kVkStypeMappedMemoryRange, nullptr, out_mem, 0, kVkWholeSize};
+        impl_->vkInvalidateMappedMemoryRanges(impl_->device, 1, &rng);
+    }
+    std::memcpy(out_result.output_u32.data(), mapped, static_cast<size_t>(byte_size));
+    impl_->vkUnmapMemory(impl_->device, out_mem);
+    cleanup();
+
+    out_result.executed_on_vulkan_icd = true;
+    return Status::Ok();
+}
+
+Status VulkanBackend::ExecuteDynamicRenderingMultiPass(
+    const VulkanDynamicRenderingMultiPassDesc& desc,
+    VulkanDynamicRenderingMultiPassResult& out_result) {
+    out_result = VulkanDynamicRenderingMultiPassResult{};
+    if (!IsInitialized()) {
+        return Status::Error(StatusCode::DeviceError, "VulkanBackend is not initialized");
+    }
+    if (desc.width == 0u || desc.height == 0u || desc.passes.empty()) {
+        return Status::Error(StatusCode::InvalidArgument,
+                             "ExecuteDynamicRenderingMultiPass: invalid dimensions or empty passes");
+    }
+    for (const auto& p : desc.passes) {
+        if (auto st = ValidateSpirvBinary(p.vertex_spirv); !st.ok()) return st;
+        if (auto st = ValidateSpirvBinary(p.fragment_spirv); !st.ok()) return st;
+    }
+
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    if (impl_->fallback_mode || !impl_->device || !impl_->has_graphics_queue) {
+        out_result.framebuffer.width = desc.width;
+        out_result.framebuffer.height = desc.height;
+        out_result.framebuffer.pixels.assign(static_cast<size_t>(desc.width) * desc.height * 4u, 0u);
+        out_result.passes_executed = static_cast<uint32_t>(desc.passes.size());
+        out_result.fnv1a_hash = out_result.framebuffer.ComputeFnv1aHash();
+        out_result.executed_on_vulkan_icd = false;
+        out_result.used_vk_cmd_begin_rendering = false;
+        return Status::Ok();
+    }
+
+    const bool use_dyn_rendering =
+        impl_->dynamic_rendering_enabled &&
+        impl_->vkCmdBeginRendering != nullptr &&
+        impl_->vkCmdEndRendering != nullptr;
+    const int32_t vk_fmt = static_cast<int32_t>(desc.color_format);
+    const uint32_t samples = desc.enable_msaa_4x ? kVkSampleCount4Bit : kVkSampleCount1Bit;
+
+    // Choose supported hardware depth resolve mode for MSAA depth targets.
+    uint32_t vk_depth_resolve_mode = kVkResolveModeNone;
+    VulkanDepthResolveMode eff_depth_mode = VulkanDepthResolveMode::None;
+    if (desc.enable_msaa_4x && desc.enable_depth && desc.depth_resolve_mode != VulkanDepthResolveMode::None) {
+        const uint32_t req_bit = static_cast<uint32_t>(desc.depth_resolve_mode);
+        if ((impl_->supported_depth_resolve_modes & req_bit) != 0u) {
+            vk_depth_resolve_mode = req_bit;
+            eff_depth_mode = desc.depth_resolve_mode;
+        } else if ((impl_->supported_depth_resolve_modes & kVkResolveModeSampleZeroBit) != 0u) {
+            vk_depth_resolve_mode = kVkResolveModeSampleZeroBit;
+            eff_depth_mode = VulkanDepthResolveMode::SampleZero;
+        }
+    }
+
+    VkImage color_img = kVkNullHandle, color_resolve_img = kVkNullHandle;
+    VkImage depth_img = kVkNullHandle, depth_resolve_img = kVkNullHandle;
+    VkDeviceMemory color_mem = kVkNullHandle, color_resolve_mem = kVkNullHandle;
+    VkDeviceMemory depth_mem = kVkNullHandle, depth_resolve_mem = kVkNullHandle;
+    VkImageView color_view = kVkNullHandle, color_resolve_view = kVkNullHandle;
+    VkImageView depth_view = kVkNullHandle, depth_resolve_view = kVkNullHandle;
+    VkBuffer color_rb = kVkNullHandle, depth_rb = kVkNullHandle;
+    VkDeviceMemory color_rb_mem = kVkNullHandle, depth_rb_mem = kVkNullHandle;
+    VkCommandBuffer cmd = nullptr;
+
+    struct PassGpu {
+        VkBuffer vb = kVkNullHandle, ib = kVkNullHandle;
+        VkDeviceMemory vb_mem = kVkNullHandle, ib_mem = kVkNullHandle;
+        VkShaderModule vs = kVkNullHandle, fs = kVkNullHandle;
+        VkPipelineLayout pipe_layout = kVkNullHandle;
+        VkPipeline pipeline = kVkNullHandle;
+        VkRenderPass fallback_rp = kVkNullHandle;
+        VkFramebuffer fallback_fb = kVkNullHandle;
+        uint32_t pc_size = 0u;
+    };
+    std::vector<PassGpu> pass_gpus(desc.passes.size());
+
+    auto cleanup = [&]() {
+        if (cmd) { impl_->vkFreeCommandBuffers(impl_->device, impl_->graphics_command_pool, 1, &cmd); cmd = nullptr; }
+        for (auto& pg : pass_gpus) {
+            if (pg.fallback_fb != kVkNullHandle) impl_->vkDestroyFramebuffer(impl_->device, pg.fallback_fb, nullptr);
+            if (pg.fallback_rp != kVkNullHandle) impl_->vkDestroyRenderPass(impl_->device, pg.fallback_rp, nullptr);
+            if (pg.pipeline != kVkNullHandle) impl_->vkDestroyPipeline(impl_->device, pg.pipeline, nullptr);
+            if (pg.pipe_layout != kVkNullHandle) impl_->vkDestroyPipelineLayout(impl_->device, pg.pipe_layout, nullptr);
+            if (pg.fs != kVkNullHandle) impl_->vkDestroyShaderModule(impl_->device, pg.fs, nullptr);
+            if (pg.vs != kVkNullHandle) impl_->vkDestroyShaderModule(impl_->device, pg.vs, nullptr);
+            if (pg.ib != kVkNullHandle) impl_->vkDestroyBuffer(impl_->device, pg.ib, nullptr);
+            if (pg.ib_mem != kVkNullHandle) impl_->vkFreeMemory(impl_->device, pg.ib_mem, nullptr);
+            if (pg.vb != kVkNullHandle) impl_->vkDestroyBuffer(impl_->device, pg.vb, nullptr);
+            if (pg.vb_mem != kVkNullHandle) impl_->vkFreeMemory(impl_->device, pg.vb_mem, nullptr);
+        }
+        if (depth_rb != kVkNullHandle) impl_->vkDestroyBuffer(impl_->device, depth_rb, nullptr);
+        if (depth_rb_mem != kVkNullHandle) impl_->vkFreeMemory(impl_->device, depth_rb_mem, nullptr);
+        if (color_rb != kVkNullHandle) impl_->vkDestroyBuffer(impl_->device, color_rb, nullptr);
+        if (color_rb_mem != kVkNullHandle) impl_->vkFreeMemory(impl_->device, color_rb_mem, nullptr);
+        if (depth_resolve_view != kVkNullHandle) impl_->vkDestroyImageView(impl_->device, depth_resolve_view, nullptr);
+        if (depth_view != kVkNullHandle) impl_->vkDestroyImageView(impl_->device, depth_view, nullptr);
+        if (color_resolve_view != kVkNullHandle) impl_->vkDestroyImageView(impl_->device, color_resolve_view, nullptr);
+        if (color_view != kVkNullHandle) impl_->vkDestroyImageView(impl_->device, color_view, nullptr);
+        if (depth_resolve_img != kVkNullHandle) impl_->vkDestroyImage(impl_->device, depth_resolve_img, nullptr);
+        if (depth_resolve_mem != kVkNullHandle) impl_->vkFreeMemory(impl_->device, depth_resolve_mem, nullptr);
+        if (depth_img != kVkNullHandle) impl_->vkDestroyImage(impl_->device, depth_img, nullptr);
+        if (depth_mem != kVkNullHandle) impl_->vkFreeMemory(impl_->device, depth_mem, nullptr);
+        if (color_resolve_img != kVkNullHandle) impl_->vkDestroyImage(impl_->device, color_resolve_img, nullptr);
+        if (color_resolve_mem != kVkNullHandle) impl_->vkFreeMemory(impl_->device, color_resolve_mem, nullptr);
+        if (color_img != kVkNullHandle) impl_->vkDestroyImage(impl_->device, color_img, nullptr);
+        if (color_mem != kVkNullHandle) impl_->vkFreeMemory(impl_->device, color_mem, nullptr);
+    };
+
+    auto make_view = [&](VkImage img, int32_t fmt, VkFlags aspect, VkImageView& out_v) -> Status {
+        VkImageViewCreateInfo iv{};
+        iv.sType = kVkStypeImageViewCreateInfo;
+        iv.image = img;
+        iv.viewType = kVkImageViewType2D;
+        iv.format = fmt;
+        iv.subresourceRange = {aspect, 0, 1, 0, 1};
+        if (impl_->vkCreateImageView(impl_->device, &iv, nullptr, &out_v) != kVkSuccess) {
+            return Status::Error(StatusCode::DeviceError, "vkCreateImageView(dynamic rendering) failed");
+        }
+        return Status::Ok();
+    };
+
+    Status st = impl_->CreateDeviceImage(
+        kVkImageType2D, vk_fmt, desc.width, desc.height, 1, 1, samples,
+        kVkImageUsageColorAttachmentBit | kVkImageUsageTransferSrcBit, color_img, color_mem);
+    if (!st.ok()) { cleanup(); return st; }
+    st = make_view(color_img, vk_fmt, kVkImageAspectColorBit, color_view);
+    if (!st.ok()) { cleanup(); return st; }
+
+    if (desc.enable_msaa_4x) {
+        st = impl_->CreateDeviceImage(
+            kVkImageType2D, vk_fmt, desc.width, desc.height, 1, 1, kVkSampleCount1Bit,
+            kVkImageUsageColorAttachmentBit | kVkImageUsageTransferDstBit | kVkImageUsageTransferSrcBit,
+            color_resolve_img, color_resolve_mem);
+        if (!st.ok()) { cleanup(); return st; }
+        st = make_view(color_resolve_img, vk_fmt, kVkImageAspectColorBit, color_resolve_view);
+        if (!st.ok()) { cleanup(); return st; }
+    }
+
+    if (desc.enable_depth) {
+        const VkFlags depth_usage = kVkImageUsageDepthStencilAttachmentBit |
+                                    (desc.enable_msaa_4x ? 0u : kVkImageUsageTransferSrcBit);
+        st = impl_->CreateDeviceImage(
+            kVkImageType2D, kVkFormatD32Sfloat, desc.width, desc.height, 1, 1, samples,
+            depth_usage, depth_img, depth_mem);
+        if (!st.ok()) { cleanup(); return st; }
+        st = make_view(depth_img, kVkFormatD32Sfloat, kVkImageAspectDepthBit, depth_view);
+        if (!st.ok()) { cleanup(); return st; }
+
+        if (desc.enable_msaa_4x && use_dyn_rendering && vk_depth_resolve_mode != kVkResolveModeNone) {
+            st = impl_->CreateDeviceImage(
+                kVkImageType2D, kVkFormatD32Sfloat, desc.width, desc.height, 1, 1, kVkSampleCount1Bit,
+                kVkImageUsageDepthStencilAttachmentBit | kVkImageUsageTransferSrcBit,
+                depth_resolve_img, depth_resolve_mem);
+            if (!st.ok()) { cleanup(); return st; }
+            st = make_view(depth_resolve_img, kVkFormatD32Sfloat, kVkImageAspectDepthBit, depth_resolve_view);
+            if (!st.ok()) { cleanup(); return st; }
+        }
+    }
+
+    const VkDeviceSize color_rb_bytes =
+        static_cast<VkDeviceSize>(desc.width) * desc.height * BytesPerTexel(desc.color_format);
+    bool color_rb_coh = true, depth_rb_coh = true;
+    st = impl_->CreateHostBuffer(color_rb_bytes, kVkBufferUsageTransferDstBit, color_rb, color_rb_mem, color_rb_coh);
+    if (!st.ok()) { cleanup(); return st; }
+
+    const bool do_depth_readback =
+        desc.enable_depth && desc.readback_depth &&
+        (!desc.enable_msaa_4x || (depth_resolve_img != kVkNullHandle));
+    const VkDeviceSize depth_rb_bytes =
+        static_cast<VkDeviceSize>(desc.width) * desc.height * sizeof(float);
+    if (do_depth_readback) {
+        st = impl_->CreateHostBuffer(depth_rb_bytes, kVkBufferUsageTransferDstBit, depth_rb, depth_rb_mem, depth_rb_coh);
+        if (!st.ok()) { cleanup(); return st; }
+    }
+
+    for (size_t pi = 0u; pi < desc.passes.size(); ++pi) {
+        const auto& p = desc.passes[pi];
+        auto& pg = pass_gpus[pi];
+        bool vb_coh = true, ib_coh = true;
+        if (!p.vertex_buffer_bytes.empty()) {
+            st = impl_->CreateHostBuffer(p.vertex_buffer_bytes.size(), kVkBufferUsageVertexBufferBit,
+                                         pg.vb, pg.vb_mem, vb_coh,
+                                         p.vertex_buffer_bytes.data(), p.vertex_buffer_bytes.size());
+            if (!st.ok()) { cleanup(); return st; }
+        }
+        if (!p.index_buffer_u32.empty()) {
+            st = impl_->CreateHostBuffer(p.index_buffer_u32.size() * sizeof(uint32_t), kVkBufferUsageIndexBufferBit,
+                                         pg.ib, pg.ib_mem, ib_coh,
+                                         p.index_buffer_u32.data(), p.index_buffer_u32.size() * sizeof(uint32_t));
+            if (!st.ok()) { cleanup(); return st; }
+        }
+
+        VkShaderModuleCreateInfo vsm{kVkStypeShaderModuleCreateInfo, nullptr, 0u,
+                                     p.vertex_spirv.size() * sizeof(uint32_t), p.vertex_spirv.data()};
+        VkShaderModuleCreateInfo fsm{kVkStypeShaderModuleCreateInfo, nullptr, 0u,
+                                     p.fragment_spirv.size() * sizeof(uint32_t), p.fragment_spirv.data()};
+        if (impl_->vkCreateShaderModule(impl_->device, &vsm, nullptr, &pg.vs) != kVkSuccess ||
+            impl_->vkCreateShaderModule(impl_->device, &fsm, nullptr, &pg.fs) != kVkSuccess) {
+            cleanup();
+            return Status::Error(StatusCode::ShaderError, "vkCreateShaderModule(dynamic rendering) failed");
+        }
+
+        pg.pc_size = std::min<uint32_t>(
+            static_cast<uint32_t>((p.push_constants.size() + 3u) & ~3u),
+            impl_->max_push_constants_size);
+        VkPushConstantRange pc_range{kVkShaderStageAllGraphics, 0u, pg.pc_size};
+        VkPipelineLayoutCreateInfo pl_ci{};
+        pl_ci.sType = kVkStypePipelineLayoutCreateInfo;
+        pl_ci.pushConstantRangeCount = (pg.pc_size > 0u) ? 1u : 0u;
+        pl_ci.pPushConstantRanges = (pg.pc_size > 0u) ? &pc_range : nullptr;
+        if (impl_->vkCreatePipelineLayout(impl_->device, &pl_ci, nullptr, &pg.pipe_layout) != kVkSuccess) {
+            cleanup();
+            return Status::Error(StatusCode::DeviceError, "vkCreatePipelineLayout(dynamic rendering) failed");
+        }
+
+        if (!use_dyn_rendering) {
+            VkAttachmentDescription atts[2]{};
+            atts[0].format = vk_fmt;
+            atts[0].samples = samples;
+            atts[0].loadOp = p.clear_color_on_load ? kVkAttachmentLoadOpClear : kVkAttachmentLoadOpLoad;
+            atts[0].storeOp = kVkAttachmentStoreOpStore;
+            atts[0].stencilLoadOp = kVkAttachmentLoadOpDontCare;
+            atts[0].stencilStoreOp = kVkAttachmentStoreOpDontCare;
+            atts[0].initialLayout = (pi == 0u && p.clear_color_on_load) ? kVkImageLayoutUndefined : kVkImageLayoutColorAttachmentOptimal;
+            atts[0].finalLayout = kVkImageLayoutColorAttachmentOptimal;
+            VkAttachmentReference cref{0, kVkImageLayoutColorAttachmentOptimal};
+            VkAttachmentReference dref{1, kVkImageLayoutDepthStencilAttachmentOptimal};
+            if (desc.enable_depth) {
+                atts[1].format = kVkFormatD32Sfloat;
+                atts[1].samples = samples;
+                atts[1].loadOp = p.clear_depth_on_load ? kVkAttachmentLoadOpClear : kVkAttachmentLoadOpLoad;
+                atts[1].storeOp = kVkAttachmentStoreOpStore;
+                atts[1].stencilLoadOp = kVkAttachmentLoadOpDontCare;
+                atts[1].stencilStoreOp = kVkAttachmentStoreOpDontCare;
+                atts[1].initialLayout = (pi == 0u && p.clear_depth_on_load) ? kVkImageLayoutUndefined : kVkImageLayoutDepthStencilAttachmentOptimal;
+                atts[1].finalLayout = kVkImageLayoutDepthStencilAttachmentOptimal;
+            }
+            VkSubpassDescription sp{};
+            sp.pipelineBindPoint = kVkPipelineBindPointGraphics;
+            sp.colorAttachmentCount = 1;
+            sp.pColorAttachments = &cref;
+            sp.pDepthStencilAttachment = desc.enable_depth ? &dref : nullptr;
+            VkRenderPassCreateInfo rp_ci{};
+            rp_ci.sType = kVkStypeRenderPassCreateInfo;
+            rp_ci.attachmentCount = desc.enable_depth ? 2u : 1u;
+            rp_ci.pAttachments = atts;
+            rp_ci.subpassCount = 1;
+            rp_ci.pSubpasses = &sp;
+            if (impl_->vkCreateRenderPass(impl_->device, &rp_ci, nullptr, &pg.fallback_rp) != kVkSuccess) {
+                cleanup();
+                return Status::Error(StatusCode::DeviceError, "vkCreateRenderPass(multipass fallback) failed");
+            }
+            VkImageView fb_views[2] = {color_view, depth_view};
+            VkFramebufferCreateInfo fb_ci{};
+            fb_ci.sType = kVkStypeFramebufferCreateInfo;
+            fb_ci.renderPass = pg.fallback_rp;
+            fb_ci.attachmentCount = desc.enable_depth ? 2u : 1u;
+            fb_ci.pAttachments = fb_views;
+            fb_ci.width = desc.width;
+            fb_ci.height = desc.height;
+            fb_ci.layers = 1;
+            if (impl_->vkCreateFramebuffer(impl_->device, &fb_ci, nullptr, &pg.fallback_fb) != kVkSuccess) {
+                cleanup();
+                return Status::Error(StatusCode::DeviceError, "vkCreateFramebuffer(multipass fallback) failed");
+            }
+        }
+
+        VkPipelineShaderStageCreateInfo stages[2]{};
+        stages[0].sType = kVkStypePipelineShaderStageCreateInfo;
+        stages[0].stage = kVkShaderStageVertexBit;
+        stages[0].module = pg.vs;
+        stages[0].pName = p.vertex_entry.c_str();
+        stages[1].sType = kVkStypePipelineShaderStageCreateInfo;
+        stages[1].stage = kVkShaderStageFragmentBit;
+        stages[1].module = pg.fs;
+        stages[1].pName = p.fragment_entry.c_str();
+
+        VkVertexInputBindingDescription vb_desc{};
+        std::vector<VkVertexInputAttributeDescription> vk_attrs;
+        VkPipelineVertexInputStateCreateInfo vi_ci{};
+        vi_ci.sType = kVkStypePipelineVertexInputStateCreateInfo;
+        if (!p.vertex_attributes.empty() && p.vertex_stride > 0u) {
+            vb_desc = {0u, p.vertex_stride, kVkVertexInputRateVertex};
+            for (const auto& a : p.vertex_attributes) {
+                vk_attrs.push_back({a.location, a.binding, static_cast<int32_t>(a.format), a.offset});
+            }
+            vi_ci.vertexBindingDescriptionCount = 1;
+            vi_ci.pVertexBindingDescriptions = &vb_desc;
+            vi_ci.vertexAttributeDescriptionCount = static_cast<uint32_t>(vk_attrs.size());
+            vi_ci.pVertexAttributeDescriptions = vk_attrs.data();
+        }
+
+        VkPipelineInputAssemblyStateCreateInfo ia_ci{};
+        ia_ci.sType = kVkStypePipelineInputAssemblyStateCreateInfo;
+        ia_ci.topology = kVkPrimitiveTopologyTriangleList;
+        VkPipelineViewportStateCreateInfo vp_ci{};
+        vp_ci.sType = kVkStypePipelineViewportStateCreateInfo;
+        vp_ci.viewportCount = 1;
+        vp_ci.scissorCount = 1;
+        VkPipelineRasterizationStateCreateInfo rs_ci{};
+        rs_ci.sType = kVkStypePipelineRasterizationStateCreateInfo;
+        rs_ci.polygonMode = kVkPolygonModeFill;
+        rs_ci.cullMode = kVkCullModeNone;
+        rs_ci.frontFace = kVkFrontFaceCounterClockwise;
+        rs_ci.lineWidth = 1.0f;
+        VkPipelineMultisampleStateCreateInfo ms_ci{};
+        ms_ci.sType = kVkStypePipelineMultisampleStateCreateInfo;
+        ms_ci.rasterizationSamples = samples;
+        VkPipelineDepthStencilStateCreateInfo ds_ci{};
+        ds_ci.sType = kVkStypePipelineDepthStencilStateCreateInfo;
+        ds_ci.depthTestEnable = (desc.enable_depth && p.depth_test) ? 1u : 0u;
+        ds_ci.depthWriteEnable = (desc.enable_depth && p.depth_write) ? 1u : 0u;
+        ds_ci.depthCompareOp = kVkCompareOpLess;
+        VkPipelineColorBlendAttachmentState cb_att{};
+        cb_att.colorWriteMask = 0xFu;
+        VkPipelineColorBlendStateCreateInfo cb_ci{};
+        cb_ci.sType = kVkStypePipelineColorBlendStateCreateInfo;
+        cb_ci.attachmentCount = 1;
+        cb_ci.pAttachments = &cb_att;
+        const int32_t dyn_states[2] = {kVkDynamicStateViewport, kVkDynamicStateScissor};
+        VkPipelineDynamicStateCreateInfo dyn_ci{};
+        dyn_ci.sType = kVkStypePipelineDynamicStateCreateInfo;
+        dyn_ci.dynamicStateCount = 2;
+        dyn_ci.pDynamicStates = dyn_states;
+
+        VkPipelineRenderingCreateInfo pr_ci{};
+        pr_ci.sType = kVkStypePipelineRenderingCreateInfo;
+        pr_ci.colorAttachmentCount = 1u;
+        pr_ci.pColorAttachmentFormats = &vk_fmt;
+        pr_ci.depthAttachmentFormat = desc.enable_depth ? kVkFormatD32Sfloat : 0;
+        pr_ci.stencilAttachmentFormat = 0;
+
+        VkGraphicsPipelineCreateInfo gp_ci{};
+        gp_ci.sType = kVkStypeGraphicsPipelineCreateInfo;
+        gp_ci.pNext = use_dyn_rendering ? static_cast<const void*>(&pr_ci) : nullptr;
+        gp_ci.stageCount = 2u;
+        gp_ci.pStages = stages;
+        gp_ci.pVertexInputState = &vi_ci;
+        gp_ci.pInputAssemblyState = &ia_ci;
+        gp_ci.pViewportState = &vp_ci;
+        gp_ci.pRasterizationState = &rs_ci;
+        gp_ci.pMultisampleState = &ms_ci;
+        gp_ci.pDepthStencilState = desc.enable_depth ? &ds_ci : nullptr;
+        gp_ci.pColorBlendState = &cb_ci;
+        gp_ci.pDynamicState = &dyn_ci;
+        gp_ci.layout = pg.pipe_layout;
+        gp_ci.renderPass = use_dyn_rendering ? kVkNullHandle : pg.fallback_rp;
+        gp_ci.subpass = 0;
+        gp_ci.basePipelineIndex = -1;
+        if (impl_->vkCreateGraphicsPipelines(impl_->device, kVkNullHandle, 1, &gp_ci, nullptr, &pg.pipeline) != kVkSuccess) {
+            cleanup();
+            return Status::Error(StatusCode::ShaderError, "vkCreateGraphicsPipelines(dynamic rendering) failed");
+        }
+    }
+
+    VkCommandBufferAllocateInfo cba{};
+    cba.sType = kVkStypeCommandBufferAllocateInfo;
+    cba.commandPool = impl_->graphics_command_pool;
+    cba.level = kVkCommandBufferLevelPrimary;
+    cba.commandBufferCount = 1;
+    if (impl_->vkAllocateCommandBuffers(impl_->device, &cba, &cmd) != kVkSuccess || !cmd) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkAllocateCommandBuffers(dynamic rendering) failed");
+    }
+    VkCommandBufferBeginInfo cbi{};
+    cbi.sType = kVkStypeCommandBufferBeginInfo;
+    cbi.flags = kVkCommandBufferUsageOneTimeSubmitBit;
+    if (impl_->vkBeginCommandBuffer(cmd, &cbi) != kVkSuccess) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkBeginCommandBuffer(dynamic rendering) failed");
+    }
+
+    // Transition attachments to optimal attachment layouts before Pass 0.
+    impl_->CmdImageBarrier(cmd, color_img, kVkImageAspectColorBit,
+                           kVkImageLayoutUndefined, kVkImageLayoutColorAttachmentOptimal,
+                           kVkPipelineStageTopOfPipeBit, kVkPipelineStageColorAttachmentOutputBit,
+                           0u, kVkAccessColorAttachmentWriteBit);
+    if (color_resolve_img != kVkNullHandle && use_dyn_rendering) {
+        impl_->CmdImageBarrier(cmd, color_resolve_img, kVkImageAspectColorBit,
+                               kVkImageLayoutUndefined, kVkImageLayoutColorAttachmentOptimal,
+                               kVkPipelineStageTopOfPipeBit, kVkPipelineStageColorAttachmentOutputBit,
+                               0u, kVkAccessColorAttachmentWriteBit);
+    }
+    if (depth_img != kVkNullHandle) {
+        impl_->CmdImageBarrier(cmd, depth_img, kVkImageAspectDepthBit,
+                               kVkImageLayoutUndefined, kVkImageLayoutDepthStencilAttachmentOptimal,
+                               kVkPipelineStageTopOfPipeBit,
+                               kVkPipelineStageEarlyFragmentTestsBit | kVkPipelineStageLateFragmentTestsBit,
+                               0u, kVkAccessDepthStencilAttachmentWriteBit);
+    }
+    if (depth_resolve_img != kVkNullHandle && use_dyn_rendering) {
+        impl_->CmdImageBarrier(cmd, depth_resolve_img, kVkImageAspectDepthBit,
+                               kVkImageLayoutUndefined, kVkImageLayoutDepthStencilAttachmentOptimal,
+                               kVkPipelineStageTopOfPipeBit,
+                               kVkPipelineStageEarlyFragmentTestsBit | kVkPipelineStageLateFragmentTestsBit,
+                               0u, kVkAccessDepthStencilAttachmentWriteBit);
+    }
+
+    VkViewport vp{0.0f, 0.0f, static_cast<float>(desc.width), static_cast<float>(desc.height), 0.0f, 1.0f};
+    VkRect2D sc{{0, 0}, {desc.width, desc.height}};
+
+    for (size_t pi = 0u; pi < desc.passes.size(); ++pi) {
+        const auto& p = desc.passes[pi];
+        const auto& pg = pass_gpus[pi];
+        const bool is_last_pass = (pi + 1u == desc.passes.size());
+
+        if (pi > 0u) {
+            // Inter-pass dependency barrier preserving color + depth written by prior pass.
+            impl_->CmdImageBarrier(cmd, color_img, kVkImageAspectColorBit,
+                                   kVkImageLayoutColorAttachmentOptimal, kVkImageLayoutColorAttachmentOptimal,
+                                   kVkPipelineStageColorAttachmentOutputBit, kVkPipelineStageColorAttachmentOutputBit,
+                                   kVkAccessColorAttachmentWriteBit,
+                                   kVkAccessColorAttachmentReadBit | kVkAccessColorAttachmentWriteBit);
+            if (depth_img != kVkNullHandle) {
+                impl_->CmdImageBarrier(
+                    cmd, depth_img, kVkImageAspectDepthBit,
+                    kVkImageLayoutDepthStencilAttachmentOptimal, kVkImageLayoutDepthStencilAttachmentOptimal,
+                    kVkPipelineStageEarlyFragmentTestsBit | kVkPipelineStageLateFragmentTestsBit,
+                    kVkPipelineStageEarlyFragmentTestsBit | kVkPipelineStageLateFragmentTestsBit,
+                    kVkAccessDepthStencilAttachmentWriteBit,
+                    kVkAccessDepthStencilAttachmentReadBit | kVkAccessDepthStencilAttachmentWriteBit);
+            }
+        }
+
+        if (use_dyn_rendering) {
+            VkRenderingAttachmentInfo col_att{};
+            col_att.sType = kVkStypeRenderingAttachmentInfo;
+            col_att.imageView = color_view;
+            col_att.imageLayout = kVkImageLayoutColorAttachmentOptimal;
+            col_att.loadOp = p.clear_color_on_load ? kVkAttachmentLoadOpClear : kVkAttachmentLoadOpLoad;
+            col_att.storeOp = kVkAttachmentStoreOpStore;
+            col_att.clearValue.color.float32[0] = p.clear_color[0];
+            col_att.clearValue.color.float32[1] = p.clear_color[1];
+            col_att.clearValue.color.float32[2] = p.clear_color[2];
+            col_att.clearValue.color.float32[3] = p.clear_color[3];
+            if (is_last_pass && desc.enable_msaa_4x && color_resolve_view != kVkNullHandle) {
+                col_att.resolveMode = kVkResolveModeAverageBit;
+                col_att.resolveImageView = color_resolve_view;
+                col_att.resolveImageLayout = kVkImageLayoutColorAttachmentOptimal;
+                out_result.resolved_msaa_color = true;
+            }
+
+            VkRenderingAttachmentInfo dep_att{};
+            if (desc.enable_depth) {
+                dep_att.sType = kVkStypeRenderingAttachmentInfo;
+                dep_att.imageView = depth_view;
+                dep_att.imageLayout = kVkImageLayoutDepthStencilAttachmentOptimal;
+                dep_att.loadOp = p.clear_depth_on_load ? kVkAttachmentLoadOpClear : kVkAttachmentLoadOpLoad;
+                dep_att.storeOp = kVkAttachmentStoreOpStore;
+                dep_att.clearValue.depthStencil = {p.clear_depth, 0u};
+                if (is_last_pass && desc.enable_msaa_4x &&
+                    depth_resolve_view != kVkNullHandle && vk_depth_resolve_mode != kVkResolveModeNone) {
+                    dep_att.resolveMode = vk_depth_resolve_mode;
+                    dep_att.resolveImageView = depth_resolve_view;
+                    dep_att.resolveImageLayout = kVkImageLayoutDepthStencilAttachmentOptimal;
+                    out_result.resolved_msaa_depth = true;
+                    out_result.effective_depth_resolve_mode = eff_depth_mode;
+                }
+            }
+
+            VkRenderingInfo ri{};
+            ri.sType = kVkStypeRenderingInfo;
+            ri.renderArea = {{0, 0}, {desc.width, desc.height}};
+            ri.layerCount = 1u;
+            ri.colorAttachmentCount = 1u;
+            ri.pColorAttachments = &col_att;
+            ri.pDepthAttachment = desc.enable_depth ? &dep_att : nullptr;
+            impl_->vkCmdBeginRendering(cmd, &ri);
+        } else {
+            VkClearValue cvs[2]{};
+            cvs[0].color.float32[0] = p.clear_color[0];
+            cvs[0].color.float32[1] = p.clear_color[1];
+            cvs[0].color.float32[2] = p.clear_color[2];
+            cvs[0].color.float32[3] = p.clear_color[3];
+            cvs[1].depthStencil = {p.clear_depth, 0u};
+            VkRenderPassBeginInfo rpb{};
+            rpb.sType = kVkStypeRenderPassBeginInfo;
+            rpb.renderPass = pg.fallback_rp;
+            rpb.framebuffer = pg.fallback_fb;
+            rpb.renderArea = {{0, 0}, {desc.width, desc.height}};
+            rpb.clearValueCount = desc.enable_depth ? 2u : 1u;
+            rpb.pClearValues = cvs;
+            impl_->vkCmdBeginRenderPass(cmd, &rpb, kVkSubpassContentsInline);
+        }
+
+        impl_->vkCmdSetViewport(cmd, 0, 1, &vp);
+        impl_->vkCmdSetScissor(cmd, 0, 1, &sc);
+        impl_->vkCmdBindPipeline(cmd, kVkPipelineBindPointGraphics, pg.pipeline);
+        if (pg.pc_size > 0u && !p.push_constants.empty()) {
+            std::vector<uint8_t> pc_buf(pg.pc_size, 0u);
+            std::memcpy(pc_buf.data(), p.push_constants.data(), std::min<size_t>(p.push_constants.size(), pg.pc_size));
+            impl_->vkCmdPushConstants(cmd, pg.pipe_layout, kVkShaderStageAllGraphics, 0u, pg.pc_size, pc_buf.data());
+        }
+        if (pg.vb != kVkNullHandle) {
+            const VkDeviceSize vb_off = 0;
+            impl_->vkCmdBindVertexBuffers(cmd, 0, 1, &pg.vb, &vb_off);
+        }
+        if (pg.ib != kVkNullHandle) {
+            impl_->vkCmdBindIndexBuffer(cmd, pg.ib, 0, kVkIndexTypeUint32);
+            impl_->vkCmdDrawIndexed(cmd, static_cast<uint32_t>(p.index_buffer_u32.size()), 1u, 0u, 0, 0u);
+        } else {
+            impl_->vkCmdDraw(cmd, p.vertex_count, 1u, 0u, 0u);
+        }
+
+        if (use_dyn_rendering) {
+            impl_->vkCmdEndRendering(cmd);
+        } else {
+            impl_->vkCmdEndRenderPass(cmd);
+        }
+    }
+
+    VkImage final_color_src = color_img;
+    if (desc.enable_msaa_4x) {
+        if (use_dyn_rendering && color_resolve_img != kVkNullHandle) {
+            impl_->CmdImageBarrier(cmd, color_resolve_img, kVkImageAspectColorBit,
+                                   kVkImageLayoutColorAttachmentOptimal, kVkImageLayoutTransferSrcOptimal,
+                                   kVkPipelineStageColorAttachmentOutputBit, kVkPipelineStageTransferBit,
+                                   kVkAccessColorAttachmentWriteBit, kVkAccessTransferReadBit);
+            final_color_src = color_resolve_img;
+        } else if (color_resolve_img != kVkNullHandle) {
+            impl_->CmdImageBarrier(cmd, color_img, kVkImageAspectColorBit,
+                                   kVkImageLayoutColorAttachmentOptimal, kVkImageLayoutTransferSrcOptimal,
+                                   kVkPipelineStageColorAttachmentOutputBit, kVkPipelineStageTransferBit,
+                                   kVkAccessColorAttachmentWriteBit, kVkAccessTransferReadBit);
+            impl_->CmdImageBarrier(cmd, color_resolve_img, kVkImageAspectColorBit,
+                                   kVkImageLayoutUndefined, kVkImageLayoutTransferDstOptimal,
+                                   kVkPipelineStageTopOfPipeBit, kVkPipelineStageTransferBit,
+                                   0u, kVkAccessTransferWriteBit);
+            VkImageResolve reg{};
+            reg.srcSubresource = {kVkImageAspectColorBit, 0, 0, 1};
+            reg.dstSubresource = {kVkImageAspectColorBit, 0, 0, 1};
+            reg.extent = {desc.width, desc.height, 1};
+            impl_->vkCmdResolveImage(cmd, color_img, kVkImageLayoutTransferSrcOptimal,
+                                     color_resolve_img, kVkImageLayoutTransferDstOptimal, 1, &reg);
+            impl_->CmdImageBarrier(cmd, color_resolve_img, kVkImageAspectColorBit,
+                                   kVkImageLayoutTransferDstOptimal, kVkImageLayoutTransferSrcOptimal,
+                                   kVkPipelineStageTransferBit, kVkPipelineStageTransferBit,
+                                   kVkAccessTransferWriteBit, kVkAccessTransferReadBit);
+            final_color_src = color_resolve_img;
+            out_result.resolved_msaa_color = true;
+        }
+    } else {
+        impl_->CmdImageBarrier(cmd, color_img, kVkImageAspectColorBit,
+                               kVkImageLayoutColorAttachmentOptimal, kVkImageLayoutTransferSrcOptimal,
+                               kVkPipelineStageColorAttachmentOutputBit, kVkPipelineStageTransferBit,
+                               kVkAccessColorAttachmentWriteBit, kVkAccessTransferReadBit);
+    }
+
+    VkBufferImageCopy col_copy{};
+    col_copy.imageSubresource = {kVkImageAspectColorBit, 0, 0, 1};
+    col_copy.imageExtent = {desc.width, desc.height, 1};
+    impl_->vkCmdCopyImageToBuffer(cmd, final_color_src, kVkImageLayoutTransferSrcOptimal, color_rb, 1, &col_copy);
+
+    if (do_depth_readback) {
+        VkImage final_depth_src = (desc.enable_msaa_4x && depth_resolve_img != kVkNullHandle)
+                                      ? depth_resolve_img
+                                      : depth_img;
+        impl_->CmdImageBarrier(cmd, final_depth_src, kVkImageAspectDepthBit,
+                               kVkImageLayoutDepthStencilAttachmentOptimal, kVkImageLayoutTransferSrcOptimal,
+                               kVkPipelineStageEarlyFragmentTestsBit | kVkPipelineStageLateFragmentTestsBit,
+                               kVkPipelineStageTransferBit,
+                               kVkAccessDepthStencilAttachmentWriteBit, kVkAccessTransferReadBit);
+        VkBufferImageCopy dep_copy{};
+        dep_copy.imageSubresource = {kVkImageAspectDepthBit, 0, 0, 1};
+        dep_copy.imageExtent = {desc.width, desc.height, 1};
+        impl_->vkCmdCopyImageToBuffer(cmd, final_depth_src, kVkImageLayoutTransferSrcOptimal, depth_rb, 1, &dep_copy);
+    }
+
+    VkBufferMemoryBarrier rb_bars[2]{};
+    uint32_t rb_bar_cnt = 1u;
+    rb_bars[0].sType = kVkStypeBufferMemoryBarrier;
+    rb_bars[0].srcAccessMask = kVkAccessTransferWriteBit;
+    rb_bars[0].dstAccessMask = kVkAccessHostReadBit;
+    rb_bars[0].srcQueueFamilyIndex = kVkQueueFamilyIgnored;
+    rb_bars[0].dstQueueFamilyIndex = kVkQueueFamilyIgnored;
+    rb_bars[0].buffer = color_rb;
+    rb_bars[0].offset = 0;
+    rb_bars[0].size = color_rb_bytes;
+    if (do_depth_readback) {
+        rb_bars[1].sType = kVkStypeBufferMemoryBarrier;
+        rb_bars[1].srcAccessMask = kVkAccessTransferWriteBit;
+        rb_bars[1].dstAccessMask = kVkAccessHostReadBit;
+        rb_bars[1].srcQueueFamilyIndex = kVkQueueFamilyIgnored;
+        rb_bars[1].dstQueueFamilyIndex = kVkQueueFamilyIgnored;
+        rb_bars[1].buffer = depth_rb;
+        rb_bars[1].offset = 0;
+        rb_bars[1].size = depth_rb_bytes;
+        rb_bar_cnt = 2u;
+    }
+    impl_->vkCmdPipelineBarrier(cmd, kVkPipelineStageTransferBit, kVkPipelineStageHostBit,
+                                0, 0, nullptr, rb_bar_cnt, rb_bars, 0, nullptr);
+
+    if (impl_->vkEndCommandBuffer(cmd) != kVkSuccess) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkEndCommandBuffer(dynamic rendering) failed");
+    }
+    VkSubmitInfo si{};
+    si.sType = kVkStypeSubmitInfo;
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    if (impl_->vkQueueSubmit(impl_->graphics_queue, 1, &si, kVkNullHandle) != kVkSuccess ||
+        impl_->vkQueueWaitIdle(impl_->graphics_queue) != kVkSuccess) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkQueueSubmit(dynamic rendering) failed");
+    }
+
+    void* mapped = nullptr;
+    if (impl_->vkMapMemory(impl_->device, color_rb_mem, 0, color_rb_bytes, 0, &mapped) != kVkSuccess || !mapped) {
+        cleanup();
+        return Status::Error(StatusCode::DeviceError, "vkMapMemory(dynamic rendering color) failed");
+    }
+    if (!color_rb_coh) {
+        VkMappedMemoryRange rng{kVkStypeMappedMemoryRange, nullptr, color_rb_mem, 0, kVkWholeSize};
+        impl_->vkInvalidateMappedMemoryRanges(impl_->device, 1, &rng);
+    }
+    out_result.framebuffer.width = desc.width;
+    out_result.framebuffer.height = desc.height;
+    out_result.framebuffer.pixels.resize(static_cast<size_t>(desc.width) * desc.height * 4u);
+    if (desc.color_format == VulkanImageFormat::Rgba8Unorm ||
+        desc.color_format == VulkanImageFormat::Bgra8Unorm) {
+        std::memcpy(out_result.framebuffer.pixels.data(), mapped, static_cast<size_t>(color_rb_bytes));
+    }
+    impl_->vkUnmapMemory(impl_->device, color_rb_mem);
+
+    if (do_depth_readback) {
+        void* dmapped = nullptr;
+        if (impl_->vkMapMemory(impl_->device, depth_rb_mem, 0, depth_rb_bytes, 0, &dmapped) == kVkSuccess && dmapped) {
+            if (!depth_rb_coh) {
+                VkMappedMemoryRange rng{kVkStypeMappedMemoryRange, nullptr, depth_rb_mem, 0, kVkWholeSize};
+                impl_->vkInvalidateMappedMemoryRanges(impl_->device, 1, &rng);
+            }
+            out_result.depth_readback.resize(static_cast<size_t>(desc.width) * desc.height);
+            std::memcpy(out_result.depth_readback.data(), dmapped, static_cast<size_t>(depth_rb_bytes));
+            impl_->vkUnmapMemory(impl_->device, depth_rb_mem);
+        }
+    }
+
+    cleanup();
+    out_result.fnv1a_hash = out_result.framebuffer.ComputeFnv1aHash();
+    out_result.passes_executed = static_cast<uint32_t>(desc.passes.size());
+    out_result.executed_on_vulkan_icd = true;
+    out_result.used_vk_cmd_begin_rendering = use_dyn_rendering;
     return Status::Ok();
 }
 

@@ -677,6 +677,7 @@ HRESULT STDMETHODCALLTYPE CommandListX::Reset(
         written_mirrored_vas_.clear();
         deferred_cpu_writes_.clear();
         deferred_cpu_waits_.clear();
+        deferred_state_transitions_.clear();
     }
     {
         std::lock_guard<std::mutex> lock(ext_state_mutex_);
@@ -1405,6 +1406,28 @@ void STDMETHODCALLTYPE CommandListX::ResourceBarrier(
                         emit = false;
                         break;
                     }
+                    // Sprint 16: Dedicated Copy Engine queue parity (xvalkyrie 90ef28a).
+                    // D3D12 Copy command lists only permit COMMON, COPY_SOURCE, and COPY_DEST;
+                    // filter out non-copy barrier states (e.g. RENDER_TARGET, PIXEL_SHADER_RESOURCE,
+                    // UNORDERED_ACCESS) and drop redundant COMMON->COMMON transitions cleanly.
+                    if (list_type_ == D3D12_COMMAND_LIST_TYPE_COPY) {
+                        constexpr UINT kCopyAllowedMask =
+                            static_cast<UINT>(D3D12_RESOURCE_STATE_COPY_SOURCE) |
+                            static_cast<UINT>(D3D12_RESOURCE_STATE_COPY_DEST);
+                        const UINT orig_sb = static_cast<UINT>(b.Transition.StateBefore);
+                        const UINT orig_sa = static_cast<UINT>(b.Transition.StateAfter);
+                        const UINT copy_sb = orig_sb & kCopyAllowedMask;
+                        const UINT copy_sa = orig_sa & kCopyAllowedMask;
+                        if (copy_sb != orig_sb || copy_sa != orig_sa) {
+                            b.Transition.StateBefore = static_cast<D3D12_RESOURCE_STATES>(copy_sb);
+                            b.Transition.StateAfter = static_cast<D3D12_RESOURCE_STATES>(copy_sa);
+                            if (device_x_) device_x_->RecordCopyQueueBarrierSanitized(false);
+                        }
+                        if (b.Transition.StateBefore == b.Transition.StateAfter) {
+                            emit = false;
+                            break;
+                        }
+                    }
                     // Desktop D3D12 forbids buffer-only state bits on texture resources
                     // (Xbox titles sometimes pass GENERIC_READ or VB/IB bits on textures).
                     if (!is_buffer) {
@@ -1444,9 +1467,11 @@ void STDMETHODCALLTYPE CommandListX::ResourceBarrier(
                 }
                 if (emit && b.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION &&
                     track_unified && b.Transition.pResource != nullptr) {
-                    device_x_->NotifyResourceStateTransition(
-                        b.Transition.pResource,
-                        b.Transition.StateAfter);
+                    {
+                        std::lock_guard<std::mutex> lk(aaa_rec_mutex_);
+                        deferred_state_transitions_.push_back(
+                            DeferredStateTransition{b.Transition.pResource, b.Transition.StateAfter});
+                    }
                     if ((b.Transition.StateAfter &
                          (D3D12_RESOURCE_STATE_UNORDERED_ACCESS | D3D12_RESOURCE_STATE_COPY_DEST)) != 0 ||
                         (b.Transition.StateBefore &
@@ -1470,9 +1495,11 @@ void STDMETHODCALLTYPE CommandListX::ResourceBarrier(
                     // VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT barrier on Vulkan.
                     ++global_uav_barriers;
                     if (device_x_) device_x_->RecordGlobalUavBarrier();
-                    if (list_type_ == D3D12_COMMAND_LIST_TYPE_COPY) {
-                        emit = false;
-                    }
+                }
+                if (list_type_ == D3D12_COMMAND_LIST_TYPE_COPY) {
+                    // UAV barriers are forbidden on D3D12 Copy command lists.
+                    if (device_x_) device_x_->RecordCopyQueueBarrierSanitized(true);
+                    emit = false;
                 }
                 break;
             default:
@@ -1738,7 +1765,11 @@ void CommandListX::ExecuteEnhancedBarriers(
                         const D3D12_RESOURCE_STATES before_st = BarrierAccessToLegacyState(bb.AccessBefore);
                         const D3D12_RESOURCE_STATES after_st = BarrierAccessToLegacyState(bb.AccessAfter);
                         if (track_unified) {
-                            device_x_->NotifyResourceStateTransition(host_res, after_st);
+                            {
+                                std::lock_guard<std::mutex> lk(aaa_rec_mutex_);
+                                deferred_state_transitions_.push_back(
+                                    DeferredStateTransition{host_res, after_st});
+                            }
                             ++unified_notifs;
                             uint64_t va = 0ull;
                             if (device_x_->LookupMirroredTitleVaForResource(host_res, va) && va != 0ull) {
@@ -1797,7 +1828,11 @@ void CommandListX::ExecuteEnhancedBarriers(
                         const D3D12_RESOURCE_STATES after_st =
                             BarrierLayoutToLegacyState(tb.LayoutAfter, tb.AccessAfter);
                         if (track_unified) {
-                            device_x_->NotifyResourceStateTransition(host_res, after_st);
+                            {
+                                std::lock_guard<std::mutex> lk(aaa_rec_mutex_);
+                                deferred_state_transitions_.push_back(
+                                    DeferredStateTransition{host_res, after_st});
+                            }
                             ++unified_notifs;
                             uint64_t va = 0ull;
                             if (device_x_->LookupMirroredTitleVaForResource(host_res, va) && va != 0ull) {
@@ -1914,6 +1949,9 @@ void STDMETHODCALLTYPE CommandListX::SetDescriptorHeaps(
     }
     if (device_x_) {
         device_x_->RecordBridgeHeapBind();
+        if (bound_cbv_srv_uav_heap_) {
+            device_x_->NotifyDescriptorHeapBoundOnCommandList(bound_cbv_srv_uav_heap_);
+        }
     }
     host_list_->SetDescriptorHeaps(NumDescriptorHeaps, unwrapped);
     RecordList("ID3D12GraphicsCommandListX::SetDescriptorHeaps", 28, S_OK);
@@ -1936,6 +1974,7 @@ void STDMETHODCALLTYPE CommandListX::SetGraphicsRootSignature(
 void STDMETHODCALLTYPE CommandListX::SetComputeRootDescriptorTable(
     UINT RootParameterIndex, D3D12_GPU_DESCRIPTOR_HANDLE BaseDescriptor) {
     if (device_x_) {
+        BaseDescriptor = device_x_->TranslateGpuDescriptorHandle(BaseDescriptor);
         const uint32_t sgpr_slot = (RootParameterIndex * 2u) % 14u;
         (void)device_x_->GetDescriptorBridge().SetRootSgprTablePtr(sgpr_slot, BaseDescriptor.ptr);
         device_x_->RecordBridgeTableBind();
@@ -1947,6 +1986,7 @@ void STDMETHODCALLTYPE CommandListX::SetComputeRootDescriptorTable(
 void STDMETHODCALLTYPE CommandListX::SetGraphicsRootDescriptorTable(
     UINT RootParameterIndex, D3D12_GPU_DESCRIPTOR_HANDLE BaseDescriptor) {
     if (device_x_) {
+        BaseDescriptor = device_x_->TranslateGpuDescriptorHandle(BaseDescriptor);
         const uint32_t sgpr_slot = (RootParameterIndex * 2u) % 14u;
         (void)device_x_->GetDescriptorBridge().SetRootSgprTablePtr(sgpr_slot, BaseDescriptor.ptr);
         device_x_->RecordBridgeTableBind();
@@ -2393,8 +2433,71 @@ void STDMETHODCALLTYPE CommandListX::ExecuteIndirect(
     ID3D12CommandSignature* pCommandSignature, UINT MaxCommandCount,
     ID3D12Resource* pArgumentBuffer, UINT64 ArgumentBufferOffset,
     ID3D12Resource* pCountBuffer, UINT64 CountBufferOffset) {
+    CommandSignatureXProxy* sig_proxy = TryGetCommandSignatureProxy(pCommandSignature);
+    ID3D12CommandSignature* host_sig = UnwrapCommandSignature(pCommandSignature);
     ID3D12Resource* host_arg = UnwrapResource(pArgumentBuffer);
     ID3D12Resource* host_cnt = UnwrapResource(pCountBuffer);
+
+    const bool has_count = (host_cnt != nullptr);
+    const bool has_root_consts = (sig_proxy != nullptr) && sig_proxy->HasRootConstants();
+    const bool is_dispatch_mesh = (sig_proxy != nullptr) && sig_proxy->HasDispatchMesh();
+
+    if (MaxCommandCount == 0u) {
+        if (device_x_) device_x_->RecordZeroCountNoop();
+        RecordList("ID3D12GraphicsCommandListX::ExecuteIndirect[ZeroNoop]", 59, S_OK);
+        return;
+    }
+
+    // Strict argument-buffer & alignment validation (Sprint 16 ExecuteIndirect completeness).
+    if (!pCommandSignature || !host_arg ||
+        (ArgumentBufferOffset & 3ull) != 0ull ||
+        (has_count && (CountBufferOffset & 3ull) != 0ull)) {
+        if (device_x_) {
+            device_x_->RecordExecuteIndirectStats(
+                has_count, has_root_consts, is_dispatch_mesh,
+                false, /*rejected=*/true, false, false);
+        }
+        RecordList("ID3D12GraphicsCommandListX::ExecuteIndirect[RejectedInvalid]", 59, E_INVALIDARG);
+        return;
+    }
+
+    const D3D12_RESOURCE_DESC arg_desc = host_arg->GetDesc();
+    const UINT64 arg_buf_size = (arg_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) ? arg_desc.Width : 0ull;
+    const UINT stride = (sig_proxy && sig_proxy->ByteStride() > 0u) ? sig_proxy->ByteStride() : 16u;
+    const UINT min_stride = (sig_proxy && sig_proxy->MinRequiredStride() > 0u) ? sig_proxy->MinRequiredStride() : stride;
+
+    if (arg_buf_size == 0ull || stride < min_stride || ArgumentBufferOffset + min_stride > arg_buf_size) {
+        if (device_x_) {
+            device_x_->RecordExecuteIndirectStats(
+                has_count, has_root_consts, is_dispatch_mesh,
+                false, /*rejected=*/true, false, false);
+        }
+        RecordList("ID3D12GraphicsCommandListX::ExecuteIndirect[RejectedOob]", 59, E_INVALIDARG);
+        return;
+    }
+    if (has_count) {
+        const D3D12_RESOURCE_DESC cnt_desc = host_cnt->GetDesc();
+        const UINT64 cnt_buf_size = (cnt_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) ? cnt_desc.Width : 0ull;
+        if (cnt_buf_size < 4ull || CountBufferOffset + 4ull > cnt_buf_size) {
+            if (device_x_) {
+                device_x_->RecordExecuteIndirectStats(
+                    has_count, has_root_consts, is_dispatch_mesh,
+                    false, /*rejected=*/true, false, false);
+            }
+            RecordList("ID3D12GraphicsCommandListX::ExecuteIndirect[RejectedCountOob]", 59, E_INVALIDARG);
+            return;
+        }
+    }
+
+    // Clamp MaxCommandCount to argument buffer capacity so an oversized console count never faults the GPU.
+    const UINT64 avail_bytes = arg_buf_size - ArgumentBufferOffset;
+    const UINT64 max_fit64 = 1ull + ((avail_bytes - static_cast<UINT64>(min_stride)) / static_cast<UINT64>(stride));
+    UINT effective_max_count = MaxCommandCount;
+    bool bounds_clamped = false;
+    if (static_cast<UINT64>(effective_max_count) > max_fit64) {
+        effective_max_count = static_cast<UINT>(std::min<UINT64>(max_fit64, 0xFFFFFFFFull));
+        bounds_clamped = true;
+    }
 
     // Ensure dirty CPU pages in TitleVAMirror-backed indirect argument / count buffers are flushed
     // directly into the GPU shadow buffer right before ExecuteIndirect reads them.
@@ -2421,9 +2524,250 @@ void STDMETHODCALLTYPE CommandListX::ExecuteIndirect(
         flush_indirect_buf(host_cnt);
     }
 
-    host_list_->ExecuteIndirect(
-        UnwrapCommandSignature(pCommandSignature), MaxCommandCount,
-        host_arg, ArgumentBufferOffset, host_cnt, CountBufferOffset);
+    // Translate guest GPU VAs inside indirect argument records (CBV/SRV/UAV/VB/IB addresses)
+    // when TitleVA/XMem/custom VA translation is active and the argument buffer is CPU-readable.
+    ID3D12Resource* exec_arg_buf = host_arg;
+    UINT64 exec_arg_offset = ArgumentBufferOffset;
+    bool va_translated = false;
+    if (device_x_ && sig_proxy && sig_proxy->HasGpuVaArgs() &&
+        device_x_->HasActiveGuestVaTranslation() && effective_max_count > 0u) {
+        D3D12_HEAP_PROPERTIES arg_hp{};
+        if (SUCCEEDED(host_arg->GetHeapProperties(&arg_hp, nullptr)) &&
+            arg_hp.Type == D3D12_HEAP_TYPE_UPLOAD) {
+            const UINT64 span_bytes =
+                static_cast<UINT64>(effective_max_count - 1u) * stride + min_stride;
+            void* src_map = nullptr;
+            const D3D12_RANGE rr{
+                static_cast<SIZE_T>(ArgumentBufferOffset),
+                static_cast<SIZE_T>(ArgumentBufferOffset + span_bytes)};
+            if (SUCCEEDED(host_arg->Map(0u, &rr, &src_map)) && src_map) {
+                std::vector<uint8_t> patched(static_cast<size_t>(span_bytes));
+                std::memcpy(patched.data(),
+                            static_cast<const uint8_t*>(src_map) + ArgumentBufferOffset,
+                            static_cast<size_t>(span_bytes));
+                const D3D12_RANGE wn{0u, 0u};
+                host_arg->Unmap(0u, &wn);
+
+                const auto& descs = sig_proxy->ArgumentDescs();
+                const auto& offs = sig_proxy->ArgumentOffsets();
+                bool any_patched = false;
+                for (UINT c = 0u; c < effective_max_count; ++c) {
+                    const size_t rec_base = static_cast<size_t>(c) * stride;
+                    for (size_t a = 0u; a < descs.size() && a < offs.size(); ++a) {
+                        const auto t = descs[a].Type;
+                        if (t == D3D12_INDIRECT_ARGUMENT_TYPE_VERTEX_BUFFER_VIEW ||
+                            t == D3D12_INDIRECT_ARGUMENT_TYPE_INDEX_BUFFER_VIEW ||
+                            t == D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW ||
+                            t == D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW ||
+                            t == D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW) {
+                            const size_t va_off = rec_base + offs[a];
+                            if (va_off + 8u <= patched.size()) {
+                                uint64_t gva = 0ull;
+                                std::memcpy(&gva, patched.data() + va_off, 8u);
+                                if (gva != 0ull) {
+                                    const uint64_t h_va = device_x_->TranslateGuestGpuVa(gva);
+                                    if (h_va != gva && h_va != 0ull) {
+                                        std::memcpy(patched.data() + va_off, &h_va, 8u);
+                                        any_patched = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if (any_patched && device_x_->HostDevice()) {
+                    D3D12_HEAP_PROPERTIES up_hp{};
+                    up_hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+                    D3D12_RESOURCE_DESC up_rd{};
+                    up_rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+                    up_rd.Width = (span_bytes + 255ull) & ~255ull;
+                    up_rd.Height = 1u;
+                    up_rd.DepthOrArraySize = 1u;
+                    up_rd.MipLevels = 1u;
+                    up_rd.SampleDesc.Count = 1u;
+                    up_rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+                    ID3D12Resource* shadow_arg = nullptr;
+                    if (SUCCEEDED(device_x_->HostDevice()->CreateCommittedResource(
+                            &up_hp, D3D12_HEAP_FLAG_NONE, &up_rd,
+                            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                            OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&shadow_arg))) &&
+                        shadow_arg) {
+                        void* dst_map = nullptr;
+                        const D3D12_RANGE er{0u, 0u};
+                        if (SUCCEEDED(shadow_arg->Map(0u, &er, &dst_map)) && dst_map) {
+                            std::memcpy(dst_map, patched.data(), patched.size());
+                            shadow_arg->Unmap(0u, nullptr);
+                            exec_arg_buf = shadow_arg;
+                            exec_arg_offset = 0ull;
+                            va_translated = true;
+                            device_x_->TrackCommandListTransientResource(shadow_arg);
+                        } else {
+                            shadow_arg->Release();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    bool vk_routed = false;
+    if (device_x_ && device_x_->IsVulkanRoutingActive()) {
+        vk_routed = true;
+        std::lock_guard<std::mutex> lock(vk_rec_mutex_);
+        VulkanRecordedOp op{};
+        op.kind = VulkanRecordedOpKind::ExecuteIndirect;
+        op.pso = vk_cur_pso_;
+        op.is_spirv_direct = vk_cur_pso_is_spirv_;
+        op.rtv_resource = vk_cur_rtv_;
+        op.dsv_resource = vk_cur_dsv_;
+        op.has_clear_color = vk_has_clear_color_;
+        std::memcpy(op.clear_color, vk_clear_color_, sizeof(op.clear_color));
+        op.clear_depth = vk_clear_depth_;
+        op.viewport_width = vk_vp_width_;
+        op.viewport_height = vk_vp_height_;
+        op.vbv = vk_cur_vbv_;
+        op.has_vbv = vk_has_vbv_;
+        op.ibv = vk_cur_ibv_;
+        op.has_ibv = vk_has_ibv_;
+        op.root_constants = (sig_proxy && sig_proxy->PrimaryActionType() == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH)
+                                ? vk_cmp_root_constants_
+                                : vk_gfx_root_constants_;
+        op.root_srvs = vk_cmp_srvs_;
+        op.root_uavs = vk_cmp_uavs_;
+        op.indirect_arg_resource = exec_arg_buf;
+        op.indirect_count_resource = host_cnt;
+        op.indirect_arg_offset = exec_arg_offset;
+        op.indirect_count_offset = CountBufferOffset;
+        op.indirect_max_count = effective_max_count;
+        op.indirect_stride = stride;
+        op.indirect_action_type = sig_proxy ? static_cast<uint32_t>(sig_proxy->PrimaryActionType()) : 0u;
+        op.indirect_action_offset = sig_proxy ? sig_proxy->PrimaryActionOffset() : 0u;
+        op.indirect_const_arg_offset = sig_proxy ? sig_proxy->FirstConstantArgOffset() : 0u;
+        op.indirect_const_bytes = sig_proxy ? sig_proxy->FirstConstantBytes() : 0u;
+        op.indirect_const_dst_offset = sig_proxy ? sig_proxy->FirstConstantDestOffsetBytes() : 0u;
+        vk_batch_.ops.push_back(std::move(op));
+        if (!vk_cur_pso_is_spirv_) {
+            vk_batch_.has_host_commands = true;
+        }
+    }
+
+    if (device_x_) {
+        device_x_->RecordExecuteIndirectStats(
+            has_count, has_root_consts, is_dispatch_mesh,
+            bounds_clamped, /*rejected=*/false, va_translated, vk_routed);
+    }
+
+    // If this is a virtual DispatchMesh fallback on WARP / MeshTier=0 (host_sig == nullptr),
+    // skip the native host ExecuteIndirect call safely after validation & Vulkan routing.
+    if (host_sig != nullptr && !(vk_routed && vk_cur_pso_is_spirv_)) {
+        UINT host_max_count = effective_max_count;
+        ID3D12Resource* exec_cnt_buf = host_cnt;
+        UINT64 exec_cnt_offset = CountBufferOffset;
+        bool handled_via_warp_replay = false;
+        // Windows 10 inbox WARP (pre-Agility 1.613) has known driver defects in
+        // ExecuteIndirect when combining root-mutating arguments (CONSTANT/CBV/SRV/UAV)
+        // with pCountBuffer or unprimed compute PSOs. When running on WARP with a
+        // CPU-readable indirect argument buffer for compute DISPATCH, replay each
+        // validated record directly onto host_list_ for 100% bit-exact parity.
+        if (device_x_ && device_x_->AdapterInfo().is_warp &&
+            sig_proxy && (sig_proxy->HasRootConstants() || sig_proxy->HasGpuVaArgs()) &&
+            sig_proxy->PrimaryActionType() == D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH) {
+            if (exec_cnt_buf != nullptr) {
+                D3D12_HEAP_PROPERTIES cnt_hp{};
+                if (SUCCEEDED(exec_cnt_buf->GetHeapProperties(&cnt_hp, nullptr)) &&
+                    (cnt_hp.Type == D3D12_HEAP_TYPE_UPLOAD || cnt_hp.Type == D3D12_HEAP_TYPE_READBACK)) {
+                    void* cnt_map = nullptr;
+                    const D3D12_RANGE cr{
+                        static_cast<SIZE_T>(CountBufferOffset),
+                        static_cast<SIZE_T>(CountBufferOffset + 4ull)};
+                    if (SUCCEEDED(exec_cnt_buf->Map(0u, &cr, &cnt_map)) && cnt_map) {
+                        uint32_t resolved_cnt = 0u;
+                        std::memcpy(&resolved_cnt,
+                                    static_cast<const uint8_t*>(cnt_map) + CountBufferOffset, 4u);
+                        const D3D12_RANGE wn{0u, 0u};
+                        exec_cnt_buf->Unmap(0u, &wn);
+                        host_max_count = std::min<UINT>(host_max_count, resolved_cnt);
+                        exec_cnt_buf = nullptr;
+                        exec_cnt_offset = 0ull;
+                    }
+                }
+            }
+            if (exec_cnt_buf == nullptr && host_max_count > 0u && exec_arg_buf != nullptr) {
+                D3D12_HEAP_PROPERTIES ahp{};
+                if (SUCCEEDED(exec_arg_buf->GetHeapProperties(&ahp, nullptr)) &&
+                    (ahp.Type == D3D12_HEAP_TYPE_UPLOAD || ahp.Type == D3D12_HEAP_TYPE_READBACK)) {
+                    const UINT64 replay_bytes =
+                        static_cast<UINT64>(host_max_count - 1u) * stride + min_stride;
+                    void* arg_map = nullptr;
+                    const D3D12_RANGE ar{
+                        static_cast<SIZE_T>(exec_arg_offset),
+                        static_cast<SIZE_T>(exec_arg_offset + replay_bytes)};
+                    if (SUCCEEDED(exec_arg_buf->Map(0u, &ar, &arg_map)) && arg_map) {
+                        const auto* base = static_cast<const uint8_t*>(arg_map) + exec_arg_offset;
+                        const auto& descs = sig_proxy->ArgumentDescs();
+                        const auto& offs = sig_proxy->ArgumentOffsets();
+                        for (UINT c = 0u; c < host_max_count; ++c) {
+                            const uint8_t* rec = base + static_cast<size_t>(c) * stride;
+                            for (size_t a = 0u; a < descs.size() && a < offs.size(); ++a) {
+                                const auto& ad = descs[a];
+                                const uint8_t* ptr = rec + offs[a];
+                                switch (ad.Type) {
+                                    case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT:
+                                        host_list_->SetComputeRoot32BitConstants(
+                                            ad.Constant.RootParameterIndex,
+                                            ad.Constant.Num32BitValuesToSet,
+                                            ptr,
+                                            ad.Constant.DestOffsetIn32BitValues);
+                                        break;
+                                    case D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT_BUFFER_VIEW: {
+                                        uint64_t va = 0ull;
+                                        std::memcpy(&va, ptr, 8u);
+                                        host_list_->SetComputeRootConstantBufferView(
+                                            ad.ConstantBufferView.RootParameterIndex, va);
+                                        break;
+                                    }
+                                    case D3D12_INDIRECT_ARGUMENT_TYPE_SHADER_RESOURCE_VIEW: {
+                                        uint64_t va = 0ull;
+                                        std::memcpy(&va, ptr, 8u);
+                                        host_list_->SetComputeRootShaderResourceView(
+                                            ad.ShaderResourceView.RootParameterIndex, va);
+                                        break;
+                                    }
+                                    case D3D12_INDIRECT_ARGUMENT_TYPE_UNORDERED_ACCESS_VIEW: {
+                                        uint64_t va = 0ull;
+                                        std::memcpy(&va, ptr, 8u);
+                                        host_list_->SetComputeRootUnorderedAccessView(
+                                            ad.UnorderedAccessView.RootParameterIndex, va);
+                                        break;
+                                    }
+                                    case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: {
+                                        uint32_t g[3]{};
+                                        std::memcpy(g, ptr, 12u);
+                                        if (g[0] > 0u && g[1] > 0u && g[2] > 0u) {
+                                            host_list_->Dispatch(g[0], g[1], g[2]);
+                                        }
+                                        break;
+                                    }
+                                    default:
+                                        break;
+                                }
+                            }
+                        }
+                        const D3D12_RANGE wn{0u, 0u};
+                        exec_arg_buf->Unmap(0u, &wn);
+                        handled_via_warp_replay = true;
+                    }
+                }
+            } else if (exec_cnt_buf == nullptr && host_max_count == 0u) {
+                handled_via_warp_replay = true;
+            }
+        }
+        if (!handled_via_warp_replay && host_max_count > 0u) {
+            host_list_->ExecuteIndirect(
+                host_sig, host_max_count,
+                exec_arg_buf, exec_arg_offset, exec_cnt_buf, exec_cnt_offset);
+        }
+    }
     RecordList("ID3D12GraphicsCommandListX::ExecuteIndirect", 59, S_OK);
 }
 
@@ -3109,6 +3453,15 @@ void CommandListX::ExtractDeferredCpuOps(
     std::lock_guard<std::mutex> lock(aaa_rec_mutex_);
     out_writes.insert(out_writes.end(), deferred_cpu_writes_.begin(), deferred_cpu_writes_.end());
     out_waits.insert(out_waits.end(), deferred_cpu_waits_.begin(), deferred_cpu_waits_.end());
+}
+
+void CommandListX::ExtractDeferredStateTransitions(
+    std::vector<DeferredStateTransition>& out_transitions) const {
+    std::lock_guard<std::mutex> lock(aaa_rec_mutex_);
+    out_transitions.insert(
+        out_transitions.end(),
+        deferred_state_transitions_.begin(),
+        deferred_state_transitions_.end());
 }
 
 // ---------------------------------------------------------------------------
