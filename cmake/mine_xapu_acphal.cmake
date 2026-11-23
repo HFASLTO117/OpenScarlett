@@ -20,3 +20,12 @@ add_dependencies(test_mine_xapu_acphal xapu AcpHal)
 # 3. Clean-room regression test suite for Minecraft Preview perf & hardening
 openscarlett_add_test(test_minecraft_perf_hardening tests/test_minecraft_perf_hardening.cpp)
 add_dependencies(test_minecraft_perf_hardening openscarlett_hook XAudio2_9 AcpHal xapu dstorage_xs d3d12_xs)
+
+# 4. Real-time system resource & native sampling CPU profiler (Windows)
+if(WIN32)
+    add_executable(os_live_profiler tools/os_live_profiler.cpp)
+    target_link_libraries(os_live_profiler PRIVATE dbghelp pdh psapi)
+    if(MSVC)
+        target_compile_options(os_live_profiler PRIVATE /W4)
+    endif()
+endif()
