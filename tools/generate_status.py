@@ -159,6 +159,7 @@ def collect_dlls(build_dir: pathlib.Path) -> list[DllInfo]:
         ("XAudio2_9.dll", "high", 11, "Live WASAPI, 64+ voices, submix/reverb APOs, XMA2/Opus/ADPCM & X3DAudio"),
         ("GameInput.dll", "high", 7, "XInput + KB + Raw Input mouse, hot-plug device callbacks & impulse-trigger rumble"),
         ("dstorage_xs.dll", "high", 6, "GDeflate v1 + BCPack, request cancellation & physical-page targets"),
+        ("dxcompiler_xs.dll", "high", 3, "DxcCreateInstance/2 dynamic forwarding to bundled dxcompiler.dll + telemetry"),
         ("d3d12_xs.dll", "partial", 48, "3/13 COM proxies (DeviceX/QueueX/CmdListX), HDR10 PresentX, early Vulkan routing"),
         ("libHttpClient.GDK.dll", "partial", 21, "Offline/HTTP request queue & XAsync lifecycle"),
         ("mfplat_xs.dll", "partial", 16, "MFResetDXGIDeviceManagerX & session scaffolding (H.264/HEVC HW decode pending)"),
@@ -181,9 +182,10 @@ def collect_dlls(build_dir: pathlib.Path) -> list[DllInfo]:
         ("xtfdebugmonitor.dll", "stub", 7, "XTF debug monitor stubs"),
     ]
 
-    # Auto-upgrade tiers when Sprint 9/10 implementations land!
+    # Auto-upgrade tiers when Sprint 9/10/14/UE5 implementations land!
     has_proxies = has("tests/test_d3d12_xs_proxies_multiqueue.cpp")
     has_mf_hw = has("tests/test_media_video_gameinput.cpp")
+    has_ue5 = has("tests/test_ue5_matrix_import_bringup.cpp")
 
     out: list[DllInfo] = []
     for name, tier, fallback_exp, note in catalog:
@@ -195,10 +197,28 @@ def collect_dlls(build_dir: pathlib.Path) -> list[DllInfo]:
                 exp = measured
         if name == "d3d12_xs.dll" and has_proxies:
             tier = "high"
-            note = "Full Xbox COM object proxies, multi-queue MT recording, HDR10 PresentX & Vulkan routing"
+            note = (
+                "Full Xbox COM proxies, 42 IID_ID3D12* GUID exports, D3D12Xbox* helpers, MT recording, HDR10 PresentX & Vulkan routing"
+                if has_ue5
+                else "Full Xbox COM object proxies, multi-queue MT recording, HDR10 PresentX & Vulkan routing"
+            )
         if name == "mfplat_xs.dll" and has_mf_hw:
             tier = "high"
-            note = "H.264/HEVC D3D12 Media Foundation decode + IMFDXGIDeviceManager lifecycle"
+            note = (
+                "H.264/HEVC D3D12 decode, IMFDXGIDeviceManager + 46 System32 MFPlat forwarded exports"
+                if has_ue5
+                else "H.264/HEVC D3D12 Media Foundation decode + IMFDXGIDeviceManager lifecycle"
+            )
+        if name == "xg_xs.dll" and has_ue5:
+            note = "15 2D + 6 3D GFX10 tile modes, XGCreateTextureComputer (1D/2D/3D), HTILE/DCC/CMASK & GPU compute untiling"
+        if name == "xcrdapi.dll" and has_ue5:
+            tier = "high"
+            note = "Console DirectStorage (DStorageGetFactory/SetConfiguration*) forwarding, breadcrumbs & container staging"
+        if name == "AcpHal.dll" and has_ue5:
+            tier = "high"
+            note = "Thread-safe APU cached/non-cached heap (ApuCreateHeap/Alloc/Free/Map/State) + shape/XMA2 audio DSP"
+        if name == "xmem.dll" and has_ue5:
+            note = "XMemAlloc/Free/Default, XMemSetAllocationHooks, XMemCheckDefaultHeaps, working set stats & virtual query"
         out.append(DllInfo(name=name, tier=tier, exports=exp, note=note))
     return out
 
@@ -337,7 +357,7 @@ def collect_components(
             ),
         ),
         Component(
-            short_name="Xbox Live, GDK & OS Shims (30 DLLs)",
+            short_name=f"Xbox Live, GDK & OS Shims ({len(dlls)} DLLs)",
             plain_summary=f"{high_dlls} high-coverage, {part_dlls} partial, {stub_dlls} stub DLLs — 292/292 thunks, WinRT & offline auth",
             tech_name=f"GDK & Console Shims ({len(dlls)} DLLs: {high_dlls} High / {part_dlls} Partial / {stub_dlls} Stub)",
             area="GDK Shims",
