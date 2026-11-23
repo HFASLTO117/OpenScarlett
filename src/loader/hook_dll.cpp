@@ -1592,6 +1592,35 @@ bool ResolveVirtualCreatePathW(std::wstring_view virtual_path,
     return true;
 }
 
+void TraceVfsFailureW(const char* api_tag,
+                      std::wstring_view raw_path,
+                      std::wstring_view host_path,
+                      DWORD access,
+                      DWORD disp,
+                      DWORD err) {
+    static const std::string s_trace_path = []() {
+        std::wstring w = ReadEnvW(L"OPENSCARLETT_TRACE_VFS_ERR");
+        return openscarlett::WideToUtf8(w);
+    }();
+    if (s_trace_path.empty()) {
+        return;
+    }
+    FILE* f = nullptr;
+    if (::fopen_s(&f, s_trace_path.c_str(), "a") == 0 && f) {
+        const std::string raw_u8 = openscarlett::WideToUtf8(raw_path);
+        const std::string host_u8 = openscarlett::WideToUtf8(host_path);
+        std::fprintf(f, "[VFS_ERR] tid=%lu api=%s err=%lu access=0x%08lX disp=%lu raw=%s host=%s\n",
+                     static_cast<unsigned long>(::GetCurrentThreadId()),
+                     api_tag ? api_tag : "",
+                     static_cast<unsigned long>(err),
+                     static_cast<unsigned long>(access),
+                     static_cast<unsigned long>(disp),
+                     raw_u8.c_str(),
+                     host_u8.c_str());
+        std::fclose(f);
+    }
+}
+
 HANDLE CreateVirtualFileW(std::wstring_view virtual_path,
                           const char* api_tag,
                           DWORD dwDesiredAccess,
@@ -1607,14 +1636,21 @@ HANDLE CreateVirtualFileW(std::wstring_view virtual_path,
                                    host_path, passthrough, resolve_err)) {
         if (passthrough) {
             const std::wstring passthrough_path(virtual_path);
-            return g_real_CreateFileW(passthrough_path.c_str(),
-                                      dwDesiredAccess,
-                                      dwShareMode,
-                                      lpSecurityAttributes,
-                                      dwCreationDisposition,
-                                      dwFlagsAndAttributes,
-                                      hTemplateFile);
+            HANDLE h = g_real_CreateFileW(passthrough_path.c_str(),
+                                          dwDesiredAccess,
+                                          dwShareMode,
+                                          lpSecurityAttributes,
+                                          dwCreationDisposition,
+                                          dwFlagsAndAttributes,
+                                          hTemplateFile);
+            if (h == INVALID_HANDLE_VALUE) {
+                const DWORD e = ::GetLastError();
+                TraceVfsFailureW(api_tag, virtual_path, passthrough_path, dwDesiredAccess, dwCreationDisposition, e);
+                ::SetLastError(e);
+            }
+            return h;
         }
+        TraceVfsFailureW(api_tag, virtual_path, L"<resolve_failed>", dwDesiredAccess, dwCreationDisposition, resolve_err);
         ::SetLastError(resolve_err);
         return INVALID_HANDLE_VALUE;
     }
@@ -1627,6 +1663,9 @@ HANDLE CreateVirtualFileW(std::wstring_view virtual_path,
                                   dwFlagsAndAttributes,
                                   hTemplateFile);
     DWORD err = ::GetLastError();
+    if (h == INVALID_HANDLE_VALUE) {
+        TraceVfsFailureW(api_tag, virtual_path, host_path, dwDesiredAccess, dwCreationDisposition, err);
+    }
     openscarlett::CallTelemetry::Global().Record(
         "vfs",
         api_tag,
@@ -1659,13 +1698,21 @@ HANDLE WINAPI Hook_CreateFileW(LPCWSTR lpFileName,
                                   dwFlagsAndAttributes,
                                   hTemplateFile);
     }
-    return g_real_CreateFileW(lpFileName,
-                              dwDesiredAccess,
-                              dwShareMode,
-                              lpSecurityAttributes,
-                              dwCreationDisposition,
-                              dwFlagsAndAttributes,
-                              hTemplateFile);
+    HANDLE h = g_real_CreateFileW(lpFileName,
+                                  dwDesiredAccess,
+                                  dwShareMode,
+                                  lpSecurityAttributes,
+                                  dwCreationDisposition,
+                                  dwFlagsAndAttributes,
+                                  hTemplateFile);
+    if (h == INVALID_HANDLE_VALUE && tl_vfs_hook_depth == 0 && lpFileName != nullptr &&
+        !g_shutting_down.load(std::memory_order_acquire)) {
+        const DWORD e = ::GetLastError();
+        ScopedVfsHookGuard guard;
+        TraceVfsFailureW("CreateFileW:direct", lpFileName, lpFileName, dwDesiredAccess, dwCreationDisposition, e);
+        ::SetLastError(e);
+    }
+    return h;
 }
 
 HANDLE WINAPI Hook_CreateFile2(LPCWSTR lpFileName,
@@ -1749,7 +1796,8 @@ DWORD WINAPI Hook_GetFileAttributesW(LPCWSTR lpFileName) {
     if (tl_vfs_hook_depth == 0 &&
         !g_shutting_down.load(std::memory_order_acquire) &&
         lpFileName != nullptr &&
-        openscarlett::VfsMounts::DetectVirtualDriveW(lpFileName) != openscarlett::VfsDrive::None) {
+        openscarlett::VfsMounts::DetectVirtualDriveW(lpFileName) != openscarlett::VfsDrive::None &&
+        !ShouldPassThroughHostDDriveW(lpFileName)) {
         ScopedVfsHookGuard guard;
         std::wstring host_path;
         bool was_wo = false;
@@ -1792,35 +1840,37 @@ DWORD WINAPI Hook_GetFileAttributesA(LPCSTR lpFileName) {
         openscarlett::VfsMounts::DetectVirtualDriveA(lpFileName) != openscarlett::VfsDrive::None) {
         ScopedVfsHookGuard guard;
         std::wstring wide_in = AnsiToWide(lpFileName);
-        std::wstring host_path;
-        bool was_wo = false;
-        auto st = g_vfs.TranslateForAccessW(
-            wide_in, openscarlett::VfsAccessMode::ReadOnly, host_path, &was_wo, true);
-        if (st == openscarlett::VfsTranslateStatus::RejectedTraversal) {
-            openscarlett::CallTelemetry::Global().Record(
-                "vfs", "GetFileAttributesA:traversal_blocked", openscarlett::CallOutcome::Error,
-                static_cast<int32_t>(ERROR_ACCESS_DENIED), -1);
-            ::SetLastError(ERROR_ACCESS_DENIED);
-            return INVALID_FILE_ATTRIBUTES;
-        }
-        if (st == openscarlett::VfsTranslateStatus::DeletedWhiteout) {
-            openscarlett::CallTelemetry::Global().Record(
-                "vfs", "GetFileAttributesA:whiteout", openscarlett::CallOutcome::Error,
-                static_cast<int32_t>(ERROR_FILE_NOT_FOUND), -1);
-            ::SetLastError(ERROR_FILE_NOT_FOUND);
-            return INVALID_FILE_ATTRIBUTES;
-        }
-        if (st == openscarlett::VfsTranslateStatus::Translated) {
-            DWORD attrs = g_real_GetFileAttributesW(host_path.c_str());
-            DWORD err = ::GetLastError();
-            openscarlett::CallTelemetry::Global().Record(
-                "vfs",
-                "GetFileAttributesA",
-                attrs != INVALID_FILE_ATTRIBUTES ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error,
-                attrs != INVALID_FILE_ATTRIBUTES ? 0 : static_cast<int32_t>(err),
-                -1);
-            ::SetLastError(err);
-            return attrs;
+        if (!ShouldPassThroughHostDDriveW(wide_in)) {
+            std::wstring host_path;
+            bool was_wo = false;
+            auto st = g_vfs.TranslateForAccessW(
+                wide_in, openscarlett::VfsAccessMode::ReadOnly, host_path, &was_wo, true);
+            if (st == openscarlett::VfsTranslateStatus::RejectedTraversal) {
+                openscarlett::CallTelemetry::Global().Record(
+                    "vfs", "GetFileAttributesA:traversal_blocked", openscarlett::CallOutcome::Error,
+                    static_cast<int32_t>(ERROR_ACCESS_DENIED), -1);
+                ::SetLastError(ERROR_ACCESS_DENIED);
+                return INVALID_FILE_ATTRIBUTES;
+            }
+            if (st == openscarlett::VfsTranslateStatus::DeletedWhiteout) {
+                openscarlett::CallTelemetry::Global().Record(
+                    "vfs", "GetFileAttributesA:whiteout", openscarlett::CallOutcome::Error,
+                    static_cast<int32_t>(ERROR_FILE_NOT_FOUND), -1);
+                ::SetLastError(ERROR_FILE_NOT_FOUND);
+                return INVALID_FILE_ATTRIBUTES;
+            }
+            if (st == openscarlett::VfsTranslateStatus::Translated) {
+                DWORD attrs = g_real_GetFileAttributesW(host_path.c_str());
+                DWORD err = ::GetLastError();
+                openscarlett::CallTelemetry::Global().Record(
+                    "vfs",
+                    "GetFileAttributesA",
+                    attrs != INVALID_FILE_ATTRIBUTES ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error,
+                    attrs != INVALID_FILE_ATTRIBUTES ? 0 : static_cast<int32_t>(err),
+                    -1);
+                ::SetLastError(err);
+                return attrs;
+            }
         }
     }
     return g_real_GetFileAttributesA(lpFileName);
@@ -1832,7 +1882,8 @@ BOOL WINAPI Hook_GetFileAttributesExW(LPCWSTR lpFileName,
     if (tl_vfs_hook_depth == 0 &&
         !g_shutting_down.load(std::memory_order_acquire) &&
         lpFileName != nullptr &&
-        openscarlett::VfsMounts::DetectVirtualDriveW(lpFileName) != openscarlett::VfsDrive::None) {
+        openscarlett::VfsMounts::DetectVirtualDriveW(lpFileName) != openscarlett::VfsDrive::None &&
+        !ShouldPassThroughHostDDriveW(lpFileName)) {
         ScopedVfsHookGuard guard;
         std::wstring host_path;
         bool was_wo = false;
@@ -1927,7 +1978,8 @@ BOOL WINAPI Hook_CreateDirectoryW(LPCWSTR lpPathName, LPSECURITY_ATTRIBUTES lpSe
     if (tl_vfs_hook_depth == 0 &&
         !g_shutting_down.load(std::memory_order_acquire) &&
         lpPathName != nullptr &&
-        openscarlett::VfsMounts::DetectVirtualDriveW(lpPathName) != openscarlett::VfsDrive::None) {
+        openscarlett::VfsMounts::DetectVirtualDriveW(lpPathName) != openscarlett::VfsDrive::None &&
+        !ShouldPassThroughHostDDriveW(lpPathName)) {
         ScopedVfsHookGuard guard;
         const auto drive = openscarlett::VfsMounts::DetectVirtualDriveW(lpPathName);
         std::wstring host_path;

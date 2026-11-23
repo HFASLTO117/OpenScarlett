@@ -8942,14 +8942,36 @@ XGameResult OPENSCARLETT_GDK_CALL XGameUiShowErrorDialogResult(XAsyncBlock* asyn
 
 XGameResult OPENSCARLETT_GDK_CALL XGameUiShowTextEntryAsync(
     XAsyncBlock* async,
-    const char* /*titleText*/,
-    const char* /*descriptionText*/,
+    const char* titleText,
+    const char* descriptionText,
     const char* defaultText,
-    XGameUiTextEntryInputScope /*inputScope*/,
+    XGameUiTextEntryInputScope inputScope,
     uint32_t maxTextLength) {
     if (!async) {
         return RecordHr("XGameUiShowTextEntryAsync", XGR_E_INVALIDARG);
     }
+#if defined(_WIN32)
+    {
+        static const std::string s_trace_xgr = []() {
+            char buf[512]{};
+            DWORD n = ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_XGR", buf, sizeof(buf));
+            return (n > 0 && n < sizeof(buf)) ? std::string(buf, n) : std::string{};
+        }();
+        if (!s_trace_xgr.empty()) {
+            FILE* f = nullptr;
+            if (::fopen_s(&f, s_trace_xgr.c_str(), "a") == 0 && f) {
+                std::fprintf(f, "[XGR] XGameUiShowTextEntryAsync title='%s' desc='%s' default='%s' scope=%u maxLen=%u\n",
+                             titleText ? titleText : "", descriptionText ? descriptionText : "",
+                             defaultText ? defaultText : "", static_cast<unsigned>(inputScope), maxTextLength);
+                std::fclose(f);
+            }
+        }
+    }
+#else
+    (void)titleText;
+    (void)descriptionText;
+    (void)inputScope;
+#endif
     std::string text = defaultText ? defaultText : "";
     if (maxTextLength > 0 && text.size() > maxTextLength) {
         text.resize(maxTextLength);
