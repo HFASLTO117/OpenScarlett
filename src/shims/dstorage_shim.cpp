@@ -905,8 +905,10 @@ private:
                 op->bytes_transferred = bytes;
                 op->error_code = err;
                 op->completed = true;
+                // Notify while holding op->mutex so ReadAt() cannot observe completed==true and
+                // destroy the stack-allocated IocpReadOp before notify_one() returns!
+                op->cv.notify_one();
             }
-            op->cv.notify_one();
         }
     }
 
@@ -2043,8 +2045,8 @@ public:
                     if (closed_ && active_.empty() && in_flight_requests_ == 0u && in_flight_barriers_ == 0u) {
                         drain_cv_.notify_all();
                     }
+                    space_cv_.notify_all();
                 }
-                space_cv_.notify_all();
                 if (wake_barriers) {
                     DStoragePriorityScheduler::Global().NotifyWorkAvailable();
                 }
@@ -2098,8 +2100,8 @@ public:
             if (closed_ && active_.empty() && in_flight_requests_ == 0u && in_flight_barriers_ == 0u) {
                 drain_cv_.notify_all();
             }
+            space_cv_.notify_all();
         }
-        space_cv_.notify_all();
         if (wake_after_barrier) {
             DStoragePriorityScheduler::Global().NotifyWorkAvailable();
         }
@@ -3264,6 +3266,9 @@ private:
 
 public:
     void CloseInternal() {
+        // Keep DStorageQueueCore alive across CloseInternal() if invoked while still owned by
+        // shared_ptr (weak_from_this() safely yields nullptr if invoked from ~DStorageQueueCore()).
+        const auto self_keepalive = weak_from_this().lock();
         std::deque<QueueItem> leftover_staged;
         {
             std::unique_lock<std::mutex> lk(mutex_);
@@ -3316,8 +3321,10 @@ public:
         {
             std::lock_guard<std::mutex> lk(mutex_);
             close_complete_ = true;
+            // Notify while holding mutex_ so concurrent Release()/Close() cannot destroy
+            // DStorageQueueCore / close_cv_ before notify_all() returns!
+            close_cv_.notify_all();
         }
-        close_cv_.notify_all();
     }
 
 private:
