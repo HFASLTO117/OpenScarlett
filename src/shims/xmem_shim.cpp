@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 
 #if defined(_MSC_VER)
@@ -35,6 +36,7 @@
 #pragma comment(linker, "/export:XMemMapPhysicalPages=XMemShim_XMemMapPhysicalPages")
 #pragma comment(linker, "/export:XMemUnmapPhysicalPages=XMemShim_XMemUnmapPhysicalPages")
 #pragma comment(linker, "/export:XMemGetWorkingSetStatistics=XMemShim_XMemGetWorkingSetStatistics")
+#pragma comment(linker, "/export:XMemTransferMemory=XMemShim_XMemTransferMemory")
 #pragma comment(linker, "/export:XMemGetTelemetryCallCountForTest=XMemShim_GetTelemetryCallCountForTest")
 #endif
 
@@ -42,6 +44,7 @@ namespace {
 
 constexpr const char* kModName = "xmem.dll";
 constexpr int32_t kHrFail = static_cast<int32_t>(0x80004005u);
+constexpr int32_t kHrPointer = static_cast<int32_t>(0x80004003u);
 
 using XMemAllocHookFn = void*(OPENSCARLETT_KERNELX_CALL*)(size_t, uint64_t);
 using XMemFreeHookFn = void(OPENSCARLETT_KERNELX_CALL*)(void*, uint64_t);
@@ -68,12 +71,22 @@ inline void RecordOutcome(const char* sym, bool ok) {
         -1);
 }
 
+inline void RecordHresult(const char* sym, int32_t hr) {
+    openscarlett::CallTelemetry::Global().Record(
+        kModName,
+        sym,
+        hr >= 0 ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error,
+        hr,
+        -1);
+}
+
 }  // namespace
 
 extern "C" {
 
 OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL XMemGetWorkingSetStatistics(
-    void* lpBuffer);
+    uintptr_t arg0,
+    void* arg1);
 
 int32_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemSetAllocationHooks(
     XMemAllocHookFn allocHook,
@@ -227,11 +240,53 @@ int32_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemUnmapPhysicalPages(
     return ok;
 }
 
-int32_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemGetWorkingSetStatistics(void* lpBuffer) {
-    const int32_t ok = ::XMemGetWorkingSetStatistics(lpBuffer);
+int32_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemGetWorkingSetStatistics(
+    uintptr_t arg0,
+    void* arg1) {
+    const int32_t ok = ::XMemGetWorkingSetStatistics(arg0, arg1);
     RecordOutcome("XMemGetWorkingSetStatistics", ok != 0);
     return ok;
 }
+
+#if defined(_WIN32)
+HRESULT WINAPI XMemShim_XMemTransferMemory(
+    void* destinationAddress,
+    const void* sourceAddress,
+    SIZE_T sizeInBytes,
+    UINT64 flags) {
+    (void)flags;
+    if (!destinationAddress || !sourceAddress) {
+        RecordHresult("XMemTransferMemory", static_cast<int32_t>(E_POINTER));
+        return E_POINTER;
+    }
+    if (sizeInBytes == 0u) {
+        RecordHresult("XMemTransferMemory", static_cast<int32_t>(S_OK));
+        return S_OK;
+    }
+    std::memmove(destinationAddress, sourceAddress, sizeInBytes);
+    RecordHresult("XMemTransferMemory", static_cast<int32_t>(S_OK));
+    return S_OK;
+}
+#else
+int32_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemTransferMemory(
+    void* destinationAddress,
+    const void* sourceAddress,
+    size_t sizeInBytes,
+    uint64_t flags) {
+    (void)flags;
+    if (!destinationAddress || !sourceAddress) {
+        RecordHresult("XMemTransferMemory", kHrPointer);
+        return kHrPointer;
+    }
+    if (sizeInBytes == 0u) {
+        RecordHresult("XMemTransferMemory", 0);
+        return 0;
+    }
+    std::memmove(destinationAddress, sourceAddress, sizeInBytes);
+    RecordHresult("XMemTransferMemory", 0);
+    return 0;
+}
+#endif
 
 int32_t OPENSCARLETT_KERNELX_CALL XMemShim_GetTelemetryCallCountForTest(
     const char* symbolName,

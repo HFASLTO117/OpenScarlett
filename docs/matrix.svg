@@ -21,7 +21,7 @@
     <text class="h1" x="26" y="36">Coverage Visualizer — RDNA2 Shaders, D3D12 / Vulkan &amp; All 30 DLLs</text>
     <text class="sub" x="26" y="56">Honest breakdown of what works vs what is still behind · Green = Live / High · Amber = Partial · Red / Grey = Behind or Stub</text>
     <line x1="26" y1="70" x2="874" y2="70" stroke="#21262d" stroke-width="1"/>
-    <text class="h2" x="26" y="94">1. RDNA2 / GFX10.3 Shader Instruction Coverage (774 / 779 decoded · 99%)</text>
+    <text class="h2" x="26" y="94">1. RDNA2 / GFX10.3 Shader Instruction Coverage (779 / 779 decoded · 100%)</text>
     <text class="lbl" x="26" y="123">VOP (Vector ALU / VOP3P)</text>
     <rect x="224" y="115" width="156" height="9" rx="4.5" fill="#21262d"/>
     <rect x="224" y="115" width="156" height="9" rx="4.5" fill="#2ea043"/>
@@ -105,7 +105,7 @@
     <text class="lbl" x="620" y="405">GPU Compute Untiling</text>
     <text class="tiny" x="864" y="404.5" text-anchor="end" fill="#2ea043" font-weight="700">LIVE</text>
     <line x1="26" y1="430" x2="874" y2="430" stroke="#21262d" stroke-width="1"/>
-    <text class="h2" x="26" y="454">3. All 31 Shimmed Xbox / GDK DLLs (15 high coverage · 6 partial · 10 stub / telemetry)</text>
+    <text class="h2" x="26" y="454">3. All 30 Shimmed Xbox / GDK DLLs (16 high coverage · 4 partial · 10 stub / telemetry)</text>
     <rect x="26" y="468" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="26" y="468" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="36" y="482">xgameruntime</text>
@@ -125,7 +125,7 @@
     <rect x="710" y="468" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="710" y="468" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="720" y="482">xg_xs</text>
-    <text class="tiny" x="720" y="493">27 exports · high</text>
+    <text class="tiny" x="720" y="493">25 exports · high</text>
     <rect x="26" y="506" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="26" y="506" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="36" y="520">winrt_xs</text>
@@ -133,7 +133,7 @@
     <rect x="197" y="506" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="197" y="506" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="207" y="520">xmem</text>
-    <text class="tiny" x="207" y="531">18 exports · high</text>
+    <text class="tiny" x="207" y="531">16 exports · high</text>
     <rect x="368" y="506" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="368" y="506" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="378" y="520">XAudio2_9</text>
@@ -148,83 +148,83 @@
     <text class="tiny" x="720" y="531">12 exports · high</text>
     <rect x="26" y="544" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="26" y="544" width="3.5" height="30" rx="2" fill="#2ea043"/>
-    <text class="mono" x="36" y="558">dxcompiler_xs</text>
-    <text class="tiny" x="36" y="569">3 exports · high</text>
+    <text class="mono" x="36" y="558">d3d12_xs</text>
+    <text class="tiny" x="36" y="569">50 exports · high</text>
     <rect x="197" y="544" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="197" y="544" width="3.5" height="30" rx="2" fill="#2ea043"/>
-    <text class="mono" x="207" y="558">d3d12_xs</text>
-    <text class="tiny" x="207" y="569">105 exports · high</text>
-    <rect x="368" y="544" width="163" height="30" rx="6" fill="#261e10" stroke="#30363d" stroke-width="1"/>
-    <rect x="368" y="544" width="3.5" height="30" rx="2" fill="#d29922"/>
-    <text class="mono" x="378" y="558">libHttpClient</text>
-    <text class="tiny" x="378" y="569">58 exports · partial</text>
-    <rect x="539" y="544" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
-    <rect x="539" y="544" width="3.5" height="30" rx="2" fill="#2ea043"/>
-    <text class="mono" x="549" y="558">mfplat_xs</text>
-    <text class="tiny" x="549" y="569">51 exports · high</text>
+    <text class="mono" x="207" y="558">libHttpClient</text>
+    <text class="tiny" x="207" y="569">58 exports · high</text>
+    <rect x="368" y="544" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
+    <rect x="368" y="544" width="3.5" height="30" rx="2" fill="#2ea043"/>
+    <text class="mono" x="378" y="558">mfplat_xs</text>
+    <text class="tiny" x="378" y="569">17 exports · high</text>
+    <rect x="539" y="544" width="163" height="30" rx="6" fill="#261e10" stroke="#30363d" stroke-width="1"/>
+    <rect x="539" y="544" width="3.5" height="30" rx="2" fill="#d29922"/>
+    <text class="mono" x="549" y="558">advapi32leg</text>
+    <text class="tiny" x="549" y="569">14 exports · partial</text>
     <rect x="710" y="544" width="163" height="30" rx="6" fill="#261e10" stroke="#30363d" stroke-width="1"/>
     <rect x="710" y="544" width="3.5" height="30" rx="2" fill="#d29922"/>
-    <text class="mono" x="720" y="558">advapi32leg</text>
-    <text class="tiny" x="720" y="569">14 exports · partial</text>
-    <rect x="26" y="582" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
-    <rect x="26" y="582" width="3.5" height="30" rx="2" fill="#2ea043"/>
-    <text class="mono" x="36" y="596">xcrdapi</text>
-    <text class="tiny" x="36" y="607">16 exports · high</text>
-    <rect x="197" y="582" width="163" height="30" rx="6" fill="#261e10" stroke="#30363d" stroke-width="1"/>
-    <rect x="197" y="582" width="3.5" height="30" rx="2" fill="#d29922"/>
-    <text class="mono" x="207" y="596">Bink2Scarlett</text>
-    <text class="tiny" x="207" y="607">12 exports · partial</text>
-    <rect x="368" y="582" width="163" height="30" rx="6" fill="#261e10" stroke="#30363d" stroke-width="1"/>
-    <rect x="368" y="582" width="3.5" height="30" rx="2" fill="#d29922"/>
-    <text class="mono" x="378" y="596">XboxBvhBuild</text>
-    <text class="tiny" x="378" y="607">33 exports · partial</text>
-    <rect x="539" y="582" width="163" height="30" rx="6" fill="#261e10" stroke="#30363d" stroke-width="1"/>
-    <rect x="539" y="582" width="3.5" height="30" rx="2" fill="#d29922"/>
-    <text class="mono" x="549" y="596">ffx_upscaler</text>
-    <text class="tiny" x="549" y="607">11 exports · partial</text>
+    <text class="mono" x="720" y="558">xcrdapi</text>
+    <text class="tiny" x="720" y="569">13 exports · partial</text>
+    <rect x="26" y="582" width="163" height="30" rx="6" fill="#261e10" stroke="#30363d" stroke-width="1"/>
+    <rect x="26" y="582" width="3.5" height="30" rx="2" fill="#d29922"/>
+    <text class="mono" x="36" y="596">Bink2Scarlett</text>
+    <text class="tiny" x="36" y="607">12 exports · partial</text>
+    <rect x="197" y="582" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
+    <rect x="197" y="582" width="3.5" height="30" rx="2" fill="#2ea043"/>
+    <text class="mono" x="207" y="596">XboxBvhBuild</text>
+    <text class="tiny" x="207" y="607">33 exports · high</text>
+    <rect x="368" y="582" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
+    <rect x="368" y="582" width="3.5" height="30" rx="2" fill="#2ea043"/>
+    <text class="mono" x="378" y="596">ffx_upscaler</text>
+    <text class="tiny" x="378" y="607">11 exports · high</text>
+    <rect x="539" y="582" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
+    <rect x="539" y="582" width="3.5" height="30" rx="2" fill="#2ea043"/>
+    <text class="mono" x="549" y="596">ffx_loader</text>
+    <text class="tiny" x="549" y="607">5 exports · high</text>
     <rect x="710" y="582" width="163" height="30" rx="6" fill="#261e10" stroke="#30363d" stroke-width="1"/>
     <rect x="710" y="582" width="3.5" height="30" rx="2" fill="#d29922"/>
-    <text class="mono" x="720" y="596">ffx_loader</text>
-    <text class="tiny" x="720" y="607">5 exports · partial</text>
-    <rect x="26" y="620" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
-    <rect x="26" y="620" width="3.5" height="30" rx="2" fill="#2ea043"/>
-    <text class="mono" x="36" y="634">AcpHal</text>
-    <text class="tiny" x="36" y="645">10 exports · high</text>
+    <text class="mono" x="720" y="596">AcpHal</text>
+    <text class="tiny" x="720" y="607">3 exports · partial</text>
+    <rect x="26" y="620" width="163" height="30" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+    <rect x="26" y="620" width="3.5" height="30" rx="2" fill="#6e7681"/>
+    <text class="mono" x="36" y="634">pixevt</text>
+    <text class="tiny" x="36" y="645">13 exports · stub</text>
     <rect x="197" y="620" width="163" height="30" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
     <rect x="197" y="620" width="3.5" height="30" rx="2" fill="#6e7681"/>
-    <text class="mono" x="207" y="634">pixevt</text>
-    <text class="tiny" x="207" y="645">13 exports · stub</text>
+    <text class="mono" x="207" y="634">hix_xs</text>
+    <text class="tiny" x="207" y="645">11 exports · stub</text>
     <rect x="368" y="620" width="163" height="30" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
     <rect x="368" y="620" width="3.5" height="30" rx="2" fill="#6e7681"/>
-    <text class="mono" x="378" y="634">hix_xs</text>
-    <text class="tiny" x="378" y="645">11 exports · stub</text>
+    <text class="mono" x="378" y="634">KernelTrace</text>
+    <text class="tiny" x="378" y="645">9 exports · stub</text>
     <rect x="539" y="620" width="163" height="30" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
     <rect x="539" y="620" width="3.5" height="30" rx="2" fill="#6e7681"/>
-    <text class="mono" x="549" y="634">KernelTrace</text>
+    <text class="mono" x="549" y="634">xtfpix</text>
     <text class="tiny" x="549" y="645">9 exports · stub</text>
     <rect x="710" y="620" width="163" height="30" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
     <rect x="710" y="620" width="3.5" height="30" rx="2" fill="#6e7681"/>
-    <text class="mono" x="720" y="634">xtfpix</text>
-    <text class="tiny" x="720" y="645">9 exports · stub</text>
+    <text class="mono" x="720" y="634">xbtp</text>
+    <text class="tiny" x="720" y="645">8 exports · stub</text>
     <rect x="26" y="658" width="163" height="30" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
     <rect x="26" y="658" width="3.5" height="30" rx="2" fill="#6e7681"/>
-    <text class="mono" x="36" y="672">xbtp</text>
+    <text class="mono" x="36" y="672">mflnmhelp</text>
     <text class="tiny" x="36" y="683">8 exports · stub</text>
     <rect x="197" y="658" width="163" height="30" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
     <rect x="197" y="658" width="3.5" height="30" rx="2" fill="#6e7681"/>
-    <text class="mono" x="207" y="672">mflnmhelp</text>
+    <text class="mono" x="207" y="672">mfhevcdec</text>
     <text class="tiny" x="207" y="683">8 exports · stub</text>
     <rect x="368" y="658" width="163" height="30" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
     <rect x="368" y="658" width="3.5" height="30" rx="2" fill="#6e7681"/>
-    <text class="mono" x="378" y="672">mfhevcdec</text>
+    <text class="mono" x="378" y="672">gamecorecli</text>
     <text class="tiny" x="378" y="683">8 exports · stub</text>
     <rect x="539" y="658" width="163" height="30" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
     <rect x="539" y="658" width="3.5" height="30" rx="2" fill="#6e7681"/>
-    <text class="mono" x="549" y="672">gamecorecli</text>
-    <text class="tiny" x="549" y="683">8 exports · stub</text>
+    <text class="mono" x="549" y="672">minuserx</text>
+    <text class="tiny" x="549" y="683">7 exports · stub</text>
     <rect x="710" y="658" width="163" height="30" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
     <rect x="710" y="658" width="3.5" height="30" rx="2" fill="#6e7681"/>
-    <text class="mono" x="720" y="672">minuserx</text>
+    <text class="mono" x="720" y="672">xtfdebugmon</text>
     <text class="tiny" x="720" y="683">7 exports · stub</text>
   </g>
   <rect x="0.5" y="0.5" width="899" height="715" rx="12" fill="none" stroke="#30363d" stroke-width="1"/>

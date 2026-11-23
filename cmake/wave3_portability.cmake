@@ -87,6 +87,7 @@ set(_openscarlett_known_targets
     GameInput
     XAudio2_9
     AcpHal
+    xapu
     dstorage_xs
     dxcompiler_xs
     Microsoft.Xbox.Services.GDK.C
@@ -161,6 +162,9 @@ set(_openscarlett_known_targets
     ScarlettArena
     ScarlettDoom
     test_scarlett_game_live
+    test_mine_xapu_acphal
+    test_mine_d3d12_xmem
+    test_mine_routing_apisets
 )
 
 foreach(_tgt IN LISTS _openscarlett_known_targets)

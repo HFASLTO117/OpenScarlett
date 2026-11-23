@@ -488,7 +488,7 @@ size_t GetSubobjectStrideBytes(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type) noexcep
             return sizeof(StreamSubobjLayout<D3D12_DEPTH_STENCIL_DESC1>);
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING:
             return sizeof(StreamSubobjLayout<D3D12_VIEW_INSTANCING_DESC>);
-#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+#if defined(__ID3D12Device10_INTERFACE_DEFINED__) && !defined(__MINGW32__)
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2:
             return sizeof(StreamSubobjLayout<D3D12_DEPTH_STENCIL_DESC2>);
 #endif
@@ -687,6 +687,52 @@ bool SafeHashGuestMemoryFnv1a64(const void* src, size_t byte_count, uint64_t& ou
 D3D12_HEAP_FLAGS SanitizeXboxHeapFlags(D3D12_HEAP_FLAGS flags) noexcept {
     constexpr uint32_t kMaskOut = static_cast<uint32_t>(D3D12_HEAP_FLAG_ALLOW_DISPLAY);
     return static_cast<D3D12_HEAP_FLAGS>(static_cast<uint32_t>(flags) & ~kMaskOut);
+}
+
+// Sanitize zero-initialized D3D12_DEPTH_STENCIL_DESC enum fields (valid D3D12_COMPARISON_FUNC
+// and D3D12_STENCIL_OP values are 1..8). Strict IHVs such as Intel Arc Battlemage can reject
+// or fault on PSOs containing invalid 0 enum values even when DepthEnable/StencilEnable are FALSE.
+bool SanitizeDepthStencilOp(D3D12_DEPTH_STENCILOP_DESC& op) noexcept {
+    bool changed = false;
+    if (static_cast<uint32_t>(op.StencilFailOp) == 0u) {
+        op.StencilFailOp = D3D12_STENCIL_OP_KEEP;
+        changed = true;
+    }
+    if (static_cast<uint32_t>(op.StencilDepthFailOp) == 0u) {
+        op.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+        changed = true;
+    }
+    if (static_cast<uint32_t>(op.StencilPassOp) == 0u) {
+        op.StencilPassOp = D3D12_STENCIL_OP_KEEP;
+        changed = true;
+    }
+    if (static_cast<uint32_t>(op.StencilFunc) == 0u) {
+        op.StencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        changed = true;
+    }
+    return changed;
+}
+
+bool SanitizeDepthStencilDesc(D3D12_DEPTH_STENCIL_DESC& ds) noexcept {
+    bool changed = false;
+    if (static_cast<uint32_t>(ds.DepthFunc) == 0u) {
+        ds.DepthFunc = ds.DepthEnable ? D3D12_COMPARISON_FUNC_LESS_EQUAL : D3D12_COMPARISON_FUNC_ALWAYS;
+        changed = true;
+    }
+    if (SanitizeDepthStencilOp(ds.FrontFace)) changed = true;
+    if (SanitizeDepthStencilOp(ds.BackFace)) changed = true;
+    return changed;
+}
+
+bool SanitizeDepthStencilDesc1(D3D12_DEPTH_STENCIL_DESC1& ds) noexcept {
+    bool changed = false;
+    if (static_cast<uint32_t>(ds.DepthFunc) == 0u) {
+        ds.DepthFunc = ds.DepthEnable ? D3D12_COMPARISON_FUNC_LESS_EQUAL : D3D12_COMPARISON_FUNC_ALWAYS;
+        changed = true;
+    }
+    if (SanitizeDepthStencilOp(ds.FrontFace)) changed = true;
+    if (SanitizeDepthStencilOp(ds.BackFace)) changed = true;
+    return changed;
 }
 
 XG_TILE_MODE ExtractXboxGfx10TileMode(D3D12_TEXTURE_LAYOUT layout) noexcept {
@@ -1967,6 +2013,18 @@ DeviceX::~DeviceX() {
     ReleaseAaaRuntimeObjects();
     ReleaseUnifiedMemoryObjects();
     {
+        std::lock_guard<std::mutex> lock(cbv_align_mutex_);
+        if (cbv_align_ring_) {
+            if (cbv_align_ring_cpu_) {
+                cbv_align_ring_->Unmap(0u, nullptr);
+                cbv_align_ring_cpu_ = nullptr;
+            }
+            cbv_align_ring_->Release();
+            cbv_align_ring_ = nullptr;
+            cbv_align_ring_gpu_ = 0ull;
+        }
+    }
+    {
         std::lock_guard<std::mutex> lock(residency_mutex_);
         residency_entries_.clear();
         residency_lru_.clear();
@@ -2868,6 +2926,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateGraphicsPipelineState(
             lifted_desc.pRootSignature = SynthesizeHostRootSignatureFromXboxDesc(fallback_rs_desc);
         }
     }
+    (void)SanitizeDepthStencilDesc(lifted_desc.DepthStencilState);
 
     if (!ppPipelineState) {
         const HRESULT hr = host_dev_->CreateGraphicsPipelineState(&lifted_desc, riid, nullptr);
@@ -3140,10 +3199,15 @@ void STDMETHODCALLTYPE DeviceX::CreateConstantBufferView(
     const D3D12_CONSTANT_BUFFER_VIEW_DESC* desc_ptr = pDesc;
     D3D12_GPU_VIRTUAL_ADDRESS gpu_va = pDesc ? pDesc->BufferLocation : 0ull;
     if (pDesc && pDesc->BufferLocation != 0ull) {
-        const D3D12_GPU_VIRTUAL_ADDRESS mapped_va = TranslateGuestGpuVa(pDesc->BufferLocation);
-        if (mapped_va != pDesc->BufferLocation) {
+        D3D12_GPU_VIRTUAL_ADDRESS mapped_va = TranslateGuestGpuVa(pDesc->BufferLocation);
+        if ((mapped_va & 255ull) != 0ull) {
+            mapped_va = AlignRootCbvGpuVaForDesktop(mapped_va);
+        }
+        const UINT aligned_size = (pDesc->SizeInBytes + 255u) & ~255u;
+        if (mapped_va != pDesc->BufferLocation || aligned_size != pDesc->SizeInBytes) {
             translated = *pDesc;
             translated.BufferLocation = mapped_va;
+            translated.SizeInBytes = aligned_size;
             desc_ptr = &translated;
             gpu_va = mapped_va;
         }
@@ -3413,24 +3477,29 @@ D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE DeviceX::GetResourceAllocationI
     UINT visibleMask, UINT numResourceDescs, const D3D12_RESOURCE_DESC* pResourceDescs) {
     std::vector<D3D12_RESOURCE_DESC> rw_descs;
     const D3D12_RESOURCE_DESC* descs_ptr = pResourceDescs;
-    if (pResourceDescs && numResourceDescs > 0u && IsR9G9B9E5UavFallbackActive()) {
-        bool need_rw = false;
+    if (pResourceDescs && numResourceDescs > 0u) {
+        rw_descs.resize(numResourceDescs);
+        const bool r9_fb = IsR9G9B9E5UavFallbackActive();
         for (UINT i = 0; i < numResourceDescs; ++i) {
-            if (ShouldRewriteR9G9B9E5Uav(pResourceDescs[i])) {
-                need_rw = true;
-                break;
+            D3D12_RESOURCE_DESC clean = SanitizeXboxResourceDesc(pResourceDescs[i]);
+            if (r9_fb && ShouldRewriteR9G9B9E5Uav(clean)) {
+                clean.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
             }
+            rw_descs[i] = clean;
         }
-        if (need_rw) {
-            rw_descs.assign(pResourceDescs, pResourceDescs + numResourceDescs);
-            for (auto& d : rw_descs) {
-                if (ShouldRewriteR9G9B9E5Uav(d)) d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
-            }
-            descs_ptr = rw_descs.data();
-        }
+        descs_ptr = rw_descs.data();
     }
-    const D3D12_RESOURCE_ALLOCATION_INFO info =
+    D3D12_RESOURCE_ALLOCATION_INFO info =
         host_dev_->GetResourceAllocationInfo(visibleMask, numResourceDescs, descs_ptr);
+    if (info.SizeInBytes == UINT64_MAX && !rw_descs.empty()) {
+        uint64_t total = 0ull;
+        for (const auto& d : rw_descs) {
+            const uint64_t sz = std::max<uint64_t>(EstimateResourceVramBytes(d), 65536ull);
+            total += (sz + 65535ull) & ~65535ull;
+        }
+        info.SizeInBytes = total;
+        info.Alignment = 65536ull;
+    }
     RecordDev("ID3D12DeviceX::GetResourceAllocationInfo", 25, S_OK);
     return info;
 }
@@ -3454,6 +3523,13 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommittedResource(
     bool did_r9g9b9e5_fallback = false;
     if (pDesc) {
         clean_desc = SanitizeXboxResourceDesc(*pDesc);
+        if (retail_scarlett_abi_ &&
+            clean_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+            clean_desc.Width > 0ull) {
+            // Retail Xbox UMA titles memset(Map(), 0, GetResourceAllocationInfo().SizeInBytes),
+            // which is always 64 KiB aligned. Desktop drivers may only map ceil(Width, 4 KiB).
+            clean_desc.Width = (clean_desc.Width + 65535ull) & ~65535ull;
+        }
         if (ShouldRewriteR9G9B9E5Uav(clean_desc)) {
             clean_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
             did_r9g9b9e5_fallback = true;
@@ -3467,6 +3543,13 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommittedResource(
         desc_ptr = &clean_desc;
     }
     const D3D12_HEAP_FLAGS clean_heap_flags = SanitizeXboxHeapFlags(HeapFlags);
+    if (pHeapProperties) {
+        if (pHeapProperties->Type == D3D12_HEAP_TYPE_UPLOAD) {
+            InitialResourceState = D3D12_RESOURCE_STATE_GENERIC_READ;
+        } else if (pHeapProperties->Type == D3D12_HEAP_TYPE_READBACK) {
+            InitialResourceState = D3D12_RESOURCE_STATE_COPY_DEST;
+        }
+    }
     if (!ppvResource) {
         const HRESULT hr = host_dev_->CreateCommittedResource(
             pHeapProperties, clean_heap_flags, desc_ptr, InitialResourceState,
@@ -3630,6 +3713,18 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResource(
     D3D12_RESOURCE_STATES InitialState, const D3D12_CLEAR_VALUE* pOptimizedClearValue,
     REFIID riid, void** ppvResource) {
     ID3D12Heap* host_heap = UnwrapHeap(pHeap);
+    uint64_t heap_remaining_bytes = UINT64_MAX;
+    if (host_heap) {
+        const D3D12_HEAP_DESC hd = host_heap->GetDesc();
+        if (hd.SizeInBytes > HeapOffset) {
+            heap_remaining_bytes = hd.SizeInBytes - HeapOffset;
+        }
+        if (hd.Properties.Type == D3D12_HEAP_TYPE_UPLOAD) {
+            InitialState = D3D12_RESOURCE_STATE_GENERIC_READ;
+        } else if (hd.Properties.Type == D3D12_HEAP_TYPE_READBACK) {
+            InitialState = D3D12_RESOURCE_STATE_COPY_DEST;
+        }
+    }
     D3D12_RESOURCE_DESC clean_desc{};
     const D3D12_RESOURCE_DESC* desc_ptr = pDesc;
     D3D12_CLEAR_VALUE clean_clear{};
@@ -3637,6 +3732,16 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResource(
     bool did_r9g9b9e5_fallback = false;
     if (pDesc) {
         clean_desc = SanitizeXboxResourceDesc(*pDesc);
+        if (retail_scarlett_abi_ &&
+            clean_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+            clean_desc.Width > 0ull) {
+            // Retail Xbox UMA titles memset(Map(), 0, GetResourceAllocationInfo().SizeInBytes),
+            // which is always 64 KiB aligned. Desktop drivers may only map ceil(Width, 4 KiB).
+            const uint64_t rounded = (clean_desc.Width + 65535ull) & ~65535ull;
+            if (rounded <= heap_remaining_bytes) {
+                clean_desc.Width = rounded;
+            }
+        }
         if (ShouldRewriteR9G9B9E5Uav(clean_desc)) {
             clean_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
             did_r9g9b9e5_fallback = true;
@@ -3765,6 +3870,13 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateReservedResource(
     bool did_r9g9b9e5_fallback = false;
     if (pDesc) {
         clean_desc = SanitizeXboxResourceDesc(*pDesc);
+        if (retail_scarlett_abi_ &&
+            clean_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+            clean_desc.Width > 0ull) {
+            // Retail Xbox UMA titles memset(Map(), 0, GetResourceAllocationInfo().SizeInBytes),
+            // which is always 64 KiB aligned. Desktop drivers may only map ceil(Width, 4 KiB).
+            clean_desc.Width = (clean_desc.Width + 65535ull) & ~65535ull;
+        }
         if (ShouldRewriteR9G9B9E5Uav(clean_desc)) {
             clean_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
             did_r9g9b9e5_fallback = true;
@@ -4327,7 +4439,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePipelineState(
             needs_stream_rebuild = true;
             pso_remapped_ext_tags_.fetch_add(1ull, std::memory_order_relaxed);
             if (raw_tag == 25u) {
-#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+#if defined(__ID3D12Device10_INTERFACE_DEFINED__) && !defined(__MINGW32__)
                 const size_t ds2_stride = sizeof(StreamSubobjLayout<D3D12_DEPTH_STENCIL_DESC2>);
                 if (pos + ds2_stride <= total_bytes) {
                     ent.desktop_type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1;
@@ -4391,6 +4503,22 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePipelineState(
                 std::memcpy(&stream_prim_topo,
                             raw_stream + pos + offsetof(StreamSubobjLayout<D3D12_PRIMITIVE_TOPOLOGY_TYPE>, value),
                             sizeof(stream_prim_topo));
+            } else if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL) {
+                D3D12_DEPTH_STENCIL_DESC ds_probe{};
+                std::memcpy(&ds_probe,
+                            raw_stream + pos + offsetof(StreamSubobjLayout<D3D12_DEPTH_STENCIL_DESC>, value),
+                            sizeof(ds_probe));
+                if (SanitizeDepthStencilDesc(ds_probe)) {
+                    needs_stream_rebuild = true;
+                }
+            } else if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1) {
+                D3D12_DEPTH_STENCIL_DESC1 ds1_probe{};
+                std::memcpy(&ds1_probe,
+                            raw_stream + pos + offsetof(StreamSubobjLayout<D3D12_DEPTH_STENCIL_DESC1>, value),
+                            sizeof(ds1_probe));
+                if (SanitizeDepthStencilDesc1(ds1_probe)) {
+                    needs_stream_rebuild = true;
+                }
             } else if (IsShaderSubobjectType(sub_type)) {
                 D3D12_SHADER_BYTECODE bc{};
                 std::memcpy(&bc, raw_stream + pos + kBytecodeOffset, sizeof(bc));
@@ -4565,7 +4693,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePipelineState(
             if (ent.drop_subobject) continue;
 
             if (ent.convert_ds2_to_ds1) {
-#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+#if defined(__ID3D12Device10_INTERFACE_DEFINED__) && !defined(__MINGW32__)
                 StreamSubobjLayout<D3D12_DEPTH_STENCIL_DESC2> ds2{};
                 std::memcpy(&ds2, raw_stream + ent.src_offset, sizeof(ds2));
                 StreamSubobjLayout<D3D12_DEPTH_STENCIL_DESC1> ds1{};
@@ -4645,6 +4773,20 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePipelineState(
                 }
             } else if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY) {
                 rebuilt_topo_pos = dst_pos;
+            } else if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL) {
+                D3D12_DEPTH_STENCIL_DESC ds_val{};
+                const size_t ds_off = offsetof(StreamSubobjLayout<D3D12_DEPTH_STENCIL_DESC>, value);
+                std::memcpy(&ds_val, rebuilt_bytes.data() + dst_pos + ds_off, sizeof(ds_val));
+                if (SanitizeDepthStencilDesc(ds_val)) {
+                    std::memcpy(rebuilt_bytes.data() + dst_pos + ds_off, &ds_val, sizeof(ds_val));
+                }
+            } else if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1) {
+                D3D12_DEPTH_STENCIL_DESC1 ds1_val{};
+                const size_t ds1_off = offsetof(StreamSubobjLayout<D3D12_DEPTH_STENCIL_DESC1>, value);
+                std::memcpy(&ds1_val, rebuilt_bytes.data() + dst_pos + ds1_off, sizeof(ds1_val));
+                if (SanitizeDepthStencilDesc1(ds1_val)) {
+                    std::memcpy(rebuilt_bytes.data() + dst_pos + ds1_off, &ds1_val, sizeof(ds1_val));
+                }
             } else if (has_xbox_shader && IsShaderSubobjectType(ent.desktop_type)) {
                 D3D12_SHADER_BYTECODE bc{};
                 std::memcpy(&bc, rebuilt_bytes.data() + dst_pos + kBytecodeOffset, sizeof(bc));
@@ -5002,6 +5144,13 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommittedResource1(
     bool did_r9g9b9e5_fallback = false;
     if (pDesc) {
         clean_desc = SanitizeXboxResourceDesc(*pDesc);
+        if (retail_scarlett_abi_ &&
+            clean_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+            clean_desc.Width > 0ull) {
+            // Retail Xbox UMA titles memset(Map(), 0, GetResourceAllocationInfo().SizeInBytes),
+            // which is always 64 KiB aligned. Desktop drivers may only map ceil(Width, 4 KiB).
+            clean_desc.Width = (clean_desc.Width + 65535ull) & ~65535ull;
+        }
         if (ShouldRewriteR9G9B9E5Uav(clean_desc)) {
             clean_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
             did_r9g9b9e5_fallback = true;
@@ -5015,6 +5164,13 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommittedResource1(
         desc_ptr = &clean_desc;
     }
     const D3D12_HEAP_FLAGS clean_heap_flags = SanitizeXboxHeapFlags(HeapFlags);
+    if (pHeapProperties) {
+        if (pHeapProperties->Type == D3D12_HEAP_TYPE_UPLOAD) {
+            InitialResourceState = D3D12_RESOURCE_STATE_GENERIC_READ;
+        } else if (pHeapProperties->Type == D3D12_HEAP_TYPE_READBACK) {
+            InitialResourceState = D3D12_RESOURCE_STATE_COPY_DEST;
+        }
+    }
     if (!ppvResource) {
         const HRESULT hr = host_dev4_->CreateCommittedResource1(
             pHeapProperties, clean_heap_flags, desc_ptr, InitialResourceState,
@@ -5134,6 +5290,13 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateReservedResource1(
     bool did_r9g9b9e5_fallback = false;
     if (pDesc) {
         clean_desc = SanitizeXboxResourceDesc(*pDesc);
+        if (retail_scarlett_abi_ &&
+            clean_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+            clean_desc.Width > 0ull) {
+            // Retail Xbox UMA titles memset(Map(), 0, GetResourceAllocationInfo().SizeInBytes),
+            // which is always 64 KiB aligned. Desktop drivers may only map ceil(Width, 4 KiB).
+            clean_desc.Width = (clean_desc.Width + 65535ull) & ~65535ull;
+        }
         if (ShouldRewriteR9G9B9E5Uav(clean_desc)) {
             clean_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
             did_r9g9b9e5_fallback = true;
@@ -5415,6 +5578,31 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateStateObject(
         }
     }
 
+    // Sprint 14 integration: auto-lift embedded Xbox RDNA2 / Xbox-DXBC DXIL_LIBRARY
+    // subobjects via LiftDxrStateObjectDesc (lib_6_5 / lib_6_6 + SBT remapping + DXR=0 fallback).
+    openscarlett::DxrLiftedStateObjectResult lifted_so{};
+    bool has_dxil_library = false;
+    if (desc_ptr && desc_ptr->pSubobjects && desc_ptr->NumSubobjects > 0u) {
+        for (UINT i = 0u; i < desc_ptr->NumSubobjects; ++i) {
+            if (desc_ptr->pSubobjects[i].Type == D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY &&
+                desc_ptr->pSubobjects[i].pDesc != nullptr) {
+                has_dxil_library = true;
+                break;
+            }
+        }
+    }
+    if (has_dxil_library) {
+        openscarlett::DxrStateObjectLiftOptions lift_opts{};
+        lift_opts.host_dxr_tier = adapter_info_.raytracing_tier;
+        lift_opts.prefer_sm66 = (adapter_info_.highest_shader_model >= 0x66u);
+        lift_opts.compile_with_dxc = true;
+        const openscarlett::Status lift_st =
+            openscarlett::LiftDxrStateObjectDesc(desc_ptr, lift_opts, lifted_so);
+        if (lift_st.ok() && lifted_so.modified && lifted_so.LiftedDesc() != nullptr) {
+            desc_ptr = lifted_so.LiftedDesc();
+        }
+    }
+
     if (!ppStateObject) {
         const HRESULT hr = host_dev5_->CreateStateObject(desc_ptr, riid, nullptr);
         RecordDev("ID3D12DeviceX::CreateStateObject", 62, hr);
@@ -5425,15 +5613,15 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateStateObject(
     HRESULT hr = host_dev5_->CreateStateObject(
         desc_ptr, OS_D3D12_IID(ID3D12StateObject), reinterpret_cast<void**>(&host_so));
     if ((FAILED(hr) || !host_so) &&
-        adapter_info_.raytracing_tier == 0u &&
-        pDesc != nullptr &&
-        pDesc->pSubobjects != nullptr &&
-        pDesc->NumSubobjects > 0u &&
-        (pDesc->Type == D3D12_STATE_OBJECT_TYPE_COLLECTION ||
-         pDesc->Type == D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE)) {
+        (adapter_info_.raytracing_tier == 0u || lifted_so.fallback_plan.requires_software_fallback) &&
+        desc_ptr != nullptr &&
+        desc_ptr->pSubobjects != nullptr &&
+        desc_ptr->NumSubobjects > 0u &&
+        (desc_ptr->Type == D3D12_STATE_OBJECT_TYPE_COLLECTION ||
+         desc_ptr->Type == D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE)) {
         // Non-DXR adapter (e.g. GTX 1650 Ti / Win10 WARP): provide software StateObjectXProxy
         // supporting ID3D12StateObject + ID3D12StateObjectProperties shader identifier queries.
-        auto* sw_proxy = new (std::nothrow) StateObjectXProxy(this, nullptr, pDesc);
+        auto* sw_proxy = new (std::nothrow) StateObjectXProxy(this, nullptr, desc_ptr);
         if (!sw_proxy) {
             RecordDev("ID3D12DeviceX::CreateStateObject", 62, E_OUTOFMEMORY);
             return E_OUTOFMEMORY;
@@ -5447,7 +5635,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateStateObject(
         RecordDev("ID3D12DeviceX::CreateStateObject", 62, hr);
         return hr;
     }
-    auto* proxy = new (std::nothrow) StateObjectXProxy(this, host_so, pDesc);
+    auto* proxy = new (std::nothrow) StateObjectXProxy(this, host_so, desc_ptr);
     host_so->Release();
     if (!proxy) {
         RecordDev("ID3D12DeviceX::CreateStateObject", 62, E_OUTOFMEMORY);
@@ -7076,6 +7264,105 @@ ID3D12Resource* DeviceX::ResolveBufferResourceByGpuVa(
     return nullptr;
 }
 
+D3D12_GPU_VIRTUAL_ADDRESS DeviceX::AlignRootCbvGpuVaForDesktop(
+    D3D12_GPU_VIRTUAL_ADDRESS translated_va) {
+    if (translated_va == 0ull || (translated_va & 255ull) == 0ull || !host_dev_) {
+        return translated_va;
+    }
+
+    ID3D12Resource* src_res = nullptr;
+    uint64_t src_offset = 0ull;
+    uint64_t src_total_size = 0ull;
+    {
+        std::lock_guard<std::mutex> lock(buffer_va_mutex_);
+        for (const auto& [res, entry] : buffer_va_map_) {
+            if (entry.gpu_va != 0ull && translated_va >= entry.gpu_va &&
+                translated_va < entry.gpu_va + entry.size_bytes) {
+                src_res = res;
+                src_res->AddRef();
+                src_offset = translated_va - entry.gpu_va;
+                src_total_size = entry.size_bytes;
+                break;
+            }
+        }
+    }
+    if (!src_res || src_offset >= src_total_size) {
+        if (src_res) src_res->Release();
+        return translated_va & ~255ull;
+    }
+
+    constexpr uint64_t kSlotBytes = 4096ull;
+    constexpr uint32_t kSlotCount = 8192u;  // 32 MiB ring
+    constexpr uint64_t kRingBytes = kSlotBytes * kSlotCount;
+    const uint64_t copy_bytes = std::min<uint64_t>(kSlotBytes, src_total_size - src_offset);
+
+    D3D12_GPU_VIRTUAL_ADDRESS aligned_gpu_va = translated_va & ~255ull;
+    D3D12_HEAP_PROPERTIES hp{};
+    const bool is_cpu_readable =
+        SUCCEEDED(src_res->GetHeapProperties(&hp, nullptr)) &&
+        (hp.Type == D3D12_HEAP_TYPE_UPLOAD ||
+         (hp.Type == D3D12_HEAP_TYPE_CUSTOM &&
+          hp.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE));
+
+    if (is_cpu_readable) {
+        std::lock_guard<std::mutex> ring_lock(cbv_align_mutex_);
+        if (!cbv_align_ring_) {
+            D3D12_HEAP_PROPERTIES up_hp{};
+            up_hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+            D3D12_RESOURCE_DESC rdesc{};
+            rdesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+            rdesc.Width = kRingBytes;
+            rdesc.Height = 1u;
+            rdesc.DepthOrArraySize = 1u;
+            rdesc.MipLevels = 1u;
+            rdesc.SampleDesc.Count = 1u;
+            rdesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+            ID3D12Resource* ring = nullptr;
+            if (SUCCEEDED(host_dev_->CreateCommittedResource(
+                    &up_hp, D3D12_HEAP_FLAG_NONE, &rdesc,
+                    D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                    OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&ring))) &&
+                ring) {
+                void* mapped_ring = nullptr;
+                D3D12_RANGE zero_read{0u, 0u};
+                if (SUCCEEDED(ring->Map(0u, &zero_read, &mapped_ring)) && mapped_ring) {
+                    cbv_align_ring_ = ring;
+                    cbv_align_ring_cpu_ = static_cast<uint8_t*>(mapped_ring);
+                    cbv_align_ring_gpu_ = ring->GetGPUVirtualAddress();
+                } else {
+                    ring->Release();
+                }
+            }
+        }
+        if (cbv_align_ring_ && cbv_align_ring_cpu_) {
+            void* src_mapped = nullptr;
+            D3D12_RANGE read_range{
+                static_cast<SIZE_T>(src_offset),
+                static_cast<SIZE_T>(src_offset + copy_bytes)};
+            if (SUCCEEDED(src_res->Map(0u, &read_range, &src_mapped)) && src_mapped) {
+                const uint32_t slot = cbv_align_ring_cursor_++ % kSlotCount;
+                const uint64_t slot_off = static_cast<uint64_t>(slot) * kSlotBytes;
+                std::memcpy(
+                    cbv_align_ring_cpu_ + slot_off,
+                    static_cast<const uint8_t*>(src_mapped) + src_offset,
+                    static_cast<size_t>(copy_bytes));
+                if (copy_bytes < kSlotBytes) {
+                    const uint64_t pad_end = std::min<uint64_t>((copy_bytes + 255ull) & ~255ull, kSlotBytes);
+                    if (pad_end > copy_bytes) {
+                        std::memset(cbv_align_ring_cpu_ + slot_off + copy_bytes, 0,
+                                    static_cast<size_t>(pad_end - copy_bytes));
+                    }
+                }
+                D3D12_RANGE no_write{0u, 0u};
+                src_res->Unmap(0u, &no_write);
+                aligned_gpu_va = cbv_align_ring_gpu_ + slot_off;
+            }
+        }
+    }
+    src_res->Release();
+    return aligned_gpu_va;
+}
+
 bool DeviceX::LookupMirroredTitleVaForResource(
     ID3D12Resource* host_resource, uint64_t& out_title_va) const noexcept {
     out_title_va = 0ull;
@@ -8021,8 +8308,16 @@ uint64_t DeviceX::EffectiveResidencyBudgetBytesLocked() const noexcept {
     if (residency_budget_override_bytes_ > 0ull) {
         return residency_budget_override_bytes_;
     }
-    if (dxgi_mem_info_.queried_dxgi_adapter3 && dxgi_mem_info_.local_budget_bytes > 0ull) {
-        return std::min<uint64_t>(dxgi_mem_info_.local_budget_bytes, console_profile_.target_console_vram_bytes);
+    if (dxgi_mem_info_.queried_dxgi_adapter3 &&
+        (dxgi_mem_info_.local_budget_bytes > 0ull || dxgi_mem_info_.non_local_budget_bytes > 0ull)) {
+        // Integrated UMA GPUs (e.g. Intel Arc B390 reporting 128 MB dedicated VRAM) expose
+        // their full unified pool via non-local or combined DXGI segments.
+        constexpr uint64_t kUmaLocalThreshold = 512ull * 1024ull * 1024ull;
+        uint64_t host_budget = dxgi_mem_info_.local_budget_bytes;
+        if (host_budget < kUmaLocalThreshold && dxgi_mem_info_.non_local_budget_bytes > host_budget) {
+            host_budget = dxgi_mem_info_.non_local_budget_bytes;
+        }
+        return std::min<uint64_t>(host_budget, console_profile_.target_console_vram_bytes);
     }
     if (adapter_info_.dedicated_video_memory_bytes > 0ull) {
         const uint64_t safe_host = (adapter_info_.dedicated_video_memory_bytes * 85ull) / 100ull;

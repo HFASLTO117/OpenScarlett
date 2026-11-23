@@ -73,13 +73,13 @@ using OsGameInputUserAssociationCallback = void(OPENSCARLETT_GAMEINPUT_CALL*)(
     void* context,
     const OsGameInputUserAssociationEvent* event);
 
-using OsGameInputDeviceCallback = void(OPENSCARLETT_GAMEINPUT_CALL*)(
-    uint64_t callbackToken,
-    void* context,
-    IGameInputDevice* device,
-    uint64_t timestamp,
-    uint32_t currentStatus,
-    uint32_t previousStatus);
+using OsGameInputDeviceCallback = GameInputDeviceCallback;
+
+static_assert(offsetof(GameInputDeviceInfo, deviceId) == 0x20, "deviceId offset");
+static_assert(offsetof(GameInputDeviceInfo, deviceRootId) == 0x40, "deviceRootId offset");
+static_assert(offsetof(GameInputDeviceInfo, deviceFamily) == 0x60, "deviceFamily offset");
+static_assert(offsetof(GameInputDeviceInfo, supportedInput) == 0x68, "supportedInput offset");
+static_assert(sizeof(GameInputDeviceInfo) == 0x140, "GameInputDeviceInfo size");
 
 struct IGameInputEx {
     virtual int32_t OPENSCARLETT_GAMEINPUT_CALL QueryInterface(
@@ -480,7 +480,11 @@ public:
         info_.deviceId[1] = 0x53u;  // 'S'
         info_.deviceId[2] = static_cast<uint8_t>(slot & 0xFFu);
         info_.deviceId[3] = static_cast<uint8_t>(family & 0xFF);
-        info_.displayName = display_name;
+        std::memcpy(info_.deviceRootId, info_.deviceId, sizeof(info_.deviceId));
+        display_name_str_.data = display_name ? display_name : "";
+        display_name_str_.sizeInBytes = static_cast<uint32_t>(std::strlen(display_name_str_.data));
+        display_name_str_.codePointCount = display_name_str_.sizeInBytes;
+        info_.displayName = &display_name_str_;
     }
 
     ~GameInputDeviceImpl();
@@ -523,8 +527,37 @@ public:
         return status_.load(std::memory_order_acquire);
     }
 
+    void OPENSCARLETT_GAMEINPUT_CALL GetBatteryState(void* state) override {
+        RecordOk("IGameInputDevice::GetBatteryState", 5);
+        if (state) {
+            // GameInputBatteryState is 20 bytes (4 floats + 1 enum); zero-init safely.
+            std::memset(state, 0, 20);
+        }
+    }
+
+    int32_t OPENSCARLETT_GAMEINPUT_CALL CreateForceFeedbackEffect(
+        uint32_t /*motorIndex*/, const void* /*params*/, void** effect) override {
+        if (effect) *effect = nullptr;
+        return RecordHr("IGameInputDevice::CreateForceFeedbackEffect", GAMEINPUT_E_NOTIMPL, 6);
+    }
+
+    bool OPENSCARLETT_GAMEINPUT_CALL IsForceFeedbackMotorPoweredOn(uint32_t /*motorIndex*/) override {
+        RecordOk("IGameInputDevice::IsForceFeedbackMotorPoweredOn", 7);
+        return false;
+    }
+
+    void OPENSCARLETT_GAMEINPUT_CALL SetForceFeedbackMotorGain(
+        uint32_t /*motorIndex*/, float /*masterGain*/) override {
+        RecordOk("IGameInputDevice::SetForceFeedbackMotorGain", 8);
+    }
+
+    int32_t OPENSCARLETT_GAMEINPUT_CALL SetHapticMotorState(
+        uint32_t /*motorIndex*/, const void* /*params*/) override {
+        return RecordHr("IGameInputDevice::SetHapticMotorState", GAMEINPUT_S_OK, 9);
+    }
+
     void OPENSCARLETT_GAMEINPUT_CALL SetRumbleState(const GameInputRumbleParams* params) override {
-        RecordOk("IGameInputDevice::SetRumbleState", 5);
+        RecordOk("IGameInputDevice::SetRumbleState", 10);
         auto sanitize_unit = [](float v) -> float {
             return std::isfinite(v) ? std::clamp(v, 0.0f, 1.0f) : 0.0f;
         };
@@ -595,6 +628,42 @@ public:
         return xinput_slot_.load(std::memory_order_relaxed);
     }
 
+    void OPENSCARLETT_GAMEINPUT_CALL SetInputSynchronizationState(bool /*enabled*/) override {}
+    void OPENSCARLETT_GAMEINPUT_CALL SendInputSynchronizationHint() override {}
+    void OPENSCARLETT_GAMEINPUT_CALL PowerOff() override {}
+    int32_t OPENSCARLETT_GAMEINPUT_CALL CreateRawDeviceReport(
+        uint32_t /*reportId*/, uint32_t /*reportKind*/, void** report) override {
+        if (report) *report = nullptr;
+        return GAMEINPUT_E_NOTIMPL;
+    }
+    int32_t OPENSCARLETT_GAMEINPUT_CALL GetRawDeviceFeature(
+        uint32_t /*reportId*/, void** report) override {
+        if (report) *report = nullptr;
+        return GAMEINPUT_E_NOTIMPL;
+    }
+    int32_t OPENSCARLETT_GAMEINPUT_CALL SetRawDeviceFeature(void* /*report*/) override {
+        return GAMEINPUT_E_NOTIMPL;
+    }
+    int32_t OPENSCARLETT_GAMEINPUT_CALL SendRawDeviceOutput(void* /*report*/) override {
+        return GAMEINPUT_E_NOTIMPL;
+    }
+    int32_t OPENSCARLETT_GAMEINPUT_CALL SendRawDeviceOutputWithResponse(
+        void* /*requestReport*/, void** responseReport) override {
+        if (responseReport) *responseReport = nullptr;
+        return GAMEINPUT_E_NOTIMPL;
+    }
+    int32_t OPENSCARLETT_GAMEINPUT_CALL ExecuteRawDeviceIoControl(
+        uint32_t /*controlCode*/, size_t /*inputBufferSize*/, const void* /*inputBuffer*/,
+        size_t /*outputBufferSize*/, void* /*outputBuffer*/, size_t* outputSize) override {
+        if (outputSize) *outputSize = 0u;
+        return GAMEINPUT_E_NOTIMPL;
+    }
+    bool OPENSCARLETT_GAMEINPUT_CALL AcquireExclusiveRawDeviceAccess(
+        uint64_t /*timeoutInMicroseconds*/) override {
+        return false;
+    }
+    void OPENSCARLETT_GAMEINPUT_CALL ReleaseExclusiveRawDeviceAccess() override {}
+
     uint32_t SetStatus(uint32_t new_status) {
         return status_.exchange(new_status, std::memory_order_acq_rel);
     }
@@ -639,6 +708,7 @@ private:
     std::atomic<uint64_t> user_assoc_seq_{0ull};
     std::atomic<uint64_t> connect_seq_{0ull};
     GameInputDeviceInfo info_{};
+    GameInputString display_name_str_{};
     std::mutex mutex_;
     GameInputRumbleParams last_rumble_{};
     uint16_t last_xinput_left_ = 0u;
@@ -732,21 +802,26 @@ public:
         }
     }
 
-    bool OPENSCARLETT_GAMEINPUT_CALL GetGamepadState(GameInputGamepadState* state) override {
-        RecordOk("IGameInputReading::GetGamepadState", 7);
-        if (!state) return false;
-        *state = gamepad_;
-        return (kind_ & GameInputKindGamepad) != 0;
+    bool OPENSCARLETT_GAMEINPUT_CALL GetRawReport(void** report) override {
+        if (report) *report = nullptr;
+        return false;
     }
 
+    uint32_t OPENSCARLETT_GAMEINPUT_CALL GetControllerAxisCount() override { return 0u; }
+    uint32_t OPENSCARLETT_GAMEINPUT_CALL GetControllerAxisState(uint32_t, float*) override { return 0u; }
+    uint32_t OPENSCARLETT_GAMEINPUT_CALL GetControllerButtonCount() override { return 0u; }
+    uint32_t OPENSCARLETT_GAMEINPUT_CALL GetControllerButtonState(uint32_t, bool*) override { return 0u; }
+    uint32_t OPENSCARLETT_GAMEINPUT_CALL GetControllerSwitchCount() override { return 0u; }
+    uint32_t OPENSCARLETT_GAMEINPUT_CALL GetControllerSwitchState(uint32_t, uint32_t*) override { return 0u; }
+
     uint32_t OPENSCARLETT_GAMEINPUT_CALL GetKeyCount() override {
-        RecordOk("IGameInputReading::GetKeyCount", 8);
+        RecordOk("IGameInputReading::GetKeyCount", 14);
         return static_cast<uint32_t>(keys_.size());
     }
 
     uint32_t OPENSCARLETT_GAMEINPUT_CALL GetKeyState(
         uint32_t stateArrayCount, GameInputKeyState* stateArray) override {
-        RecordOk("IGameInputReading::GetKeyState", 9);
+        RecordOk("IGameInputReading::GetKeyState", 15);
         if (!stateArray || stateArrayCount == 0) return 0;
         const uint32_t count = std::min<uint32_t>(
             stateArrayCount, static_cast<uint32_t>(keys_.size()));
@@ -757,13 +832,32 @@ public:
     }
 
     bool OPENSCARLETT_GAMEINPUT_CALL GetMouseState(GameInputMouseState* state) override {
-        RecordOk("IGameInputReading::GetMouseState", 10);
+        RecordOk("IGameInputReading::GetMouseState", 16);
         if (!state) return false;
         *state = mouse_;
         return (kind_ & GameInputKindMouse) != 0;
     }
 
-    bool GetUiNavigationState(OsGameInputUiNavigationState* state) const {
+    uint32_t OPENSCARLETT_GAMEINPUT_CALL GetTouchCount() override { return 0u; }
+    uint32_t OPENSCARLETT_GAMEINPUT_CALL GetTouchState(uint32_t, void*) override { return 0u; }
+    bool OPENSCARLETT_GAMEINPUT_CALL GetMotionState(void*) override { return false; }
+    bool OPENSCARLETT_GAMEINPUT_CALL GetArcadeStickState(void*) override { return false; }
+    bool OPENSCARLETT_GAMEINPUT_CALL GetFlightStickState(void*) override { return false; }
+
+    bool OPENSCARLETT_GAMEINPUT_CALL GetGamepadState(GameInputGamepadState* state) override {
+        RecordOk("IGameInputReading::GetGamepadState", 22);
+        if (!state) return false;
+        *state = gamepad_;
+        return (kind_ & GameInputKindGamepad) != 0;
+    }
+
+    bool OPENSCARLETT_GAMEINPUT_CALL GetRacingWheelState(void*) override { return false; }
+
+    bool OPENSCARLETT_GAMEINPUT_CALL GetUiNavigationState(void* state) override {
+        return GetUiNavigationStateInternal(static_cast<OsGameInputUiNavigationState*>(state));
+    }
+
+    bool GetUiNavigationStateInternal(OsGameInputUiNavigationState* state) const {
         if (!state) return false;
         state->buttons = ui_nav_buttons_;
         return (kind_ & (GameInputKindUiNavigation | GameInputKindGamepad | GameInputKindKeyboard)) != 0u;
@@ -1161,8 +1255,101 @@ public:
         return RecordHr("IGameInput::GetPreviousReading", GAMEINPUT_E_READING_NOT_FOUND, 6);
     }
 
+    int32_t OPENSCARLETT_GAMEINPUT_CALL GetTemporalReading(
+        uint64_t /*timestamp*/,
+        IGameInputDevice* device,
+        IGameInputReading** reading) override {
+        return GetCurrentReading(GameInputKindUnknown, device, reading);
+    }
+
+    int32_t OPENSCARLETT_GAMEINPUT_CALL RegisterReadingCallback(
+        IGameInputDevice* /*device*/,
+        GameInputKind /*inputKind*/,
+        float /*analogThreshold*/,
+        void* /*context*/,
+        GameInputReadingCallback /*callbackFunc*/,
+        uint64_t* callbackToken) override {
+        const uint64_t tok = next_cb_token_++;
+        if (callbackToken) *callbackToken = tok;
+        return RecordHr("IGameInput::RegisterReadingCallback", GAMEINPUT_S_OK, 8);
+    }
+
+    int32_t OPENSCARLETT_GAMEINPUT_CALL RegisterSystemButtonCallback(
+        IGameInputDevice* /*device*/,
+        uint32_t /*buttonFilter*/,
+        void* /*context*/,
+        GameInputSystemButtonCallback /*callbackFunc*/,
+        uint64_t* callbackToken) override {
+        const uint64_t tok = next_cb_token_++;
+        if (callbackToken) *callbackToken = tok;
+        return RecordHr("IGameInput::RegisterSystemButtonCallback", GAMEINPUT_S_OK, 10);
+    }
+
+    int32_t OPENSCARLETT_GAMEINPUT_CALL RegisterKeyboardLayoutCallback(
+        IGameInputDevice* /*device*/,
+        void* /*context*/,
+        GameInputKeyboardLayoutCallback /*callbackFunc*/,
+        uint64_t* callbackToken) override {
+        const uint64_t tok = next_cb_token_++;
+        if (callbackToken) *callbackToken = tok;
+        return RecordHr("IGameInput::RegisterKeyboardLayoutCallback", GAMEINPUT_S_OK, 11);
+    }
+
+    int32_t OPENSCARLETT_GAMEINPUT_CALL CreateDispatcher(void** dispatcher) override {
+        if (dispatcher) *dispatcher = nullptr;
+        return RecordHr("IGameInput::CreateDispatcher", GAMEINPUT_E_NOTIMPL, 14);
+    }
+
+    int32_t OPENSCARLETT_GAMEINPUT_CALL CreateAggregateDevice(
+        GameInputKind /*inputKind*/, IGameInputDevice** device) override {
+        if (!device) return RecordHr("IGameInput::CreateAggregateDevice", GAMEINPUT_E_POINTER, 15);
+        *device = default_device_;
+        if (default_device_) default_device_->AddRef();
+        return RecordHr("IGameInput::CreateAggregateDevice", GAMEINPUT_S_OK, 15);
+    }
+
+    int32_t OPENSCARLETT_GAMEINPUT_CALL FindDeviceFromId(
+        const void* value, IGameInputDevice** device) override {
+        if (!device) return RecordHr("IGameInput::FindDeviceFromId", GAMEINPUT_E_POINTER, 16);
+        *device = nullptr;
+        if (!value) return RecordHr("IGameInput::FindDeviceFromId", GAMEINPUT_E_INVALIDARG, 16);
+        std::lock_guard<std::mutex> lk(mutex_);
+        for (const auto& kv : slot_devices_) {
+            if (kv.second && std::memcmp(kv.second->GetDeviceInfo()->deviceId, value, 32) == 0) {
+                kv.second->AddRef();
+                *device = kv.second;
+                return RecordHr("IGameInput::FindDeviceFromId", GAMEINPUT_S_OK, 16);
+            }
+        }
+        return RecordHr("IGameInput::FindDeviceFromId", GAMEINPUT_E_DEVICE_DISCONNECTED, 16);
+    }
+
+    int32_t OPENSCARLETT_GAMEINPUT_CALL FindDeviceFromObject(
+        void* /*value*/, IGameInputDevice** device) override {
+        if (device) *device = nullptr;
+        return RecordHr("IGameInput::FindDeviceFromObject", GAMEINPUT_E_NOTIMPL, 17);
+    }
+
+    int32_t OPENSCARLETT_GAMEINPUT_CALL FindDeviceFromPlatformHandle(
+        void* /*value*/, IGameInputDevice** device) override {
+        if (device) *device = nullptr;
+        return RecordHr("IGameInput::FindDeviceFromPlatformHandle", GAMEINPUT_E_NOTIMPL, 18);
+    }
+
+    int32_t OPENSCARLETT_GAMEINPUT_CALL FindDeviceFromPlatformString(
+        const wchar_t* /*value*/, IGameInputDevice** device) override {
+        if (device) *device = nullptr;
+        return RecordHr("IGameInput::FindDeviceFromPlatformString", GAMEINPUT_E_NOTIMPL, 19);
+    }
+
+    int32_t OPENSCARLETT_GAMEINPUT_CALL EnableOemDeviceSupport(
+        uint16_t /*vendorId*/, uint16_t /*productId*/,
+        uint8_t /*interfaceNumber*/, uint8_t /*collectionNumber*/) override {
+        return RecordHr("IGameInput::EnableOemDeviceSupport", GAMEINPUT_S_OK, 20);
+    }
+
     void OPENSCARLETT_GAMEINPUT_CALL SetFocusPolicy(uint32_t policy) override {
-        RecordOk("IGameInput::SetFocusPolicy", 7);
+        RecordOk("IGameInput::SetFocusPolicy", 21);
         focus_policy_.store(policy, std::memory_order_release);
     }
 
@@ -1942,7 +2129,7 @@ OpenScarlettGameInputGetUiNavigationState(
         return RecordHr("OpenScarlettGameInputGetUiNavigationState", GAMEINPUT_E_INVALIDARG);
     }
     auto* r = static_cast<GameInputReadingImpl*>(reading);
-    const bool ok = r->GetUiNavigationState(static_cast<OsGameInputUiNavigationState*>(outState));
+    const bool ok = r->GetUiNavigationStateInternal(static_cast<OsGameInputUiNavigationState*>(outState));
     return RecordHr("OpenScarlettGameInputGetUiNavigationState",
                     ok ? GAMEINPUT_S_OK : GAMEINPUT_E_INVALIDARG);
 }

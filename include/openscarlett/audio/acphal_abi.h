@@ -75,6 +75,23 @@ struct AcpHalShapeContexts {
     void* internalAllocation;
 };
 
+// Xbox APU Audio Heap ABI (exported by AcpHal.dll)
+typedef uint32_t APU_ADDRESS;
+
+constexpr APU_ADDRESS APU_INVALID_ADDRESS = 0u;
+constexpr uint32_t APU_ALLOC_CACHED = 0x00000000u;
+constexpr uint32_t APU_ALLOC_NONCACHED = 0x00000001u;
+constexpr uint32_t APU_ALLOC_DEFAULT_ALIGNMENT = 0u;
+
+struct APU_HEAP_STATE {
+    uint32_t bytesAllocated;
+    uint32_t bytesFree;
+    uint32_t bytesLost;
+    uint32_t maximumBlockSizeAvailable;
+    uint32_t allocationCount;
+};
+static_assert(sizeof(APU_HEAP_STATE) == 20, "APU_HEAP_STATE must be 20 bytes");
+
 struct IAcpHal {
     virtual int32_t OPENSCARLETT_ACPHAL_CALL QueryInterface(
         const AcpHalGuid* riid, void** ppvObject) = 0;
@@ -100,6 +117,28 @@ OPENSCARLETT_ACPHAL_API int32_t OPENSCARLETT_ACPHAL_CALL AcpHalAllocateShapeCont
     AcpHalShapeContexts* pAllocated);
 OPENSCARLETT_ACPHAL_API int32_t OPENSCARLETT_ACPHAL_CALL AcpHalReleaseShapeContexts(
     AcpHalShapeContexts* pAllocated);
+
+OPENSCARLETT_ACPHAL_API int32_t OPENSCARLETT_ACPHAL_CALL ApuCreateHeap(
+    uint32_t cachedSizeInBytes,
+    uint32_t nonCachedSizeInBytes);
+OPENSCARLETT_ACPHAL_API int32_t OPENSCARLETT_ACPHAL_CALL ApuAlloc(
+    void** virtualAddress,
+    APU_ADDRESS* physicalAddress,
+    uint32_t sizeInBytes,
+    uint32_t alignmentInBytes,
+    uint32_t flags);
+OPENSCARLETT_ACPHAL_API int32_t OPENSCARLETT_ACPHAL_CALL ApuFree(
+    void* virtualAddress);
+OPENSCARLETT_ACPHAL_API int32_t OPENSCARLETT_ACPHAL_CALL ApuHeapGetState(
+    APU_HEAP_STATE* state,
+    uint32_t flags);
+OPENSCARLETT_ACPHAL_API int32_t OPENSCARLETT_ACPHAL_CALL ApuIsVirtualAddressValid(
+    const void* virtualAddress,
+    uint32_t sizeInBytes);
+OPENSCARLETT_ACPHAL_API APU_ADDRESS OPENSCARLETT_ACPHAL_CALL ApuMapVirtualAddress(
+    const void* virtualAddress);
+OPENSCARLETT_ACPHAL_API void* OPENSCARLETT_ACPHAL_CALL ApuMapApuAddress(
+    APU_ADDRESS apuAddress);
 
 #ifdef __cplusplus
 }

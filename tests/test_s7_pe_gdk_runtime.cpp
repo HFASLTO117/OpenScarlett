@@ -189,7 +189,7 @@ void TestKnownDllResolution(const fs::path& bin_dir, const fs::path& scratch_dir
             reinterpret_cast<void*>(::GetProcAddress(h_hook, "OpenScarlettHook_ResolveKnownDllPathW")));
         OS_REQUIRE(fn_count != nullptr);
         OS_REQUIRE(fn_known != nullptr);
-        OS_REQUIRE(fn_count() == 30u);
+        OS_REQUIRE(fn_count() == 31u);
 
         wchar_t resolved_buf[MAX_PATH]{};
         OS_REQUIRE(fn_known(L"ws2_32.dll", resolved_buf, MAX_PATH) == 1);
@@ -837,9 +837,9 @@ void TestSixNewFixedReturnStubDlls(const fs::path& bin_dir) {
     using namespace openscarlett;
 
     DllRoutingTable table;
-    OS_REQUIRE(table.ListRules().size() == 19u);
-    OS_REQUIRE(table.ListAllRules().size() == 24u);
-    OS_REQUIRE(table.ListCompleteRules().size() == 30u);
+    OS_REQUIRE(table.ListRules().size() == 20u);
+    OS_REQUIRE(table.ListAllRules().size() == 25u);
+    OS_REQUIRE(table.ListCompleteRules().size() == 31u);
 
     const char* kSixDlls[] = {
         "mflnmhelp.dll",

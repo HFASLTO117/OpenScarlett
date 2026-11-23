@@ -165,6 +165,9 @@ std::vector<wchar_t> BuildChildEnvironmentBlock(const std::wstring& shim_dir,
     UpsertEnvEntry(entries, L"OPENSCARLETT_VFS_T", vfs_t);
     UpsertEnvEntry(entries, L"OPENSCARLETT_VFS_S", vfs_s);
     UpsertEnvEntry(entries, L"OPENSCARLETT_SAVE_ROOT", vfs_s);
+    if (!HasEnvVarW(L"OPENSCARLETT_PLS_DRIVE_P") && !HasEnvVarW(L"OPENSCARLETT_PLS_PATH")) {
+        UpsertEnvEntry(entries, L"OPENSCARLETT_PLS_DRIVE_P", L"1");
+    }
     RemoveEnvEntry(entries, L"OPENSCARLETT_CHILD_TELEMETRY_PER_PID");
 
     if (!title_id.empty()) {

@@ -325,8 +325,12 @@ PeForwarderResolver::PeForwarderResolver(DllRoutingTable routing_table)
         // UI / Graphics / Shell / Multimedia / Downlevel API-sets
         {"api-ms-win-ntuser-", "user32.dll"},
         {"ext-ms-win-ntuser-", "user32.dll"},
+        {"api-ms-win-rtcore-ntuser-", "user32.dll"},
+        {"ext-ms-win-rtcore-ntuser-", "user32.dll"},
         {"api-ms-win-gdi-", "gdi32.dll"},
         {"ext-ms-win-gdi-", "gdi32.dll"},
+        {"api-ms-win-rtcore-gdi-", "gdi32.dll"},
+        {"ext-ms-win-rtcore-gdi-", "gdi32.dll"},
         {"api-ms-win-dx-", "dxgi.dll"},
         {"ext-ms-win-dx-", "dxgi.dll"},
         {"api-ms-win-mm-", "winmm.dll"},

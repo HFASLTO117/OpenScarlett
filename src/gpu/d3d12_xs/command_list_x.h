@@ -224,6 +224,8 @@ public:
     static ID3D12GraphicsCommandList* UnwrapHostGraphicsList(
         ID3D12GraphicsCommandList* maybe_wrapped) noexcept;
     static CommandListX* TryFromCommandList(ID3D12CommandList* maybe_wrapped) noexcept;
+    static void RegisterExternalAlias(const void* alias_ptr, CommandListX* wrapper) noexcept;
+    static void UnregisterExternalAlias(const void* alias_ptr) noexcept;
     void CopyVulkanRecordedBatch(VulkanRecordedBatch& out_batch) const;
     void ExtractPendingMirrorWritebacks(std::vector<uint64_t>& out_vas) const;
     void ExtractDeferredCpuOps(

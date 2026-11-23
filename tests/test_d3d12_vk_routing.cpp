@@ -402,13 +402,12 @@ std::vector<uint32_t> BuildSimpleMeshSpirv() {
     const uint32_t t_arr_v4 = b.Id(), t_out_arr_v4 = b.Id();
     const uint32_t t_arr_idx = b.Id(), t_out_arr_idx = b.Id(), t_out_v3u = b.Id();
     const uint32_t c_u0 = b.Id(), c_u1 = b.Id(), c_u2 = b.Id(), c_u3 = b.Id(), c_i0 = b.Id();
-    const uint32_t c_f0 = b.Id(), c_f1 = b.Id(), c_fn08 = b.Id(), c_fp08 = b.Id();
+    const uint32_t c_f0 = b.Id(), c_f025 = b.Id(), c_f1 = b.Id(), c_fn08 = b.Id(), c_fp08 = b.Id();
     const uint32_t c_p0 = b.Id(), c_p1 = b.Id(), c_p2 = b.Id(), c_col = b.Id(), c_tri = b.Id();
     const uint32_t v_pv = b.Id(), v_col = b.Id(), v_idx = b.Id();
     const uint32_t fn_main = b.Id(), lbl = b.Id();
 
-    b.Op(17, {1});     // Shader
-    b.Op(17, {5283});  // MeshShadingEXT
+    b.Op(17, {5283});  // MeshShadingEXT (implicitly declares Shader)
     {
         std::vector<uint32_t> ext;
         SpvBuilder::PushStr(ext, "SPV_EXT_mesh_shader");
@@ -456,12 +455,14 @@ std::vector<uint32_t> BuildSimpleMeshSpirv() {
     b.Op(32, {t_out_v3u, 3, t_v3u});
 
     b.Op(43, {t_f32, c_f0, F32Bits(0.0f)});
+    b.Op(43, {t_f32, c_f025, F32Bits(0.25f)});
     b.Op(43, {t_f32, c_f1, F32Bits(1.0f)});
     b.Op(43, {t_f32, c_fn08, F32Bits(-0.8f)});
     b.Op(43, {t_f32, c_fp08, F32Bits(0.8f)});
-    b.Op(44, {t_v4, c_p0, c_fn08, c_fn08, c_f0, c_f1});
-    b.Op(44, {t_v4, c_p1, c_fp08, c_fn08, c_f0, c_f1});
-    b.Op(44, {t_v4, c_p2, c_f0, c_fp08, c_f0, c_f1});
+    // Strictly interior Z=0.25 (avoiding z=0.0 near-plane clipping ambiguity on Intel Arc Xe2)
+    b.Op(44, {t_v4, c_p0, c_fn08, c_fn08, c_f025, c_f1});
+    b.Op(44, {t_v4, c_p1, c_fp08, c_fn08, c_f025, c_f1});
+    b.Op(44, {t_v4, c_p2, c_f0, c_fp08, c_f025, c_f1});
     b.Op(44, {t_v4, c_col, c_f0, c_f1, c_f0, c_f1});  // Pure green
     b.Op(44, {t_v3u, c_tri, c_u0, c_u1, c_u2});
 
@@ -975,6 +976,10 @@ void Test1_D3D12ToVulkanRoutingParityAndDirectSpirv(bool prefer_warp) {
     OS_REQUIRE(SUCCEEDED(OpenScarlettD3D12CopyLastPresentPixels(
         queue.Get(), gfx_px.data(), static_cast<uint32_t>(gfx_px.size()), &copied)));
     // Mesh shader outputs pure green (0, 255, 0, 255) at center pixel!
+    if (gfx_px[mid + 0] > 2u || gfx_px[mid + 1] < 253u || gfx_px[mid + 2] > 2u) {
+        std::fprintf(stderr, "  [MESH-FAIL] center pixel RGBA=(%u,%u,%u,%u) expected=(0,255,0,255)\n",
+                     gfx_px[mid + 0], gfx_px[mid + 1], gfx_px[mid + 2], gfx_px[mid + 3]);
+    }
     OS_REQUIRE(gfx_px[mid + 0] <= 2u);
     OS_REQUIRE(gfx_px[mid + 1] >= 253u);
     OS_REQUIRE(gfx_px[mid + 2] <= 2u);

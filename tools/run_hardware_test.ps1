@@ -1,4 +1,4 @@
-# OpenScarlett — 1-Click Portable Hardware & Self-Test Runner
+﻿# OpenScarlett — 1-Click Portable Hardware & Self-Test Runner
 # Runs host GPU/OS probes + all OpenScarlett live tests, shows clear live results,
 # saves a privacy-sanitized Markdown report, and optionally opens a pre-filled GitHub Issue.
 
@@ -165,8 +165,13 @@ $TestDescriptions = @{
     'test_s12_os_loader_gameinput.exe' = 'Sprint 12 live PeForwarder/LSA/probe CLI, TLS slot 0, NtCreateFile nested VFS, GameInput user-before-connect & 128-voice XAudio2'
     'test_s13_live_xbox_shader_e2e.exe' = 'Sprint 13 live Xbox DXBC/PM4/SGPR + RayQuery E2E through DeviceX (VS/PS/CS/Mesh no-RTS0), unified texture sync & title HWND PresentX'
     'test_s13_vk_xg_tiled.exe'         = 'Sprint 13 Vulkan OPTIONS2/7 & VK_EXT_custom_border_color, placed tiled textures in CommandListX/XG untiler & stencil/HTILE parity'
-    'test_s13_shader_cfg_safety.exe'   = 'Sprint 13 RDNA2 MIMG R128/TFE/LWE refusal, poisoned mutex recovery, CFG canonicalization, V# slot-0/LDS & 764/779 GPU opcodes'
+    'test_s13_shader_cfg_safety.exe'   = 'Sprint 13 RDNA2 MIMG R128/TFE/LWE refusal, poisoned mutex recovery, CFG canonicalization, V# slot-0/LDS & 769/779 GPU opcodes'
     'test_s13_gdk_offline_ntdll.exe'   = 'Sprint 13 offline-first XSTS default (OPENSCARLETT_MOCK_XSTS=1 opt-in), XTaskQueue waiter re-arm/drain, dialog/XError & UMS/wldp shims'
+    'test_s14_p0_shims_ffx_config.exe' = 'Sprint 14 XAudio2_9 ordinal pinning (@1-@4), XMemGetWorkingSetStatistics, FFX 2.0 5-export ABI, middleware routing, MIME/WS & MicrosoftGame.Config'
+    'test_s14_d3d12_barriers_residency.exe' = 'Sprint 14 Agility SDK, unwrapped Enhanced Barriers, live VRAM LRU/window-0 residency, Series PSO stream remap, Resource1/2+Heap1 & FenceWaitDispatcher'
+    'test_s14_xbox_bvh_builder_abi.exe' = 'Sprint 14 24 mangled C++ XboxBvhBuilder ABI exports, dual-path BVH4 rehydration (DXR 1.1 + DXR=0 GPU compute) & LiftDxrStateObjectDesc'
+    'test_s14_dstorage_x2_iocp.exe'    = 'Sprint 14 DirectStorage X2, RFC 1950 Zlib, Xbox BCPack BC1-BC7 + fuzz, concurrent OVERLAPPED/IOCP (>64 GiB sparse) & MSAA 2x/4x/8x tiled layouts'
+    'test_s14_shader_sm66_779.exe'     = 'Sprint 14 Issue #29 RDNA4 VOPC fix, SM 6.6 + HS/DS/GS/lib profiles, off-C: cache, live RayQuery lifter, 13 radar rules & 779/779 GFX10.3 opcodes'
     'test_ue5_dxc_xcrdapi_xg.exe'      = 'UE5 Scarlett bringup: dxcompiler_xs DxcCreateInstance/2, XCRDAPI DStorageGetFactory & xg_xs XGCreateTextureComputer (1D/2D/3D)'
     'test_ue5_d3d12_exports.exe'       = 'UE5 Scarlett bringup: 42 byte-exact IID_ID3D12* GUID data exports & 9 D3D12Xbox* process/device/frame helpers'
     'test_ue5_acphal_xmem_mfplat.exe'  = 'UE5 Scarlett bringup: AcpHal thread-safe APU heap, XMem allocation hooks & 46 System32 MFPlat forwarded exports'

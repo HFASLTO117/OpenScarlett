@@ -77,6 +77,7 @@ struct MeshletCullPsoStream {
     PsoStreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, D3D12_BLEND_DESC> blend;
     PsoStreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, D3D12_RASTERIZER_DESC> rasterizer;
     PsoStreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, D3D12_DEPTH_STENCIL_DESC> depth_stencil;
+    PsoStreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE> topology;
     PsoStreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, UINT> sample_mask;
     PsoStreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, DXGI_SAMPLE_DESC> sample_desc;
     PsoStreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY> rt_formats;
@@ -819,6 +820,7 @@ int main(int argc, char** argv) {
         stream.blend.inner = blend_desc;
         stream.rasterizer.inner = rast_desc;
         stream.depth_stencil.inner = ds_desc;
+        stream.topology.inner = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         stream.sample_mask.inner = UINT_MAX;
         stream.sample_desc.inner = {1, 0};
         stream.rt_formats.inner.NumRenderTargets = 1;

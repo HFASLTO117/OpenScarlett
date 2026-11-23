@@ -185,6 +185,9 @@ def collect_dlls(build_dir: pathlib.Path) -> list[DllInfo]:
     # Auto-upgrade tiers when Sprint 9/10/14/UE5 implementations land!
     has_proxies = has("tests/test_d3d12_xs_proxies_multiqueue.cpp")
     has_mf_hw = has("tests/test_media_video_gameinput.cpp")
+    has_s14_ffx = has("tests/test_s14_p0_shims_ffx_config.cpp")
+    has_s14_bvh = has("tests/test_s14_xbox_bvh_builder_abi.cpp")
+    has_s14_ds = has("tests/test_s14_dstorage_x2_iocp.cpp")
     has_ue5 = has("tests/test_ue5_matrix_import_bringup.cpp")
 
     out: list[DllInfo] = []
@@ -198,9 +201,9 @@ def collect_dlls(build_dir: pathlib.Path) -> list[DllInfo]:
         if name == "d3d12_xs.dll" and has_proxies:
             tier = "high"
             note = (
-                "Full Xbox COM proxies, 42 IID_ID3D12* GUID exports, D3D12Xbox* helpers, MT recording, HDR10 PresentX & Vulkan routing"
+                "Full Xbox COM proxies (incl. Resource1/2, Heap1), 42 IID_ID3D12* GUID exports, D3D12Xbox* helpers, Agility SDK, Enhanced Barriers, HDR10 PresentX & Vulkan routing"
                 if has_ue5
-                else "Full Xbox COM object proxies, multi-queue MT recording, HDR10 PresentX & Vulkan routing"
+                else "Full Xbox COM proxies (incl. Resource1/2, Heap1), Agility SDK, Enhanced Barriers, live VRAM residency, HDR10 PresentX & Vulkan routing"
             )
         if name == "mfplat_xs.dll" and has_mf_hw:
             tier = "high"
@@ -218,7 +221,25 @@ def collect_dlls(build_dir: pathlib.Path) -> list[DllInfo]:
             tier = "high"
             note = "Thread-safe APU cached/non-cached heap (ApuCreateHeap/Alloc/Free/Map/State) + shape/XMA2 audio DSP"
         if name == "xmem.dll" and has_ue5:
-            note = "XMemAlloc/Free/Default, XMemSetAllocationHooks, XMemCheckDefaultHeaps, working set stats & virtual query"
+            note = "XMemAlloc/Free/Default, XMemSetAllocationHooks, XMemCheckDefaultHeaps, 2-arg working set stats, XMemTransferMemory & virtual query"
+        if name == "XboxBvhBuilder.dll" and has_s14_bvh:
+            tier = "high"
+            note = "Real C++ XboxBvhBuilder ABI (24 mangled + 9 C exports), dual-path BVH4 rehydration & SAH BVH"
+        if name == "amd_fidelityfx_upscaler_xbox.dll" and has_s14_ffx:
+            tier = "high"
+            note = "Real 5-export AMD FidelityFX 2.0 C ABI + live GPU D3D12 compute upscale & FSR 1.0 EASU+RCAS"
+        if name == "amd_fidelityfx_loader_xbox.dll" and has_s14_ffx:
+            tier = "high"
+            note = "Real 5-export AMD FidelityFX 2.0 loader & version dispatch forwarding to upscaler"
+        if name == "dstorage_xs.dll" and has_s14_ds:
+            note = "Xbox 0x48 ABI, X2 COM, GDeflate v1 + RFC 1950 Zlib + BCPack BC1-BC7, concurrent IOCP (>64 GiB) & phys-page targets"
+        if name == "XAudio2_9.dll" and has_s14_ffx:
+            note = "Standard @1-@4 ordinal pinning, live WASAPI, 128 voices, submix/reverb APOs, XMA2/Opus/ADPCM & X3DAudio"
+        if name == "libHttpClient.GDK.dll" and has_s14_ffx:
+            tier = "high"
+            note = "Offline/HTTP request queue, WebSocket C ABI, HCHttpCall* getters/setters & XAsync lifecycle"
+        if name == "XCurl.dll" and has_s14_ffx:
+            note = "16/16 shipping thunks + 15 curl_form*/curl_mime_* exports, WinHTTP handles & offline XSTS auth"
         out.append(DllInfo(name=name, tier=tier, exports=exp, note=note))
     return out
 
@@ -305,9 +326,9 @@ def collect_components(
                 else f"`{opcodes_decoded}/{opcodes_total}` GFX10.3 opcodes decoded & lifted to SPIR-V (`spirv-val`) + DXIL SM 6.5 (`dxc` + MD5 re-signed), lockstep 1-wave LDS barriers, `PSV0` wave bounds, Wave32-on-64 isolation, mesh `merged_wave_info`/`CullPrimitiveEXT`, FSSM/vfetch, CPU interpreter & disk cache{corpus_note}. Still expanding `MIMG`/`DS`/`SMEM`/`FLAT` & HS/DS/GS stages."
             ),
             verified_on=(
-                "`spirv-val` + `dxc` SM 6.5 + 9 PCs + WARP (`test_rdna2_corpus_bench`, `test_rdna2_isa_scalar_vector`, `test_rdna2_isa_mem_img`, `test_xg_gpu_untile_and_stages`, `test_rdna2_lockstep_isa`, `test_d3d12_xs_autolift`)"
+                "`spirv-val` + `dxc` SM 6.5/6.6 + 10 PCs + WARP (`test_rdna2_corpus_bench`, `test_rdna2_isa_scalar_vector`, `test_rdna2_isa_mem_img`, `test_xg_gpu_untile_and_stages`, `test_rdna2_lockstep_isa`, `test_d3d12_xs_autolift`, `test_s14_shader_sm66_779`)"
                 if has_stages_ext
-                else "`spirv-val` + `dxc` SM 6.5 + 9 PCs + WARP (`test_rdna2_lockstep_isa`, `test_rdna2_corpus_parity`, `test_rdna2_lifter_live`, `test_d3d12_xs_autolift`)"
+                else "`spirv-val` + `dxc` SM 6.5/6.6 + 10 PCs + WARP (`test_rdna2_lockstep_isa`, `test_rdna2_corpus_parity`, `test_rdna2_lifter_live`, `test_d3d12_xs_autolift`)"
             ),
         ),
         Component(
@@ -320,17 +341,17 @@ def collect_components(
             tech_name="`d3d12_xs` Proxy, Vulkan 1.4 Routing, HDR10 `PresentX` & `xg_xs`",
             area="Graphics",
             stage="Live Verified" if gfx_pct >= 85 else "Partial",
-            pill_label="9 PCs Verified" if gfx_pct >= 85 else "Partial (9 PCs)",
+            pill_label="10 PCs Verified" if gfx_pct >= 85 else "Partial (10 PCs)",
             pct=gfx_pct,
             what_works=(
-                "All 13 Xbox COM proxies (`DeviceX`, `CommandQueueX`, `CommandListX`, `ResourceX`, `HeapX`, `DescriptorHeapX`, `PipelineStateX`, `RootSignatureX`, `FenceX`, `CommandAllocatorX`, `QueryHeapX`, `CommandSignatureX`, `StateObjectX`), 6-thread multi-queue (`Direct`/`Compute`/`Copy`) `FenceX` sync, `WriteBufferImmediate`/`SetViewInstanceMask`/`OMSetDepthBounds`/`SetSamplePositions`, direct `d3d12_xs`->Vulkan 1.4 routing, `VK_EXT_mesh_shader`, HDR10/scRGB `PresentX`, GPU compute untiler/retiler (`cs_6_5` + SPIR-V) & `xg_xs` `HTILE`/`DCC`/`CMASK` fast-clear passthrough."
+                "All 13 Xbox COM proxies (`DeviceX`, `CommandQueueX`, `CommandListX`, `ResourceX` 1/2, `HeapX` 1, `DescriptorHeapX`, `PipelineStateX`, `RootSignatureX`, `FenceX`, `CommandAllocatorX`, `QueryHeapX`, `CommandSignatureX`, `StateObjectX`), Agility SDK & unwrapped Enhanced Barriers, live VRAM residency + sparse Window-0 isolation, 6-thread multi-queue (`Direct`/`Compute`/`Copy`) `FenceX` sync, `WriteBufferImmediate`/`SetViewInstanceMask`/`OMSetDepthBounds`/`SetSamplePositions`, direct `d3d12_xs`->Vulkan 1.4 routing, `VK_EXT_mesh_shader`, HDR10/scRGB `PresentX`, GPU compute untiler/retiler (`cs_6_5` + SPIR-V) & `xg_xs` 2D/3D/MSAA `HTILE`/`DCC`/`CMASK` fast-clear passthrough."
                 if (has_proxies and has_gpu_untile)
                 else "Direct `d3d12_xs`->Vulkan 1.4 routing (`--backend=vulkan`), `VK_EXT_mesh_shader`, sparse/`GetResourceTiling`, HDR10/scRGB `PresentX`, NVIDIA `R9G9B9E5`->`RGBA16F` UAV fallback, `KickoffX`/`Wait32/64BitValueX`/`RSSetDepthBiasX`, `xg_xs` 15 2D + 6 3D + `HTILE`/`DCC`/`CMASK`. Remaining: 10+ full COM object proxies, multi-queue MT recording & GPU compute untiling."
             ),
             verified_on=(
-                "9 PCs (GTX 1650 Ti, RTX 2060 SUPER/3080 Ti/5060/5070, AMD RX 7600/7900 XTX/9070 XT) + WARP (`test_d3d12_xs_proxies_multiqueue`, `test_xg_gpu_untile_and_stages`, `test_d3d12_vk_routing`, `test_vulkan_mesh_showcase`, `test_hdr10_d3d12`)"
+                "10 PCs (GTX 1650 Ti, RTX 2060 SUPER/3060/3080 Ti/5060/5070, AMD RX 7600/7900 XTX/9070 XT) + WARP (`test_d3d12_xs_proxies_multiqueue`, `test_xg_gpu_untile_and_stages`, `test_d3d12_vk_routing`, `test_vulkan_mesh_showcase`, `test_hdr10_d3d12`, `test_s14_d3d12_barriers_residency`)"
                 if (has_proxies and has_gpu_untile)
-                else "9 PCs (GTX 1650 Ti, RTX 2060 SUPER/3080 Ti/5060/5070, AMD RX 7600/7900 XTX/9070 XT) + WARP (`test_d3d12_vk_routing`, `test_gpu_d3d12x_vk_parity`, `test_vulkan_graphics_live`, `test_vulkan_mesh_showcase`, `test_hdr10_d3d12`)"
+                else "10 PCs (GTX 1650 Ti, RTX 2060 SUPER/3060/3080 Ti/5060/5070, AMD RX 7600/7900 XTX/9070 XT) + WARP (`test_d3d12_vk_routing`, `test_gpu_d3d12x_vk_parity`, `test_vulkan_graphics_live`, `test_vulkan_mesh_showcase`, `test_hdr10_d3d12`)"
             ),
         ),
         Component(
@@ -393,9 +414,9 @@ def collect_components(
                 else "GDeflate v1, BCPack BC1–BC7, RDNA2 BVH4 decoder + SAH BVH, XMA2 IMDCT, `MSOpusDecoder` Opus (`0x704F`), IMA-ADPCM, WASAPI, `X3DAudio`/`XAudio2FX`, Bink2 `KB2i`, live GPU FSR 1.0 (`0 LSB` on AMD RDNA3/4). Remaining: `mfplat` H.264/HEVC D3D12 video decode, 64+ voice clock sync & full `GameInput` hot-plug rings."
             ),
             verified_on=(
-                "9 PCs (NVIDIA + AMD) + WARP (`test_media_video_gameinput`, `test_codecs`, `test_bcpack_bvh4`, `test_audio_opus_wasapi`, `test_d3d12_xs_live`)"
+                "10 PCs (NVIDIA + AMD) + WARP (`test_media_video_gameinput`, `test_codecs`, `test_bcpack_bvh4`, `test_audio_opus_wasapi`, `test_d3d12_xs_live`)"
                 if has_media
-                else "9 PCs (NVIDIA + AMD) + WARP (`test_codecs`, `test_bcpack_bvh4`, `test_audio_opus_wasapi`, `test_d3d12_xs_live`)"
+                else "10 PCs (NVIDIA + AMD) + WARP (`test_codecs`, `test_bcpack_bvh4`, `test_audio_opus_wasapi`, `test_d3d12_xs_live`)"
             ),
         ),
         Component(
@@ -523,7 +544,7 @@ def render_status_svg(
         f'    <rect width="{W}" height="{H}" fill="#0d1117"/>',
         f'    <rect x="0" y="0" width="{W}" height="3" fill="url(#accentBar)"/>',
         '    <text class="h1" x="28" y="40">OpenScarlett — Honest Subsystem Progress (Early Alpha)</text>',
-        f'    <text class="sub" x="28" y="62">Windows 10/11 x64 · MIT · {html.escape(test_str)} · {len(dlls)} DLLs ({tot_exp} exports) · {opcodes_decoded}/{opcodes_total} RDNA2 ops · 9 PCs</text>',
+        f'    <text class="sub" x="28" y="62">Windows 10/11 x64 · MIT · {html.escape(test_str)} · {len(dlls)} DLLs ({tot_exp} exports) · {opcodes_decoded}/{opcodes_total} RDNA2 ops · 10 PCs</text>',
         '    <line x1="28" y1="82" x2="872" y2="82" stroke="#21262d" stroke-width="1"/>',
     ]
 
@@ -697,7 +718,7 @@ def render_markdown(
     corpus_part = f" · **Validated Shader Corpus:** `{corpus_passed}/{corpus_total}`" if corpus_total else ""
     rows = [
         "<!-- OPENSCARLETT_STATUS_START -->",
-        f"**Automated Tests:** {test_str} · **Shimmed DLLs:** `{len(dlls)}` (`{tot_exp}` PE exports) · **Shipping GDK Thunks:** `292/292` · **RDNA2 Opcodes Decoded:** `{opcodes_decoded}/{opcodes_total}`{corpus_part} · **Verified Hardware:** `9 PCs` (`NVIDIA` + `AMD`)",
+        f"**Automated Tests:** {test_str} · **Shimmed DLLs:** `{len(dlls)}` (`{tot_exp}` PE exports) · **Shipping GDK Thunks:** `292/292` · **RDNA2 Opcodes Decoded:** `{opcodes_decoded}/{opcodes_total}`{corpus_part} · **Verified Hardware:** `10 PCs` (`NVIDIA` + `AMD`)",
         "",
         "| Subsystem | Area | Status | Honest Progress | Technical Coverage | Verified On |",
         "| :--- | :--- | :--- | :---: | :--- | :--- |",
@@ -748,13 +769,13 @@ def render_dashboard_html(
     hardware_json = json.dumps(
         [
             {"tier": "NVIDIA Turing", "status": "verified", "detail": "GTX 1650 Ti (Win10 22H2) · RTX 2060 SUPER (Win11 26H2, DXR=12)"},
-            {"tier": "NVIDIA Ampere", "status": "verified", "detail": "RTX 3080 Ti (Win11 25H2, DXR=12, Vulkan 1.4.357)"},
+            {"tier": "NVIDIA Ampere", "status": "verified", "detail": "RTX 3060 · RTX 3080 Ti (Win11 25H2, DXR=12, Vulkan 1.4.357, 67/67 Pass)"},
             {"tier": "NVIDIA Blackwell", "status": "verified", "detail": "RTX 5060 · RTX 5070 (Win11 25H2/26H2, DXR=12, Vulkan 1.4.357)"},
             {"tier": "AMD RDNA 3 & 4", "status": "verified", "detail": "RX 7600 · RX 7900 XTX · RX 9070 XT (Win11 26H2, Wave64, DXR=11, 67/67 Pass)"},
             {"tier": "Software Fallback", "status": "verified", "detail": "D3D12 WARP (Windows 10/11 & CI runners)"},
             {"tier": "NVIDIA RTX 40 (Ada)", "status": "needed", "detail": "Ada Lovelace SM 6.7 validation — tester needed"},
             {"tier": "AMD RX 6000 (RDNA2)", "status": "needed", "detail": "Native RDNA2 (Series X|S sibling) — tester needed"},
-            {"tier": "Intel Arc (A / B)", "status": "needed", "detail": "Wave8/Wave16/Wave32 & UMA heaps — tester needed"},
+            {"tier": "Intel Arc (A / B)", "status": "needed", "detail": "Arc B390 Battlemage tested (60/67; mesh PSO, Vulkan subpass & VOPC fixes landed — re-test welcome)"},
             {"tier": "Handheld APUs", "status": "needed", "detail": "ROG Ally / Legion Go / Steam Deck Windows — tester needed"},
         ]
     )
@@ -851,7 +872,7 @@ def render_dashboard_html(
       <div class="kpi"><div class="val">{len(dlls)}</div><div class="lbl">Xbox / GDK DLLs ({tot_exp} Exports)</div></div>
       <div class="kpi"><div class="val">{html.escape(op_label)}</div><div class="lbl">RDNA2 GFX10.3 Opcodes</div></div>
       <div class="kpi"><div class="val">292/292</div><div class="lbl">Shipping GDK Thunks</div></div>
-      <div class="kpi"><div class="val">9 PCs</div><div class="lbl">NVIDIA &amp; AMD Verified</div></div>
+      <div class="kpi"><div class="val">10 PCs</div><div class="lbl">NVIDIA &amp; AMD Verified</div></div>
     </div>
 
     <div class="section">

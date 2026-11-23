@@ -229,6 +229,34 @@ ResourceXProxy::ResourceXProxy(
         has_cached_heap_props_ = true;
     }
     RegisterProxy(static_cast<const ID3D12Resource*>(this), D3D12XProxyKind::Resource, host_res_);
+    if (device_x_ && device_x_->IsRetailScarlettAbi()) {
+        static void* s_res_retail_vtbl[17]{};
+        static std::once_flag s_res_once;
+        static void* const* s_res_vtbl_ptr = nullptr;
+        auto thunk_get_desc = +[](void* arg0, void* arg1) -> D3D12_RESOURCE_DESC* {
+            ResourceXProxy* self = nullptr;
+            D3D12_RESOURCE_DESC* out = nullptr;
+            if (arg0 && reinterpret_cast<uintptr_t>(arg0) >= 0x10000u &&
+                *reinterpret_cast<void* const* const*>(arg0) == s_res_vtbl_ptr) {
+                self = static_cast<ResourceXProxy*>(arg0);
+                out = static_cast<D3D12_RESOURCE_DESC*>(arg1);
+            } else {
+                out = static_cast<D3D12_RESOURCE_DESC*>(arg0);
+                self = static_cast<ResourceXProxy*>(arg1);
+            }
+            if (out && self) {
+                *out = self->HostResource() ? self->HostResource()->GetDesc() : D3D12_RESOURCE_DESC{};
+            }
+            return out;
+        };
+        const void* const* raw_vtbl = *reinterpret_cast<const void* const* const*>(this);
+        std::call_once(s_res_once, [raw_vtbl, thunk_get_desc]() {
+            std::memcpy(s_res_retail_vtbl, raw_vtbl, sizeof(s_res_retail_vtbl));
+            s_res_retail_vtbl[10] = reinterpret_cast<void*>(thunk_get_desc);
+            s_res_vtbl_ptr = s_res_retail_vtbl;
+        });
+        *reinterpret_cast<void* const**>(this) = s_res_retail_vtbl;
+    }
 }
 
 ResourceXProxy::~ResourceXProxy() {
@@ -315,11 +343,53 @@ HRESULT STDMETHODCALLTYPE ResourceXProxy::GetDevice(REFIID riid, void** ppvDevic
 
 HRESULT STDMETHODCALLTYPE ResourceXProxy::Map(
     UINT Subresource, const D3D12_RANGE* pReadRange, void** ppData) {
-    return host_res_ ? host_res_->Map(Subresource, pReadRange, ppData) : E_FAIL;
+    if (!host_res_) return E_FAIL;
+    const bool skip_host_map =
+        device_x_ && device_x_->IsRetailScarlettAbi() &&
+        has_cached_heap_props_ && cached_heap_props_.Type == D3D12_HEAP_TYPE_DEFAULT;
+    if (!skip_host_map) {
+        const HRESULT hr = host_res_->Map(Subresource, pReadRange, ppData);
+        if (SUCCEEDED(hr)) {
+            return hr;
+        }
+    }
+    // Xbox Series X UMA compatibility: titles routinely call Map() directly on
+    // D3D12_HEAP_TYPE_DEFAULT resources (e.g. to zero-init textures/buffers).
+    // On discrete PC GPUs where host Map() returns E_INVALIDARG, back the map
+    // with a zero-initialized CPU shadow buffer sized to GetResourceAllocationInfo.
+    std::lock_guard<std::mutex> lk(uma_map_mutex_);
+    if (uma_cpu_shadow_.empty()) {
+        uint64_t alloc_bytes = 0ull;
+        if (device_x_) {
+            const D3D12_RESOURCE_ALLOCATION_INFO info =
+                device_x_->GetResourceAllocationInfo(0u, 1u, &cached_desc_);
+            alloc_bytes = info.SizeInBytes;
+        }
+        if (alloc_bytes == 0ull || alloc_bytes == UINT64_MAX) {
+            alloc_bytes = std::max<uint64_t>(cached_desc_.Width, 65536ull);
+        }
+        // Cap sanity bound at 512 MiB to prevent runaway allocations on malformed descs.
+        alloc_bytes = std::min<uint64_t>(alloc_bytes, 512ull * 1024ull * 1024ull);
+        // Add 256 KiB alignment headroom for Xbox XG tiled surface sizes that exceed PC GetResourceAllocationInfo.
+        const uint64_t padded_bytes = ((alloc_bytes + 65535ull) & ~65535ull) + 262144ull;
+        uma_cpu_shadow_.assign(static_cast<size_t>(padded_bytes), 0u);
+    }
+    uma_shadow_mapped_ = true;
+    if (ppData) {
+        *ppData = uma_cpu_shadow_.data();
+    }
+    return S_OK;
 }
 
 void STDMETHODCALLTYPE ResourceXProxy::Unmap(
     UINT Subresource, const D3D12_RANGE* pWrittenRange) {
+    {
+        std::lock_guard<std::mutex> lk(uma_map_mutex_);
+        if (uma_shadow_mapped_) {
+            uma_shadow_mapped_ = false;
+            return;
+        }
+    }
     if (host_res_) host_res_->Unmap(Subresource, pWrittenRange);
 }
 
@@ -446,6 +516,34 @@ HeapXProxy::HeapXProxy(DeviceX* parent_device, ID3D12Heap* host_heap, uint64_t x
 #endif
     }
     RegisterProxy(static_cast<const ID3D12Heap*>(this), D3D12XProxyKind::Heap, host_heap_);
+    if (device_x_ && device_x_->IsRetailScarlettAbi()) {
+        static void* s_heap_retail_vtbl[10]{};
+        static std::once_flag s_heap_once;
+        static void* const* s_heap_vtbl_ptr = nullptr;
+        auto thunk_get_desc = +[](void* arg0, void* arg1) -> D3D12_HEAP_DESC* {
+            HeapXProxy* self = nullptr;
+            D3D12_HEAP_DESC* out = nullptr;
+            if (arg0 && reinterpret_cast<uintptr_t>(arg0) >= 0x10000u &&
+                *reinterpret_cast<void* const* const*>(arg0) == s_heap_vtbl_ptr) {
+                self = static_cast<HeapXProxy*>(arg0);
+                out = static_cast<D3D12_HEAP_DESC*>(arg1);
+            } else {
+                out = static_cast<D3D12_HEAP_DESC*>(arg0);
+                self = static_cast<HeapXProxy*>(arg1);
+            }
+            if (out && self) {
+                *out = self->HostHeap() ? self->HostHeap()->GetDesc() : D3D12_HEAP_DESC{};
+            }
+            return out;
+        };
+        const void* const* raw_vtbl = *reinterpret_cast<const void* const* const*>(this);
+        std::call_once(s_heap_once, [raw_vtbl, thunk_get_desc]() {
+            std::memcpy(s_heap_retail_vtbl, raw_vtbl, sizeof(s_heap_retail_vtbl));
+            s_heap_retail_vtbl[8] = reinterpret_cast<void*>(thunk_get_desc);
+            s_heap_vtbl_ptr = s_heap_retail_vtbl;
+        });
+        *reinterpret_cast<void* const**>(this) = s_heap_retail_vtbl;
+    }
 }
 
 HeapXProxy::~HeapXProxy() {
@@ -565,6 +663,45 @@ DescriptorHeapXProxy::DescriptorHeapXProxy(DeviceX* parent_device, ID3D12Descrip
         static_cast<const ID3D12DescriptorHeap*>(this),
         D3D12XProxyKind::DescriptorHeap,
         host_heap_);
+    if (device_x_ && device_x_->IsRetailScarlettAbi()) {
+        static void* s_dh_retail_vtbl[11]{};
+        static std::once_flag s_dh_once;
+        static void* const* s_dh_vtbl_ptr = nullptr;
+        auto thunk_get_desc = +[](void* arg0, void* arg1) -> D3D12_DESCRIPTOR_HEAP_DESC* {
+            DescriptorHeapXProxy* self = nullptr;
+            D3D12_DESCRIPTOR_HEAP_DESC* out = nullptr;
+            if (arg0 && reinterpret_cast<uintptr_t>(arg0) >= 0x10000u &&
+                *reinterpret_cast<void* const* const*>(arg0) == s_dh_vtbl_ptr) {
+                self = static_cast<DescriptorHeapXProxy*>(arg0);
+                out = static_cast<D3D12_DESCRIPTOR_HEAP_DESC*>(arg1);
+            } else {
+                out = static_cast<D3D12_DESCRIPTOR_HEAP_DESC*>(arg0);
+                self = static_cast<DescriptorHeapXProxy*>(arg1);
+            }
+            if (out && self) {
+                *out = self->HostDescriptorHeap() ? self->HostDescriptorHeap()->GetDesc()
+                                                  : D3D12_DESCRIPTOR_HEAP_DESC{};
+            }
+            return out;
+        };
+        auto thunk_cpu_start = +[](DescriptorHeapXProxy* self) -> SIZE_T {
+            if (!self || !self->HostDescriptorHeap()) return 0u;
+            return self->HostDescriptorHeap()->GetCPUDescriptorHandleForHeapStart().ptr;
+        };
+        auto thunk_gpu_start = +[](DescriptorHeapXProxy* self) -> UINT64 {
+            if (!self || !self->HostDescriptorHeap()) return 0ull;
+            return self->HostDescriptorHeap()->GetGPUDescriptorHandleForHeapStart().ptr;
+        };
+        const void* const* raw_vtbl = *reinterpret_cast<const void* const* const*>(this);
+        std::call_once(s_dh_once, [raw_vtbl, thunk_get_desc, thunk_cpu_start, thunk_gpu_start]() {
+            std::memcpy(s_dh_retail_vtbl, raw_vtbl, sizeof(s_dh_retail_vtbl));
+            s_dh_retail_vtbl[8] = reinterpret_cast<void*>(thunk_get_desc);
+            s_dh_retail_vtbl[9] = reinterpret_cast<void*>(thunk_cpu_start);
+            s_dh_retail_vtbl[10] = reinterpret_cast<void*>(thunk_gpu_start);
+            s_dh_vtbl_ptr = s_dh_retail_vtbl;
+        });
+        *reinterpret_cast<void* const**>(this) = s_dh_retail_vtbl;
+    }
 }
 
 DescriptorHeapXProxy::~DescriptorHeapXProxy() {

@@ -45,8 +45,8 @@ fs::path GetExeDir() {
 // 1. AcpHal.dll — APU Heap Allocator, Mapping & Concurrent Stress Test
 // ===========================================================================
 struct TestApuHeapState {
-    uint32_t bytesFree;
     uint32_t bytesAllocated;
+    uint32_t bytesFree;
     uint32_t bytesLost;
     uint32_t maximumBlockSizeAvailable;
     uint32_t allocationCount;
@@ -65,7 +65,7 @@ void TestAcpHalApuHeap() {
     using PfnApuHeapGetState = int32_t(__stdcall*)(TestApuHeapState*, uint32_t);
     using PfnApuMapVirtual = uint32_t(__stdcall*)(const void*);
     using PfnApuMapApu = void*(__stdcall*)(uint32_t);
-    using PfnApuIsValid = int32_t(__stdcall*)(const void*);
+    using PfnApuIsValid = int32_t(__stdcall*)(const void*, uint32_t);
 
     auto fn_create_heap = reinterpret_cast<PfnApuCreateHeap>(
         reinterpret_cast<void*>(::GetProcAddress(mod, "ApuCreateHeap")));
@@ -145,12 +145,12 @@ void TestAcpHalApuHeap() {
     std::memset(p_nc, 0x3Cu, 8192u);
 
     // ApuIsVirtualAddressValid & ApuMapVirtualAddress <-> ApuMapApuAddress round-trip (base + interior!)
-    OS_REQUIRE(fn_is_valid(nullptr) == 0);
-    OS_REQUIRE(fn_is_valid(p64) == 1);
-    OS_REQUIRE(fn_is_valid(static_cast<uint8_t*>(p64) + 512u) == 1);
-    OS_REQUIRE(fn_is_valid(static_cast<uint8_t*>(p64) + 1024u) == 0);
-    OS_REQUIRE(fn_is_valid(p4k) == 1);
-    OS_REQUIRE(fn_is_valid(p_nc) == 1);
+    OS_REQUIRE(fn_is_valid(nullptr, 16u) == 0);
+    OS_REQUIRE(fn_is_valid(p64, 1024u) == 1);
+    OS_REQUIRE(fn_is_valid(static_cast<uint8_t*>(p64) + 512u, 512u) == 1);
+    OS_REQUIRE(fn_is_valid(static_cast<uint8_t*>(p64) + 1024u, 1u) == 0);
+    OS_REQUIRE(fn_is_valid(p4k, 16384u) == 1);
+    OS_REQUIRE(fn_is_valid(p_nc, 8192u) == 1);
 
     OS_REQUIRE(fn_map_va(p64) == apu64);
     OS_REQUIRE(fn_map_va(static_cast<uint8_t*>(p64) + 333u) == apu64 + 333u);
@@ -177,7 +177,7 @@ void TestAcpHalApuHeap() {
 
     // Free all allocations & confirm full coalescing + invalidation
     OS_REQUIRE(fn_free(p64) == 0);
-    OS_REQUIRE(fn_is_valid(p64) == 0);
+    OS_REQUIRE(fn_is_valid(p64, 1024u) == 0);
     OS_REQUIRE(fn_map_va(p64) == 0u);
     OS_REQUIRE(fn_map_apu(apu64) == nullptr);
     OS_REQUIRE(fn_free(p64) < 0);  // double-free rejected
@@ -220,7 +220,7 @@ void TestAcpHalApuHeap() {
                 }
                 if ((reinterpret_cast<uintptr_t>(p) & (align - 1u)) != 0u ||
                     (apu & (align - 1u)) != 0u ||
-                    fn_is_valid(p) != 1 ||
+                    fn_is_valid(p, sz) != 1 ||
                     fn_map_va(p) != apu ||
                     fn_map_apu(apu) != p) {
                     mt_failures.fetch_add(1u, std::memory_order_relaxed);
