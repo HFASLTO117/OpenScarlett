@@ -241,6 +241,11 @@ public:
 
     void SetRetailScarlettAbi(bool enabled) noexcept { retail_scarlett_abi_ = enabled; }
     bool IsRetailScarlettAbi() const noexcept { return retail_scarlett_abi_; }
+    void LiftPendingXdatGraphicsPso(class PipelineStateXProxy* proxy);
+    void CreatePlacedShaderResourceViewX(
+        const D3D12_RESOURCE_DESC* pResourceDesc,
+        const void* pViewDesc,
+        D3D12_CPU_DESCRIPTOR_HANDLE destDescriptor);
     ID3D12Resource* LookupRetailRtvResource(SIZE_T ptr) const noexcept {
         std::lock_guard<std::mutex> lk(valid_view_mutex_);
         auto it = valid_rtv_handles_.find(ptr);
@@ -398,7 +403,9 @@ public:
     D3D12_GPU_VIRTUAL_ADDRESS TranslateGuestGpuVa(D3D12_GPU_VIRTUAL_ADDRESS address) const noexcept;
     // Desktop D3D12 requires 256-byte alignment for CBV GPU VAs, while Xbox Series X allows
     // 16-byte CBV alignment. Copies unaligned slices into a persistently-mapped 256B-aligned ring.
-    D3D12_GPU_VIRTUAL_ADDRESS AlignRootCbvGpuVaForDesktop(D3D12_GPU_VIRTUAL_ADDRESS translated_va);
+    D3D12_GPU_VIRTUAL_ADDRESS AlignRootCbvGpuVaForDesktop(
+        D3D12_GPU_VIRTUAL_ADDRESS translated_va,
+        D3D12_GPU_VIRTUAL_ADDRESS guest_va_fallback = 0ull);
     uint32_t FrameIntervalMicroseconds() const noexcept {
         return frame_interval_us_.load(std::memory_order_relaxed);
     }

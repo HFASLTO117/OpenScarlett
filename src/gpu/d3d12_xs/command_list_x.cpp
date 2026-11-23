@@ -697,7 +697,9 @@ HRESULT STDMETHODCALLTYPE CommandListX::Reset(
         IOpenScarlettProxyInspect* insp = nullptr;
         if (SUCCEEDED(pInitialState->QueryInterface(IID_IOpenScarlettProxyInspect, reinterpret_cast<void**>(&insp))) && insp) {
             if (insp->GetProxyKind() == D3D12XProxyKind::PipelineState) {
-                last_pso_is_standin_ = static_cast<PipelineStateXProxy*>(pInitialState)->IsStandinPso();
+                auto* pso_proxy = static_cast<PipelineStateXProxy*>(pInitialState);
+                pso_proxy->EnsureLiftedOnBind();
+                last_pso_is_standin_ = pso_proxy->IsStandinPso();
             }
             insp->Release();
         }
@@ -1552,18 +1554,24 @@ void STDMETHODCALLTYPE CommandListX::SetPipelineState(ID3D12PipelineState* pPipe
         vk_cur_pso_is_spirv_ = is_spirv;
         skip_host = is_spirv;
     }
-    ID3D12PipelineState* host_pso = UnwrapPipelineState(pPipelineState);
-    last_host_pso_ = host_pso;
+    ID3D12PipelineState* host_pso = nullptr;
     last_pso_is_standin_ = false;
     if (pPipelineState && IsKnownProxyPointer(pPipelineState)) {
         IOpenScarlettProxyInspect* insp = nullptr;
         if (SUCCEEDED(pPipelineState->QueryInterface(IID_IOpenScarlettProxyInspect, reinterpret_cast<void**>(&insp))) && insp) {
             if (insp->GetProxyKind() == D3D12XProxyKind::PipelineState) {
-                last_pso_is_standin_ = static_cast<PipelineStateXProxy*>(pPipelineState)->IsStandinPso();
+                auto* pso_proxy = static_cast<PipelineStateXProxy*>(pPipelineState);
+                pso_proxy->EnsureLiftedOnBind();
+                last_pso_is_standin_ = pso_proxy->IsStandinPso();
+                host_pso = pso_proxy->HostPipelineState();
             }
             insp->Release();
         }
     }
+    if (!host_pso) {
+        host_pso = UnwrapPipelineState(pPipelineState);
+    }
+    last_host_pso_ = host_pso;
     if (IsDiagTraceEnabled()) {
         char buf[96];
         std::snprintf(buf, sizeof(buf), "SetPipelineState(%p standin=%d)",
@@ -2675,6 +2683,36 @@ void STDMETHODCALLTYPE CommandListX::IASetVertexBuffers(
                       static_cast<unsigned long long>(pViews[0].BufferLocation),
                       static_cast<unsigned long long>(translated[0].BufferLocation));
         AppendDiagOp(buf);
+    }
+    static const bool trace_dd = []() {
+        char v[16]{};
+        return ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_DRAW_DATA", v, sizeof(v)) > 0 && v[0] == '1';
+    }();
+    static std::atomic<uint32_t> s_vb_log{0u};
+    if (trace_dd && pViews && pViews[0].BufferLocation >= 0x10000000ull &&
+        s_vb_log.fetch_add(1u, std::memory_order_relaxed) < 8u) {
+        const uint32_t stride = pViews[0].StrideInBytes;
+        const uint32_t sz = pViews[0].SizeInBytes;
+        std::fprintf(stderr,
+                     "[OpenScarlett][VB] raw=0x%llX -> host=0x%llX sz=%u stride=%u\n",
+                     static_cast<unsigned long long>(pViews[0].BufferLocation),
+                     static_cast<unsigned long long>(translated[0].BufferLocation), sz, stride);
+        if (stride == 24u && sz >= 72u) {
+            const auto* vb = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(pViews[0].BufferLocation));
+            for (uint32_t vi = 0u; vi < 3u; ++vi) {
+                float px = 0, py = 0, pz = 0, u = 0, v = 0;
+                uint32_t col = 0;
+                std::memcpy(&px, vb + vi * 24u + 0u, 4u);
+                std::memcpy(&py, vb + vi * 24u + 4u, 4u);
+                std::memcpy(&pz, vb + vi * 24u + 8u, 4u);
+                std::memcpy(&col, vb + vi * 24u + 12u, 4u);
+                std::memcpy(&u, vb + vi * 24u + 16u, 4u);
+                std::memcpy(&v, vb + vi * 24u + 20u, 4u);
+                std::fprintf(stderr, "  v[%u] pos=(%.3f, %.3f, %.3f) col=0x%08X uv=(%.3f, %.3f)\n",
+                             vi, px, py, pz, col, u, v);
+            }
+        }
+        std::fflush(stderr);
     }
     if (device_x_ && device_x_->IsVulkanRoutingActive() && StartSlot == 0u && pass_views) {
         std::lock_guard<std::mutex> lock(vk_rec_mutex_);

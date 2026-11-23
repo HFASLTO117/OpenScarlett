@@ -245,10 +245,40 @@ struct FssmPixelInputEntry {
     uint8_t component_mask = 0xFu;
 };
 
+struct VsIaInputBinding {
+    std::string semantic_name;
+    uint32_t semantic_index = 0u;
+    uint8_t mask = 0xFu;
+    uint8_t component_type = 3u;  // 1=uint, 2=sint, 3=float
+    uint8_t dst_vgpr_base = 0u;
+};
+
+struct Psv0HlslBindingOverrides {
+    bool enabled = false;
+    bool has_root_const = false;
+    uint32_t root_const_reg = 0u;
+    uint32_t root_const_space = 0u;
+    bool in0_is_srv = false;
+    bool in0_is_cbv = false;
+    uint32_t in0_reg = 0u;
+    uint32_t in0_space = 0u;
+    bool has_srv0 = false;
+    uint32_t srv0_reg = 0u;
+    uint32_t srv0_space = 0u;
+    bool has_tex0 = false;
+    uint32_t tex0_reg = 0u;
+    uint32_t tex0_space = 0u;
+    bool has_samp0 = false;
+    uint32_t samp0_reg = 0u;
+    uint32_t samp0_space = 0u;
+};
+
 struct StageContractTable {
     std::vector<VertexFetchEntry> vertex_fetches;
     std::vector<FssmPixelInputEntry> pixel_inputs;
     Rdna2TextureFormat texture_srv_format = Rdna2TextureFormat::Float4;
+    std::vector<VsIaInputBinding> vs_ia_inputs;
+    Psv0HlslBindingOverrides psv0_bindings{};
 };
 
 struct Rdna2IrModule {

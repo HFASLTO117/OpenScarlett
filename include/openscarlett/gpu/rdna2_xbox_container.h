@@ -352,6 +352,33 @@ struct XboxBvhIntersectInfo {
 // ---------------------------------------------------------------------------
 // Full Xbox dxc_xs DXBC/RDNA2 Container Model, Parser, & Synthetic Builder
 // ---------------------------------------------------------------------------
+struct XboxFssmVsFetchEntry {
+    uint8_t attr_reg = 0u;
+    uint8_t read_mask = 0u;
+    uint8_t first_vgpr = 0u;
+    uint8_t vgpr_count = 0u;
+};
+
+struct XboxFssmPsInterpEntry {
+    uint8_t reg = 0u;
+    uint8_t mask = 0u;
+    uint8_t table_index = 0u;
+    uint8_t param_slot = 0u;
+    uint8_t flags = 0u;  // bits 0..1: 1=flat, 2=interpolated; bit 4: 16-bit
+};
+
+struct XboxFssmMetadata {
+    bool present = false;
+    uint32_t sub_version = 0u;        // 5 (UE5-era) or 6 (GTA VI, +8 shift)
+    uint32_t user_sgpr_count = 0u;    // FSSM +0xD4 bits [23:16]
+    bool uses_fetch_shader = false;   // FSSM +0xD4 bit 2
+    uint8_t fetch_sgpr_pair = 0u;     // FSSM +0xD4 bits [31:24]
+    uint32_t fetch_first_vgpr = 4u;   // FSSM +0xD8
+    uint32_t spi_ps_input_ena = 0u;   // FSSM +0x248 (v6) / +0x240 (v5)
+    std::vector<XboxFssmVsFetchEntry> vs_fetches;
+    std::vector<XboxFssmPsInterpEntry> ps_interps;
+};
+
 struct XboxParsedShaderContainer {
     XboxShaderBlobFormat format = XboxShaderBlobFormat::Unknown;
     XboxDxbcHeaderInfo header{};
@@ -369,6 +396,7 @@ struct XboxParsedShaderContainer {
     XboxRootSignatureDesc root_signature{};  // RTS0 (v1.0 or v1.1)
     Rdna2PgmRegisterSetup reg_setup{};       // PM4 SET_SH_REG / SET_CONTEXT_REG / PM4R
     XboxPsv0Info psv0{};                     // PSV0 runtime metadata
+    XboxFssmMetadata fssm{};                 // Retail XDAT -> XBCH -> FSSM stage metadata
     XboxRootSgprMap sgpr_map{};              // Derived s0..s31 user-data binding map
 
     std::vector<XboxDxbcChunk> chunks;

@@ -924,8 +924,37 @@ PipelineStateXProxy::~PipelineStateXProxy() {
     if (device_x_) {
         device_x_->NotifyPipelineDestroyed(static_cast<ID3D12PipelineState*>(this));
     }
+    pending_xdat_.reset();
     if (host_pso_) host_pso_->Release();
     if (device_x_) device_x_->Release();
+}
+
+void PipelineStateXProxy::SetPendingXdatGfxDesc(std::unique_ptr<PendingXdatGfxDesc> desc) {
+    std::lock_guard<std::mutex> lk(lift_mutex_);
+    pending_xdat_ = std::move(desc);
+    lift_attempted_.store(false, std::memory_order_release);
+}
+
+void PipelineStateXProxy::AdoptLiftedHostPso(ID3D12PipelineState* lifted_pso) {
+    if (!lifted_pso) return;
+    lifted_pso->AddRef();
+    if (host_pso_) host_pso_->Release();
+    host_pso_ = lifted_pso;
+    is_standin_pso_ = false;
+    RegisterProxy(
+        static_cast<const ID3D12PipelineState*>(this),
+        D3D12XProxyKind::PipelineState,
+        host_pso_);
+}
+
+void PipelineStateXProxy::EnsureLiftedOnBind() {
+    if (lift_attempted_.load(std::memory_order_acquire)) return;
+    std::lock_guard<std::mutex> lk(lift_mutex_);
+    if (lift_attempted_.load(std::memory_order_relaxed)) return;
+    lift_attempted_.store(true, std::memory_order_release);
+    if (!pending_xdat_ || !device_x_) return;
+    device_x_->LiftPendingXdatGraphicsPso(this);
+    pending_xdat_.reset();
 }
 
 HRESULT STDMETHODCALLTYPE PipelineStateXProxy::QueryInterface(REFIID riid, void** ppvObject) {

@@ -1773,6 +1773,33 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
                 tmp_fence->Release();
             }
             const HRESULT rem_hr = device_x_->HostDevice()->GetDeviceRemovedReason();
+            static const bool dump_all_ops = []() {
+                char v[16]{};
+                return ::GetEnvironmentVariableA("OPENSCARLETT_DUMP_CL_OPS", v, sizeof(v)) > 0 && v[0] == '1';
+            }();
+            static std::atomic<uint32_t> s_dump_exec_count{0u};
+            if (dump_all_ops) {
+                const uint32_t seq = s_dump_exec_count.fetch_add(1u, std::memory_order_relaxed);
+                if (seq < 25u) {
+                    std::lock_guard<std::mutex> dlk(s_diag_mu);
+                    FILE* f = nullptr;
+                    if (::fopen_s(&f, CommandListX::DiagTraceLogPath(), "a") == 0 && f) {
+                        std::fprintf(f, "\n=== EXEC #%u (n=%u, valid=%u, queue_type=%d, rem=0x%08X) ===\n",
+                                     seq, NumCommandLists, valid_list_count, static_cast<int>(queue_type_),
+                                     static_cast<unsigned>(rem_hr));
+                        for (UINT i = 0; i < NumCommandLists; ++i) {
+                            if (CommandListX* clx = CommandListX::TryFromCommandList(ppCommandLists[i])) {
+                                const auto ops = clx->CopyDiagOps();
+                                std::fprintf(f, "--- List[%u] (%zu ops) ---\n", i, ops.size());
+                                for (const auto& op : ops) {
+                                    std::fprintf(f, "  %s\n", op.c_str());
+                                }
+                            }
+                        }
+                        std::fclose(f);
+                    }
+                }
+            }
             if (FAILED(rem_hr) && !s_dumped.exchange(true)) {
                 std::lock_guard<std::mutex> dlk(s_diag_mu);
                 FILE* f = nullptr;
@@ -3265,7 +3292,8 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
     const bool want_capture_this_frame =
         !capture_png_path.empty() &&
         ((exit_after_frames > 0ull && this_non_blank_frame == exit_after_frames) ||
-         (exit_after_frames == 0ull && (this_non_blank_frame == 1ull || this_non_blank_frame == 10ull)));
+         (exit_after_frames == 0ull &&
+          (this_non_blank_frame == 1ull || (this_non_blank_frame % 25ull) == 0ull)));
 
     HWND target_hwnd = ResolveTargetOutputWindowLocked(pPresentParameters, force_headless);
     const bool use_swapchain = (target_hwnd != nullptr && IsWindow(target_hwnd) != FALSE);

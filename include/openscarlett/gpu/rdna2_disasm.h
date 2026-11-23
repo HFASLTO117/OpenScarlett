@@ -114,6 +114,15 @@ struct XboxStaticSamplerInfo {
     uint32_t shader_visibility = 0;
 };
 
+struct XboxPsv0ResourceBinding {
+    uint32_t res_type = 0u;     // PSVResourceType: 1=CBV, 2=Sampler, 3=SRV_Typed, 4=SRV_Raw, 5=SRV_Struct, 6..9=UAV
+    uint32_t space = 0u;
+    uint32_t lower_bound = 0u;
+    uint32_t upper_bound = 0u;
+    uint32_t res_kind = 0u;     // PSVResourceKind: 2=Texture2D, 11=RawBuffer, 12=StructuredBuffer, 13=CBuffer
+    uint32_t res_flags = 0u;
+};
+
 struct XboxPsv0Info {
     bool present = false;
     uint32_t runtime_info_size = 0;
@@ -123,6 +132,7 @@ struct XboxPsv0Info {
     uint32_t num_threads_x = 0;
     uint32_t num_threads_y = 0;
     uint32_t num_threads_z = 0;
+    std::vector<XboxPsv0ResourceBinding> resource_bindings;
 };
 
 struct XboxDxbcContainer {
@@ -513,6 +523,17 @@ enum class Rdna2Opcode : uint16_t {
     V_CVT_PKNORM_I16_F32,
     V_CVT_PKNORM_U16_F32,
     V_ADD3_U32,
+    V_LSHL_ADD_U32,
+    V_LSHL_OR_B32,
+    V_MIN3_F32,
+    V_MIN3_I32,
+    V_MIN3_U32,
+    V_MAX3_F32,
+    V_MAX3_I32,
+    V_MAX3_U32,
+    V_MED3_F32,
+    V_MED3_I32,
+    V_MED3_U32,
     V_DOT2_F32_F16,
     V_PERMLANE16_B32,
     V_PERMLANEX16_B32,
@@ -741,6 +762,8 @@ struct Rdna2Instruction {
     uint8_t mimg_dmask = 0;
     uint8_t mimg_dim = 0;
     bool mimg_unrm = false;
+    uint8_t mimg_nsa_dwords = 0;
+    uint8_t mimg_nsa_vaddr[12]{};
 
     // DS metadata
     uint8_t ds_offset0 = 0;

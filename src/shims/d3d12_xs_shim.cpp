@@ -1155,7 +1155,7 @@ public:
             std::fflush(stderr);
         }
         const HRESULT hr = inner_->PresentX(PlaneCount, pPlaneParameters, pPresentParameters);
-        if (idx < 5u || (FAILED(hr) && idx < 15u)) {
+        if (idx < 5u || (idx % 25u) == 0u || (FAILED(hr) && idx < 15u)) {
             std::fprintf(stderr, "[OpenScarlett][d3d12_xs] PresentX(#%u) -> hr=0x%08lX\n",
                          idx, static_cast<unsigned long>(hr));
             std::fflush(stderr);
@@ -2371,13 +2371,41 @@ public:
         return S_OK;
     }
     // Slot 70 (+0x230): CreateShaderResourceViewFromRawDescriptorsX
+    // Retail Scarlett ABI: (const D3D12_RESOURCE_DESC* pResDesc, const void* pViewDesc (desktop SRV desc + u64 gpuAddr @+0x28), CPU handle)
     virtual HRESULT STDMETHODCALLTYPE CreateShaderResourceViewFromRawDescriptorsX(
         const void* pTextureWords,
         const void* pViewDesc,
         D3D12_CPU_DESCRIPTOR_HANDLE destDescriptor) {
-        (void)pTextureWords;
-        (void)pViewDesc;
-        (void)destDescriptor;
+        static const bool trace_dd = []() {
+            char v[16]{};
+            return ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_DRAW_DATA", v, sizeof(v)) > 0 && v[0] == '1';
+        }();
+        static std::atomic<uint32_t> s_s70_log{0u};
+        if (trace_dd && s_s70_log.fetch_add(1u, std::memory_order_relaxed) < 25u) {
+            const auto* rd = static_cast<const D3D12_RESOURCE_DESC*>(pTextureWords);
+            const auto* vd = static_cast<const D3D12_SHADER_RESOURCE_VIEW_DESC*>(pViewDesc);
+            uint64_t gpu_va = 0ull;
+            if (pViewDesc) {
+                std::memcpy(&gpu_va, static_cast<const uint8_t*>(pViewDesc) + 0x28u, sizeof(gpu_va));
+            }
+            std::fprintf(stderr,
+                         "[OpenScarlett][SLOT70] cpu=0x%llX res=(dim=%d %llux%u fmt=%d) view=(fmt=%d vdim=%d) va=0x%llX\n",
+                         static_cast<unsigned long long>(destDescriptor.ptr),
+                         rd ? static_cast<int>(rd->Dimension) : -1,
+                         rd ? static_cast<unsigned long long>(rd->Width) : 0ull,
+                         rd ? rd->Height : 0u,
+                         rd ? static_cast<int>(rd->Format) : -1,
+                         vd ? static_cast<int>(vd->Format) : -1,
+                         vd ? static_cast<int>(vd->ViewDimension) : -1,
+                         static_cast<unsigned long long>(gpu_va));
+            std::fflush(stderr);
+        }
+        if (inner_) {
+            inner_->CreatePlacedShaderResourceViewX(
+                static_cast<const D3D12_RESOURCE_DESC*>(pTextureWords),
+                pViewDesc,
+                destDescriptor);
+        }
         openscarlett::CallTelemetry::Global().Record(
             "d3d12_xs.dll", "ScarlettRetailDevice::CreateShaderResourceViewFromRawDescriptorsX",
             openscarlett::CallOutcome::Ok, S_OK, 70);

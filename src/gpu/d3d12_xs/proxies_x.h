@@ -354,6 +354,19 @@ private:
 // 4. PipelineStateXProxy (ID3D12PipelineState / ID3D12PipelineStateX)
 //    Supports both native host D3D12 PSOs and direct SPIR-V Vulkan PSOs (host_pso == nullptr).
 // ---------------------------------------------------------------------------
+struct PendingXdatGfxDesc {
+    std::vector<uint8_t> vs_blob;
+    std::vector<uint8_t> ps_blob;
+    ID3D12RootSignature* host_rs = nullptr;
+    std::vector<std::string> il_names;
+    std::vector<D3D12_INPUT_ELEMENT_DESC> il_elems;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC gpso{};
+
+    ~PendingXdatGfxDesc() {
+        if (host_rs) host_rs->Release();
+    }
+};
+
 class PipelineStateXProxy final
     : public ID3D12PipelineState,
       public IOpenScarlettProxyInspect {
@@ -367,6 +380,10 @@ public:
     ID3D12PipelineState* HostPipelineState() const noexcept { return host_pso_; }
     bool IsStandinPso() const noexcept { return is_standin_pso_; }
     void SetStandinPso(bool v) noexcept { is_standin_pso_ = v; }
+    void SetPendingXdatGfxDesc(std::unique_ptr<PendingXdatGfxDesc> desc);
+    void EnsureLiftedOnBind();
+    void AdoptLiftedHostPso(ID3D12PipelineState* lifted_pso);
+    PendingXdatGfxDesc* PendingXdatDesc() noexcept { return pending_xdat_.get(); }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override;
     ULONG STDMETHODCALLTYPE AddRef() override;
@@ -395,6 +412,9 @@ private:
     DeviceX* device_x_ = nullptr;
     ID3D12PipelineState* host_pso_ = nullptr;
     bool is_standin_pso_ = false;
+    std::atomic<bool> lift_attempted_{false};
+    std::mutex lift_mutex_;
+    std::unique_ptr<PendingXdatGfxDesc> pending_xdat_;
 };
 
 // ---------------------------------------------------------------------------
