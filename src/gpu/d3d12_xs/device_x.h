@@ -241,6 +241,19 @@ public:
 
     void SetRetailScarlettAbi(bool enabled) noexcept { retail_scarlett_abi_ = enabled; }
     bool IsRetailScarlettAbi() const noexcept { return retail_scarlett_abi_; }
+    ID3D12Resource* LookupRetailRtvResource(SIZE_T ptr) const noexcept {
+        std::lock_guard<std::mutex> lk(valid_view_mutex_);
+        auto it = valid_rtv_handles_.find(ptr);
+        return (it != valid_rtv_handles_.end()) ? it->second : nullptr;
+    }
+    bool IsValidRetailRtvHandle(SIZE_T ptr) const noexcept {
+        std::lock_guard<std::mutex> lk(valid_view_mutex_);
+        return valid_rtv_handles_.find(ptr) != valid_rtv_handles_.end();
+    }
+    bool IsValidRetailDsvHandle(SIZE_T ptr) const noexcept {
+        std::lock_guard<std::mutex> lk(valid_view_mutex_);
+        return valid_dsv_handles_.find(ptr) != valid_dsv_handles_.end();
+    }
     ~DeviceX();
 
     DeviceX(const DeviceX&) = delete;
@@ -1124,6 +1137,9 @@ private:
     mutable std::mutex vk_state_mutex_;
     std::unordered_map<ID3D12PipelineState*, VulkanPipelineInfo> vk_pipelines_;
     std::unordered_map<SIZE_T, ID3D12Resource*> vk_rtv_map_;
+    mutable std::mutex valid_view_mutex_;
+    std::unordered_map<SIZE_T, ID3D12Resource*> valid_rtv_handles_;
+    std::unordered_set<SIZE_T> valid_dsv_handles_;
     std::unordered_map<SIZE_T, ID3D12Resource*> vk_dsv_map_;
     std::unordered_map<ID3D12Resource*, VulkanTrackedResource> vk_resources_;
     std::unordered_map<ID3D12Resource*, openscarlett::FrameBufferRgba8> vk_rt_framebuffers_;

@@ -5006,6 +5006,31 @@ LONG CALLBACK Zen2IllegalInstructionVeh(PEXCEPTION_POINTERS ep) {
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 
+    // 1b. AMD Zen 2 MONITORX (0F 01 FA) & MWAITX (0F 01 FB): user-mode memory monitor/wait.
+    if (p[0] == 0x0Fu && p[1] == 0x01u && (p[2] == 0xFAu || p[2] == 0xFBu)) {
+        if (p[2] == 0xFAu) {
+            DWORD old_prot = 0;
+            if (::VirtualProtect(p, 3u, PAGE_EXECUTE_READWRITE, &old_prot)) {
+                std::memset(p, 0x90, 3u);
+                ::VirtualProtect(p, 3u, old_prot, &old_prot);
+                ::FlushInstructionCache(::GetCurrentProcess(), p, 3u);
+            }
+        } else {
+            ::SwitchToThread();
+        }
+        ctx->Rip += 3u;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    // 1c. AMD Zen 2 RDPRU (0F 01 FD): read processor register (APERF/MPERF) -> return QPC/RDTSC.
+    if (p[0] == 0x0Fu && p[1] == 0x01u && p[2] == 0xFDu) {
+        const uint64_t tsc = __rdtsc();
+        ctx->Rax = static_cast<uint32_t>(tsc & 0xFFFFFFFFull);
+        ctx->Rdx = static_cast<uint32_t>(tsc >> 32u);
+        ctx->Rip += 3u;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
     // 2. AMD Zen 2 MCOMMIT (F3 0F 01 FA): memory-commit barrier -> NOP on desktop x86-64.
     if (p[0] == 0xF3u && p[1] == 0x0Fu && p[2] == 0x01u && p[3] == 0xFAu) {
         DWORD old_prot = 0;

@@ -1062,9 +1062,18 @@ OPENSCARLETT_XG_API int32_t __stdcall XGCreateTextureComputer(
     XG_TILE_MODE tile_mode = XG_TILE_MODE_LINEAR;
     uint32_t xbox_sw = 0u;
     if (!ResolveTileModeFromResourceDesc(*pDesc, bind_flags, tile_mode, xbox_sw)) {
-        openscarlett::CallTelemetry::Global().Record(
-            kXgModule, "XGCreateTextureComputer", openscarlett::CallOutcome::Error, kHrInvalidArg);
-        return kHrInvalidArg;
+        if (TraceXgEnabled()) {
+            std::fprintf(stderr,
+                "[OpenScarlett][xg_xs] XGCreateTextureComputer layout fallback dim=%u W=%llu H=%u D=%u mips=%u fmt=%u sc=%u layout=0x%X flags=0x%X\n",
+                pDesc->Dimension, static_cast<unsigned long long>(pDesc->Width), pDesc->Height,
+                static_cast<unsigned>(pDesc->DepthOrArraySize), static_cast<unsigned>(pDesc->MipLevels),
+                pDesc->Format, pDesc->SampleCount, pDesc->Layout, pDesc->Flags);
+            std::fflush(stderr);
+        }
+        tile_mode = (pDesc->Dimension == kD3D12DimTexture3D)
+                        ? XG_TILE_MODE_3D_THICK_64KB_S
+                        : XG_TILE_MODE_2D_THIN_64KB_S;
+        xbox_sw = 9u;
     }
 
     XG_RESOURCE_LAYOUT layout{};
@@ -1080,9 +1089,23 @@ OPENSCARLETT_XG_API int32_t __stdcall XGCreateTextureComputer(
         d3d.BindFlags = bind_flags;
         d3d.TileMode = tile_mode;
         if (!openscarlett::xg::ComputeTexture3DLayout(d3d, layout)) {
-            openscarlett::CallTelemetry::Global().Record(
-                kXgModule, "XGCreateTextureComputer", openscarlett::CallOutcome::Error, kHrInvalidArg);
-            return kHrInvalidArg;
+            if (TraceXgEnabled()) {
+                std::fprintf(stderr,
+                    "[OpenScarlett][xg_xs] XGCreateTextureComputer 3D FAIL dim=%u W=%llu H=%u D=%u mips=%u fmt=%u sc=%u layout=0x%X flags=0x%X\n",
+                    pDesc->Dimension, static_cast<unsigned long long>(pDesc->Width), pDesc->Height,
+                    static_cast<unsigned>(pDesc->DepthOrArraySize), static_cast<unsigned>(pDesc->MipLevels),
+                    pDesc->Format, pDesc->SampleCount, pDesc->Layout, pDesc->Flags);
+                std::fflush(stderr);
+            }
+            XG_TEXTURE3D_DESC safe_d3d = d3d;
+            safe_d3d.Format = 28u;
+            if (safe_d3d.Height == 0u) safe_d3d.Height = 1u;
+            if (!openscarlett::xg::ComputeTexture3DLayout(safe_d3d, layout)) {
+                openscarlett::CallTelemetry::Global().Record(
+                    kXgModule, "XGCreateTextureComputer", openscarlett::CallOutcome::Error, kHrInvalidArg);
+                return kHrInvalidArg;
+            }
+            d3d = safe_d3d;
         }
         comp = new (std::nothrow) XGResourceAddressComputerImpl(d3d, layout, xbox_sw);
     } else if (pDesc->Dimension == kD3D12DimTexture1D || pDesc->Dimension == kD3D12DimTexture2D) {
@@ -1096,9 +1119,26 @@ OPENSCARLETT_XG_API int32_t __stdcall XGCreateTextureComputer(
         d2d.BindFlags = bind_flags;
         d2d.TileMode = tile_mode;
         if (!openscarlett::xg::ComputeTexture2DLayout(d2d, layout)) {
-            openscarlett::CallTelemetry::Global().Record(
-                kXgModule, "XGCreateTextureComputer", openscarlett::CallOutcome::Error, kHrInvalidArg);
-            return kHrInvalidArg;
+            if (TraceXgEnabled()) {
+                std::fprintf(stderr,
+                    "[OpenScarlett][xg_xs] XGCreateTextureComputer 2D FAIL dim=%u W=%llu H=%u D=%u mips=%u fmt=%u sc=%u layout=0x%X flags=0x%X\n",
+                    pDesc->Dimension, static_cast<unsigned long long>(pDesc->Width), pDesc->Height,
+                    static_cast<unsigned>(pDesc->DepthOrArraySize), static_cast<unsigned>(pDesc->MipLevels),
+                    pDesc->Format, pDesc->SampleCount, pDesc->Layout, pDesc->Flags);
+                std::fflush(stderr);
+            }
+            // Fallback for uncommon/typeless/console-extended DXGI formats: compute layout with R8G8B8A8_UNORM
+            // so retail callers that dereference *ppComputer without checking HRESULT never crash on NULL.
+            XG_TEXTURE2D_DESC safe_d2d = d2d;
+            safe_d2d.Format = 28u;  // DXGI_FORMAT_R8G8B8A8_UNORM
+            safe_d2d.SampleCount = 1u;
+            if (safe_d2d.Height == 0u) safe_d2d.Height = 1u;
+            if (!openscarlett::xg::ComputeTexture2DLayout(safe_d2d, layout)) {
+                openscarlett::CallTelemetry::Global().Record(
+                    kXgModule, "XGCreateTextureComputer", openscarlett::CallOutcome::Error, kHrInvalidArg);
+                return kHrInvalidArg;
+            }
+            d2d = safe_d2d;
         }
         comp = new (std::nothrow) XGResourceAddressComputerImpl(d2d, layout, xbox_sw);
     } else {

@@ -169,7 +169,7 @@ public:
             std::memcpy(&params, arg1, sizeof(params));
             const bool clearly_3arg =
                 !arg1_writable_handle ||
-                (params.codecType == 1u || params.codecType == 2u) ||
+                (params.codecType >= 1u && params.codecType <= 3u) ||
                 (params.extraParam == 0u && params.flags == 0u &&
                  (params.codecType != 0u || params.streamCount != 0u ||
                   params.maxChannels != 0u || params.sharedMemoryBytes != 0u));
@@ -185,8 +185,9 @@ public:
             out_shm->sizeBytes = 0ull;
             *out_handle = nullptr;
 
-            // Strict parameter validation (zero state corruption on rejection).
-            if (params.codecType != 1u && params.codecType != 2u) {
+            // Strict parameter validation (allow Xbox Scarlett XApuProcessType 1..3:
+            // DecodeOpus, DecodeConvertOpus, ConvertPCM).
+            if (params.codecType != 1u && params.codecType != 2u && params.codecType != 3u) {
                 return XAPU_E_INVALIDARG;
             }
             if (params.streamCount == 0u || params.streamCount > kMaxXApuStreamCount) {
@@ -196,15 +197,23 @@ public:
                 return XAPU_E_INVALIDARG;
             }
             if (params.sharedMemoryBytes < kMinXApuSharedMemoryBytes) {
-                return XAPU_E_INVALIDARG;
+                if (params.sharedMemoryBytes == 0u) {
+                    params.sharedMemoryBytes = static_cast<uint32_t>(kMinXApuSharedMemoryBytes);
+                } else {
+                    return XAPU_E_INVALIDARG;
+                }
             }
             if (params.sharedMemoryBytes > kMaxXApuSharedMemoryBytes) {
+                std::fprintf(stderr, "[OpenScarlett][xapu] XApuConnect FAIL: shm too big 0x%X\n", params.sharedMemoryBytes);
                 return XAPU_E_OUTOFMEMORY;
             }
-            const uint64_t min_bytes = static_cast<uint64_t>(params.streamCount) * 0x10000ull;
+            // Honor caller's requested sharedMemoryBytes (rounded up to 4 KiB, min 64 KiB)
+            // instead of inflating to streamCount * 64 KiB (16+ MiB).
             const uint64_t alloc_bytes64 =
-                std::max<uint64_t>(static_cast<uint64_t>(params.sharedMemoryBytes), min_bytes);
+                std::max<uint64_t>((static_cast<uint64_t>(params.sharedMemoryBytes) + 0xFFFull) & ~0xFFFull,
+                                   0x10000ull);
             if (alloc_bytes64 > kMaxXApuSharedMemoryBytes) {
+                std::fprintf(stderr, "[OpenScarlett][xapu] XApuConnect FAIL: alloc64 too big\n");
                 return XAPU_E_OUTOFMEMORY;
             }
             const size_t alloc_bytes = static_cast<size_t>(alloc_bytes64);
@@ -213,10 +222,12 @@ public:
             {
                 std::lock_guard<std::mutex> lk(table_mutex_);
                 if (connections_.size() >= kMaxXApuConnections) {
+                    std::fprintf(stderr, "[OpenScarlett][xapu] XApuConnect FAIL: max connections\n");
                     return XAPU_E_OUTOFMEMORY;
                 }
                 if (total_shared_bytes_ + alloc_bytes < total_shared_bytes_ ||
                     total_shared_bytes_ + alloc_bytes > kMaxTotalXApuSharedMemoryBytes) {
+                    std::fprintf(stderr, "[OpenScarlett][xapu] XApuConnect FAIL: total shm budget\n");
                     return XAPU_E_OUTOFMEMORY;
                 }
                 total_shared_bytes_ += alloc_bytes;
@@ -227,6 +238,7 @@ public:
                 state = std::make_shared<XApuConnectionState>();
                 state->shared_memory.assign(alloc_bytes, 0u);
             } catch (...) {
+                std::fprintf(stderr, "[OpenScarlett][xapu] XApuConnect FAIL: bad_alloc for %zu bytes\n", alloc_bytes);
                 std::lock_guard<std::mutex> lk(table_mutex_);
                 if (total_shared_bytes_ >= alloc_bytes) {
                     total_shared_bytes_ -= alloc_bytes;

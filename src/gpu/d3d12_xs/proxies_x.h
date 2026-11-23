@@ -128,6 +128,8 @@ public:
     ResourceXProxy& operator=(const ResourceXProxy&) = delete;
 
     ID3D12Resource* HostResource() const noexcept { return host_res_; }
+    bool IsL0SpilledFromDefault() const noexcept { return l0_spilled_from_default_; }
+    void SetL0SpilledFromDefault(bool v) noexcept { l0_spilled_from_default_ = v; }
     D3D12_GPU_VIRTUAL_ADDRESS TrackedXboxGpuVa() const noexcept { return xbox_gpu_va_; }
     void SetTrackedXboxGpuVa(D3D12_GPU_VIRTUAL_ADDRESS va) noexcept { xbox_gpu_va_ = va; }
 
@@ -211,6 +213,7 @@ private:
     std::mutex uma_map_mutex_;
     std::vector<uint8_t> uma_cpu_shadow_;
     bool uma_shadow_mapped_ = false;
+    bool l0_spilled_from_default_ = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -230,6 +233,8 @@ public:
     HeapXProxy& operator=(const HeapXProxy&) = delete;
 
     ID3D12Heap* HostHeap() const noexcept { return host_heap_; }
+    bool IsL0SpilledFromDefault() const noexcept { return l0_spilled_from_default_; }
+    void SetL0SpilledFromDefault(bool v) noexcept { l0_spilled_from_default_ = v; }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override;
     ULONG STDMETHODCALLTYPE AddRef() override;
@@ -272,6 +277,7 @@ private:
     ID3D12Heap1* host_heap1_ = nullptr;
 #endif
     uint64_t xbox_va_ = 0ull;
+    bool l0_spilled_from_default_ = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -359,6 +365,8 @@ public:
     PipelineStateXProxy& operator=(const PipelineStateXProxy&) = delete;
 
     ID3D12PipelineState* HostPipelineState() const noexcept { return host_pso_; }
+    bool IsStandinPso() const noexcept { return is_standin_pso_; }
+    void SetStandinPso(bool v) noexcept { is_standin_pso_ = v; }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override;
     ULONG STDMETHODCALLTYPE AddRef() override;
@@ -386,6 +394,7 @@ private:
     std::atomic<ULONG> ref_count_{1u};
     DeviceX* device_x_ = nullptr;
     ID3D12PipelineState* host_pso_ = nullptr;
+    bool is_standin_pso_ = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -403,6 +412,8 @@ public:
     RootSignatureXProxy& operator=(const RootSignatureXProxy&) = delete;
 
     ID3D12RootSignature* HostRootSignature() const noexcept { return host_rs_; }
+    bool IsEmptyFallback() const noexcept { return is_empty_fallback_; }
+    void SetEmptyFallback(bool v) noexcept { is_empty_fallback_ = v; }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override;
     ULONG STDMETHODCALLTYPE AddRef() override;
@@ -428,6 +439,7 @@ private:
     std::atomic<ULONG> ref_count_{1u};
     DeviceX* device_x_ = nullptr;
     ID3D12RootSignature* host_rs_ = nullptr;
+    bool is_empty_fallback_ = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -466,6 +478,42 @@ public:
     // ID3D12Fence1
     D3D12_FENCE_FLAGS STDMETHODCALLTYPE GetCreationFlags() override;
 
+    // Retail Xbox Series X|S ID3D12Fence extension slots (slot 12+ on primary vtable):
+    // Slot 12 (+0x60): GetCompletedValuePtrX() -> returns pointer to 64-bit fence value word
+    // (verified live at RVA 0x4FB0AEC..0x4FB0B30: caller dereferences [rax] and compares vs target).
+    virtual const volatile uint64_t* STDMETHODCALLTYPE GetCompletedValuePtrX() {
+        SyncCpuFenceWord();
+        return &cpu_fence_word_;
+    }
+    void NotifyGpuSignal(uint64_t value) noexcept {
+        uint64_t cur = pending_gpu_signal_.load(std::memory_order_acquire);
+        while (value > cur && !pending_gpu_signal_.compare_exchange_weak(cur, value, std::memory_order_acq_rel)) {}
+        SyncCpuFenceWord();
+    }
+    void SyncCpuFenceWord() noexcept {
+        uint64_t v = host_fence_ ? host_fence_->GetCompletedValue() : 0ull;
+        const uint64_t pend = pending_gpu_signal_.load(std::memory_order_acquire);
+        if (host_fence_ && v != UINT64_MAX && pend > v) {
+            HANDLE ev = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (ev) {
+                if (SUCCEEDED(host_fence_->SetEventOnCompletion(pend, ev))) {
+                    ::WaitForSingleObject(ev, 50u);
+                }
+                ::CloseHandle(ev);
+            }
+            v = host_fence_->GetCompletedValue();
+            if (v < pend) {
+                v = pend;
+            }
+        }
+        if (v > cpu_fence_word_) {
+            cpu_fence_word_ = v;
+        }
+    }
+    virtual HRESULT STDMETHODCALLTYPE XboxFenceSlot13() { return S_OK; }
+    virtual HRESULT STDMETHODCALLTYPE XboxFenceSlot14() { return S_OK; }
+    virtual HRESULT STDMETHODCALLTYPE XboxFenceSlot15() { return S_OK; }
+
     D3D12XProxyKind STDMETHODCALLTYPE GetProxyKind() const noexcept override {
         return D3D12XProxyKind::Fence;
     }
@@ -482,6 +530,8 @@ private:
     ID3D12Fence* host_fence_ = nullptr;
     ID3D12Fence1* host_fence1_ = nullptr;
     D3D12_FENCE_FLAGS creation_flags_ = D3D12_FENCE_FLAG_NONE;
+    volatile uint64_t cpu_fence_word_ = 0ull;
+    std::atomic<uint64_t> pending_gpu_signal_{0ull};
 };
 
 // ---------------------------------------------------------------------------
@@ -514,6 +564,16 @@ public:
     HRESULT STDMETHODCALLTYPE GetDevice(REFIID riid, void** ppvDevice) override;
 
     HRESULT STDMETHODCALLTYPE Reset() override;
+
+    // Retail Xbox Series X|S ID3D12CommandAllocator extension slots (slot 9+ on primary vtable):
+    // Slot 9 (+0x48): SetCustomAllocationCallbackX / SetOutOfMemoryCallbackX(pfnCallback, pContext).
+    virtual HRESULT STDMETHODCALLTYPE SetCustomAllocationCallbackX(
+        void* /*pfnCallback*/, void* /*pContext*/) {
+        return S_OK;
+    }
+    virtual HRESULT STDMETHODCALLTYPE XboxCommandAllocatorSlot10() { return S_OK; }
+    virtual HRESULT STDMETHODCALLTYPE XboxCommandAllocatorSlot11() { return S_OK; }
+    virtual HRESULT STDMETHODCALLTYPE XboxCommandAllocatorSlot12() { return S_OK; }
 
     D3D12XProxyKind STDMETHODCALLTYPE GetProxyKind() const noexcept override {
         return D3D12XProxyKind::CommandAllocator;

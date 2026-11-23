@@ -181,10 +181,14 @@ bool IsPowerOfTwo(size_t v) noexcept {
 
 bool ValidateXAllocAttributes(uint64_t attrs) noexcept {
     const uint32_t mem_type = static_cast<uint32_t>((attrs >> 28) & 0xFu);
-    if (mem_type > XALLOC_MEMTYPE_PHYSICAL) {
-        return false;
+    if (mem_type <= XALLOC_MEMTYPE_PHYSICAL) {
+        return true;
     }
-    return true;
+    // Retail Xbox GDK system/middleware allocators (dwAllocatorId >= 0x80, e.g.
+    // 0xF0814000 for Chad/XAudio2 physical memory) pack memory-protect + zero-init +
+    // physical flags into bits 28..31.
+    const uint32_t alloc_id = static_cast<uint32_t>((attrs >> 16) & 0xFFu);
+    return alloc_id >= 0x80u;
 }
 
 int32_t ClampThreadPriority(int32_t priority) noexcept {

@@ -188,7 +188,9 @@ struct VulkanRecordedBatch {
 
 struct DeferredCpuWrite32 {
     uint64_t address = 0ull;
-    uint32_t value = 0u;
+    uint64_t value = 0ull;
+    bool is_64bit = false;
+    bool is_timestamp = false;
 };
 
 struct DeferredCpuWait {
@@ -482,6 +484,10 @@ public:
         D3D12_GPU_VIRTUAL_ADDRESS Address,
         uint32_t Value,
         uint32_t Flags) override;
+    void Write64BitValueX(
+        D3D12_GPU_VIRTUAL_ADDRESS Address,
+        uint64_t Value,
+        uint32_t Flags);
     void STDMETHODCALLTYPE SetPredicationX(
         D3D12_GPU_VIRTUAL_ADDRESS BufferAddress,
         D3D12_PREDICATION_OP Operation,
@@ -672,9 +678,16 @@ public:
     static const char* DiagTraceLogPath() noexcept;
     void AppendDiagOp(std::string op);
     std::vector<std::string> CopyDiagOps() const;
+    void ExtractTransientResources(std::vector<ID3D12Resource*>& out);
     bool LastCloseFailed() const noexcept { return last_close_failed_.load(std::memory_order_acquire); }
 
 private:
+    static constexpr uint32_t kRetailPrivateAllocRingSize = 8u;
+    ID3D12CommandAllocator* retail_private_allocs_[kRetailPrivateAllocRingSize]{};
+    uint32_t retail_private_alloc_idx_ = 0u;
+    bool last_pso_is_standin_ = false;
+    bool last_gfx_rs_is_empty_ = false;
+    bool last_cmp_rs_is_empty_ = false;
     std::atomic<bool> last_close_failed_{false};
     mutable std::mutex diag_ops_mutex_;
     std::vector<std::string> diag_ops_;

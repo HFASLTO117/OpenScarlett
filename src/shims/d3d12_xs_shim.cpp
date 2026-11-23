@@ -9,6 +9,9 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#if defined(_MSC_VER)
+#  include <intrin.h>
+#endif
 #include <mutex>
 #include <new>
 #include <string>
@@ -555,6 +558,10 @@ bool EnvEnablesD3D12Debug() noexcept {
 
 inline D3D12_RESOURCE_DESC SanitizeRetailResourceDesc(const D3D12_RESOURCE_DESC& src) noexcept {
     D3D12_RESOURCE_DESC d = src;
+    if (static_cast<uint32_t>(d.Format) == 118u) {
+        // Xbox Scarlett console DXGI_FORMAT_D16_UNORM_S8_UINT (118) -> PC D24_UNORM_S8_UINT (45).
+        d.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    }
     if (d.SampleDesc.Count == 0u) {
         d.SampleDesc.Count = 1u;
         d.SampleDesc.Quality = 0u;
@@ -911,7 +918,29 @@ class ScarlettRetailCommandQueueProxy final : public ID3D12CommandQueue {
 public:
     static constexpr size_t kVtblSlotCount = 40u;
 
-    static void* const* GetPatchedVtbl(const void* const* raw_vtbl) {
+    static void* const* GetPatchedVtbl(const void* const* raw_vtbl, uint32_t retail_version) {
+        if (retail_version >= 0x00020004u) {
+            static void* s_vtbl_v4[kVtblSlotCount]{};
+            static std::once_flag s_once_v4;
+            std::call_once(s_once_v4, [raw_vtbl]() {
+                std::memcpy(s_vtbl_v4, raw_vtbl, sizeof(s_vtbl_v4));
+                // Xbox Series X|S Version >= 0x20004 inserts 2 slots before Signal (slots 14..15),
+                // shifting Signal/Wait/GetTimestampFrequency/GetClockCalibration/GetDesc/SuspendX/
+                // ResumeX/SignalX/PresentX by +2 (GetTimestampFrequency=18, GetDesc=20, PresentX=32).
+                s_vtbl_v4[14] = reinterpret_cast<void*>(&Thunk_V4NoOpOk);
+                s_vtbl_v4[15] = reinterpret_cast<void*>(&Thunk_V4NoOpOk);
+                s_vtbl_v4[16] = const_cast<void*>(raw_vtbl[14]);  // Signal
+                s_vtbl_v4[17] = const_cast<void*>(raw_vtbl[15]);  // Wait
+                s_vtbl_v4[18] = const_cast<void*>(raw_vtbl[16]);  // GetTimestampFrequency
+                s_vtbl_v4[19] = const_cast<void*>(raw_vtbl[17]);  // GetClockCalibration
+                s_vtbl_v4[20] = reinterpret_cast<void*>(&Thunk_GetDesc);
+                s_vtbl_v4[23] = const_cast<void*>(raw_vtbl[21]);  // SuspendX
+                s_vtbl_v4[24] = const_cast<void*>(raw_vtbl[22]);  // ResumeX
+                s_vtbl_v4[25] = const_cast<void*>(raw_vtbl[23]);  // SignalX
+                s_vtbl_v4[32] = const_cast<void*>(raw_vtbl[30]);  // PresentX
+            });
+            return s_vtbl_v4;
+        }
         static void* s_vtbl[kVtblSlotCount]{};
         static std::once_flag s_once;
         std::call_once(s_once, [raw_vtbl]() {
@@ -921,11 +950,16 @@ public:
         return s_vtbl;
     }
 
+    static HRESULT STDMETHODCALLTYPE Thunk_V4NoOpOk(ScarlettRetailCommandQueueProxy* /*self*/) {
+        return S_OK;
+    }
+
     static D3D12_COMMAND_QUEUE_DESC* STDMETHODCALLTYPE Thunk_GetDesc(void* arg0, void* arg1) {
         ScarlettRetailCommandQueueProxy* self = nullptr;
         D3D12_COMMAND_QUEUE_DESC* out = nullptr;
         if (arg0 && reinterpret_cast<uintptr_t>(arg0) >= 0x10000u &&
-            *reinterpret_cast<void* const* const*>(arg0) == s_patched_vtbl_ptr_) {
+            (*reinterpret_cast<void* const* const*>(arg0) == s_patched_vtbl_ptr_ ||
+             *reinterpret_cast<void* const* const*>(arg0) == s_patched_vtbl_v4_ptr_)) {
             self = static_cast<ScarlettRetailCommandQueueProxy*>(arg0);
             out = static_cast<D3D12_COMMAND_QUEUE_DESC*>(arg1);
         } else {
@@ -944,8 +978,12 @@ public:
             inner_->AddRef();
         }
         const void* const* raw_vtbl = *reinterpret_cast<const void* const* const*>(this);
-        void* const* patched = GetPatchedVtbl(raw_vtbl);
-        s_patched_vtbl_ptr_ = patched;
+        void* const* patched = GetPatchedVtbl(raw_vtbl, retail_version_);
+        if (retail_version_ >= 0x00020004u) {
+            s_patched_vtbl_v4_ptr_ = patched;
+        } else {
+            s_patched_vtbl_ptr_ = patched;
+        }
         *reinterpret_cast<void* const**>(this) = patched;
     }
 
@@ -1047,12 +1085,27 @@ public:
     D3D12_COMMAND_QUEUE_DESC STDMETHODCALLTYPE GetDesc() override { return inner_->GetDesc(); }
 #endif
 
-    HRESULT RecordUnimpl(int slot) {
+    HRESULT RecordUnimpl(int slot, uintptr_t a1 = 0u, uintptr_t a2 = 0u, uintptr_t a3 = 0u, const void* ret = nullptr) {
+        static std::atomic<uint32_t> s_qslot_counts[64]{};
         char buf[96];
         std::snprintf(buf, sizeof(buf), "ScarlettRetailCommandQueue::Slot_%d", slot);
-        std::fprintf(stderr, "[OpenScarlett][d3d12_xs] UNIMPL %s (+0x%X)\n", buf, slot * 8);
-        std::fflush(stderr);
-        OutputDebugStringA(buf);
+        const uint32_t idx = (slot >= 0 && slot < 64) ? static_cast<uint32_t>(slot) : 63u;
+        const uint32_t seen = s_qslot_counts[idx].fetch_add(1u, std::memory_order_relaxed);
+        if (seen < 3u) {
+            const uintptr_t base = reinterpret_cast<uintptr_t>(::GetModuleHandleW(nullptr));
+            const uintptr_t rva = (ret && reinterpret_cast<uintptr_t>(ret) > base)
+                                      ? (reinterpret_cast<uintptr_t>(ret) - base)
+                                      : reinterpret_cast<uintptr_t>(ret);
+            std::fprintf(stderr,
+                         "[OpenScarlett][d3d12_xs] UNIMPL %s (+0x%X) ret=+0x%llX a1=0x%llX a2=0x%llX a3=0x%llX\n",
+                         buf, slot * 8,
+                         static_cast<unsigned long long>(rva),
+                         static_cast<unsigned long long>(a1),
+                         static_cast<unsigned long long>(a2),
+                         static_cast<unsigned long long>(a3));
+            std::fflush(stderr);
+            OutputDebugStringA(buf);
+        }
         openscarlett::CallTelemetry::Global().Record(
             "d3d12_xs.dll", buf, openscarlett::CallOutcome::NotImplemented, E_NOTIMPL, slot);
         return E_NOTIMPL;
@@ -1078,14 +1131,40 @@ public:
     virtual HRESULT STDMETHODCALLTYPE Slot27() { return RecordUnimpl(27); }
     virtual HRESULT STDMETHODCALLTYPE Slot28() { return RecordUnimpl(28); }
     virtual HRESULT STDMETHODCALLTYPE Slot29() { return RecordUnimpl(29); }
-    // Slot 30 (+0xF0): PresentX (Version < 0x20004, e.g. 0x20001 Matrix Awakens)
+    // Slot 30 (+0xF0): PresentX (also aliased to Slot 32 on Version >= 0x20004 via GetPatchedVtbl)
     virtual HRESULT STDMETHODCALLTYPE PresentX(
         UINT PlaneCount,
         const D3D12XBOX_PRESENT_PLANE_PARAMETERS* pPlaneParameters,
         const D3D12XBOX_PRESENT_PARAMETERS* pPresentParameters) {
-        return inner_->PresentX(PlaneCount, pPlaneParameters, pPresentParameters);
+        static std::atomic<uint32_t> s_px_calls{0u};
+        const uint32_t idx = s_px_calls.fetch_add(1u, std::memory_order_relaxed);
+        if (idx < 5u) {
+            ID3D12Resource* r0 =
+                (PlaneCount > 0u && pPlaneParameters && pPlaneParameters[0].ResourceCount > 0u &&
+                 pPlaneParameters[0].ppResources)
+                    ? pPlaneParameters[0].ppResources[0]
+                    : nullptr;
+            std::fprintf(stderr,
+                         "[OpenScarlett][d3d12_xs] PresentX(#%u: planes=%u pPlane=%p token=%llu resCnt=%u r0=%p pParams=%p)\n",
+                         idx, PlaneCount, static_cast<const void*>(pPlaneParameters),
+                         (PlaneCount > 0u && pPlaneParameters)
+                             ? static_cast<unsigned long long>(pPlaneParameters[0].Token) : 0ull,
+                         (PlaneCount > 0u && pPlaneParameters) ? pPlaneParameters[0].ResourceCount : 0u,
+                         static_cast<void*>(r0),
+                         static_cast<const void*>(pPresentParameters));
+            std::fflush(stderr);
+        }
+        const HRESULT hr = inner_->PresentX(PlaneCount, pPlaneParameters, pPresentParameters);
+        if (idx < 5u || (FAILED(hr) && idx < 15u)) {
+            std::fprintf(stderr, "[OpenScarlett][d3d12_xs] PresentX(#%u) -> hr=0x%08lX\n",
+                         idx, static_cast<unsigned long>(hr));
+            std::fflush(stderr);
+        }
+        return hr;
     }
-    virtual HRESULT STDMETHODCALLTYPE Slot31() { return RecordUnimpl(31); }
+    virtual HRESULT STDMETHODCALLTYPE Slot31(uintptr_t a1, uintptr_t a2, uintptr_t a3) {
+        return RecordUnimpl(31, a1, a2, a3, _ReturnAddress());
+    }
     // Slot 32 (+0x100): PresentX on Scarlett GRDK Version >= 0x20004 (kept stubbed on < 0x20004)
     virtual HRESULT STDMETHODCALLTYPE PresentX_Slot32(
         UINT PlaneCount,
@@ -1094,7 +1173,17 @@ public:
         if (retail_version_ < 0x00020004u) {
             return RecordUnimpl(32);
         }
+        static std::atomic<uint32_t> s_p32_calls{0u};
+        const uint32_t idx = s_p32_calls.fetch_add(1u, std::memory_order_relaxed);
         const HRESULT hr = inner_->PresentX(PlaneCount, pPlaneParameters, pPresentParameters);
+        if (idx < 5u || (FAILED(hr) && idx < 20u)) {
+            std::fprintf(stderr,
+                         "[OpenScarlett][d3d12_xs] PresentX_Slot32(#%u: planes=%u pPlane=%p pParams=%p) -> hr=0x%08lX\n",
+                         idx, PlaneCount, static_cast<const void*>(pPlaneParameters),
+                         static_cast<const void*>(pPresentParameters),
+                         static_cast<unsigned long>(hr));
+            std::fflush(stderr);
+        }
         openscarlett::CallTelemetry::Global().Record(
             "d3d12_xs.dll", "ScarlettRetailCommandQueue::PresentX_Slot32",
             SUCCEEDED(hr) ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error, hr, 32);
@@ -1102,7 +1191,20 @@ public:
     }
     virtual HRESULT STDMETHODCALLTYPE Slot33() { return RecordUnimpl(33); }
     virtual HRESULT STDMETHODCALLTYPE Slot34() { return RecordUnimpl(34); }
-    virtual HRESULT STDMETHODCALLTYPE Slot35() { return RecordUnimpl(35); }
+    // Slot 35 (+0x118): ExecuteCommandListsX / SubmitCommandListsX(NumCommandLists, ppCommandLists, token, flags)
+    virtual HRESULT STDMETHODCALLTYPE Slot35(
+        UINT NumCommandLists,
+        ID3D12CommandList* const* ppCommandLists,
+        uintptr_t /*token*/,
+        UINT /*flags*/) {
+        if (inner_ && NumCommandLists > 0u && ppCommandLists) {
+            inner_->ExecuteCommandLists(NumCommandLists, ppCommandLists);
+        }
+        openscarlett::CallTelemetry::Global().Record(
+            "d3d12_xs.dll", "ScarlettRetailCommandQueue::ExecuteCommandListsX_Slot35",
+            openscarlett::CallOutcome::Ok, S_OK, 35);
+        return S_OK;
+    }
     virtual HRESULT STDMETHODCALLTYPE Slot36() { return RecordUnimpl(36); }
     virtual HRESULT STDMETHODCALLTYPE Slot37() { return RecordUnimpl(37); }
     virtual HRESULT STDMETHODCALLTYPE Slot38() { return RecordUnimpl(38); }
@@ -1110,6 +1212,7 @@ public:
 
 private:
     static inline void* const* s_patched_vtbl_ptr_ = nullptr;
+    static inline void* const* s_patched_vtbl_v4_ptr_ = nullptr;
     std::atomic<ULONG> ref_count_{1u};
     ID3D12CommandQueueX* inner_ = nullptr;
     uint32_t retail_version_ = 0u;
@@ -1267,13 +1370,28 @@ public:
     virtual void STDMETHODCALLTYPE EndEvent() { inner_->EndEvent(); }
     virtual void STDMETHODCALLTYPE ExecuteIndirect(ID3D12CommandSignature* cs, UINT mc, ID3D12Resource* ab, UINT64 aoff, ID3D12Resource* cb, UINT64 coff) { inner_->ExecuteIndirect(cs, mc, ab, aoff, cb, coff); }
 
-    // Safe telemetry stubs for any extended retail Scarlett slots 60..139
-    void RecordClUnimpl(int slot) {
+    // Safe telemetry stubs for any extended retail Scarlett slots 60..191
+    void RecordClUnimpl(int slot, uintptr_t a1 = 0u, uintptr_t a2 = 0u, uintptr_t a3 = 0u, const void* ret = nullptr) {
+        static std::atomic<uint32_t> s_cl_counts[256]{};
         char buf[96];
         std::snprintf(buf, sizeof(buf), "ScarlettRetailCmdList::Slot_%d", slot);
-        std::fprintf(stderr, "[OpenScarlett][d3d12_xs] UNIMPL %s (+0x%X)\n", buf, slot * 8);
-        std::fflush(stderr);
-        OutputDebugStringA(buf);
+        const uint32_t idx = (slot >= 0 && slot < 256) ? static_cast<uint32_t>(slot) : 255u;
+        const uint32_t seen = s_cl_counts[idx].fetch_add(1u, std::memory_order_relaxed);
+        if (seen < 2u) {
+            const uintptr_t base = reinterpret_cast<uintptr_t>(::GetModuleHandleW(nullptr));
+            const uintptr_t rva = (ret && reinterpret_cast<uintptr_t>(ret) > base)
+                                      ? (reinterpret_cast<uintptr_t>(ret) - base)
+                                      : reinterpret_cast<uintptr_t>(ret);
+            std::fprintf(stderr,
+                         "[OpenScarlett][d3d12_xs] UNIMPL %s (+0x%X) ret=+0x%llX a1=0x%llX a2=0x%llX a3=0x%llX\n",
+                         buf, slot * 8,
+                         static_cast<unsigned long long>(rva),
+                         static_cast<unsigned long long>(a1),
+                         static_cast<unsigned long long>(a2),
+                         static_cast<unsigned long long>(a3));
+            std::fflush(stderr);
+            OutputDebugStringA(buf);
+        }
         if (inner_) {
             inner_->RecordUnsupportedExtensionIgnored(buf, slot);
         } else {
@@ -1282,7 +1400,15 @@ public:
         }
     }
     virtual void STDMETHODCALLTYPE Slot60() { RecordClUnimpl(60); }
-    virtual void STDMETHODCALLTYPE Slot61() { RecordClUnimpl(61); }
+    // Slot 61 (+0x1E8): ExecuteIndirect (retail GRDK 2504+ +2 shifted from PC slot 59)
+    virtual void STDMETHODCALLTYPE Slot61(
+        ID3D12CommandSignature* cs, UINT mc,
+        ID3D12Resource* ab, UINT64 aoff,
+        ID3D12Resource* cb, UINT64 coff) {
+        if (inner_) {
+            inner_->ExecuteIndirect(cs, mc, ab, aoff, cb, coff);
+        }
+    }
     virtual void STDMETHODCALLTYPE Slot62() { RecordClUnimpl(62); }
     virtual void STDMETHODCALLTYPE Slot63() { RecordClUnimpl(63); }
     virtual void STDMETHODCALLTYPE Slot64() { RecordClUnimpl(64); }
@@ -1291,12 +1417,39 @@ public:
     virtual void STDMETHODCALLTYPE Slot67() { RecordClUnimpl(67); }
     virtual void STDMETHODCALLTYPE Slot68() { RecordClUnimpl(68); }
     virtual void STDMETHODCALLTYPE Slot69() { RecordClUnimpl(69); }
-    virtual void STDMETHODCALLTYPE Slot70() { RecordClUnimpl(70); }
-    virtual void STDMETHODCALLTYPE Slot71() { RecordClUnimpl(71); }
-    virtual void STDMETHODCALLTYPE Slot72() { RecordClUnimpl(72); }
-    virtual void STDMETHODCALLTYPE Slot73() { RecordClUnimpl(73); }
-    virtual void STDMETHODCALLTYPE Slot74() { RecordClUnimpl(74); }
-    virtual void STDMETHODCALLTYPE Slot75() { RecordClUnimpl(75); }
+    virtual void STDMETHODCALLTYPE Slot70(uintptr_t a1, uintptr_t a2, uintptr_t a3) { RecordClUnimpl(70, a1, a2, a3, _ReturnAddress()); }
+    // Slot 71 (+0x238): Write32BitValueBottomOfPipeX(Address, Value, Flags, Reserved)
+    virtual void STDMETHODCALLTYPE Slot71(
+        D3D12_GPU_VIRTUAL_ADDRESS Address, uint32_t Value, uint32_t Flags, uint32_t /*Reserved*/) {
+        if (inner_) {
+            inner_->Write32BitValueX(Address, Value, Flags);
+        }
+    }
+    // Slot 72 (+0x240): Write64BitValueBottomOfPipeX / WriteTimestampToMemoryX(Address, Value, Reserved, Flags)
+    virtual void STDMETHODCALLTYPE Slot72(
+        D3D12_GPU_VIRTUAL_ADDRESS Address, uint64_t Value, uint32_t /*Reserved*/, uint32_t Flags) {
+        if (inner_) {
+            inner_->Write64BitValueX(Address, Value, Flags);
+        }
+    }
+    // Slot 73 (+0x248): Wait32BitValueX(Address, Op, Ref, Mask, Flags)
+    virtual void STDMETHODCALLTYPE Slot73(
+        D3D12_GPU_VIRTUAL_ADDRESS Address, uint32_t Op, uint32_t Ref, uint32_t Mask, uint32_t /*Flags*/) {
+        if (inner_ && Address != 0ull) {
+            inner_->Wait32BitValueX(Address, Ref, Mask, static_cast<D3D12XBOX_WAIT_VALUE_OP>(Op));
+        }
+    }
+    // Slot 74 (+0x250): Wait64BitValueX(Address, Op, Ref, Mask, Flags)
+    virtual void STDMETHODCALLTYPE Slot74(
+        D3D12_GPU_VIRTUAL_ADDRESS Address, uint32_t /*Op*/, uint64_t /*Ref*/, uint64_t /*Mask*/, uint32_t /*Flags*/) {
+        // Non-blocking on CPU wait when wait-op is ALWAYS or title-side sync; log telemetry cleanly.
+        if (inner_ && Address != 0ull) {
+            openscarlett::CallTelemetry::Global().Record(
+                "d3d12_xs.dll", "ScarlettRetailCmdList::Wait64BitValueX_Slot74",
+                openscarlett::CallOutcome::Ok, S_OK, 74);
+        }
+    }
+    virtual void STDMETHODCALLTYPE Slot75(uintptr_t a1, uintptr_t a2, uintptr_t a3) { RecordClUnimpl(75, a1, a2, a3, _ReturnAddress()); }
     virtual void STDMETHODCALLTYPE Slot76() { RecordClUnimpl(76); }
     virtual void STDMETHODCALLTYPE Slot77() { RecordClUnimpl(77); }
     virtual void STDMETHODCALLTYPE Slot78() { RecordClUnimpl(78); }
@@ -1398,7 +1551,7 @@ public:
     virtual void STDMETHODCALLTYPE RSSetShadingRateImage(ID3D12Resource* r) { inner_->RSSetShadingRateImage(r); }
     virtual void STDMETHODCALLTYPE DispatchMesh(UINT x, UINT y, UINT z) { inner_->DispatchMesh(x, y, z); }
     virtual void STDMETHODCALLTYPE Slot125() { RecordClUnimpl(125); }
-    virtual void STDMETHODCALLTYPE Slot126() { RecordClUnimpl(126); }
+    virtual void STDMETHODCALLTYPE Slot126(uintptr_t a1, uintptr_t a2, uintptr_t a3) { RecordClUnimpl(126, a1, a2, a3, _ReturnAddress()); }
     virtual void STDMETHODCALLTYPE Slot127() { RecordClUnimpl(127); }
     virtual void STDMETHODCALLTYPE Slot128() { RecordClUnimpl(128); }
     virtual void STDMETHODCALLTYPE Slot129() { RecordClUnimpl(129); }
@@ -1410,14 +1563,80 @@ public:
             "d3d12_xs.dll", "ScarlettRetailCmdList::BuildRaytracingAccelerationStructuresX",
             openscarlett::CallOutcome::Ok, S_OK, 131);
     }
-    virtual void STDMETHODCALLTYPE Slot132() { RecordClUnimpl(132); }
+    virtual void STDMETHODCALLTYPE Slot132(uintptr_t a1, uintptr_t a2, uintptr_t a3) { RecordClUnimpl(132, a1, a2, a3, _ReturnAddress()); }
     virtual void STDMETHODCALLTYPE Slot133() { RecordClUnimpl(133); }
     virtual void STDMETHODCALLTYPE Slot134() { RecordClUnimpl(134); }
     virtual void STDMETHODCALLTYPE Slot135() { RecordClUnimpl(135); }
     virtual void STDMETHODCALLTYPE Slot136() { RecordClUnimpl(136); }
     virtual void STDMETHODCALLTYPE Slot137() { RecordClUnimpl(137); }
     virtual void STDMETHODCALLTYPE Slot138() { RecordClUnimpl(138); }
-    virtual void STDMETHODCALLTYPE Slot139() { RecordClUnimpl(139); }
+    // Slot 139 (+0x458): ResetX(ID3D12CommandAllocator* pAllocator, ID3D12PipelineState* pInitialState, UINT Flags)
+    virtual HRESULT STDMETHODCALLTYPE Slot139(
+        ID3D12CommandAllocator* pAllocator,
+        ID3D12PipelineState* pInitialState,
+        UINT /*Flags*/) {
+        return inner_ ? inner_->Reset(pAllocator, pInitialState) : S_OK;
+    }
+    virtual void STDMETHODCALLTYPE Slot140() { RecordClUnimpl(140); }
+    virtual void STDMETHODCALLTYPE Slot141() { RecordClUnimpl(141); }
+    virtual void STDMETHODCALLTYPE Slot142(uintptr_t a1, uintptr_t a2, uintptr_t a3) { RecordClUnimpl(142, a1, a2, a3, _ReturnAddress()); }
+    virtual void STDMETHODCALLTYPE Slot143() { RecordClUnimpl(143); }
+    virtual void STDMETHODCALLTYPE Slot144() { RecordClUnimpl(144); }
+    virtual void STDMETHODCALLTYPE Slot145() { RecordClUnimpl(145); }
+    // Slot 146 (+0x490): ID3D12GraphicsCommandList7::Barrier (Enhanced Barriers)
+    virtual void STDMETHODCALLTYPE Barrier(
+        UINT32 NumBarrierGroups, const void* pBarrierGroups) {
+        (void)NumBarrierGroups;
+        (void)pBarrierGroups;
+        openscarlett::CallTelemetry::Global().Record(
+            "d3d12_xs.dll", "ScarlettRetailCmdList::Barrier",
+            openscarlett::CallOutcome::Ok, S_OK, 146);
+    }
+    virtual void STDMETHODCALLTYPE Slot147() { RecordClUnimpl(147); }
+    virtual void STDMETHODCALLTYPE Slot148() { RecordClUnimpl(148); }
+    virtual void STDMETHODCALLTYPE Slot149() { RecordClUnimpl(149); }
+    virtual void STDMETHODCALLTYPE Slot150() { RecordClUnimpl(150); }
+    virtual void STDMETHODCALLTYPE Slot151() { RecordClUnimpl(151); }
+    virtual void STDMETHODCALLTYPE Slot152() { RecordClUnimpl(152); }
+    virtual void STDMETHODCALLTYPE Slot153() { RecordClUnimpl(153); }
+    virtual void STDMETHODCALLTYPE Slot154() { RecordClUnimpl(154); }
+    virtual void STDMETHODCALLTYPE Slot155() { RecordClUnimpl(155); }
+    virtual void STDMETHODCALLTYPE Slot156() { RecordClUnimpl(156); }
+    virtual void STDMETHODCALLTYPE Slot157() { RecordClUnimpl(157); }
+    virtual void STDMETHODCALLTYPE Slot158() { RecordClUnimpl(158); }
+    virtual void STDMETHODCALLTYPE Slot159() { RecordClUnimpl(159); }
+    virtual void STDMETHODCALLTYPE Slot160() { RecordClUnimpl(160); }
+    virtual void STDMETHODCALLTYPE Slot161() { RecordClUnimpl(161); }
+    virtual void STDMETHODCALLTYPE Slot162() { RecordClUnimpl(162); }
+    virtual void STDMETHODCALLTYPE Slot163() { RecordClUnimpl(163); }
+    virtual void STDMETHODCALLTYPE Slot164() { RecordClUnimpl(164); }
+    virtual void STDMETHODCALLTYPE Slot165() { RecordClUnimpl(165); }
+    virtual void STDMETHODCALLTYPE Slot166() { RecordClUnimpl(166); }
+    virtual void STDMETHODCALLTYPE Slot167() { RecordClUnimpl(167); }
+    virtual void STDMETHODCALLTYPE Slot168() { RecordClUnimpl(168); }
+    virtual void STDMETHODCALLTYPE Slot169() { RecordClUnimpl(169); }
+    virtual void STDMETHODCALLTYPE Slot170() { RecordClUnimpl(170); }
+    virtual void STDMETHODCALLTYPE Slot171() { RecordClUnimpl(171); }
+    virtual void STDMETHODCALLTYPE Slot172() { RecordClUnimpl(172); }
+    virtual void STDMETHODCALLTYPE Slot173() { RecordClUnimpl(173); }
+    virtual void STDMETHODCALLTYPE Slot174() { RecordClUnimpl(174); }
+    virtual void STDMETHODCALLTYPE Slot175() { RecordClUnimpl(175); }
+    virtual void STDMETHODCALLTYPE Slot176() { RecordClUnimpl(176); }
+    virtual void STDMETHODCALLTYPE Slot177() { RecordClUnimpl(177); }
+    virtual void STDMETHODCALLTYPE Slot178() { RecordClUnimpl(178); }
+    virtual void STDMETHODCALLTYPE Slot179() { RecordClUnimpl(179); }
+    virtual void STDMETHODCALLTYPE Slot180() { RecordClUnimpl(180); }
+    virtual void STDMETHODCALLTYPE Slot181() { RecordClUnimpl(181); }
+    virtual void STDMETHODCALLTYPE Slot182() { RecordClUnimpl(182); }
+    virtual void STDMETHODCALLTYPE Slot183() { RecordClUnimpl(183); }
+    virtual void STDMETHODCALLTYPE Slot184() { RecordClUnimpl(184); }
+    virtual void STDMETHODCALLTYPE Slot185() { RecordClUnimpl(185); }
+    virtual void STDMETHODCALLTYPE Slot186() { RecordClUnimpl(186); }
+    virtual void STDMETHODCALLTYPE Slot187() { RecordClUnimpl(187); }
+    virtual void STDMETHODCALLTYPE Slot188() { RecordClUnimpl(188); }
+    virtual void STDMETHODCALLTYPE Slot189() { RecordClUnimpl(189); }
+    virtual void STDMETHODCALLTYPE Slot190() { RecordClUnimpl(190); }
+    virtual void STDMETHODCALLTYPE Slot191() { RecordClUnimpl(191); }
 
 private:
     // MUST remain the first member so +0x18 (m_pCurrent) and +0x30 (m_pLimit) are both 0!
@@ -1447,8 +1666,57 @@ public:
             s_vtbl[26] = reinterpret_cast<void*>(&Thunk_GetCustomHeapProperties);
             s_vtbl[43] = reinterpret_cast<void*>(&Thunk_GetAdapterLuid);
             s_vtbl[95] = reinterpret_cast<void*>(&Thunk_GetResourceAllocationInfo1);
+            s_vtbl[108] = reinterpret_cast<void*>(&Thunk_GetResourceAllocationInfo2);
         });
         return s_vtbl;
+    }
+
+    static D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE Thunk_GetResourceAllocationInfo2(
+        void* arg0,
+        void* arg1,
+        UINT visibleMask,
+        UINT numResourceDescs,
+        const D3D12_RESOURCE_DESC1* pResourceDescs,
+        D3D12_RESOURCE_ALLOCATION_INFO1* pResourceAllocationInfo1) {
+        ScarlettRetailDeviceProxy* self = nullptr;
+        D3D12_RESOURCE_ALLOCATION_INFO* out_ret = nullptr;
+        if (arg0 && reinterpret_cast<uintptr_t>(arg0) >= 0x10000u &&
+            *reinterpret_cast<const void* const* const*>(arg0) == s_patched_vtbl_ptr_) {
+            self = static_cast<ScarlettRetailDeviceProxy*>(arg0);
+            out_ret = static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(arg1);
+        } else {
+            out_ret = static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(arg0);
+            self = static_cast<ScarlettRetailDeviceProxy*>(arg1);
+        }
+        D3D12_RESOURCE_ALLOCATION_INFO res{};
+        if (self && self->inner_) {
+            std::vector<D3D12_RESOURCE_DESC> clean_descs;
+            if (pResourceDescs && numResourceDescs > 0u) {
+                clean_descs.resize(numResourceDescs);
+                for (UINT i = 0u; i < numResourceDescs; ++i) {
+                    D3D12_RESOURCE_DESC d0{};
+                    d0.Dimension = pResourceDescs[i].Dimension;
+                    d0.Alignment = pResourceDescs[i].Alignment;
+                    d0.Width = pResourceDescs[i].Width;
+                    d0.Height = pResourceDescs[i].Height;
+                    d0.DepthOrArraySize = pResourceDescs[i].DepthOrArraySize;
+                    d0.MipLevels = pResourceDescs[i].MipLevels;
+                    d0.Format = pResourceDescs[i].Format;
+                    d0.SampleDesc = pResourceDescs[i].SampleDesc;
+                    d0.Layout = pResourceDescs[i].Layout;
+                    d0.Flags = pResourceDescs[i].Flags;
+                    clean_descs[i] = SanitizeRetailResourceDesc(d0);
+                }
+            }
+            res = self->inner_->GetResourceAllocationInfo1(
+                visibleMask, numResourceDescs,
+                clean_descs.empty() ? nullptr : clean_descs.data(),
+                pResourceAllocationInfo1);
+        }
+        if (out_ret) {
+            *out_ret = res;
+        }
+        return out_ret;
     }
 
     static D3D12_RESOURCE_ALLOCATION_INFO* STDMETHODCALLTYPE Thunk_GetResourceAllocationInfo1(
@@ -1933,13 +2201,28 @@ public:
     LUID STDMETHODCALLTYPE GetAdapterLuid() override { return inner_->GetAdapterLuid(); }
 #endif
 
-    // Retail Scarlett d3d12_xs.h ID3D12Device extended vtable (slots 44..127)
-    HRESULT RecordUnimpl(int slot) {
+    // Retail Scarlett d3d12_xs.h ID3D12Device extended vtable (slots 44..191)
+    HRESULT RecordUnimpl(int slot, uintptr_t a1 = 0u, uintptr_t a2 = 0u, uintptr_t a3 = 0u, const void* ret = nullptr) {
+        static std::atomic<uint32_t> s_slot_log_counts[256]{};
         char buf[96];
         std::snprintf(buf, sizeof(buf), "ScarlettRetailDevice::Slot_%d", slot);
-        std::fprintf(stderr, "[OpenScarlett][d3d12_xs] UNIMPL %s (+0x%X)\n", buf, slot * 8);
-        std::fflush(stderr);
-        OutputDebugStringA(buf);
+        const uint32_t idx = (slot >= 0 && slot < 256) ? static_cast<uint32_t>(slot) : 255u;
+        const uint32_t seen = s_slot_log_counts[idx].fetch_add(1u, std::memory_order_relaxed);
+        if (seen < 3u) {
+            const uintptr_t base = reinterpret_cast<uintptr_t>(::GetModuleHandleW(nullptr));
+            const uintptr_t rva = (ret && reinterpret_cast<uintptr_t>(ret) > base)
+                                      ? (reinterpret_cast<uintptr_t>(ret) - base)
+                                      : reinterpret_cast<uintptr_t>(ret);
+            std::fprintf(stderr,
+                         "[OpenScarlett][d3d12_xs] UNIMPL %s (+0x%X) ret=+0x%llX a1=0x%llX a2=0x%llX a3=0x%llX\n",
+                         buf, slot * 8,
+                         static_cast<unsigned long long>(rva),
+                         static_cast<unsigned long long>(a1),
+                         static_cast<unsigned long long>(a2),
+                         static_cast<unsigned long long>(a3));
+            std::fflush(stderr);
+            OutputDebugStringA(buf);
+        }
         openscarlett::CallTelemetry::Global().Record(
             "d3d12_xs.dll", buf, openscarlett::CallOutcome::NotImplemented, E_NOTIMPL, slot);
         return E_NOTIMPL;
@@ -1996,11 +2279,46 @@ public:
     virtual HRESULT STDMETHODCALLTYPE Slot54() { return RecordUnimpl(54); }
     virtual HRESULT STDMETHODCALLTYPE Slot55() { return RecordUnimpl(55); }
     virtual HRESULT STDMETHODCALLTYPE Slot56() { return RecordUnimpl(56); }
-    virtual HRESULT STDMETHODCALLTYPE Slot57() { return RecordUnimpl(57); }
+    virtual HRESULT STDMETHODCALLTYPE Slot57(uintptr_t a1, uintptr_t a2, uintptr_t a3) {
+        static std::atomic<uint32_t> s_57_dump{0u};
+        if (s_57_dump.fetch_add(1u, std::memory_order_relaxed) < 2u && a1 >= 0x10000ull) {
+            const auto* q = reinterpret_cast<const uint64_t*>(a1);
+            std::fprintf(stderr,
+                         "[OpenScarlett][d3d12_xs] Device::Slot57 desc@%p: q0=0x%llX q1=0x%llX q2=0x%llX q3=0x%llX q4=0x%llX q5=0x%llX\n",
+                         reinterpret_cast<const void*>(a1),
+                         static_cast<unsigned long long>(q[0]), static_cast<unsigned long long>(q[1]),
+                         static_cast<unsigned long long>(q[2]), static_cast<unsigned long long>(q[3]),
+                         static_cast<unsigned long long>(q[4]), static_cast<unsigned long long>(q[5]));
+            std::fflush(stderr);
+        }
+        return RecordUnimpl(57, a1, a2, a3, _ReturnAddress());
+    }
     virtual HRESULT STDMETHODCALLTYPE Slot58() { return RecordUnimpl(58); }
     virtual HRESULT STDMETHODCALLTYPE Slot59() { return RecordUnimpl(59); }
-    virtual HRESULT STDMETHODCALLTYPE Slot60() { return RecordUnimpl(60); }
-    virtual HRESULT STDMETHODCALLTYPE Slot61() { return RecordUnimpl(61); }
+    // Slot 60 (+0x1E0): CreateGraphicsPipelineStateX(pDesc, pCache, pFlags, riid, ppv)
+    virtual HRESULT STDMETHODCALLTYPE CreateGraphicsPipelineStateX(
+        const D3D12_GRAPHICS_PIPELINE_STATE_DESC* pDesc,
+        void* /*pCache*/,
+        void* /*pFlags*/,
+        REFIID riid,
+        void** ppPipelineState) {
+        const HRESULT hr = inner_->CreateGraphicsPipelineState(pDesc, riid, ppPipelineState);
+        openscarlett::CallTelemetry::Global().Record(
+            "d3d12_xs.dll", "ScarlettRetailDevice::CreateGraphicsPipelineStateX",
+            SUCCEEDED(hr) ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error, hr, 60);
+        return hr;
+    }
+    // Slot 61 (+0x1E8): CreateSamplerX / CreateSampler2
+    virtual HRESULT STDMETHODCALLTYPE CreateSamplerX(
+        const D3D12_SAMPLER_DESC* pDesc,
+        D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
+        (void)pDesc;
+        (void)DestDescriptor;
+        openscarlett::CallTelemetry::Global().Record(
+            "d3d12_xs.dll", "ScarlettRetailDevice::CreateSamplerX",
+            openscarlett::CallOutcome::Ok, S_OK, 61);
+        return S_OK;
+    }
     // Slot 62 (+0x1F0): CreateComputePipelineStateX(pDesc, pCache, pFlags, riid, ppv)
     virtual HRESULT STDMETHODCALLTYPE CreateComputePipelineStateX(
         const D3D12_COMPUTE_PIPELINE_STATE_DESC* pDesc,
@@ -2018,8 +2336,33 @@ public:
     virtual HRESULT STDMETHODCALLTYPE Slot64() { return RecordUnimpl(64); }
     virtual HRESULT STDMETHODCALLTYPE Slot65() { return RecordUnimpl(65); }
     virtual HRESULT STDMETHODCALLTYPE Slot66() { return RecordUnimpl(66); }
-    virtual HRESULT STDMETHODCALLTYPE Slot67() { return RecordUnimpl(67); }
-    virtual HRESULT STDMETHODCALLTYPE Slot68() { return RecordUnimpl(68); }
+    virtual HRESULT STDMETHODCALLTYPE Slot67(uintptr_t a1, uintptr_t a2, uintptr_t a3) {
+        static std::atomic<uint32_t> s_67_dump{0u};
+        if (s_67_dump.fetch_add(1u, std::memory_order_relaxed) < 2u && a1 >= 0x10000ull) {
+            const auto* q = reinterpret_cast<const uint64_t*>(a1);
+            std::fprintf(stderr,
+                         "[OpenScarlett][d3d12_xs] Device::Slot67 desc@%p: q0=0x%llX q1=0x%llX q2=0x%llX q3=0x%llX q4=0x%llX q5=0x%llX\n",
+                         reinterpret_cast<const void*>(a1),
+                         static_cast<unsigned long long>(q[0]), static_cast<unsigned long long>(q[1]),
+                         static_cast<unsigned long long>(q[2]), static_cast<unsigned long long>(q[3]),
+                         static_cast<unsigned long long>(q[4]), static_cast<unsigned long long>(q[5]));
+            std::fflush(stderr);
+        }
+        return RecordUnimpl(67, a1, a2, a3, _ReturnAddress());
+    }
+    // Slot 68 (+0x220): GetGpuHardwareConfigurationX
+    virtual HRESULT STDMETHODCALLTYPE GetGpuHardwareConfigurationX(void* pOutConfig) {
+        if (pOutConfig) {
+            std::memset(pOutConfig, 0, 16u);
+            auto* words = static_cast<uint32_t*>(pOutConfig);
+            words[0] = 0x10030000u;  // GFX10.3 / Scarlett
+            words[1] = 52u;          // Anaconda CU count
+        }
+        openscarlett::CallTelemetry::Global().Record(
+            "d3d12_xs.dll", "ScarlettRetailDevice::GetGpuHardwareConfigurationX",
+            openscarlett::CallOutcome::Ok, S_OK, 68);
+        return S_OK;
+    }
     // Slot 69 (+0x228): SetDriverFlagX(uint32_t key, uint32_t value)
     virtual HRESULT STDMETHODCALLTYPE SetDriverFlagX(uint32_t /*key*/, uint32_t /*value*/) {
         openscarlett::CallTelemetry::Global().Record(
@@ -2064,7 +2407,20 @@ public:
             SUCCEEDED(hr) ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error, hr, 73);
         return hr;
     }
-    virtual HRESULT STDMETHODCALLTYPE Slot74() { return RecordUnimpl(74); }
+    // Slot 74 (+0x250): CreateTilePoolX / RegisterPagePoolX(pBaseAddress, numPages, pOutHandle)
+    virtual HRESULT STDMETHODCALLTYPE CreateTilePoolX_Slot74(
+        void* pBaseAddress,
+        UINT numPages,
+        uint64_t* pOutHandle) {
+        (void)numPages;
+        if (pOutHandle) {
+            *pOutHandle = reinterpret_cast<uint64_t>(pBaseAddress);
+        }
+        openscarlett::CallTelemetry::Global().Record(
+            "d3d12_xs.dll", "ScarlettRetailDevice::CreateTilePoolX_Slot74",
+            openscarlett::CallOutcome::Ok, S_OK, 74);
+        return S_OK;
+    }
     virtual HRESULT STDMETHODCALLTYPE Slot75() { return RecordUnimpl(75); }
     virtual HRESULT STDMETHODCALLTYPE Slot76() { return RecordUnimpl(76); }
     virtual HRESULT STDMETHODCALLTYPE Slot77() { return RecordUnimpl(77); }
@@ -2273,11 +2629,148 @@ public:
         return inner_->CreateProtectedResourceSession1(pDesc, riid, ppSession);
     }
     virtual HRESULT STDMETHODCALLTYPE Slot107() { return RecordUnimpl(107); }
-    virtual HRESULT STDMETHODCALLTYPE Slot108() { return RecordUnimpl(108); }
-    virtual HRESULT STDMETHODCALLTYPE Slot109() { return RecordUnimpl(109); }
-    virtual HRESULT STDMETHODCALLTYPE Slot110() { return RecordUnimpl(110); }
-    virtual HRESULT STDMETHODCALLTYPE Slot111() { return RecordUnimpl(111); }
-    virtual HRESULT STDMETHODCALLTYPE Slot112() { return RecordUnimpl(112); }
+    // Slot 108 (+0x360): ID3D12Device8::GetResourceAllocationInfo2 (patched via Thunk_GetResourceAllocationInfo2)
+    virtual D3D12_RESOURCE_ALLOCATION_INFO STDMETHODCALLTYPE GetResourceAllocationInfo2(
+        UINT visibleMask, UINT numResourceDescs, const D3D12_RESOURCE_DESC1* pResourceDescs,
+        D3D12_RESOURCE_ALLOCATION_INFO1* pResourceAllocationInfo1) {
+        std::vector<D3D12_RESOURCE_DESC> clean;
+        if (pResourceDescs && numResourceDescs > 0u) {
+            clean.resize(numResourceDescs);
+            for (UINT i = 0u; i < numResourceDescs; ++i) {
+                D3D12_RESOURCE_DESC d0{};
+                d0.Dimension = pResourceDescs[i].Dimension;
+                d0.Alignment = pResourceDescs[i].Alignment;
+                d0.Width = pResourceDescs[i].Width;
+                d0.Height = pResourceDescs[i].Height;
+                d0.DepthOrArraySize = pResourceDescs[i].DepthOrArraySize;
+                d0.MipLevels = pResourceDescs[i].MipLevels;
+                d0.Format = pResourceDescs[i].Format;
+                d0.SampleDesc = pResourceDescs[i].SampleDesc;
+                d0.Layout = pResourceDescs[i].Layout;
+                d0.Flags = pResourceDescs[i].Flags;
+                clean[i] = SanitizeRetailResourceDesc(d0);
+            }
+        }
+        return inner_->GetResourceAllocationInfo1(
+            visibleMask, numResourceDescs, clean.empty() ? nullptr : clean.data(), pResourceAllocationInfo1);
+    }
+    // Slot 109 (+0x368): ID3D12Device8::CreateCommittedResource2
+    virtual HRESULT STDMETHODCALLTYPE CreateCommittedResource2(
+        const D3D12_HEAP_PROPERTIES* pHeapProperties,
+        D3D12_HEAP_FLAGS HeapFlags,
+        const D3D12_RESOURCE_DESC1* pDesc,
+        D3D12_RESOURCE_STATES InitialResourceState,
+        const D3D12_CLEAR_VALUE* pOptimizedClearValue,
+        ID3D12ProtectedResourceSession* pProtectedSession,
+        REFIID riidResource,
+        void** ppvResource) {
+        (void)pProtectedSession;
+        D3D12_RESOURCE_DESC desc0{};
+        const D3D12_RESOURCE_DESC* desc_ptr = nullptr;
+        if (pDesc) {
+            desc0.Dimension = pDesc->Dimension;
+            desc0.Alignment = pDesc->Alignment;
+            desc0.Width = pDesc->Width;
+            desc0.Height = pDesc->Height;
+            desc0.DepthOrArraySize = pDesc->DepthOrArraySize;
+            desc0.MipLevels = pDesc->MipLevels;
+            desc0.Format = pDesc->Format;
+            desc0.SampleDesc = pDesc->SampleDesc;
+            desc0.Layout = pDesc->Layout;
+            desc0.Flags = pDesc->Flags;
+            desc0 = SanitizeRetailResourceDesc(desc0);
+            desc_ptr = &desc0;
+        }
+        D3D12_RESOURCE_STATES state = InitialResourceState;
+        if (static_cast<uint32_t>(state) == 0xFFFFFFFFu) {
+            state = D3D12_RESOURCE_STATE_COMMON;
+        }
+        HRESULT hr = inner_->CreateCommittedResource(
+            pHeapProperties, HeapFlags, desc_ptr, state, pOptimizedClearValue, riidResource, ppvResource);
+        if (FAILED(hr) && state != D3D12_RESOURCE_STATE_COMMON) {
+            hr = inner_->CreateCommittedResource(
+                pHeapProperties, HeapFlags, desc_ptr, D3D12_RESOURCE_STATE_COMMON,
+                pOptimizedClearValue, riidResource, ppvResource);
+        }
+        openscarlett::CallTelemetry::Global().Record(
+            "d3d12_xs.dll", "ScarlettRetailDevice::CreateCommittedResource2",
+            SUCCEEDED(hr) ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error, hr, 109);
+        return hr;
+    }
+    // Slot 110 (+0x370): ID3D12Device8::CreatePlacedResource1
+    virtual HRESULT STDMETHODCALLTYPE CreatePlacedResource1(
+        ID3D12Heap* pHeap,
+        UINT64 HeapOffset,
+        const D3D12_RESOURCE_DESC1* pDesc,
+        D3D12_RESOURCE_STATES InitialState,
+        const D3D12_CLEAR_VALUE* pOptimizedClearValue,
+        REFIID riid,
+        void** ppvResource) {
+        D3D12_RESOURCE_DESC desc0{};
+        const D3D12_RESOURCE_DESC* desc_ptr = nullptr;
+        if (pDesc) {
+            desc0.Dimension = pDesc->Dimension;
+            desc0.Alignment = pDesc->Alignment;
+            desc0.Width = pDesc->Width;
+            desc0.Height = pDesc->Height;
+            desc0.DepthOrArraySize = pDesc->DepthOrArraySize;
+            desc0.MipLevels = pDesc->MipLevels;
+            desc0.Format = pDesc->Format;
+            desc0.SampleDesc = pDesc->SampleDesc;
+            desc0.Layout = pDesc->Layout;
+            desc0.Flags = pDesc->Flags;
+            desc0 = SanitizeRetailResourceDesc(desc0);
+            desc_ptr = &desc0;
+        }
+        D3D12_RESOURCE_STATES state = InitialState;
+        if (static_cast<uint32_t>(state) == 0xFFFFFFFFu) {
+            state = D3D12_RESOURCE_STATE_COMMON;
+        }
+        const HRESULT hr = inner_->CreatePlacedResource(
+            pHeap, HeapOffset, desc_ptr, state, pOptimizedClearValue, riid, ppvResource);
+        openscarlett::CallTelemetry::Global().Record(
+            "d3d12_xs.dll", "ScarlettRetailDevice::CreatePlacedResource1",
+            SUCCEEDED(hr) ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error, hr, 110);
+        return hr;
+    }
+    // Slot 111 (+0x378): ID3D12Device8::CreateSamplerFeedbackUnorderedAccessView
+    virtual void STDMETHODCALLTYPE CreateSamplerFeedbackUnorderedAccessView(
+        ID3D12Resource* pTargetedResource,
+        ID3D12Resource* pFeedbackResource,
+        D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
+        inner_->CreateSamplerFeedbackUnorderedAccessView(
+            pTargetedResource, pFeedbackResource, DestDescriptor);
+    }
+    // Slot 112 (+0x380): ID3D12Device8::GetCopyableFootprints1
+    virtual void STDMETHODCALLTYPE GetCopyableFootprints1(
+        const D3D12_RESOURCE_DESC1* pResourceDesc,
+        UINT FirstSubresource,
+        UINT NumSubresources,
+        UINT64 BaseOffset,
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT* pLayouts,
+        UINT* pNumRows,
+        UINT64* pRowSizeInBytes,
+        UINT64* pTotalBytes) {
+        D3D12_RESOURCE_DESC desc0{};
+        const D3D12_RESOURCE_DESC* desc_ptr = nullptr;
+        if (pResourceDesc) {
+            desc0.Dimension = pResourceDesc->Dimension;
+            desc0.Alignment = pResourceDesc->Alignment;
+            desc0.Width = pResourceDesc->Width;
+            desc0.Height = pResourceDesc->Height;
+            desc0.DepthOrArraySize = pResourceDesc->DepthOrArraySize;
+            desc0.MipLevels = pResourceDesc->MipLevels;
+            desc0.Format = pResourceDesc->Format;
+            desc0.SampleDesc = pResourceDesc->SampleDesc;
+            desc0.Layout = pResourceDesc->Layout;
+            desc0.Flags = pResourceDesc->Flags;
+            desc0 = SanitizeRetailResourceDesc(desc0);
+            desc_ptr = &desc0;
+        }
+        inner_->GetCopyableFootprints(
+            desc_ptr, FirstSubresource, NumSubresources, BaseOffset,
+            pLayouts, pNumRows, pRowSizeInBytes, pTotalBytes);
+    }
     virtual HRESULT STDMETHODCALLTYPE Slot113() { return RecordUnimpl(113); }
     virtual HRESULT STDMETHODCALLTYPE Slot114() { return RecordUnimpl(114); }
     // Slot 115 (+0x398): Xbox ID3D12Device8::DeserializeStateObjectX
@@ -2381,7 +2874,7 @@ public:
     virtual HRESULT STDMETHODCALLTYPE Slot130() { return RecordUnimpl(130); }
     virtual HRESULT STDMETHODCALLTYPE Slot131() { return RecordUnimpl(131); }
     virtual HRESULT STDMETHODCALLTYPE Slot132() { return RecordUnimpl(132); }
-    // Slot 133 (+0x428): CreatePlacedResourceX (retail Scarlett GRDK variant)
+    // Slot 133 (+0x428): CreatePlacedResourceX2 (retail Scarlett GRDK variant using D3D12_BARRIER_LAYOUT)
     virtual HRESULT STDMETHODCALLTYPE CreatePlacedResourceX_Slot133(
         D3D12_GPU_VIRTUAL_ADDRESS gpuVirtualAddress,
         const D3D12_RESOURCE_DESC* pDesc,
@@ -2395,12 +2888,37 @@ public:
                 openscarlett::CallOutcome::Error, E_INVALIDARG, 133);
             return E_INVALIDARG;
         }
-        if (static_cast<uint32_t>(InitialState) == 0xFFFFFFFFu) {
-            InitialState = D3D12_RESOURCE_STATE_COMMON;
-        }
         const D3D12_RESOURCE_DESC clean_desc = SanitizeRetailResourceDesc(*pDesc);
-        const HRESULT hr = inner_->CreatePlacedResourceX(
-            gpuVirtualAddress, &clean_desc, InitialState, pOptimizedClearValue, riid, ppvResource);
+        // Retail Slot 133 passes D3D12_BARRIER_LAYOUT (e.g. 0xFFFFFFFF UNDEFINED, 3 RT, 6 DEPTH_READ,
+        // 7 SHADER_RESOURCE, 9 COPY_DEST); map to a valid desktop D3D12_RESOURCE_STATES value.
+        D3D12_RESOURCE_STATES mapped_state =
+            MapBarrierLayoutToResourceState(static_cast<uint32_t>(InitialState));
+        if (clean_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            mapped_state = D3D12_RESOURCE_STATE_COMMON;
+        }
+        HRESULT hr = inner_->CreatePlacedResourceX(
+            gpuVirtualAddress, &clean_desc, mapped_state, pOptimizedClearValue, riid, ppvResource);
+        if (FAILED(hr) && mapped_state != D3D12_RESOURCE_STATE_COMMON) {
+            hr = inner_->CreatePlacedResourceX(
+                gpuVirtualAddress, &clean_desc, D3D12_RESOURCE_STATE_COMMON,
+                pOptimizedClearValue, riid, ppvResource);
+        }
+        if (FAILED(hr)) {
+            std::fprintf(stderr,
+                "[OpenScarlett][d3d12_xs] CreatePlacedResourceX_Slot133 FAILED va=0x%llX dim=%u %llux%u D=%u mips=%u fmt=%u layout=0x%X rawFlags=0x%X init=0x%X -> hr=0x%08lX\n",
+                static_cast<unsigned long long>(gpuVirtualAddress),
+                static_cast<unsigned>(pDesc->Dimension),
+                static_cast<unsigned long long>(pDesc->Width),
+                pDesc->Height,
+                static_cast<unsigned>(pDesc->DepthOrArraySize),
+                static_cast<unsigned>(pDesc->MipLevels),
+                static_cast<unsigned>(pDesc->Format),
+                static_cast<unsigned>(pDesc->Layout),
+                static_cast<unsigned>(pDesc->Flags),
+                static_cast<unsigned>(InitialState),
+                static_cast<unsigned long>(hr));
+            std::fflush(stderr);
+        }
         openscarlett::CallTelemetry::Global().Record(
             "d3d12_xs.dll", "ScarlettRetailDevice::CreatePlacedResourceX_Slot133",
             SUCCEEDED(hr) ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error, hr, 133);

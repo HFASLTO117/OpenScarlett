@@ -592,7 +592,11 @@ public:
             return ACPHAL_E_OUTOFMEMORY;
         }
         const uint32_t apu_span = static_cast<uint32_t>(span64);
-        const bool is_non_cached = (flags & APU_ALLOC_NONCACHED) != 0u;
+        const bool retail_mode = g_xbox_retail_acphal_mode.load(std::memory_order_acquire);
+        // Real Xbox GDK apu.h defines APU_ALLOC_CACHED = 1, APU_ALLOC_NONCACHED = 0;
+        // our synthetic ABI header defines APU_ALLOC_NONCACHED = 1.
+        const bool is_non_cached =
+            retail_mode ? ((flags & 1u) == 0u) : ((flags & APU_ALLOC_NONCACHED) != 0u);
 
         std::lock_guard<std::mutex> lk(mutex_);
         if (!initialized_) {
@@ -601,13 +605,35 @@ public:
             initialized_ = true;
         }
 
-        const bool use_non_cached =
+        bool use_non_cached =
             is_non_cached && (non_cached_.capacity > 0u || cached_.capacity == 0u);
-        ApuHeapPool& pool = use_non_cached ? non_cached_ : cached_;
-        const uint64_t cur_used = static_cast<uint64_t>(pool.bytes_allocated) + pool.bytes_lost;
-        if (span64 > pool.capacity || cur_used > pool.capacity || span64 > pool.capacity - cur_used) {
-            return ACPHAL_E_OUTOFMEMORY;
+        ApuHeapPool* pool_ptr = use_non_cached ? &non_cached_ : &cached_;
+        uint64_t cur_used = static_cast<uint64_t>(pool_ptr->bytes_allocated) + pool_ptr->bytes_lost;
+        if (span64 > pool_ptr->capacity || cur_used > pool_ptr->capacity ||
+            span64 > pool_ptr->capacity - cur_used) {
+            if (retail_mode) {
+                // Retail fallback: if the requested pool is smaller than the allocation,
+                // try the complementary pool (or expand capacity within APU address space).
+                ApuHeapPool* alt = use_non_cached ? &cached_ : &non_cached_;
+                const uint64_t alt_used = static_cast<uint64_t>(alt->bytes_allocated) + alt->bytes_lost;
+                if (span64 <= alt->capacity && alt_used <= alt->capacity &&
+                    span64 <= alt->capacity - alt_used) {
+                    use_non_cached = !use_non_cached;
+                    pool_ptr = alt;
+                } else {
+                    const uint64_t needed = cur_used + span64;
+                    const uint32_t max_cap = use_non_cached ? kNonCachedApuSpaceSize : kCachedApuSpaceSize;
+                    if (needed <= max_cap) {
+                        pool_ptr->capacity = static_cast<uint32_t>(needed);
+                    } else {
+                        return ACPHAL_E_OUTOFMEMORY;
+                    }
+                }
+            } else {
+                return ACPHAL_E_OUTOFMEMORY;
+            }
         }
+        ApuHeapPool& pool = *pool_ptr;
 
         APU_ADDRESS apu_addr = APU_INVALID_ADDRESS;
         if (!pool.AllocateApuRange(apu_span, apu_align, &apu_addr)) {
@@ -1164,9 +1190,13 @@ int32_t OPENSCARLETT_ACPHAL_CALL ApuCheckAddressRangeDisjoint(
 int32_t OPENSCARLETT_ACPHAL_CALL ApuCreateHeap(
     uint32_t cachedSizeInBytes,
     uint32_t nonCachedSizeInBytes) {
-    return RecordHr(
-        "ApuCreateHeap",
-        ApuHeapManager::Instance().CreateHeap(cachedSizeInBytes, nonCachedSizeInBytes));
+    const int32_t hr = ApuHeapManager::Instance().CreateHeap(cachedSizeInBytes, nonCachedSizeInBytes);
+    if (hr < 0) {
+        std::fprintf(stderr, "[OpenScarlett][AcpHal] ApuCreateHeap(cached=0x%X, nonCached=0x%X) -> 0x%08X\n",
+                     cachedSizeInBytes, nonCachedSizeInBytes, static_cast<unsigned>(hr));
+        std::fflush(stderr);
+    }
+    return RecordHr("ApuCreateHeap", hr);
 }
 
 int32_t OPENSCARLETT_ACPHAL_CALL ApuAlloc(

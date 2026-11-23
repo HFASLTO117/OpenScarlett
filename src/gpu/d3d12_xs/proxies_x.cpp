@@ -495,7 +495,13 @@ HRESULT STDMETHODCALLTYPE ResourceXProxy::ReadFromSubresource(
 HRESULT STDMETHODCALLTYPE ResourceXProxy::GetHeapProperties(
     D3D12_HEAP_PROPERTIES* pHeapProperties, D3D12_HEAP_FLAGS* pHeapFlags) {
     if (host_res_) {
-        return host_res_->GetHeapProperties(pHeapProperties, pHeapFlags);
+        const HRESULT hr = host_res_->GetHeapProperties(pHeapProperties, pHeapFlags);
+        if (SUCCEEDED(hr) && l0_spilled_from_default_ && pHeapProperties) {
+            pHeapProperties->Type = D3D12_HEAP_TYPE_DEFAULT;
+            pHeapProperties->CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+            pHeapProperties->MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+        }
+        return hr;
     }
     if (!has_cached_heap_props_) return E_FAIL;
     if (pHeapProperties) *pHeapProperties = cached_heap_props_;

@@ -158,8 +158,22 @@ int32_t ValidateAndClassifyDestination(
             if (fn_query(dst_ptr, &phys_id, &map_size, &flags) != 0) {
                 out_class.is_physical_page = true;
                 out_class.physical_id = phys_id;
-                out_class.physical_mapping_size = map_size;
-                if (map_size > 0u && dst_cap > map_size) {
+                uint64_t covered = map_size;
+                // Walk adjacent scatter-mapped physical pages (e.g. TileHeap mapped
+                // 64 KiB at a time via XMemMapPhysicalPagesScatter).
+                while (covered > 0u && covered < dst_cap) {
+                    uint64_t next_phys = 0u;
+                    uint64_t next_size = 0u;
+                    uint32_t next_flags = 0u;
+                    void* next_ptr = static_cast<uint8_t*>(dst_ptr) + covered;
+                    if (fn_query(next_ptr, &next_phys, &next_size, &next_flags) == 0 ||
+                        next_size == 0u) {
+                        break;
+                    }
+                    covered += next_size;
+                }
+                out_class.physical_mapping_size = covered;
+                if (covered > 0u && dst_cap > covered) {
                     return OS_DSTORAGE_E_REQUEST_TOO_LARGE;
                 }
             }
@@ -788,8 +802,8 @@ size_t PriorityToBucket(DSTORAGE_PRIORITY p) noexcept {
 // ===========================================================================
 struct IocpReadOp {
     OVERLAPPED ov{};
-    std::mutex mutex;
-    std::condition_variable cv;
+    SRWLOCK lock = SRWLOCK_INIT;
+    CONDITION_VARIABLE cv = CONDITION_VARIABLE_INIT;
     bool completed = false;
     DWORD bytes_transferred = 0u;
     DWORD error_code = ERROR_SUCCESS;
@@ -901,15 +915,14 @@ private:
             }
             auto* op = reinterpret_cast<IocpReadOp*>(ov);
             const DWORD err = ok ? ERROR_SUCCESS : GetLastError();
-            {
-                std::lock_guard<std::mutex> lk(op->mutex);
-                op->bytes_transferred = bytes;
-                op->error_code = err;
-                op->completed = true;
-                // Notify while holding op->mutex so ReadAt() cannot observe completed==true and
-                // destroy the stack-allocated IocpReadOp before notify_one() returns!
-                op->cv.notify_one();
-            }
+            AcquireSRWLockExclusive(&op->lock);
+            op->bytes_transferred = bytes;
+            op->error_code = err;
+            op->completed = true;
+            // Notify while holding op->lock so ReadAt() cannot observe completed==true and
+            // destroy the stack-allocated IocpReadOp before WakeConditionVariable() returns!
+            WakeConditionVariable(&op->cv);
+            ReleaseSRWLockExclusive(&op->lock);
         }
     }
 
@@ -1070,14 +1083,15 @@ public:
             // Note: On a handle associated with an IOCP (without FILE_SKIP_COMPLETION_PORT_ON_SUCCESS),
             // Windows ALWAYS queues a completion packet even when ReadFile returns TRUE synchronously.
             if (iocp_attached_) {
-                std::unique_lock<std::mutex> olk(op.mutex);
+                AcquireSRWLockExclusive(&op.lock);
                 while (!op.completed) {
                     if (closing_.load(std::memory_order_acquire) ||
                         (cancel_flag && cancel_flag->load(std::memory_order_acquire))) {
                         CancelIoEx(file_handle_, &op.ov);
                     }
-                    op.cv.wait_for(olk, std::chrono::milliseconds(5), [&]() { return op.completed; });
+                    SleepConditionVariableSRW(&op.cv, &op.lock, 5u, 0u);
                 }
+                ReleaseSRWLockExclusive(&op.lock);
                 if (op.error_code == ERROR_OPERATION_ABORTED) {
                     out.clear();
                     return closing_.load(std::memory_order_acquire)
@@ -3407,7 +3421,8 @@ public:
             *ppvObject = static_cast<IDStorageQueueX1*>(this);
             return RecordHr("IDStorageQueueX::QueryInterface", OS_DSTORAGE_S_OK, 0);
         }
-        if (GuidEquals(riid, IID_IDStorageQueueX2)) {
+        if (GuidEquals(riid, IID_IDStorageQueueX2) ||
+            GuidEquals(riid, IID_IDStorageQueueX2_Xbox)) {
             AddRef();
             *ppvObject = static_cast<IDStorageQueueX2*>(this);
             return RecordHr("IDStorageQueueX::QueryInterface", OS_DSTORAGE_S_OK, 0);
@@ -3699,6 +3714,7 @@ public:
             !GuidEquals(riid, IID_IDStorageQueueX_Xbox) &&
             !GuidEquals(riid, IID_IDStorageQueueX1) &&
             !GuidEquals(riid, IID_IDStorageQueueX2) &&
+            !GuidEquals(riid, IID_IDStorageQueueX2_Xbox) &&
             !GuidEquals(riid, IID_OS_DStorage_IUnknown)) {
             return RecordHr("IDStorageFactoryX::CreateQueue", OS_DSTORAGE_E_NOINTERFACE, 3);
         }
@@ -3823,8 +3839,7 @@ public:
         // Detect non-pointer integer arguments (e.g. 0x02000000 = 32 MiB) safely via VirtualQuery.
         MEMORY_BASIC_INFORMATION mbi{};
         const uintptr_t raw = reinterpret_cast<uintptr_t>(stats);
-        if (raw < 0x100000000ull ||
-            VirtualQuery(stats, &mbi, sizeof(mbi)) == 0u ||
+        if (VirtualQuery(stats, &mbi, sizeof(mbi)) == 0u ||
             mbi.State != MEM_COMMIT ||
             (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE)) == 0u) {
             const uint32_t sz = static_cast<uint32_t>(raw & 0xFFFFFFFFull);
@@ -3867,6 +3882,7 @@ public:
             !GuidEquals(riid, IID_IDStorageQueueX_Xbox) &&
             !GuidEquals(riid, IID_IDStorageQueueX1) &&
             !GuidEquals(riid, IID_IDStorageQueueX2) &&
+            !GuidEquals(riid, IID_IDStorageQueueX2_Xbox) &&
             !GuidEquals(riid, IID_OS_DStorage_IUnknown)) {
             return RecordHr("IDStorageFactoryX2::CreateQueue1", OS_DSTORAGE_E_NOINTERFACE, 10);
         }

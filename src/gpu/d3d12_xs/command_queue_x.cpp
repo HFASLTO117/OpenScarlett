@@ -1357,11 +1357,116 @@ HWND CommandQueueX::ResolveTargetOutputWindowLocked(
             }
             return discovered;
         }
+        // Retail Xbox Series X|S titles never call Win32 CreateWindowExW; they present
+        // directly to the console display via PresentX. Auto-create a live 1280x720 Win32
+        // output window on a dedicated message-pump thread when running interactively.
+        if (device_x_ && device_x_->IsRetailScarlettAbi()) {
+            static std::once_flag s_auto_win_once;
+            static HWND s_auto_hwnd = nullptr;
+            std::call_once(s_auto_win_once, []() {
+                HANDLE ready_ev = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+                if (!ready_ev) return;
+                std::thread([ready_ev]() {
+                    constexpr const wchar_t* kClassName = L"OpenScarlettRetailDisplayClass";
+                    WNDCLASSEXW wc{};
+                    wc.cbSize = sizeof(wc);
+                    wc.style = CS_HREDRAW | CS_VREDRAW;
+                    wc.lpfnWndProc = [](HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) -> LRESULT {
+                        if (msg == WM_CLOSE) {
+                            ::DestroyWindow(hwnd);
+                            return 0;
+                        }
+                        if (msg == WM_DESTROY) {
+                            ::PostQuitMessage(0);
+                            return 0;
+                        }
+                        return ::DefWindowProcW(hwnd, msg, wp, lp);
+                    };
+                    wc.hInstance = ::GetModuleHandleW(nullptr);
+                    wc.hCursor = ::LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
+                    wc.hbrBackground = static_cast<HBRUSH>(::GetStockObject(BLACK_BRUSH));
+                    wc.lpszClassName = kClassName;
+                    ::RegisterClassExW(&wc);
+
+                    RECT r{0, 0, 1280, 720};
+                    ::AdjustWindowRectEx(&r, WS_OVERLAPPEDWINDOW, FALSE, 0);
+                    HWND hw = ::CreateWindowExW(
+                        0, kClassName, L"OpenScarlett - Xbox Series X|S",
+                        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+                        CW_USEDEFAULT, CW_USEDEFAULT,
+                        r.right - r.left, r.bottom - r.top,
+                        nullptr, nullptr, wc.hInstance, nullptr);
+                    s_auto_hwnd = hw;
+                    if (hw) {
+                        ::ShowWindow(hw, SW_SHOW);
+                        ::UpdateWindow(hw);
+                    }
+                    ::SetEvent(ready_ev);
+                    if (!hw) return;
+                    MSG m{};
+                    while (::GetMessageW(&m, nullptr, 0, 0) > 0) {
+                        ::TranslateMessage(&m);
+                        ::DispatchMessageW(&m);
+                    }
+                }).detach();
+                ::WaitForSingleObject(ready_ev, 3000u);
+                ::CloseHandle(ready_ev);
+            });
+            if (s_auto_hwnd && ::IsWindow(s_auto_hwnd) != FALSE) {
+                attached_hwnd_ = s_auto_hwnd;
+                device_x_->AdoptTitleWindow(s_auto_hwnd);
+                return s_auto_hwnd;
+            }
+        }
     }
     return nullptr;
 }
 
+void CommandQueueX::PumpPendingRetirementsLocked() noexcept {
+    if (!retire_fence_ || pending_retirements_.empty()) return;
+    const uint64_t completed = retire_fence_->GetCompletedValue();
+    if (completed == UINT64_MAX) return;
+    size_t erase_n = 0u;
+    while (erase_n < pending_retirements_.size() &&
+           pending_retirements_[erase_n].first <= completed) {
+        for (ID3D12Resource* r : pending_retirements_[erase_n].second) {
+            if (r) r->Release();
+        }
+        ++erase_n;
+    }
+    if (erase_n > 0u) {
+        pending_retirements_.erase(
+            pending_retirements_.begin(),
+            pending_retirements_.begin() + static_cast<ptrdiff_t>(erase_n));
+    }
+}
+
 CommandQueueX::~CommandQueueX() {
+    {
+        std::lock_guard<std::mutex> rlk(retire_mutex_);
+        if (retire_fence_ && !pending_retirements_.empty()) {
+            const uint64_t target = pending_retirements_.back().first;
+            if (retire_fence_->GetCompletedValue() < target) {
+                HANDLE ev = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                if (ev) {
+                    if (SUCCEEDED(retire_fence_->SetEventOnCompletion(target, ev))) {
+                        ::WaitForSingleObject(ev, 2000u);
+                    }
+                    ::CloseHandle(ev);
+                }
+            }
+        }
+        for (auto& batch : pending_retirements_) {
+            for (ID3D12Resource* r : batch.second) {
+                if (r) r->Release();
+            }
+        }
+        pending_retirements_.clear();
+        if (retire_fence_) {
+            retire_fence_->Release();
+            retire_fence_ = nullptr;
+        }
+    }
     {
         auto& reg = GetQueueRegistry();
         std::unique_lock<std::shared_mutex> lock(reg.mutex);
@@ -1590,6 +1695,7 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
     std::vector<uint64_t> pending_writeback_vas;
     std::vector<DeferredCpuWrite32> deferred_writes;
     std::vector<DeferredCpuWait> deferred_waits;
+    std::vector<ID3D12Resource*> batch_transients;
     UINT valid_list_count = 0u;
     std::vector<CommandListX::DeferredStateTransition> deferred_state_transitions;
     for (UINT i = 0; i < NumCommandLists; ++i) {
@@ -1600,6 +1706,7 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
             clx->ExtractPendingMirrorWritebacks(pending_writeback_vas);
             clx->ExtractDeferredCpuOps(deferred_writes, deferred_waits);
             clx->ExtractDeferredStateTransitions(deferred_state_transitions);
+            clx->ExtractTransientResources(batch_transients);
         }
         raw_lists[valid_list_count++] = CommandListX::UnwrapHostList(ppCommandLists[i]);
     }
@@ -1620,6 +1727,31 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
 
     if (valid_list_count > 0u) {
         host_queue_->ExecuteCommandLists(valid_list_count, raw_lists);
+    }
+    if (!batch_transients.empty() || !pending_retirements_.empty()) {
+        std::lock_guard<std::mutex> rlk(retire_mutex_);
+        if (!batch_transients.empty() && device_x_ && device_x_->HostDevice()) {
+            if (!retire_fence_) {
+                (void)device_x_->HostDevice()->CreateFence(
+                    0ull, D3D12_FENCE_FLAG_NONE, OS_D3D12_IID(ID3D12Fence),
+                    reinterpret_cast<void**>(&retire_fence_));
+            }
+            if (retire_fence_) {
+                const uint64_t fv = ++retire_fence_val_;
+                if (SUCCEEDED(host_queue_->Signal(retire_fence_, fv))) {
+                    pending_retirements_.emplace_back(fv, std::move(batch_transients));
+                } else {
+                    for (ID3D12Resource* r : batch_transients) {
+                        if (r) r->Release();
+                    }
+                }
+            } else {
+                for (ID3D12Resource* r : batch_transients) {
+                    if (r) r->Release();
+                }
+            }
+        }
+        PumpPendingRetirementsLocked();
     }
     if (device_x_ && CommandListX::IsDiagTraceEnabled() && device_x_->HostDevice()) {
         // Flush this submission immediately so GetDeviceRemovedReason pinpoints the exact offending list.
@@ -1721,8 +1853,24 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
             }
         }
         for (const auto& wr : deferred_writes) {
-            if (IsWritableCpuVa(wr.address, sizeof(uint32_t))) {
-                *reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(wr.address)) = wr.value;
+            if (wr.is_64bit) {
+                if (IsWritableCpuVa(wr.address, sizeof(uint64_t))) {
+                    uint64_t v = wr.value;
+                    if (wr.is_timestamp) {
+                        const int64_t now = QueryQpcNow();
+                        v = (qpc_freq_ > 0)
+                                ? static_cast<uint64_t>((static_cast<double>(now) * 99750000.0) /
+                                                        static_cast<double>(qpc_freq_))
+                                : static_cast<uint64_t>(now);
+                    }
+                    ::InterlockedExchange64(
+                        reinterpret_cast<volatile LONG64*>(static_cast<uintptr_t>(wr.address)),
+                        static_cast<LONG64>(v));
+                }
+            } else if (IsWritableCpuVa(wr.address, sizeof(uint32_t))) {
+                ::InterlockedExchange(
+                    reinterpret_cast<volatile LONG*>(static_cast<uintptr_t>(wr.address)),
+                    static_cast<LONG>(static_cast<uint32_t>(wr.value)));
             }
         }
     }
@@ -2262,6 +2410,15 @@ void STDMETHODCALLTYPE CommandQueueX::EndEvent() {
 
 HRESULT STDMETHODCALLTYPE CommandQueueX::Signal(ID3D12Fence* pFence, UINT64 Value) {
     const HRESULT hr = host_queue_->Signal(UnwrapFence(pFence), Value);
+    if (SUCCEEDED(hr) && pFence && IsKnownProxyPointer(pFence)) {
+        IOpenScarlettProxyInspect* insp = nullptr;
+        if (SUCCEEDED(pFence->QueryInterface(IID_IOpenScarlettProxyInspect, reinterpret_cast<void**>(&insp))) && insp) {
+            if (insp->GetProxyKind() == D3D12XProxyKind::Fence) {
+                static_cast<FenceXProxy*>(pFence)->NotifyGpuSignal(Value);
+            }
+            insp->Release();
+        }
+    }
     if (device_x_ && device_x_->HasMirroredTitleVaRegions()) {
         std::lock_guard<std::mutex> lock(present_mutex_);
         PumpMirrorReadbackCompletionLocked();

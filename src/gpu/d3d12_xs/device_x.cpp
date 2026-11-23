@@ -3382,6 +3382,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateGraphicsPipelineState(
          IsXboxXdatDxbcBlob(lifted_desc.DS.pShaderBytecode, lifted_desc.DS.BytecodeLength) ||
          IsXboxXdatDxbcBlob(lifted_desc.HS.pShaderBytecode, lifted_desc.HS.BytecodeLength) ||
          IsXboxXdatDxbcBlob(lifted_desc.GS.pShaderBytecode, lifted_desc.GS.BytecodeLength));
+    bool used_standin_pso = false;
     if (!gfx_has_xdat) {
         hr = host_dev_->CreateGraphicsPipelineState(
             &lifted_desc, OS_D3D12_IID(ID3D12PipelineState), reinterpret_cast<void**>(&host_pso));
@@ -3415,6 +3416,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateGraphicsPipelineState(
             hr = host_dev_->CreateGraphicsPipelineState(
                 &safe, OS_D3D12_IID(ID3D12PipelineState), reinterpret_cast<void**>(&host_pso));
             if (SUCCEEDED(hr) && host_pso) {
+                used_standin_pso = true;
                 RecordDev("ID3D12DeviceX::XdatShaderStandinPso", 10, S_OK);
             }
         }
@@ -3428,6 +3430,9 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateGraphicsPipelineState(
     if (!proxy) {
         RecordDev("ID3D12DeviceX::CreateGraphicsPipelineState", 10, E_OUTOFMEMORY);
         return E_OUTOFMEMORY;
+    }
+    if (used_standin_pso || (retail_scarlett_abi_ && gfx_has_xdat)) {
+        proxy->SetStandinPso(true);
     }
     if (vulkan_routing_active_ && (lift_vs || lift_ps)) {
         VulkanPipelineInfo vk_pi{};
@@ -3565,6 +3570,9 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateComputePipelineState(
     if (!proxy) {
         RecordDev("ID3D12DeviceX::CreateComputePipelineState", 11, E_OUTOFMEMORY);
         return E_OUTOFMEMORY;
+    }
+    if (cs_is_xdat) {
+        proxy->SetStandinPso(true);
     }
     if (vulkan_routing_active_ && cs_is_xbox) {
         VulkanPipelineInfo vk_pi{};
@@ -3991,6 +3999,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateRootSignature(
         // Final fallback for retail Scarlett on non-DXR/SM6.5 desktop GPUs (e.g. DXR local root
         // signatures or Xbox-only root signature blobs): create a valid empty root signature so
         // non-fatal subsystem init (like InitRayTracing on GTX 1650 Ti) can proceed cleanly.
+        bool used_empty_fallback = false;
         if ((FAILED(hr) || !host_rs) && retail_scarlett_abi_ && fn_ser) {
             D3D12_VERSIONED_ROOT_SIGNATURE_DESC empty_desc{};
             empty_desc.Version = D3D_ROOT_SIGNATURE_VERSION_1_0;
@@ -4001,10 +4010,30 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateRootSignature(
                 hr = host_dev_->CreateRootSignature(
                     0u, empty_blob->GetBufferPointer(), empty_blob->GetBufferSize(),
                     OS_D3D12_IID(ID3D12RootSignature), reinterpret_cast<void**>(&host_rs));
+                if (SUCCEEDED(hr) && host_rs) {
+                    used_empty_fallback = true;
+                }
                 empty_blob->Release();
             }
             if (err_blob) err_blob->Release();
         }
+        if (FAILED(hr) || !host_rs) {
+            RecordDev("ID3D12DeviceX::CreateRootSignature", 16, hr);
+            return hr;
+        }
+        auto* proxy = new (std::nothrow) RootSignatureXProxy(this, host_rs);
+        host_rs->Release();
+        if (!proxy) {
+            RecordDev("ID3D12DeviceX::CreateRootSignature", 16, E_OUTOFMEMORY);
+            return E_OUTOFMEMORY;
+        }
+        if (used_empty_fallback) {
+            proxy->SetEmptyFallback(true);
+        }
+        hr = proxy->QueryInterface(riid, ppvRootSignature);
+        proxy->Release();
+        RecordDev("ID3D12DeviceX::CreateRootSignature", 16, hr);
+        return hr;
     }
     if (FAILED(hr) || !host_rs) {
         RecordDev("ID3D12DeviceX::CreateRootSignature", 16, hr);
@@ -4213,7 +4242,20 @@ void STDMETHODCALLTYPE DeviceX::CreateRenderTargetView(
         rw_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         desc_ptr = &rw_desc;
     }
-    host_dev_->CreateRenderTargetView(host_res, desc_ptr, DestDescriptor);
+    const bool valid_rtv =
+        host_res != nullptr &&
+        (host_res->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0;
+    if (!retail_scarlett_abi_ || valid_rtv) {
+        host_dev_->CreateRenderTargetView(host_res, desc_ptr, DestDescriptor);
+    }
+    if (retail_scarlett_abi_) {
+        std::lock_guard<std::mutex> lk(valid_view_mutex_);
+        if (valid_rtv) {
+            valid_rtv_handles_[DestDescriptor.ptr] = host_res;
+        } else {
+            valid_rtv_handles_.erase(DestDescriptor.ptr);
+        }
+    }
     if (vulkan_routing_active_ && host_res) {
         std::lock_guard<std::mutex> lock(vk_state_mutex_);
         vk_rtv_map_[DestDescriptor.ptr] = host_res;
@@ -4258,7 +4300,20 @@ void STDMETHODCALLTYPE DeviceX::CreateDepthStencilView(
             (clean_dsv.Flags & (D3D12_DSV_FLAG_READ_ONLY_DEPTH | D3D12_DSV_FLAG_READ_ONLY_STENCIL)) != 0;
         dsv_ptr = &clean_dsv;
     }
-    host_dev_->CreateDepthStencilView(host_res, dsv_ptr, DestDescriptor);
+    const bool valid_dsv =
+        host_res != nullptr &&
+        (host_res->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0;
+    if (!retail_scarlett_abi_ || valid_dsv) {
+        host_dev_->CreateDepthStencilView(host_res, dsv_ptr, DestDescriptor);
+    }
+    if (retail_scarlett_abi_) {
+        std::lock_guard<std::mutex> lk(valid_view_mutex_);
+        if (valid_dsv) {
+            valid_dsv_handles_.insert(DestDescriptor.ptr);
+        } else {
+            valid_dsv_handles_.erase(DestDescriptor.ptr);
+        }
+    }
     if (is_readonly_dsv) {
         readonly_dsv_creations_.fetch_add(1ull, std::memory_order_relaxed);
         RecordDev("ID3D12DeviceX::CreateDepthStencilView[ReadOnly]", 21, S_OK);
@@ -6327,6 +6382,9 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePipelineState(
     if (!proxy) {
         RecordDev("ID3D12DeviceX::CreatePipelineState", 47, E_OUTOFMEMORY);
         return E_OUTOFMEMORY;
+    }
+    if (retail_scarlett_abi_ && (stream_has_xdat || has_xbox_shader)) {
+        proxy->SetStandinPso(true);
     }
     if (vulkan_routing_active_ && has_xbox_shader) {
         VulkanPipelineInfo vk_pi = std::move(spirv_stream_pi);
@@ -8446,10 +8504,21 @@ HRESULT STDMETHODCALLTYPE DeviceX::FlushDirtyUnifiedTextures(
         std::lock_guard<std::mutex> lock(unified_mutex_);
         for (auto& [res, m] : unified_textures_) {
             if (!m.dirty || !m.cpu_readable || !m.resource || m.mirrored_by_title_va) continue;
+            const D3D12_RESOURCE_DESC rdesc = m.resource->GetDesc();
+            // Never CPU->GPU copy onto RenderTarget, DepthStencil, MSAA, or Reserved/Tiled textures.
+            if (rdesc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+                ((rdesc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                 D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) != 0 ||
+                 rdesc.SampleDesc.Count > 1u ||
+                 rdesc.Layout == D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE)) {
+                m.dirty = false;
+                dirty_unified_count_.fetch_sub(1u, std::memory_order_acq_rel);
+                continue;
+            }
             PendingUpload item{};
             item.mapping = m;
             item.mapping.resource->AddRef();
-            item.res_desc = m.resource->GetDesc();
+            item.res_desc = rdesc;
             D3D12_HEAP_PROPERTIES hp{};
             D3D12_HEAP_FLAGS hf = D3D12_HEAP_FLAG_NONE;
             if (SUCCEEDED(m.resource->GetHeapProperties(&hp, &hf))) {
@@ -8496,6 +8565,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::FlushDirtyUnifiedTextures(
             item.num_rows.resize(slices, 0u);
             item.row_sizes.resize(slices, 0ull);
             uint64_t total_copy = 0ull;
+            bool footprint_ok = true;
             for (uint32_t s = 0u; s < slices; ++s) {
                 staging_cursor = AlignUp64(staging_cursor, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
                 UINT64 sub_total = 0ull;
@@ -8503,10 +8573,19 @@ HRESULT STDMETHODCALLTYPE DeviceX::FlushDirtyUnifiedTextures(
                 host_dev_->GetCopyableFootprints(
                     &item.res_desc, sub_idx, 1u, staging_cursor,
                     &item.footprints[s], &item.num_rows[s], &item.row_sizes[s], &sub_total);
+                if (sub_total == 0ull || sub_total == UINT64_MAX ||
+                    item.num_rows[s] == 0u || item.num_rows[s] == UINT_MAX ||
+                    item.row_sizes[s] == 0ull || item.row_sizes[s] == UINT64_MAX) {
+                    footprint_ok = false;
+                    break;
+                }
                 staging_cursor += sub_total;
                 total_copy += item.row_sizes[s] * static_cast<uint64_t>(item.num_rows[s]);
             }
-            item.copy_bytes = total_copy;
+            item.copy_bytes = footprint_ok ? total_copy : 0ull;
+            if (!footprint_ok) {
+                item.footprints.clear();
+            }
         }
     }
 

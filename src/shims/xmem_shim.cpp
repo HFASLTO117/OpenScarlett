@@ -12,8 +12,10 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <unordered_set>
 
 #if defined(_MSC_VER)
 // Export standard unprefixed Xbox xmem.dll symbols pointing to our thin
@@ -60,6 +62,11 @@ struct XMemHookTable {
     std::atomic<XMemAllocHookFn> alloc_hook{nullptr};
     std::atomic<XMemFreeHookFn> free_hook{nullptr};
     std::atomic<XMemSizeHookFn> size_hook{nullptr};
+    bool auto_bound_exe_hooks = false;
+#if defined(_WIN32)
+    SRWLOCK fallback_lock = SRWLOCK_INIT;
+#endif
+    std::unordered_set<void*> fallback_ptrs;
 };
 
 XMemHookTable& GetHookTable() {
@@ -77,6 +84,7 @@ XMemHookTable& GetHookTable() {
             if (tbl && tbl[0] >= 0x10000ull && tbl[1] >= 0x10000ull) {
                 h->alloc_hook.store(reinterpret_cast<XMemAllocHookFn>(tbl[0]), std::memory_order_release);
                 h->free_hook.store(reinterpret_cast<XMemFreeHookFn>(tbl[1]), std::memory_order_release);
+                h->auto_bound_exe_hooks = true;
             }
         }
 #endif
@@ -139,9 +147,29 @@ int32_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemCheckDefaultHeaps(void) {
 }
 
 void* OPENSCARLETT_KERNELX_CALL XMemShim_XMemAlloc(size_t dwSize, uint64_t dwAllocAttributes) {
-    const auto hook = GetHookTable().alloc_hook.load(std::memory_order_acquire);
+    auto& hooks = GetHookTable();
+    const auto hook = hooks.alloc_hook.load(std::memory_order_acquire);
     void* ptr = hook ? hook(dwSize, dwAllocAttributes)
                      : ::XMemAlloc(dwSize, dwAllocAttributes);
+    if (!ptr && hook && hooks.auto_bound_exe_hooks && dwSize > 0u) {
+        // Retail __XMemAllocationHooks__ may reject non-D3D or uninitialized allocator IDs
+        // (e.g. 0xF0814000 Chad/APU audio heap or attrs=0). Fall back to XMemAllocDefault
+        // and track the pointer so XMemFree dispatches to XMemFreeDefault.
+        ptr = ::XMemAllocDefault(dwSize, dwAllocAttributes);
+        if (ptr) {
+#if defined(_WIN32)
+            ::AcquireSRWLockExclusive(&hooks.fallback_lock);
+            hooks.fallback_ptrs.insert(ptr);
+            ::ReleaseSRWLockExclusive(&hooks.fallback_lock);
+#else
+            hooks.fallback_ptrs.insert(ptr);
+#endif
+            std::fprintf(stderr,
+                         "[OpenScarlett][xmem] XMemAlloc hook returned NULL (size=0x%zX attrs=0x%llX) -> fallback %p\n",
+                         dwSize, static_cast<unsigned long long>(dwAllocAttributes), ptr);
+            std::fflush(stderr);
+        }
+    }
     RecordOutcome("XMemAlloc", ptr != nullptr);
     return ptr;
 }
@@ -160,7 +188,25 @@ void* OPENSCARLETT_KERNELX_CALL XMemShim_XMemAllocAligned(
 }
 
 void OPENSCARLETT_KERNELX_CALL XMemShim_XMemFree(void* pAddress, uint64_t dwAllocAttributes) {
-    const auto hook = GetHookTable().free_hook.load(std::memory_order_acquire);
+    auto& hooks = GetHookTable();
+    if (pAddress && hooks.auto_bound_exe_hooks) {
+        bool was_fallback = false;
+#if defined(_WIN32)
+        ::AcquireSRWLockExclusive(&hooks.fallback_lock);
+        auto it = hooks.fallback_ptrs.find(pAddress);
+        if (it != hooks.fallback_ptrs.end()) {
+            hooks.fallback_ptrs.erase(it);
+            was_fallback = true;
+        }
+        ::ReleaseSRWLockExclusive(&hooks.fallback_lock);
+#endif
+        if (was_fallback) {
+            ::XMemFreeDefault(pAddress, dwAllocAttributes);
+            RecordOutcome("XMemFree", true);
+            return;
+        }
+    }
+    const auto hook = hooks.free_hook.load(std::memory_order_acquire);
     if (!pAddress && !hook) {
 #if defined(_WIN32)
         SetLastError(0u);
@@ -420,6 +466,10 @@ int32_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemMapPhysicalPagesScatter(
             break;
         }
         if (tokens != nullptr) {
+            if (tokens[i] == 0ull || tokens[i] == ~0ull || tokens[i] == 0xFFFFFFFFull) {
+                (void)::XMemUnmapPhysicalPages(va, 1u);
+                continue;
+            }
             void* mapped = ::XMemMapPhysicalPages(
                 va,
                 1u,
@@ -427,6 +477,27 @@ int32_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemMapPhysicalPagesScatter(
                 0x04u /*PAGE_READWRITE*/,
                 &tokens[i]);
             if (!mapped) {
+                // On Xbox Scarlett, scatter mapping onto an already-mapped tile VA replaces it.
+                (void)::XMemUnmapPhysicalPages(va, 1u);
+                mapped = ::XMemMapPhysicalPages(
+                    va,
+                    1u,
+                    0x10000000u /*MEM_GRAPHICS*/,
+                    0x04u /*PAGE_READWRITE*/,
+                    &tokens[i]);
+            }
+            if (!mapped) {
+#if defined(_WIN32)
+                const DWORD err = ::GetLastError();
+                std::fprintf(stderr,
+                             "[OpenScarlett][xmem] XMemMapPhysicalPagesScatter FAIL i=%llu/%llu va=%p tok=0x%llX err=%lu\n",
+                             static_cast<unsigned long long>(i),
+                             static_cast<unsigned long long>(count),
+                             va,
+                             static_cast<unsigned long long>(tokens[i]),
+                             static_cast<unsigned long>(err));
+                std::fflush(stderr);
+#endif
                 for (uint64_t j = 0u; j < i; ++j) {
                     (void)::XMemUnmapPhysicalPages(addresses[j], 1u);
                 }
