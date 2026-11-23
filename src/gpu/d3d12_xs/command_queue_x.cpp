@@ -1383,6 +1383,21 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
     }
 
     host_queue_->ExecuteCommandLists(NumCommandLists, raw_lists);
+    if (device_x_ && EnvFlagTrueA("OPENSCARLETT_TRACE_D3D12_ERRORS")) {
+        const HRESULT rem_hr = device_x_->HostDevice() ? device_x_->HostDevice()->GetDeviceRemovedReason() : S_OK;
+        if (FAILED(rem_hr)) {
+            static std::atomic<bool> s_logged_removed{false};
+            if (!s_logged_removed.exchange(true)) {
+                char msg[256];
+                std::snprintf(msg, sizeof(msg),
+                              "[d3d12_xs] DEVICE REMOVED right after ExecuteCommandLists(n=%u, queue_type=%d): hr=0x%08X\n",
+                              NumCommandLists, static_cast<int>(queue_type_), static_cast<unsigned>(rem_hr));
+                ::OutputDebugStringA(msg);
+                std::fprintf(stderr, "%s", msg);
+                std::fflush(stderr);
+            }
+        }
+    }
 
     // Schedule fence-tracked GPU->CPU writeback for any TitleVAMirror resources written by these lists.
     if (device_x_ && !pending_writeback_vas.empty() &&

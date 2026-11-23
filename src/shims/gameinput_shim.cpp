@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -372,16 +373,39 @@ void PollGamepadAndKeyboard(
     const XInputApi& xi = GetXInput();
     if (xi.get_state) {
         OsXInputState st{};
-        if (xi.get_state(preferred_slot, &st) == ERROR_SUCCESS) {
+        DWORD last_rc = xi.get_state(preferred_slot, &st);
+        if (last_rc == ERROR_SUCCESS) {
             physical_pad_found = true;
             out_active_slot = preferred_slot;
         } else {
             for (DWORD slot = 0; slot < 4; ++slot) {
-                if (xi.get_state(slot, &st) == ERROR_SUCCESS) {
+                DWORD rc = xi.get_state(slot, &st);
+                if (rc == ERROR_SUCCESS) {
                     physical_pad_found = true;
                     out_active_slot = static_cast<uint32_t>(slot);
+                    last_rc = rc;
                     break;
                 }
+            }
+        }
+        static const bool s_trace_gi = []() {
+            char buf[8]{};
+            return ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_GAMEINPUT", buf, sizeof(buf)) > 0 && buf[0] == '1';
+        }();
+        if (s_trace_gi) {
+            static std::atomic<uint32_t> s_prev_state{0xFFFFFFFFu};
+            const uint32_t packed = (physical_pad_found ? 0x80000000u : 0u) |
+                                    ((out_active_slot & 0xFu) << 16) |
+                                    (physical_pad_found ? static_cast<uint32_t>(st.Gamepad.wButtons) : (last_rc & 0xFFFFu));
+            if (s_prev_state.exchange(packed, std::memory_order_relaxed) != packed) {
+                char msg[200];
+                std::snprintf(msg, sizeof(msg),
+                              "[GameInput] XInput found=%d slot=%u rc=%lu pkt=%u btn=0x%04X lx=%d ly=%d\n",
+                              physical_pad_found ? 1 : 0, out_active_slot, static_cast<unsigned long>(last_rc),
+                              st.dwPacketNumber, physical_pad_found ? st.Gamepad.wButtons : 0u,
+                              physical_pad_found ? static_cast<int>(st.Gamepad.sThumbLX) : 0,
+                              physical_pad_found ? static_cast<int>(st.Gamepad.sThumbLY) : 0);
+                ::OutputDebugStringA(msg);
             }
         }
         if (physical_pad_found) {

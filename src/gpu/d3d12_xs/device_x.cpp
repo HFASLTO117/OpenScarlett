@@ -8381,11 +8381,16 @@ void DeviceX::PrepareResidencyBudgetForAllocation(
     const uint64_t budget = EffectiveResidencyBudgetBytesLocked();
     if (budget == 0ull) return;
 
-    if (tracked_resident_bytes_ + requested_bytes > budget) {
+    // Only auto-evict live tracked objects via host ID3D12Device::Evict when an explicit
+    // synthetic residency budget override is active (unit tests). In real gameplay, calling
+    // Evict() on older resident resources/heaps without per-command-list MakeResident() causes
+    // WDDM/GPU page faults -> DXGI_ERROR_INVALID_CALL / DXGI_ERROR_DEVICE_REMOVED; WDDM
+    // already safely pages over-budget DEFAULT allocations and L0 spill keeps new cold buffers resident.
+    if (residency_budget_override_bytes_ > 0ull && tracked_resident_bytes_ + requested_bytes > budget) {
         const uint64_t over = (tracked_resident_bytes_ + requested_bytes) - budget;
         (void)EvictLruVictimsLocked(over, nullptr);
     }
-    // If still over budget after evicting eligible LRU victims, spill this cold allocation to L0 system RAM!
+    // If still over budget, spill this cold allocation to L0 system RAM (only when override or >95% full).
     if (allow_l0_spill && (tracked_resident_bytes_ + requested_bytes > budget)) {
         out_should_spill_l0 = true;
     }
