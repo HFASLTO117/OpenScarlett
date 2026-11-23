@@ -62,18 +62,36 @@ extern "C" {
 #endif
 
 OPENSCARLETT_XAPU_API int32_t OPENSCARLETT_XAPU_CALL XApuConnect(
-    XAPU_CONNECTION_HANDLE* outConnection);
+    void* arg1,
+    void* arg2
+#ifdef __cplusplus
+    = nullptr
+#endif
+    ,
+    void* arg3
+#ifdef __cplusplus
+    = nullptr
+#endif
+);
 
 OPENSCARLETT_XAPU_API int32_t OPENSCARLETT_XAPU_CALL XApuEnqueueCommand(
     XAPU_CONNECTION_HANDLE connection,
     const void* command,
-    uint32_t commandSize);
+    uint32_t commandSizeOrFlags);
 
 OPENSCARLETT_XAPU_API int32_t OPENSCARLETT_XAPU_CALL XApuDequeueResult(
     XAPU_CONNECTION_HANDLE connection,
     void* resultBuffer,
-    uint32_t resultBufferSize,
-    uint32_t* outResultSize);
+    uint32_t resultBufferSize
+#ifdef __cplusplus
+    = 0u
+#endif
+    ,
+    uint32_t* outResultSize
+#ifdef __cplusplus
+    = nullptr
+#endif
+);
 
 OPENSCARLETT_XAPU_API int32_t OPENSCARLETT_XAPU_CALL XApuDisconnect(
     XAPU_CONNECTION_HANDLE connection);

@@ -7,15 +7,18 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #if defined(_WIN32)
 #  include <malloc.h>
+#  include <windows.h>
 #endif
 
 namespace {
@@ -58,6 +61,118 @@ struct AcpShapeAllocation {
     uint32_t num_eq = 0;
     uint32_t num_dma = 0;
 };
+
+// Real retail Xbox Series X|S ACP_SHAPE_CONTEXTS (0x60 bytes, verified against fmod.dll).
+struct XboxAcpShapeContexts {
+    uint32_t numSrcContexts;      // +0x00 (32 bytes each -> srcContexts)
+    uint32_t numEqCompContexts;   // +0x04 (32 bytes each -> eqCompContexts)
+    uint32_t numFiltVolContexts;  // +0x08 (32 bytes each -> filtVolContexts)
+    uint32_t numDmaContexts;      // +0x0C (16 bytes each -> dmaContexts)
+    uint32_t numXmaContexts;      // +0x10 (64 bytes each -> xmaContexts)
+    uint32_t numPcmContexts;      // +0x14 (64 bytes each -> pcmContexts)
+    void* srcContexts;            // +0x18
+    void* eqCompContexts;         // +0x20
+    void* filtVolContexts;        // +0x28
+    void* dmaContexts;            // +0x30
+    void* xmaContexts;            // +0x38
+    void* pcmContexts;            // +0x40
+    uint64_t reserved[3];         // +0x48..0x5F
+};
+static_assert(sizeof(XboxAcpShapeContexts) == 0x60, "XboxAcpShapeContexts must be 96 bytes");
+
+struct XboxAcpMessage {
+    uint32_t type = 0;       // +0x00 (0x10 = CommandCompleted, 0x80 = Disconnected)
+    uint32_t error = 0;      // +0x04 (0 = OK)
+    uint64_t reserved = 0;   // +0x08
+    uint64_t commandId = 0;  // +0x10
+    uint32_t extra = 0;      // +0x18
+};
+static_assert(sizeof(XboxAcpMessage) == 0x20 || sizeof(XboxAcpMessage) == 0x1C, "XboxAcpMessage size");
+
+// Real retail Xbox Series X|S IAcpHal vtable (does NOT inherit IUnknown;
+// verified against Xbox fmod.dll:
+//   slot 0 (+0x00): Connect(cmdQueueLen, msgQueueLen)
+//   slot 1 (+0x08): Disconnect()
+//   slot 2 (+0x10): SubmitCommand(cmdType, cmdId, flags, pData, dataFlags)
+//   slot 3 (+0x18): PopMessage(ACP_MESSAGE* outMsg) -> bool
+//   slot 4 (+0x20): RegisterEvent / GetQueueSpace
+//   slot 5 (+0x28): Release()
+class XboxRetailAcpHalImpl {
+public:
+    virtual int32_t OPENSCARLETT_ACPHAL_CALL Connect(
+        uint32_t commandQueueLength, uint32_t messageQueueLength) {
+        (void)commandQueueLength;
+        (void)messageQueueLength;
+        std::lock_guard<std::mutex> lk(mutex_);
+        connected_ = true;
+        messages_.clear();
+        return RecordHr("IAcpHal::Connect", ACPHAL_S_OK, 0);
+    }
+
+    virtual int32_t OPENSCARLETT_ACPHAL_CALL Disconnect() {
+        std::lock_guard<std::mutex> lk(mutex_);
+        connected_ = false;
+        XboxAcpMessage msg{};
+        msg.type = 0x80u;  // ACP_MESSAGE_TYPE_DISCONNECTED
+        msg.error = 0u;
+        messages_.push_back(msg);
+        return RecordHr("IAcpHal::Disconnect", ACPHAL_S_OK, 1);
+    }
+
+    virtual int32_t OPENSCARLETT_ACPHAL_CALL SubmitCommand(
+        uint32_t commandType,
+        uint64_t commandId,
+        uint32_t waitFlags,
+        const void* pCommandData,
+        uint32_t extraFlags) {
+        (void)commandType;
+        (void)waitFlags;
+        (void)pCommandData;
+        (void)extraFlags;
+        if (commandId != 0ull) {
+            std::lock_guard<std::mutex> lk(mutex_);
+            XboxAcpMessage msg{};
+            msg.type = 0x10u;  // ACP_MESSAGE_TYPE_COMMAND_COMPLETED
+            msg.error = 0u;
+            msg.commandId = commandId;
+            messages_.push_back(msg);
+        }
+        return RecordHr("IAcpHal::SubmitCommand", ACPHAL_S_OK, 2);
+    }
+
+    virtual bool OPENSCARLETT_ACPHAL_CALL PopMessage(void* pMessage) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (messages_.empty()) {
+            return false;
+        }
+        const XboxAcpMessage msg = messages_.front();
+        messages_.pop_front();
+        if (pMessage) {
+            std::memcpy(pMessage, &msg, 0x1Cu);
+        }
+        return true;
+    }
+
+    virtual uint32_t OPENSCARLETT_ACPHAL_CALL GetCommandQueueSpace() {
+        return 0x800u;
+    }
+
+    virtual uint32_t OPENSCARLETT_ACPHAL_CALL Release() {
+        RecordOk("IAcpHal::Release", 5);
+        delete this;
+        return 0u;
+    }
+
+private:
+    std::mutex mutex_;
+    bool connected_ = false;
+    std::deque<XboxAcpMessage> messages_;
+};
+
+std::atomic<bool> g_xbox_retail_acphal_mode{false};
+std::mutex g_shape_alloc_mutex;
+std::unordered_set<void*> g_synthetic_shape_allocs;
+std::vector<void*> g_xbox_shape_buffers;
 
 class AcpHalImpl final : public IAcpHal {
 public:
@@ -609,6 +724,27 @@ private:
     std::map<APU_ADDRESS, uintptr_t> by_apu_;
 };
 
+static bool IsWritableAcpPtr(void* ptr, size_t bytes) {
+    if (!ptr || reinterpret_cast<uintptr_t>(ptr) < 0x10000ull) {
+        return false;
+    }
+#if defined(_WIN32)
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (::VirtualQuery(ptr, &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT) {
+        return false;
+    }
+    const DWORD prot = mbi.Protect & 0xFFu;
+    const bool writable = (prot == PAGE_READWRITE || prot == PAGE_WRITECOPY ||
+                           prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY);
+    if (!writable) return false;
+    const uintptr_t region_end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+    return reinterpret_cast<uintptr_t>(ptr) + bytes <= region_end;
+#else
+    (void)bytes;
+    return true;
+#endif
+}
+
 }  // namespace
 
 extern "C" {
@@ -618,6 +754,14 @@ int32_t OPENSCARLETT_ACPHAL_CALL AcpHalCreate(IAcpHal** ppAcpHal) {
         return RecordHr("AcpHalCreate", ACPHAL_E_POINTER);
     }
     *ppAcpHal = nullptr;
+    if (g_xbox_retail_acphal_mode.load(std::memory_order_acquire)) {
+        auto* obj = new (std::nothrow) XboxRetailAcpHalImpl();
+        if (!obj) {
+            return RecordHr("AcpHalCreate", ACPHAL_E_OUTOFMEMORY);
+        }
+        *ppAcpHal = reinterpret_cast<IAcpHal*>(obj);
+        return RecordHr("AcpHalCreate", ACPHAL_S_OK);
+    }
     auto* obj = new (std::nothrow) AcpHalImpl();
     if (!obj) {
         return RecordHr("AcpHalCreate", ACPHAL_E_OUTOFMEMORY);
@@ -629,9 +773,53 @@ int32_t OPENSCARLETT_ACPHAL_CALL AcpHalCreate(IAcpHal** ppAcpHal) {
 int32_t OPENSCARLETT_ACPHAL_CALL AcpHalAllocateShapeContexts(
     const AcpHalShapeContexts* pRequested,
     AcpHalShapeContexts* pAllocated) {
-    if (!pRequested || !pAllocated) {
+    if (!pRequested) {
         return RecordHr("AcpHalAllocateShapeContexts", ACPHAL_E_INVALIDARG);
     }
+
+    // Detect real retail Xbox 1-arg AcpHalAllocateShapeContexts(ACP_SHAPE_CONTEXTS* pShapeContexts)
+    // vs OpenScarlett's synthetic 2-arg (pRequested, pAllocated):
+    // In synthetic tests, pAllocated is a valid writable pointer AND pRequested->internalAllocation == nullptr.
+    // In retail Xbox (fmod.dll), only 1 arg is passed (pAllocated is null or non-writable, or
+    // offset +0x10 holds numXmaContexts != 0).
+    const bool is_synthetic_2arg =
+        IsWritableAcpPtr(pAllocated, sizeof(AcpHalShapeContexts)) &&
+        (pRequested->internalAllocation == nullptr);
+
+    if (!is_synthetic_2arg) {
+        g_xbox_retail_acphal_mode.store(true, std::memory_order_release);
+        auto* xbox_ctx = reinterpret_cast<XboxAcpShapeContexts*>(
+            const_cast<AcpHalShapeContexts*>(pRequested));
+
+        std::lock_guard<std::mutex> lk(g_shape_alloc_mutex);
+        auto alloc_array = [](uint32_t count, uint32_t elem_bytes) -> void* {
+            if (count == 0u) return nullptr;
+            const uint32_t total = count * elem_bytes;
+            void* va = nullptr;
+            APU_ADDRESS pa = APU_INVALID_ADDRESS;
+            if (ApuHeapManager::Instance().Alloc(&va, &pa, total, 64u, APU_ALLOC_CACHED) == ACPHAL_S_OK && va) {
+                g_xbox_shape_buffers.push_back(va);
+                return va;
+            }
+            // Fallback to host aligned memory if APU heap is full.
+            va = AlignedAllocHost(total, 64u);
+            if (va) {
+                std::memset(va, 0, total);
+                g_xbox_shape_buffers.push_back(va);
+            }
+            return va;
+        };
+
+        xbox_ctx->srcContexts = alloc_array(xbox_ctx->numSrcContexts, 32u);
+        xbox_ctx->eqCompContexts = alloc_array(xbox_ctx->numEqCompContexts, 32u);
+        xbox_ctx->filtVolContexts = alloc_array(xbox_ctx->numFiltVolContexts, 32u);
+        xbox_ctx->dmaContexts = alloc_array(xbox_ctx->numDmaContexts, 16u);
+        xbox_ctx->xmaContexts = alloc_array(xbox_ctx->numXmaContexts, 64u);
+        xbox_ctx->pcmContexts = alloc_array(xbox_ctx->numPcmContexts, 64u);
+        return RecordHr("AcpHalAllocateShapeContexts", ACPHAL_S_OK);
+    }
+
+    g_xbox_retail_acphal_mode.store(false, std::memory_order_release);
     auto* alloc = new (std::nothrow) AcpShapeAllocation();
     if (!alloc) {
         return RecordHr("AcpHalAllocateShapeContexts", ACPHAL_E_OUTOFMEMORY);
@@ -646,10 +834,33 @@ int32_t OPENSCARLETT_ACPHAL_CALL AcpHalAllocateShapeContexts(
     pAllocated->numEqContexts = alloc->num_eq;
     pAllocated->numDmaContexts = alloc->num_dma;
     pAllocated->internalAllocation = alloc;
+    {
+        std::lock_guard<std::mutex> lk(g_shape_alloc_mutex);
+        g_synthetic_shape_allocs.insert(alloc);
+    }
     return RecordHr("AcpHalAllocateShapeContexts", ACPHAL_S_OK);
 }
 
 int32_t OPENSCARLETT_ACPHAL_CALL AcpHalReleaseShapeContexts(AcpHalShapeContexts* pAllocated) {
+    {
+        std::lock_guard<std::mutex> lk(g_shape_alloc_mutex);
+        if (IsWritableAcpPtr(pAllocated, sizeof(AcpHalShapeContexts)) &&
+            pAllocated->internalAllocation != nullptr &&
+            g_synthetic_shape_allocs.erase(pAllocated->internalAllocation) > 0) {
+            delete static_cast<AcpShapeAllocation*>(pAllocated->internalAllocation);
+            std::memset(pAllocated, 0, sizeof(*pAllocated));
+            return RecordHr("AcpHalReleaseShapeContexts", ACPHAL_S_OK);
+        }
+        if (g_xbox_retail_acphal_mode.load(std::memory_order_acquire) || !g_xbox_shape_buffers.empty()) {
+            for (void* ptr : g_xbox_shape_buffers) {
+                if (ApuHeapManager::Instance().Free(ptr) != ACPHAL_S_OK) {
+                    AlignedFreeHost(ptr);
+                }
+            }
+            g_xbox_shape_buffers.clear();
+            return RecordHr("AcpHalReleaseShapeContexts", ACPHAL_S_OK);
+        }
+    }
     if (!pAllocated) {
         return RecordHr("AcpHalReleaseShapeContexts", ACPHAL_E_INVALIDARG);
     }

@@ -300,6 +300,150 @@ void TestAcpHalApuHeap() {
     ::FreeLibrary(mod);
     std::printf("  PASS: AcpHal.dll (7/7 Apu* exports, alignment, bounds, VA<->APU mapping, heap stats).\n");
 }
+
+void TestRetailXboxAcpHalAndXApuAbi() {
+    std::printf("[3/3] Testing retail Xbox Series X AcpHal.dll + xapu.dll ABI (fmod.dll parity)...\n");
+
+    // 1. Retail Xbox 1-arg AcpHalAllocateShapeContexts + Xbox IAcpHal vtable + 0-arg ReleaseShapeContexts
+    {
+        const fs::path dll_path = GetExeDir() / L"AcpHal.dll";
+        HMODULE mod = ::LoadLibraryW(dll_path.c_str());
+        OS_REQUIRE(mod != nullptr);
+
+        struct XboxAcpShapeContexts {
+            uint32_t numSrcContexts;
+            uint32_t numEqCompContexts;
+            uint32_t numFiltVolContexts;
+            uint32_t numDmaContexts;
+            uint32_t numXmaContexts;
+            uint32_t numPcmContexts;
+            void* srcContexts;
+            void* eqCompContexts;
+            void* filtVolContexts;
+            void* dmaContexts;
+            void* xmaContexts;
+            void* pcmContexts;
+            uint64_t reserved[3];
+        };
+        static_assert(sizeof(XboxAcpShapeContexts) == 0x60, "XboxAcpShapeContexts size");
+
+        struct XboxAcpMessage {
+            uint32_t type;
+            uint32_t error;
+            uint64_t reserved;
+            uint64_t commandId;
+            uint32_t extra;
+        };
+
+        struct IRetailAcpHal {
+            virtual int32_t __stdcall Connect(uint32_t cmdLen, uint32_t msgLen) = 0;
+            virtual int32_t __stdcall Disconnect() = 0;
+            virtual int32_t __stdcall SubmitCommand(
+                uint32_t type, uint64_t cmdId, uint32_t waitFlags, const void* data, uint32_t flags) = 0;
+            virtual bool __stdcall PopMessage(void* msg) = 0;
+            virtual uint32_t __stdcall GetQueueSpace() = 0;
+            virtual uint32_t __stdcall Release() = 0;
+        };
+
+        using PfnAlloc1 = int32_t(__stdcall*)(XboxAcpShapeContexts*, void*);
+        using PfnCreate = int32_t(__stdcall*)(IRetailAcpHal**);
+        using PfnRelease0 = int32_t(__stdcall*)(void*);
+        auto p_alloc = reinterpret_cast<PfnAlloc1>(::GetProcAddress(mod, "AcpHalAllocateShapeContexts"));
+        auto p_create = reinterpret_cast<PfnCreate>(::GetProcAddress(mod, "AcpHalCreate"));
+        auto p_release = reinterpret_cast<PfnRelease0>(::GetProcAddress(mod, "AcpHalReleaseShapeContexts"));
+        OS_REQUIRE(p_alloc && p_create && p_release);
+
+        XboxAcpShapeContexts ctx{};
+        ctx.numSrcContexts = 512u;
+        ctx.numDmaContexts = 1024u;
+        ctx.numXmaContexts = 512u;
+        OS_REQUIRE(p_alloc(&ctx, nullptr) == ACPHAL_S_OK);
+        OS_REQUIRE(ctx.srcContexts != nullptr);
+        OS_REQUIRE(ctx.dmaContexts != nullptr);
+        OS_REQUIRE(ctx.xmaContexts != nullptr);
+
+        IRetailAcpHal* hal = nullptr;
+        OS_REQUIRE(p_create(&hal) == ACPHAL_S_OK && hal != nullptr);
+        OS_REQUIRE(hal->Connect(0x804u, 0x804u) == ACPHAL_S_OK);
+
+        const uint32_t ping_data = 0xFEu;
+        OS_REQUIRE(hal->SubmitCommand(2u, 42ull, 0xFFFFFFFFu, &ping_data, 0u) == ACPHAL_S_OK);
+
+        XboxAcpMessage msg{};
+        OS_REQUIRE(hal->PopMessage(&msg));
+        OS_REQUIRE(msg.type == 0x10u && msg.error == 0u && msg.commandId == 42ull);
+        OS_REQUIRE(!hal->PopMessage(&msg));
+
+        OS_REQUIRE(hal->Disconnect() == ACPHAL_S_OK);
+        std::memset(&msg, 0, sizeof(msg));
+        OS_REQUIRE(hal->PopMessage(&msg));
+        OS_REQUIRE(msg.type == 0x80u && msg.error == 0u);
+
+        hal->Release();
+        OS_REQUIRE(p_release(nullptr) == ACPHAL_S_OK);
+        ::FreeLibrary(mod);
+    }
+
+    // 2. Retail Xbox 3-arg XApuConnect + flags=0 XApuEnqueueCommand + 2-arg XApuDequeueResult
+    {
+        const fs::path dll_path = GetExeDir() / L"xapu.dll";
+        HMODULE mod = ::LoadLibraryW(dll_path.c_str());
+        OS_REQUIRE(mod != nullptr);
+
+        struct XboxConnectParams {
+            uint32_t codecType;
+            uint32_t streamCount;
+            uint32_t maxChannels;
+            uint32_t sharedBytes;
+            uint32_t extra;
+            uint32_t flags;
+        };
+        struct XboxSharedMem {
+            void* base;
+            uint64_t size;
+        };
+
+        using PfnConnect3 = int32_t(__stdcall*)(const XboxConnectParams*, XboxSharedMem*, XAPU_CONNECTION_HANDLE*);
+        using PfnEnqueue3 = int32_t(__stdcall*)(XAPU_CONNECTION_HANDLE, const void*, uint32_t);
+        using PfnDequeue2 = int32_t(__stdcall*)(XAPU_CONNECTION_HANDLE, void*);
+        using PfnDisconnect = int32_t(__stdcall*)(XAPU_CONNECTION_HANDLE);
+
+        auto p_connect = reinterpret_cast<PfnConnect3>(::GetProcAddress(mod, "XApuConnect"));
+        auto p_enqueue = reinterpret_cast<PfnEnqueue3>(::GetProcAddress(mod, "XApuEnqueueCommand"));
+        auto p_dequeue = reinterpret_cast<PfnDequeue2>(::GetProcAddress(mod, "XApuDequeueResult"));
+        auto p_disconnect = reinterpret_cast<PfnDisconnect>(::GetProcAddress(mod, "XApuDisconnect"));
+        OS_REQUIRE(p_connect && p_enqueue && p_dequeue && p_disconnect);
+
+        XboxConnectParams params{1u, 16u, 8u, 16u * 0x7800u, 0u, 1u};
+        XboxSharedMem shm{};
+        XAPU_CONNECTION_HANDLE conn = nullptr;
+        OS_REQUIRE(p_connect(&params, &shm, &conn) == XAPU_S_OK);
+        OS_REQUIRE(conn != nullptr && shm.base != nullptr && shm.size >= params.sharedBytes);
+
+        uint8_t res_buf[0x50]{};
+        OS_REQUIRE(p_dequeue(conn, res_buf) == static_cast<int32_t>(0x8AC81001u));
+
+        uint32_t xbox_cmd[8]{};
+        xbox_cmd[0] = 3u;  // decode
+        xbox_cmd[1] = 7u;  // streamId
+        OS_REQUIRE(p_enqueue(conn, xbox_cmd, 0u) == XAPU_S_OK);
+
+        std::memset(res_buf, 0, sizeof(res_buf));
+        OS_REQUIRE(p_dequeue(conn, res_buf) == XAPU_S_OK);
+        uint32_t out_type = 0u, out_stream = 0u;
+        int32_t out_status = -1;
+        std::memcpy(&out_type, res_buf + 0x00, 4u);
+        std::memcpy(&out_stream, res_buf + 0x04, 4u);
+        std::memcpy(&out_status, res_buf + 0x2C, 4u);
+        OS_REQUIRE(out_type == 3u && out_stream == 7u && out_status == 0);
+        OS_REQUIRE(p_dequeue(conn, res_buf) == static_cast<int32_t>(0x8AC81001u));
+
+        OS_REQUIRE(p_disconnect(conn) == XAPU_S_OK);
+        ::FreeLibrary(mod);
+    }
+
+    std::printf("  PASS: Retail Xbox AcpHal.dll + xapu.dll ABI verified.\n");
+}
 #endif
 
 }  // namespace
@@ -308,6 +452,7 @@ int main() {
 #if defined(_WIN32)
     TestXApuDll();
     TestAcpHalApuHeap();
+    TestRetailXboxAcpHalAndXApuAbi();
 #endif
     std::printf("ALL MINE XAPU + ACPHAL TESTS PASSED\n");
     return 0;
