@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <mutex>
@@ -22,6 +23,104 @@
 extern "C" {
 __declspec(dllexport) extern const UINT D3D12SDKVersion = 614u;
 __declspec(dllexport) extern const char* D3D12SDKPath = ".\\D3D12\\";
+
+// Standard Microsoft Direct3D 12 COM interface GUID data symbols exported as DATA from
+// d3d12_xs.dll for Xbox Series X|S binaries (such as UE5 Frosty-XSX-Shipping.exe) that
+// statically import IID_ID3D12* from d3d12_xs.dll. Stored under OS_IID_* and aliased via
+// linker /EXPORT:...,DATA (and d3d12_xs_mingw.def) to avoid duplicate-symbol collisions
+// with uuid.lib / d3d12.lib while guaranteeing byte-exact Windows SDK GUIDs across toolchains.
+
+// Base interfaces
+extern const GUID OS_IID_ID3D12Object = {
+    0xc4fec28fu, 0x7966u, 0x4e95u, {0x9fu, 0x94u, 0xf4u, 0x31u, 0xcbu, 0x56u, 0xc3u, 0xb8u}};
+extern const GUID OS_IID_ID3D12DeviceChild = {
+    0x905db94bu, 0xa00cu, 0x4140u, {0x9du, 0xf5u, 0x2bu, 0x64u, 0xcau, 0x9eu, 0xa3u, 0x57u}};
+extern const GUID OS_IID_ID3D12Pageable = {
+    0x63ee58fbu, 0x1268u, 0x4835u, {0x86u, 0xdau, 0xf0u, 0x08u, 0xceu, 0x62u, 0xf0u, 0xd6u}};
+
+// Devices
+extern const GUID OS_IID_ID3D12Device = {
+    0x189819f1u, 0x1db6u, 0x4b57u, {0xbeu, 0x54u, 0x18u, 0x21u, 0x33u, 0x9bu, 0x85u, 0xf7u}};
+extern const GUID OS_IID_ID3D12Device1 = {
+    0x77acce80u, 0x638eu, 0x4e65u, {0x88u, 0x95u, 0xc1u, 0xf2u, 0x33u, 0x86u, 0x86u, 0x3eu}};
+extern const GUID OS_IID_ID3D12Device2 = {
+    0x30baa41eu, 0xb15bu, 0x475cu, {0xa0u, 0xbbu, 0x1au, 0xf5u, 0xc5u, 0xb6u, 0x43u, 0x28u}};
+extern const GUID OS_IID_ID3D12Device3 = {
+    0x81dadc15u, 0x2badu, 0x4392u, {0x93u, 0xc5u, 0x10u, 0x13u, 0x45u, 0xc4u, 0xaau, 0x98u}};
+extern const GUID OS_IID_ID3D12Device4 = {
+    0xe865df17u, 0xa9eeu, 0x46f9u, {0xa4u, 0x63u, 0x30u, 0x98u, 0x31u, 0x5au, 0xa2u, 0xe5u}};
+extern const GUID OS_IID_ID3D12Device5 = {
+    0x8b4f173bu, 0x2feau, 0x4b80u, {0x8fu, 0x58u, 0x43u, 0x07u, 0x19u, 0x1au, 0xb9u, 0x5du}};
+extern const GUID OS_IID_ID3D12Device6 = {
+    0xc70b221bu, 0x40e4u, 0x4a17u, {0x89u, 0xafu, 0x02u, 0x5au, 0x07u, 0x27u, 0xa6u, 0xdcu}};
+extern const GUID OS_IID_ID3D12Device7 = {
+    0x5c014b53u, 0x68a1u, 0x4b9bu, {0x8bu, 0xd1u, 0xddu, 0x60u, 0x46u, 0xb9u, 0x35u, 0x8bu}};
+extern const GUID OS_IID_ID3D12Device8 = {
+    0x9218e6bbu, 0xf944u, 0x4f7eu, {0xa7u, 0x5cu, 0xb1u, 0xb2u, 0xc7u, 0xb7u, 0x01u, 0xf3u}};
+extern const GUID OS_IID_ID3D12Device9 = {
+    0x4c80e962u, 0xf032u, 0x4f60u, {0xbcu, 0x9eu, 0xebu, 0xc2u, 0xcfu, 0xa1u, 0xd8u, 0x3cu}};
+extern const GUID OS_IID_ID3D12Device10 = {
+    0x517f8718u, 0xaa66u, 0x49f9u, {0xb0u, 0x2bu, 0xa7u, 0xabu, 0x89u, 0xc0u, 0x60u, 0x31u}};
+
+// Command lists
+extern const GUID OS_IID_ID3D12CommandList = {
+    0x7116d91cu, 0xe7e4u, 0x47ceu, {0xb8u, 0xc6u, 0xecu, 0x81u, 0x68u, 0xf4u, 0x37u, 0xe5u}};
+extern const GUID OS_IID_ID3D12GraphicsCommandList = {
+    0x5b160d0fu, 0xac1bu, 0x4185u, {0x8bu, 0xa8u, 0xb3u, 0xaeu, 0x42u, 0xa5u, 0xa4u, 0x55u}};
+extern const GUID OS_IID_ID3D12GraphicsCommandList1 = {
+    0x553103fbu, 0x1fe7u, 0x4557u, {0xbbu, 0x38u, 0x94u, 0x6du, 0x7du, 0x0eu, 0x7cu, 0xa7u}};
+extern const GUID OS_IID_ID3D12GraphicsCommandList2 = {
+    0x38c3e585u, 0xff17u, 0x412cu, {0x91u, 0x50u, 0x4fu, 0xc6u, 0xf9u, 0xd7u, 0x2au, 0x28u}};
+extern const GUID OS_IID_ID3D12GraphicsCommandList3 = {
+    0x6fda83a7u, 0xb84cu, 0x4e38u, {0x9au, 0xc8u, 0xc7u, 0xbdu, 0x22u, 0x01u, 0x6bu, 0x3du}};
+extern const GUID OS_IID_ID3D12GraphicsCommandList4 = {
+    0x8754318eu, 0xd3a9u, 0x4541u, {0x98u, 0xcfu, 0x64u, 0x5bu, 0x50u, 0xdcu, 0x48u, 0x74u}};
+extern const GUID OS_IID_ID3D12GraphicsCommandList5 = {
+    0x55050859u, 0x4024u, 0x474cu, {0x87u, 0xf5u, 0x64u, 0x72u, 0xeau, 0xeeu, 0x44u, 0xeau}};
+extern const GUID OS_IID_ID3D12GraphicsCommandList6 = {
+    0xc3827890u, 0xe548u, 0x4cfau, {0x96u, 0xcfu, 0x56u, 0x89u, 0xa9u, 0x37u, 0x0fu, 0x80u}};
+extern const GUID OS_IID_ID3D12GraphicsCommandList7 = {
+    0xdd171223u, 0x8b61u, 0x4769u, {0x90u, 0xe3u, 0x16u, 0x0cu, 0xcdu, 0xe4u, 0xe2u, 0xc1u}};
+
+// Queue / Resource / Heap / Fence / PSO / RootSignature / Descriptor / Allocator / Query / State / Debug
+extern const GUID OS_IID_ID3D12CommandQueue = {
+    0x0ec870a6u, 0x5d7eu, 0x4c22u, {0x8cu, 0xfcu, 0x5bu, 0xaau, 0xe0u, 0x76u, 0x16u, 0xedu}};
+extern const GUID OS_IID_ID3D12Resource = {
+    0x696442beu, 0xa72eu, 0x4059u, {0xbcu, 0x79u, 0x5bu, 0x5cu, 0x98u, 0x04u, 0x0fu, 0xadu}};
+extern const GUID OS_IID_ID3D12Resource1 = {
+    0x9d5e227au, 0x4430u, 0x4161u, {0x88u, 0xb3u, 0x3eu, 0xcau, 0x6bu, 0xb1u, 0x6eu, 0x19u}};
+extern const GUID OS_IID_ID3D12Resource2 = {
+    0xbe36ec3bu, 0xea85u, 0x4aebu, {0xa4u, 0x5au, 0xe9u, 0xd7u, 0x64u, 0x04u, 0xa4u, 0x95u}};
+extern const GUID OS_IID_ID3D12Heap = {
+    0x6b3b2502u, 0x6e51u, 0x45b3u, {0x90u, 0xeeu, 0x98u, 0x84u, 0x26u, 0x5eu, 0x8du, 0xf3u}};
+extern const GUID OS_IID_ID3D12Heap1 = {
+    0x572f7389u, 0x2168u, 0x49e3u, {0x96u, 0x93u, 0xd6u, 0xdfu, 0x58u, 0x71u, 0xbfu, 0x6du}};
+extern const GUID OS_IID_ID3D12Fence = {
+    0x0a753dcfu, 0xc4d8u, 0x4b91u, {0xadu, 0xf6u, 0xbeu, 0x5au, 0x60u, 0xd9u, 0x5au, 0x76u}};
+extern const GUID OS_IID_ID3D12Fence1 = {
+    0x433685feu, 0xe22bu, 0x4ca0u, {0xa8u, 0xdbu, 0xb5u, 0xb4u, 0xf4u, 0xddu, 0x0eu, 0x4au}};
+extern const GUID OS_IID_ID3D12PipelineState = {
+    0x765a30f3u, 0xf624u, 0x4c6fu, {0xa8u, 0x28u, 0xacu, 0xe9u, 0x48u, 0x62u, 0x24u, 0x45u}};
+extern const GUID OS_IID_ID3D12RootSignature = {
+    0xc54a6b66u, 0x72dfu, 0x4ee8u, {0x8bu, 0xe5u, 0xa9u, 0x46u, 0xa1u, 0x42u, 0x92u, 0x14u}};
+extern const GUID OS_IID_ID3D12DescriptorHeap = {
+    0x8efb471du, 0x616cu, 0x4f49u, {0x90u, 0xf7u, 0x12u, 0x7bu, 0xb7u, 0x63u, 0xfau, 0x51u}};
+extern const GUID OS_IID_ID3D12CommandAllocator = {
+    0x6102dee4u, 0xaf59u, 0x4b09u, {0xb9u, 0x99u, 0xb4u, 0x4du, 0x73u, 0xf0u, 0x9bu, 0x24u}};
+extern const GUID OS_IID_ID3D12QueryHeap = {
+    0x0d9658aeu, 0xed45u, 0x469eu, {0xa6u, 0x1du, 0x97u, 0x0eu, 0xc5u, 0x83u, 0xcau, 0xb4u}};
+extern const GUID OS_IID_ID3D12CommandSignature = {
+    0xc36a797cu, 0xec80u, 0x4f0au, {0x89u, 0x85u, 0xa7u, 0xb2u, 0x47u, 0x50u, 0x82u, 0xd1u}};
+extern const GUID OS_IID_ID3D12StateObject = {
+    0x47016943u, 0xfca8u, 0x4594u, {0x93u, 0xeau, 0xafu, 0x25u, 0x8bu, 0x55u, 0x34u, 0x6du}};
+extern const GUID OS_IID_ID3D12StateObjectProperties = {
+    0xde5fa827u, 0x9bf9u, 0x4f26u, {0x89u, 0xffu, 0xd7u, 0xf5u, 0x6fu, 0xdeu, 0x38u, 0x60u}};
+extern const GUID OS_IID_ID3D12Debug = {
+    0x344488b7u, 0x6846u, 0x474bu, {0xb9u, 0x89u, 0xf0u, 0x27u, 0x44u, 0x82u, 0x45u, 0xe0u}};
+extern const GUID OS_IID_ID3D12Debug1 = {
+    0xaffaa4cau, 0x63feu, 0x4d8eu, {0xb8u, 0xadu, 0x15u, 0x90u, 0x00u, 0xafu, 0x43u, 0x04u}};
+extern const GUID OS_IID_ID3D12InfoQueue = {
+    0x0742a90bu, 0xc387u, 0x483fu, {0xb9u, 0x46u, 0x30u, 0xa7u, 0xe4u, 0xe6u, 0x14u, 0x58u}};
 }
 
 #if defined(_MSC_VER)
@@ -32,12 +131,191 @@ __declspec(dllexport) extern const char* D3D12SDKPath = ".\\D3D12\\";
 #pragma comment(linker, "/EXPORT:D3D12CreateVersionedRootSignatureDeserializer=OS_D3D12CreateVersionedRootSignatureDeserializer")
 #pragma comment(linker, "/EXPORT:D3D12GetDebugInterface=OS_D3D12GetDebugInterface")
 #pragma comment(linker, "/EXPORT:D3D12EnableExperimentalFeatures=OS_D3D12EnableExperimentalFeatures")
+
+// Export COM interface GUIDs as DATA symbols (avoiding duplicate symbols with uuid.lib).
+#pragma comment(linker, "/EXPORT:IID_ID3D12Object=OS_IID_ID3D12Object,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12DeviceChild=OS_IID_ID3D12DeviceChild,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12Pageable=OS_IID_ID3D12Pageable,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12Device=OS_IID_ID3D12Device,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12Device1=OS_IID_ID3D12Device1,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12Device2=OS_IID_ID3D12Device2,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12Device3=OS_IID_ID3D12Device3,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12Device4=OS_IID_ID3D12Device4,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12Device5=OS_IID_ID3D12Device5,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12Device6=OS_IID_ID3D12Device6,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12Device7=OS_IID_ID3D12Device7,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12Device8=OS_IID_ID3D12Device8,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12Device9=OS_IID_ID3D12Device9,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12Device10=OS_IID_ID3D12Device10,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12CommandList=OS_IID_ID3D12CommandList,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12GraphicsCommandList=OS_IID_ID3D12GraphicsCommandList,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12GraphicsCommandList1=OS_IID_ID3D12GraphicsCommandList1,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12GraphicsCommandList2=OS_IID_ID3D12GraphicsCommandList2,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12GraphicsCommandList3=OS_IID_ID3D12GraphicsCommandList3,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12GraphicsCommandList4=OS_IID_ID3D12GraphicsCommandList4,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12GraphicsCommandList5=OS_IID_ID3D12GraphicsCommandList5,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12GraphicsCommandList6=OS_IID_ID3D12GraphicsCommandList6,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12GraphicsCommandList7=OS_IID_ID3D12GraphicsCommandList7,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12CommandQueue=OS_IID_ID3D12CommandQueue,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12Resource=OS_IID_ID3D12Resource,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12Resource1=OS_IID_ID3D12Resource1,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12Resource2=OS_IID_ID3D12Resource2,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12Heap=OS_IID_ID3D12Heap,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12Heap1=OS_IID_ID3D12Heap1,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12Fence=OS_IID_ID3D12Fence,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12Fence1=OS_IID_ID3D12Fence1,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12PipelineState=OS_IID_ID3D12PipelineState,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12RootSignature=OS_IID_ID3D12RootSignature,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12DescriptorHeap=OS_IID_ID3D12DescriptorHeap,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12CommandAllocator=OS_IID_ID3D12CommandAllocator,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12QueryHeap=OS_IID_ID3D12QueryHeap,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12CommandSignature=OS_IID_ID3D12CommandSignature,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12StateObject=OS_IID_ID3D12StateObject,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12StateObjectProperties=OS_IID_ID3D12StateObjectProperties,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12Debug=OS_IID_ID3D12Debug,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12Debug1=OS_IID_ID3D12Debug1,DATA")
+#pragma comment(linker, "/EXPORT:IID_ID3D12InfoQueue=OS_IID_ID3D12InfoQueue,DATA")
 #endif
 
 namespace {
 
 constexpr const char* kModule = "d3d12_xs.dll";
 std::atomic<int> g_prefer_warp{0};
+
+// Process-wide Xbox D3D12X state for D3D12Xbox* process/device/frame/error helpers.
+std::atomic<uint32_t> g_process_gpu_priority{
+    static_cast<uint32_t>(D3D12XBOX_PROCESS_GPU_PRIORITY_NORMAL)};
+std::atomic<uint32_t> g_process_memory_priority{
+    static_cast<uint32_t>(D3D12XBOX_PROCESS_MEMORY_PRIORITY_NORMAL)};
+std::atomic<uint32_t> g_gpu_time_limit_us{0u};
+
+struct FrameIntervalStore {
+    std::mutex mutex;
+    D3D12XBOX_FRAME_INTERVAL_STATE state{};
+};
+
+FrameIntervalStore& GetFrameIntervalStore() {
+    static FrameIntervalStore store;
+    return store;
+}
+
+struct ReportedErrorStore {
+    std::mutex mutex;
+    uint64_t count = 0ull;
+    HRESULT last_hr = S_OK;
+    std::string last_message;
+};
+
+ReportedErrorStore& GetReportedErrorStore() {
+    static ReportedErrorStore store;
+    return store;
+}
+
+// Private GUID for attaching a non-owning lifetime sentinel to DeviceX's underlying host
+// ID3D12Device so D3D12XboxGetDevice / D3D12XboxSetFrameInterval never hold an extra COM
+// reference on DeviceX (preserving immediate DeviceX::~DeviceX() teardown such as
+// ShaderCache::WaitForPendingCompiles() and avoiding DLL_PROCESS_DETACH loader-lock issues).
+// {4F534431-3258-4143-5444-455653454E54}
+constexpr GUID kActiveDeviceSentinelGuid = {
+    0x4F534431u, 0x3258u, 0x4143u, {0x54u, 0x44u, 0x45u, 0x56u, 0x53u, 0x45u, 0x4Eu, 0x54u}};
+
+struct ActiveDeviceStore {
+    std::mutex mutex;
+    openscarlett::d3d12_xs::DeviceX* active_device = nullptr;
+    uint64_t generation = 0ull;
+};
+
+ActiveDeviceStore& GetActiveDeviceStore() {
+    static ActiveDeviceStore store;
+    return store;
+}
+
+std::atomic<uint64_t> g_next_active_device_gen{1ull};
+
+void ClearActiveDeviceIfGeneration(uint64_t generation) noexcept {
+    auto& store = GetActiveDeviceStore();
+    std::lock_guard<std::mutex> lock(store.mutex);
+    if (store.generation == generation) {
+        store.active_device = nullptr;
+        store.generation = 0ull;
+    }
+}
+
+class ActiveDeviceSentinel final : public IUnknown {
+public:
+    explicit ActiveDeviceSentinel(uint64_t generation) noexcept : generation_(generation) {}
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override {
+        if (!ppvObject) return E_POINTER;
+        *ppvObject = nullptr;
+        if (IsEqualIID(riid, __uuidof(IUnknown))) {
+            *ppvObject = static_cast<IUnknown*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return E_NOINTERFACE;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return ref_count_.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    }
+
+    ULONG STDMETHODCALLTYPE Release() override {
+        const ULONG rem = ref_count_.fetch_sub(1u, std::memory_order_acq_rel) - 1u;
+        if (rem == 0u) {
+            ClearActiveDeviceIfGeneration(generation_);
+            delete this;
+        }
+        return rem;
+    }
+
+private:
+    std::atomic<ULONG> ref_count_{1u};
+    uint64_t generation_ = 0ull;
+};
+
+void StoreActiveDevice(openscarlett::d3d12_xs::DeviceX* new_dev) noexcept {
+    if (!new_dev) {
+        auto& store = GetActiveDeviceStore();
+        std::lock_guard<std::mutex> lock(store.mutex);
+        store.active_device = nullptr;
+        store.generation = 0ull;
+        return;
+    }
+
+    ID3D12Device* host_dev = new_dev->HostDevice();
+    if (!host_dev) {
+        return;
+    }
+
+    const uint64_t gen = g_next_active_device_gen.fetch_add(1ull, std::memory_order_relaxed);
+    auto* sentinel = new (std::nothrow) ActiveDeviceSentinel(gen);
+    if (!sentinel) {
+        return;
+    }
+
+    // Attach sentinel OUTSIDE store.mutex so replacing any prior sentinel on the same host
+    // device never deadlocks when the previous sentinel's Release() acquires store.mutex.
+    const HRESULT hr = host_dev->SetPrivateDataInterface(kActiveDeviceSentinelGuid, sentinel);
+    sentinel->Release();
+    if (FAILED(hr)) {
+        return;
+    }
+
+    auto& store = GetActiveDeviceStore();
+    std::lock_guard<std::mutex> lock(store.mutex);
+    store.active_device = new_dev;
+    store.generation = gen;
+}
+
+openscarlett::d3d12_xs::DeviceX* AcquireActiveDevice() noexcept {
+    auto& store = GetActiveDeviceStore();
+    std::lock_guard<std::mutex> lock(store.mutex);
+    if (store.active_device) {
+        store.active_device->AddRef();
+    }
+    return store.active_device;
+}
 
 inline void RecordExport(const char* sym, HRESULT hr) {
     openscarlett::CallOutcome outcome = openscarlett::CallOutcome::Ok;
@@ -321,6 +599,9 @@ HRESULT CreateWrappedDeviceInternal(
     }
 
     const HRESULT hr = dev_x->QueryInterface(riid, ppDevice);
+    if (SUCCEEDED(hr) && *ppDevice != nullptr) {
+        StoreActiveDevice(dev_x);
+    }
     dev_x->Release();
     return hr;
 }
@@ -1066,6 +1347,198 @@ OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12GetVulkanRoutingStats(
     hr = routing->GetVulkanRoutingStats(out_stats);
     routing->Release();
     return hr;
+}
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxSetProcessGpuPriority(
+    D3D12XBOX_PROCESS_GPU_PRIORITY Priority) {
+    const uint32_t raw = static_cast<uint32_t>(Priority);
+    if (raw > static_cast<uint32_t>(D3D12XBOX_PROCESS_GPU_PRIORITY_REALTIME)) {
+        RecordExport("D3D12XboxSetProcessGpuPriority", E_INVALIDARG);
+        return E_INVALIDARG;
+    }
+    g_process_gpu_priority.store(raw, std::memory_order_release);
+    RecordExport("D3D12XboxSetProcessGpuPriority", S_OK);
+    return S_OK;
+}
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxGetProcessGpuPriority(
+    D3D12XBOX_PROCESS_GPU_PRIORITY* pOutPriority) {
+    if (!pOutPriority) {
+        RecordExport("D3D12XboxGetProcessGpuPriority", E_POINTER);
+        return E_POINTER;
+    }
+    *pOutPriority = static_cast<D3D12XBOX_PROCESS_GPU_PRIORITY>(
+        g_process_gpu_priority.load(std::memory_order_acquire));
+    RecordExport("D3D12XboxGetProcessGpuPriority", S_OK);
+    return S_OK;
+}
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxSetProcessMemoryPriority(
+    D3D12XBOX_PROCESS_MEMORY_PRIORITY Priority) {
+    const uint32_t raw = static_cast<uint32_t>(Priority);
+    if (raw > static_cast<uint32_t>(D3D12XBOX_PROCESS_MEMORY_PRIORITY_HIGH)) {
+        RecordExport("D3D12XboxSetProcessMemoryPriority", E_INVALIDARG);
+        return E_INVALIDARG;
+    }
+    g_process_memory_priority.store(raw, std::memory_order_release);
+    RecordExport("D3D12XboxSetProcessMemoryPriority", S_OK);
+    return S_OK;
+}
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxGetProcessMemoryPriority(
+    D3D12XBOX_PROCESS_MEMORY_PRIORITY* pOutPriority) {
+    if (!pOutPriority) {
+        RecordExport("D3D12XboxGetProcessMemoryPriority", E_POINTER);
+        return E_POINTER;
+    }
+    *pOutPriority = static_cast<D3D12XBOX_PROCESS_MEMORY_PRIORITY>(
+        g_process_memory_priority.load(std::memory_order_acquire));
+    RecordExport("D3D12XboxGetProcessMemoryPriority", S_OK);
+    return S_OK;
+}
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxGetDevice(
+    REFIID riid,
+    void** ppDevice) {
+    if (!ppDevice) {
+        RecordExport("D3D12XboxGetDevice", E_POINTER);
+        return E_POINTER;
+    }
+    *ppDevice = nullptr;
+
+    openscarlett::d3d12_xs::DeviceX* dev = AcquireActiveDevice();
+    if (!dev) {
+        RecordExport("D3D12XboxGetDevice", DXGI_ERROR_NOT_FOUND);
+        return DXGI_ERROR_NOT_FOUND;
+    }
+
+    const HRESULT hr = dev->QueryInterface(riid, ppDevice);
+    dev->Release();
+    RecordExport("D3D12XboxGetDevice", hr);
+    return hr;
+}
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxSetFrameInterval(
+    IDXGIOutput* pOutput,
+    uint32_t PeriodMicroseconds,
+    uint32_t MaxFrameLatency,
+    uint32_t Flags) {
+    if (MaxFrameLatency > 16u) {
+        RecordExport("D3D12XboxSetFrameInterval", E_INVALIDARG);
+        return E_INVALIDARG;
+    }
+
+    const uint32_t effective_latency = (MaxFrameLatency == 0u) ? 1u : MaxFrameLatency;
+    {
+        auto& store = GetFrameIntervalStore();
+        std::lock_guard<std::mutex> lock(store.mutex);
+        store.state.PeriodMicroseconds = PeriodMicroseconds;
+        store.state.MaxFrameLatency = effective_latency;
+        store.state.Flags = Flags;
+        store.state.UpdateCount += 1ull;
+    }
+
+    openscarlett::d3d12_xs::DeviceX* dev = AcquireActiveDevice();
+    HRESULT hr = S_OK;
+    if (dev) {
+        hr = dev->SetFrameIntervalX(pOutput, PeriodMicroseconds, effective_latency, Flags);
+        dev->Release();
+    }
+
+    RecordExport("D3D12XboxSetFrameInterval", hr);
+    return hr;
+}
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxReportError(
+    HRESULT ErrorCode,
+    const char* Message) {
+    const char* safe_msg = Message ? Message : "";
+    {
+        auto& store = GetReportedErrorStore();
+        std::lock_guard<std::mutex> lock(store.mutex);
+        store.count += 1ull;
+        store.last_hr = ErrorCode;
+        store.last_message.assign(safe_msg, std::min<size_t>(std::strlen(safe_msg), 256u));
+    }
+
+    char diag[384]{};
+    std::snprintf(
+        diag,
+        sizeof(diag),
+        "[OpenScarlett][d3d12_xs] D3D12XboxReportError hr=0x%08lX msg=%.256s\n",
+        static_cast<unsigned long>(ErrorCode),
+        safe_msg);
+    OutputDebugStringA(diag);
+
+    RecordExport("D3D12XboxReportError", S_OK);
+    return S_OK;
+}
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxSetGpuTimeLimit(
+    uint32_t TimeLimitMicroseconds) {
+    g_gpu_time_limit_us.store(TimeLimitMicroseconds, std::memory_order_release);
+    RecordExport("D3D12XboxSetGpuTimeLimit", S_OK);
+    return S_OK;
+}
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxGetDisplayMode(
+    D3D12XBOX_DISPLAY_MODE* pOutMode) {
+    if (!pOutMode) {
+        RecordExport("D3D12XboxGetDisplayMode", E_POINTER);
+        return E_POINTER;
+    }
+    const int cx = GetSystemMetrics(SM_CXSCREEN);
+    const int cy = GetSystemMetrics(SM_CYSCREEN);
+    uint32_t period_us = D3D12XBOX_FRAME_INTERVAL_60_HZ;
+    {
+        auto& store = GetFrameIntervalStore();
+        std::lock_guard<std::mutex> lock(store.mutex);
+        if (store.state.PeriodMicroseconds > 0u) {
+            period_us = store.state.PeriodMicroseconds;
+        }
+    }
+    const uint32_t hz = (period_us > 0u)
+                            ? std::clamp<uint32_t>(
+                                  static_cast<uint32_t>((1000000ull + period_us / 2ull) / period_us),
+                                  24u,
+                                  240u)
+                            : 60u;
+
+    pOutMode->Width = (cx > 0) ? static_cast<uint32_t>(cx) : 1920u;
+    pOutMode->Height = (cy > 0) ? static_cast<uint32_t>(cy) : 1080u;
+    pOutMode->RefreshRateNumerator = hz;
+    pOutMode->RefreshRateDenominator = 1u;
+    pOutMode->Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    pOutMode->ColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    RecordExport("D3D12XboxGetDisplayMode", S_OK);
+    return S_OK;
+}
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12GetFrameIntervalState(
+    D3D12XBOX_FRAME_INTERVAL_STATE* out_state) {
+    if (!out_state) return E_POINTER;
+    auto& store = GetFrameIntervalStore();
+    std::lock_guard<std::mutex> lock(store.mutex);
+    *out_state = store.state;
+    return S_OK;
+}
+
+OPENSCARLETT_D3D12_API uint32_t WINAPI OpenScarlettD3D12GetGpuTimeLimit() {
+    return g_gpu_time_limit_us.load(std::memory_order_acquire);
+}
+
+OPENSCARLETT_D3D12_API uint64_t WINAPI OpenScarlettD3D12GetReportedErrorCount(
+    HRESULT* out_last_hr) {
+    auto& store = GetReportedErrorStore();
+    std::lock_guard<std::mutex> lock(store.mutex);
+    if (out_last_hr) {
+        *out_last_hr = store.last_hr;
+    }
+    return store.count;
+}
+
+OPENSCARLETT_D3D12_API void WINAPI OpenScarlettD3D12ResetTrackedDevice() {
+    StoreActiveDevice(nullptr);
 }
 
 }  // extern "C"
