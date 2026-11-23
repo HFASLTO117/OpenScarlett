@@ -8,6 +8,14 @@ set "OPENSCARLETT_SAVE_ROOT=%ROOT_DIR%\.tmp\saves"
 if not exist "%TEMP%" mkdir "%TEMP%"
 if not exist "%OPENSCARLETT_SAVE_ROOT%" mkdir "%OPENSCARLETT_SAVE_ROOT%"
 
+rem Shared sccache directory strictly on E:\ (or repo root drive) across main & worktrees.
+if not defined SCCACHE_DIR set "SCCACHE_DIR=%ROOT_DIR%\.sccache"
+if not defined SCCACHE_CACHE_SIZE set "SCCACHE_CACHE_SIZE=10G"
+if not defined SCCACHE_IDLE_TIMEOUT set "SCCACHE_IDLE_TIMEOUT=3600"
+if not exist "%SCCACHE_DIR%" mkdir "%SCCACHE_DIR%"
+
+if not defined OPENSCARLETT_CTEST_JOBS set "OPENSCARLETT_CTEST_JOBS=4"
+
 rem MSVC: keep an already initialised x64 developer prompt, otherwise ask vswhere
 rem for the newest install with the x64 C++ tools (Community, Professional,
 rem Enterprise or Build Tools, any version).
@@ -35,6 +43,7 @@ if exist "%VS_CMAKE%\Ninja\ninja.exe" set "PATH=%VS_CMAKE%\Ninja;%PATH%"
 :have_msvc
 
 rem Optional pinned toolchain; used first when present.
+if exist "E:\ScarlettX-dev\tools\sccache\sccache.exe" set "PATH=E:\ScarlettX-dev\tools\sccache;%PATH%"
 if exist "E:\ScarlettX-dev\tools\ninja\ninja.exe" set "PATH=E:\ScarlettX-dev\tools\ninja;%PATH%"
 if exist "E:\ScarlettX-dev\tools\cmake\cmake-4.5.1-windows-x86_64\bin\cmake.exe" set "PATH=E:\ScarlettX-dev\tools\cmake\cmake-4.5.1-windows-x86_64\bin;%PATH%"
 
@@ -45,9 +54,50 @@ for /d %%D in ("%ProgramFiles(x86)%\Windows Kits\10\bin\10.*") do (
 )
 if defined SDK_BIN set "PATH=%SDK_BIN%;%PATH%"
 
+set "BUILD_PAR=--parallel"
+if defined OPENSCARLETT_BUILD_JOBS set "BUILD_PAR=--parallel %OPENSCARLETT_BUILD_JOBS%"
+
 cd /d "%ROOT_DIR%"
+if /i "%~1"=="--cache-stats" goto :cache_stats
+if /i "%~1"=="--build-only" goto :build_only
+if /i "%~1"=="--test" goto :test_subset
 if not "%~1"=="" goto :custom
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build --parallel && ctest --test-dir build --output-on-failure
+
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build %BUILD_PAR% && ctest --test-dir build --parallel %OPENSCARLETT_CTEST_JOBS% --output-on-failure
+exit /b %ERRORLEVEL%
+
+:cache_stats
+sccache --show-stats
+exit /b %ERRORLEVEL%
+
+:build_only
+if not exist "build\build.ninja" (
+    cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release || exit /b %ERRORLEVEL%
+)
+shift
+if "%~1"=="" (
+    cmake --build build %BUILD_PAR%
+    exit /b %ERRORLEVEL%
+)
+set "TARGETS="
+:bo_loop
+if "%~1"=="" goto :bo_run
+set "TARGETS=%TARGETS% %~1"
+shift
+goto :bo_loop
+:bo_run
+cmake --build build %BUILD_PAR% --target %TARGETS%
+exit /b %ERRORLEVEL%
+
+:test_subset
+if "%~2"=="" (
+    echo Usage: build.cmd --test ^<ctest_regex^>
+    exit /b 1
+)
+if not exist "build\build.ninja" (
+    cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release || exit /b %ERRORLEVEL%
+)
+cmake --build build %BUILD_PAR% && ctest --test-dir build --parallel %OPENSCARLETT_CTEST_JOBS% -R "%~2" --output-on-failure
 exit /b %ERRORLEVEL%
 
 :custom

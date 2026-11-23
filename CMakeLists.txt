@@ -1,4 +1,33 @@
 cmake_minimum_required(VERSION 3.20)
+
+# Enable embedded debug info (/Z7) on MSVC when supported so sccache/ccache can
+# cache Debug and RelWithDebInfo objects without mspdbsrv.exe PDB contention.
+if(POLICY CMP0141)
+    cmake_policy(SET CMP0141 NEW)
+endif()
+if(NOT DEFINED CMAKE_MSVC_DEBUG_INFORMATION_FORMAT)
+    set(CMAKE_MSVC_DEBUG_INFORMATION_FORMAT "$<$<CONFIG:Debug,RelWithDebInfo>:Embedded>")
+endif()
+
+# Automatic compiler cache (sccache / ccache) for fast cross-worktree builds.
+option(OPENSCARLETT_USE_COMPILER_CACHE
+    "Use sccache or ccache automatically when available"
+    ON)
+if(OPENSCARLETT_USE_COMPILER_CACHE
+   AND NOT DEFINED ENV{OPENSCARLETT_NO_CACHE}
+   AND NOT CMAKE_C_COMPILER_LAUNCHER
+   AND NOT CMAKE_CXX_COMPILER_LAUNCHER)
+    find_program(_os_compiler_cache
+        NAMES sccache ccache
+        HINTS "E:/ScarlettX-dev/tools/sccache"
+    )
+    if(_os_compiler_cache)
+        set(CMAKE_C_COMPILER_LAUNCHER "${_os_compiler_cache}" CACHE STRING "C compiler cache launcher")
+        set(CMAKE_CXX_COMPILER_LAUNCHER "${_os_compiler_cache}" CACHE STRING "CXX compiler cache launcher")
+        message(STATUS "OpenScarlett compiler cache enabled: ${_os_compiler_cache}")
+    endif()
+endif()
+
 project(OpenScarlett VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -137,6 +166,7 @@ foreach(_os_module_cmake
     cmake/mine_xapu_acphal.cmake
     cmake/mine_d3d12_xmem.cmake
     cmake/mine_routing_apisets.cmake
+    cmake/build_speedups.cmake
 )
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_os_module_cmake}")
         include("${CMAKE_CURRENT_SOURCE_DIR}/${_os_module_cmake}")
