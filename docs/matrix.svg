@@ -133,7 +133,7 @@
     <rect x="197" y="506" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="197" y="506" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="207" y="520">xmem</text>
-    <text class="tiny" x="207" y="531">16 exports · high</text>
+    <text class="tiny" x="207" y="531">17 exports · high</text>
     <rect x="368" y="506" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="368" y="506" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="378" y="520">XAudio2_9</text>
@@ -149,7 +149,7 @@
     <rect x="26" y="544" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="26" y="544" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="36" y="558">d3d12_xs</text>
-    <text class="tiny" x="36" y="569">50 exports · high</text>
+    <text class="tiny" x="36" y="569">81 exports · high</text>
     <rect x="197" y="544" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="197" y="544" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="207" y="558">libHttpClient</text>
@@ -185,7 +185,7 @@
     <rect x="710" y="582" width="163" height="30" rx="6" fill="#261e10" stroke="#30363d" stroke-width="1"/>
     <rect x="710" y="582" width="3.5" height="30" rx="2" fill="#d29922"/>
     <text class="mono" x="720" y="596">AcpHal</text>
-    <text class="tiny" x="720" y="607">3 exports · partial</text>
+    <text class="tiny" x="720" y="607">10 exports · partial</text>
     <rect x="26" y="620" width="163" height="30" rx="6" fill="#161b22" stroke="#30363d" stroke-width="1"/>
     <rect x="26" y="620" width="3.5" height="30" rx="2" fill="#6e7681"/>
     <text class="mono" x="36" y="634">pixevt</text>
