@@ -1435,7 +1435,8 @@ HRESULT CreateWrappedDeviceInternal(
     bool enable_debug_layer,
     HWND default_hwnd,
     REFIID riid,
-    void** ppDevice) {
+    void** ppDevice,
+    bool retail_scarlett_vtable = false) {
     // Opt-in D3D12 Agility SDK discovery (graceful fallback to inbox d3d12.dll when absent).
     TryConfigureAgilitySdkOnce();
 
@@ -1481,6 +1482,22 @@ HRESULT CreateWrappedDeviceInternal(
     host_dev->Release();
     if (!dev_x) {
         return E_OUTOFMEMORY;
+    }
+
+    if (retail_scarlett_vtable) {
+        dev_x->SetRetailScarlettAbi(true);
+    }
+    if (retail_scarlett_vtable &&
+        (IsEqualIID(riid, __uuidof(ID3D12Device)) || IsEqualIID(riid, __uuidof(IUnknown)))) {
+        auto* retail = new (std::nothrow) ScarlettRetailDeviceProxy(dev_x);
+        if (!retail) {
+            dev_x->Release();
+            return E_OUTOFMEMORY;
+        }
+        StoreActiveDevice(dev_x);
+        dev_x->Release();
+        *ppDevice = static_cast<ID3D12Device*>(retail);
+        return S_OK;
     }
 
     const HRESULT hr = dev_x->QueryInterface(riid, ppDevice);
@@ -1567,7 +1584,10 @@ OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxCreateDevice(
     const bool global_warp =
         (g_prefer_warp.load(std::memory_order_acquire) != 0) || EnvPrefersWarp();
     const bool debug_layer =
+        EnvEnablesD3D12Debug() ||
         (pParameters && (pParameters->ProcessDebugFlags & D3D12XBOX_PROCESS_DEBUG_FLAG_DEBUG) != 0);
+
+    const bool retail_scarlett = (pParameters && pParameters->Version >= 0x00020000u);
 
     const HRESULT hr = CreateWrappedDeviceInternal(
         pAdapter,
@@ -1576,7 +1596,8 @@ OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxCreateDevice(
         debug_layer,
         nullptr,
         riid,
-        ppDevice);
+        ppDevice,
+        retail_scarlett);
     RecordExport("D3D12XboxCreateDevice", hr);
     return hr;
 }
