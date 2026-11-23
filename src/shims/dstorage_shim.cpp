@@ -1716,7 +1716,22 @@ public:
     void* OPENSCARLETT_DSTORAGE_CALL GetErrorEvent() override {
         RecordOk("IDStorageQueueX::GetErrorEvent", 9);
 #if defined(_WIN32)
-        return error_event_;
+        std::lock_guard<std::mutex> lk(error_mutex_);
+        if (!error_event_) {
+            return nullptr;
+        }
+        HANDLE dup = nullptr;
+        if (!DuplicateHandle(
+                GetCurrentProcess(),
+                error_event_,
+                GetCurrentProcess(),
+                &dup,
+                0u,
+                FALSE,
+                DUPLICATE_SAME_ACCESS)) {
+            return nullptr;
+        }
+        return dup;
 #else
         return nullptr;
 #endif

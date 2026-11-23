@@ -1,7 +1,10 @@
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <cstdint>
-#include <mutex>
+#include <memory>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -33,8 +36,14 @@ struct CallTraceEntry {
 class CallTelemetry {
 public:
     static CallTelemetry& Global();
+    static bool IsHookTelemetryActive() noexcept;
 
     void Reset();
+    void Record(const char* module_name,
+                const char* symbol_name,
+                CallOutcome outcome,
+                int32_t hr = 0,
+                int32_t vtable_slot = -1);
     void Record(const std::string& module_name,
                 const std::string& symbol_name,
                 CallOutcome outcome,
@@ -45,8 +54,25 @@ public:
     Status WriteJsonReport(const std::string& file_path) const;
 
 private:
-    mutable std::mutex mutex_;
-    std::unordered_map<std::string, CallTraceEntry> entries_;
+    struct AtomicEntry {
+        std::string module_name;
+        std::string symbol_name;
+        int32_t vtable_slot = -1;
+        std::atomic<uint64_t> total_calls{0};
+        std::atomic<uint64_t> ok_calls{0};
+        std::atomic<uint64_t> stub_calls{0};
+        std::atomic<uint64_t> not_impl_calls{0};
+        std::atomic<uint64_t> error_calls{0};
+        std::atomic<int32_t> last_hr{0};
+    };
+
+    static constexpr size_t kShardCount = 64u;
+    struct Shard {
+        mutable std::shared_mutex mutex;
+        std::unordered_map<uint64_t, std::vector<std::unique_ptr<AtomicEntry>>> buckets;
+    };
+
+    std::array<Shard, kShardCount> shards_;
 };
 
 }  // namespace openscarlett

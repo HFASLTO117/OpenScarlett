@@ -417,6 +417,7 @@ DllCategory ClassifyImportDll(const std::string& dll_name) {
     const std::string lo = ToLower(trimmed);
     if (lo == "d3d12_xs.dll" || lo == "d3d12_x.dll" || lo == "xg_xs.dll" || lo == "xg.dll" ||
         lo == "acphal.dll" || lo == "kernelx.dll" || lo == "xmem.dll" || lo == "dstorage_xs.dll" ||
+        lo == "dxcompiler_xs.dll" ||
         lo == "xboxbvhbuilder.dll" || lo == "chad.dll" || lo == "xapu.dll" || lo == "xcrdapi.dll" ||
         lo == "pixevt.dll" ||
         lo == "mfplat_xs.dll" || lo == "advapi32legacy.dll" ||
@@ -714,6 +715,14 @@ const DllRouteRule* DllRoutingTable::FindRule(std::string_view dll_name) const {
             return &target_it->second.rule;
         }
     }
+    if (key == "dxcompiler_xs.dll") {
+        static const DllRouteRule kDxcompilerXsRule{
+            "dxcompiler_xs.dll",
+            DllRoutePolicy::Shim,
+            1,
+        };
+        return &kDxcompilerXsRule;
+    }
     return nullptr;
 }
 
@@ -867,6 +876,19 @@ DllRouteDecision DllRoutingTable::ResolveRoute(std::string_view dll_name,
                 return resolve_entry(mf_it->second, true, mf_it->second.from_override);
             }
         }
+    }
+
+    // 3d. Scarlett DXC shader compiler shim (dxcompiler_xs.dll):
+    //     Routes to OpenScarlett's dxcompiler_xs.dll shim while keeping legacy
+    //     ListRules()/ListAllRules()/ListCompleteRules() counts unchanged unless overridden.
+    if (key == "dxcompiler_xs.dll") {
+        static const Entry kDxcompilerXsEntry{
+            DllRouteRule{"dxcompiler_xs.dll", DllRoutePolicy::Shim, 1},
+            false,
+            true,
+            false,
+        };
+        return resolve_entry(kDxcompilerXsEntry, false, false);
     }
 
     // 4. No explicit rule or alias: KnownDLLs and WindowsNative ALWAYS resolve to Windows

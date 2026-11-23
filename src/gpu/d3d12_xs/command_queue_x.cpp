@@ -1026,7 +1026,15 @@ CommandQueueX::CommandQueueX(
     QueryPerformanceFrequency(&freq);
     qpc_freq_ = freq.QuadPart;
 
-    if (device_x_) device_x_->AddRef();
+    if (device_x_) {
+        device_x_->AddRef();
+        // Retail Xbox Series X games present at full 1080p/4K interactively; disable per-frame
+        // CPU PCIe readback + FNV1a hashing by default unless explicitly requested via
+        // SetReadbackCaptureEnabled(TRUE) or OPENSCARLETT_PRESENTX_CAPTURE_PNG.
+        if (device_x_->IsRetailScarlettAbi()) {
+            readback_capture_enabled_ = false;
+        }
+    }
     if (host_queue_) {
         host_queue_->AddRef();
         queue_type_ = host_queue_->GetDesc().Type;
@@ -1360,12 +1368,16 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
     std::vector<uint64_t> pending_writeback_vas;
     std::vector<DeferredCpuWrite32> deferred_writes;
     std::vector<DeferredCpuWait> deferred_waits;
+    UINT valid_list_count = 0u;
     for (UINT i = 0; i < NumCommandLists; ++i) {
-        raw_lists[i] = CommandListX::UnwrapHostList(ppCommandLists[i]);
         if (CommandListX* clx = CommandListX::TryFromCommandList(ppCommandLists[i])) {
+            if (clx->LastCloseFailed()) {
+                continue;  // Never pass an unclosed/invalid command list to host D3D12 queue
+            }
             clx->ExtractPendingMirrorWritebacks(pending_writeback_vas);
             clx->ExtractDeferredCpuOps(deferred_writes, deferred_waits);
         }
+        raw_lists[valid_list_count++] = CommandListX::UnwrapHostList(ppCommandLists[i]);
     }
 
     // Enforce any CPU/mirrored Wait32BitValueX / Wait64BitValueX recorded on command lists.
@@ -1379,10 +1391,52 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
     }
 
     if (const auto hook = submit_hook_.load(std::memory_order_acquire)) {
-        hook(host_queue_, NumCommandLists, raw_lists, submit_hook_ctx_.load(std::memory_order_acquire));
+        hook(host_queue_, valid_list_count, raw_lists, submit_hook_ctx_.load(std::memory_order_acquire));
     }
 
-    host_queue_->ExecuteCommandLists(NumCommandLists, raw_lists);
+    if (valid_list_count > 0u) {
+        host_queue_->ExecuteCommandLists(valid_list_count, raw_lists);
+    }
+    if (device_x_ && CommandListX::IsDiagTraceEnabled() && device_x_->HostDevice()) {
+        // Flush this submission immediately so GetDeviceRemovedReason pinpoints the exact offending list.
+        static std::mutex s_diag_mu;
+        static std::atomic<bool> s_dumped{false};
+        if (!s_dumped.load(std::memory_order_acquire)) {
+            ID3D12Fence* tmp_fence = nullptr;
+            if (SUCCEEDED(device_x_->HostDevice()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&tmp_fence))) && tmp_fence) {
+                if (SUCCEEDED(host_queue_->Signal(tmp_fence, 1))) {
+                    HANDLE ev = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                    if (ev) {
+                        if (tmp_fence->GetCompletedValue() < 1) {
+                            tmp_fence->SetEventOnCompletion(1, ev);
+                            ::WaitForSingleObject(ev, 5000);
+                        }
+                        ::CloseHandle(ev);
+                    }
+                }
+                tmp_fence->Release();
+            }
+            const HRESULT rem_hr = device_x_->HostDevice()->GetDeviceRemovedReason();
+            if (FAILED(rem_hr) && !s_dumped.exchange(true)) {
+                std::lock_guard<std::mutex> dlk(s_diag_mu);
+                FILE* f = nullptr;
+                if (::fopen_s(&f, CommandListX::DiagTraceLogPath(), "a") == 0 && f) {
+                    std::fprintf(f, "\n=== DEVICE REMOVED AFTER ExecuteCommandLists(n=%u, valid=%u, queue_type=%d) hr=0x%08X ===\n",
+                                 NumCommandLists, valid_list_count, static_cast<int>(queue_type_), static_cast<unsigned>(rem_hr));
+                    for (UINT i = 0; i < NumCommandLists; ++i) {
+                        if (CommandListX* clx = CommandListX::TryFromCommandList(ppCommandLists[i])) {
+                            const auto ops = clx->CopyDiagOps();
+                            std::fprintf(f, "--- List[%u] (%zu ops) ---\n", i, ops.size());
+                            for (const auto& op : ops) {
+                                std::fprintf(f, "  %s\n", op.c_str());
+                            }
+                        }
+                    }
+                    std::fclose(f);
+                }
+            }
+        }
+    }
 
     // Schedule fence-tracked GPU->CPU writeback for any TitleVAMirror resources written by these lists.
     if (device_x_ && !pending_writeback_vas.empty() &&
@@ -1789,7 +1843,7 @@ void STDMETHODCALLTYPE CommandQueueX::EndEvent() {
 
 HRESULT STDMETHODCALLTYPE CommandQueueX::Signal(ID3D12Fence* pFence, UINT64 Value) {
     const HRESULT hr = host_queue_->Signal(UnwrapFence(pFence), Value);
-    {
+    if (device_x_ && device_x_->HasMirroredTitleVaRegions()) {
         std::lock_guard<std::mutex> lock(present_mutex_);
         PumpMirrorReadbackCompletionLocked();
     }
@@ -1799,7 +1853,7 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::Signal(ID3D12Fence* pFence, UINT64 Valu
 
 HRESULT STDMETHODCALLTYPE CommandQueueX::Wait(ID3D12Fence* pFence, UINT64 Value) {
     const HRESULT hr = host_queue_->Wait(UnwrapFence(pFence), Value);
-    {
+    if (device_x_ && device_x_->HasMirroredTitleVaRegions()) {
         std::lock_guard<std::mutex> lock(present_mutex_);
         PumpMirrorReadbackCompletionLocked();
     }
@@ -2024,7 +2078,8 @@ HRESULT CommandQueueX::EnsurePresentHelperObjectsLocked() {
         }
     }
 
-    if (present_alloc_ && present_cmd_ && present_fence_ && present_fence_event_) {
+    if (present_alloc_ && present_cmd_ && present_fence_ && present_fence_event_ &&
+        present_ring_allocs_[kPresentRingSlots - 1u] && present_ring_cmds_[kPresentRingSlots - 1u]) {
         return S_OK;
     }
     ID3D12Device* dev = device_x_->HostDevice();
@@ -2039,6 +2094,18 @@ HRESULT CommandQueueX::EnsurePresentHelperObjectsLocked() {
             0, list_type, present_alloc_, nullptr, IID_PPV_ARGS(&present_cmd_));
         if (FAILED(hr)) return hr;
         present_cmd_->Close();
+    }
+    for (uint32_t i = 0u; i < kPresentRingSlots; ++i) {
+        if (!present_ring_allocs_[i]) {
+            HRESULT hr = dev->CreateCommandAllocator(list_type, IID_PPV_ARGS(&present_ring_allocs_[i]));
+            if (FAILED(hr)) return hr;
+        }
+        if (!present_ring_cmds_[i]) {
+            HRESULT hr = dev->CreateCommandList(
+                0, list_type, present_ring_allocs_[i], nullptr, IID_PPV_ARGS(&present_ring_cmds_[i]));
+            if (FAILED(hr)) return hr;
+            present_ring_cmds_[i]->Close();
+        }
     }
     if (!present_fence_) {
         HRESULT hr = dev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&present_fence_));
@@ -2476,6 +2543,12 @@ void CommandQueueX::ReleasePresentObjectsLocked() {
     ReleaseSwapChainLocked();
     if (tonemap_upload_buf_) { tonemap_upload_buf_->Release(); tonemap_upload_buf_ = nullptr; }
     if (readback_buf_) { readback_buf_->Release(); readback_buf_ = nullptr; }
+    for (uint32_t i = 0u; i < kPresentRingSlots; ++i) {
+        if (present_ring_cmds_[i]) { present_ring_cmds_[i]->Release(); present_ring_cmds_[i] = nullptr; }
+        if (present_ring_allocs_[i]) { present_ring_allocs_[i]->Release(); present_ring_allocs_[i] = nullptr; }
+        present_ring_fences_[i] = 0ull;
+    }
+    present_ring_idx_ = 0u;
     if (present_cmd_) { present_cmd_->Release(); present_cmd_ = nullptr; }
     if (present_alloc_) { present_alloc_->Release(); present_alloc_ = nullptr; }
     if (present_fence_) { present_fence_->Release(); present_fence_ = nullptr; }
@@ -2614,8 +2687,11 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
     const bool use_swapchain = (target_hwnd != nullptr && IsWindow(target_hwnd) != FALSE);
 
     bool window_minimized = false;
-    uint32_t target_bb_width = width;
-    uint32_t target_bb_height = height;
+    // Size the DXGI flip-model swapchain (DXGI_SCALING_STRETCH) to match the presented
+    // Xbox source plane (width x height) so CopyTextureRegion fills 100% of the backbuffer
+    // and DWM hardware-scales edge-to-edge in windowed/borderless-fullscreen with zero black bars.
+    const uint32_t target_bb_width = width;
+    const uint32_t target_bb_height = height;
     if (use_swapchain) {
         AttachWindowSubclassLocked(target_hwnd);
         RECT cr{};
@@ -2628,10 +2704,6 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
         const bool cb_min =
             window_state_ ? window_state_->is_minimized.load(std::memory_order_acquire) : false;
         window_minimized = iconic || cb_min || (cw == 0u || ch == 0u);
-        if (!window_minimized) {
-            target_bb_width = cw;
-            target_bb_height = ch;
-        }
     }
 
     const bool vk_routing_active =
@@ -2702,13 +2774,36 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
         }
     }
 
+    const bool async_swapchain_fast_path =
+        direct_bb_copy_compatible && !need_readback && !need_tonemap_bb_upload && !vk_routing_active;
+    uint32_t active_ring_slot = 0u;
+
     if (direct_bb_copy_compatible || need_readback) {
-        hr = present_alloc_->Reset();
+        ID3D12CommandAllocator* active_alloc = present_alloc_;
+        ID3D12GraphicsCommandList* active_cmd = present_cmd_;
+        if (async_swapchain_fast_path) {
+            active_ring_slot = present_ring_idx_ % kPresentRingSlots;
+            present_ring_idx_ = (present_ring_idx_ + 1u) % kPresentRingSlots;
+            active_alloc = present_ring_allocs_[active_ring_slot];
+            active_cmd = present_ring_cmds_[active_ring_slot];
+            const uint64_t slot_wait_val = present_ring_fences_[active_ring_slot];
+            if (slot_wait_val > 0ull && present_fence_->GetCompletedValue() < slot_wait_val) {
+                if (SUCCEEDED(present_fence_->SetEventOnCompletion(slot_wait_val, present_fence_event_))) {
+                    WaitForSingleObject(present_fence_event_, 15000u);
+                }
+            }
+        } else if (present_fence_val_ > 0ull && present_fence_->GetCompletedValue() < present_fence_val_) {
+            if (SUCCEEDED(present_fence_->SetEventOnCompletion(present_fence_val_, present_fence_event_))) {
+                WaitForSingleObject(present_fence_event_, 15000u);
+            }
+        }
+
+        hr = active_alloc->Reset();
         if (FAILED(hr)) {
             RecordQueue("ID3D12CommandQueueX::PresentX", 19, hr);
             return hr;
         }
-        hr = present_cmd_->Reset(present_alloc_, nullptr);
+        hr = active_cmd->Reset(active_alloc, nullptr);
         if (FAILED(hr)) {
             RecordQueue("ID3D12CommandQueueX::PresentX", 19, hr);
             return hr;
@@ -2722,7 +2817,7 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
             to_copy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
             to_copy.Transition.StateBefore = caller_state;
             to_copy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-            present_cmd_->ResourceBarrier(1, &to_copy);
+            active_cmd->ResourceBarrier(1, &to_copy);
         }
 
         D3D12_TEXTURE_COPY_LOCATION src_loc{};
@@ -2746,7 +2841,7 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
                 bb_to_dst.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
                 bb_to_dst.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
                 bb_to_dst.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-                present_cmd_->ResourceBarrier(1, &bb_to_dst);
+                active_cmd->ResourceBarrier(1, &bb_to_dst);
 
                 if (copy_w > 0u && copy_h > 0u) {
                     D3D12_TEXTURE_COPY_LOCATION bb_dst{};
@@ -2762,7 +2857,7 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
                     src_box.bottom = copy_h;
                     src_box.back = 1u;
 
-                    present_cmd_->CopyTextureRegion(&bb_dst, 0, 0, 0, &src_loc, &src_box);
+                    active_cmd->CopyTextureRegion(&bb_dst, 0, 0, 0, &src_loc, &src_box);
                 }
 
                 D3D12_RESOURCE_BARRIER bb_to_present{};
@@ -2771,7 +2866,7 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
                 bb_to_present.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
                 bb_to_present.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
                 bb_to_present.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
-                present_cmd_->ResourceBarrier(1, &bb_to_present);
+                active_cmd->ResourceBarrier(1, &bb_to_present);
             }
         }
 
@@ -2780,7 +2875,7 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
             rb_dst.pResource = readback_buf_;
             rb_dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
             rb_dst.PlacedFootprint = footprint;
-            present_cmd_->CopyTextureRegion(&rb_dst, 0, 0, 0, &src_loc, nullptr);
+            active_cmd->CopyTextureRegion(&rb_dst, 0, 0, 0, &src_loc, nullptr);
         }
 
         // Restore plane 0 back to caller_state.
@@ -2791,10 +2886,10 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
             back_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
             back_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
             back_barrier.Transition.StateAfter = caller_state;
-            present_cmd_->ResourceBarrier(1, &back_barrier);
+            active_cmd->ResourceBarrier(1, &back_barrier);
         }
 
-        hr = present_cmd_->Close();
+        hr = active_cmd->Close();
         if (backbuffer) {
             backbuffer->Release();
             backbuffer = nullptr;
@@ -2804,7 +2899,7 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
             return hr;
         }
 
-        ID3D12CommandList* cmd_lists[] = {present_cmd_};
+        ID3D12CommandList* cmd_lists[] = {active_cmd};
         host_queue_->ExecuteCommandLists(1, cmd_lists);
     }
 
@@ -2975,13 +3070,30 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
     }
 
     // Phase 1: GPU Fence Signaling & Synchronization (separated from DXGI/Vulkan presentation).
+    // For interactive swapchain presents without readback, signal our ring fence asynchronously
+    // WITHOUT draining the GPU to idle so CPU and GPU pipeline concurrently at full frame rate.
     int64_t fence_sig_qpc = 0;
     double fence_wait_us = 0.0;
     uint64_t fence_completed_val = 0ull;
-    hr = WaitForInternalFenceWithTimingLocked(&fence_sig_qpc, &fence_wait_us, &fence_completed_val);
-    if (FAILED(hr)) {
-        RecordQueue("ID3D12CommandQueueX::PresentX", 19, hr);
-        return hr;
+    if (async_swapchain_fast_path) {
+        const uint64_t slot_val = ++present_fence_val_;
+        fence_sig_qpc = QueryQpcNow();
+        hr = host_queue_->Signal(present_fence_, slot_val);
+        if (FAILED(hr)) {
+            RecordQueue("ID3D12CommandQueueX::PresentX", 19, hr);
+            return hr;
+        }
+        present_ring_fences_[active_ring_slot] = slot_val;
+        fence_completed_val = present_fence_->GetCompletedValue();
+        if (device_x_ && device_x_->HasMirroredTitleVaRegions()) {
+            (void)device_x_->GetTitleVaMirror().CompleteReadbacksOnFence(fence_completed_val);
+        }
+    } else {
+        hr = WaitForInternalFenceWithTimingLocked(&fence_sig_qpc, &fence_wait_us, &fence_completed_val);
+        if (FAILED(hr)) {
+            RecordQueue("ID3D12CommandQueueX::PresentX", 19, hr);
+            return hr;
+        }
     }
 
     if (has_vk_direct_rt_fb) {

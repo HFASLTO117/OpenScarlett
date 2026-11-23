@@ -89,6 +89,7 @@ set(_openscarlett_known_targets
     AcpHal
     xapu
     dstorage_xs
+    dxcompiler_xs
     Microsoft.Xbox.Services.GDK.C
     pixevt
     xmem
@@ -162,6 +163,7 @@ set(_openscarlett_known_targets
     ScarlettDoom
     test_scarlett_game_live
     test_mine_xapu_acphal
+    test_minecraft_perf_hardening
     test_mine_d3d12_xmem
     test_mine_routing_apisets
     test_s15_rdna2_bench_trap_harness

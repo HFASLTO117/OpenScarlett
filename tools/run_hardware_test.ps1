@@ -179,6 +179,11 @@ $TestDescriptions = @{
     'test_s15_shader_peer_parity.exe'  = 'Sprint 15 ds_swizzle 4-mode, PC-rel branch, signed SMEM/pinned FLAT/LDS D16, Wave64, Blackwell/NaN & SPIR-V 1.2 dynamic indexing'
     'test_s15_graphics_xg_bc6h.exe'    = 'Sprint 15 oversized placed-tex promotion, global UAV barriers, MSAA clamp, DXGIX notifications, Vk GPU ranking, XG 3D mip tails & bit-exact BC6H/TTPF'
     'test_s15_loader_vfs_gdk_shims.exe' = 'Sprint 15 XML entities, host-preserving VFS/ReplaceFileW/ANSI/delay-load, XAsync callback wait, GDK ABI, KernelX/XMemFree(nullptr) & ETW controller'
+    'test_ue5_dxc_xcrdapi_xg.exe'      = 'UE5 Scarlett bringup: dxcompiler_xs DxcCreateInstance/2, XCRDAPI DStorageGetFactory & xg_xs XGCreateTextureComputer (1D/2D/3D)'
+    'test_ue5_d3d12_exports.exe'       = 'UE5 Scarlett bringup: 42 byte-exact IID_ID3D12* GUID data exports & 9 D3D12Xbox* process/device/frame helpers'
+    'test_ue5_acphal_xmem_mfplat.exe'  = 'UE5 Scarlett bringup: AcpHal thread-safe APU heap, XMem allocation hooks & 46 System32 MFPlat forwarded exports'
+    'test_ue5_probe_static_stub.exe'   = 'UE5 Scarlett bringup: dxcompiler_xs routing, --probe-unknown-imports PE32+ static stub synthesis & Launcher report copy'
+    'test_ue5_matrix_import_bringup.exe' = 'UE5 Matrix Awakens E2E: isolated 7-DLL guest PE (zero guest DLLs) booted via openscarlett run on HW GPU & WARP (0 missing exports)'
 }
 
 Write-Host ''

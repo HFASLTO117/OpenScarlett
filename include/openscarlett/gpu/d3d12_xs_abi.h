@@ -110,6 +110,35 @@ enum D3D12XBOX_PREDICATION_FLAGS : uint32_t {
     D3D12XBOX_PREDICATION_FLAG_INVERT = 0x1u,
 };
 
+enum D3D12XBOX_PROCESS_GPU_PRIORITY : uint32_t {
+    D3D12XBOX_PROCESS_GPU_PRIORITY_LOW = 0u,
+    D3D12XBOX_PROCESS_GPU_PRIORITY_NORMAL = 1u,
+    D3D12XBOX_PROCESS_GPU_PRIORITY_HIGH = 2u,
+    D3D12XBOX_PROCESS_GPU_PRIORITY_REALTIME = 3u,
+};
+
+enum D3D12XBOX_PROCESS_MEMORY_PRIORITY : uint32_t {
+    D3D12XBOX_PROCESS_MEMORY_PRIORITY_LOW = 0u,
+    D3D12XBOX_PROCESS_MEMORY_PRIORITY_NORMAL = 1u,
+    D3D12XBOX_PROCESS_MEMORY_PRIORITY_HIGH = 2u,
+};
+
+struct D3D12XBOX_FRAME_INTERVAL_STATE {
+    uint32_t PeriodMicroseconds = D3D12XBOX_FRAME_INTERVAL_60_HZ;
+    uint32_t MaxFrameLatency = 2u;
+    uint32_t Flags = 0u;
+    uint64_t UpdateCount = 0ull;
+};
+
+struct D3D12XBOX_DISPLAY_MODE {
+    uint32_t Width = 1920u;
+    uint32_t Height = 1080u;
+    uint32_t RefreshRateNumerator = 60u;
+    uint32_t RefreshRateDenominator = 1u;
+    DXGI_FORMAT Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    DXGI_COLOR_SPACE_TYPE ColorSpace = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+};
+
 // Xbox GFX10 texture layout tag base in D3D12_RESOURCE_DESC::Layout (0x100 + XG_TILE_MODE).
 inline constexpr uint32_t D3D12XBOX_TEXTURE_LAYOUT_GFX10_BASE = 0x100u;
 
@@ -888,6 +917,50 @@ OPENSCARLETT_D3D12_API HRESULT WINAPI DXGIXSetVLineNotification(
 OPENSCARLETT_D3D12_API HRESULT WINAPI DXGIXSetFrameNotification(
     UINT FrameCounter,
     HANDLE hEvent);
+
+// Xbox GDKX process priority, active device lookup, frame pacing & error reporting helpers.
+OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxSetProcessGpuPriority(
+    D3D12XBOX_PROCESS_GPU_PRIORITY Priority);
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxGetProcessGpuPriority(
+    D3D12XBOX_PROCESS_GPU_PRIORITY* pOutPriority);
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxSetProcessMemoryPriority(
+    D3D12XBOX_PROCESS_MEMORY_PRIORITY Priority);
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxGetProcessMemoryPriority(
+    D3D12XBOX_PROCESS_MEMORY_PRIORITY* pOutPriority);
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxGetDevice(
+    REFIID riid,
+    void** ppDevice);
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxSetFrameInterval(
+    IDXGIOutput* pOutput,
+    uint32_t PeriodMicroseconds,
+    uint32_t MaxFrameLatency,
+    uint32_t Flags);
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxReportError(
+    HRESULT ErrorCode,
+    const char* Message);
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxSetGpuTimeLimit(
+    uint32_t TimeLimitMicroseconds);
+
+OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxGetDisplayMode(
+    D3D12XBOX_DISPLAY_MODE* pOutMode);
+
+// OpenScarlett diagnostic inspection helpers for shim-managed Xbox process/frame/error state.
+OPENSCARLETT_D3D12_API HRESULT WINAPI OpenScarlettD3D12GetFrameIntervalState(
+    D3D12XBOX_FRAME_INTERVAL_STATE* out_state);
+
+OPENSCARLETT_D3D12_API uint32_t WINAPI OpenScarlettD3D12GetGpuTimeLimit();
+
+OPENSCARLETT_D3D12_API uint64_t WINAPI OpenScarlettD3D12GetReportedErrorCount(
+    HRESULT* out_last_hr);
+
+OPENSCARLETT_D3D12_API void WINAPI OpenScarlettD3D12ResetTrackedDevice();
 
 }  // extern "C"
 

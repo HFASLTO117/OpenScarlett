@@ -159,6 +159,7 @@ def collect_dlls(build_dir: pathlib.Path) -> list[DllInfo]:
         ("XAudio2_9.dll", "high", 11, "Live WASAPI, 64+ voices, submix/reverb APOs, XMA2/Opus/ADPCM & X3DAudio"),
         ("GameInput.dll", "high", 7, "XInput + KB + Raw Input mouse, hot-plug device callbacks & impulse-trigger rumble"),
         ("dstorage_xs.dll", "high", 6, "GDeflate v1 + BCPack, request cancellation & physical-page targets"),
+        ("dxcompiler_xs.dll", "high", 3, "DxcCreateInstance/2 dynamic forwarding to bundled dxcompiler.dll + telemetry"),
         ("d3d12_xs.dll", "partial", 48, "3/13 COM proxies (DeviceX/QueueX/CmdListX), HDR10 PresentX, early Vulkan routing"),
         ("libHttpClient.GDK.dll", "partial", 21, "Offline/HTTP request queue & XAsync lifecycle"),
         ("mfplat_xs.dll", "partial", 16, "MFResetDXGIDeviceManagerX & session scaffolding (H.264/HEVC HW decode pending)"),
@@ -182,7 +183,7 @@ def collect_dlls(build_dir: pathlib.Path) -> list[DllInfo]:
         ("xtfdebugmonitor.dll", "stub", 7, "XTF debug monitor stubs"),
     ]
 
-    # Auto-upgrade tiers when Sprint 9/10/14 implementations land!
+    # Auto-upgrade tiers when Sprint 9/10/14/UE5 implementations land!
     has_proxies = has("tests/test_d3d12_xs_proxies_multiqueue.cpp")
     has_mf_hw = has("tests/test_media_video_gameinput.cpp")
     has_s14_ffx = has("tests/test_s14_p0_shims_ffx_config.cpp")
@@ -191,6 +192,8 @@ def collect_dlls(build_dir: pathlib.Path) -> list[DllInfo]:
     has_s15_shims = has("tests/test_s15_loader_vfs_gdk_shims.cpp")
     has_s15_gfx = has("tests/test_s15_graphics_xg_bc6h.cpp")
     has_mine_xapu = has("tests/test_mine_xapu_acphal.cpp")
+    has_mine_perf = has("tests/test_minecraft_perf_hardening.cpp")
+    has_ue5 = has("tests/test_ue5_matrix_import_bringup.cpp")
 
     out: list[DllInfo] = []
     for name, tier, fallback_exp, note in catalog:
@@ -203,13 +206,17 @@ def collect_dlls(build_dir: pathlib.Path) -> list[DllInfo]:
         if name == "d3d12_xs.dll" and has_proxies:
             tier = "high"
             note = (
-                "Full Xbox COM proxies (incl. retail Scarlett ABI & Resource1/2/Heap1), Agility SDK, Enhanced Barriers, oversized placed-tex promotion, live MSAA clamp, DXGIX vline/frame notifications, live VRAM residency, HDR10 PresentX & Vulkan routing"
-                if has_s15_gfx
-                else "Full Xbox COM proxies (incl. Resource1/2, Heap1), Agility SDK, Enhanced Barriers, live VRAM residency, HDR10 PresentX & Vulkan routing"
+                "Full Xbox COM proxies (retail Scarlett ABI, Resource1/2/Heap1), lock-free 64 MiB CBV align ring + L0 WRITE_BACK upload buffers, async 3-slot PresentX ring, cached barrier unwrap, 42 IID_ID3D12* GUID exports, D3D12Xbox* helpers, Agility SDK, Enhanced Barriers, oversized placed-tex promotion, live MSAA clamp, VRAM residency, HDR10 & Vulkan routing"
+                if (has_s15_gfx and has_ue5 and has_mine_perf)
+                else (
+                    "Full Xbox COM proxies (incl. retail Scarlett ABI & Resource1/2/Heap1), 42 IID_ID3D12* GUID exports, D3D12Xbox* helpers, Agility SDK, Enhanced Barriers, oversized placed-tex promotion, live MSAA clamp, DXGIX vline/frame notifications, live VRAM residency, HDR10 PresentX & Vulkan routing"
+                    if (has_s15_gfx and has_ue5)
+                    else "Full Xbox COM proxies (incl. Resource1/2, Heap1), Agility SDK, Enhanced Barriers, live VRAM residency, HDR10 PresentX & Vulkan routing"
+                )
             )
-        if name == "AcpHal.dll" and has_mine_xapu:
+        if name == "AcpHal.dll" and (has_mine_xapu or has_ue5):
             tier = "high"
-            note = "Retail Xbox AcpHal APU heap, shape/audio DSP queue & FMOD audio middleware ABI"
+            note = "Thread-safe APU cached/non-cached heap (checked 64-bit ranges, transactional SHAPE rollback), shape/XMA2 audio DSP & FMOD audio middleware ABI"
         if name == "KernelTraceControl.dll" and has_s15_shims:
             tier = "partial"
             note = "Non-admin in-memory ETW trace session controller (StartTrace/ControlTrace/EnableTraceEx2/rundown)"
@@ -218,7 +225,18 @@ def collect_dlls(build_dir: pathlib.Path) -> list[DllInfo]:
             note = "PIX begin/end event markers & in-memory ETW capture session controller"
         if name == "mfplat_xs.dll" and has_mf_hw:
             tier = "high"
-            note = "H.264/HEVC D3D12 Media Foundation decode + IMFDXGIDeviceManager lifecycle"
+            note = (
+                "H.264/HEVC D3D12 decode, IMFDXGIDeviceManager + 46 System32 MFPlat forwarded exports"
+                if has_ue5
+                else "H.264/HEVC D3D12 Media Foundation decode + IMFDXGIDeviceManager lifecycle"
+            )
+        if name == "xg_xs.dll" and has_ue5:
+            note = "15 2D + 6 3D GFX10 tile modes, XGCreateTextureComputer (1D/2D/3D), HTILE/DCC/CMASK & GPU compute untiling"
+        if name == "xcrdapi.dll" and has_ue5:
+            tier = "high"
+            note = "Console DirectStorage (DStorageGetFactory/SetConfiguration*) forwarding, breadcrumbs & container staging"
+        if name == "xmem.dll" and has_ue5:
+            note = "XMemAlloc/Free/Default, XMemSetAllocationHooks, XMemCheckDefaultHeaps, 2-arg working set stats, XMemTransferMemory & virtual query"
         if name == "XboxBvhBuilder.dll" and has_s14_bvh:
             tier = "high"
             note = "Real C++ XboxBvhBuilder ABI (24 mangled + 9 C exports), dual-path BVH4 rehydration & SAH BVH"
@@ -283,6 +301,8 @@ def collect_components(
     has_media = has("tests/test_media_video_gameinput.cpp")
     has_probe_veh = has("src/loader/probe_veh.cpp")
     has_launcher = has("tests/test_launcher_updater.cpp")
+    has_mine_perf = has("tests/test_minecraft_perf_hardening.cpp")
+    has_live_profiler = has("tools/os_live_profiler.cpp")
 
     rdna2_pct = min(100, int(round(100.0 * opcodes_decoded / max(1, opcodes_total))))
     gfx_score = sum(1.0 if t.status == "live" else (0.5 if t.status == "partial" else 0.0) for t in trans_items)
@@ -299,7 +319,7 @@ def collect_components(
     media_pct = 68 + (25 if has_media else 0)
     loader_pct = 85 + (12 if has_probe_veh else 0)
     launcher_pct = (90 + (8 if has_probe_veh else 0)) if has_launcher else 40
-    compat_pct = 40 if has("tests/test_gdkx_untouched_samples.cpp") else 20
+    compat_pct = 50 if has_mine_perf else (40 if has("tests/test_gdkx_untouched_samples.cpp") else 20)
 
     corpus_note = f", {corpus_passed}/{corpus_total} corpus shaders validated" if corpus_total else ""
     winrt_exports = count_exports("include/openscarlett/winrt/winrt_abi.h", "OPENSCARLETT_WINRT_API")
@@ -440,40 +460,62 @@ def collect_components(
             ),
         ),
         Component(
-            short_name="Windows Launcher GUI & 60s Tester",
+            short_name="Windows Launcher GUI & Live Profiler",
             plain_summary=(
-                "Native Win32/D2D GUI, First-Boot Probe, 60s HW tester & SHA-256 updater"
-                if has_probe_veh
-                else "Native Win32/D2D app launcher, integrated 60s HW tester & BCrypt SHA-256 updater"
+                "Win32/D2D GUI, First-Boot Probe, 60s HW tester, os_live_profiler & updater"
+                if (has_probe_veh and has_live_profiler)
+                else (
+                    "Native Win32/D2D GUI, First-Boot Probe, 60s HW tester & SHA-256 updater"
+                    if has_probe_veh
+                    else "Native Win32/D2D app launcher, integrated 60s HW tester & BCrypt SHA-256 updater"
+                )
             ),
-            tech_name="Native Win32/Direct2D `OpenScarlettLauncher.exe` + Opt-In SHA-256 Updater",
+            tech_name="Native Win32/Direct2D `OpenScarlettLauncher.exe`, `os_live_profiler` & Opt-In SHA-256 Updater",
             area="UX & Tools",
             stage="Live Verified" if has_launcher else "In Progress",
             pill_label="Live Verified" if has_launcher else "In Progress",
             pct=launcher_pct,
             what_works=(
-                "Native Win32/Direct2D launcher with embedded scarlet icon, GPU telemetry strip, Play & Launch tab with First-Boot Probe mode & one-click Copy Sanitized Telemetry, integrated 60s Hardware Self-Test, PE32+ Binary Inspector, and opt-in WinHTTP + BCrypt SHA-256 verified GitHub updater."
-                if has_probe_veh
-                else "Native Win32/Direct2D launcher with GPU telemetry strip, Play & Launch tab, integrated 60s Hardware Self-Test, PE32+ Binary Inspector, and opt-in WinHTTP + BCrypt SHA-256 verified GitHub updater (First-Boot Probe UI next)."
+                "Native Win32/Direct2D launcher with embedded scarlet icon, GPU telemetry strip, Play & Launch tab with First-Boot Probe mode & one-click Copy Sanitized Telemetry, integrated 60s Hardware Self-Test, PE32+ Binary Inspector, opt-in WinHTTP + BCrypt SHA-256 verified GitHub updater, and `os_live_profiler` (`tools/profile_live.cmd`) for 1 Hz CPU/RAM/GPU 3D%/VRAM telemetry + 200 Hz 24-frame x64 call-stack hotspot sampling."
+                if (has_probe_veh and has_live_profiler)
+                else (
+                    "Native Win32/Direct2D launcher with embedded scarlet icon, GPU telemetry strip, Play & Launch tab with First-Boot Probe mode & one-click Copy Sanitized Telemetry, integrated 60s Hardware Self-Test, PE32+ Binary Inspector, and opt-in WinHTTP + BCrypt SHA-256 verified GitHub updater."
+                    if has_probe_veh
+                    else "Native Win32/Direct2D launcher with GPU telemetry strip, Play & Launch tab, integrated 60s Hardware Self-Test, PE32+ Binary Inspector, and opt-in WinHTTP + BCrypt SHA-256 verified GitHub updater (First-Boot Probe UI next)."
+                )
             ),
             verified_on=(
-                "Win10 & Win11 26H2 (`test_launcher_updater`, `test_probe_veh_capture` + AMD RX 9070 XT live report #14)"
-                if has_probe_veh
-                else "Win10 & Win11 26H2 (`test_launcher_updater` + AMD RX 9070 XT live report #14)"
+                "Win10 & Win11 26H2 (`test_launcher_updater`, `test_probe_veh_capture`, live 60s `os_live_profiler` Minecraft 3D gameplay capture + AMD RX 9070 XT live report #14)"
+                if (has_probe_veh and has_live_profiler)
+                else (
+                    "Win10 & Win11 26H2 (`test_launcher_updater`, `test_probe_veh_capture` + AMD RX 9070 XT live report #14)"
+                    if has_probe_veh
+                    else "Win10 & Win11 26H2 (`test_launcher_updater` + AMD RX 9070 XT live report #14)"
+                )
             ),
         ),
         Component(
             short_name="Real-World Game Compatibility",
-            plain_summary="6/6 untouched GDKX samples & Freedoom live · Minecraft & UE5 in bring-up",
-            tech_name="Real-World Title Compatibility (Untouched GDKX Samples, Playable Demos & Active Bring-Up)",
+            plain_summary=(
+                "Minecraft Preview 60 FPS 3D live · 6/6 GDKX samples · UE5 in bring-up"
+                if has_mine_perf
+                else "6/6 untouched GDKX samples & Freedoom live · Minecraft & UE5 in bring-up"
+            ),
+            tech_name="Real-World Title Compatibility (Minecraft Preview 60 FPS, Untouched GDKX Samples & Active Bring-Up)",
             area="Compatibility",
             stage="Partial",
-            pill_label="Active Bring-Up",
+            pill_label="Minecraft 60 FPS" if has_mine_perf else "Active Bring-Up",
             pct=compat_pct,
             what_works=(
-                "Live **6/6 untouched MIT `_GAMING_XBOX_SCARLETT` samples** at 4K, 60 FPS **Freedoom: Phase 1**, `ScarlettArena`, shadowed/skinned BC1+BC3 3D dual-API GDK scene (`gdk_3d_scene`), shipping commercial GDK thunks (`Alexandria IV DEMO`, `0 E_NOINTERFACE`), and next-gen flagship open-world AAA gap audit closed on `main`. Active commercial bring-up underway on **Minecraft (Xbox Series Preview)** and **UE5 (*The Matrix Awakens*)** — join Discord to help test real unpacked GDKs!"
+                "Live **retail Xbox Series X Minecraft Preview (`1.18.3064.0`)** booting to menus, saving/loading LevelDB worlds on `P:\\`, and rendering flicker-free 3D worlds at **locked 60 FPS** (12-chunk render distance, 8× AA, Fancy Graphics, edge-to-edge borderless fullscreen) on GTX 1650 Ti (~14% CPU, ~40% spare render headroom; `OPENSCARLETT_FCAP=0` for uncapped FPS); live **6/6 untouched MIT `_GAMING_XBOX_SCARLETT` samples** at 4K; 60 FPS **Freedoom: Phase 1** & `ScarlettArena`; shadowed/skinned BC1+BC3 3D dual-API GDK scene (`gdk_3d_scene`); shipping commercial GDK thunks (`Alexandria IV DEMO`, `0 E_NOINTERFACE`); and 7-DLL **UE5 (*The Matrix Awakens*)** import surface merged with active runtime bring-up underway."
+                if has_mine_perf
+                else "Live **6/6 untouched MIT `_GAMING_XBOX_SCARLETT` samples** at 4K, 60 FPS **Freedoom: Phase 1**, `ScarlettArena`, shadowed/skinned BC1+BC3 3D dual-API GDK scene (`gdk_3d_scene`), shipping commercial GDK thunks (`Alexandria IV DEMO`, `0 E_NOINTERFACE`), and next-gen flagship open-world AAA gap audit closed on `main`. Active commercial bring-up underway on **Minecraft (Xbox Series Preview)** and **UE5 (*The Matrix Awakens*)** — join Discord to help test real unpacked GDKs!"
             ),
-            verified_on="GTX 1650 Ti + WARP + 10 community NVIDIA/AMD PCs (`test_gdkx_untouched_samples`, `test_scarlett_game_live`, `test_gdk_3d_scene_dual_api`, `test_real_gdk_thunks_live`, `test_mine_xapu_acphal`)",
+            verified_on=(
+                "GTX 1650 Ti + WARP + 10 community NVIDIA/AMD PCs (live retail Minecraft Preview `1.18.3064.0`, `test_minecraft_perf_hardening`, `test_mine_xapu_acphal`, `test_ue5_matrix_import_bringup`, `test_gdkx_untouched_samples`, `test_scarlett_game_live`, `test_gdk_3d_scene_dual_api`, `test_real_gdk_thunks_live`)"
+                if has_mine_perf
+                else "GTX 1650 Ti + WARP + 10 community NVIDIA/AMD PCs (`test_gdkx_untouched_samples`, `test_scarlett_game_live`, `test_gdk_3d_scene_dual_api`, `test_real_gdk_thunks_live`, `test_mine_xapu_acphal`)"
+            ),
         ),
     ]
 

@@ -597,6 +597,24 @@ private:
     void RecordMirroredResourceGpuWrite(ID3D12Resource* host_resource);
 
     // Sprint 13 placed tiled texture transient buffers & bridge helpers (Leonida #1674)
+    static constexpr uint32_t kAlignedStagingRingSlots = 4u;
+    struct AlignedStagingSlot {
+        ID3D12Resource* buffer = nullptr;
+        UINT64 capacity = 0ull;
+        UINT64 cursor = 0ull;
+        D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
+        std::vector<ID3D12Resource*> retired_buffers;
+    };
+    AlignedStagingSlot aligned_staging_ring_[kAlignedStagingRingSlots]{};
+    uint32_t aligned_staging_slot_idx_ = 0u;
+    bool AcquireAlignedStagingSlice(
+        UINT64 required_bytes,
+        ID3D12Resource*& out_buf,
+        UINT64& out_offset,
+        D3D12_RESOURCE_STATES& out_current_state);
+    void TransitionAlignedStagingState(D3D12_RESOURCE_STATES new_state);
+    void ReleaseAlignedStagingRing();
+
     std::mutex tiled_transient_mutex_;
     std::vector<ID3D12Resource*> tiled_transient_resources_;
     void TrackTiledTransientResource(ID3D12Resource* res);
@@ -622,6 +640,18 @@ private:
         UINT num_barriers,
         const D3D12_RESOURCE_BARRIER* unwrapped_barriers,
         std::vector<D3D12_RESOURCE_BARRIER>& extra_coherency_barriers);
+
+public:
+    static bool IsDiagTraceEnabled() noexcept;
+    static const char* DiagTraceLogPath() noexcept;
+    void AppendDiagOp(std::string op);
+    std::vector<std::string> CopyDiagOps() const;
+    bool LastCloseFailed() const noexcept { return last_close_failed_.load(std::memory_order_acquire); }
+
+private:
+    std::atomic<bool> last_close_failed_{false};
+    mutable std::mutex diag_ops_mutex_;
+    std::vector<std::string> diag_ops_;
 
     // Sprint 14 Enhanced Barriers telemetry & diagnostics
     std::atomic<uint64_t> eb_barrier_calls_{0ull};

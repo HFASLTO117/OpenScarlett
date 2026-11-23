@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <new>
@@ -312,6 +313,19 @@ inline void RecordDev(const char* method, int32_t slot, HRESULT hr = S_OK) {
         outcome = openscarlett::CallOutcome::NotImplemented;
     } else if (FAILED(hr)) {
         outcome = openscarlett::CallOutcome::Error;
+        if (hr != E_NOINTERFACE && hr != DXGI_ERROR_NOT_FOUND && CommandListX::IsDiagTraceEnabled()) {
+            static std::mutex s_dev_log_mu;
+            static std::atomic<uint32_t> s_fail_lines{0u};
+            if (s_fail_lines.fetch_add(1u, std::memory_order_relaxed) < 200u) {
+                std::lock_guard<std::mutex> lk(s_dev_log_mu);
+                FILE* f = nullptr;
+                if (::fopen_s(&f, CommandListX::DiagTraceLogPath(), "a") == 0 && f) {
+                    std::fprintf(f, "[DeviceX:FAIL] %s slot=%d hr=0x%08X\n",
+                                 method, slot, static_cast<unsigned>(hr));
+                    std::fclose(f);
+                }
+            }
+        }
     }
     openscarlett::CallTelemetry::Global().Record(
         kModule,
@@ -1806,12 +1820,29 @@ void DeviceX::NotifyResourceDestroyed(ID3D12Resource* host_resource) noexcept {
     UntrackLiveResidencyObject(static_cast<ID3D12Pageable*>(host_resource));
     sampler_feedback_mgr_.NotifyResourceDestroyed(host_resource);
     {
-        std::lock_guard<std::mutex> lock(buffer_va_mutex_);
-        buffer_va_map_.erase(host_resource);
+        std::unique_lock<std::shared_mutex> lock(buffer_va_mutex_);
+        auto it = buffer_va_map_.find(host_resource);
+        if (it != buffer_va_map_.end()) {
+            if (it->second.owns_persistent_map && it->second.mapped_cpu_ptr) {
+                D3D12_RANGE no_write{0u, 0u};
+                host_resource->Unmap(0u, &no_write);
+            }
+            if (it->second.gpu_va != 0ull) {
+                auto git = buffer_va_by_gpu_.find(it->second.gpu_va);
+                if (git != buffer_va_by_gpu_.end() && git->second == host_resource) {
+                    buffer_va_by_gpu_.erase(git);
+                }
+            }
+            buffer_va_map_.erase(it);
+            buffer_va_gen_.fetch_add(1ull, std::memory_order_release);
+        }
     }
-    {
+    if (tile_mode_count_.load(std::memory_order_acquire) != 0u) {
         std::lock_guard<std::mutex> lock(tile_mode_mutex_);
-        resource_tile_modes_.erase(host_resource);
+        if (resource_tile_modes_.erase(host_resource) > 0u) {
+            tile_mode_count_.store(
+                static_cast<uint32_t>(resource_tile_modes_.size()), std::memory_order_release);
+        }
     }
     {
         uint64_t mirrored_va = 0ull;
@@ -2170,13 +2201,13 @@ DeviceX::~DeviceX() {
     {
         std::lock_guard<std::mutex> lock(cbv_align_mutex_);
         if (cbv_align_ring_) {
-            if (cbv_align_ring_cpu_) {
+            if (cbv_align_ring_cpu_.load(std::memory_order_relaxed)) {
                 cbv_align_ring_->Unmap(0u, nullptr);
-                cbv_align_ring_cpu_ = nullptr;
+                cbv_align_ring_cpu_.store(nullptr, std::memory_order_release);
             }
             cbv_align_ring_->Release();
             cbv_align_ring_ = nullptr;
-            cbv_align_ring_gpu_ = 0ull;
+            cbv_align_ring_gpu_.store(0ull, std::memory_order_release);
         }
     }
     {
@@ -3290,15 +3321,26 @@ HRESULT STDMETHODCALLTYPE DeviceX::CheckFeatureSupport(
 
 HRESULT STDMETHODCALLTYPE DeviceX::CreateDescriptorHeap(
     const D3D12_DESCRIPTOR_HEAP_DESC* pDescriptorHeapDesc, REFIID riid, void** ppvHeap) {
+    D3D12_DESCRIPTOR_HEAP_DESC clean_desc{};
+    const D3D12_DESCRIPTOR_HEAP_DESC* eff_desc = pDescriptorHeapDesc;
+    if (pDescriptorHeapDesc &&
+        (pDescriptorHeapDesc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV ||
+         pDescriptorHeapDesc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_DSV) &&
+        (pDescriptorHeapDesc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0) {
+        clean_desc = *pDescriptorHeapDesc;
+        clean_desc.Flags = static_cast<D3D12_DESCRIPTOR_HEAP_FLAGS>(
+            clean_desc.Flags & ~D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE);
+        eff_desc = &clean_desc;
+    }
     if (!ppvHeap) {
-        const HRESULT hr = host_dev_->CreateDescriptorHeap(pDescriptorHeapDesc, riid, nullptr);
+        const HRESULT hr = host_dev_->CreateDescriptorHeap(eff_desc, riid, nullptr);
         RecordDev("ID3D12DeviceX::CreateDescriptorHeap", 14, hr);
         return hr;
     }
     *ppvHeap = nullptr;
     ID3D12DescriptorHeap* host_heap = nullptr;
     HRESULT hr = host_dev_->CreateDescriptorHeap(
-        pDescriptorHeapDesc, OS_D3D12_IID(ID3D12DescriptorHeap), reinterpret_cast<void**>(&host_heap));
+        eff_desc, OS_D3D12_IID(ID3D12DescriptorHeap), reinterpret_cast<void**>(&host_heap));
     if (FAILED(hr) || !host_heap) {
         RecordDev("ID3D12DeviceX::CreateDescriptorHeap", 14, hr);
         return hr;
@@ -3781,12 +3823,25 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommittedResource(
     D3D12_HEAP_PROPERTIES eff_heap_props{};
     const D3D12_HEAP_PROPERTIES* eff_heap_ptr = pHeapProperties;
     bool did_l0_spill = false;
+    bool try_wb_upload_promote = false;
     if (should_spill_l0 && pHeapProperties) {
         eff_heap_props = *pHeapProperties;
         eff_heap_props.Type = D3D12_HEAP_TYPE_CUSTOM;
         eff_heap_props.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
         eff_heap_props.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
         eff_heap_ptr = &eff_heap_props;
+    } else if (retail_scarlett_abi_ && pHeapProperties &&
+               pHeapProperties->Type == D3D12_HEAP_TYPE_UPLOAD &&
+               desc_ptr && desc_ptr->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        // Retail Xbox titles bind unaligned root CBVs out of UPLOAD buffers; promoting retail
+        // UPLOAD buffers to L0 WRITE_BACK cached RAM avoids 500x slower Write-Combined CPU reads
+        // during desktop 256-byte CBV alignment while keeping identical GPU L0 PCIe visibility.
+        eff_heap_props = *pHeapProperties;
+        eff_heap_props.Type = D3D12_HEAP_TYPE_CUSTOM;
+        eff_heap_props.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+        eff_heap_props.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+        eff_heap_ptr = &eff_heap_props;
+        try_wb_upload_promote = true;
     }
 
     ID3D12Resource* host_res = nullptr;
@@ -3795,8 +3850,8 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommittedResource(
         clear_ptr, OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
     if (should_spill_l0 && SUCCEEDED(hr) && host_res) {
         did_l0_spill = true;
-    } else if (should_spill_l0 && (FAILED(hr) || !host_res)) {
-        // Adapter rejected L0 custom pool for this resource; fall back cleanly to original heap props.
+    } else if ((should_spill_l0 || try_wb_upload_promote) && (FAILED(hr) || !host_res)) {
+        // Adapter rejected custom L0 pool for this resource; fall back cleanly to original heap props.
         hr = host_dev_->CreateCommittedResource(
             pHeapProperties, clean_heap_flags, desc_ptr, InitialResourceState,
             clear_ptr, OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
@@ -3871,12 +3926,23 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateHeap(
     D3D12_HEAP_DESC eff_heap{};
     const D3D12_HEAP_DESC* eff_heap_ptr = heap_ptr;
     bool did_l0_spill = false;
+    bool try_wb_upload_promote = false;
     if (should_spill_l0 && heap_ptr) {
         eff_heap = *heap_ptr;
         eff_heap.Properties.Type = D3D12_HEAP_TYPE_CUSTOM;
         eff_heap.Properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
         eff_heap.Properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
         eff_heap_ptr = &eff_heap;
+    } else if (retail_scarlett_abi_ && heap_ptr &&
+               heap_ptr->Properties.Type == D3D12_HEAP_TYPE_UPLOAD) {
+        // Promote retail UPLOAD heaps to L0 WRITE_BACK cached RAM so placed CBV buffers
+        // support full-speed L1/L2/L3 cached CPU reads during 256-byte root CBV alignment.
+        eff_heap = *heap_ptr;
+        eff_heap.Properties.Type = D3D12_HEAP_TYPE_CUSTOM;
+        eff_heap.Properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+        eff_heap.Properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+        eff_heap_ptr = &eff_heap;
+        try_wb_upload_promote = true;
     }
 
     ID3D12Heap* host_heap = nullptr;
@@ -3884,7 +3950,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateHeap(
         eff_heap_ptr, OS_D3D12_IID(ID3D12Heap), reinterpret_cast<void**>(&host_heap));
     if (should_spill_l0 && SUCCEEDED(hr) && host_heap) {
         did_l0_spill = true;
-    } else if (should_spill_l0 && (FAILED(hr) || !host_heap)) {
+    } else if ((should_spill_l0 || try_wb_upload_promote) && (FAILED(hr) || !host_heap)) {
         hr = host_dev_->CreateHeap(
             heap_ptr, OS_D3D12_IID(ID3D12Heap), reinterpret_cast<void**>(&host_heap));
     }
@@ -5505,11 +5571,30 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommittedResource1(
         return hr;
     }
     *ppvResource = nullptr;
+    D3D12_HEAP_PROPERTIES eff_hp{};
+    const D3D12_HEAP_PROPERTIES* eff_hp_ptr = pHeapProperties;
+    bool try_wb_promote = false;
+    if (retail_scarlett_abi_ && pHeapProperties &&
+        pHeapProperties->Type == D3D12_HEAP_TYPE_UPLOAD &&
+        desc_ptr && desc_ptr->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        eff_hp = *pHeapProperties;
+        eff_hp.Type = D3D12_HEAP_TYPE_CUSTOM;
+        eff_hp.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+        eff_hp.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+        eff_hp_ptr = &eff_hp;
+        try_wb_promote = true;
+    }
     ID3D12Resource* host_res = nullptr;
     HRESULT hr = host_dev4_->CreateCommittedResource1(
-        pHeapProperties, clean_heap_flags, desc_ptr, InitialResourceState,
+        eff_hp_ptr, clean_heap_flags, desc_ptr, InitialResourceState,
         clear_ptr, pProtectedSession,
         OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
+    if (try_wb_promote && (FAILED(hr) || !host_res)) {
+        hr = host_dev4_->CreateCommittedResource1(
+            pHeapProperties, clean_heap_flags, desc_ptr, InitialResourceState,
+            clear_ptr, pProtectedSession,
+            OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
+    }
     if (FAILED(hr) || !host_res) {
         RecordDev("ID3D12DeviceX::CreateCommittedResource1", 53, hr);
         return hr;
@@ -5527,6 +5612,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommittedResource1(
             /*is_placed_suballocation=*/false,
             /*spilled_to_l0=*/false,
             sparse_va);
+        TrackBufferVaResource(host_res, *desc_ptr, 0ull);
     }
     TrackFallbackResource(host_res, did_r9g9b9e5_fallback);
     if (vulkan_routing_active_ && pHeapProperties && desc_ptr) {
@@ -5568,10 +5654,27 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateHeap1(
         return hr;
     }
     *ppvHeap = nullptr;
+    D3D12_HEAP_DESC eff_heap{};
+    const D3D12_HEAP_DESC* eff_heap_ptr = heap_ptr;
+    bool try_wb_promote = false;
+    if (retail_scarlett_abi_ && heap_ptr &&
+        heap_ptr->Properties.Type == D3D12_HEAP_TYPE_UPLOAD) {
+        eff_heap = *heap_ptr;
+        eff_heap.Properties.Type = D3D12_HEAP_TYPE_CUSTOM;
+        eff_heap.Properties.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+        eff_heap.Properties.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+        eff_heap_ptr = &eff_heap;
+        try_wb_promote = true;
+    }
     ID3D12Heap* host_heap = nullptr;
     HRESULT hr = host_dev4_->CreateHeap1(
-        heap_ptr, pProtectedSession,
+        eff_heap_ptr, pProtectedSession,
         OS_D3D12_IID(ID3D12Heap), reinterpret_cast<void**>(&host_heap));
+    if (try_wb_promote && (FAILED(hr) || !host_heap)) {
+        hr = host_dev4_->CreateHeap1(
+            heap_ptr, pProtectedSession,
+            OS_D3D12_IID(ID3D12Heap), reinterpret_cast<void**>(&host_heap));
+    }
     if (FAILED(hr) || !host_heap) {
         RecordDev("ID3D12DeviceX::CreateHeap1", 54, hr);
         return hr;
@@ -6213,17 +6316,43 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommittedResource2(
         return hr;
     }
 
+    D3D12_HEAP_PROPERTIES eff_hp2{};
+    const D3D12_HEAP_PROPERTIES* eff_hp2_ptr = pHeapProperties;
+    bool try_wb_promote2 = false;
+    if (retail_scarlett_abi_ && pHeapProperties &&
+        pHeapProperties->Type == D3D12_HEAP_TYPE_UPLOAD &&
+        desc1_ptr && desc1_ptr->Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+        eff_hp2 = *pHeapProperties;
+        eff_hp2.Type = D3D12_HEAP_TYPE_CUSTOM;
+        eff_hp2.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_WRITE_BACK;
+        eff_hp2.MemoryPoolPreference = D3D12_MEMORY_POOL_L0;
+        eff_hp2_ptr = &eff_hp2;
+        try_wb_promote2 = true;
+    }
+
     if (host_dev8_) {
         hr = host_dev8_->CreateCommittedResource2(
-            pHeapProperties, clean_hf, desc1_ptr,
+            eff_hp2_ptr, clean_hf, desc1_ptr,
             InitialResourceState, pOptimizedClearValue, pProtectedSession,
             OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
+        if (try_wb_promote2 && (FAILED(hr) || !host_res)) {
+            hr = host_dev8_->CreateCommittedResource2(
+                pHeapProperties, clean_hf, desc1_ptr,
+                InitialResourceState, pOptimizedClearValue, pProtectedSession,
+                OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
+        }
     } else if (desc1_ptr) {
         const D3D12_RESOURCE_DESC d0 = Desc1ToDesc0(*desc1_ptr);
         hr = host_dev_->CreateCommittedResource(
-            pHeapProperties, clean_hf, &d0,
+            eff_hp2_ptr, clean_hf, &d0,
             InitialResourceState, pOptimizedClearValue,
             OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
+        if (try_wb_promote2 && (FAILED(hr) || !host_res)) {
+            hr = host_dev_->CreateCommittedResource(
+                pHeapProperties, clean_hf, &d0,
+                InitialResourceState, pOptimizedClearValue,
+                OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
+        }
     }
     if (SUCCEEDED(hr) && host_res && ppvResource) {
         const D3D12_RESOURCE_DESC d0 = desc1_ptr ? Desc1ToDesc0(*desc1_ptr) : D3D12_RESOURCE_DESC{};
@@ -7653,8 +7782,44 @@ void DeviceX::TrackBufferVaResource(
     if (!host_res || desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return;
     const D3D12_GPU_VIRTUAL_ADDRESS gpu_va = host_res->GetGPUVirtualAddress();
     if (gpu_va == 0ull && guest_va == 0ull) return;
-    std::lock_guard<std::mutex> lock(buffer_va_mutex_);
-    buffer_va_map_[host_res] = TrackedBufferVa{gpu_va, desc.Width, guest_va};
+
+    // For CPU-accessible upload/custom-L0 buffers, establish a single persistent Map() once
+    // at creation time so AlignRootCbvGpuVaForDesktop never calls GetHeapProperties/Map/Unmap
+    // per draw call.
+    const uint8_t* mapped_cpu = nullptr;
+    bool owns_map = false;
+    D3D12_HEAP_PROPERTIES hp{};
+    if (SUCCEEDED(host_res->GetHeapProperties(&hp, nullptr)) &&
+        (hp.Type == D3D12_HEAP_TYPE_UPLOAD ||
+         (hp.Type == D3D12_HEAP_TYPE_CUSTOM &&
+          hp.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE))) {
+        void* p = nullptr;
+        D3D12_RANGE zero_read{0u, 0u};
+        if (SUCCEEDED(host_res->Map(0u, &zero_read, &p)) && p) {
+            mapped_cpu = static_cast<const uint8_t*>(p);
+            owns_map = true;
+        }
+    }
+
+    std::unique_lock<std::shared_mutex> lock(buffer_va_mutex_);
+    auto existing = buffer_va_map_.find(host_res);
+    if (existing != buffer_va_map_.end()) {
+        if (existing->second.owns_persistent_map && existing->second.mapped_cpu_ptr) {
+            D3D12_RANGE no_write{0u, 0u};
+            host_res->Unmap(0u, &no_write);
+        }
+        if (existing->second.gpu_va != 0ull) {
+            auto git = buffer_va_by_gpu_.find(existing->second.gpu_va);
+            if (git != buffer_va_by_gpu_.end() && git->second == host_res) {
+                buffer_va_by_gpu_.erase(git);
+            }
+        }
+    }
+    buffer_va_map_[host_res] = TrackedBufferVa{gpu_va, desc.Width, guest_va, mapped_cpu, owns_map};
+    if (gpu_va != 0ull) {
+        buffer_va_by_gpu_[gpu_va] = host_res;
+    }
+    buffer_va_gen_.fetch_add(1ull, std::memory_order_release);
 }
 
 ID3D12Resource* DeviceX::ResolveBufferResourceByGpuVa(
@@ -7662,13 +7827,19 @@ ID3D12Resource* DeviceX::ResolveBufferResourceByGpuVa(
     if (out_offset_bytes) *out_offset_bytes = 0ull;
     if (va == 0ull) return nullptr;
     const D3D12_GPU_VIRTUAL_ADDRESS translated = TranslateGuestGpuVa(va);
-    std::lock_guard<std::mutex> lock(buffer_va_mutex_);
-    for (const auto& [res, entry] : buffer_va_map_) {
-        if (entry.gpu_va != 0ull && translated >= entry.gpu_va &&
-            translated < entry.gpu_va + entry.size_bytes) {
-            if (out_offset_bytes) *out_offset_bytes = translated - entry.gpu_va;
-            return res;
+    std::shared_lock<std::shared_mutex> lock(buffer_va_mutex_);
+    auto git = buffer_va_by_gpu_.upper_bound(translated);
+    if (git != buffer_va_by_gpu_.begin()) {
+        --git;
+        auto mit = buffer_va_map_.find(git->second);
+        if (mit != buffer_va_map_.end() &&
+            translated >= mit->second.gpu_va &&
+            translated < mit->second.gpu_va + mit->second.size_bytes) {
+            if (out_offset_bytes) *out_offset_bytes = translated - mit->second.gpu_va;
+            return git->second;
         }
+    }
+    for (const auto& [res, entry] : buffer_va_map_) {
         if (entry.guest_va != 0ull && va >= entry.guest_va &&
             va < entry.guest_va + entry.size_bytes) {
             if (out_offset_bytes) *out_offset_bytes = va - entry.guest_va;
@@ -7684,43 +7855,16 @@ D3D12_GPU_VIRTUAL_ADDRESS DeviceX::AlignRootCbvGpuVaForDesktop(
         return translated_va;
     }
 
-    ID3D12Resource* src_res = nullptr;
-    uint64_t src_offset = 0ull;
-    uint64_t src_total_size = 0ull;
-    {
-        std::lock_guard<std::mutex> lock(buffer_va_mutex_);
-        for (const auto& [res, entry] : buffer_va_map_) {
-            if (entry.gpu_va != 0ull && translated_va >= entry.gpu_va &&
-                translated_va < entry.gpu_va + entry.size_bytes) {
-                src_res = res;
-                src_res->AddRef();
-                src_offset = translated_va - entry.gpu_va;
-                src_total_size = entry.size_bytes;
-                break;
-            }
-        }
-    }
-    if (!src_res || src_offset >= src_total_size) {
-        if (src_res) src_res->Release();
-        return translated_va & ~255ull;
-    }
-
     constexpr uint64_t kSlotBytes = 4096ull;
-    constexpr uint32_t kSlotCount = 8192u;  // 32 MiB ring
+    constexpr uint32_t kSlotCount = 16384u;  // 64 MiB lock-free ring (power of 2)
     constexpr uint64_t kRingBytes = kSlotBytes * kSlotCount;
-    const uint64_t copy_bytes = std::min<uint64_t>(kSlotBytes, src_total_size - src_offset);
 
-    D3D12_GPU_VIRTUAL_ADDRESS aligned_gpu_va = translated_va & ~255ull;
-    D3D12_HEAP_PROPERTIES hp{};
-    const bool is_cpu_readable =
-        SUCCEEDED(src_res->GetHeapProperties(&hp, nullptr)) &&
-        (hp.Type == D3D12_HEAP_TYPE_UPLOAD ||
-         (hp.Type == D3D12_HEAP_TYPE_CUSTOM &&
-          hp.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE));
-
-    if (is_cpu_readable) {
+    uint8_t* ring_cpu = cbv_align_ring_cpu_.load(std::memory_order_acquire);
+    D3D12_GPU_VIRTUAL_ADDRESS ring_gpu = cbv_align_ring_gpu_.load(std::memory_order_relaxed);
+    if (!ring_cpu) {
         std::lock_guard<std::mutex> ring_lock(cbv_align_mutex_);
-        if (!cbv_align_ring_) {
+        ring_cpu = cbv_align_ring_cpu_.load(std::memory_order_relaxed);
+        if (!ring_cpu) {
             D3D12_HEAP_PROPERTIES up_hp{};
             up_hp.Type = D3D12_HEAP_TYPE_UPLOAD;
             D3D12_RESOURCE_DESC rdesc{};
@@ -7741,40 +7885,82 @@ D3D12_GPU_VIRTUAL_ADDRESS DeviceX::AlignRootCbvGpuVaForDesktop(
                 D3D12_RANGE zero_read{0u, 0u};
                 if (SUCCEEDED(ring->Map(0u, &zero_read, &mapped_ring)) && mapped_ring) {
                     cbv_align_ring_ = ring;
-                    cbv_align_ring_cpu_ = static_cast<uint8_t*>(mapped_ring);
-                    cbv_align_ring_gpu_ = ring->GetGPUVirtualAddress();
+                    ring_gpu = ring->GetGPUVirtualAddress();
+                    ring_cpu = static_cast<uint8_t*>(mapped_ring);
+                    cbv_align_ring_gpu_.store(ring_gpu, std::memory_order_relaxed);
+                    cbv_align_ring_cpu_.store(ring_cpu, std::memory_order_release);
                 } else {
                     ring->Release();
                 }
             }
+        } else {
+            ring_gpu = cbv_align_ring_gpu_.load(std::memory_order_relaxed);
         }
-        if (cbv_align_ring_ && cbv_align_ring_cpu_) {
-            void* src_mapped = nullptr;
-            D3D12_RANGE read_range{
-                static_cast<SIZE_T>(src_offset),
-                static_cast<SIZE_T>(src_offset + copy_bytes)};
-            if (SUCCEEDED(src_res->Map(0u, &read_range, &src_mapped)) && src_mapped) {
-                const uint32_t slot = cbv_align_ring_cursor_++ % kSlotCount;
-                const uint64_t slot_off = static_cast<uint64_t>(slot) * kSlotBytes;
-                std::memcpy(
-                    cbv_align_ring_cpu_ + slot_off,
-                    static_cast<const uint8_t*>(src_mapped) + src_offset,
-                    static_cast<size_t>(copy_bytes));
-                if (copy_bytes < kSlotBytes) {
-                    const uint64_t pad_end = std::min<uint64_t>((copy_bytes + 255ull) & ~255ull, kSlotBytes);
-                    if (pad_end > copy_bytes) {
-                        std::memset(cbv_align_ring_cpu_ + slot_off + copy_bytes, 0,
-                                    static_cast<size_t>(pad_end - copy_bytes));
-                    }
-                }
-                D3D12_RANGE no_write{0u, 0u};
-                src_res->Unmap(0u, &no_write);
-                aligned_gpu_va = cbv_align_ring_gpu_ + slot_off;
+    }
+    if (!ring_cpu || ring_gpu == 0ull) {
+        return translated_va & ~255ull;
+    }
+
+    // Concurrent shared-lock read across all command-list recording threads + per-thread
+    // last-hit cache (O(1) hit for 99.9% of dynamic CBV draws) and O(log N) upper_bound fallback.
+    struct ThreadLocalBufHint {
+        const DeviceX* dev = nullptr;
+        uint64_t gen = 0ull;
+        uint64_t gpu_va = 0ull;
+        uint64_t size_bytes = 0ull;
+        const uint8_t* mapped_cpu = nullptr;
+    };
+    static thread_local ThreadLocalBufHint tl_hint{};
+
+    std::shared_lock<std::shared_mutex> slock(buffer_va_mutex_);
+    const uint64_t cur_gen = buffer_va_gen_.load(std::memory_order_acquire);
+    const uint8_t* src_cpu = nullptr;
+    uint64_t src_offset = 0ull;
+    uint64_t src_total_size = 0ull;
+
+    if (tl_hint.dev == this && tl_hint.gen == cur_gen && tl_hint.mapped_cpu != nullptr &&
+        translated_va >= tl_hint.gpu_va &&
+        translated_va < tl_hint.gpu_va + tl_hint.size_bytes) {
+        src_cpu = tl_hint.mapped_cpu;
+        src_offset = translated_va - tl_hint.gpu_va;
+        src_total_size = tl_hint.size_bytes;
+    } else {
+        auto git = buffer_va_by_gpu_.upper_bound(translated_va);
+        if (git != buffer_va_by_gpu_.begin()) {
+            --git;
+            auto mit = buffer_va_map_.find(git->second);
+            if (mit != buffer_va_map_.end() &&
+                mit->second.mapped_cpu_ptr != nullptr &&
+                translated_va >= mit->second.gpu_va &&
+                translated_va < mit->second.gpu_va + mit->second.size_bytes) {
+                src_cpu = mit->second.mapped_cpu_ptr;
+                src_offset = translated_va - mit->second.gpu_va;
+                src_total_size = mit->second.size_bytes;
+                tl_hint.dev = this;
+                tl_hint.gen = cur_gen;
+                tl_hint.gpu_va = mit->second.gpu_va;
+                tl_hint.size_bytes = mit->second.size_bytes;
+                tl_hint.mapped_cpu = src_cpu;
             }
         }
     }
-    src_res->Release();
-    return aligned_gpu_va;
+
+    if (!src_cpu || src_offset >= src_total_size) {
+        return translated_va & ~255ull;
+    }
+
+    const uint64_t copy_bytes = std::min<uint64_t>(kSlotBytes, src_total_size - src_offset);
+    const uint32_t slot = cbv_align_ring_cursor_.fetch_add(1u, std::memory_order_relaxed) & (kSlotCount - 1u);
+    const uint64_t slot_off = static_cast<uint64_t>(slot) * kSlotBytes;
+    std::memcpy(ring_cpu + slot_off, src_cpu + src_offset, static_cast<size_t>(copy_bytes));
+    if (copy_bytes < kSlotBytes) {
+        const uint64_t pad_end = std::min<uint64_t>((copy_bytes + 255ull) & ~255ull, kSlotBytes);
+        if (pad_end > copy_bytes) {
+            std::memset(ring_cpu + slot_off + copy_bytes, 0,
+                        static_cast<size_t>(pad_end - copy_bytes));
+        }
+    }
+    return ring_gpu + slot_off;
 }
 
 bool DeviceX::LookupMirroredTitleVaForResource(
@@ -7868,6 +8054,9 @@ HRESULT DeviceX::FlushMirroredTitleVaPagesOnQueue(
 }
 
 XG_TILE_MODE DeviceX::GetTrackedResourceTileMode(ID3D12Resource* host_resource) const noexcept {
+    if (!host_resource || tile_mode_count_.load(std::memory_order_acquire) == 0u) {
+        return XG_TILE_MODE_LINEAR;
+    }
     host_resource = UnwrapResource(host_resource);
     if (!host_resource) return XG_TILE_MODE_LINEAR;
     std::lock_guard<std::mutex> lock(tile_mode_mutex_);
@@ -7884,6 +8073,8 @@ void DeviceX::SetTrackedResourceTileMode(ID3D12Resource* host_resource, XG_TILE_
     } else {
         resource_tile_modes_[host_resource] = mode;
     }
+    tile_mode_count_.store(
+        static_cast<uint32_t>(resource_tile_modes_.size()), std::memory_order_release);
 }
 
 bool DeviceX::EnsureXgGpuUntilerReady() {
@@ -7930,8 +8121,16 @@ void DeviceX::ReleaseAaaRuntimeObjects() {
         mirrored_va_count_.store(0u, std::memory_order_release);
     }
     {
-        std::lock_guard<std::mutex> lock(buffer_va_mutex_);
+        std::unique_lock<std::shared_mutex> lock(buffer_va_mutex_);
+        for (auto& [res, entry] : buffer_va_map_) {
+            if (res && entry.owns_persistent_map && entry.mapped_cpu_ptr) {
+                D3D12_RANGE no_write{0u, 0u};
+                res->Unmap(0u, &no_write);
+            }
+        }
         buffer_va_map_.clear();
+        buffer_va_by_gpu_.clear();
+        buffer_va_gen_.fetch_add(1ull, std::memory_order_release);
     }
     {
         std::lock_guard<std::mutex> lock(tile_mode_mutex_);
@@ -8102,7 +8301,9 @@ HRESULT DeviceX::RecordUntileUploadOnCommandList(
     D3D12_HEAP_PROPERTIES src_hp{};
     D3D12_HEAP_FLAGS src_hf = D3D12_HEAP_FLAG_NONE;
     if (FAILED(src_loc.pResource->GetHeapProperties(&src_hp, &src_hf)) ||
-        src_hp.Type != D3D12_HEAP_TYPE_UPLOAD) {
+        (src_hp.Type != D3D12_HEAP_TYPE_UPLOAD &&
+         !(src_hp.Type == D3D12_HEAP_TYPE_CUSTOM &&
+           src_hp.CPUPageProperty != D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE))) {
         return E_FAIL;
     }
 
@@ -8801,11 +9002,16 @@ void DeviceX::PrepareResidencyBudgetForAllocation(
     const uint64_t budget = EffectiveResidencyBudgetBytesLocked();
     if (budget == 0ull) return;
 
-    if (tracked_resident_bytes_ + requested_bytes > budget) {
+    // Only auto-evict live tracked objects via host ID3D12Device::Evict when an explicit
+    // synthetic residency budget override is active (unit tests). In real gameplay, calling
+    // Evict() on older resident resources/heaps without per-command-list MakeResident() causes
+    // WDDM/GPU page faults -> DXGI_ERROR_INVALID_CALL / DXGI_ERROR_DEVICE_REMOVED; WDDM
+    // already safely pages over-budget DEFAULT allocations and L0 spill keeps new cold buffers resident.
+    if (residency_budget_override_bytes_ > 0ull && tracked_resident_bytes_ + requested_bytes > budget) {
         const uint64_t over = (tracked_resident_bytes_ + requested_bytes) - budget;
         (void)EvictLruVictimsLocked(over, nullptr);
     }
-    // If still over budget after evicting eligible LRU victims, spill this cold allocation to L0 system RAM!
+    // If still over budget, spill this cold allocation to L0 system RAM (only when override or >95% full).
     if (allow_l0_spill && (tracked_resident_bytes_ + requested_bytes > budget)) {
         out_should_spill_l0 = true;
     }

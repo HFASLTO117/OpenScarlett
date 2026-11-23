@@ -13,8 +13,13 @@ namespace {
 
 struct ProxyRegistryEntry {
     D3D12XProxyKind kind = D3D12XProxyKind::Unknown;
+    uint8_t flags = 0u;  // Bit 0: has_barrier_info, Bit 1: upload_or_readback, Bit 2: is_buffer
     IUnknown* host_obj = nullptr;
 };
+
+constexpr uint8_t kProxyFlagHasBarrierInfo = 1u << 0;
+constexpr uint8_t kProxyFlagUploadOrReadback = 1u << 1;
+constexpr uint8_t kProxyFlagIsBuffer = 1u << 2;
 
 struct ProxyRegistryShard {
     std::shared_mutex mutex;
@@ -33,11 +38,11 @@ std::array<ProxyRegistryShard, kProxyShardCount>& GetProxyShards() {
     return shards;
 }
 
-void RegisterProxy(const void* proxy_ptr, D3D12XProxyKind kind, IUnknown* host_obj) noexcept {
+void RegisterProxy(const void* proxy_ptr, D3D12XProxyKind kind, IUnknown* host_obj, uint8_t flags = 0u) noexcept {
     if (!proxy_ptr) return;
     auto& shard = GetProxyShards()[ShardIndex(proxy_ptr)];
     std::unique_lock<std::shared_mutex> lock(shard.mutex);
-    shard.map[proxy_ptr] = ProxyRegistryEntry{kind, host_obj};
+    shard.map[proxy_ptr] = ProxyRegistryEntry{kind, flags, host_obj};
 }
 
 void UnregisterProxy(const void* proxy_ptr) noexcept {
@@ -67,6 +72,28 @@ ID3D12Resource* UnwrapResource(ID3D12Resource* maybe_wrapped) noexcept {
     ProxyRegistryEntry entry{};
     if (LookupProxy(static_cast<const void*>(maybe_wrapped), entry) &&
         entry.kind == D3D12XProxyKind::Resource) {
+        return static_cast<ID3D12Resource*>(entry.host_obj);
+    }
+    return maybe_wrapped;
+}
+
+ID3D12Resource* UnwrapResourceWithBarrierInfo(
+    ID3D12Resource* maybe_wrapped,
+    bool& out_has_cached_info,
+    bool& out_is_upload_or_readback,
+    bool& out_is_buffer) noexcept {
+    out_has_cached_info = false;
+    out_is_upload_or_readback = false;
+    out_is_buffer = false;
+    if (!maybe_wrapped) return nullptr;
+    ProxyRegistryEntry entry{};
+    if (LookupProxy(static_cast<const void*>(maybe_wrapped), entry) &&
+        entry.kind == D3D12XProxyKind::Resource) {
+        if ((entry.flags & kProxyFlagHasBarrierInfo) != 0u) {
+            out_has_cached_info = true;
+            out_is_upload_or_readback = (entry.flags & kProxyFlagUploadOrReadback) != 0u;
+            out_is_buffer = (entry.flags & kProxyFlagIsBuffer) != 0u;
+        }
         return static_cast<ID3D12Resource*>(entry.host_obj);
     }
     return maybe_wrapped;
@@ -228,7 +255,18 @@ ResourceXProxy::ResourceXProxy(
         cached_heap_props_ = *heap_props_hint;
         has_cached_heap_props_ = true;
     }
-    RegisterProxy(static_cast<const ID3D12Resource*>(this), D3D12XProxyKind::Resource, host_res_);
+    uint8_t barrier_flags = 0u;
+    if (has_cached_heap_props_) {
+        barrier_flags |= kProxyFlagHasBarrierInfo;
+        if (cached_heap_props_.Type == D3D12_HEAP_TYPE_UPLOAD ||
+            cached_heap_props_.Type == D3D12_HEAP_TYPE_READBACK) {
+            barrier_flags |= kProxyFlagUploadOrReadback;
+        }
+        if (cached_desc_.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            barrier_flags |= kProxyFlagIsBuffer;
+        }
+    }
+    RegisterProxy(static_cast<const ID3D12Resource*>(this), D3D12XProxyKind::Resource, host_res_, barrier_flags);
     if (device_x_ && device_x_->IsRetailScarlettAbi()) {
         static void* s_res_retail_vtbl[17]{};
         static std::once_flag s_res_once;
