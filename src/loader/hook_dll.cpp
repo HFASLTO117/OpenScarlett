@@ -121,6 +121,11 @@ using PfnDeleteFileW = BOOL(WINAPI*)(LPCWSTR);
 using PfnMoveFileExW = BOOL(WINAPI*)(LPCWSTR, LPCWSTR, DWORD);
 using PfnRemoveDirectoryW = BOOL(WINAPI*)(LPCWSTR);
 using PfnFindFirstFileW = HANDLE(WINAPI*)(LPCWSTR, LPWIN32_FIND_DATAW);
+using PfnFindFirstFileExW = HANDLE(WINAPI*)(LPCWSTR, FINDEX_INFO_LEVELS, LPVOID, FINDEX_SEARCH_OPS, LPVOID, DWORD);
+using PfnGetDiskFreeSpaceExW = BOOL(WINAPI*)(LPCWSTR, PULARGE_INTEGER, PULARGE_INTEGER, PULARGE_INTEGER);
+using PfnGetDiskFreeSpaceW = BOOL(WINAPI*)(LPCWSTR, LPDWORD, LPDWORD, LPDWORD, LPDWORD);
+using PfnSetCurrentDirectoryA = BOOL(WINAPI*)(LPCSTR);
+using PfnSetCurrentDirectoryW = BOOL(WINAPI*)(LPCWSTR);
 using PfnCreateProcessA = BOOL(WINAPI*)(LPCSTR,
                                         LPSTR,
                                         LPSECURITY_ATTRIBUTES,
@@ -164,6 +169,11 @@ PfnDeleteFileW g_real_DeleteFileW = nullptr;
 PfnMoveFileExW g_real_MoveFileExW = nullptr;
 PfnRemoveDirectoryW g_real_RemoveDirectoryW = nullptr;
 PfnFindFirstFileW g_real_FindFirstFileW = nullptr;
+PfnFindFirstFileExW g_real_FindFirstFileExW = nullptr;
+PfnGetDiskFreeSpaceExW g_real_GetDiskFreeSpaceExW = nullptr;
+PfnGetDiskFreeSpaceW g_real_GetDiskFreeSpaceW = nullptr;
+PfnSetCurrentDirectoryA g_real_SetCurrentDirectoryA = nullptr;
+PfnSetCurrentDirectoryW g_real_SetCurrentDirectoryW = nullptr;
 PfnCreateProcessA g_real_CreateProcessA = nullptr;
 PfnCreateProcessW g_real_CreateProcessW = nullptr;
 PfnCreateProcessA g_kernelbase_CreateProcessA = nullptr;
@@ -2001,6 +2011,174 @@ HANDLE WINAPI Hook_FindFirstFileW(LPCWSTR lpFileName, LPWIN32_FIND_DATAW lpFindF
     return g_real_FindFirstFileW(lpFileName, lpFindFileData);
 }
 
+HANDLE WINAPI Hook_FindFirstFileExW(LPCWSTR lpFileName,
+                                    FINDEX_INFO_LEVELS fInfoLevelId,
+                                    LPVOID lpFindFileData,
+                                    FINDEX_SEARCH_OPS fSearchOp,
+                                    LPVOID lpSearchFilter,
+                                    DWORD dwAdditionalFlags) {
+    if (!g_shutting_down.load(std::memory_order_acquire) &&
+        lpFileName != nullptr &&
+        openscarlett::VfsMounts::DetectVirtualDriveW(lpFileName) != openscarlett::VfsDrive::None &&
+        !ShouldPassThroughHostDDriveW(lpFileName)) {
+        const std::wstring_view in_view(lpFileName);
+        const auto drive = openscarlett::VfsMounts::DetectVirtualDriveW(in_view);
+        const bool has_wildcards = (in_view.find_first_of(L"*?") != std::wstring_view::npos);
+        const bool is_find_data_w = (fInfoLevelId == FindExInfoStandard || fInfoLevelId == FindExInfoBasic);
+
+        if (drive == openscarlett::VfsDrive::Game && has_wildcards && is_find_data_w && lpFindFileData != nullptr) {
+            std::wstring base_pat;
+            std::wstring overlay_pat;
+            std::wstring rel_pat;
+            bool was_wo = false;
+            auto st = g_vfs.ResolveGamePairW(in_view, base_pat, overlay_pat, rel_pat, &was_wo);
+            if (st == openscarlett::VfsTranslateStatus::RejectedTraversal) {
+                ::SetLastError(ERROR_ACCESS_DENIED);
+                return INVALID_HANDLE_VALUE;
+            }
+            if (st == openscarlett::VfsTranslateStatus::DeletedWhiteout) {
+                ::SetLastError(ERROR_FILE_NOT_FOUND);
+                return INVALID_HANDLE_VALUE;
+            }
+            if (st == openscarlett::VfsTranslateStatus::Translated) {
+                std::wstring rel_dir;
+                const size_t slash = rel_pat.find_last_of(L'\\');
+                if (slash != std::wstring::npos) {
+                    rel_dir = rel_pat.substr(0, slash);
+                }
+                auto* fd = static_cast<LPWIN32_FIND_DATAW>(lpFindFileData);
+                auto is_hidden = [&](const wchar_t* filename, bool from_overlay) -> bool {
+                    std::wstring_view fn(filename);
+                    if (from_overlay && rel_dir.empty() && fn == L".whiteout") return true;
+                    if (fn == L"." || fn == L"..") return false;
+                    std::wstring vpath = L"G:\\";
+                    if (!rel_dir.empty()) vpath += rel_dir + L"\\";
+                    vpath.append(fn);
+                    return g_vfs.IsWhiteoutedW(vpath);
+                };
+                auto find_vis = [&](const std::wstring& pat, bool from_overlay) -> HANDLE {
+                    if (pat.empty()) return INVALID_HANDLE_VALUE;
+                    HANDLE h = g_real_FindFirstFileExW(
+                        pat.c_str(), fInfoLevelId, lpFindFileData, fSearchOp, lpSearchFilter, dwAdditionalFlags);
+                    if (h == INVALID_HANDLE_VALUE) return INVALID_HANDLE_VALUE;
+                    while (is_hidden(fd->cFileName, from_overlay)) {
+                        if (!::FindNextFileW(h, fd)) {
+                            ::FindClose(h);
+                            return INVALID_HANDLE_VALUE;
+                        }
+                    }
+                    return h;
+                };
+                HANDLE h = find_vis(overlay_pat, true);
+                if (h == INVALID_HANDLE_VALUE) {
+                    h = find_vis(base_pat, false);
+                }
+                DWORD err = (h != INVALID_HANDLE_VALUE) ? ERROR_SUCCESS : ERROR_FILE_NOT_FOUND;
+                ::SetLastError(err);
+                return h;
+            }
+        }
+
+        std::wstring host_path;
+        bool was_wo = false;
+        auto st = g_vfs.TranslateForAccessW(
+            lpFileName, openscarlett::VfsAccessMode::ReadOnly, host_path, &was_wo, true);
+        if (st == openscarlett::VfsTranslateStatus::RejectedTraversal) {
+            ::SetLastError(ERROR_ACCESS_DENIED);
+            return INVALID_HANDLE_VALUE;
+        }
+        if (st == openscarlett::VfsTranslateStatus::DeletedWhiteout) {
+            ::SetLastError(ERROR_FILE_NOT_FOUND);
+            return INVALID_HANDLE_VALUE;
+        }
+        if (st == openscarlett::VfsTranslateStatus::Translated) {
+            return g_real_FindFirstFileExW(
+                host_path.c_str(), fInfoLevelId, lpFindFileData, fSearchOp, lpSearchFilter, dwAdditionalFlags);
+        }
+    }
+    return g_real_FindFirstFileExW(
+        lpFileName, fInfoLevelId, lpFindFileData, fSearchOp, lpSearchFilter, dwAdditionalFlags);
+}
+
+BOOL WINAPI Hook_GetDiskFreeSpaceExW(LPCWSTR lpDirectoryName,
+                                     PULARGE_INTEGER lpFreeBytesAvailableToCaller,
+                                     PULARGE_INTEGER lpTotalNumberOfBytes,
+                                     PULARGE_INTEGER lpTotalNumberOfFreeBytes) {
+    if (!g_shutting_down.load(std::memory_order_acquire) &&
+        lpDirectoryName != nullptr &&
+        openscarlett::VfsMounts::DetectVirtualDriveW(lpDirectoryName) != openscarlett::VfsDrive::None &&
+        !ShouldPassThroughHostDDriveW(lpDirectoryName)) {
+        std::wstring host_path;
+        auto st = g_vfs.TranslateForAccessW(
+            lpDirectoryName, openscarlett::VfsAccessMode::ReadOnly, host_path, nullptr, true);
+        if (st == openscarlett::VfsTranslateStatus::Translated) {
+            return g_real_GetDiskFreeSpaceExW(
+                host_path.c_str(), lpFreeBytesAvailableToCaller, lpTotalNumberOfBytes, lpTotalNumberOfFreeBytes);
+        }
+    }
+    return g_real_GetDiskFreeSpaceExW(
+        lpDirectoryName, lpFreeBytesAvailableToCaller, lpTotalNumberOfBytes, lpTotalNumberOfFreeBytes);
+}
+
+BOOL WINAPI Hook_GetDiskFreeSpaceW(LPCWSTR lpRootPathName,
+                                   LPDWORD lpSectorsPerCluster,
+                                   LPDWORD lpBytesPerSector,
+                                   LPDWORD lpNumberOfFreeClusters,
+                                   LPDWORD lpTotalNumberOfClusters) {
+    if (!g_shutting_down.load(std::memory_order_acquire) &&
+        lpRootPathName != nullptr &&
+        openscarlett::VfsMounts::DetectVirtualDriveW(lpRootPathName) != openscarlett::VfsDrive::None &&
+        !ShouldPassThroughHostDDriveW(lpRootPathName)) {
+        std::wstring host_path;
+        auto st = g_vfs.TranslateForAccessW(
+            lpRootPathName, openscarlett::VfsAccessMode::ReadOnly, host_path, nullptr, true);
+        if (st == openscarlett::VfsTranslateStatus::Translated) {
+            // GetDiskFreeSpaceW expects a root path or directory; ensure trailing backslash.
+            if (!host_path.empty() && host_path.back() != L'\\') {
+                host_path.push_back(L'\\');
+            }
+            return g_real_GetDiskFreeSpaceW(
+                host_path.c_str(), lpSectorsPerCluster, lpBytesPerSector,
+                lpNumberOfFreeClusters, lpTotalNumberOfClusters);
+        }
+    }
+    return g_real_GetDiskFreeSpaceW(
+        lpRootPathName, lpSectorsPerCluster, lpBytesPerSector,
+        lpNumberOfFreeClusters, lpTotalNumberOfClusters);
+}
+
+BOOL WINAPI Hook_SetCurrentDirectoryW(LPCWSTR lpPathName) {
+    if (!g_shutting_down.load(std::memory_order_acquire) &&
+        lpPathName != nullptr &&
+        openscarlett::VfsMounts::DetectVirtualDriveW(lpPathName) != openscarlett::VfsDrive::None &&
+        !ShouldPassThroughHostDDriveW(lpPathName)) {
+        std::wstring host_path;
+        auto st = g_vfs.TranslateForAccessW(
+            lpPathName, openscarlett::VfsAccessMode::ReadOnly, host_path, nullptr, true);
+        if (st == openscarlett::VfsTranslateStatus::Translated) {
+            return g_real_SetCurrentDirectoryW(host_path.c_str());
+        }
+    }
+    return g_real_SetCurrentDirectoryW(lpPathName);
+}
+
+BOOL WINAPI Hook_SetCurrentDirectoryA(LPCSTR lpPathName) {
+    if (!g_shutting_down.load(std::memory_order_acquire) &&
+        lpPathName != nullptr &&
+        openscarlett::VfsMounts::DetectVirtualDriveA(lpPathName) != openscarlett::VfsDrive::None) {
+        const std::wstring wide = openscarlett::Utf8ToWide(lpPathName);
+        if (!ShouldPassThroughHostDDriveW(wide)) {
+            std::wstring host_path;
+            auto st = g_vfs.TranslateForAccessW(
+                wide, openscarlett::VfsAccessMode::ReadOnly, host_path, nullptr, true);
+            if (st == openscarlett::VfsTranslateStatus::Translated && g_real_SetCurrentDirectoryW) {
+                return g_real_SetCurrentDirectoryW(host_path.c_str());
+            }
+        }
+    }
+    return g_real_SetCurrentDirectoryA(lpPathName);
+}
+
 // ---------------------------------------------------------------------------
 // Hook Implementations: Win32 Child-Process Hook Propagation
 //   Hooks CreateProcessW / CreateProcessA so non-Store guest launchers
@@ -2430,6 +2608,16 @@ void* ResolveHookForSymbol(const char* name) {
          reinterpret_cast<void**>(&g_real_RemoveDirectoryW)},
         {"FindFirstFileW", reinterpret_cast<void*>(&Hook_FindFirstFileW),
          reinterpret_cast<void**>(&g_real_FindFirstFileW)},
+        {"FindFirstFileExW", reinterpret_cast<void*>(&Hook_FindFirstFileExW),
+         reinterpret_cast<void**>(&g_real_FindFirstFileExW)},
+        {"GetDiskFreeSpaceExW", reinterpret_cast<void*>(&Hook_GetDiskFreeSpaceExW),
+         reinterpret_cast<void**>(&g_real_GetDiskFreeSpaceExW)},
+        {"GetDiskFreeSpaceW", reinterpret_cast<void*>(&Hook_GetDiskFreeSpaceW),
+         reinterpret_cast<void**>(&g_real_GetDiskFreeSpaceW)},
+        {"SetCurrentDirectoryA", reinterpret_cast<void*>(&Hook_SetCurrentDirectoryA),
+         reinterpret_cast<void**>(&g_real_SetCurrentDirectoryA)},
+        {"SetCurrentDirectoryW", reinterpret_cast<void*>(&Hook_SetCurrentDirectoryW),
+         reinterpret_cast<void**>(&g_real_SetCurrentDirectoryW)},
         {"CreateProcessA", reinterpret_cast<void*>(&Hook_CreateProcessA),
          reinterpret_cast<void**>(&g_real_CreateProcessA)},
         {"CreateProcessW", reinterpret_cast<void*>(&Hook_CreateProcessW),
@@ -2483,6 +2671,11 @@ void* ResolveHookForRealAddress(ULONGLONG addr) {
     if (void* p = match(g_real_MoveFileExW, &Hook_MoveFileExW)) return p;
     if (void* p = match(g_real_RemoveDirectoryW, &Hook_RemoveDirectoryW)) return p;
     if (void* p = match(g_real_FindFirstFileW, &Hook_FindFirstFileW)) return p;
+    if (void* p = match(g_real_FindFirstFileExW, &Hook_FindFirstFileExW)) return p;
+    if (void* p = match(g_real_GetDiskFreeSpaceExW, &Hook_GetDiskFreeSpaceExW)) return p;
+    if (void* p = match(g_real_GetDiskFreeSpaceW, &Hook_GetDiskFreeSpaceW)) return p;
+    if (void* p = match(g_real_SetCurrentDirectoryA, &Hook_SetCurrentDirectoryA)) return p;
+    if (void* p = match(g_real_SetCurrentDirectoryW, &Hook_SetCurrentDirectoryW)) return p;
     if (void* p = match(g_real_CreateProcessA, &Hook_CreateProcessA)) return p;
     if (void* p = match(g_real_CreateProcessW, &Hook_CreateProcessW)) return p;
     if (void* p = match(g_kernelbase_CreateProcessA, &Hook_CreateProcessA)) return p;
@@ -2950,6 +3143,11 @@ bool InitializeHookRuntime(HMODULE self_mod) {
     g_real_MoveFileExW = reinterpret_cast<PfnMoveFileExW>(::GetProcAddress(k32, "MoveFileExW"));
     g_real_RemoveDirectoryW = reinterpret_cast<PfnRemoveDirectoryW>(::GetProcAddress(k32, "RemoveDirectoryW"));
     g_real_FindFirstFileW = reinterpret_cast<PfnFindFirstFileW>(::GetProcAddress(k32, "FindFirstFileW"));
+    g_real_FindFirstFileExW = reinterpret_cast<PfnFindFirstFileExW>(::GetProcAddress(k32, "FindFirstFileExW"));
+    g_real_GetDiskFreeSpaceExW = reinterpret_cast<PfnGetDiskFreeSpaceExW>(::GetProcAddress(k32, "GetDiskFreeSpaceExW"));
+    g_real_GetDiskFreeSpaceW = reinterpret_cast<PfnGetDiskFreeSpaceW>(::GetProcAddress(k32, "GetDiskFreeSpaceW"));
+    g_real_SetCurrentDirectoryA = reinterpret_cast<PfnSetCurrentDirectoryA>(::GetProcAddress(k32, "SetCurrentDirectoryA"));
+    g_real_SetCurrentDirectoryW = reinterpret_cast<PfnSetCurrentDirectoryW>(::GetProcAddress(k32, "SetCurrentDirectoryW"));
     g_real_CreateProcessA = reinterpret_cast<PfnCreateProcessA>(::GetProcAddress(k32, "CreateProcessA"));
     g_real_CreateProcessW = reinterpret_cast<PfnCreateProcessW>(::GetProcAddress(k32, "CreateProcessW"));
     if (g_kernelbase_mod != nullptr) {
