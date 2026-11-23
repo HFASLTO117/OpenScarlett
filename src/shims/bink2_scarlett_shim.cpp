@@ -30,6 +30,9 @@ struct BinkGlobalState {
     std::mutex mutex;
     std::string last_error;
     std::unordered_map<HBink, std::unique_ptr<BinkSession>> sessions;
+    std::mutex gpu_mutex;
+    std::unique_ptr<openscarlett::Bink2GpuColorConverter> gpu_hw;
+    std::unique_ptr<openscarlett::Bink2GpuColorConverter> gpu_warp;
 };
 
 BinkGlobalState& GetBinkState() {
@@ -356,6 +359,94 @@ int32_t OS_SHIM_CALL BinkPause(HBink bink, int32_t pause) {
     s->pub.Paused = pause != 0 ? 1u : 0u;
     RecordOk("BinkPause");
     return static_cast<int32_t>(s->pub.Paused);
+}
+
+// Live GPU YUV420p(+A) -> RGBA8/BGRA8 compute-shader conversion export (BT.709 / BT.601;
+// supports HW GPU when preferWarp==0 and D3D12 WARP when preferWarp!=0, with CPU fallback).
+OS_BINK2_API int32_t OS_SHIM_CALL BinkConvertYuvToRgbaGpu(
+    uint32_t width,
+    uint32_t height,
+    const uint8_t* planeY,
+    uint32_t pitchY,
+    const uint8_t* planeU,
+    uint32_t pitchU,
+    const uint8_t* planeV,
+    uint32_t pitchV,
+    const uint8_t* planeA,
+    uint32_t pitchA,
+    uint32_t matrixMode,
+    uint32_t pixelFormat,
+    uint32_t preferWarp,
+    uint8_t* outPixels,
+    size_t outPixelsCapacity,
+    uint32_t* outUsedGpu) {
+    if (outUsedGpu) *outUsedGpu = 0u;
+    if (!outPixels || width == 0u || height == 0u) {
+        SetLastErrorStr("BinkConvertYuvToRgbaGpu: invalid arguments");
+        RecordErr("BinkConvertYuvToRgbaGpu");
+        return -1;
+    }
+    const uint64_t required = static_cast<uint64_t>(width) * static_cast<uint64_t>(height) * 4ull;
+    if (required > outPixelsCapacity) {
+        SetLastErrorStr("BinkConvertYuvToRgbaGpu: output buffer too small");
+        RecordErr("BinkConvertYuvToRgbaGpu");
+        return -1;
+    }
+
+    auto& g = GetBinkState();
+    std::lock_guard<std::mutex> glk(g.gpu_mutex);
+    auto& conv_ptr = (preferWarp != 0u) ? g.gpu_warp : g.gpu_hw;
+    if (!conv_ptr) {
+        conv_ptr = std::make_unique<openscarlett::Bink2GpuColorConverter>();
+        (void)conv_ptr->Initialize(preferWarp != 0u, /*allow_cpu_fallback=*/true);
+    }
+
+    std::vector<uint8_t> rgba;
+    bool used_gpu = false;
+    const auto mat = (matrixMode != 0u)
+                         ? openscarlett::Bink2ColorMatrix::Bt601
+                         : openscarlett::Bink2ColorMatrix::Bt709;
+    const auto pfmt = (pixelFormat != 0u)
+                          ? openscarlett::Bink2PixelFormat::Bgra8
+                          : openscarlett::Bink2PixelFormat::Rgba8;
+    const openscarlett::Status st = conv_ptr->ConvertYuv420pToRgba(
+        width, height, planeY, pitchY, planeU, pitchU, planeV, pitchV, planeA, pitchA,
+        mat, pfmt, rgba, &used_gpu);
+    if (!st.ok() || rgba.size() != static_cast<size_t>(required)) {
+        SetLastErrorStr(st.message.empty() ? "BinkConvertYuvToRgbaGpu failed" : st.message);
+        RecordErr("BinkConvertYuvToRgbaGpu");
+        return -1;
+    }
+    std::memcpy(outPixels, rgba.data(), rgba.size());
+    if (outUsedGpu) *outUsedGpu = used_gpu ? 1u : 0u;
+    RecordOk("BinkConvertYuvToRgbaGpu");
+    return 0;
+}
+
+OS_BINK2_API int32_t OS_SHIM_CALL BinkGetGpuConverterStats(
+    uint32_t preferWarp,
+    uint32_t* outUsingGpu,
+    uint32_t* outIsWarp,
+    uint64_t* outGpuConversions,
+    uint64_t* outCpuFallbacks) {
+    if (outUsingGpu) *outUsingGpu = 0u;
+    if (outIsWarp) *outIsWarp = 0u;
+    if (outGpuConversions) *outGpuConversions = 0ull;
+    if (outCpuFallbacks) *outCpuFallbacks = 0ull;
+    auto& g = GetBinkState();
+    std::lock_guard<std::mutex> glk(g.gpu_mutex);
+    auto& conv_ptr = (preferWarp != 0u) ? g.gpu_warp : g.gpu_hw;
+    if (!conv_ptr) {
+        RecordOk("BinkGetGpuConverterStats");
+        return 0;
+    }
+    const auto st = conv_ptr->Stats();
+    if (outUsingGpu) *outUsingGpu = st.using_gpu ? 1u : 0u;
+    if (outIsWarp) *outIsWarp = st.is_warp ? 1u : 0u;
+    if (outGpuConversions) *outGpuConversions = st.gpu_conversions;
+    if (outCpuFallbacks) *outCpuFallbacks = st.cpu_fallback_conversions;
+    RecordOk("BinkGetGpuConverterStats");
+    return 0;
 }
 
 }  // extern "C"

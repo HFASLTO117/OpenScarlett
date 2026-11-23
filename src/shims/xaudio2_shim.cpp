@@ -986,6 +986,9 @@ public:
             pBuffer->AudioBytes > 0x80000000u) {
             return RecordHr("IXAudio2SourceVoice::SubmitSourceBuffer", OS_XAUDIO2_E_INVALIDARG, 9);
         }
+        if (pBuffer->LoopCount > OS_XAUDIO2_LOOP_INFINITE) {
+            return RecordHr("IXAudio2SourceVoice::SubmitSourceBuffer", OS_XAUDIO2_E_INVALIDARG, 9);
+        }
 
         const uint32_t ch = std::max<uint32_t>(1u, format_.nChannels);
         std::vector<float> decoded;
@@ -1061,9 +1064,9 @@ public:
                     return RecordHr("IXAudio2SourceVoice::SubmitSourceBuffer",
                                     OS_XAUDIO2_E_INVALIDARG, 9);
                 }
-                if ((pBuffer->Flags & OS_XAUDIO2_END_OF_STREAM) != 0u) {
-                    (void)opus_decoder_->Drain(decoded);
-                }
+            }
+            if ((pBuffer->Flags & OS_XAUDIO2_END_OF_STREAM) != 0u) {
+                (void)opus_decoder_->Drain(decoded);
             }
         } else if (effective_format_tag_ == OS_WAVE_FORMAT_IEEE_FLOAT) {
             if (format_.wBitsPerSample != 32) {
@@ -1079,9 +1082,11 @@ public:
             if (format_.wBitsPerSample == 16) {
                 const size_t sample_count = pBuffer->AudioBytes / sizeof(int16_t);
                 decoded.resize(sample_count);
-                const auto* src = reinterpret_cast<const int16_t*>(pBuffer->pAudioData);
-                for (size_t i = 0; i < sample_count; ++i) {
-                    decoded[i] = static_cast<float>(src[i]) / 32768.0f;
+                if (sample_count > 0) {
+                    const auto* src = reinterpret_cast<const int16_t*>(pBuffer->pAudioData);
+                    for (size_t i = 0; i < sample_count; ++i) {
+                        decoded[i] = static_cast<float>(src[i]) / 32768.0f;
+                    }
                 }
             } else if (format_.wBitsPerSample == 8) {
                 const size_t sample_count = pBuffer->AudioBytes;
@@ -1092,9 +1097,11 @@ public:
             } else if (format_.wBitsPerSample == 32) {
                 const size_t sample_count = pBuffer->AudioBytes / sizeof(int32_t);
                 decoded.resize(sample_count);
-                const auto* src = reinterpret_cast<const int32_t*>(pBuffer->pAudioData);
-                for (size_t i = 0; i < sample_count; ++i) {
-                    decoded[i] = static_cast<float>(static_cast<double>(src[i]) / 2147483648.0);
+                if (sample_count > 0) {
+                    const auto* src = reinterpret_cast<const int32_t*>(pBuffer->pAudioData);
+                    for (size_t i = 0; i < sample_count; ++i) {
+                        decoded[i] = static_cast<float>(static_cast<double>(src[i]) / 2147483648.0);
+                    }
                 }
             } else {
                 return RecordHr("IXAudio2SourceVoice::SubmitSourceBuffer",
@@ -1117,50 +1124,53 @@ public:
                 eff_ch = std::min<uint32_t>(2u, ch);
             }
         }
-        uint32_t total_frames = static_cast<uint32_t>(decoded.size() / std::max<uint32_t>(1u, eff_ch));
+        eff_ch = std::max<uint32_t>(1u, eff_ch);
+        const uint32_t raw_total_frames = static_cast<uint32_t>(decoded.size() / eff_ch);
 
-        const uint32_t orig_total_frames = total_frames;
-        uint32_t play_slice_start = 0u;
-        if (pBuffer->PlayBegin > 0u || pBuffer->PlayLength > 0u) {
-            play_slice_start = std::min<uint32_t>(pBuffer->PlayBegin, orig_total_frames);
-            const uint32_t max_avail = orig_total_frames - play_slice_start;
-            const uint32_t len = (pBuffer->PlayLength > 0u)
-                                     ? std::min<uint32_t>(pBuffer->PlayLength, max_avail)
-                                     : max_avail;
-            std::vector<float> sliced(static_cast<size_t>(len) * eff_ch);
-            if (len > 0u) {
-                std::memcpy(sliced.data(),
-                            decoded.data() + static_cast<size_t>(play_slice_start) * eff_ch,
-                            static_cast<size_t>(len) * eff_ch * sizeof(float));
+        // Enforce strict XAudio2 play/loop region clamping invariants (xcl #89/#90):
+        //   1. PlayBegin clamped to [0, raw_total_frames]; PlayLength clamped to remaining samples.
+        //   2. Loop region [LoopBegin, LoopBegin + LoopLength) intersected in 64-bit against the
+        //      active play region [eff_play_begin, eff_play_end] (no 32-bit overflow, no OOB reads).
+        //   3. Zero-length play or loop regions cleanly force loops_remaining = 0 (silent_buffer safe;
+        //      never enters an infinite zero-length loop and always fires OnBufferStart/End/StreamEnd).
+        const uint64_t eff_play_begin = std::min<uint64_t>(pBuffer->PlayBegin, raw_total_frames);
+        const uint64_t max_play_avail = static_cast<uint64_t>(raw_total_frames) - eff_play_begin;
+        const uint64_t eff_play_len =
+            (pBuffer->PlayLength > 0u)
+                ? std::min<uint64_t>(pBuffer->PlayLength, max_play_avail)
+                : max_play_avail;
+        const uint64_t eff_play_end = eff_play_begin + eff_play_len;
+        const uint32_t total_frames = static_cast<uint32_t>(eff_play_len);
+
+        if (eff_play_begin > 0ull || eff_play_len < raw_total_frames) {
+            std::vector<float> sliced(static_cast<size_t>(total_frames) * eff_ch);
+            if (total_frames > 0u) {
+                std::memcpy(
+                    sliced.data(),
+                    decoded.data() + static_cast<size_t>(eff_play_begin) * eff_ch,
+                    static_cast<size_t>(total_frames) * eff_ch * sizeof(float));
             }
             decoded = std::move(sliced);
-            total_frames = len;
+        } else if (decoded.size() != static_cast<size_t>(total_frames) * eff_ch) {
+            decoded.resize(static_cast<size_t>(total_frames) * eff_ch);
         }
-        const uint64_t play_end = static_cast<uint64_t>(play_slice_start) + total_frames;
 
-        // Enforce XAudio2 play/loop region invariants cleanly:
-        // - LoopCount == 0 or empty play slice clears LoopBegin/LoopLength to 0.
-        // - Otherwise clamp [LoopBegin, LoopBegin + LoopLength) into [play_slice_start, play_end);
-        //   if disjoint or empty after clamping, disable looping cleanly.
         uint32_t adj_loop_begin = 0u;
         uint32_t adj_loop_length = 0u;
-        uint32_t eff_loop_count = 0u;
+        uint32_t adj_loops_remaining = 0u;
         if (pBuffer->LoopCount > 0u && total_frames > 0u) {
-            const uint64_t raw_loop_begin = static_cast<uint64_t>(pBuffer->LoopBegin);
-            const uint64_t raw_loop_end =
-                (pBuffer->LoopLength > 0u)
-                    ? (raw_loop_begin + static_cast<uint64_t>(pBuffer->LoopLength))
-                    : play_end;
-            if (raw_loop_begin < play_end && raw_loop_end > static_cast<uint64_t>(play_slice_start)) {
-                const uint64_t clamped_begin =
-                    std::max<uint64_t>(raw_loop_begin, static_cast<uint64_t>(play_slice_start));
-                const uint64_t clamped_end = std::min<uint64_t>(raw_loop_end, play_end);
-                if (clamped_end > clamped_begin) {
-                    adj_loop_begin = static_cast<uint32_t>(clamped_begin - play_slice_start);
-                    adj_loop_length = static_cast<uint32_t>(clamped_end - clamped_begin);
-                    eff_loop_count = pBuffer->LoopCount;
-                }
-            }
+            const uint64_t req_loop_begin = static_cast<uint64_t>(pBuffer->LoopBegin);
+            const uint64_t req_loop_end =
+                (pBuffer->LoopLength == 0u)
+                    ? eff_play_end
+                    : (req_loop_begin + static_cast<uint64_t>(pBuffer->LoopLength));
+            const uint64_t clamped_loop_begin =
+                std::clamp<uint64_t>(req_loop_begin, eff_play_begin, eff_play_end);
+            const uint64_t clamped_loop_end =
+                std::clamp<uint64_t>(req_loop_end, clamped_loop_begin, eff_play_end);
+            adj_loop_begin = static_cast<uint32_t>(clamped_loop_begin - eff_play_begin);
+            adj_loop_length = static_cast<uint32_t>(clamped_loop_end - clamped_loop_begin);
+            adj_loops_remaining = (adj_loop_length > 0u) ? pBuffer->LoopCount : 0u;
         }
 
         auto* qb = new (std::nothrow) QueuedAudioBuffer();
@@ -1173,7 +1183,7 @@ public:
         qb->play_cursor = 0.0;
         qb->loop_begin = adj_loop_begin;
         qb->loop_length = adj_loop_length;
-        qb->loops_remaining = eff_loop_count;
+        qb->loops_remaining = adj_loops_remaining;
         qb->end_of_stream = (pBuffer->Flags & OS_XAUDIO2_END_OF_STREAM) != 0;
         qb->context = pBuffer->pContext;
 
@@ -1331,8 +1341,10 @@ public:
                     out_cbs.started.push_back(cur->context);
                 }
                 if (cur->total_frames == 0 ||
+                    cur->samples.size() < static_cast<size_t>(cur->total_frames) * std::max<uint32_t>(1u, cur->channels) ||
                     cur->play_cursor >= static_cast<double>(cur->total_frames)) {
-                    if (cur->loops_remaining > 0 && cur->loop_length > 0) {
+                    if (cur->total_frames > 0u && cur->loops_remaining > 0u && cur->loop_length > 0u &&
+                        static_cast<uint64_t>(cur->loop_begin) + static_cast<uint64_t>(cur->loop_length) <= cur->total_frames) {
                         if (cur->loops_remaining != OS_XAUDIO2_LOOP_INFINITE) {
                             --cur->loops_remaining;
                         }
@@ -1360,9 +1372,11 @@ public:
                 break;
             }
 
-            const uint32_t i0 = static_cast<uint32_t>(cur->play_cursor);
-            const uint32_t i1 = std::min<uint32_t>(i0 + 1, cur->total_frames - 1);
-            const float frac = static_cast<float>(cur->play_cursor - static_cast<double>(i0));
+            const uint32_t i0 = std::min<uint32_t>(
+                static_cast<uint32_t>(cur->play_cursor), cur->total_frames - 1u);
+            const uint32_t i1 = std::min<uint32_t>(i0 + 1u, cur->total_frames - 1u);
+            const float frac = static_cast<float>(
+                std::clamp(cur->play_cursor - static_cast<double>(i0), 0.0, 1.0));
 
             const uint32_t src_ch = cur->channels;
             for (uint32_t oc = 0; oc < out_channels; ++oc) {
@@ -1379,10 +1393,13 @@ public:
             ++mixed_frames;
             samples_played_.fetch_add(1ull, std::memory_order_release);
 
+            const uint64_t loop_end_u64 =
+                static_cast<uint64_t>(cur->loop_begin) + static_cast<uint64_t>(cur->loop_length);
             if (cur->loops_remaining > 0u && cur->loop_length > 0u &&
-                cur->play_cursor >= static_cast<double>(cur->loop_begin + cur->loop_length)) {
+                loop_end_u64 <= cur->total_frames &&
+                cur->play_cursor >= static_cast<double>(loop_end_u64)) {
                 const double overshoot =
-                    cur->play_cursor - static_cast<double>(cur->loop_begin + cur->loop_length);
+                    cur->play_cursor - static_cast<double>(loop_end_u64);
                 if (cur->loops_remaining != OS_XAUDIO2_LOOP_INFINITE) {
                     --cur->loops_remaining;
                 }

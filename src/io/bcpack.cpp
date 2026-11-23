@@ -3166,6 +3166,26 @@ Bc6hBcpPresetInfo ClassifyBc6hPresetFromByte0(uint8_t b0) noexcept {
     return info;
 }
 
+// Helper to classify BC7 subset group (1/2/3 subsets) from unary mode prefix in byte 0
+// so BC7 mode/preset transitions across modes 0..7 (incl. final 34 preset slots 64..97)
+// never cross-predict incompatible endpoint/selector layouts (SixNG d724355/#37/#40/#41).
+uint8_t ClassifyBc7SubsetGroupFromByte0(uint8_t b0) noexcept {
+    if (b0 == 0u) return 0u;  // reserved
+    uint8_t m = 0u;
+    while (m < 8u && ((b0 >> m) & 1u) == 0u) ++m;
+    switch (m) {
+        case 4u:
+        case 5u:
+        case 6u: return 1u;  // 1-subset modes (incl. preset slots 64..79, 96..97)
+        case 1u:
+        case 3u:
+        case 7u: return 2u;  // 2-subset modes (incl. preset slots 80..95)
+        case 0u:
+        case 2u: return 3u;  // 3-subset modes
+        default: return 0u;
+    }
+}
+
 struct Bc67State {
     HwLruCache<uint8_t, 4u> mode_cache;
     HwLruCache<std::array<uint8_t, 11>, 8u> ep_cache;
@@ -3174,6 +3194,9 @@ struct Bc67State {
     // spatial predictors or polluting 2-region preset/endpoint tables (SixNG #15/#20/#21).
     HwLruCache<std::array<uint8_t, 11>, 8u> ep_cache_1r;
     HwLruCache<uint32_t, 16u> sel_cache_1r;
+    // Separate BC7 3-subset caches keep 1-subset / 2-subset / 3-subset endpoint presets isolated.
+    HwLruCache<std::array<uint8_t, 11>, 8u> ep_cache_3s;
+    HwLruCache<uint32_t, 16u> sel_cache_3s;
 
     static void Encode(
         HwBitWriter& bw,
@@ -3198,11 +3221,11 @@ struct Bc67State {
         }
         st.mode_cache.PushOrPromote(m_cur);
 
-        bool use_1r_cache = false;
+        uint8_t cache_group = 0u;  // 0 = default/2-region, 1 = 1-region/1-subset, 2 = 3-subset
         const uint8_t* eff_pred = pred;
         if (is_bc6h) {
             const Bc6hBcpPresetInfo cur_p = ClassifyBc6hPresetFromByte0(m_cur);
-            use_1r_cache = (cur_p.is_valid && cur_p.region_count == 1u);
+            cache_group = (cur_p.is_valid && cur_p.region_count == 1u) ? 1u : 0u;
             if (pred) {
                 const Bc6hBcpPresetInfo pred_p = ClassifyBc6hPresetFromByte0(pred[0]);
                 if (!cur_p.is_valid || !pred_p.is_valid || cur_p.region_count != pred_p.region_count) {
@@ -3210,9 +3233,20 @@ struct Bc67State {
                     eff_pred = nullptr;
                 }
             }
+        } else {
+            const uint8_t cur_grp = ClassifyBc7SubsetGroupFromByte0(m_cur);
+            cache_group = (cur_grp == 1u) ? 1u : ((cur_grp == 3u) ? 2u : 0u);
+            if (pred) {
+                const uint8_t pred_grp = ClassifyBc7SubsetGroupFromByte0(pred[0]);
+                if (cur_grp == 0u || pred_grp == 0u || cur_grp != pred_grp) {
+                    eff_pred = nullptr;
+                }
+            }
         }
-        auto& active_ep_cache = use_1r_cache ? st.ep_cache_1r : st.ep_cache;
-        auto& active_sel_cache = use_1r_cache ? st.sel_cache_1r : st.sel_cache;
+        auto& active_ep_cache =
+            (cache_group == 1u) ? st.ep_cache_1r : ((cache_group == 2u) ? st.ep_cache_3s : st.ep_cache);
+        auto& active_sel_cache =
+            (cache_group == 1u) ? st.sel_cache_1r : ((cache_group == 2u) ? st.sel_cache_3s : st.sel_cache);
 
         // 2. Partition/Rotation/Endpoint payload (11 bytes).
         std::array<uint8_t, 11> ep_cur{};
@@ -3318,20 +3352,31 @@ struct Bc67State {
         st.mode_cache.PushOrPromote(m_cur);
         out_blk[0] = m_cur;
 
-        bool use_1r_cache = false;
+        uint8_t cache_group = 0u;
         const uint8_t* eff_pred = pred;
         if (is_bc6h) {
             const Bc6hBcpPresetInfo cur_p = ClassifyBc6hPresetFromByte0(m_cur);
-            use_1r_cache = (cur_p.is_valid && cur_p.region_count == 1u);
+            cache_group = (cur_p.is_valid && cur_p.region_count == 1u) ? 1u : 0u;
             if (pred) {
                 const Bc6hBcpPresetInfo pred_p = ClassifyBc6hPresetFromByte0(pred[0]);
                 if (!cur_p.is_valid || !pred_p.is_valid || cur_p.region_count != pred_p.region_count) {
                     eff_pred = nullptr;
                 }
             }
+        } else {
+            const uint8_t cur_grp = ClassifyBc7SubsetGroupFromByte0(m_cur);
+            cache_group = (cur_grp == 1u) ? 1u : ((cur_grp == 3u) ? 2u : 0u);
+            if (pred) {
+                const uint8_t pred_grp = ClassifyBc7SubsetGroupFromByte0(pred[0]);
+                if (cur_grp == 0u || pred_grp == 0u || cur_grp != pred_grp) {
+                    eff_pred = nullptr;
+                }
+            }
         }
-        auto& active_ep_cache = use_1r_cache ? st.ep_cache_1r : st.ep_cache;
-        auto& active_sel_cache = use_1r_cache ? st.sel_cache_1r : st.sel_cache;
+        auto& active_ep_cache =
+            (cache_group == 1u) ? st.ep_cache_1r : ((cache_group == 2u) ? st.ep_cache_3s : st.ep_cache);
+        auto& active_sel_cache =
+            (cache_group == 1u) ? st.sel_cache_1r : ((cache_group == 2u) ? st.sel_cache_3s : st.sel_cache);
 
         std::array<uint8_t, 11> ep_pred{};
         if (eff_pred) std::memcpy(ep_pred.data(), eff_pred + 1u, 11u);
@@ -4460,6 +4505,983 @@ Status BcPackRansDecode(
     if (ptr != end || state != kRansLowerBound) {
         out_decoded.clear();
         return Status::Error(StatusCode::ParseError, "rANS final state or stream length mismatch");
+    }
+    return Status::Ok();
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 16: BC7 Full 98-Slot BCPack Endpoint Preset Table (incl. Last 34
+// Slots 64..97 for Modes 4/5/6/7), Bit-Exact 8-Mode DXGI BC7 Decoder, and
+// 100% TTPF Layout Engine (Single-Mip No-Tail, Cubemap 6-Face, 3D Volume)
+// ---------------------------------------------------------------------------
+namespace {
+
+// Official DXGI BC7 2-subset partition table (64 partitions x 16 texels).
+constexpr uint8_t kBc7PartitionTable2[64][16] = {
+    {0,0,1,1,0,0,1,1,0,0,1,1,0,0,1,1}, {0,0,0,1,0,0,0,1,0,0,0,1,0,0,0,1},
+    {0,1,1,1,0,1,1,1,0,1,1,1,0,1,1,1}, {0,0,0,1,0,0,1,1,0,0,1,1,0,1,1,1},
+    {0,0,0,0,0,0,0,1,0,0,0,1,0,0,1,1}, {0,0,1,1,0,1,1,1,0,1,1,1,1,1,1,1},
+    {0,0,0,1,0,0,1,1,0,1,1,1,1,1,1,1}, {0,0,0,0,0,0,0,1,0,0,1,1,0,1,1,1},
+    {0,0,0,0,0,0,0,0,0,0,0,1,0,0,1,1}, {0,0,1,1,0,1,1,1,1,1,1,1,1,1,1,1},
+    {0,0,0,0,0,0,0,1,0,1,1,1,1,1,1,1}, {0,0,0,0,0,0,0,0,0,0,0,1,0,1,1,1},
+    {0,0,0,1,0,1,1,1,1,1,1,1,1,1,1,1}, {0,0,0,0,0,0,0,0,1,1,1,1,1,1,1,1},
+    {0,0,0,0,1,1,1,1,1,1,1,1,1,1,1,1}, {0,0,0,0,0,0,0,0,0,0,0,0,1,1,1,1},
+    {0,0,0,0,1,0,0,0,1,1,1,0,1,1,1,1}, {0,1,1,1,0,0,0,1,0,0,0,0,0,0,0,0},
+    {0,0,0,0,0,0,0,0,1,0,0,0,1,1,1,0}, {0,1,1,1,0,0,1,1,0,0,0,1,0,0,0,0},
+    {0,0,1,1,0,0,0,1,0,0,0,0,0,0,0,0}, {0,0,0,0,1,0,0,0,1,1,0,0,1,1,1,0},
+    {0,0,0,0,0,0,0,0,1,0,0,0,1,1,0,0}, {0,1,1,1,0,0,1,1,0,0,1,1,0,0,0,1},
+    {0,0,1,1,0,0,0,1,0,0,0,1,0,0,0,0}, {0,0,0,0,1,0,0,0,1,0,0,0,1,1,0,0},
+    {0,1,1,0,0,1,1,0,0,1,1,0,0,1,1,0}, {0,0,1,1,0,1,1,0,0,1,1,0,1,1,0,0},
+    {0,0,0,1,0,1,1,1,1,1,1,0,1,0,0,0}, {0,0,0,0,1,1,1,1,1,1,1,1,0,0,0,0},
+    {0,1,1,1,0,0,0,1,1,0,0,0,1,1,1,0}, {0,0,1,1,1,0,0,1,1,0,0,1,1,1,0,0},
+    {0,1,0,1,0,1,0,1,0,1,0,1,0,1,0,1}, {0,0,0,0,1,1,1,1,0,0,0,0,1,1,1,1},
+    {0,1,0,1,1,0,1,0,0,1,0,1,1,0,1,0}, {0,0,1,1,0,0,1,1,1,1,0,0,1,1,0,0},
+    {0,0,1,1,1,1,0,0,0,0,1,1,1,1,0,0}, {0,1,0,1,0,1,0,1,1,0,1,0,1,0,1,0},
+    {0,1,1,0,1,0,0,1,0,1,1,0,1,0,0,1}, {0,1,0,1,1,0,1,0,1,0,1,0,0,1,0,1},
+    {0,1,1,1,0,0,1,1,1,1,0,0,1,1,1,0}, {0,0,0,1,0,0,1,1,1,1,0,0,1,0,0,0},
+    {0,0,1,1,0,0,1,0,0,1,0,0,1,1,0,0}, {0,0,1,1,1,0,1,1,1,1,0,1,1,1,0,0},
+    {0,1,1,0,1,0,0,1,1,0,0,1,0,1,1,0}, {0,0,1,1,1,1,0,0,1,1,0,0,0,0,1,1},
+    {0,1,1,0,0,1,1,0,1,0,0,1,1,0,0,1}, {0,0,0,0,0,1,1,0,0,1,1,0,0,0,0,0},
+    {0,1,0,0,1,1,1,0,0,1,0,0,0,0,0,0}, {0,0,1,0,0,1,1,1,0,0,1,0,0,0,0,0},
+    {0,0,0,0,0,0,1,0,0,1,1,1,0,0,1,0}, {0,0,0,0,0,1,0,0,1,1,1,0,0,1,0,0},
+    {0,1,1,0,1,1,0,0,1,0,0,1,0,0,1,1}, {0,0,1,1,0,1,1,0,1,1,0,0,1,0,0,1},
+    {0,1,1,0,0,0,1,1,1,0,0,1,1,1,0,0}, {0,0,1,1,1,0,0,1,1,1,0,0,0,1,1,0},
+    {0,1,1,0,1,1,0,0,1,1,0,0,1,0,0,1}, {0,1,1,0,0,0,1,1,0,0,1,1,1,0,0,1},
+    {0,1,1,1,1,1,1,0,1,0,0,0,0,0,0,1}, {0,0,0,1,1,0,0,0,1,1,1,0,0,1,1,1},
+    {0,0,0,0,1,1,1,1,0,0,1,1,0,0,1,1}, {0,0,1,1,0,0,1,1,1,1,1,1,0,0,0,0},
+    {0,0,1,0,0,0,1,0,1,1,1,0,1,1,1,0}, {0,1,0,0,0,1,0,0,0,1,1,1,0,1,1,1},
+};
+
+// Official DXGI BC7 3-subset partition table (64 partitions x 16 texels).
+constexpr uint8_t kBc7PartitionTable3[64][16] = {
+    {0,0,1,1,0,0,1,1,0,2,2,1,2,2,2,2}, {0,0,0,1,0,0,1,1,2,2,1,1,2,2,2,1},
+    {0,0,0,0,2,0,0,1,2,2,1,1,2,2,1,1}, {0,2,2,2,0,0,2,2,0,0,1,1,0,1,1,1},
+    {0,0,0,0,0,0,0,0,1,1,2,2,1,1,2,2}, {0,0,1,1,0,0,1,1,0,0,2,2,0,0,2,2},
+    {0,0,2,2,0,0,2,2,1,1,1,1,1,1,1,1}, {0,0,1,1,0,0,1,1,2,2,1,1,2,2,1,1},
+    {0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2}, {0,0,0,0,1,1,1,1,1,1,1,1,2,2,2,2},
+    {0,0,0,0,1,1,1,1,2,2,2,2,2,2,2,2}, {0,0,1,2,0,0,1,2,0,0,1,2,0,0,1,2},
+    {0,1,1,2,0,1,1,2,0,1,1,2,0,1,1,2}, {0,1,2,2,0,1,2,2,0,1,2,2,0,1,2,2},
+    {0,0,1,1,0,1,1,2,1,1,2,2,1,2,2,2}, {0,0,1,1,2,0,0,1,2,2,0,0,2,2,2,0},
+    {0,0,0,1,0,0,1,1,0,1,1,2,1,1,2,2}, {0,1,1,1,0,0,1,1,2,0,0,1,2,2,0,0},
+    {0,0,0,0,1,1,2,2,1,1,2,2,1,1,2,2}, {0,0,2,2,0,0,2,2,0,0,2,2,1,1,1,1},
+    {0,1,1,1,0,1,1,1,0,2,2,2,0,2,2,2}, {0,0,0,1,0,0,0,1,2,2,2,1,2,2,2,1},
+    {0,0,0,0,0,0,1,1,0,1,2,2,0,1,2,2}, {0,0,0,0,1,1,0,0,2,2,1,0,2,2,1,0},
+    {0,1,2,2,0,1,2,2,0,0,1,1,0,0,0,0}, {0,0,1,2,0,0,1,2,1,1,2,2,2,2,2,2},
+    {0,1,1,0,1,2,2,1,1,2,2,1,0,1,1,0}, {0,0,0,0,0,1,1,0,1,2,2,1,1,2,2,1},
+    {0,0,2,2,1,1,0,2,1,1,0,2,0,0,2,2}, {0,1,1,0,0,1,1,0,2,0,0,2,2,2,2,2},
+    {0,0,1,1,0,1,2,2,0,1,2,2,0,0,1,1}, {0,0,0,0,2,0,0,0,2,2,1,1,2,2,2,1},
+    {0,0,0,0,0,0,0,2,1,1,2,2,1,2,2,2}, {0,2,2,2,0,0,2,2,0,0,1,2,0,0,1,1},
+    {0,0,1,1,0,0,1,2,0,0,2,2,0,2,2,2}, {0,1,2,0,0,1,2,0,0,1,2,0,0,1,2,0},
+    {0,0,0,0,1,1,1,1,2,2,2,2,0,0,0,0}, {0,1,2,0,1,2,0,1,2,0,1,2,0,1,2,0},
+    {0,1,2,0,2,0,1,2,1,2,0,1,0,1,2,0}, {0,0,1,1,2,2,0,0,1,1,2,2,0,0,1,1},
+    {0,0,1,1,1,1,2,2,2,2,0,0,0,0,1,1}, {0,1,0,1,0,1,0,1,2,2,2,2,2,2,2,2},
+    {0,0,0,0,0,0,0,0,2,1,2,1,2,1,2,1}, {0,0,2,2,1,1,2,2,0,0,2,2,1,1,2,2},
+    {0,0,2,2,0,0,1,1,0,0,2,2,0,0,1,1}, {0,2,2,0,1,2,2,1,0,2,2,0,1,2,2,1},
+    {0,1,0,1,2,2,2,2,2,2,2,2,0,1,0,1}, {0,0,0,0,2,1,2,1,2,1,2,1,2,1,2,1},
+    {0,1,0,1,0,1,0,1,0,1,0,1,2,2,2,2}, {0,2,2,2,0,1,1,1,0,2,2,2,0,1,1,1},
+    {0,0,0,2,1,1,1,2,0,0,0,2,1,1,1,2}, {0,0,0,0,2,1,1,2,2,1,1,2,2,1,1,2},
+    {0,2,2,2,0,1,1,1,0,1,1,1,0,2,2,2}, {0,0,0,2,1,1,1,2,1,1,1,2,0,0,0,2},
+    {0,1,1,0,0,1,1,0,0,1,1,0,2,2,2,2}, {0,0,0,0,0,0,0,0,2,1,1,2,2,1,1,2},
+    {0,1,1,0,0,1,1,0,2,2,2,2,2,2,2,2}, {0,0,2,2,0,0,1,1,0,0,1,1,0,0,2,2},
+    {0,0,2,2,1,1,2,2,1,1,2,2,0,0,2,2}, {0,0,0,0,0,0,0,0,0,0,0,0,2,1,1,2},
+    {0,0,0,2,0,0,0,1,0,0,0,2,0,0,0,1}, {0,2,2,2,1,2,2,2,0,2,2,2,1,2,2,2},
+    {0,1,0,1,2,2,2,2,2,2,2,2,2,2,2,2}, {0,1,1,1,2,0,1,1,2,2,0,1,2,2,2,0},
+};
+
+constexpr uint8_t kBc7AnchorIndex2[64] = {
+    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
+    15,  2,  8,  2,  2,  8,  8, 15,  2,  8,  2,  2,  8,  8,  2,  2,
+    15, 15,  6,  8,  2,  8, 15, 15,  2,  8,  2,  2,  2, 15, 15,  6,
+     6,  2,  6,  8, 15, 15,  2,  2, 15, 15, 15, 15, 15,  2,  2, 15,
+};
+
+constexpr uint8_t kBc7AnchorIndex3A[64] = {
+     3,  3, 15, 15,  8,  3, 15, 15,  8,  8,  6,  6,  6,  5,  3,  3,
+     3,  3,  8, 15,  3,  3,  6, 10,  5,  8,  8,  6,  8,  5, 15, 15,
+     8, 15,  3,  5,  6, 10,  8, 15, 15,  3, 15,  5, 15, 15, 15, 15,
+     3, 15,  5,  5,  5,  8,  5, 10,  5, 10,  8, 13, 15, 12,  3,  3,
+};
+
+constexpr uint8_t kBc7AnchorIndex3B[64] = {
+    15,  8,  8,  3, 15, 15,  3,  8, 15, 15, 15, 15, 15, 15, 15,  8,
+    15,  8, 15,  3, 15,  8, 15,  8,  3, 15,  6, 10, 15, 15, 10,  8,
+    15,  3, 15, 10, 10,  8,  9, 10,  6, 15,  8, 15,  3,  6,  6,  8,
+    15,  3, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,  3, 15, 15,  8,
+};
+
+struct Bc7ModeSpec {
+    uint8_t subsets;
+    uint8_t partition_bits;
+    uint8_t rotation_bits;
+    uint8_t index_sel_bits;
+    uint8_t color_bits;
+    uint8_t alpha_bits;
+    uint8_t endpoint_pbits;
+    uint8_t shared_pbits;
+    uint8_t index_bits;
+    uint8_t index2_bits;
+};
+
+constexpr Bc7ModeSpec kBc7ModeSpecs[8] = {
+    {3, 4, 0, 0, 4, 0, 1, 0, 3, 0},  // Mode 0
+    {2, 6, 0, 0, 6, 0, 0, 1, 3, 0},  // Mode 1
+    {3, 6, 0, 0, 5, 0, 0, 0, 2, 0},  // Mode 2
+    {2, 6, 0, 0, 7, 0, 1, 0, 2, 0},  // Mode 3
+    {1, 0, 2, 1, 5, 6, 0, 0, 2, 3},  // Mode 4
+    {1, 0, 2, 0, 7, 8, 0, 0, 2, 2},  // Mode 5
+    {1, 0, 0, 0, 7, 7, 1, 0, 4, 0},  // Mode 6
+    {2, 6, 0, 0, 5, 5, 1, 0, 2, 0},  // Mode 7
+};
+
+constexpr uint8_t kBc7Weight2[4] = {0, 21, 43, 64};
+constexpr uint8_t kBc7Weight3[8] = {0, 9, 18, 27, 37, 46, 55, 64};
+constexpr uint8_t kBc7Weight4[16] = {
+    0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64};
+
+struct Bc7BitReader128 {
+    uint64_t lo = 0ull;
+    uint64_t hi = 0ull;
+    uint32_t pos = 0u;
+
+    explicit Bc7BitReader128(const uint8_t blk[16]) noexcept {
+        for (uint32_t i = 0u; i < 8u; ++i) {
+            lo |= (static_cast<uint64_t>(blk[i]) << (i * 8u));
+            hi |= (static_cast<uint64_t>(blk[8u + i]) << (i * 8u));
+        }
+    }
+
+    uint32_t Read(uint32_t bits) noexcept {
+        if (bits == 0u || pos >= 128u) return 0u;
+        uint32_t out = 0u;
+        for (uint32_t i = 0u; i < bits && pos < 128u; ++i, ++pos) {
+            const uint32_t b = (pos < 64u)
+                                   ? static_cast<uint32_t>((lo >> pos) & 1ull)
+                                   : static_cast<uint32_t>((hi >> (pos - 64u)) & 1ull);
+            out |= (b << i);
+        }
+        return out;
+    }
+};
+
+struct Bc7BitWriter128 {
+    uint64_t lo = 0ull;
+    uint64_t hi = 0ull;
+    uint32_t pos = 0u;
+
+    void Write(uint32_t val, uint32_t bits) noexcept {
+        for (uint32_t i = 0u; i < bits && pos < 128u; ++i, ++pos) {
+            const uint64_t bit = static_cast<uint64_t>((val >> i) & 1u);
+            if (pos < 64u) {
+                lo |= (bit << pos);
+            } else {
+                hi |= (bit << (pos - 64u));
+            }
+        }
+    }
+
+    void Store(uint8_t out_blk[16]) const noexcept {
+        for (uint32_t i = 0u; i < 8u; ++i) {
+            out_blk[i] = static_cast<uint8_t>((lo >> (i * 8u)) & 0xFFull);
+            out_blk[8u + i] = static_cast<uint8_t>((hi >> (i * 8u)) & 0xFFull);
+        }
+    }
+};
+
+inline uint8_t Bc7UnquantizeChannel(uint32_t val, uint32_t bits) noexcept {
+    if (bits >= 8u) return static_cast<uint8_t>(val & 0xFFu);
+    if (bits == 0u) return 255u;
+    const uint32_t shift = 8u - bits;
+    return static_cast<uint8_t>((val << shift) | (val >> (bits - shift)));
+}
+
+inline uint8_t Bc7Interpolate(uint8_t e0, uint8_t e1, uint8_t weight) noexcept {
+    return static_cast<uint8_t>(
+        ((64u - static_cast<uint32_t>(weight)) * static_cast<uint32_t>(e0) +
+         static_cast<uint32_t>(weight) * static_cast<uint32_t>(e1) + 32u) >>
+        6u);
+}
+
+inline uint8_t Bc7ExtractMode(uint8_t b0) noexcept {
+    if (b0 == 0u) return 0xFFu;
+    uint8_t m = 0u;
+    while (m < 8u && ((b0 >> m) & 1u) == 0u) {
+        ++m;
+    }
+    return (m < 8u) ? m : 0xFFu;
+}
+
+// Canonical 98-slot BC7 BCPack preset table builder:
+//  Slots  0..15: Mode 0 (3 subsets, partition 0..15, RGB4+1P, 3b idx)
+//  Slots 16..31: Mode 1 (2 subsets, partition bucket 0..15, RGB6+1sharedP, 3b idx)
+//  Slots 32..47: Mode 2 (3 subsets, partition bucket 0..15, RGB5, 2b idx)
+//  Slots 48..63: Mode 3 (2 subsets, partition bucket 0..15, RGB7+1P, 2b idx)
+//  --- Last 34 endpoint preset slots (64..97) covering Modes 4, 5, 6, 7 ---
+//  Slots 64..71: Mode 4 (4 rotations x 2 index_selection = 8 slots, RGB5/A6, 2b+3b idx)
+//  Slots 72..75: Mode 5 (4 rotations = 4 slots, RGB7/A8, 2b+2b idx)
+//  Slots 76..79: Mode 6 (4 unique p-bit pairs 00..11 general alpha = 4 slots, RGBA7+1P, 4b idx)
+//  Slots 80..95: Mode 7 (16 unique p-bit patterns 0000..1111 = 16 slots, RGBA5+1P, 2b idx)
+//  Slot  96:     Mode 6 (p-bits 11, full-opaque A0==A1==127 endpoint precision class)
+//  Slot  97:     Mode 6 (p-bits 00, zero-alpha A0==A1==0 endpoint precision class)
+const std::array<Bc7BcpPresetEntry, kBc7BcpPresetCount>& GetBc7BcpPresetTable() noexcept {
+    static const std::array<Bc7BcpPresetEntry, kBc7BcpPresetCount> kTable = []() {
+        std::array<Bc7BcpPresetEntry, kBc7BcpPresetCount> tbl{};
+        for (uint32_t i = 0u; i < 16u; ++i) {
+            auto& e0 = tbl[i];
+            e0 = Bc7BcpPresetEntry{i, 0u, 3u, static_cast<uint8_t>(i), 0u, 0u, 4u, 0u, 6u, 0u, 3u, 0u, 0u, true};
+            auto& e1 = tbl[16u + i];
+            e1 = Bc7BcpPresetEntry{16u + i, 1u, 2u, static_cast<uint8_t>(i), 0u, 0u, 6u, 0u, 2u, 0u, 3u, 0u, 0u, true};
+            auto& e2 = tbl[32u + i];
+            e2 = Bc7BcpPresetEntry{32u + i, 2u, 3u, static_cast<uint8_t>(i), 0u, 0u, 5u, 0u, 0u, 0u, 2u, 0u, 0u, true};
+            auto& e3 = tbl[48u + i];
+            e3 = Bc7BcpPresetEntry{48u + i, 3u, 2u, static_cast<uint8_t>(i), 0u, 0u, 7u, 0u, 4u, 0u, 2u, 0u, 0u, true};
+        }
+        // Last 34 slots: [64..97]
+        for (uint32_t r = 0u; r < 4u; ++r) {
+            for (uint32_t isel = 0u; isel < 2u; ++isel) {
+                const uint32_t slot = 64u + r * 2u + isel;
+                tbl[slot] = Bc7BcpPresetEntry{
+                    slot, 4u, 1u, 0u, static_cast<uint8_t>(r), static_cast<uint8_t>(isel),
+                    5u, 6u, 0u, 0u, 2u, 3u, 0u, true};
+            }
+        }
+        for (uint32_t r = 0u; r < 4u; ++r) {
+            const uint32_t slot = 72u + r;
+            tbl[slot] = Bc7BcpPresetEntry{
+                slot, 5u, 1u, 0u, static_cast<uint8_t>(r), 0u,
+                7u, 8u, 0u, 0u, 2u, 2u, 0u, true};
+        }
+        for (uint32_t pb = 0u; pb < 4u; ++pb) {
+            const uint32_t slot = 76u + pb;
+            tbl[slot] = Bc7BcpPresetEntry{
+                slot, 6u, 1u, 0u, 0u, 0u,
+                7u, 7u, 2u, static_cast<uint8_t>(pb), 4u, 0u, 0u, true};
+        }
+        for (uint32_t pb = 0u; pb < 16u; ++pb) {
+            const uint32_t slot = 80u + pb;
+            tbl[slot] = Bc7BcpPresetEntry{
+                slot, 7u, 2u, 0u, 0u, 0u,
+                5u, 5u, 4u, static_cast<uint8_t>(pb), 2u, 0u, 0u, true};
+        }
+        tbl[96u] = Bc7BcpPresetEntry{96u, 6u, 1u, 0u, 0u, 0u, 7u, 7u, 2u, 3u, 4u, 0u, 1u, true};
+        tbl[97u] = Bc7BcpPresetEntry{97u, 6u, 1u, 0u, 0u, 0u, 7u, 7u, 2u, 0u, 4u, 0u, 2u, true};
+        return tbl;
+    }();
+    return kTable;
+}
+
+constexpr uint16_t kTtpfLayoutVersion = 1u;
+constexpr size_t kTtpfLayoutHeaderBytes = 64u;
+constexpr uint32_t kTtpfMax3DDepth = 2048u;
+constexpr uint32_t kTtpfMaxArraySize = 2048u;
+
+inline uint64_t TtpfAlignUp64(uint64_t val, uint64_t align, bool& overflow) noexcept {
+    if (align <= 1ull) return val;
+    const uint64_t rem = align - 1ull;
+    if (val > UINT64_MAX - rem) {
+        overflow = true;
+        return 0ull;
+    }
+    return ((val + rem) / align) * align;
+}
+
+inline uint32_t TtpfMaxMips3D(uint32_t w, uint32_t h, uint32_t d) noexcept {
+    uint32_t m = std::max(w, std::max(h, d));
+    if (m == 0u) return 0u;
+    uint32_t levels = 1u;
+    while (m > 1u) {
+        m >>= 1u;
+        ++levels;
+    }
+    return levels;
+}
+
+inline void AppendLe64(std::vector<uint8_t>& dst, uint64_t v) {
+    for (uint32_t i = 0u; i < 8u; ++i) {
+        dst.push_back(static_cast<uint8_t>((v >> (i * 8u)) & 0xFFull));
+    }
+}
+
+inline uint64_t ReadLe64(const uint8_t* p) noexcept {
+    uint64_t v = 0ull;
+    for (uint32_t i = 0u; i < 8u; ++i) {
+        v |= (static_cast<uint64_t>(p[i]) << (i * 8u));
+    }
+    return v;
+}
+
+}  // namespace
+
+bool Bc7GetBcpPresetTableEntry(uint32_t preset_index, Bc7BcpPresetEntry& out_entry) noexcept {
+    out_entry = Bc7BcpPresetEntry{};
+    if (preset_index >= kBc7BcpPresetCount) {
+        out_entry.preset_index = 0xFFu;
+        return false;
+    }
+    out_entry = GetBc7BcpPresetTable()[preset_index];
+    return true;
+}
+
+bool Bc7ResolveBcpPreset(const uint8_t block[16], Bc7BcpPresetEntry& out_entry) noexcept {
+    out_entry = Bc7BcpPresetEntry{};
+    if (!block) {
+        out_entry.preset_index = 0xFFu;
+        return false;
+    }
+    const uint8_t mode = Bc7ExtractMode(block[0]);
+    if (mode > 7u) {
+        out_entry.preset_index = 0xFFu;
+        return false;
+    }
+    Bc7BitReader128 br(block);
+    (void)br.Read(static_cast<uint32_t>(mode) + 1u);  // consume unary mode prefix
+    const auto& tbl = GetBc7BcpPresetTable();
+
+    uint32_t slot = 0u;
+    switch (mode) {
+        case 0u: {
+            const uint32_t part = br.Read(4u);
+            slot = part & 0x0Fu;
+            break;
+        }
+        case 1u: {
+            const uint32_t part = br.Read(6u);
+            slot = 16u + ((part >> 2u) & 0x0Fu);
+            break;
+        }
+        case 2u: {
+            const uint32_t part = br.Read(6u);
+            slot = 32u + ((part >> 2u) & 0x0Fu);
+            break;
+        }
+        case 3u: {
+            const uint32_t part = br.Read(6u);
+            slot = 48u + ((part >> 2u) & 0x0Fu);
+            break;
+        }
+        case 4u: {
+            const uint32_t rot = br.Read(2u);
+            const uint32_t isel = br.Read(1u);
+            slot = 64u + rot * 2u + isel;
+            break;
+        }
+        case 5u: {
+            const uint32_t rot = br.Read(2u);
+            slot = 72u + rot;
+            break;
+        }
+        case 6u: {
+            // Mode 6: 7b mode prefix, then R0,R1,G0,G1,B0,B1,A0,A1 (8 x 7b = 56b), then p0,p1 (2b)
+            (void)br.Read(42u);  // skip R0,R1,G0,G1,B0,B1 (6*7 = 42 bits)
+            const uint32_t a0 = br.Read(7u);
+            const uint32_t a1 = br.Read(7u);
+            const uint32_t p0 = br.Read(1u);
+            const uint32_t p1 = br.Read(1u);
+            const uint32_t pb = p0 | (p1 << 1u);
+            if (pb == 3u && a0 == 0x7Fu && a1 == 0x7Fu) {
+                slot = 96u;
+            } else if (pb == 0u && a0 == 0u && a1 == 0u) {
+                slot = 97u;
+            } else {
+                slot = 76u + pb;
+            }
+            break;
+        }
+        case 7u: {
+            // Mode 7: 8b mode prefix, 6b partition, 16 x 5b endpoints = 80b, then p0..p3 (4b)
+            (void)br.Read(6u);   // partition
+            (void)br.Read(32u);
+            (void)br.Read(32u);
+            (void)br.Read(16u);
+            const uint32_t pb = br.Read(4u);
+            slot = 80u + (pb & 0x0Fu);
+            break;
+        }
+        default:
+            out_entry.preset_index = 0xFFu;
+            return false;
+    }
+
+    out_entry = tbl[slot];
+    return true;
+}
+
+bool Bc7BuildBlockForPreset(uint32_t preset_index, uint32_t seed, uint8_t out_block[16]) noexcept {
+    if (!out_block || preset_index >= kBc7BcpPresetCount) {
+        return false;
+    }
+    const Bc7BcpPresetEntry& e = GetBc7BcpPresetTable()[preset_index];
+    const Bc7ModeSpec& spec = kBc7ModeSpecs[e.mode_index];
+
+    uint32_t s = seed ^ (preset_index * 2654435761u) ^ 0xA53C9E17u;
+    auto next_bits = [&](uint32_t n) noexcept -> uint32_t {
+        if (n == 0u) return 0u;
+        s = s * 1664525u + 1013904223u;
+        const uint32_t mask = (n >= 32u) ? 0xFFFFFFFFu : ((1u << n) - 1u);
+        return (s >> 16u) & mask;
+    };
+
+    Bc7BitWriter128 bw;
+    // Unary mode prefix: `mode` zero bits followed by a `1` bit.
+    bw.Write(1u << e.mode_index, static_cast<uint32_t>(e.mode_index) + 1u);
+
+    // Partition / Rotation / Index Selection
+    uint32_t partition = 0u;
+    if (spec.partition_bits == 4u) {
+        partition = e.partition_bucket & 0x0Fu;
+        bw.Write(partition, 4u);
+    } else if (spec.partition_bits == 6u) {
+        if (e.mode_index <= 3u) {
+            partition = (static_cast<uint32_t>(e.partition_bucket) << 2u) | (next_bits(2u));
+        } else {
+            partition = next_bits(6u);
+        }
+        bw.Write(partition, 6u);
+    }
+    if (spec.rotation_bits > 0u) {
+        bw.Write(e.rotation, spec.rotation_bits);
+    }
+    if (spec.index_sel_bits > 0u) {
+        bw.Write(e.index_selection, spec.index_sel_bits);
+    }
+
+    const uint32_t num_ep = static_cast<uint32_t>(spec.subsets) * 2u;
+    // Color endpoints: R0..Rn, G0..Gn, B0..Bn
+    for (uint32_t c = 0u; c < 3u; ++c) {
+        for (uint32_t ep = 0u; ep < num_ep; ++ep) {
+            bw.Write(next_bits(spec.color_bits), spec.color_bits);
+        }
+    }
+    // Alpha endpoints
+    if (spec.alpha_bits > 0u) {
+        for (uint32_t ep = 0u; ep < num_ep; ++ep) {
+            uint32_t av = next_bits(spec.alpha_bits);
+            if (e.mode_index == 6u) {
+                if (e.alpha_class == 1u) {
+                    av = 0x7Fu;
+                } else if (e.alpha_class == 2u) {
+                    av = 0u;
+                } else {
+                    // Ensure general Mode 6 slots [76..79] do not collide with slots 96/97.
+                    av = 16u + (av % 96u);
+                }
+            }
+            bw.Write(av, spec.alpha_bits);
+        }
+    }
+    // P-bits
+    if (spec.endpoint_pbits > 0u) {
+        for (uint32_t ep = 0u; ep < num_ep; ++ep) {
+            const uint32_t pb = (e.mode_index == 6u || e.mode_index == 7u)
+                                    ? ((e.pbit_pattern >> ep) & 1u)
+                                    : next_bits(1u);
+            bw.Write(pb, 1u);
+        }
+    } else if (spec.shared_pbits > 0u) {
+        for (uint32_t sub = 0u; sub < spec.subsets; ++sub) {
+            bw.Write(next_bits(1u), 1u);
+        }
+    }
+
+    // Indices: primary (respecting anchor bit savings!) + optional secondary
+    auto write_index_plane = [&](uint32_t ibits, bool use_multi_anchors) {
+        for (uint32_t p = 0u; p < 16u; ++p) {
+            bool is_anchor = (p == 0u);
+            if (use_multi_anchors) {
+                if (spec.subsets == 2u && p == kBc7AnchorIndex2[partition]) is_anchor = true;
+                if (spec.subsets == 3u &&
+                    (p == kBc7AnchorIndex3A[partition] || p == kBc7AnchorIndex3B[partition])) {
+                    is_anchor = true;
+                }
+            }
+            const uint32_t wbits = is_anchor ? (ibits - 1u) : ibits;
+            bw.Write(next_bits(wbits), wbits);
+        }
+    };
+    write_index_plane(spec.index_bits, spec.subsets > 1u);
+    if (spec.index2_bits > 0u) {
+        write_index_plane(spec.index2_bits, false);
+    }
+
+    bw.Store(out_block);
+    return true;
+}
+
+void Bc7DecodeBlock(const uint8_t block[16], uint8_t out_rgba8[64]) noexcept {
+    if (!out_rgba8) return;
+    std::memset(out_rgba8, 0, 64u);
+    if (!block) return;
+
+    const uint8_t mode = Bc7ExtractMode(block[0]);
+    if (mode > 7u) {
+        // DXGI BC7 spec: reserved mode (byte 0 == 0x00) decodes to RGBA(0, 0, 0, 0).
+        return;
+    }
+
+    const Bc7ModeSpec& spec = kBc7ModeSpecs[mode];
+    Bc7BitReader128 br(block);
+    (void)br.Read(static_cast<uint32_t>(mode) + 1u);
+
+    const uint32_t partition = br.Read(spec.partition_bits);
+    const uint32_t rotation = br.Read(spec.rotation_bits);
+    const uint32_t index_sel = br.Read(spec.index_sel_bits);
+
+    const uint32_t num_ep = static_cast<uint32_t>(spec.subsets) * 2u;
+    uint32_t raw_r[6]{}, raw_g[6]{}, raw_b[6]{}, raw_a[6]{};
+    for (uint32_t i = 0u; i < num_ep; ++i) raw_r[i] = br.Read(spec.color_bits);
+    for (uint32_t i = 0u; i < num_ep; ++i) raw_g[i] = br.Read(spec.color_bits);
+    for (uint32_t i = 0u; i < num_ep; ++i) raw_b[i] = br.Read(spec.color_bits);
+    if (spec.alpha_bits > 0u) {
+        for (uint32_t i = 0u; i < num_ep; ++i) raw_a[i] = br.Read(spec.alpha_bits);
+    }
+
+    uint32_t pbits[6]{};
+    if (spec.endpoint_pbits > 0u) {
+        for (uint32_t i = 0u; i < num_ep; ++i) pbits[i] = br.Read(1u);
+    } else if (spec.shared_pbits > 0u) {
+        for (uint32_t s = 0u; s < spec.subsets; ++s) {
+            const uint32_t sp = br.Read(1u);
+            pbits[s * 2u + 0u] = sp;
+            pbits[s * 2u + 1u] = sp;
+        }
+    }
+
+    const bool has_pbit = (spec.endpoint_pbits > 0u || spec.shared_pbits > 0u);
+    const uint32_t eff_color_bits = spec.color_bits + (has_pbit ? 1u : 0u);
+    const uint32_t eff_alpha_bits =
+        (spec.alpha_bits > 0u) ? (spec.alpha_bits + (has_pbit ? 1u : 0u)) : 0u;
+
+    uint8_t ep_r[6]{}, ep_g[6]{}, ep_b[6]{}, ep_a[6]{};
+    for (uint32_t i = 0u; i < num_ep; ++i) {
+        const uint32_t rv = has_pbit ? ((raw_r[i] << 1u) | pbits[i]) : raw_r[i];
+        const uint32_t gv = has_pbit ? ((raw_g[i] << 1u) | pbits[i]) : raw_g[i];
+        const uint32_t bv = has_pbit ? ((raw_b[i] << 1u) | pbits[i]) : raw_b[i];
+        ep_r[i] = Bc7UnquantizeChannel(rv, eff_color_bits);
+        ep_g[i] = Bc7UnquantizeChannel(gv, eff_color_bits);
+        ep_b[i] = Bc7UnquantizeChannel(bv, eff_color_bits);
+        if (spec.alpha_bits > 0u) {
+            const uint32_t av = has_pbit ? ((raw_a[i] << 1u) | pbits[i]) : raw_a[i];
+            ep_a[i] = Bc7UnquantizeChannel(av, eff_alpha_bits);
+        } else {
+            ep_a[i] = 255u;
+        }
+    }
+
+    uint8_t idx1[16]{};
+    uint8_t idx2[16]{};
+    for (uint32_t p = 0u; p < 16u; ++p) {
+        bool is_anchor = (p == 0u);
+        if (spec.subsets == 2u && p == kBc7AnchorIndex2[partition]) is_anchor = true;
+        if (spec.subsets == 3u &&
+            (p == kBc7AnchorIndex3A[partition] || p == kBc7AnchorIndex3B[partition])) {
+            is_anchor = true;
+        }
+        const uint32_t rbits = is_anchor ? (spec.index_bits - 1u) : spec.index_bits;
+        idx1[p] = static_cast<uint8_t>(br.Read(rbits));
+    }
+    if (spec.index2_bits > 0u) {
+        for (uint32_t p = 0u; p < 16u; ++p) {
+            const uint32_t rbits = (p == 0u) ? (spec.index2_bits - 1u) : spec.index2_bits;
+            idx2[p] = static_cast<uint8_t>(br.Read(rbits));
+        }
+    }
+
+    auto lookup_weight = [](uint8_t idx, uint32_t bits) noexcept -> uint8_t {
+        if (bits == 2u) return kBc7Weight2[idx & 3u];
+        if (bits == 3u) return kBc7Weight3[idx & 7u];
+        return kBc7Weight4[idx & 15u];
+    };
+
+    for (uint32_t p = 0u; p < 16u; ++p) {
+        uint8_t subset = 0u;
+        if (spec.subsets == 2u) {
+            subset = kBc7PartitionTable2[partition][p];
+        } else if (spec.subsets == 3u) {
+            subset = kBc7PartitionTable3[partition][p];
+        }
+        const uint32_t e0 = static_cast<uint32_t>(subset) * 2u;
+        const uint32_t e1 = e0 + 1u;
+
+        uint8_t cw = 0u;
+        uint8_t aw = 0u;
+        if (spec.index2_bits == 0u) {
+            cw = lookup_weight(idx1[p], spec.index_bits);
+            aw = cw;
+        } else if (index_sel == 0u) {
+            cw = lookup_weight(idx1[p], spec.index_bits);
+            aw = lookup_weight(idx2[p], spec.index2_bits);
+        } else {
+            cw = lookup_weight(idx2[p], spec.index2_bits);
+            aw = lookup_weight(idx1[p], spec.index_bits);
+        }
+
+        uint8_t r = Bc7Interpolate(ep_r[e0], ep_r[e1], cw);
+        uint8_t g = Bc7Interpolate(ep_g[e0], ep_g[e1], cw);
+        uint8_t b = Bc7Interpolate(ep_b[e0], ep_b[e1], cw);
+        uint8_t a = (spec.alpha_bits > 0u) ? Bc7Interpolate(ep_a[e0], ep_a[e1], aw) : 255u;
+
+        if (rotation == 1u) {
+            std::swap(a, r);
+        } else if (rotation == 2u) {
+            std::swap(a, g);
+        } else if (rotation == 3u) {
+            std::swap(a, b);
+        }
+
+        out_rgba8[p * 4u + 0u] = r;
+        out_rgba8[p * 4u + 1u] = g;
+        out_rgba8[p * 4u + 2u] = b;
+        out_rgba8[p * 4u + 3u] = a;
+    }
+}
+
+Status Bc7DecodeSurface(
+    const uint8_t* blocks,
+    size_t blocks_size,
+    uint32_t width,
+    uint32_t height,
+    std::vector<uint8_t>& out_rgba8) {
+    out_rgba8.clear();
+    if (!blocks || width == 0u || height == 0u ||
+        width > kBcPackMaxDimension || height > kBcPackMaxDimension) {
+        return Status::Error(StatusCode::InvalidArgument, "Invalid BC7 surface parameters");
+    }
+    const uint64_t expected_bytes = BcCalculateSurfaceSize(BcFormat::BC7, width, height);
+    if (expected_bytes == 0ull || blocks_size < expected_bytes) {
+        return Status::Error(StatusCode::InvalidArgument, "BC7 source buffer smaller than surface size");
+    }
+    const uint32_t bx_count = (width + 3u) / 4u;
+    const uint32_t by_count = (height + 3u) / 4u;
+    out_rgba8.resize(static_cast<size_t>(width) * static_cast<size_t>(height) * 4u, 0u);
+
+    uint8_t px_blk[64]{};
+    for (uint32_t by = 0u; by < by_count; ++by) {
+        for (uint32_t bx = 0u; bx < bx_count; ++bx) {
+            const size_t blk_idx = static_cast<size_t>(by) * bx_count + bx;
+            Bc7DecodeBlock(blocks + blk_idx * 16u, px_blk);
+            for (uint32_t ty = 0u; ty < 4u; ++ty) {
+                const uint32_t py = by * 4u + ty;
+                if (py >= height) continue;
+                for (uint32_t tx = 0u; tx < 4u; ++tx) {
+                    const uint32_t px = bx * 4u + tx;
+                    if (px >= width) continue;
+                    const size_t src_i = (static_cast<size_t>(ty) * 4u + tx) * 4u;
+                    const size_t dst_i = (static_cast<size_t>(py) * width + px) * 4u;
+                    out_rgba8[dst_i + 0u] = px_blk[src_i + 0u];
+                    out_rgba8[dst_i + 1u] = px_blk[src_i + 1u];
+                    out_rgba8[dst_i + 2u] = px_blk[src_i + 2u];
+                    out_rgba8[dst_i + 3u] = px_blk[src_i + 3u];
+                }
+            }
+        }
+    }
+    return Status::Ok();
+}
+
+// ---------------------------------------------------------------------------
+// 100% TTPF Layout Engine:
+//  1. Single-mip textures without mip tail (mip_count == 1 -> has_mip_tail = false, 0 tail overhead)
+//  2. Cubemap mip counts (6 faces * array_size, face-major indexing, per-face mip tail)
+//  3. 3D volume layouts (depth halving max(1, depth >> mip), 3D slice stride, >4 GiB 64-bit safe)
+// ---------------------------------------------------------------------------
+Status TtpfCalculateLayout(const TtpfLayoutDesc& desc, TtpfLayoutResult& out_layout) {
+    out_layout = TtpfLayoutResult{};
+    const uint32_t block_bytes = BcFormatBlockBytes(desc.format);
+    if (block_bytes == 0u) {
+        return Status::Error(StatusCode::InvalidArgument, "TTPF invalid BC format");
+    }
+    if (desc.width == 0u || desc.height == 0u || desc.depth == 0u ||
+        desc.array_size == 0u || desc.mip_count == 0u) {
+        return Status::Error(StatusCode::InvalidArgument, "TTPF dimensions/counts must be non-zero");
+    }
+    if (desc.width > kBcPackMaxDimension || desc.height > kBcPackMaxDimension) {
+        return Status::Error(StatusCode::InvalidArgument, "TTPF width/height exceeds maximum");
+    }
+    if (desc.tile_size_bytes == 0u || (desc.tile_size_bytes & (desc.tile_size_bytes - 1u)) != 0u) {
+        return Status::Error(StatusCode::InvalidArgument, "TTPF tile_size_bytes must be a power of 2");
+    }
+
+    uint32_t effective_slices = 0u;
+    uint32_t max_mips = 0u;
+    switch (desc.dimension) {
+        case TtpfTextureDimension::Tex2D:
+            if (desc.depth != 1u || desc.array_size > kTtpfMaxArraySize) {
+                return Status::Error(StatusCode::InvalidArgument, "TTPF Tex2D requires depth==1 and valid array_size");
+            }
+            effective_slices = desc.array_size;
+            max_mips = BcCalculateMaxMipLevels(desc.width, desc.height);
+            break;
+
+        case TtpfTextureDimension::Cube:
+            if (desc.depth != 1u || desc.width != desc.height) {
+                return Status::Error(StatusCode::InvalidArgument, "TTPF Cube requires square faces and depth==1");
+            }
+            if (static_cast<uint64_t>(desc.array_size) * 6ull > kTtpfMaxArraySize) {
+                return Status::Error(StatusCode::InvalidArgument, "TTPF Cube face count exceeds maximum");
+            }
+            effective_slices = desc.array_size * 6u;
+            max_mips = BcCalculateMaxMipLevels(desc.width, desc.height);
+            break;
+
+        case TtpfTextureDimension::Tex3D:
+            if (desc.array_size != 1u || desc.depth > kTtpfMax3DDepth) {
+                return Status::Error(StatusCode::InvalidArgument, "TTPF Tex3D requires array_size==1 and depth <= 2048");
+            }
+            effective_slices = 1u;
+            max_mips = TtpfMaxMips3D(desc.width, desc.height, desc.depth);
+            break;
+
+        default:
+            return Status::Error(StatusCode::InvalidArgument, "TTPF unsupported texture dimension");
+    }
+
+    if (desc.mip_count > max_mips) {
+        return Status::Error(StatusCode::InvalidArgument, "TTPF mip_count exceeds maximum for dimensions");
+    }
+
+    const uint64_t sub_count64 = static_cast<uint64_t>(effective_slices) * static_cast<uint64_t>(desc.mip_count);
+    if (sub_count64 == 0ull || sub_count64 > 65536ull) {
+        return Status::Error(StatusCode::InvalidArgument, "TTPF subresource count out of bounds");
+    }
+
+    out_layout.desc = desc;
+    if (out_layout.desc.codec_mask == 0ull) {
+        out_layout.desc.codec_mask = TtpfComputeCodecBitMask(static_cast<uint32_t>(desc.format));
+    }
+
+    // Rule 1: Single-mip textures NEVER have a mip tail (zero tail padding overhead).
+    const bool allow_tail = desc.enable_mip_tail && (desc.mip_count > 1u);
+    uint32_t tail_first_mip = desc.mip_count;
+    if (allow_tail) {
+        for (uint32_t m = 0u; m < desc.mip_count; ++m) {
+            const uint32_t mw = std::max<uint32_t>(1u, desc.width >> m);
+            const uint32_t mh = std::max<uint32_t>(1u, desc.height >> m);
+            const uint32_t md = (desc.dimension == TtpfTextureDimension::Tex3D)
+                                    ? std::max<uint32_t>(1u, desc.depth >> m)
+                                    : 1u;
+            const uint64_t bw = (static_cast<uint64_t>(mw) + 3ull) / 4ull;
+            const uint64_t bh = (static_cast<uint64_t>(mh) + 3ull) / 4ull;
+            const uint64_t mip_bytes = bw * bh * static_cast<uint64_t>(block_bytes) * static_cast<uint64_t>(md);
+            if (mip_bytes < desc.tile_size_bytes) {
+                tail_first_mip = m;
+                break;
+            }
+        }
+    }
+
+    out_layout.effective_slice_count = effective_slices;
+    out_layout.subresource_count = static_cast<uint32_t>(sub_count64);
+    out_layout.has_mip_tail = allow_tail && (tail_first_mip < desc.mip_count);
+    out_layout.mip_tail_first_level = out_layout.has_mip_tail ? tail_first_mip : desc.mip_count;
+    out_layout.subresources.reserve(static_cast<size_t>(sub_count64));
+
+    bool overflow = false;
+    uint64_t cursor = 0ull;
+    uint64_t total_logical = 0ull;
+    uint64_t tail_bytes_per_slice = 0ull;
+
+    // Face-major / slice-major subresource layout (slice * mip_count + mip).
+    for (uint32_t s = 0u; s < effective_slices; ++s) {
+        uint64_t slice_tail_start = 0ull;
+        uint64_t slice_tail_logical = 0ull;
+        bool started_tail = false;
+
+        for (uint32_t m = 0u; m < desc.mip_count; ++m) {
+            const uint32_t mw = std::max<uint32_t>(1u, desc.width >> m);
+            const uint32_t mh = std::max<uint32_t>(1u, desc.height >> m);
+            const uint32_t md = (desc.dimension == TtpfTextureDimension::Tex3D)
+                                    ? std::max<uint32_t>(1u, desc.depth >> m)
+                                    : 1u;
+            const uint32_t bw = static_cast<uint32_t>((static_cast<uint64_t>(mw) + 3ull) / 4ull);
+            const uint32_t bh = static_cast<uint32_t>((static_cast<uint64_t>(mh) + 3ull) / 4ull);
+            const uint64_t row_pitch = static_cast<uint64_t>(bw) * static_cast<uint64_t>(block_bytes);
+            const uint64_t slice_pitch = row_pitch * static_cast<uint64_t>(bh);
+            const uint64_t byte_sz = slice_pitch * static_cast<uint64_t>(md);
+            if (md > 0u && byte_sz / static_cast<uint64_t>(md) != slice_pitch) {
+                return Status::Error(StatusCode::InvalidArgument, "TTPF subresource size 64-bit overflow");
+            }
+            if (total_logical > UINT64_MAX - byte_sz) {
+                return Status::Error(StatusCode::InvalidArgument, "TTPF total logical size 64-bit overflow");
+            }
+            total_logical += byte_sz;
+
+            const bool in_tail = out_layout.has_mip_tail && (m >= tail_first_mip);
+            TtpfSubresourceLayout sub{};
+            sub.subresource_index = s * desc.mip_count + m;
+            sub.array_slice = s;
+            sub.mip_level = m;
+            sub.width = mw;
+            sub.height = mh;
+            sub.depth = md;
+            sub.block_width = bw;
+            sub.block_height = bh;
+            sub.row_pitch_bytes = row_pitch;
+            sub.slice_pitch_bytes = slice_pitch;
+            sub.byte_size = byte_sz;
+            sub.in_mip_tail = in_tail;
+
+            if (!in_tail) {
+                cursor = TtpfAlignUp64(cursor, desc.tile_size_bytes, overflow);
+                const uint64_t padded = TtpfAlignUp64(byte_sz, desc.tile_size_bytes, overflow);
+                if (overflow || cursor > UINT64_MAX - padded) {
+                    return Status::Error(StatusCode::InvalidArgument, "TTPF tiled offset 64-bit overflow");
+                }
+                sub.byte_offset = cursor;
+                sub.padded_tile_size = padded;
+                cursor += padded;
+            } else {
+                if (!started_tail) {
+                    cursor = TtpfAlignUp64(cursor, desc.tile_size_bytes, overflow);
+                    if (overflow) {
+                        return Status::Error(StatusCode::InvalidArgument, "TTPF mip tail offset overflow");
+                    }
+                    slice_tail_start = cursor;
+                    started_tail = true;
+                }
+                const uint64_t sub_aligned = TtpfAlignUp64(byte_sz, 256ull, overflow);
+                if (overflow || cursor > UINT64_MAX - sub_aligned) {
+                    return Status::Error(StatusCode::InvalidArgument, "TTPF mip tail packing overflow");
+                }
+                sub.byte_offset = cursor;
+                sub.padded_tile_size = sub_aligned;
+                cursor += sub_aligned;
+                slice_tail_logical += sub_aligned;
+            }
+            out_layout.subresources.push_back(sub);
+        }
+
+        if (started_tail) {
+            const uint64_t tail_padded = TtpfAlignUp64(slice_tail_logical, desc.tile_size_bytes, overflow);
+            if (overflow || slice_tail_start > UINT64_MAX - tail_padded) {
+                return Status::Error(StatusCode::InvalidArgument, "TTPF mip tail finalize overflow");
+            }
+            cursor = slice_tail_start + tail_padded;
+            tail_bytes_per_slice = tail_padded;
+        }
+    }
+
+    out_layout.mip_tail_bytes_per_slice = out_layout.has_mip_tail ? tail_bytes_per_slice : 0ull;
+    out_layout.total_logical_bytes = total_logical;
+    out_layout.total_tiled_bytes = cursor;
+    out_layout.exceeds_4gib = (cursor > 0xFFFFFFFFull) || (total_logical > 0xFFFFFFFFull);
+    return Status::Ok();
+}
+
+Status TtpfSerializeLayoutHeader(const TtpfLayoutResult& layout, std::vector<uint8_t>& out_bytes) {
+    out_bytes.clear();
+    const Status vst = TtpfValidateLayout(layout);
+    if (!vst.ok()) {
+        return vst;
+    }
+    out_bytes.reserve(kTtpfLayoutHeaderBytes);
+    AppendLe32(out_bytes, kTtpfMagic);
+    AppendLe16(out_bytes, kTtpfLayoutVersion);
+    const uint16_t flags =
+        (layout.has_mip_tail ? 0x0001u : 0x0000u) |
+        (layout.desc.enable_mip_tail ? 0x0002u : 0x0000u);
+    AppendLe16(out_bytes, flags);
+    out_bytes.push_back(static_cast<uint8_t>(layout.desc.format));
+    out_bytes.push_back(static_cast<uint8_t>(layout.desc.dimension));
+    AppendLe16(out_bytes, static_cast<uint16_t>(layout.desc.mip_count));
+    AppendLe32(out_bytes, layout.desc.width);
+    AppendLe32(out_bytes, layout.desc.height);
+    AppendLe32(out_bytes, layout.desc.depth);
+    AppendLe32(out_bytes, layout.desc.array_size);
+    AppendLe32(out_bytes, layout.desc.tile_size_bytes);
+    AppendLe32(out_bytes, layout.mip_tail_first_level);
+    AppendLe64(out_bytes, layout.desc.codec_mask);
+    AppendLe64(out_bytes, layout.total_logical_bytes);
+    AppendLe64(out_bytes, layout.total_tiled_bytes);
+    const uint32_t crc = BcPackCrc32(out_bytes.data(), out_bytes.size());
+    AppendLe32(out_bytes, crc);
+    return Status::Ok();
+}
+
+Status TtpfParseLayoutHeader(
+    const uint8_t* src,
+    size_t src_size,
+    TtpfLayoutResult& out_layout) {
+    out_layout = TtpfLayoutResult{};
+    if (!src || src_size < kTtpfLayoutHeaderBytes) {
+        return Status::Error(StatusCode::ParseError, "TTPF layout header truncated");
+    }
+    if (ReadLe32(src + 0u) != kTtpfMagic) {
+        return Status::Error(StatusCode::ParseError, "TTPF layout magic mismatch");
+    }
+    if (ReadLe16(src + 4u) != kTtpfLayoutVersion) {
+        return Status::Error(StatusCode::ParseError, "TTPF layout version mismatch");
+    }
+    const uint32_t expected_crc = ReadLe32(src + 60u);
+    const uint32_t actual_crc = BcPackCrc32(src, 60u);
+    if (actual_crc != expected_crc) {
+        return Status::Error(StatusCode::ParseError, "TTPF layout header CRC32 mismatch");
+    }
+
+    const uint16_t flags = ReadLe16(src + 6u);
+    TtpfLayoutDesc desc{};
+    desc.format = static_cast<BcFormat>(src[8u]);
+    desc.dimension = static_cast<TtpfTextureDimension>(src[9u]);
+    desc.mip_count = ReadLe16(src + 10u);
+    desc.width = ReadLe32(src + 12u);
+    desc.height = ReadLe32(src + 16u);
+    desc.depth = ReadLe32(src + 20u);
+    desc.array_size = ReadLe32(src + 24u);
+    desc.tile_size_bytes = ReadLe32(src + 28u);
+    const uint32_t hdr_tail_first = ReadLe32(src + 32u);
+    desc.codec_mask = ReadLe64(src + 36u);
+    const uint64_t hdr_logical = ReadLe64(src + 44u);
+    const uint64_t hdr_tiled = ReadLe64(src + 52u);
+    desc.enable_mip_tail = (flags & 0x0002u) != 0u;
+    const bool hdr_has_tail = (flags & 0x0001u) != 0u;
+
+    Status st = TtpfCalculateLayout(desc, out_layout);
+    if (!st.ok()) {
+        return st;
+    }
+    if (out_layout.has_mip_tail != hdr_has_tail ||
+        out_layout.mip_tail_first_level != hdr_tail_first ||
+        out_layout.total_logical_bytes != hdr_logical ||
+        out_layout.total_tiled_bytes != hdr_tiled) {
+        out_layout = TtpfLayoutResult{};
+        return Status::Error(StatusCode::ParseError, "TTPF layout header fields inconsistent with geometry");
+    }
+    return Status::Ok();
+}
+
+Status TtpfValidateLayout(const TtpfLayoutResult& layout) {
+    TtpfLayoutResult expected{};
+    Status st = TtpfCalculateLayout(layout.desc, expected);
+    if (!st.ok()) {
+        return st;
+    }
+    if (layout.effective_slice_count != expected.effective_slice_count ||
+        layout.subresource_count != expected.subresource_count ||
+        layout.has_mip_tail != expected.has_mip_tail ||
+        layout.mip_tail_first_level != expected.mip_tail_first_level ||
+        layout.mip_tail_bytes_per_slice != expected.mip_tail_bytes_per_slice ||
+        layout.total_logical_bytes != expected.total_logical_bytes ||
+        layout.total_tiled_bytes != expected.total_tiled_bytes ||
+        layout.subresources.size() != expected.subresources.size()) {
+        return Status::Error(StatusCode::ParseError, "TTPF layout validation mismatch");
+    }
+    if (layout.desc.mip_count == 1u && (layout.has_mip_tail || layout.mip_tail_bytes_per_slice != 0ull)) {
+        return Status::Error(StatusCode::ParseError, "TTPF single-mip layout must not contain a mip tail");
+    }
+    // Verify every subresource lies strictly within [0, total_tiled_bytes] with 64-bit bounds check.
+    for (size_t i = 0u; i < layout.subresources.size(); ++i) {
+        const auto& s = layout.subresources[i];
+        const auto& e = expected.subresources[i];
+        if (s.subresource_index != e.subresource_index ||
+            s.array_slice != e.array_slice ||
+            s.mip_level != e.mip_level ||
+            s.width != e.width || s.height != e.height || s.depth != e.depth ||
+            s.byte_offset != e.byte_offset || s.byte_size != e.byte_size ||
+            s.in_mip_tail != e.in_mip_tail) {
+            return Status::Error(StatusCode::ParseError, "TTPF subresource layout entry mismatch");
+        }
+        if (!TtpfValidatePayloadBounds(
+                layout.total_tiled_bytes, s.byte_offset, s.padded_tile_size, layout.desc.codec_mask)) {
+            return Status::Error(StatusCode::ParseError, "TTPF subresource exceeds 64-bit tiled bounds");
+        }
     }
     return Status::Ok();
 }

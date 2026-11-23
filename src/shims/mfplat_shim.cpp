@@ -2278,9 +2278,27 @@ public:
     HRESULT STDMETHODCALLTYPE CopyAllItems(IMFAttributes*) override { return S_OK; }
 
     // IMFActivate
-    HRESULT STDMETHODCALLTYPE ActivateObject(REFIID, void** ppv) override {
-        if (ppv) *ppv = nullptr;
-        return E_NOTIMPL;
+    HRESULT STDMETHODCALLTYPE ActivateObject(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        *ppv = nullptr;
+        HMODULE h_hevc = GetModuleHandleW(L"mfhevcdec.dll");
+        if (!h_hevc) {
+            h_hevc = LoadLibraryW(L"mfhevcdec.dll");
+        }
+        if (h_hevc) {
+            using PfnCreate = int32_t(__stdcall*)(void**);
+            auto fn = reinterpret_cast<PfnCreate>(
+                reinterpret_cast<void*>(GetProcAddress(h_hevc, "MFCreateHevcDecoderTransform")));
+            if (fn) {
+                IUnknown* mft = nullptr;
+                if (fn(reinterpret_cast<void**>(&mft)) == 0 && mft) {
+                    const HRESULT qhr = mft->QueryInterface(riid, ppv);
+                    mft->Release();
+                    return qhr;
+                }
+            }
+        }
+        return E_NOINTERFACE;
     }
     HRESULT STDMETHODCALLTYPE ShutdownObject() override { return S_OK; }
     HRESULT STDMETHODCALLTYPE DetachObject() override { return S_OK; }

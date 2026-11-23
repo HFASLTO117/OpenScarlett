@@ -60,6 +60,7 @@ struct AcpShapeAllocation {
     uint32_t num_src = 0;
     uint32_t num_eq = 0;
     uint32_t num_dma = 0;
+    void* stage_buffers[4] = {};
 };
 
 // Real retail Xbox Series X|S ACP_SHAPE_CONTEXTS (0x60 bytes, verified against fmod.dll).
@@ -351,13 +352,23 @@ constexpr uint32_t kCachedApuSpaceSize = 0x70000000u;
 constexpr uint32_t kNonCachedApuSpaceBase = 0x80000000u;
 constexpr uint32_t kNonCachedApuSpaceSize = 0x70000000u;
 constexpr uint32_t kDefaultAlignmentBytes = 64u;
+constexpr uint32_t kMaxApuAlignmentBytes = 0x10000000u;  // 256 MiB max alignment
+constexpr uint64_t kMaxShapeStageBytes = 256ull * 1024ull * 1024ull;
 
 inline bool IsPowerOfTwo(uint32_t v) {
     return v != 0u && (v & (v - 1u)) == 0u;
 }
 
-inline uint64_t AlignUpU64(uint64_t value, uint64_t alignment) {
-    return (value + alignment - 1ull) & ~(alignment - 1ull);
+inline bool CheckedAlignUpU64(uint64_t value, uint64_t alignment, uint64_t& out) {
+    if (alignment == 0ull || (alignment & (alignment - 1ull)) != 0ull) {
+        return false;
+    }
+    const uint64_t mask = alignment - 1ull;
+    if (value > UINT64_MAX - mask) {
+        return false;
+    }
+    out = (value + mask) & ~mask;
+    return true;
 }
 
 inline void* AlignedAllocHost(size_t size, size_t alignment) {
@@ -387,6 +398,8 @@ struct ApuFreeRange {
 };
 
 struct ApuHeapPool {
+    uint32_t space_base = 0;
+    uint32_t space_size = 0;
     uint32_t capacity = 0;
     uint32_t bytes_allocated = 0;
     uint32_t bytes_lost = 0;
@@ -394,21 +407,35 @@ struct ApuHeapPool {
     std::vector<ApuFreeRange> free_ranges;
 
     void InitAddressSpace(uint32_t base, uint32_t size) {
+        space_base = base;
+        space_size = size;
         free_ranges.clear();
         free_ranges.push_back(ApuFreeRange{base, size});
     }
 
+    bool IsRangeWithinSpace(uint64_t start, uint64_t span) const noexcept {
+        if (span == 0ull || start + span < start) {
+            return false;
+        }
+        const uint64_t end = start + span;
+        const uint64_t space_end = static_cast<uint64_t>(space_base) + static_cast<uint64_t>(space_size);
+        return start >= space_base && end <= space_end && end <= 0x100000000ull;
+    }
+
     bool AllocateApuRange(uint32_t span, uint32_t alignment, APU_ADDRESS* out_addr) {
-        if (span == 0u || alignment == 0u) return false;
+        if (!out_addr || span == 0u || alignment == 0u) {
+            return false;
+        }
         for (size_t i = 0; i < free_ranges.size(); ++i) {
             const uint64_t r_start = free_ranges[i].start;
-            const uint64_t r_end = r_start + free_ranges[i].size;
-            const uint64_t aligned = AlignUpU64(r_start, alignment);
-            if (aligned < r_start || aligned > 0xFFFFFFFFull) {
+            const uint64_t r_end = r_start + static_cast<uint64_t>(free_ranges[i].size);
+            uint64_t aligned = 0ull;
+            if (!CheckedAlignUpU64(r_start, alignment, aligned)) {
                 continue;
             }
             const uint64_t alloc_end = aligned + static_cast<uint64_t>(span);
-            if (alloc_end < aligned || alloc_end > r_end || alloc_end > 0x100000000ull) {
+            if (alloc_end < aligned || alloc_end > r_end ||
+                !IsRangeWithinSpace(aligned, static_cast<uint64_t>(span))) {
                 continue;
             }
 
@@ -436,28 +463,32 @@ struct ApuHeapPool {
         return false;
     }
 
-    void FreeApuRange(APU_ADDRESS start, uint32_t span) {
-        if (span == 0u) return;
+    bool FreeApuRange(APU_ADDRESS start, uint32_t span) {
+        if (span == 0u || !IsRangeWithinSpace(start, span)) {
+            return false;
+        }
         const uint64_t entry_start = start;
         const uint64_t entry_end = entry_start + static_cast<uint64_t>(span);
-        if (entry_end < entry_start || entry_end > 0x100000000ull) return;
 
-        ApuFreeRange entry{start, span};
         auto it = std::lower_bound(
             free_ranges.begin(),
             free_ranges.end(),
-            entry.start,
+            start,
             [](const ApuFreeRange& r, uint32_t addr) { return r.start < addr; });
-        // Reject overlapping range insertions so a double-free cannot corrupt the free list.
-        if (it != free_ranges.end() && entry_end > it->start) {
-            return;
+
+        // Reject overlapping frees to preserve free-list disjointness invariant.
+        if (it != free_ranges.end() && entry_end > static_cast<uint64_t>(it->start)) {
+            return false;
         }
         if (it != free_ranges.begin()) {
             const auto prev = it - 1;
-            if (static_cast<uint64_t>(prev->start) + prev->size > entry_start) {
-                return;
+            const uint64_t prev_end = static_cast<uint64_t>(prev->start) + prev->size;
+            if (prev_end > entry_start) {
+                return false;
             }
         }
+
+        ApuFreeRange entry{start, span};
         it = free_ranges.insert(it, entry);
 
         // Coalesce with next range if contiguous.
@@ -477,6 +508,7 @@ struct ApuHeapPool {
                 free_ranges.erase(it);
             }
         }
+        return true;
     }
 };
 
@@ -511,14 +543,18 @@ public:
     }
 
     int32_t CreateHeap(uint32_t cached_bytes, uint32_t non_cached_bytes) {
-        if (cached_bytes == 0u && non_cached_bytes == 0u) {
+        if ((cached_bytes == 0u && non_cached_bytes == 0u) ||
+            cached_bytes > kCachedApuSpaceSize ||
+            non_cached_bytes > kNonCachedApuSpaceSize) {
             return ACPHAL_E_INVALIDARG;
         }
         std::lock_guard<std::mutex> lk(mutex_);
-        const uint32_t cached_used = cached_.bytes_allocated + cached_.bytes_lost;
-        const uint32_t non_cached_used = non_cached_.bytes_allocated + non_cached_.bytes_lost;
-        cached_.capacity = std::max(cached_bytes, cached_used);
-        non_cached_.capacity = std::max(non_cached_bytes, non_cached_used);
+        const uint64_t cached_used =
+            static_cast<uint64_t>(cached_.bytes_allocated) + cached_.bytes_lost;
+        const uint64_t non_cached_used =
+            static_cast<uint64_t>(non_cached_.bytes_allocated) + non_cached_.bytes_lost;
+        cached_.capacity = static_cast<uint32_t>(std::max<uint64_t>(cached_bytes, cached_used));
+        non_cached_.capacity = static_cast<uint32_t>(std::max<uint64_t>(non_cached_bytes, non_cached_used));
         initialized_ = true;
         return ACPHAL_S_OK;
     }
@@ -540,7 +576,8 @@ public:
         if (size_in_bytes == 0u) {
             return ACPHAL_E_INVALIDARG;
         }
-        if (alignment_in_bytes != 0u && !IsPowerOfTwo(alignment_in_bytes)) {
+        if (alignment_in_bytes != 0u &&
+            (!IsPowerOfTwo(alignment_in_bytes) || alignment_in_bytes > kMaxApuAlignmentBytes)) {
             return ACPHAL_E_INVALIDARG;
         }
 
@@ -565,9 +602,8 @@ public:
         }
 
         ApuHeapPool& pool = is_non_cached ? non_cached_ : cached_;
-        const uint64_t used_after =
-            static_cast<uint64_t>(pool.bytes_allocated) + pool.bytes_lost + span64;
-        if (used_after > pool.capacity) {
+        const uint64_t cur_used = static_cast<uint64_t>(pool.bytes_allocated) + pool.bytes_lost;
+        if (span64 > pool.capacity || cur_used > pool.capacity || span64 > pool.capacity - cur_used) {
             return ACPHAL_E_OUTOFMEMORY;
         }
 
@@ -576,14 +612,28 @@ public:
             return ACPHAL_E_OUTOFMEMORY;
         }
 
+        // Defensive overlap & 64-bit address-range overflow guard on active APU map.
+        if (HasApuOverlapLocked(apu_addr, apu_span)) {
+            pool.FreeApuRange(apu_addr, apu_span);
+            return ACPHAL_E_OUTOFMEMORY;
+        }
+
         void* ptr = AlignedAllocHost(size_in_bytes, os_align);
         if (!ptr) {
             pool.FreeApuRange(apu_addr, apu_span);
             return ACPHAL_E_OUTOFMEMORY;
         }
-        std::memset(ptr, 0, size_in_bytes);
 
         const uintptr_t va_key = reinterpret_cast<uintptr_t>(ptr);
+        if (va_key + static_cast<uintptr_t>(size_in_bytes) < va_key ||
+            HasVaOverlapLocked(va_key, size_in_bytes)) {
+            AlignedFreeHost(ptr);
+            pool.FreeApuRange(apu_addr, apu_span);
+            return ACPHAL_E_OUTOFMEMORY;
+        }
+
+        std::memset(ptr, 0, size_in_bytes);
+
         ApuAllocRecord rec{};
         rec.virtual_address = ptr;
         rec.apu_address = apu_addr;
@@ -625,7 +675,7 @@ public:
             by_va_.erase(it);
 
             ApuHeapPool& pool = rec.non_cached ? non_cached_ : cached_;
-            pool.FreeApuRange(rec.apu_address, rec.apu_span);
+            (void)pool.FreeApuRange(rec.apu_address, rec.apu_span);
             pool.bytes_allocated -= rec.requested_size;
             pool.bytes_lost -= rec.pad_bytes;
             pool.allocation_count -= 1u;
@@ -666,6 +716,9 @@ public:
             return 0;
         }
         const uintptr_t va = reinterpret_cast<uintptr_t>(virtual_address);
+        if (va + static_cast<uintptr_t>(size_in_bytes) < va) {
+            return 0;
+        }
         std::lock_guard<std::mutex> lk(mutex_);
         auto it = by_va_.upper_bound(va);
         if (it == by_va_.begin()) {
@@ -684,7 +737,11 @@ public:
         if (size_in_bytes == 0u) {
             return 1;
         }
-        return (offset + static_cast<uint64_t>(size_in_bytes) <= rec.requested_size) ? 1 : 0;
+        const uint64_t end_off = offset + static_cast<uint64_t>(size_in_bytes);
+        if (end_off < offset) {
+            return 0;
+        }
+        return (end_off <= rec.requested_size) ? 1 : 0;
     }
 
     APU_ADDRESS MapVirtualAddress(const void* virtual_address) {
@@ -707,7 +764,11 @@ public:
         if (offset >= rec.requested_size) {
             return APU_INVALID_ADDRESS;
         }
-        return rec.apu_address + static_cast<uint32_t>(offset);
+        const uint64_t apu64 = static_cast<uint64_t>(rec.apu_address) + offset;
+        if (apu64 > 0xFFFFFFFFull) {
+            return APU_INVALID_ADDRESS;
+        }
+        return static_cast<APU_ADDRESS>(apu64);
     }
 
     void* MapApuAddress(APU_ADDRESS apu_address) {
@@ -736,7 +797,103 @@ public:
         return static_cast<uint8_t*>(rec.virtual_address) + offset;
     }
 
+    // Validates that a caller-supplied APU range [apu_address, apu_address + size_in_bytes)
+    // does not wrap 32-bit/64-bit address space and lies strictly inside a single live allocation
+    // (or does not overlap any existing allocation when checking candidate placement).
+    int32_t ValidateApuAddressRange(APU_ADDRESS apu_address, uint32_t size_in_bytes) {
+        if (apu_address == APU_INVALID_ADDRESS || size_in_bytes == 0u) {
+            return ACPHAL_E_INVALIDARG;
+        }
+        const uint64_t req_start = apu_address;
+        const uint64_t req_end = req_start + static_cast<uint64_t>(size_in_bytes);
+        if (req_end < req_start || req_end > 0x100000000ull) {
+            return ACPHAL_E_INVALIDARG;
+        }
+        std::lock_guard<std::mutex> lk(mutex_);
+        auto it = by_apu_.upper_bound(apu_address);
+        if (it == by_apu_.begin()) {
+            return ACPHAL_E_INVALIDARG;
+        }
+        --it;
+        auto va_it = by_va_.find(it->second);
+        if (va_it == by_va_.end()) {
+            return ACPHAL_E_INVALIDARG;
+        }
+        const ApuAllocRecord& rec = va_it->second;
+        const uint64_t rec_start = rec.apu_address;
+        const uint64_t rec_end = rec_start + static_cast<uint64_t>(rec.requested_size);
+        if (req_start < rec_start || req_end > rec_end) {
+            return ACPHAL_E_INVALIDARG;
+        }
+        return ACPHAL_S_OK;
+    }
+
+    // Checks whether an arbitrary APU range [apu_start, apu_start + size_in_bytes) would overflow
+    // or overlap any existing active allocation. Returns ACPHAL_S_OK if disjoint & in-space,
+    // ACPHAL_E_INVALIDARG on overflow/overlap.
+    int32_t CheckApuRangeDisjoint(APU_ADDRESS apu_start, uint32_t size_in_bytes) {
+        if (apu_start == APU_INVALID_ADDRESS || size_in_bytes == 0u) {
+            return ACPHAL_E_INVALIDARG;
+        }
+        const uint64_t req_start = apu_start;
+        const uint64_t req_end = req_start + static_cast<uint64_t>(size_in_bytes);
+        if (req_end < req_start || req_end > 0x100000000ull) {
+            return ACPHAL_E_INVALIDARG;
+        }
+        std::lock_guard<std::mutex> lk(mutex_);
+        if (!cached_.IsRangeWithinSpace(req_start, size_in_bytes) &&
+            !non_cached_.IsRangeWithinSpace(req_start, size_in_bytes)) {
+            return ACPHAL_E_INVALIDARG;
+        }
+        return HasApuOverlapLocked(apu_start, size_in_bytes) ? ACPHAL_E_INVALIDARG : ACPHAL_S_OK;
+    }
+
 private:
+    bool HasApuOverlapLocked(APU_ADDRESS start, uint32_t span) const {
+        const uint64_t s = start;
+        const uint64_t e = s + static_cast<uint64_t>(span);
+        if (e < s || e > 0x100000000ull) return true;
+        auto it = by_apu_.lower_bound(start);
+        if (it != by_apu_.end()) {
+            if (static_cast<uint64_t>(it->first) < e) {
+                return true;
+            }
+        }
+        if (it != by_apu_.begin()) {
+            auto prev = std::prev(it);
+            auto va_it = by_va_.find(prev->second);
+            if (va_it != by_va_.end()) {
+                const uint64_t prev_end =
+                    static_cast<uint64_t>(va_it->second.apu_address) + va_it->second.apu_span;
+                if (prev_end > s) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    bool HasVaOverlapLocked(uintptr_t start, uint32_t size) const {
+        const uint64_t s = static_cast<uint64_t>(start);
+        const uint64_t e = s + static_cast<uint64_t>(size);
+        if (e < s) return true;
+        auto it = by_va_.lower_bound(start);
+        if (it != by_va_.end()) {
+            if (static_cast<uint64_t>(it->first) < e) {
+                return true;
+            }
+        }
+        if (it != by_va_.begin()) {
+            auto prev = std::prev(it);
+            const uint64_t prev_end =
+                static_cast<uint64_t>(prev->first) + static_cast<uint64_t>(prev->second.requested_size);
+            if (prev_end > s) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     std::mutex mutex_;
     bool initialized_ = false;
     ApuHeapPool cached_{};
@@ -749,9 +906,16 @@ static bool IsWritableAcpPtr(void* ptr, size_t bytes) {
     if (!ptr || reinterpret_cast<uintptr_t>(ptr) < 0x10000ull) {
         return false;
     }
+    const uintptr_t start = reinterpret_cast<uintptr_t>(ptr);
+    if (start + bytes < start) {
+        return false;
+    }
 #if defined(_WIN32)
     MEMORY_BASIC_INFORMATION mbi{};
     if (::VirtualQuery(ptr, &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT) {
+        return false;
+    }
+    if ((mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0u) {
         return false;
     }
     const DWORD prot = mbi.Protect & 0xFFu;
@@ -759,9 +923,8 @@ static bool IsWritableAcpPtr(void* ptr, size_t bytes) {
                            prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY);
     if (!writable) return false;
     const uintptr_t region_end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
-    return reinterpret_cast<uintptr_t>(ptr) + bytes <= region_end;
+    return start + bytes <= region_end;
 #else
-    (void)bytes;
     return true;
 #endif
 }
@@ -812,83 +975,121 @@ int32_t OPENSCARLETT_ACPHAL_CALL AcpHalAllocateShapeContexts(
         auto* xbox_ctx = reinterpret_cast<XboxAcpShapeContexts*>(
             const_cast<AcpHalShapeContexts*>(pRequested));
 
-        std::lock_guard<std::mutex> lk(g_shape_alloc_mutex);
-        // Upfront 64-bit overflow and sanity validation across all 6 SHAPE context arrays.
-        constexpr uint64_t kMaxSingleShapeArrayBytes = 256ull * 1024ull * 1024ull;
-        const uint32_t counts[6] = {
-            xbox_ctx->numSrcContexts,
-            xbox_ctx->numEqCompContexts,
-            xbox_ctx->numFiltVolContexts,
-            xbox_ctx->numDmaContexts,
-            xbox_ctx->numXmaContexts,
-            xbox_ctx->numPcmContexts,
+        // 6 SHAPE pipeline stages in retail XboxAcpShapeContexts.
+        // Validate ALL stage byte counts in 64-bit FIRST before committing any allocations,
+        // and atomically roll back stages 0..N-1 on partial OOM leaving zero leaked APU memory!
+        struct StageSpec {
+            uint32_t count;
+            uint32_t elem_bytes;
+            void** out_slot;
         };
-        const uint32_t elem_sizes[6] = {32u, 32u, 32u, 16u, 64u, 64u};
-        uint32_t byte_sizes[6] = {0u, 0u, 0u, 0u, 0u, 0u};
-        for (size_t i = 0; i < 6u; ++i) {
-            const uint64_t prod = static_cast<uint64_t>(counts[i]) * elem_sizes[i];
-            if (prod > kMaxSingleShapeArrayBytes || prod > 0xFFFFFFFFull) {
-                return RecordHr("AcpHalAllocateShapeContexts", ACPHAL_E_OUTOFMEMORY);
+        StageSpec stages[6] = {
+            {xbox_ctx->numSrcContexts,     32u, &xbox_ctx->srcContexts},
+            {xbox_ctx->numEqCompContexts,  32u, &xbox_ctx->eqCompContexts},
+            {xbox_ctx->numFiltVolContexts, 32u, &xbox_ctx->filtVolContexts},
+            {xbox_ctx->numDmaContexts,     16u, &xbox_ctx->dmaContexts},
+            {xbox_ctx->numXmaContexts,     64u, &xbox_ctx->xmaContexts},
+            {xbox_ctx->numPcmContexts,     64u, &xbox_ctx->pcmContexts},
+        };
+
+        uint32_t stage_bytes[6] = {};
+        for (size_t i = 0u; i < 6u; ++i) {
+            const uint64_t total64 =
+                static_cast<uint64_t>(stages[i].count) * static_cast<uint64_t>(stages[i].elem_bytes);
+            if (total64 > kMaxShapeStageBytes || total64 > 0xFFFFFFFFull) {
+                for (size_t j = 0u; j < 6u; ++j) {
+                    *stages[j].out_slot = nullptr;
+                }
+                return RecordHr("AcpHalAllocateShapeContexts", ACPHAL_E_INVALIDARG);
             }
-            byte_sizes[i] = static_cast<uint32_t>(prod);
+            stage_bytes[i] = static_cast<uint32_t>(total64);
         }
 
-        // Transactional allocation: allocate into temporaries and roll back on any failure
-        // without clobbering existing pointers in xbox_ctx.
-        void* tmp_ptrs[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
-        bool from_apu[6] = {false, false, false, false, false, false};
-        bool ok = true;
-        for (size_t i = 0; i < 6u; ++i) {
-            if (byte_sizes[i] == 0u) {
+        std::lock_guard<std::mutex> lk(g_shape_alloc_mutex);
+        void* allocated_ptrs[6] = {};
+        int32_t fail_hr = ACPHAL_S_OK;
+        for (size_t i = 0u; i < 6u; ++i) {
+            if (stage_bytes[i] == 0u) {
                 continue;
             }
             void* va = nullptr;
             APU_ADDRESS pa = APU_INVALID_ADDRESS;
-            if (ApuHeapManager::Instance().Alloc(&va, &pa, byte_sizes[i], 64u, APU_ALLOC_CACHED) == ACPHAL_S_OK && va) {
-                tmp_ptrs[i] = va;
-                from_apu[i] = true;
-            } else {
-                va = AlignedAllocHost(byte_sizes[i], 64u);
-                if (!va) {
-                    ok = false;
-                    break;
+            const int32_t hr =
+                ApuHeapManager::Instance().Alloc(&va, &pa, stage_bytes[i], 64u, APU_ALLOC_CACHED);
+            if (hr != ACPHAL_S_OK || !va) {
+                fail_hr = (hr < 0) ? hr : ACPHAL_E_OUTOFMEMORY;
+                // Atomic rollback of stages 0..(i-1): zero leaked APU buffers!
+                for (size_t r = i; r > 0u; --r) {
+                    if (allocated_ptrs[r - 1u]) {
+                        (void)ApuHeapManager::Instance().Free(allocated_ptrs[r - 1u]);
+                        allocated_ptrs[r - 1u] = nullptr;
+                    }
                 }
-                std::memset(va, 0, byte_sizes[i]);
-                tmp_ptrs[i] = va;
-                from_apu[i] = false;
-            }
-        }
-        if (!ok) {
-            for (size_t i = 0; i < 6u; ++i) {
-                if (!tmp_ptrs[i]) continue;
-                if (from_apu[i]) {
-                    (void)ApuHeapManager::Instance().Free(tmp_ptrs[i]);
-                } else {
-                    AlignedFreeHost(tmp_ptrs[i]);
+                for (size_t j = 0u; j < 6u; ++j) {
+                    *stages[j].out_slot = nullptr;
                 }
+                return RecordHr("AcpHalAllocateShapeContexts", fail_hr);
             }
-            return RecordHr("AcpHalAllocateShapeContexts", ACPHAL_E_OUTOFMEMORY);
+            allocated_ptrs[i] = va;
         }
 
-        for (size_t i = 0; i < 6u; ++i) {
-            if (tmp_ptrs[i]) {
-                g_xbox_shape_buffers.push_back(tmp_ptrs[i]);
+        // All 6 stages succeeded — publish pointers and track for AcpHalReleaseShapeContexts.
+        for (size_t i = 0u; i < 6u; ++i) {
+            *stages[i].out_slot = allocated_ptrs[i];
+            if (allocated_ptrs[i]) {
+                g_xbox_shape_buffers.push_back(allocated_ptrs[i]);
             }
         }
-        xbox_ctx->srcContexts = tmp_ptrs[0];
-        xbox_ctx->eqCompContexts = tmp_ptrs[1];
-        xbox_ctx->filtVolContexts = tmp_ptrs[2];
-        xbox_ctx->dmaContexts = tmp_ptrs[3];
-        xbox_ctx->xmaContexts = tmp_ptrs[4];
-        xbox_ctx->pcmContexts = tmp_ptrs[5];
         return RecordHr("AcpHalAllocateShapeContexts", ACPHAL_S_OK);
     }
 
+    // Synthetic 2-arg path: validate counts, allocate per-stage APU backing buffers with
+    // atomic rollback on stage N failure, zero leaked APU allocations or dangling handles.
     g_xbox_retail_acphal_mode.store(false, std::memory_order_release);
+    std::memset(pAllocated, 0, sizeof(*pAllocated));
+
+    const uint32_t req_counts[4] = {
+        pRequested->numXmaContexts,
+        pRequested->numSrcContexts,
+        pRequested->numEqContexts,
+        pRequested->numDmaContexts,
+    };
+    const uint32_t stage_elem_bytes[4] = {64u, 32u, 32u, 16u};
+    uint32_t stage_bytes[4] = {};
+    for (size_t i = 0u; i < 4u; ++i) {
+        const uint64_t total64 =
+            static_cast<uint64_t>(req_counts[i]) * static_cast<uint64_t>(stage_elem_bytes[i]);
+        if (total64 > kMaxShapeStageBytes || total64 > 0xFFFFFFFFull) {
+            return RecordHr("AcpHalAllocateShapeContexts", ACPHAL_E_INVALIDARG);
+        }
+        stage_bytes[i] = static_cast<uint32_t>(total64);
+    }
+
     auto* alloc = new (std::nothrow) AcpShapeAllocation();
     if (!alloc) {
         return RecordHr("AcpHalAllocateShapeContexts", ACPHAL_E_OUTOFMEMORY);
     }
+
+    for (size_t i = 0u; i < 4u; ++i) {
+        if (stage_bytes[i] == 0u) continue;
+        void* va = nullptr;
+        APU_ADDRESS pa = APU_INVALID_ADDRESS;
+        const int32_t hr =
+            ApuHeapManager::Instance().Alloc(&va, &pa, stage_bytes[i], 64u, APU_ALLOC_CACHED);
+        if (hr != ACPHAL_S_OK || !va) {
+            // Atomic rollback of stages 0..(i-1)!
+            for (size_t r = i; r > 0u; --r) {
+                if (alloc->stage_buffers[r - 1u]) {
+                    (void)ApuHeapManager::Instance().Free(alloc->stage_buffers[r - 1u]);
+                    alloc->stage_buffers[r - 1u] = nullptr;
+                }
+            }
+            delete alloc;
+            return RecordHr("AcpHalAllocateShapeContexts", (hr < 0) ? hr : ACPHAL_E_OUTOFMEMORY);
+        }
+        alloc->stage_buffers[i] = va;
+    }
+
     alloc->num_xma = std::min<uint32_t>(pRequested->numXmaContexts, kMaxAcpContexts);
     alloc->num_src = pRequested->numSrcContexts;
     alloc->num_eq = pRequested->numEqContexts;
@@ -912,7 +1113,13 @@ int32_t OPENSCARLETT_ACPHAL_CALL AcpHalReleaseShapeContexts(AcpHalShapeContexts*
         if (IsWritableAcpPtr(pAllocated, sizeof(AcpHalShapeContexts)) &&
             pAllocated->internalAllocation != nullptr &&
             g_synthetic_shape_allocs.erase(pAllocated->internalAllocation) > 0) {
-            delete static_cast<AcpShapeAllocation*>(pAllocated->internalAllocation);
+            auto* alloc = static_cast<AcpShapeAllocation*>(pAllocated->internalAllocation);
+            for (void* buf : alloc->stage_buffers) {
+                if (buf) {
+                    (void)ApuHeapManager::Instance().Free(buf);
+                }
+            }
+            delete alloc;
             std::memset(pAllocated, 0, sizeof(*pAllocated));
             return RecordHr("AcpHalReleaseShapeContexts", ACPHAL_S_OK);
         }
@@ -929,9 +1136,33 @@ int32_t OPENSCARLETT_ACPHAL_CALL AcpHalReleaseShapeContexts(AcpHalShapeContexts*
     if (!pAllocated) {
         return RecordHr("AcpHalReleaseShapeContexts", ACPHAL_E_INVALIDARG);
     }
-    delete static_cast<AcpShapeAllocation*>(pAllocated->internalAllocation);
+    if (pAllocated->internalAllocation) {
+        auto* alloc = static_cast<AcpShapeAllocation*>(pAllocated->internalAllocation);
+        for (void* buf : alloc->stage_buffers) {
+            if (buf) {
+                (void)ApuHeapManager::Instance().Free(buf);
+            }
+        }
+        delete alloc;
+    }
     std::memset(pAllocated, 0, sizeof(*pAllocated));
     return RecordHr("AcpHalReleaseShapeContexts", ACPHAL_S_OK);
+}
+
+int32_t OPENSCARLETT_ACPHAL_CALL ApuValidateAddressRange(
+    APU_ADDRESS apuAddress,
+    uint32_t sizeInBytes) {
+    return RecordHr(
+        "ApuValidateAddressRange",
+        ApuHeapManager::Instance().ValidateApuAddressRange(apuAddress, sizeInBytes));
+}
+
+int32_t OPENSCARLETT_ACPHAL_CALL ApuCheckAddressRangeDisjoint(
+    APU_ADDRESS apuAddress,
+    uint32_t sizeInBytes) {
+    return RecordHr(
+        "ApuCheckAddressRangeDisjoint",
+        ApuHeapManager::Instance().CheckApuRangeDisjoint(apuAddress, sizeInBytes));
 }
 
 int32_t OPENSCARLETT_ACPHAL_CALL ApuCreateHeap(

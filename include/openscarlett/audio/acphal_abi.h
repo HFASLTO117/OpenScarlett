@@ -139,6 +139,12 @@ OPENSCARLETT_ACPHAL_API APU_ADDRESS OPENSCARLETT_ACPHAL_CALL ApuMapVirtualAddres
     const void* virtualAddress);
 OPENSCARLETT_ACPHAL_API void* OPENSCARLETT_ACPHAL_CALL ApuMapApuAddress(
     APU_ADDRESS apuAddress);
+OPENSCARLETT_ACPHAL_API int32_t OPENSCARLETT_ACPHAL_CALL ApuValidateAddressRange(
+    APU_ADDRESS apuAddress,
+    uint32_t sizeInBytes);
+OPENSCARLETT_ACPHAL_API int32_t OPENSCARLETT_ACPHAL_CALL ApuCheckAddressRangeDisjoint(
+    APU_ADDRESS apuAddress,
+    uint32_t sizeInBytes);
 
 #ifdef __cplusplus
 }

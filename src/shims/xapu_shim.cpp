@@ -21,6 +21,12 @@ namespace {
 constexpr const char* kModName = "xapu.dll";
 constexpr uint32_t kMaxQueuedCommandsPerConnection = 4096u;
 constexpr uint32_t kMaxCommandBytes = 16u * 1024u * 1024u;
+constexpr uint32_t kMaxXApuConnections = 1024u;
+constexpr uint32_t kMaxXApuStreamCount = 4096u;
+constexpr uint32_t kMaxXApuChannels = 16u;
+constexpr size_t kMinXApuSharedMemoryBytes = 4096u;
+constexpr size_t kMaxXApuSharedMemoryBytes = 128u * 1024u * 1024u;
+constexpr size_t kMaxTotalXApuSharedMemoryBytes = 256u * 1024u * 1024u;
 constexpr int32_t kXboxXApuQueueEmpty = static_cast<int32_t>(0x8AC81001u);
 
 struct XboxXApuConnectParams {
@@ -41,8 +47,12 @@ struct XboxXApuResult {
     uint8_t data[0x50];  // 80 bytes (type at +0x00, streamId at +0x04, status at +0x2C, outBytes at +0x44)
 };
 
-bool IsWritablePointer(void* ptr, size_t bytes) {
-    if (!ptr || reinterpret_cast<uintptr_t>(ptr) < 0x10000ull) {
+bool IsReadablePointer(const void* ptr, size_t bytes) {
+    if (!ptr || reinterpret_cast<uintptr_t>(ptr) < 0x10000ull || bytes == 0u) {
+        return false;
+    }
+    const uintptr_t start = reinterpret_cast<uintptr_t>(ptr);
+    if (start + bytes < start) {
         return false;
     }
 #if defined(_WIN32)
@@ -50,7 +60,37 @@ bool IsWritablePointer(void* ptr, size_t bytes) {
     if (::VirtualQuery(ptr, &mbi, sizeof(mbi)) == 0) {
         return false;
     }
-    if (mbi.State != MEM_COMMIT) {
+    if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0u) {
+        return false;
+    }
+    const DWORD prot = mbi.Protect & 0xFFu;
+    const bool readable = (prot == PAGE_READONLY || prot == PAGE_READWRITE || prot == PAGE_WRITECOPY ||
+                           prot == PAGE_EXECUTE_READ || prot == PAGE_EXECUTE_READWRITE ||
+                           prot == PAGE_EXECUTE_WRITECOPY);
+    if (!readable) {
+        return false;
+    }
+    const uintptr_t region_end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+    return start + bytes <= region_end;
+#else
+    return true;
+#endif
+}
+
+bool IsWritablePointer(void* ptr, size_t bytes) {
+    if (!ptr || reinterpret_cast<uintptr_t>(ptr) < 0x10000ull || bytes == 0u) {
+        return false;
+    }
+    const uintptr_t start = reinterpret_cast<uintptr_t>(ptr);
+    if (start + bytes < start) {
+        return false;
+    }
+#if defined(_WIN32)
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (::VirtualQuery(ptr, &mbi, sizeof(mbi)) == 0) {
+        return false;
+    }
+    if (mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0u) {
         return false;
     }
     const DWORD prot = mbi.Protect & 0xFFu;
@@ -60,9 +100,8 @@ bool IsWritablePointer(void* ptr, size_t bytes) {
         return false;
     }
     const uintptr_t region_end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
-    return reinterpret_cast<uintptr_t>(ptr) + bytes <= region_end;
+    return start + bytes <= region_end;
 #else
-    (void)bytes;
     return true;
 #endif
 }
@@ -85,6 +124,7 @@ struct XApuQueuedCommand {
 struct XApuConnectionState {
     uint64_t id = 0;
     bool xbox_retail_mode = false;
+    size_t reserved_shared_bytes = 0;
     std::vector<uint8_t> shared_memory;
     std::mutex queue_mutex;
     uint64_t next_seq = 1;
@@ -105,27 +145,37 @@ public:
             return XAPU_E_POINTER;
         }
 
-        // Detect real retail Xbox 3-arg XApuConnect(pParams, pOutSharedMem, pOutHandle)
-        // vs synthetic 1-arg XApuConnect(XAPU_CONNECTION_HANDLE* outHandle).
-        bool is_xbox_retail = false;
-        XboxXApuConnectParams params{};
-        if (IsWritablePointer(arg2, sizeof(XboxXApuSharedMem)) &&
-            IsWritablePointer(arg3, sizeof(XAPU_CONNECTION_HANDLE))) {
-            std::memcpy(&params, arg1, sizeof(params));
-            if ((params.codecType == 1u || params.codecType == 2u) &&
-                params.streamCount > 0u && params.streamCount <= 4096u &&
-                params.sharedMemoryBytes >= 4096u &&
-                params.sharedMemoryBytes <= 256u * 1024u * 1024u) {
-                is_xbox_retail = true;
+        const bool arg1_writable_handle = IsWritablePointer(arg1, sizeof(XAPU_CONNECTION_HANDLE));
+        const bool arg1_readable_params = IsReadablePointer(arg1, sizeof(XboxXApuConnectParams));
+        const bool arg2_writable = IsWritablePointer(arg2, sizeof(XboxXApuSharedMem));
+        const bool arg3_writable = IsWritablePointer(arg3, sizeof(XAPU_CONNECTION_HANDLE));
+
+        // If arg1 is read-only (e.g. const XboxXApuConnectParams in .rdata), this is strictly a 3-arg call.
+        if (!arg1_writable_handle) {
+            if (!arg1_readable_params || !arg2_writable || !arg3_writable) {
+                return XAPU_E_POINTER;
             }
         }
 
-        auto state = std::make_shared<XApuConnectionState>();
-        const uint64_t handle_val = next_handle_id_.fetch_add(1u, std::memory_order_relaxed);
-        state->id = handle_val;
-        state->xbox_retail_mode = is_xbox_retail;
-        auto* raw_handle = reinterpret_cast<XAPU_CONNECTION_HANDLE>(
-            static_cast<uintptr_t>(0x5841505500000000ull | (handle_val & 0xFFFFFFFFull)));
+        // Detect real retail Xbox 3-arg XApuConnect(pParams, pOutSharedMem, pOutHandle)
+        // vs synthetic 1-arg XApuConnect(XAPU_CONNECTION_HANDLE* outHandle).
+        // Hardened (xcl #89/#90): never silently fall back to 1-arg and clobber pParams when a
+        // 3-arg caller passes invalid params or triggers OOM!
+        bool is_xbox_retail = false;
+        XboxXApuConnectParams params{};
+        if (arg2_writable && arg3_writable && arg1_readable_params &&
+            arg2 != arg1 && arg3 != arg1 && arg2 != arg3) {
+            std::memcpy(&params, arg1, sizeof(params));
+            const bool clearly_3arg =
+                !arg1_writable_handle ||
+                (params.codecType == 1u || params.codecType == 2u) ||
+                (params.extraParam == 0u && params.flags == 0u &&
+                 (params.codecType != 0u || params.streamCount != 0u ||
+                  params.maxChannels != 0u || params.sharedMemoryBytes != 0u));
+            if (clearly_3arg) {
+                is_xbox_retail = true;
+            }
+        }
 
         if (is_xbox_retail) {
             auto* out_shm = static_cast<XboxXApuSharedMem*>(arg2);
@@ -134,32 +184,106 @@ public:
             out_shm->sizeBytes = 0ull;
             *out_handle = nullptr;
 
-            // Allocate generous shared memory backing (fmod.dll indexes up to streamCount * 0xE000),
-            // using checked 64-bit arithmetic and OOM rollback so outputs stay zeroed on failure.
-            constexpr uint64_t kMaxRetailShmBytes = 512ull * 1024ull * 1024ull;
+            // Strict parameter validation (zero state corruption on rejection).
+            if (params.codecType != 1u && params.codecType != 2u) {
+                return XAPU_E_INVALIDARG;
+            }
+            if (params.streamCount == 0u || params.streamCount > kMaxXApuStreamCount) {
+                return XAPU_E_INVALIDARG;
+            }
+            if (params.maxChannels > kMaxXApuChannels) {
+                return XAPU_E_INVALIDARG;
+            }
+            if (params.sharedMemoryBytes < kMinXApuSharedMemoryBytes) {
+                return XAPU_E_INVALIDARG;
+            }
+            if (params.sharedMemoryBytes > kMaxXApuSharedMemoryBytes) {
+                return XAPU_E_OUTOFMEMORY;
+            }
             const uint64_t min_bytes = static_cast<uint64_t>(params.streamCount) * 0x10000ull;
-            const uint64_t alloc_bytes = std::max<uint64_t>(params.sharedMemoryBytes, min_bytes);
-            if (alloc_bytes == 0ull || alloc_bytes > kMaxRetailShmBytes) {
+            const uint64_t alloc_bytes64 =
+                std::max<uint64_t>(static_cast<uint64_t>(params.sharedMemoryBytes), min_bytes);
+            if (alloc_bytes64 > kMaxXApuSharedMemoryBytes) {
                 return XAPU_E_OUTOFMEMORY;
             }
+            const size_t alloc_bytes = static_cast<size_t>(alloc_bytes64);
+
+            // Reserve global connection & shared-memory budget atomically before allocating.
+            {
+                std::lock_guard<std::mutex> lk(table_mutex_);
+                if (connections_.size() >= kMaxXApuConnections) {
+                    return XAPU_E_OUTOFMEMORY;
+                }
+                if (total_shared_bytes_ + alloc_bytes < total_shared_bytes_ ||
+                    total_shared_bytes_ + alloc_bytes > kMaxTotalXApuSharedMemoryBytes) {
+                    return XAPU_E_OUTOFMEMORY;
+                }
+                total_shared_bytes_ += alloc_bytes;
+            }
+
+            std::shared_ptr<XApuConnectionState> state;
             try {
-                state->shared_memory.assign(static_cast<size_t>(alloc_bytes), 0u);
-            } catch (const std::bad_alloc&) {
-                state->shared_memory.clear();
+                state = std::make_shared<XApuConnectionState>();
+                state->shared_memory.assign(alloc_bytes, 0u);
+            } catch (...) {
+                std::lock_guard<std::mutex> lk(table_mutex_);
+                if (total_shared_bytes_ >= alloc_bytes) {
+                    total_shared_bytes_ -= alloc_bytes;
+                }
                 return XAPU_E_OUTOFMEMORY;
             }
+
+            const uint64_t handle_val = next_handle_id_.fetch_add(1u, std::memory_order_relaxed);
+            state->id = handle_val;
+            state->xbox_retail_mode = true;
+            state->reserved_shared_bytes = alloc_bytes;
+            auto* raw_handle = reinterpret_cast<XAPU_CONNECTION_HANDLE>(
+                static_cast<uintptr_t>(0x5841505500000000ull | (handle_val & 0xFFFFFFFFull)));
+
             out_shm->baseAddress = state->shared_memory.data();
             out_shm->sizeBytes = alloc_bytes;
             *out_handle = raw_handle;
-        } else {
-            *static_cast<XAPU_CONNECTION_HANDLE*>(arg1) = raw_handle;
+
+            {
+                std::lock_guard<std::mutex> lk(table_mutex_);
+                connections_[raw_handle] = std::move(state);
+            }
+            return XAPU_S_OK;
         }
+
+        // 1-arg synthetic path: XApuConnect(XAPU_CONNECTION_HANDLE* outHandle)
+        if (!arg1_writable_handle) {
+            return XAPU_E_POINTER;
+        }
+        *static_cast<XAPU_CONNECTION_HANDLE*>(arg1) = nullptr;
 
         {
             std::lock_guard<std::mutex> lk(table_mutex_);
-            connections_[raw_handle] = std::move(state);
+            if (connections_.size() >= kMaxXApuConnections) {
+                return XAPU_E_OUTOFMEMORY;
+            }
         }
 
+        std::shared_ptr<XApuConnectionState> state;
+        try {
+            state = std::make_shared<XApuConnectionState>();
+        } catch (...) {
+            return XAPU_E_OUTOFMEMORY;
+        }
+        const uint64_t handle_val = next_handle_id_.fetch_add(1u, std::memory_order_relaxed);
+        state->id = handle_val;
+        state->xbox_retail_mode = false;
+        auto* raw_handle = reinterpret_cast<XAPU_CONNECTION_HANDLE>(
+            static_cast<uintptr_t>(0x5841505500000000ull | (handle_val & 0xFFFFFFFFull)));
+
+        {
+            std::lock_guard<std::mutex> lk(table_mutex_);
+            if (connections_.size() >= kMaxXApuConnections) {
+                return XAPU_E_OUTOFMEMORY;
+            }
+            connections_[raw_handle] = std::move(state);
+        }
+        *static_cast<XAPU_CONNECTION_HANDLE*>(arg1) = raw_handle;
         return XAPU_S_OK;
     }
 
@@ -316,6 +440,14 @@ public:
             }
             removed = std::move(it->second);
             connections_.erase(it);
+            if (removed && removed->reserved_shared_bytes > 0u) {
+                if (total_shared_bytes_ >= removed->reserved_shared_bytes) {
+                    total_shared_bytes_ -= removed->reserved_shared_bytes;
+                } else {
+                    total_shared_bytes_ = 0u;
+                }
+                removed->reserved_shared_bytes = 0u;
+            }
         }
 
         if (removed) {
@@ -340,6 +472,7 @@ private:
 
     std::atomic<uint64_t> next_handle_id_{1u};
     std::mutex table_mutex_;
+    size_t total_shared_bytes_ = 0u;
     std::unordered_map<XAPU_CONNECTION_HANDLE, std::shared_ptr<XApuConnectionState>> connections_;
 };
 
