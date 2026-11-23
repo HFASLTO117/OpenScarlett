@@ -174,3 +174,4 @@ foreach(_os_module_cmake
         include("${CMAKE_CURRENT_SOURCE_DIR}/${_os_module_cmake}")
     endif()
 endforeach()
+include(cmake/s15_w3_graphics.cmake)

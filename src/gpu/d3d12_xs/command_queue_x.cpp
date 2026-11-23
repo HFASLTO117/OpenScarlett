@@ -1477,10 +1477,13 @@ void CommandQueueX::ExecuteVulkanRecordedBatch(const VulkanRecordedBatch& batch)
         switch (op.kind) {
             case VulkanRecordedOpKind::Barrier: {
                 const uint32_t n = std::max<uint32_t>(1u, op.barrier_count);
+                const uint32_t n_global = std::min<uint32_t>(n, op.global_uav_barrier_count);
                 barriers_cnt += n;
                 for (uint32_t b = 0; b < n; ++b) {
                     openscarlett::VulkanCommandItem item{};
-                    item.op = openscarlett::VulkanCommandOp::PipelineBarrier;
+                    item.op = (b < n_global)
+                                  ? openscarlett::VulkanCommandOp::GlobalUavBarrier
+                                  : openscarlett::VulkanCommandOp::PipelineBarrier;
                     vk_cl_desc.commands.push_back(item);
                 }
                 break;
@@ -2516,6 +2519,14 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
                 ? (static_cast<double>(pres_qpc - total_start_qpc) * 1000000.0 / static_cast<double>(qpc_freq_))
                 : 0.0;
         last_timing_stats_.present_count = present_count_;
+        {
+            uint64_t sig_vlines = 0ull;
+            uint64_t sig_frames = 0ull;
+            SignalRegisteredDisplayNotificationsOnPresent(&sig_vlines, &sig_frames);
+            if (device_x_ && (sig_vlines > 0ull || sig_frames > 0ull)) {
+                device_x_->RecordDisplayNotificationsSignaled(sig_vlines, sig_frames);
+            }
+        }
         RecordQueue("ID3D12CommandQueueX::PresentX", 19, S_OK);
         return S_OK;
     }
@@ -3114,6 +3125,14 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
                static_cast<double>(qpc_freq_))
             : 0.0;
     last_timing_stats_.present_count = present_count_;
+    {
+        uint64_t sig_vlines = 0ull;
+        uint64_t sig_frames = 0ull;
+        SignalRegisteredDisplayNotificationsOnPresent(&sig_vlines, &sig_frames);
+        if (device_x_ && (sig_vlines > 0ull || sig_frames > 0ull)) {
+            device_x_->RecordDisplayNotificationsSignaled(sig_vlines, sig_frames);
+        }
+    }
 
     RecordQueue("ID3D12CommandQueueX::PresentX", 19, S_OK);
     return S_OK;
