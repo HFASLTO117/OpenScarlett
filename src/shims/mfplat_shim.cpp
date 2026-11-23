@@ -350,7 +350,7 @@ struct OsIMFMediaEngineClassFactory : public IUnknown {
 };
 
 // ===========================================================================
-// Host mfplat.dll Dynamic Loader
+// Host mfplat.dll Dynamic Loader (Strictly %SystemRoot%\System32\MFPlat.dll)
 // ===========================================================================
 using PfnMFStartup = HRESULT(STDAPICALLTYPE*)(ULONG, DWORD);
 using PfnMFShutdown = HRESULT(STDAPICALLTYPE*)(void);
@@ -358,13 +358,47 @@ using PfnMFCreateDXGIDeviceManager = HRESULT(STDAPICALLTYPE*)(UINT*, IMFDXGIDevi
 using PfnMFCreateMediaType = HRESULT(STDAPICALLTYPE*)(IMFMediaType**);
 using PfnMFCreateSample = HRESULT(STDAPICALLTYPE*)(IMFSample**);
 using PfnMFCreateMemoryBuffer = HRESULT(STDAPICALLTYPE*)(DWORD, IMFMediaBuffer**);
+using PfnMFCreateAlignedMemoryBuffer = HRESULT(STDAPICALLTYPE*)(DWORD, DWORD, IMFMediaBuffer**);
 using PfnMFCreateAttributes = HRESULT(STDAPICALLTYPE*)(IMFAttributes**, UINT32);
 using PfnMFCreateAsyncResult = HRESULT(STDAPICALLTYPE*)(IUnknown*, IMFAsyncCallback*, IUnknown*, IMFAsyncResult**);
+using PfnMFCreateSourceResolver = HRESULT(STDAPICALLTYPE*)(void**);
+using PfnMFLockWorkQueue = HRESULT(STDAPICALLTYPE*)(DWORD);
 using PfnMFAllocateWorkQueue = HRESULT(STDAPICALLTYPE*)(DWORD*);
+using PfnMFAllocateWorkQueueEx = HRESULT(STDAPICALLTYPE*)(uint32_t, DWORD*);
+using PfnMFAllocateSerialWorkQueue = HRESULT(STDAPICALLTYPE*)(DWORD, DWORD*);
 using PfnMFUnlockWorkQueue = HRESULT(STDAPICALLTYPE*)(DWORD);
+using PfnMFPutWorkItem = HRESULT(STDAPICALLTYPE*)(DWORD, void*, void*);
+using PfnMFPutWorkItem2 = HRESULT(STDAPICALLTYPE*)(DWORD, LONG, void*, void*);
+using PfnMFPutWorkItemEx = HRESULT(STDAPICALLTYPE*)(DWORD, void*);
+using PfnMFPutWorkItemEx2 = HRESULT(STDAPICALLTYPE*)(DWORD, LONG, void*);
+using PfnMFPutWaitingWorkItem = HRESULT(STDAPICALLTYPE*)(HANDLE, LONG, void*, uint64_t*);
+using PfnMFCancelWorkItem = HRESULT(STDAPICALLTYPE*)(uint64_t);
+using PfnMFLockSharedWorkQueue = HRESULT(STDAPICALLTYPE*)(LPCWSTR, LONG, DWORD*, DWORD*);
+using PfnMFGetWorkQueueMMCSSClass = HRESULT(STDAPICALLTYPE*)(DWORD, LPWSTR, DWORD*);
+using PfnMFGetWorkQueueMMCSSTaskId = HRESULT(STDAPICALLTYPE*)(DWORD, DWORD*);
+using PfnMFGetWorkQueueMMCSSPriority = HRESULT(STDAPICALLTYPE*)(DWORD, LONG*);
 using PfnMFLockPlatform = HRESULT(STDAPICALLTYPE*)(void);
 using PfnMFUnlockPlatform = HRESULT(STDAPICALLTYPE*)(void);
 using PfnMFGetSystemTime = LONGLONG(STDAPICALLTYPE*)(void);
+using PfnMFCreateWaveFormatExFromMFMediaType = HRESULT(STDAPICALLTYPE*)(void*, void**, UINT32*, UINT32);
+using PfnMFInitMediaTypeFromWaveFormatEx = HRESULT(STDAPICALLTYPE*)(void*, const void*, UINT32);
+using PfnMFCreateEventQueue = HRESULT(STDAPICALLTYPE*)(void**);
+using PfnMFCreateCollection = HRESULT(STDAPICALLTYPE*)(void**);
+using PfnMFCreateDXGISurfaceBuffer = HRESULT(STDAPICALLTYPE*)(const void*, void*, UINT, BOOL, void**);
+using PfnMFCreate2DMediaBuffer = HRESULT(STDAPICALLTYPE*)(DWORD, DWORD, DWORD, BOOL, void**);
+using PfnMFCreateVideoMediaType = HRESULT(STDAPICALLTYPE*)(const void*, void**);
+using PfnMFCreateAudioMediaType = HRESULT(STDAPICALLTYPE*)(const void*, void**);
+using PfnMFCreatePresentationDescriptor = HRESULT(STDAPICALLTYPE*)(DWORD, void**, void**);
+using PfnMFCreateStreamDescriptor = HRESULT(STDAPICALLTYPE*)(DWORD, DWORD, void**, void**);
+using PfnMFCreateMediaTypeHandler = HRESULT(STDAPICALLTYPE*)(void**);
+using PfnMFGetStrideForBitmapInfoHeader = HRESULT(STDAPICALLTYPE*)(DWORD, DWORD, LONG*);
+using PfnMFCalculateImageSize = HRESULT(STDAPICALLTYPE*)(const void*, UINT32, UINT32, UINT32*);
+using PfnMFCopyImage = HRESULT(STDAPICALLTYPE*)(BYTE*, LONG, const BYTE*, LONG, DWORD, DWORD);
+using PfnMFCreateMediaEvent = HRESULT(STDAPICALLTYPE*)(uint32_t, const void*, HRESULT, const void*, void**);
+using PfnMFCreateMediaBufferWrapper = HRESULT(STDAPICALLTYPE*)(void*, DWORD, DWORD, void**);
+using PfnMFCreateTempFile = HRESULT(STDAPICALLTYPE*)(uint32_t, uint32_t, uint32_t, void**);
+using PfnMFCreateFile = HRESULT(STDAPICALLTYPE*)(uint32_t, uint32_t, uint32_t, LPCWSTR, void**);
+using PfnMFCreateMFByteStreamOnStream = HRESULT(STDAPICALLTYPE*)(void*, void**);
 using PfnMFTEnumEx = HRESULT(STDAPICALLTYPE*)(
     GUID,
     UINT32,
@@ -377,6 +411,7 @@ struct HostMfPlat {
     std::mutex mutex;
     bool attempted = false;
     HMODULE mod = nullptr;
+    HMODULE mf_mod = nullptr;
 
     PfnMFStartup mf_startup = nullptr;
     PfnMFShutdown mf_shutdown = nullptr;
@@ -384,13 +419,47 @@ struct HostMfPlat {
     PfnMFCreateMediaType mf_create_media_type = nullptr;
     PfnMFCreateSample mf_create_sample = nullptr;
     PfnMFCreateMemoryBuffer mf_create_memory_buffer = nullptr;
+    PfnMFCreateAlignedMemoryBuffer mf_create_aligned_memory_buffer = nullptr;
     PfnMFCreateAttributes mf_create_attributes = nullptr;
     PfnMFCreateAsyncResult mf_create_async_result = nullptr;
+    PfnMFCreateSourceResolver mf_create_source_resolver = nullptr;
+    PfnMFLockWorkQueue mf_lock_wq = nullptr;
     PfnMFAllocateWorkQueue mf_allocate_wq = nullptr;
+    PfnMFAllocateWorkQueueEx mf_allocate_wq_ex = nullptr;
+    PfnMFAllocateSerialWorkQueue mf_allocate_serial_wq = nullptr;
     PfnMFUnlockWorkQueue mf_unlock_wq = nullptr;
+    PfnMFPutWorkItem mf_put_work_item = nullptr;
+    PfnMFPutWorkItem2 mf_put_work_item2 = nullptr;
+    PfnMFPutWorkItemEx mf_put_work_item_ex = nullptr;
+    PfnMFPutWorkItemEx2 mf_put_work_item_ex2 = nullptr;
+    PfnMFPutWaitingWorkItem mf_put_waiting_work_item = nullptr;
+    PfnMFCancelWorkItem mf_cancel_work_item = nullptr;
+    PfnMFLockSharedWorkQueue mf_lock_shared_wq = nullptr;
+    PfnMFGetWorkQueueMMCSSClass mf_get_wq_mmcss_class = nullptr;
+    PfnMFGetWorkQueueMMCSSTaskId mf_get_wq_mmcss_task_id = nullptr;
+    PfnMFGetWorkQueueMMCSSPriority mf_get_wq_mmcss_priority = nullptr;
     PfnMFLockPlatform mf_lock_platform = nullptr;
     PfnMFUnlockPlatform mf_unlock_platform = nullptr;
     PfnMFGetSystemTime mf_get_system_time = nullptr;
+    PfnMFCreateWaveFormatExFromMFMediaType mf_create_wfx_from_mt = nullptr;
+    PfnMFInitMediaTypeFromWaveFormatEx mf_init_mt_from_wfx = nullptr;
+    PfnMFCreateEventQueue mf_create_event_queue = nullptr;
+    PfnMFCreateCollection mf_create_collection = nullptr;
+    PfnMFCreateDXGISurfaceBuffer mf_create_dxgi_surface_buffer = nullptr;
+    PfnMFCreate2DMediaBuffer mf_create_2d_media_buffer = nullptr;
+    PfnMFCreateVideoMediaType mf_create_video_media_type = nullptr;
+    PfnMFCreateAudioMediaType mf_create_audio_media_type = nullptr;
+    PfnMFCreatePresentationDescriptor mf_create_presentation_descriptor = nullptr;
+    PfnMFCreateStreamDescriptor mf_create_stream_descriptor = nullptr;
+    PfnMFCreateMediaTypeHandler mf_create_media_type_handler = nullptr;
+    PfnMFGetStrideForBitmapInfoHeader mf_get_stride_for_bih = nullptr;
+    PfnMFCalculateImageSize mf_calculate_image_size = nullptr;
+    PfnMFCopyImage mf_copy_image = nullptr;
+    PfnMFCreateMediaEvent mf_create_media_event = nullptr;
+    PfnMFCreateMediaBufferWrapper mf_create_media_buffer_wrapper = nullptr;
+    PfnMFCreateTempFile mf_create_temp_file = nullptr;
+    PfnMFCreateFile mf_create_file = nullptr;
+    PfnMFCreateMFByteStreamOnStream mf_create_bytestream_on_stream = nullptr;
     PfnMFTEnumEx mft_enum_ex = nullptr;
 
     std::atomic<uint32_t> fallback_token_gen{0x5CA01000u};
@@ -403,6 +472,8 @@ struct HostMfPlat {
         if (attempted) return;
         attempted = true;
 
+        // Strictly load from %SystemRoot%\System32\MFPlat.dll so we NEVER
+        // recurse into mfplat_xs.dll or a redirected MFPlat.dll in the title directory.
         wchar_t sys_dir[MAX_PATH]{};
         const UINT len = GetSystemDirectoryW(sys_dir, MAX_PATH);
         if (len > 0u && len < MAX_PATH - 16u) {
@@ -410,11 +481,8 @@ struct HostMfPlat {
             if (!full_path.empty() && full_path.back() != L'\\') {
                 full_path.push_back(L'\\');
             }
-            full_path += L"mfplat.dll";
+            full_path += L"MFPlat.dll";
             mod = LoadLibraryW(full_path.c_str());
-        }
-        if (!mod) {
-            mod = LoadLibraryW(L"mfplat.dll");
         }
         if (!mod) {
             return;
@@ -429,13 +497,62 @@ struct HostMfPlat {
         mf_create_media_type = reinterpret_cast<PfnMFCreateMediaType>(load("MFCreateMediaType"));
         mf_create_sample = reinterpret_cast<PfnMFCreateSample>(load("MFCreateSample"));
         mf_create_memory_buffer = reinterpret_cast<PfnMFCreateMemoryBuffer>(load("MFCreateMemoryBuffer"));
+        mf_create_aligned_memory_buffer = reinterpret_cast<PfnMFCreateAlignedMemoryBuffer>(load("MFCreateAlignedMemoryBuffer"));
         mf_create_attributes = reinterpret_cast<PfnMFCreateAttributes>(load("MFCreateAttributes"));
         mf_create_async_result = reinterpret_cast<PfnMFCreateAsyncResult>(load("MFCreateAsyncResult"));
+        mf_create_source_resolver = reinterpret_cast<PfnMFCreateSourceResolver>(load("MFCreateSourceResolver"));
+        mf_lock_wq = reinterpret_cast<PfnMFLockWorkQueue>(load("MFLockWorkQueue"));
         mf_allocate_wq = reinterpret_cast<PfnMFAllocateWorkQueue>(load("MFAllocateWorkQueue"));
+        mf_allocate_wq_ex = reinterpret_cast<PfnMFAllocateWorkQueueEx>(load("MFAllocateWorkQueueEx"));
+        mf_allocate_serial_wq = reinterpret_cast<PfnMFAllocateSerialWorkQueue>(load("MFAllocateSerialWorkQueue"));
         mf_unlock_wq = reinterpret_cast<PfnMFUnlockWorkQueue>(load("MFUnlockWorkQueue"));
+        mf_put_work_item = reinterpret_cast<PfnMFPutWorkItem>(load("MFPutWorkItem"));
+        mf_put_work_item2 = reinterpret_cast<PfnMFPutWorkItem2>(load("MFPutWorkItem2"));
+        mf_put_work_item_ex = reinterpret_cast<PfnMFPutWorkItemEx>(load("MFPutWorkItemEx"));
+        mf_put_work_item_ex2 = reinterpret_cast<PfnMFPutWorkItemEx2>(load("MFPutWorkItemEx2"));
+        mf_put_waiting_work_item = reinterpret_cast<PfnMFPutWaitingWorkItem>(load("MFPutWaitingWorkItem"));
+        mf_cancel_work_item = reinterpret_cast<PfnMFCancelWorkItem>(load("MFCancelWorkItem"));
+        mf_lock_shared_wq = reinterpret_cast<PfnMFLockSharedWorkQueue>(load("MFLockSharedWorkQueue"));
+        mf_get_wq_mmcss_class = reinterpret_cast<PfnMFGetWorkQueueMMCSSClass>(load("MFGetWorkQueueMMCSSClass"));
+        mf_get_wq_mmcss_task_id = reinterpret_cast<PfnMFGetWorkQueueMMCSSTaskId>(load("MFGetWorkQueueMMCSSTaskId"));
+        mf_get_wq_mmcss_priority = reinterpret_cast<PfnMFGetWorkQueueMMCSSPriority>(load("MFGetWorkQueueMMCSSPriority"));
         mf_lock_platform = reinterpret_cast<PfnMFLockPlatform>(load("MFLockPlatform"));
         mf_unlock_platform = reinterpret_cast<PfnMFUnlockPlatform>(load("MFUnlockPlatform"));
         mf_get_system_time = reinterpret_cast<PfnMFGetSystemTime>(load("MFGetSystemTime"));
+        mf_create_wfx_from_mt = reinterpret_cast<PfnMFCreateWaveFormatExFromMFMediaType>(load("MFCreateWaveFormatExFromMFMediaType"));
+        mf_init_mt_from_wfx = reinterpret_cast<PfnMFInitMediaTypeFromWaveFormatEx>(load("MFInitMediaTypeFromWaveFormatEx"));
+        mf_create_event_queue = reinterpret_cast<PfnMFCreateEventQueue>(load("MFCreateEventQueue"));
+        mf_create_collection = reinterpret_cast<PfnMFCreateCollection>(load("MFCreateCollection"));
+        mf_create_dxgi_surface_buffer = reinterpret_cast<PfnMFCreateDXGISurfaceBuffer>(load("MFCreateDXGISurfaceBuffer"));
+        mf_create_2d_media_buffer = reinterpret_cast<PfnMFCreate2DMediaBuffer>(load("MFCreate2DMediaBuffer"));
+        mf_create_video_media_type = reinterpret_cast<PfnMFCreateVideoMediaType>(load("MFCreateVideoMediaType"));
+        mf_create_audio_media_type = reinterpret_cast<PfnMFCreateAudioMediaType>(load("MFCreateAudioMediaType"));
+        mf_create_presentation_descriptor = reinterpret_cast<PfnMFCreatePresentationDescriptor>(load("MFCreatePresentationDescriptor"));
+        mf_create_stream_descriptor = reinterpret_cast<PfnMFCreateStreamDescriptor>(load("MFCreateStreamDescriptor"));
+        mf_create_media_type_handler = reinterpret_cast<PfnMFCreateMediaTypeHandler>(load("MFCreateMediaTypeHandler"));
+        if (!mf_create_media_type_handler) {
+            mf_create_media_type_handler = reinterpret_cast<PfnMFCreateMediaTypeHandler>(load("MFCreateSimpleTypeHandler"));
+        }
+        if (!mf_create_media_type_handler && len > 0u && len < MAX_PATH - 16u) {
+            std::wstring mf_path(sys_dir, len);
+            if (!mf_path.empty() && mf_path.back() != L'\\') {
+                mf_path.push_back(L'\\');
+            }
+            mf_path += L"mf.dll";
+            mf_mod = LoadLibraryW(mf_path.c_str());
+            if (mf_mod) {
+                mf_create_media_type_handler = reinterpret_cast<PfnMFCreateMediaTypeHandler>(
+                    reinterpret_cast<void*>(GetProcAddress(mf_mod, "MFCreateSimpleTypeHandler")));
+            }
+        }
+        mf_get_stride_for_bih = reinterpret_cast<PfnMFGetStrideForBitmapInfoHeader>(load("MFGetStrideForBitmapInfoHeader"));
+        mf_calculate_image_size = reinterpret_cast<PfnMFCalculateImageSize>(load("MFCalculateImageSize"));
+        mf_copy_image = reinterpret_cast<PfnMFCopyImage>(load("MFCopyImage"));
+        mf_create_media_event = reinterpret_cast<PfnMFCreateMediaEvent>(load("MFCreateMediaEvent"));
+        mf_create_media_buffer_wrapper = reinterpret_cast<PfnMFCreateMediaBufferWrapper>(load("MFCreateMediaBufferWrapper"));
+        mf_create_temp_file = reinterpret_cast<PfnMFCreateTempFile>(load("MFCreateTempFile"));
+        mf_create_file = reinterpret_cast<PfnMFCreateFile>(load("MFCreateFile"));
+        mf_create_bytestream_on_stream = reinterpret_cast<PfnMFCreateMFByteStreamOnStream>(load("MFCreateMFByteStreamOnStream"));
         mft_enum_ex = reinterpret_cast<PfnMFTEnumEx>(load("MFTEnumEx"));
     }
 };
@@ -2741,6 +2858,780 @@ OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFTEnumEx(
     return RecordHr("MFTEnumEx", kHrOk);
 }
 #endif
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFCreateAlignedMemoryBuffer(
+    uint32_t cbMaxLength,
+    uint32_t cbAlignment,
+    void** ppBuffer) {
+    if (!ppBuffer) {
+        return RecordHr("MFCreateAlignedMemoryBuffer", kHrPointer);
+    }
+    *ppBuffer = nullptr;
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_create_aligned_memory_buffer) {
+        IMFMediaBuffer* buf = nullptr;
+        const HRESULT hr = host.mf_create_aligned_memory_buffer(
+            static_cast<DWORD>(cbMaxLength), static_cast<DWORD>(cbAlignment), &buf);
+        if (SUCCEEDED(hr) && buf) {
+            *ppBuffer = buf;
+            return RecordHr("MFCreateAlignedMemoryBuffer", static_cast<int32_t>(hr));
+        }
+        return RecordHr("MFCreateAlignedMemoryBuffer", static_cast<int32_t>(hr));
+    }
+    auto* fb = new (std::nothrow) FallbackMfMemoryBuffer(static_cast<DWORD>(cbMaxLength));
+    if (!fb) return RecordHr("MFCreateAlignedMemoryBuffer", kHrOutOfMemory);
+    *ppBuffer = static_cast<IMFMediaBuffer*>(fb);
+    return RecordHr("MFCreateAlignedMemoryBuffer", kHrOk);
+#else
+    (void)cbMaxLength;
+    (void)cbAlignment;
+    return RecordHr("MFCreateAlignedMemoryBuffer", kHrNotImpl);
+#endif
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFCreateSourceResolver(void** ppISourceResolver) {
+    if (!ppISourceResolver) {
+        return RecordHr("MFCreateSourceResolver", kHrPointer);
+    }
+    *ppISourceResolver = nullptr;
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_create_source_resolver) {
+        const HRESULT hr = host.mf_create_source_resolver(ppISourceResolver);
+        return RecordHr("MFCreateSourceResolver", static_cast<int32_t>(hr));
+    }
+#endif
+    return RecordHr("MFCreateSourceResolver", kHrNotImpl);
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFLockWorkQueue(uint32_t dwWorkQueue) {
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_lock_wq) {
+        const HRESULT hr = host.mf_lock_wq(static_cast<DWORD>(dwWorkQueue));
+        return RecordHr("MFLockWorkQueue", static_cast<int32_t>(hr));
+    }
+    return RecordHr("MFLockWorkQueue", kHrOk);
+#else
+    (void)dwWorkQueue;
+    return RecordHr("MFLockWorkQueue", kHrOk);
+#endif
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFAllocateWorkQueueEx(
+    uint32_t WorkQueueType,
+    uint32_t* pdwWorkQueue) {
+    if (!pdwWorkQueue) {
+        return RecordHr("MFAllocateWorkQueueEx", kHrPointer);
+    }
+    *pdwWorkQueue = 0u;
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_allocate_wq_ex) {
+        DWORD wq = 0u;
+        const HRESULT hr = host.mf_allocate_wq_ex(WorkQueueType, &wq);
+        *pdwWorkQueue = static_cast<uint32_t>(wq);
+        return RecordHr("MFAllocateWorkQueueEx", static_cast<int32_t>(hr));
+    }
+    return MFAllocateWorkQueue(pdwWorkQueue);
+#else
+    (void)WorkQueueType;
+    return RecordHr("MFAllocateWorkQueueEx", kHrNotImpl);
+#endif
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFAllocateSerialWorkQueue(
+    uint32_t dwWorkQueue,
+    uint32_t* pdwWorkQueue) {
+    if (!pdwWorkQueue) {
+        return RecordHr("MFAllocateSerialWorkQueue", kHrPointer);
+    }
+    *pdwWorkQueue = 0u;
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_allocate_serial_wq) {
+        DWORD wq = 0u;
+        const HRESULT hr = host.mf_allocate_serial_wq(static_cast<DWORD>(dwWorkQueue), &wq);
+        *pdwWorkQueue = static_cast<uint32_t>(wq);
+        return RecordHr("MFAllocateSerialWorkQueue", static_cast<int32_t>(hr));
+    }
+    return MFAllocateWorkQueue(pdwWorkQueue);
+#else
+    (void)dwWorkQueue;
+    return RecordHr("MFAllocateSerialWorkQueue", kHrNotImpl);
+#endif
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFPutWorkItem(
+    uint32_t dwQueue,
+    void* pCallback,
+    void* pState) {
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_put_work_item) {
+        const HRESULT hr = host.mf_put_work_item(static_cast<DWORD>(dwQueue), pCallback, pState);
+        return RecordHr("MFPutWorkItem", static_cast<int32_t>(hr));
+    }
+#else
+    (void)dwQueue;
+    (void)pCallback;
+    (void)pState;
+#endif
+    return RecordHr("MFPutWorkItem", kHrNotImpl);
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFPutWorkItem2(
+    uint32_t dwQueue,
+    int32_t Priority,
+    void* pCallback,
+    void* pState) {
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_put_work_item2) {
+        const HRESULT hr = host.mf_put_work_item2(
+            static_cast<DWORD>(dwQueue), static_cast<LONG>(Priority), pCallback, pState);
+        return RecordHr("MFPutWorkItem2", static_cast<int32_t>(hr));
+    }
+#else
+    (void)dwQueue;
+    (void)Priority;
+    (void)pCallback;
+    (void)pState;
+#endif
+    return RecordHr("MFPutWorkItem2", kHrNotImpl);
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFPutWorkItemEx(uint32_t dwQueue, void* pResult) {
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_put_work_item_ex) {
+        const HRESULT hr = host.mf_put_work_item_ex(static_cast<DWORD>(dwQueue), pResult);
+        return RecordHr("MFPutWorkItemEx", static_cast<int32_t>(hr));
+    }
+#else
+    (void)dwQueue;
+    (void)pResult;
+#endif
+    return RecordHr("MFPutWorkItemEx", kHrNotImpl);
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFPutWorkItemEx2(
+    uint32_t dwQueue,
+    int32_t Priority,
+    void* pResult) {
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_put_work_item_ex2) {
+        const HRESULT hr = host.mf_put_work_item_ex2(
+            static_cast<DWORD>(dwQueue), static_cast<LONG>(Priority), pResult);
+        return RecordHr("MFPutWorkItemEx2", static_cast<int32_t>(hr));
+    }
+#else
+    (void)dwQueue;
+    (void)Priority;
+    (void)pResult;
+#endif
+    return RecordHr("MFPutWorkItemEx2", kHrNotImpl);
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFPutWaitingWorkItem(
+    void* hEvent,
+    int32_t Priority,
+    void* pResult,
+    uint64_t* pKey) {
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_put_waiting_work_item) {
+        const HRESULT hr = host.mf_put_waiting_work_item(
+            static_cast<HANDLE>(hEvent), static_cast<LONG>(Priority), pResult, pKey);
+        return RecordHr("MFPutWaitingWorkItem", static_cast<int32_t>(hr));
+    }
+#else
+    (void)hEvent;
+    (void)Priority;
+    (void)pResult;
+    (void)pKey;
+#endif
+    return RecordHr("MFPutWaitingWorkItem", kHrNotImpl);
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFCancelWorkItem(uint64_t Key) {
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_cancel_work_item) {
+        const HRESULT hr = host.mf_cancel_work_item(Key);
+        return RecordHr("MFCancelWorkItem", static_cast<int32_t>(hr));
+    }
+#else
+    (void)Key;
+#endif
+    return RecordHr("MFCancelWorkItem", kHrNotImpl);
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFLockSharedWorkQueue(
+    const wchar_t* wszClass,
+    int32_t BasePriority,
+    uint32_t* pdwTaskId,
+    uint32_t* pID) {
+    if (!pID) {
+        return RecordHr("MFLockSharedWorkQueue", kHrPointer);
+    }
+    *pID = 0u;
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_lock_shared_wq) {
+        DWORD task_id = pdwTaskId ? static_cast<DWORD>(*pdwTaskId) : 0u;
+        DWORD qid = 0u;
+        const HRESULT hr = host.mf_lock_shared_wq(
+            wszClass, static_cast<LONG>(BasePriority), pdwTaskId ? &task_id : nullptr, &qid);
+        if (pdwTaskId) *pdwTaskId = static_cast<uint32_t>(task_id);
+        *pID = static_cast<uint32_t>(qid);
+        return RecordHr("MFLockSharedWorkQueue", static_cast<int32_t>(hr));
+    }
+#else
+    (void)wszClass;
+    (void)BasePriority;
+    (void)pdwTaskId;
+#endif
+    return RecordHr("MFLockSharedWorkQueue", kHrNotImpl);
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFGetWorkQueueMMCSSClass(
+    uint32_t dwWorkQueueId,
+    wchar_t* pwszClass,
+    uint32_t* pcchClass) {
+    if (!pcchClass) {
+        return RecordHr("MFGetWorkQueueMMCSSClass", kHrPointer);
+    }
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_get_wq_mmcss_class) {
+        DWORD cch = static_cast<DWORD>(*pcchClass);
+        const HRESULT hr = host.mf_get_wq_mmcss_class(
+            static_cast<DWORD>(dwWorkQueueId), pwszClass, &cch);
+        *pcchClass = static_cast<uint32_t>(cch);
+        return RecordHr("MFGetWorkQueueMMCSSClass", static_cast<int32_t>(hr));
+    }
+#else
+    (void)dwWorkQueueId;
+    (void)pwszClass;
+#endif
+    return RecordHr("MFGetWorkQueueMMCSSClass", kHrNotImpl);
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFGetWorkQueueMMCSSTaskId(
+    uint32_t dwWorkQueueId,
+    uint32_t* pdwTaskId) {
+    if (!pdwTaskId) {
+        return RecordHr("MFGetWorkQueueMMCSSTaskId", kHrPointer);
+    }
+    *pdwTaskId = 0u;
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_get_wq_mmcss_task_id) {
+        DWORD tid = 0u;
+        const HRESULT hr = host.mf_get_wq_mmcss_task_id(static_cast<DWORD>(dwWorkQueueId), &tid);
+        *pdwTaskId = static_cast<uint32_t>(tid);
+        return RecordHr("MFGetWorkQueueMMCSSTaskId", static_cast<int32_t>(hr));
+    }
+#else
+    (void)dwWorkQueueId;
+#endif
+    return RecordHr("MFGetWorkQueueMMCSSTaskId", kHrNotImpl);
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFGetWorkQueueMMCSSPriority(
+    uint32_t dwWorkQueueId,
+    int32_t* lPriority) {
+    if (!lPriority) {
+        return RecordHr("MFGetWorkQueueMMCSSPriority", kHrPointer);
+    }
+    *lPriority = 0;
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_get_wq_mmcss_priority) {
+        LONG prio = 0;
+        const HRESULT hr = host.mf_get_wq_mmcss_priority(static_cast<DWORD>(dwWorkQueueId), &prio);
+        *lPriority = static_cast<int32_t>(prio);
+        return RecordHr("MFGetWorkQueueMMCSSPriority", static_cast<int32_t>(hr));
+    }
+#else
+    (void)dwWorkQueueId;
+#endif
+    return RecordHr("MFGetWorkQueueMMCSSPriority", kHrNotImpl);
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFCreateWaveFormatExFromMFMediaType(
+    void* pMFType,
+    void** ppWF,
+    uint32_t* pcbSize,
+    uint32_t Flags) {
+    if (!ppWF) {
+        return RecordHr("MFCreateWaveFormatExFromMFMediaType", kHrPointer);
+    }
+    *ppWF = nullptr;
+    if (pcbSize) *pcbSize = 0u;
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_create_wfx_from_mt) {
+        UINT32 sz = 0u;
+        const HRESULT hr = host.mf_create_wfx_from_mt(
+            pMFType, ppWF, pcbSize ? &sz : nullptr, static_cast<UINT32>(Flags));
+        if (pcbSize) *pcbSize = static_cast<uint32_t>(sz);
+        return RecordHr("MFCreateWaveFormatExFromMFMediaType", static_cast<int32_t>(hr));
+    }
+#else
+    (void)pMFType;
+    (void)Flags;
+#endif
+    return RecordHr("MFCreateWaveFormatExFromMFMediaType", kHrNotImpl);
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFInitMediaTypeFromWaveFormatEx(
+    void* pMFType,
+    const void* pWaveFormat,
+    uint32_t cbBufSize) {
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_init_mt_from_wfx) {
+        const HRESULT hr = host.mf_init_mt_from_wfx(
+            pMFType, pWaveFormat, static_cast<UINT32>(cbBufSize));
+        return RecordHr("MFInitMediaTypeFromWaveFormatEx", static_cast<int32_t>(hr));
+    }
+#else
+    (void)pMFType;
+    (void)pWaveFormat;
+    (void)cbBufSize;
+#endif
+    return RecordHr("MFInitMediaTypeFromWaveFormatEx", kHrNotImpl);
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFCreateEventQueue(void** ppMediaEventQueue) {
+    if (!ppMediaEventQueue) {
+        return RecordHr("MFCreateEventQueue", kHrPointer);
+    }
+    *ppMediaEventQueue = nullptr;
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_create_event_queue) {
+        const HRESULT hr = host.mf_create_event_queue(ppMediaEventQueue);
+        return RecordHr("MFCreateEventQueue", static_cast<int32_t>(hr));
+    }
+#endif
+    return RecordHr("MFCreateEventQueue", kHrNotImpl);
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFCreateCollection(void** ppIMFCollection) {
+    if (!ppIMFCollection) {
+        return RecordHr("MFCreateCollection", kHrPointer);
+    }
+    *ppIMFCollection = nullptr;
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_create_collection) {
+        const HRESULT hr = host.mf_create_collection(ppIMFCollection);
+        return RecordHr("MFCreateCollection", static_cast<int32_t>(hr));
+    }
+#endif
+    return RecordHr("MFCreateCollection", kHrNotImpl);
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFCreateDXGISurfaceBuffer(
+    const void* riid,
+    void* punkSurface,
+    uint32_t uSubresourceIndex,
+    int32_t fBottomUpWhenLinear,
+    void** ppBuffer) {
+    if (!ppBuffer) {
+        return RecordHr("MFCreateDXGISurfaceBuffer", kHrPointer);
+    }
+    *ppBuffer = nullptr;
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_create_dxgi_surface_buffer) {
+        const HRESULT hr = host.mf_create_dxgi_surface_buffer(
+            riid,
+            punkSurface,
+            static_cast<UINT>(uSubresourceIndex),
+            static_cast<BOOL>(fBottomUpWhenLinear),
+            ppBuffer);
+        return RecordHr("MFCreateDXGISurfaceBuffer", static_cast<int32_t>(hr));
+    }
+#else
+    (void)riid;
+    (void)punkSurface;
+    (void)uSubresourceIndex;
+    (void)fBottomUpWhenLinear;
+#endif
+    return RecordHr("MFCreateDXGISurfaceBuffer", kHrNotImpl);
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFCreate2DMediaBuffer(
+    uint32_t dwWidth,
+    uint32_t dwHeight,
+    uint32_t dwFourCC,
+    int32_t fBottomUp,
+    void** ppBuffer) {
+    if (!ppBuffer) {
+        return RecordHr("MFCreate2DMediaBuffer", kHrPointer);
+    }
+    *ppBuffer = nullptr;
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_create_2d_media_buffer) {
+        const HRESULT hr = host.mf_create_2d_media_buffer(
+            static_cast<DWORD>(dwWidth),
+            static_cast<DWORD>(dwHeight),
+            static_cast<DWORD>(dwFourCC),
+            static_cast<BOOL>(fBottomUp),
+            ppBuffer);
+        return RecordHr("MFCreate2DMediaBuffer", static_cast<int32_t>(hr));
+    }
+#else
+    (void)dwWidth;
+    (void)dwHeight;
+    (void)dwFourCC;
+    (void)fBottomUp;
+#endif
+    return RecordHr("MFCreate2DMediaBuffer", kHrNotImpl);
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFCreateVideoMediaType(
+    const void* pVideoFormat,
+    void** ppIVideoMediaType) {
+    if (!ppIVideoMediaType) {
+        return RecordHr("MFCreateVideoMediaType", kHrPointer);
+    }
+    *ppIVideoMediaType = nullptr;
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_create_video_media_type) {
+        const HRESULT hr = host.mf_create_video_media_type(pVideoFormat, ppIVideoMediaType);
+        return RecordHr("MFCreateVideoMediaType", static_cast<int32_t>(hr));
+    }
+#else
+    (void)pVideoFormat;
+#endif
+    return RecordHr("MFCreateVideoMediaType", kHrNotImpl);
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFCreateAudioMediaType(
+    const void* pAudioFormat,
+    void** ppIAudioMediaType) {
+    if (!ppIAudioMediaType) {
+        return RecordHr("MFCreateAudioMediaType", kHrPointer);
+    }
+    *ppIAudioMediaType = nullptr;
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_create_audio_media_type) {
+        const HRESULT hr = host.mf_create_audio_media_type(pAudioFormat, ppIAudioMediaType);
+        return RecordHr("MFCreateAudioMediaType", static_cast<int32_t>(hr));
+    }
+#else
+    (void)pAudioFormat;
+#endif
+    return RecordHr("MFCreateAudioMediaType", kHrNotImpl);
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFCreatePresentationDescriptor(
+    uint32_t cStreamDescriptors,
+    void** apStreamDescriptors,
+    void** ppPresentationDescriptor) {
+    if (!ppPresentationDescriptor) {
+        return RecordHr("MFCreatePresentationDescriptor", kHrPointer);
+    }
+    *ppPresentationDescriptor = nullptr;
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_create_presentation_descriptor) {
+        const HRESULT hr = host.mf_create_presentation_descriptor(
+            static_cast<DWORD>(cStreamDescriptors), apStreamDescriptors, ppPresentationDescriptor);
+        return RecordHr("MFCreatePresentationDescriptor", static_cast<int32_t>(hr));
+    }
+#else
+    (void)cStreamDescriptors;
+    (void)apStreamDescriptors;
+#endif
+    return RecordHr("MFCreatePresentationDescriptor", kHrNotImpl);
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFCreateStreamDescriptor(
+    uint32_t dwStreamIdentifier,
+    uint32_t cMediaTypes,
+    void** apMediaTypes,
+    void** ppDescriptor) {
+    if (!ppDescriptor) {
+        return RecordHr("MFCreateStreamDescriptor", kHrPointer);
+    }
+    *ppDescriptor = nullptr;
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_create_stream_descriptor) {
+        const HRESULT hr = host.mf_create_stream_descriptor(
+            static_cast<DWORD>(dwStreamIdentifier),
+            static_cast<DWORD>(cMediaTypes),
+            apMediaTypes,
+            ppDescriptor);
+        return RecordHr("MFCreateStreamDescriptor", static_cast<int32_t>(hr));
+    }
+#else
+    (void)dwStreamIdentifier;
+    (void)cMediaTypes;
+    (void)apMediaTypes;
+#endif
+    return RecordHr("MFCreateStreamDescriptor", kHrNotImpl);
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFCreateMediaTypeHandler(void** ppHandler) {
+    if (!ppHandler) {
+        return RecordHr("MFCreateMediaTypeHandler", kHrPointer);
+    }
+    *ppHandler = nullptr;
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_create_media_type_handler) {
+        const HRESULT hr = host.mf_create_media_type_handler(ppHandler);
+        return RecordHr("MFCreateMediaTypeHandler", static_cast<int32_t>(hr));
+    }
+#endif
+    return RecordHr("MFCreateMediaTypeHandler", kHrNotImpl);
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFGetStrideForBitmapInfoHeader(
+    uint32_t format,
+    uint32_t dwWidth,
+    int32_t* pStride) {
+    if (!pStride) {
+        return RecordHr("MFGetStrideForBitmapInfoHeader", kHrPointer);
+    }
+    *pStride = 0;
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_get_stride_for_bih) {
+        LONG stride = 0;
+        const HRESULT hr = host.mf_get_stride_for_bih(
+            static_cast<DWORD>(format), static_cast<DWORD>(dwWidth), &stride);
+        *pStride = static_cast<int32_t>(stride);
+        return RecordHr("MFGetStrideForBitmapInfoHeader", static_cast<int32_t>(hr));
+    }
+#else
+    (void)format;
+    (void)dwWidth;
+#endif
+    return RecordHr("MFGetStrideForBitmapInfoHeader", kHrNotImpl);
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFCalculateImageSize(
+    const void* guidSubtype,
+    uint32_t unWidth,
+    uint32_t unHeight,
+    uint32_t* pcbImageSize) {
+    if (!pcbImageSize) {
+        return RecordHr("MFCalculateImageSize", kHrPointer);
+    }
+    *pcbImageSize = 0u;
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_calculate_image_size) {
+        UINT32 sz = 0u;
+        const HRESULT hr = host.mf_calculate_image_size(
+            guidSubtype, static_cast<UINT32>(unWidth), static_cast<UINT32>(unHeight), &sz);
+        *pcbImageSize = static_cast<uint32_t>(sz);
+        return RecordHr("MFCalculateImageSize", static_cast<int32_t>(hr));
+    }
+#else
+    (void)guidSubtype;
+    (void)unWidth;
+    (void)unHeight;
+#endif
+    return RecordHr("MFCalculateImageSize", kHrNotImpl);
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFCopyImage(
+    uint8_t* pDest,
+    int32_t lDestStride,
+    const uint8_t* pSrc,
+    int32_t lSrcStride,
+    uint32_t dwWidthInBytes,
+    uint32_t dwLines) {
+    if (!pDest || !pSrc) {
+        return RecordHr("MFCopyImage", kHrInvalidArg);
+    }
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_copy_image) {
+        const HRESULT hr = host.mf_copy_image(
+            pDest,
+            static_cast<LONG>(lDestStride),
+            pSrc,
+            static_cast<LONG>(lSrcStride),
+            static_cast<DWORD>(dwWidthInBytes),
+            static_cast<DWORD>(dwLines));
+        return RecordHr("MFCopyImage", static_cast<int32_t>(hr));
+    }
+#endif
+    for (uint32_t y = 0u; y < dwLines; ++y) {
+        std::memcpy(
+            pDest + static_cast<std::ptrdiff_t>(y) * lDestStride,
+            pSrc + static_cast<std::ptrdiff_t>(y) * lSrcStride,
+            dwWidthInBytes);
+    }
+    return RecordHr("MFCopyImage", kHrOk);
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFCreateMediaEvent(
+    uint32_t met,
+    const void* guidExtendedType,
+    int32_t hrStatus,
+    const void* pvValue,
+    void** ppEvent) {
+    if (!ppEvent) {
+        return RecordHr("MFCreateMediaEvent", kHrPointer);
+    }
+    *ppEvent = nullptr;
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_create_media_event) {
+        const HRESULT hr = host.mf_create_media_event(
+            met, guidExtendedType, static_cast<HRESULT>(hrStatus), pvValue, ppEvent);
+        return RecordHr("MFCreateMediaEvent", static_cast<int32_t>(hr));
+    }
+#else
+    (void)met;
+    (void)guidExtendedType;
+    (void)hrStatus;
+    (void)pvValue;
+#endif
+    return RecordHr("MFCreateMediaEvent", kHrNotImpl);
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFCreateMediaBufferWrapper(
+    void* pBuffer,
+    uint32_t cbOffset,
+    uint32_t dwLength,
+    void** ppBuffer) {
+    if (!ppBuffer) {
+        return RecordHr("MFCreateMediaBufferWrapper", kHrPointer);
+    }
+    *ppBuffer = nullptr;
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_create_media_buffer_wrapper) {
+        const HRESULT hr = host.mf_create_media_buffer_wrapper(
+            pBuffer, static_cast<DWORD>(cbOffset), static_cast<DWORD>(dwLength), ppBuffer);
+        return RecordHr("MFCreateMediaBufferWrapper", static_cast<int32_t>(hr));
+    }
+#else
+    (void)pBuffer;
+    (void)cbOffset;
+    (void)dwLength;
+#endif
+    return RecordHr("MFCreateMediaBufferWrapper", kHrNotImpl);
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFCreateTempFile(
+    uint32_t AccessMode,
+    uint32_t OpenMode,
+    uint32_t fFlags,
+    void** ppIByteStream) {
+    if (!ppIByteStream) {
+        return RecordHr("MFCreateTempFile", kHrPointer);
+    }
+    *ppIByteStream = nullptr;
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_create_temp_file) {
+        const HRESULT hr = host.mf_create_temp_file(AccessMode, OpenMode, fFlags, ppIByteStream);
+        return RecordHr("MFCreateTempFile", static_cast<int32_t>(hr));
+    }
+#else
+    (void)AccessMode;
+    (void)OpenMode;
+    (void)fFlags;
+#endif
+    return RecordHr("MFCreateTempFile", kHrNotImpl);
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFCreateFile(
+    uint32_t AccessMode,
+    uint32_t OpenMode,
+    uint32_t fFlags,
+    const wchar_t* pwszFileURL,
+    void** ppIByteStream) {
+    if (!ppIByteStream) {
+        return RecordHr("MFCreateFile", kHrPointer);
+    }
+    *ppIByteStream = nullptr;
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_create_file) {
+        const HRESULT hr = host.mf_create_file(
+            AccessMode, OpenMode, fFlags, pwszFileURL, ppIByteStream);
+        return RecordHr("MFCreateFile", static_cast<int32_t>(hr));
+    }
+#else
+    (void)AccessMode;
+    (void)OpenMode;
+    (void)fFlags;
+    (void)pwszFileURL;
+#endif
+    return RecordHr("MFCreateFile", kHrNotImpl);
+}
+
+OS_MFPLAT_API int32_t OS_MFPLAT_CALL MFCreateMFByteStreamOnStream(
+    void* pStream,
+    void** ppByteStream) {
+    if (!ppByteStream) {
+        return RecordHr("MFCreateMFByteStreamOnStream", kHrPointer);
+    }
+    *ppByteStream = nullptr;
+#if defined(_WIN32)
+    auto& host = GetHostMf();
+    host.EnsureLoaded();
+    if (host.mf_create_bytestream_on_stream) {
+        const HRESULT hr = host.mf_create_bytestream_on_stream(pStream, ppByteStream);
+        return RecordHr("MFCreateMFByteStreamOnStream", static_cast<int32_t>(hr));
+    }
+#else
+    (void)pStream;
+#endif
+    return RecordHr("MFCreateMFByteStreamOnStream", kHrNotImpl);
+}
 
 OS_MFPLAT_API int32_t OS_MFPLAT_CALL OpenScarlettMfPlatGetTelemetryCount(
     const char* symbolName,

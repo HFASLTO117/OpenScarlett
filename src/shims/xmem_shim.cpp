@@ -1,5 +1,6 @@
 // MIT xmem.dll shim forwarding Xbox memory allocations to kernelx.dll
-// while recording xmem.dll call telemetry.
+// while supporting thread-safe XMemSetAllocationHooks, heap validation
+// (XMemCheckDefaultHeaps), and xmem.dll call telemetry.
 
 #if defined(_WIN32)
 #  include <windows.h>
@@ -8,8 +9,10 @@
 #include "openscarlett/kernel/kernelx_abi.h"
 #include "openscarlett/core/telemetry.h"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 
 #if defined(_MSC_VER)
 // Export standard unprefixed Xbox xmem.dll symbols pointing to our thin
@@ -22,6 +25,8 @@
 #pragma comment(linker, "/export:XMemFreeDefault=XMemShim_XMemFreeDefault")
 #pragma comment(linker, "/export:XMemSize=XMemShim_XMemSize")
 #pragma comment(linker, "/export:XMemSizeDefault=XMemShim_XMemSizeDefault")
+#pragma comment(linker, "/export:XMemSetAllocationHooks=XMemShim_XMemSetAllocationHooks")
+#pragma comment(linker, "/export:XMemCheckDefaultHeaps=XMemShim_XMemCheckDefaultHeaps")
 #pragma comment(linker, "/export:XMemGetAuxiliaryTitleMemory=XMemShim_XMemGetAuxiliaryTitleMemory")
 #pragma comment(linker, "/export:XMemReleaseAuxiliaryTitleMemory=XMemShim_XMemReleaseAuxiliaryTitleMemory")
 #pragma comment(linker, "/export:XMemVirtualQuery=XMemShim_XMemVirtualQuery")
@@ -37,6 +42,22 @@ namespace {
 
 constexpr const char* kModName = "xmem.dll";
 constexpr int32_t kHrFail = static_cast<int32_t>(0x80004005u);
+
+using XMemAllocHookFn = void*(OPENSCARLETT_KERNELX_CALL*)(size_t, uint64_t);
+using XMemFreeHookFn = void(OPENSCARLETT_KERNELX_CALL*)(void*, uint64_t);
+using XMemSizeHookFn = size_t(OPENSCARLETT_KERNELX_CALL*)(void*, uint64_t);
+
+struct XMemHookTable {
+    std::mutex mutex;
+    std::atomic<XMemAllocHookFn> alloc_hook{nullptr};
+    std::atomic<XMemFreeHookFn> free_hook{nullptr};
+    std::atomic<XMemSizeHookFn> size_hook{nullptr};
+};
+
+XMemHookTable& GetHookTable() {
+    static XMemHookTable* s_hooks = new XMemHookTable();
+    return *s_hooks;
+}
 
 inline void RecordOutcome(const char* sym, bool ok) {
     openscarlett::CallTelemetry::Global().Record(
@@ -54,8 +75,37 @@ extern "C" {
 OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL XMemGetWorkingSetStatistics(
     void* lpBuffer);
 
+int32_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemSetAllocationHooks(
+    XMemAllocHookFn allocHook,
+    XMemFreeHookFn freeHook,
+    XMemSizeHookFn sizeHook) {
+    auto& hooks = GetHookTable();
+    {
+        std::lock_guard<std::mutex> lk(hooks.mutex);
+        hooks.alloc_hook.store(allocHook, std::memory_order_release);
+        hooks.free_hook.store(freeHook, std::memory_order_release);
+        hooks.size_hook.store(sizeHook, std::memory_order_release);
+    }
+    RecordOutcome("XMemSetAllocationHooks", true);
+    return 0;  // S_OK
+}
+
+int32_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemCheckDefaultHeaps(void) {
+    bool ok = true;
+#if defined(_WIN32)
+    HANDLE proc_heap = ::GetProcessHeap();
+    if (proc_heap != nullptr) {
+        ok = (::HeapValidate(proc_heap, 0u, nullptr) != FALSE);
+    }
+#endif
+    RecordOutcome("XMemCheckDefaultHeaps", ok);
+    return ok ? 1 : 0;
+}
+
 void* OPENSCARLETT_KERNELX_CALL XMemShim_XMemAlloc(size_t dwSize, uint64_t dwAllocAttributes) {
-    void* ptr = ::XMemAlloc(dwSize, dwAllocAttributes);
+    const auto hook = GetHookTable().alloc_hook.load(std::memory_order_acquire);
+    void* ptr = hook ? hook(dwSize, dwAllocAttributes)
+                     : ::XMemAlloc(dwSize, dwAllocAttributes);
     RecordOutcome("XMemAlloc", ptr != nullptr);
     return ptr;
 }
@@ -74,12 +124,17 @@ void* OPENSCARLETT_KERNELX_CALL XMemShim_XMemAllocAligned(
 }
 
 void OPENSCARLETT_KERNELX_CALL XMemShim_XMemFree(void* pAddress, uint64_t dwAllocAttributes) {
+    const auto hook = GetHookTable().free_hook.load(std::memory_order_acquire);
 #if defined(_WIN32)
     SetLastError(0u);
 #endif
-    ::XMemFree(pAddress, dwAllocAttributes);
+    if (hook) {
+        hook(pAddress, dwAllocAttributes);
+    } else {
+        ::XMemFree(pAddress, dwAllocAttributes);
+    }
 #if defined(_WIN32)
-    const bool ok = (pAddress == nullptr) || (GetLastError() == 0u);
+    const bool ok = hook ? true : ((pAddress == nullptr) || (GetLastError() == 0u));
 #else
     const bool ok = true;
 #endif
@@ -100,7 +155,9 @@ void OPENSCARLETT_KERNELX_CALL XMemShim_XMemFreeDefault(void* pAddress, uint64_t
 }
 
 size_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemSize(void* pAddress, uint64_t dwAllocAttributes) {
-    const size_t sz = ::XMemSize(pAddress, dwAllocAttributes);
+    const auto hook = GetHookTable().size_hook.load(std::memory_order_acquire);
+    const size_t sz = hook ? hook(pAddress, dwAllocAttributes)
+                           : ::XMemSize(pAddress, dwAllocAttributes);
     RecordOutcome("XMemSize", pAddress == nullptr || sz > 0u);
     return sz;
 }
