@@ -208,6 +208,9 @@ private:
     D3D12_HEAP_FLAGS cached_heap_flags_ = D3D12_HEAP_FLAG_NONE;
     bool has_cached_heap_props_ = false;
     D3D12_GPU_VIRTUAL_ADDRESS xbox_gpu_va_ = 0ull;
+    std::mutex uma_map_mutex_;
+    std::vector<uint8_t> uma_cpu_shadow_;
+    bool uma_shadow_mapped_ = false;
 };
 
 // ---------------------------------------------------------------------------
