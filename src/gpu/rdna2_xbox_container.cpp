@@ -410,16 +410,32 @@ bool VisibilityMatchesStage(uint32_t vis, ShaderStage stage) noexcept {
 
 const char* ExtendedSop1Name(uint16_t raw_op) noexcept {
     switch (raw_op) {
-        case kSop1RawMovB64:          return "s_mov_b64";
-        case kSop1RawAndSaveExecB64:  return "s_and_saveexec_b64";
-        case kSop1RawOrSaveExecB64:   return "s_or_saveexec_b64";
-        case kSop1RawXorSaveExecB64:  return "s_xor_saveexec_b64";
-        case kSop1RawAndN2SaveExecB64:return "s_andn2_saveexec_b64";
-        case kSop1RawAndSaveExecB32:  return "s_and_saveexec_b32";
-        case kSop1RawOrSaveExecB32:   return "s_or_saveexec_b32";
-        case kSop1RawXorSaveExecB32:  return "s_xor_saveexec_b32";
-        case kSop1RawAndN2SaveExecB32:return "s_andn2_saveexec_b32";
-        default:                      return nullptr;
+        case kSop1RawMovB64:            return "s_mov_b64";
+        case kSop1RawAndSaveExecB64:    return "s_and_saveexec_b64";
+        case kSop1RawOrSaveExecB64:     return "s_or_saveexec_b64";
+        case kSop1RawXorSaveExecB64:    return "s_xor_saveexec_b64";
+        case kSop1RawAndN2SaveExecB64:  return "s_andn2_saveexec_b64";
+        case kSop1RawOrN2SaveExecB64:   return "s_orn2_saveexec_b64";
+        case kSop1RawNandSaveExecB64:   return "s_nand_saveexec_b64";
+        case kSop1RawNorSaveExecB64:    return "s_nor_saveexec_b64";
+        case kSop1RawXnorSaveExecB64:   return "s_xnor_saveexec_b64";
+        case kSop1RawAndN1SaveExecB64:  return "s_andn1_saveexec_b64";
+        case kSop1RawOrN1SaveExecB64:   return "s_orn1_saveexec_b64";
+        case kSop1RawAndN1WrExecB64:    return "s_andn1_wrexec_b64";
+        case kSop1RawAndN2WrExecB64:    return "s_andn2_wrexec_b64";
+        case kSop1RawAndSaveExecB32:    return "s_and_saveexec_b32";
+        case kSop1RawOrSaveExecB32:     return "s_or_saveexec_b32";
+        case kSop1RawXorSaveExecB32:    return "s_xor_saveexec_b32";
+        case kSop1RawAndN2SaveExecB32:  return "s_andn2_saveexec_b32";
+        case kSop1RawOrN2SaveExecB32:   return "s_orn2_saveexec_b32";
+        case kSop1RawNandSaveExecB32:   return "s_nand_saveexec_b32";
+        case kSop1RawNorSaveExecB32:    return "s_nor_saveexec_b32";
+        case kSop1RawXnorSaveExecB32:   return "s_xnor_saveexec_b32";
+        case kSop1RawAndN1SaveExecB32:  return "s_andn1_saveexec_b32";
+        case kSop1RawOrN1SaveExecB32:   return "s_orn1_saveexec_b32";
+        case kSop1RawAndN1WrExecB32:    return "s_andn1_wrexec_b32";
+        case kSop1RawAndN2WrExecB32:    return "s_andn2_wrexec_b32";
+        default:                        return nullptr;
     }
 }
 

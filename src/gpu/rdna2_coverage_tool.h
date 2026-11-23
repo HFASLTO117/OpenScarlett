@@ -96,6 +96,7 @@ struct Rdna2CoverageReport {
 
     std::vector<Rdna2FamilyCoverage> families;
     std::vector<Rdna2StageCoverage> stages;
+    std::vector<Rdna2StageCoverage> extended_stages;  // "HS", "DS", "GS" real-GPU stage verification
     std::vector<Rdna2WorkloadCoverage> workloads;
 };
 

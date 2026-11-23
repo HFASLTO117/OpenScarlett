@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -808,6 +809,135 @@ bool ShaderCache::IsAsyncPsoCompilationEnabled() const {
     return false;
 }
 
+void ShaderCache::SetAsyncWorkerCount(uint32_t worker_count) {
+    if (worker_count == 0u) {
+        configured_worker_count_.store(0u, std::memory_order_relaxed);
+    } else {
+        configured_worker_count_.store(std::clamp(worker_count, 1u, 8u), std::memory_order_relaxed);
+    }
+}
+
+uint32_t ShaderCache::GetAsyncWorkerCount() const noexcept {
+    const uint32_t explicit_cnt = configured_worker_count_.load(std::memory_order_relaxed);
+    if (explicit_cnt > 0u) {
+        return explicit_cnt;
+    }
+    const unsigned int hw = std::thread::hardware_concurrency();
+    const uint32_t auto_cnt = std::min<uint32_t>(4u, std::max<uint32_t>(2u, static_cast<uint32_t>(hw / 2u)));
+    return IsInProcessDxcAvailable() ? auto_cnt : std::min<uint32_t>(auto_cnt, 2u);
+}
+
+void ShaderCache::SetAsyncCompletionCallback(AsyncCompileCompletionCallback callback) {
+    std::lock_guard<std::mutex> lock(async_mutex_);
+    completion_callback_ = std::move(callback);
+}
+
+std::vector<ShaderCacheDiskEntryInfo> ShaderCache::EnumerateDiskCacheEntries() const {
+    std::vector<ShaderCacheDiskEntryInfo> entries;
+    const std::string dir = ResolveCacheDirectory();
+    std::error_code ec;
+    if (!std::filesystem::exists(dir, ec) || ec) {
+        return entries;
+    }
+    for (const auto& de : std::filesystem::directory_iterator(dir, ec)) {
+        if (ec) break;
+        if (!de.is_regular_file(ec) || ec) continue;
+        const std::filesystem::path p = de.path();
+        if (p.extension() != ".ossc") continue;
+
+        ShaderCacheDiskEntryInfo info{};
+        info.key_hex = p.stem().string();
+        info.path = p.string();
+        info.size_bytes = static_cast<uint64_t>(de.file_size(ec));
+        if (ec) info.size_bytes = 0u;
+        const auto ftime = de.last_write_time(ec);
+        if (!ec) {
+            const auto dur = ftime.time_since_epoch();
+            info.last_write_epoch_sec = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::seconds>(dur).count());
+        }
+
+        std::ifstream ifs(p, std::ios::binary);
+        if (ifs && info.size_bytes >= sizeof(OnDiskCacheHeader)) {
+            OnDiskCacheHeader hdr{};
+            ifs.read(reinterpret_cast<char*>(&hdr), static_cast<std::streamsize>(sizeof(hdr)));
+            if (ifs &&
+                std::memcmp(hdr.magic, kCacheFileMagic, 4) == 0 &&
+                hdr.format_version == kShaderCacheFormatVersion &&
+                hdr.target_len > 0u && hdr.target_len <= 64u &&
+                hdr.dxil_size >= 32u && hdr.dxil_size <= (64u * 1024u * 1024u)) {
+                const uint64_t expected_size = sizeof(OnDiskCacheHeader) +
+                                               static_cast<uint64_t>(hdr.target_len) +
+                                               static_cast<uint64_t>(hdr.dxil_size);
+                if (info.size_bytes == expected_size) {
+                    std::string target(hdr.target_len, '\0');
+                    std::vector<uint8_t> dxil(hdr.dxil_size);
+                    ifs.read(target.data(), static_cast<std::streamsize>(hdr.target_len));
+                    ifs.read(reinterpret_cast<char*>(dxil.data()), static_cast<std::streamsize>(hdr.dxil_size));
+                    if (ifs &&
+                        std::memcmp(dxil.data(), "DXBC", 4) == 0 &&
+                        HashPayloadChecksum(target, dxil) == hdr.payload_checksum &&
+                        ComputeCacheEntryCrc32(hdr, target, dxil) == hdr.crc32) {
+                        info.stage = static_cast<ShaderStage>(hdr.stage);
+                        info.target_profile = std::move(target);
+                        info.valid_crc32 = true;
+                    }
+                }
+            }
+        }
+        entries.push_back(std::move(info));
+    }
+    std::sort(entries.begin(), entries.end(),
+              [](const ShaderCacheDiskEntryInfo& a, const ShaderCacheDiskEntryInfo& b) {
+                  if (a.last_write_epoch_sec != b.last_write_epoch_sec) {
+                      return a.last_write_epoch_sec < b.last_write_epoch_sec;
+                  }
+                  return a.key_hex < b.key_hex;
+              });
+    return entries;
+}
+
+size_t ShaderCache::PruneDiskCache(uint64_t max_bytes, size_t max_entries) {
+    auto entries = EnumerateDiskCacheEntries();
+    size_t removed = 0u;
+    std::error_code ec;
+
+    // 1. Always evict corrupt entries first
+    std::vector<ShaderCacheDiskEntryInfo> valid_entries;
+    valid_entries.reserve(entries.size());
+    uint64_t total_bytes = 0u;
+    for (auto& e : entries) {
+        if (!e.valid_crc32) {
+            if (std::filesystem::remove(e.path, ec) && !ec) {
+                ++removed;
+                corrupt_entries_.fetch_add(1, std::memory_order_relaxed);
+                disk_entries_pruned_.fetch_add(1, std::memory_order_relaxed);
+            }
+        } else {
+            total_bytes += e.size_bytes;
+            valid_entries.push_back(std::move(e));
+        }
+    }
+
+    // 2. Evict oldest valid entries (already sorted oldest-first) until within budget
+    size_t remaining = valid_entries.size();
+    for (const auto& e : valid_entries) {
+        const bool over_bytes = (max_bytes > 0u && total_bytes > max_bytes);
+        const bool over_count = (max_entries > 0u && remaining > max_entries);
+        if (!over_bytes && !over_count) {
+            break;
+        }
+        if (std::filesystem::remove(e.path, ec) && !ec) {
+            ++removed;
+            if (total_bytes >= e.size_bytes) total_bytes -= e.size_bytes;
+            else total_bytes = 0u;
+            if (remaining > 0u) --remaining;
+            disk_entries_pruned_.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    return removed;
+}
+
 void ShaderCache::ClearMemoryCache() {
     std::lock_guard<std::mutex> lock(cache_mutex_);
     memory_cache_.clear();
@@ -824,6 +954,15 @@ void ShaderCache::ResetStats() {
     sync_succeeded_.store(0, std::memory_order_relaxed);
     sync_failed_.store(0, std::memory_order_relaxed);
     standins_served_.store(0, std::memory_order_relaxed);
+    total_compile_time_us_.store(0, std::memory_order_relaxed);
+    compile_count_.store(0, std::memory_order_relaxed);
+    disk_bytes_read_.store(0, std::memory_order_relaxed);
+    disk_bytes_written_.store(0, std::memory_order_relaxed);
+    peak_queue_depth_.store(0, std::memory_order_relaxed);
+    hot_swaps_ready_.store(0, std::memory_order_relaxed);
+    disk_entries_pruned_.store(0, std::memory_order_relaxed);
+    async_dedup_hits_.store(0, std::memory_order_relaxed);
+    async_priority_promotions_.store(0, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lock(cache_mutex_);
         last_compile_error_.clear();
@@ -843,6 +982,17 @@ ShaderCacheStats ShaderCache::Stats() const noexcept {
     s.sync_compiles_failed = sync_failed_.load(std::memory_order_relaxed);
     s.total_compile_failures = s.sync_compiles_failed + s.async_compiles_failed;
     s.standins_served = standins_served_.load(std::memory_order_relaxed);
+    s.total_compile_time_us = total_compile_time_us_.load(std::memory_order_relaxed);
+    const uint64_t cc = compile_count_.load(std::memory_order_relaxed);
+    s.avg_compile_time_us = (cc > 0u) ? (s.total_compile_time_us / cc) : 0u;
+    s.disk_bytes_read = disk_bytes_read_.load(std::memory_order_relaxed);
+    s.disk_bytes_written = disk_bytes_written_.load(std::memory_order_relaxed);
+    s.active_worker_threads = active_worker_threads_.load(std::memory_order_relaxed);
+    s.peak_queue_depth = peak_queue_depth_.load(std::memory_order_relaxed);
+    s.hot_swaps_ready = hot_swaps_ready_.load(std::memory_order_relaxed);
+    s.disk_entries_pruned = disk_entries_pruned_.load(std::memory_order_relaxed);
+    s.async_dedup_hits = async_dedup_hits_.load(std::memory_order_relaxed);
+    s.async_priority_promotions = async_priority_promotions_.load(std::memory_order_relaxed);
     return s;
 }
 
@@ -865,7 +1015,14 @@ std::string ShaderCache::FormatDiagnosticsSummary() const {
         << ", async_fail=" << s.async_compiles_failed
         << ", total_fail=" << s.total_compile_failures
         << ", corrupt=" << s.corrupt_entries
-        << ", standins=" << s.standins_served << "]";
+        << ", standins=" << s.standins_served
+        << ", hot_swaps=" << s.hot_swaps_ready
+        << ", dedup=" << s.async_dedup_hits
+        << ", promos=" << s.async_priority_promotions
+        << ", peak_q=" << s.peak_queue_depth
+        << ", avg_us=" << s.avg_compile_time_us
+        << ", disk_rw=" << s.disk_bytes_read << "/" << s.disk_bytes_written << "B"
+        << ", pruned=" << s.disk_entries_pruned << "]";
     if (!last_err.empty()) {
         oss << " last_error=\"" << last_err << "\"";
     }
@@ -949,6 +1106,7 @@ bool ShaderCache::TryLoadFromDisk(const ShaderCacheKey& key, MemoryEntry& out_en
     out_entry.stage = static_cast<ShaderStage>(hdr.stage);
     out_entry.target_profile = std::move(target);
     out_entry.dxil = std::move(dxil);
+    disk_bytes_read_.fetch_add(static_cast<uint64_t>(file_size), std::memory_order_relaxed);
     return true;
 }
 
@@ -1011,6 +1169,10 @@ Status ShaderCache::SaveToDiskAtomic(const ShaderCacheKey& key, const MemoryEntr
         return Status::Error(StatusCode::IoError, "Rename failed for shader cache entry");
     }
 #endif
+    const uint64_t written_bytes = sizeof(OnDiskCacheHeader) +
+                                   static_cast<uint64_t>(entry.target_profile.size()) +
+                                   static_cast<uint64_t>(entry.dxil.size());
+    disk_bytes_written_.fetch_add(written_bytes, std::memory_order_relaxed);
     return Status::Ok();
 }
 
@@ -1259,15 +1421,39 @@ Status ShaderCache::CompileRealXboxShaderSync(
 void ShaderCache::EnqueueAsyncJob(AsyncJob job) {
     {
         std::lock_guard<std::mutex> lock(async_mutex_);
+        if (job.had_standin) {
+            standin_pending_keys_.insert(job.key);
+        }
         if (!inflight_keys_.insert(job.key).second) {
+            async_dedup_hits_.fetch_add(1, std::memory_order_relaxed);
+            // Promote priority in-place if the job is still waiting in queue
+            for (auto& queued : job_queue_) {
+                if (queued.key == job.key) {
+                    if (static_cast<uint8_t>(job.priority) > static_cast<uint8_t>(queued.priority)) {
+                        queued.priority = job.priority;
+                        async_priority_promotions_.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    if (job.had_standin) {
+                        queued.had_standin = true;
+                    }
+                    break;
+                }
+            }
             return;  // Already queued or compiling
         }
+        job.sequence = next_job_seq_++;
         job_queue_.push_back(std::move(job));
+        const uint64_t qdepth = static_cast<uint64_t>(job_queue_.size());
+        uint64_t prev_peak = peak_queue_depth_.load(std::memory_order_relaxed);
+        while (qdepth > prev_peak &&
+               !peak_queue_depth_.compare_exchange_weak(prev_peak, qdepth, std::memory_order_relaxed)) {
+        }
         async_queued_.fetch_add(1, std::memory_order_relaxed);
         CallTelemetry::Global().Record(kCacheTelemetryModule, "AsyncCompileQueued", CallOutcome::Ok, 0);
-        const uint32_t max_workers = IsInProcessDxcAvailable() ? 4u : 2u;
+        const uint32_t max_workers = GetAsyncWorkerCount();
         if (active_workers_ < max_workers) {
             ++active_workers_;
+            active_worker_threads_.store(active_workers_, std::memory_order_relaxed);
             workers_.emplace_back(&ShaderCache::WorkerLoop, this);
         }
     }
@@ -1281,40 +1467,128 @@ void ShaderCache::WorkerLoop() {
             std::lock_guard<std::mutex> lock(async_mutex_);
             if (job_queue_.empty()) {
                 --active_workers_;
+                active_worker_threads_.store(active_workers_, std::memory_order_relaxed);
                 async_cv_.notify_all();
                 return;
             }
-            job = std::move(job_queue_.front());
-            job_queue_.pop_front();
+            // Select highest-priority job (FIFO sequence tie-breaker)
+            size_t best_idx = 0u;
+            for (size_t i = 1u; i < job_queue_.size(); ++i) {
+                const auto& cand = job_queue_[i];
+                const auto& best = job_queue_[best_idx];
+                if (static_cast<uint8_t>(cand.priority) > static_cast<uint8_t>(best.priority) ||
+                    (cand.priority == best.priority && cand.sequence < best.sequence)) {
+                    best_idx = i;
+                }
+            }
+            job = std::move(job_queue_[best_idx]);
+            job_queue_.erase(job_queue_.begin() + static_cast<std::ptrdiff_t>(best_idx));
             ++active_jobs_;
         }
 
+        const auto t0 = std::chrono::steady_clock::now();
         std::vector<uint8_t> dxil;
         std::string diag;
         Status st = CompileRealXboxShaderSync(
             job.blob_bytes, job.stage, job.target_profile, job.request, dxil, &diag);
+        const auto elapsed_us = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0).count());
+        total_compile_time_us_.fetch_add(elapsed_us, std::memory_order_relaxed);
+        compile_count_.fetch_add(1, std::memory_order_relaxed);
+
+        CachedShaderResult cb_result{};
+        cb_result.key = job.key;
+        cb_result.stage = job.stage;
+        cb_result.target_profile = job.target_profile;
+
         if (st.ok()) {
             (void)Put(job.key, job.stage, job.target_profile, dxil);
+            cb_result.dxil = std::move(dxil);
+            cb_result.diagnostics = "ShaderCache ASYNC READY key=" + job.key.ToHex() +
+                                    " target=" + job.target_profile;
             async_completed_.fetch_add(1, std::memory_order_relaxed);
             CallTelemetry::Global().Record(kCacheTelemetryModule, "AsyncCompileCompleted", CallOutcome::Ok, 0);
         } else {
             async_failed_.fetch_add(1, std::memory_order_relaxed);
+            cb_result.diagnostics = diag.empty() ? st.message : diag;
             {
                 std::lock_guard<std::mutex> lock(cache_mutex_);
                 last_compile_error_ = "Async DXIL compile failed (key=" + job.key.ToHex() +
                                       ", target=" + job.target_profile + "): " +
-                                      (diag.empty() ? st.message : diag);
+                                      cb_result.diagnostics;
             }
             CallTelemetry::Global().Record(kCacheTelemetryModule, "AsyncCompileCompleted", CallOutcome::Error, -1);
         }
 
+        AsyncCompileCompletionCallback cb_copy;
+        bool was_standin_pending = false;
         {
             std::lock_guard<std::mutex> lock(async_mutex_);
             inflight_keys_.erase(job.key);
+            if (standin_pending_keys_.erase(job.key) > 0u || job.had_standin) {
+                was_standin_pending = true;
+            }
             --active_jobs_;
+            cb_copy = completion_callback_;
+        }
+        if (st.ok() && was_standin_pending) {
+            hot_swaps_ready_.fetch_add(1, std::memory_order_relaxed);
         }
         async_cv_.notify_all();
+        if (cb_copy) {
+            cb_copy(job.key, cb_result, st);
+        }
     }
+}
+
+Status ShaderCache::PrewarmXboxShaderAsync(
+    const void* blob,
+    size_t blob_size,
+    const ShaderCacheLiftRequest& request,
+    ShaderCacheKey* out_key,
+    ShaderCachePriority priority) {
+    if (!blob || blob_size < 4u) {
+        return Status::Error(StatusCode::InvalidArgument, "Empty Xbox shader bytecode for prewarm");
+    }
+    XboxParsedShaderContainer full_container{};
+    if (auto st = ParseFullXboxShaderContainer(blob, blob_size, full_container); !st.ok()) {
+        return st;
+    }
+    if (!full_container.has_xs2) {
+        return Status::Error(StatusCode::UnsupportedFormat, "Prewarm blob does not carry Xbox XS2/RDNA2 microcode");
+    }
+
+    const ShaderStage stage = full_container.xs2.stage;
+    const std::string target_profile = SelectTargetProfileForStage(stage, request.highest_shader_model);
+    const uint32_t sm_flags =
+        ((stage == ShaderStage::Mesh && request.mesh_has_payload) ? 1u : 0u) |
+        ((full_container.xs2.wave_size == 64u) ? 2u : 0u) |
+        ((request.highest_shader_model & 0xFFu) << 8) |
+        ((static_cast<uint32_t>(stage) & 0xFFu) << 16);
+    const ShaderCacheKey key = ComputeShaderCacheKey(
+        blob, blob_size, target_profile, sm_flags, kShaderCacheFormatVersion);
+    if (out_key) {
+        *out_key = key;
+    }
+
+    CachedShaderResult hit{};
+    if (TryGet(key, hit)) {
+        return Status::Ok();
+    }
+
+    const auto* raw_ptr = static_cast<const uint8_t*>(blob);
+    AsyncJob job{};
+    job.key = key;
+    job.blob_bytes.assign(raw_ptr, raw_ptr + blob_size);
+    job.stage = stage;
+    job.target_profile = target_profile;
+    job.request = request;
+    job.request.priority = priority;
+    job.priority = priority;
+    job.had_standin = false;
+    EnqueueAsyncJob(std::move(job));
+    return Status::Ok();
 }
 
 bool ShaderCache::IsCompileReady(const ShaderCacheKey& key) const {
@@ -1436,6 +1710,8 @@ Status ShaderCache::GetOrLiftXboxShader(
         job.stage = stage;
         job.target_profile = target_profile;
         job.request = request;
+        job.priority = request.priority;
+        job.had_standin = true;
         EnqueueAsyncJob(std::move(job));
         standins_served_.fetch_add(1, std::memory_order_relaxed);
 
@@ -1451,9 +1727,15 @@ Status ShaderCache::GetOrLiftXboxShader(
     }
 
     // 4. Synchronous lift + compile (in-process dxcompiler.dll preferred) + atomic disk cache store
+    const auto sync_t0 = std::chrono::steady_clock::now();
     std::vector<uint8_t> dxil;
     std::string sync_diag;
     Status st = CompileRealXboxShaderSync(blob_copy, stage, target_profile, request, dxil, &sync_diag);
+    const auto sync_elapsed_us = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - sync_t0).count());
+    total_compile_time_us_.fetch_add(sync_elapsed_us, std::memory_order_relaxed);
+    compile_count_.fetch_add(1, std::memory_order_relaxed);
     if (!st.ok()) {
         sync_failed_.fetch_add(1, std::memory_order_relaxed);
         const std::string detail = sync_diag.empty() ? st.message : sync_diag;
