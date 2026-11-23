@@ -141,6 +141,19 @@ public:
                                         std::wstring& out_rel_path,
                                         bool* out_was_whiteout = nullptr) const;
 
+    // CoW & handle-support helpers for NT/Win32 hooks (TRUNCATE_EXISTING, NtSetInformationFile,
+    // NtQueryDirectoryFile, GetFinalPathNameByHandleW). Never modify g_root or read-only sub-mounts.
+    bool HasBaseGamePathW(std::wstring_view virtual_path, bool* out_is_dir = nullptr) const;
+    bool WriteWhiteoutForVirtualPathW(std::wstring_view virtual_path) const;
+    bool ClearWhiteoutForVirtualPathW(std::wstring_view virtual_path) const;
+    bool TryMapHostPathToVirtualW(std::wstring_view host_path,
+                                  std::wstring& out_virtual_path,
+                                  bool* out_from_overlay = nullptr) const;
+    VfsTranslateStatus PrepareOverlayTruncateW(std::wstring_view virtual_path,
+                                               bool allow_create,
+                                               std::wstring& out_host_path,
+                                               bool* out_was_whiteout = nullptr) const;
+
     const std::wstring& GetGameRoot() const noexcept { return g_root_; }
     const std::wstring& GetGameOverlayRoot() const noexcept { return g_overlay_root_; }
     const std::wstring& GetScratchRoot() const noexcept { return t_root_; }

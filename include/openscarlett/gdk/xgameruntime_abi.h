@@ -44,6 +44,7 @@ constexpr XGameResult XGR_E_NOT_SUFFICIENT_BUFFER = static_cast<XGameResult>(0x8
 constexpr XGameResult XGR_E_NO_MORE_ITEMS = static_cast<XGameResult>(0x80070103u);
 constexpr XGameResult XGR_E_NOT_FOUND = static_cast<XGameResult>(0x80070490u);
 constexpr XGameResult XGR_E_GAMERUNTIME_NOT_INITIALIZED = static_cast<XGameResult>(0x89240100u);
+constexpr XGameResult XGR_E_GS_INVALID_CONTAINER_NAME = static_cast<XGameResult>(0x80830001u);
 constexpr XGameResult XGR_E_GS_UPDATE_TOO_BIG = static_cast<XGameResult>(0x80830002u);
 constexpr XGameResult XGR_E_GS_PROVIDED_BUFFER_TOO_SMALL = static_cast<XGameResult>(0x80830007u);
 constexpr XGameResult XGR_E_GS_BLOB_NOT_FOUND = static_cast<XGameResult>(0x80830008u);
@@ -208,6 +209,12 @@ OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XAsyncBegin(
     const void* identity,
     const char* identityName,
     XAsyncProvider provider);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XAsyncBeginAlloc(
+    XAsyncBlock* asyncBlock,
+    const void* identity,
+    const char* identityName,
+    XAsyncProvider provider,
+    size_t contextSize);
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XAsyncSchedule(
     XAsyncBlock* asyncBlock,
     uint32_t delayInMs);
@@ -445,6 +452,9 @@ OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XUserFindUserByLocalId(
     XUserLocalId userLocalId,
     XUserHandle* handle);
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XUserFindForDevice(
+    const XUserAppLocalDeviceId* deviceId,
+    XUserHandle* handle);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XUserFindUserByDevice(
     const XUserAppLocalDeviceId* deviceId,
     XUserHandle* handle);
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XUserGetTokenAndSignatureAsync(
@@ -835,9 +845,39 @@ OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameStreamingGetServerLo
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameStreamingGetLastFrameDisplayed(
     XGameStreamingClientId client,
     uint64_t* frameId);
+struct XGameStreamingDisplayDetails {
+    uint32_t preferredWidth;
+    uint32_t preferredHeight;
+    int32_t safeAreaLeft;
+    int32_t safeAreaTop;
+    int32_t safeAreaRight;
+    int32_t safeAreaBottom;
+    uint32_t maxPixels;
+    uint32_t maxWidth;
+    uint32_t maxHeight;
+    uint32_t flags;
+};
+
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameStreamingIsTouchInputEnabledOnClient(
     XGameStreamingClientId client,
     bool* touchInputEnabled);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameStreamingGetDisplayDetails(
+    XGameStreamingClientId client,
+    uint32_t maxSupportedPixels,
+    float widestSupportedAspectRatio,
+    float tallestSupportedAspectRatio,
+    XGameStreamingDisplayDetails* displayDetails);
+OPENSCARLETT_GDK_API size_t OPENSCARLETT_GDK_CALL XGameStreamingGetTouchBundleVersionNameSize(
+    XGameStreamingClientId client);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameStreamingGetTouchBundleVersion(
+    XGameStreamingClientId client,
+    size_t versionNameSize,
+    char* versionName);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameStreamingGetStreamLatency(
+    XGameStreamingClientId client,
+    uint32_t* averageInputLatencyUs,
+    uint32_t* averageOutputLatencyUs,
+    uint32_t* standardDeviationUs);
 
 // ---------------------------------------------------------------------------
 // XMem
@@ -1087,6 +1127,8 @@ struct XDisplayHdrModeInfo {
 
 typedef struct XDisplayTimeoutDeferral* XDisplayTimeoutDeferralHandle;
 
+OPENSCARLETT_GDK_API XDisplayHdrModeResult OPENSCARLETT_GDK_CALL XDisplayGetHdrMode(
+    XDisplayHdrModeInfo* displayHdrModeInfo);
 OPENSCARLETT_GDK_API XDisplayHdrModeResult OPENSCARLETT_GDK_CALL XDisplayTryEnableHdrMode(
     XDisplayHdrModePreference preferredMode,
     XDisplayHdrModeInfo* displayHdrModeInfo);
@@ -2034,6 +2076,52 @@ OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUiShowTextEntryAsync
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUiShowTextEntryResultSize(
     XAsyncBlock* async,
     uint32_t* resultTextBufferSize);
+typedef struct XGameUiTextEntryObject* XGameUiTextEntryHandle;
+
+enum XGameUiTextEntryPositionHint : uint32_t {
+    XGameUiTextEntryPositionHint_Bottom = 0,
+    XGameUiTextEntryPositionHint_Top = 1,
+};
+
+enum XGameUiTextEntryChangeTypeFlags : uint32_t {
+    XGameUiTextEntryChangeTypeFlags_None = 0x0,
+    XGameUiTextEntryChangeTypeFlags_TextChanged = 0x1,
+    XGameUiTextEntryChangeTypeFlags_Dismissed = 0x2,
+};
+
+struct XGameUiTextEntryOptions {
+    XGameUiTextEntryInputScope inputScope;
+    XGameUiTextEntryPositionHint positionHint;
+    uint32_t flags;
+};
+
+struct XGameUiTextEntryExtents {
+    float left;
+    float top;
+    float right;
+    float bottom;
+};
+
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUiTextEntryOpen(
+    const XGameUiTextEntryOptions* options,
+    uint32_t maxLength,
+    const char* initialText,
+    uint32_t cursorIndex,
+    XGameUiTextEntryHandle* handle);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUiTextEntryGetState(
+    XGameUiTextEntryHandle handle,
+    XGameUiTextEntryChangeTypeFlags* changeType,
+    uint32_t* cursorIndex,
+    uint32_t* imeClauseStartIndex,
+    uint32_t* imeClauseEndIndex,
+    uint32_t bufferSize,
+    char* buffer);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUiTextEntryUpdatePositionHint(
+    XGameUiTextEntryHandle handle,
+    XGameUiTextEntryPositionHint positionHint);
+OPENSCARLETT_GDK_API void OPENSCARLETT_GDK_CALL XGameUiTextEntryClose(
+    XGameUiTextEntryHandle handle);
+
 OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameUiShowTextEntryResult(
     XAsyncBlock* async,
     uint32_t resultTextBufferSize,
@@ -3501,6 +3589,30 @@ OPENSCARLETT_GDK_API int32_t OPENSCARLETT_GDK_CALL XgrGetTelemetryCallCountForTe
     const char* symbolName,
     uint64_t* outTotalCalls,
     uint64_t* outNotImplCalls);
+
+// Sprint 16 runtime controls & diagnostics (offline parity + opt-in native Win32 System UI)
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL OpenScarlettGdkSetNativeSystemUiMode(
+    int enabled,
+    uint32_t autoDismissMs);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL OpenScarlettGdkGetNativeSystemUiStats(
+    uint32_t* outDialogsOpened,
+    uint32_t* outDialogsCompleted,
+    uint32_t* outDialogsAutoDismissed,
+    uint32_t* outDialogsCanceled);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL OpenScarlettGdkAssociateDeviceWithUser(
+    const XUserAppLocalDeviceId* deviceId,
+    XUserLocalId newUser);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL OpenScarlettGdkGetGameEventStats(
+    uint64_t* outTotalEvents,
+    uint64_t* outTotalBytes,
+    uint32_t* outBufferedEvents);
+OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL OpenScarlettGdkSetSimulatedStreamingState(
+    int streaming,
+    XGameStreamingClientId clientId,
+    uint32_t width,
+    uint32_t height,
+    uint32_t latencyMs,
+    int touchEnabled);
 
 #ifdef __cplusplus
 }

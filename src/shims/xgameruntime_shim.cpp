@@ -144,18 +144,52 @@ bool ValidateMessageDialogButtons(
            IsDialogButtonIndexValid(cancel_button, first_text, second_text, third_text);
 }
 
+bool IsPathOnSystemDriveC(const fs::path& p) noexcept {
+    const std::string s = p.string();
+    if (s.size() >= 2u && s[1] == ':') {
+        const char d = static_cast<char>(std::toupper(static_cast<unsigned char>(s[0])));
+        if (d == 'C') {
+            return true;
+        }
+    }
+    return false;
+}
+
 fs::path ResolveSaveRoot() {
     std::string env_root = GetEnvString("OPENSCARLETT_SAVE_ROOT");
     if (!env_root.empty()) {
         return fs::path(env_root);
     }
+    std::string env_work = GetEnvString("OPENSCARLETT_WORK_DIR");
+    if (!env_work.empty()) {
+        return fs::path(env_work) / "saves";
+    }
     std::string env_temp = GetEnvString("TEMP");
     if (!env_temp.empty()) {
-        return fs::path(env_temp) / "saves";
+        fs::path tp(env_temp);
+        if (!IsPathOnSystemDriveC(tp)) {
+            return tp / "saves";
+        }
     }
+#if defined(_WIN32)
+    wchar_t exe_buf[MAX_PATH]{};
+    const DWORD exe_len = ::GetModuleFileNameW(nullptr, exe_buf, MAX_PATH);
+    if (exe_len > 0u && exe_len < MAX_PATH) {
+        fs::path exe_dir = fs::path(std::wstring(exe_buf, exe_len)).parent_path();
+        if (!exe_dir.empty() && !IsPathOnSystemDriveC(exe_dir)) {
+            return exe_dir / ".tmp" / "openscarlett_saves";
+        }
+    }
+#endif
     std::error_code ec;
     fs::path tmp = fs::temp_directory_path(ec);
-    if (!ec && !tmp.empty()) {
+    if (!ec && !tmp.empty() && !IsPathOnSystemDriveC(tmp)) {
+        return tmp / "openscarlett_saves";
+    }
+    if (fs::exists(fs::path("E:\\OpenScarlett"), ec)) {
+        return fs::path("E:\\OpenScarlett") / ".tmp" / "openscarlett_saves";
+    }
+    if (!tmp.empty()) {
         return tmp / "openscarlett_saves";
     }
     return fs::path("openscarlett_saves");
@@ -720,6 +754,7 @@ struct AsyncRecord {
     XAsyncBlock* async_block = nullptr;
     XTaskQueueHandle queue = nullptr;
     void* provider_context = nullptr;
+    bool owns_provider_context = false;
     const void* identity = nullptr;
     std::string identity_name;
     XAsyncProvider provider = nullptr;
@@ -842,6 +877,15 @@ struct XPackageInstallationMonitor {
     uint64_t total_bytes = 1024ULL * 1024ULL;
 };
 
+struct XGameUiTextEntryObject {
+    std::mutex mutex;
+    XGameUiTextEntryOptions options{};
+    uint32_t max_length = 256u;
+    std::string text;
+    uint32_t cursor_index = 0u;
+    uint32_t change_flags = XGameUiTextEntryChangeTypeFlags_None;
+};
+
 namespace {
 
 struct InviteListenerEntry {
@@ -874,6 +918,31 @@ struct UserChangeListenerEntry {
     XTaskQueueHandle queue = nullptr;
     void* context = nullptr;
     XUserChangeEventCallback callback = nullptr;
+};
+
+struct UserDeviceAssocListenerEntry {
+    uint64_t token = 0;
+    XTaskQueueHandle queue = nullptr;
+    void* context = nullptr;
+    XUserDeviceAssociationChangedCallback callback = nullptr;
+};
+
+struct StreamingConnListenerEntry {
+    uint64_t token = 0;
+    XTaskQueueHandle queue = nullptr;
+    void* context = nullptr;
+    XGameStreamingConnectionStateChangedCallback callback = nullptr;
+};
+
+struct GameEventRecord {
+    uint64_t seq = 0u;
+    uint64_t reg_handle = 0u;
+    uint16_t event_id = 0u;
+    uint8_t version = 0u;
+    uint8_t level = 0u;
+    uint64_t keyword = 0u;
+    uint32_t data_count = 0u;
+    uint64_t data_bytes = 0u;
 };
 
 struct RuntimeState {
@@ -990,6 +1059,36 @@ struct RuntimeState {
     uint32_t streaming_init_count = 0;
     std::string active_touch_layout;
     std::unordered_map<uint32_t, std::string> active_stt_hypotheses;
+    bool streaming_simulated = false;
+    XGameStreamingClientId streaming_client_id = 0ull;
+    uint32_t streaming_width = 1920u;
+    uint32_t streaming_height = 1080u;
+    uint32_t streaming_latency_ms = 0u;
+    bool streaming_touch_enabled = false;
+    uint64_t streaming_frame_counter = 0u;
+    std::vector<StreamingConnListenerEntry> streaming_conn_listeners;
+
+    // XUser device association state
+    std::map<std::string, uint64_t> device_user_map;
+    std::vector<UserDeviceAssocListenerEntry> user_device_assoc_listeners;
+
+    // XGameEvent telemetry ring
+    std::mutex event_mutex;
+    std::deque<GameEventRecord> event_ring;
+    uint64_t event_total_count = 0u;
+    uint64_t event_total_bytes = 0u;
+
+    // XGameUi in-place text entry handles & optional native Win32 System UI state
+    std::mutex text_entry_mutex;
+    std::unordered_map<XGameUiTextEntryObject*, std::shared_ptr<XGameUiTextEntryObject>>
+        live_text_entries;
+    std::atomic<bool> native_ui_explicit{false};
+    std::atomic<bool> native_ui_enabled{false};
+    std::atomic<uint32_t> native_ui_auto_dismiss_ms{0u};
+    std::atomic<uint32_t> native_ui_dialogs_opened{0u};
+    std::atomic<uint32_t> native_ui_dialogs_completed{0u};
+    std::atomic<uint32_t> native_ui_dialogs_auto_dismissed{0u};
+    std::atomic<uint32_t> native_ui_dialogs_canceled{0u};
 };
 
 RuntimeState& GetRuntime() {
@@ -1060,7 +1159,10 @@ std::shared_ptr<AsyncRecord> LookupAsync(const XAsyncBlock* block) {
     auto& rt = GetRuntime();
     std::lock_guard<std::mutex> lk(rt.async_mutex);
     auto it = rt.async_records.find(slot.id);
-    return it == rt.async_records.end() ? nullptr : it->second;
+    if (it == rt.async_records.end() || !it->second || it->second->async_block != block) {
+        return nullptr;
+    }
+    return it->second;
 }
 
 void CleanupAsyncRecordOnce(const std::shared_ptr<AsyncRecord>& rec) {
@@ -1071,6 +1173,11 @@ void CleanupAsyncRecordOnce(const std::shared_ptr<AsyncRecord>& rec) {
             data.async = rec->async_block;
             data.context = rec->provider_context;
             rec->provider(XAsyncOp_Cleanup, &data);
+        }
+        if (rec->owns_provider_context && rec->provider_context != nullptr) {
+            delete[] static_cast<uint8_t*>(rec->provider_context);
+            rec->provider_context = nullptr;
+            rec->owns_provider_context = false;
         }
         if (rec->queue) {
             XTaskQueueCloseHandle(rec->queue);
@@ -3514,25 +3621,36 @@ void OPENSCARLETT_GDK_CALL XTaskQueueUnregisterWaiter(
 // ===========================================================================
 // XAsync
 // ===========================================================================
-XGameResult OPENSCARLETT_GDK_CALL XAsyncBegin(
+XGameResult XAsyncBeginInternal(
     XAsyncBlock* asyncBlock,
     void* context,
+    bool ownsContext,
     const void* identity,
     const char* identityName,
-    XAsyncProvider provider) {
+    XAsyncProvider provider,
+    const char* apiName) {
     if (!asyncBlock || !provider) {
-        return RecordHr("XAsyncBegin", XGR_E_INVALIDARG);
+        if (ownsContext && context != nullptr) {
+            delete[] static_cast<uint8_t*>(context);
+        }
+        return RecordHr(apiName, XGR_E_INVALIDARG);
     }
 
     // Acquire queue handle for this operation.
     XTaskQueueHandle q = nullptr;
     if (asyncBlock->queue) {
         if (XTaskQueueDuplicateHandle(asyncBlock->queue, &q) < 0) {
-            return RecordHr("XAsyncBegin", XGR_E_HANDLE);
+            if (ownsContext && context != nullptr) {
+                delete[] static_cast<uint8_t*>(context);
+            }
+            return RecordHr(apiName, XGR_E_HANDLE);
         }
     } else {
         if (!XTaskQueueGetCurrentProcessTaskQueue(&q)) {
-            return RecordHr("XAsyncBegin", XGR_E_FAIL);
+            if (ownsContext && context != nullptr) {
+                delete[] static_cast<uint8_t*>(context);
+            }
+            return RecordHr(apiName, XGR_E_FAIL);
         }
     }
 
@@ -3540,6 +3658,7 @@ XGameResult OPENSCARLETT_GDK_CALL XAsyncBegin(
     rec->async_block = asyncBlock;
     rec->queue = q;
     rec->provider_context = context;
+    rec->owns_provider_context = ownsContext;
     rec->identity = identity;
     rec->identity_name = identityName ? identityName : "";
     rec->provider = provider;
@@ -3595,11 +3714,53 @@ XGameResult OPENSCARLETT_GDK_CALL XAsyncBegin(
             XTaskQueueCloseHandle(rec->queue);
             rec->queue = nullptr;
         }
+        if (rec->owns_provider_context && rec->provider_context != nullptr) {
+            delete[] static_cast<uint8_t*>(rec->provider_context);
+            rec->provider_context = nullptr;
+            rec->owns_provider_context = false;
+        }
         std::memset(asyncBlock->internal, 0, sizeof(asyncBlock->internal));
-        return RecordHr("XAsyncBegin", hr);
+        return RecordHr(apiName, hr);
     }
 
-    return RecordHr("XAsyncBegin", XGR_S_OK);
+    return RecordHr(apiName, XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XAsyncBegin(
+    XAsyncBlock* asyncBlock,
+    void* context,
+    const void* identity,
+    const char* identityName,
+    XAsyncProvider provider) {
+    return XAsyncBeginInternal(
+        asyncBlock, context, false, identity, identityName, provider, "XAsyncBegin");
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XAsyncBeginAlloc(
+    XAsyncBlock* asyncBlock,
+    const void* identity,
+    const char* identityName,
+    XAsyncProvider provider,
+    size_t contextSize) {
+    if (!asyncBlock || !provider) {
+        return RecordHr("XAsyncBeginAlloc", XGR_E_INVALIDARG);
+    }
+    uint8_t* alloc_ctx = nullptr;
+    if (contextSize > 0u) {
+        alloc_ctx = new (std::nothrow) uint8_t[contextSize]();
+        if (!alloc_ctx) {
+            return RecordHr("XAsyncBeginAlloc", XGR_E_OUTOFMEMORY);
+        }
+    }
+    const XGameResult hr = XAsyncBeginInternal(
+        asyncBlock,
+        alloc_ctx,
+        alloc_ctx != nullptr,
+        identity,
+        identityName,
+        provider,
+        "XAsyncBeginAlloc");
+    return hr;
 }
 
 XGameResult OPENSCARLETT_GDK_CALL XAsyncSchedule(
@@ -3626,9 +3787,17 @@ void OPENSCARLETT_GDK_CALL XAsyncComplete(
     XGameResult result,
     size_t requiredBufferSize) {
     RecordOk("XAsyncComplete");
+    if (!asyncBlock) {
+        return;
+    }
     auto rec = LookupAsync(asyncBlock);
-    if (!rec) return;
-
+    if (!rec) {
+        // No live operation associated with this XAsyncBlock: strict safe no-op!
+        return;
+    }
+    if (rec->cleaned_up.load(std::memory_order_acquire)) {
+        return;
+    }
     if (rec->complete_called.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
@@ -3694,6 +3863,9 @@ XGameResult OPENSCARLETT_GDK_CALL XAsyncGetStatus(
 XGameResult OPENSCARLETT_GDK_CALL XAsyncGetResultSize(
     XAsyncBlock* asyncBlock,
     size_t* bufferSize) {
+    if (bufferSize) {
+        *bufferSize = 0u;
+    }
     if (!asyncBlock || !bufferSize) {
         return RecordHr("XAsyncGetResultSize", XGR_E_INVALIDARG);
     }
@@ -3718,6 +3890,9 @@ XGameResult OPENSCARLETT_GDK_CALL XAsyncGetResult(
     size_t bufferSize,
     void* buffer,
     size_t* bufferUsed) {
+    if (bufferUsed) {
+        *bufferUsed = 0u;
+    }
     auto rec = LookupAsync(asyncBlock);
     if (!rec) {
         return RecordHr("XAsyncGetResult", XGR_E_INVALIDARG);
@@ -3785,13 +3960,18 @@ XGameResult OPENSCARLETT_GDK_CALL XAsyncGetResult(
 
 void OPENSCARLETT_GDK_CALL XAsyncCancel(XAsyncBlock* asyncBlock) {
     RecordOk("XAsyncCancel");
+    if (!asyncBlock) {
+        return;
+    }
     auto rec = LookupAsync(asyncBlock);
-    if (!rec) return;
-    if (rec->canceled.exchange(true, std::memory_order_acq_rel)) {
+    if (!rec) {
         return;
     }
     if (rec->complete_called.load(std::memory_order_acquire) ||
         rec->cleaned_up.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (rec->canceled.exchange(true, std::memory_order_acq_rel)) {
         return;
     }
     if (rec->provider) {
@@ -4134,8 +4314,27 @@ XGameResult OPENSCARLETT_GDK_CALL XUserFindForDevice(
         return RecordHr("XUserFindForDevice", XGR_E_INVALIDARG);
     }
     *handle = nullptr;
+    const std::string dev_key(
+        reinterpret_cast<const char*>(deviceId->value), sizeof(deviceId->value));
     auto& rt = GetRuntime();
+    uint64_t mapped_local_id = 0ull;
+    {
+        std::lock_guard<std::mutex> rlk(rt.reg_mutex);
+        auto mit = rt.device_user_map.find(dev_key);
+        if (mit != rt.device_user_map.end()) {
+            mapped_local_id = mit->second;
+        }
+    }
     std::lock_guard<std::mutex> lk(rt.user_mutex);
+    if (mapped_local_id != 0ull) {
+        for (auto& [raw, u] : rt.live_users) {
+            if (u && u->local_id == mapped_local_id) {
+                u->ref_count.fetch_add(1, std::memory_order_relaxed);
+                *handle = raw;
+                return RecordHr("XUserFindForDevice", XGR_S_OK);
+            }
+        }
+    }
     if (!rt.live_users.empty()) {
         auto it = rt.live_users.begin();
         it->second->ref_count.fetch_add(1, std::memory_order_relaxed);
@@ -4147,6 +4346,13 @@ XGameResult OPENSCARLETT_GDK_CALL XUserFindForDevice(
     rt.live_users[raw] = std::move(u);
     *handle = raw;
     return RecordHr("XUserFindForDevice", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XUserFindUserByDevice(
+    const XUserAppLocalDeviceId* deviceId,
+    XUserHandle* handle) {
+    const XGameResult hr = XUserFindForDevice(deviceId, handle);
+    return RecordHr("XUserFindUserByDevice", hr);
 }
 
 XGameResult OPENSCARLETT_GDK_CALL XUserGetTokenAndSignatureAsync(
@@ -4327,10 +4533,18 @@ XGameResult OPENSCARLETT_GDK_CALL XUserGetDefaultAudioEndpointUtf16(
     size_t endpointIdUtf16Count,
     wchar_t* endpointIdUtf16,
     size_t* endpointIdUtf16Used) {
+    if (defaultAudioEndpointKind != XUserDefaultAudioEndpointKind_CommunicationRender &&
+        defaultAudioEndpointKind != XUserDefaultAudioEndpointKind_CommunicationCapture) {
+        return RecordHr("XUserGetDefaultAudioEndpointUtf16", XGR_E_INVALIDARG);
+    }
     const std::wstring ep =
         (defaultAudioEndpointKind == XUserDefaultAudioEndpointKind_CommunicationCapture)
             ? L"{0.0.1.00000000}.{openscarlett-audio-capture}"
             : L"{0.0.0.00000000}.{openscarlett-audio-render}";
+    if (endpointIdUtf16 == nullptr && endpointIdUtf16Count == 0u && endpointIdUtf16Used != nullptr) {
+        *endpointIdUtf16Used = ep.size() + 1u;
+        return RecordHr("XUserGetDefaultAudioEndpointUtf16", XGR_S_OK);
+    }
     return RecordHr(
         "XUserGetDefaultAudioEndpointUtf16",
         CopyWideStringResult(ep, endpointIdUtf16Count, endpointIdUtf16, endpointIdUtf16Used));
@@ -4429,7 +4643,7 @@ bool OPENSCARLETT_GDK_CALL XUserUnregisterForDefaultAudioEndpointUtf16Changed(
 
 XGameResult OPENSCARLETT_GDK_CALL XUserRegisterForDeviceAssociationChanged(
     XTaskQueueHandle queue,
-    void* /*context*/,
+    void* context,
     XUserDeviceAssociationChangedCallback callback,
     XTaskQueueRegistrationToken* token) {
     if (token) {
@@ -4441,7 +4655,14 @@ XGameResult OPENSCARLETT_GDK_CALL XUserRegisterForDeviceAssociationChanged(
     if (queue != nullptr && !LookupQueue(queue)) {
         return RecordHr("XUserRegisterForDeviceAssociationChanged", XGR_E_HANDLE);
     }
-    *token = AllocateRegToken(kRegUserDeviceAssoc);
+    const XTaskQueueRegistrationToken reg = AllocateRegToken(kRegUserDeviceAssoc);
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.reg_mutex);
+        rt.user_device_assoc_listeners.push_back(
+            UserDeviceAssocListenerEntry{reg.token, queue, context, callback});
+    }
+    *token = reg;
     return RecordHr("XUserRegisterForDeviceAssociationChanged", XGR_S_OK);
 }
 
@@ -4449,7 +4670,70 @@ bool OPENSCARLETT_GDK_CALL XUserUnregisterForDeviceAssociationChanged(
     XTaskQueueRegistrationToken token,
     bool /*wait*/) {
     RecordOk("XUserUnregisterForDeviceAssociationChanged");
-    return ReleaseRegToken(kRegUserDeviceAssoc, token);
+    const bool removed = ReleaseRegToken(kRegUserDeviceAssoc, token);
+    if (removed) {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.reg_mutex);
+        rt.user_device_assoc_listeners.erase(
+            std::remove_if(rt.user_device_assoc_listeners.begin(),
+                           rt.user_device_assoc_listeners.end(),
+                           [&](const UserDeviceAssocListenerEntry& e) {
+                               return e.token == token.token;
+                           }),
+            rt.user_device_assoc_listeners.end());
+    }
+    return removed;
+}
+
+XGameResult OPENSCARLETT_GDK_CALL OpenScarlettGdkAssociateDeviceWithUser(
+    const XUserAppLocalDeviceId* deviceId,
+    XUserLocalId newUser) {
+    if (!deviceId) {
+        return RecordHr("OpenScarlettGdkAssociateDeviceWithUser", XGR_E_INVALIDARG);
+    }
+    const std::string dev_key(
+        reinterpret_cast<const char*>(deviceId->value), sizeof(deviceId->value));
+    XUserDeviceAssociationChange change{};
+    change.deviceId = *deviceId;
+    change.newUser = newUser;
+
+    std::vector<UserDeviceAssocListenerEntry> listeners;
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.reg_mutex);
+        auto it = rt.device_user_map.find(dev_key);
+        change.oldUser.value = (it != rt.device_user_map.end()) ? it->second : 0ull;
+        rt.device_user_map[dev_key] = newUser.value;
+        listeners = rt.user_device_assoc_listeners;
+    }
+
+    struct DeviceAssocDispatchCtx {
+        XUserDeviceAssociationChangedCallback cb = nullptr;
+        void* ctx = nullptr;
+        XUserDeviceAssociationChange change{};
+    };
+    auto dispatch_trampoline = [](void* raw, bool canceled) {
+        std::unique_ptr<DeviceAssocDispatchCtx> h(static_cast<DeviceAssocDispatchCtx*>(raw));
+        if (!canceled && h && h->cb) {
+            h->cb(h->ctx, &h->change);
+        }
+    };
+
+    for (const auto& l : listeners) {
+        if (!l.callback) continue;
+        if (l.queue != nullptr && LookupQueue(l.queue) != nullptr) {
+            auto* dctx = new (std::nothrow) DeviceAssocDispatchCtx{l.callback, l.context, change};
+            if (dctx) {
+                if (XTaskQueueSubmitCallback(
+                        l.queue, XTaskQueuePort_Completion, dctx, +dispatch_trampoline) < 0) {
+                    delete dctx;
+                }
+            }
+        } else {
+            l.callback(l.context, &change);
+        }
+    }
+    return RecordHr("OpenScarlettGdkAssociateDeviceWithUser", XGR_S_OK);
 }
 
 XGameResult OPENSCARLETT_GDK_CALL XUserResolveIssueWithUiAsync(
@@ -4791,14 +5075,60 @@ OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XGameSaveFilesGetRemainin
     return RecordHr("XGameSaveFilesGetRemainingQuota", XGR_S_OK);
 }
 
+bool IsValidGameSaveContainerName(const char* name) noexcept {
+    if (!name || *name == '\0') {
+        return false;
+    }
+    const size_t len = std::strlen(name);
+    if (len == 0u || len > 256u) {
+        return false;
+    }
+    if (name[0] == '/' || name[len - 1u] == '/') {
+        return false;
+    }
+    size_t seg_start = 0u;
+    for (size_t i = 0u; i < len; ++i) {
+        const unsigned char c = static_cast<unsigned char>(name[i]);
+        const bool ok_char =
+            (c >= 'A' && c <= 'Z') ||
+            (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') ||
+            c == '_' || c == '-' || c == '.' || c == '/';
+        if (!ok_char) {
+            return false;
+        }
+        if (i > 0u && name[i] == '/' && name[i - 1u] == '/') {
+            return false;
+        }
+        if (i > 0u && name[i] == '.' && name[i - 1u] == '.') {
+            return false;
+        }
+        if (name[i] == '/') {
+            const size_t seg_len = i - seg_start;
+            if (seg_len == 0u || (seg_len == 1u && name[seg_start] == '.')) {
+                return false;
+            }
+            seg_start = i + 1u;
+        }
+    }
+    const size_t tail_len = len - seg_start;
+    if (tail_len == 0u || (tail_len == 1u && name[seg_start] == '.')) {
+        return false;
+    }
+    return true;
+}
+
 XGameResult OPENSCARLETT_GDK_CALL XGameSaveCreateContainer(
     XGameSaveProviderHandle provider,
     const char* name,
     XGameSaveContainerHandle* result) {
-    if (!provider || !name || !*name || !result) {
+    if (!provider || !result) {
         return RecordHr("XGameSaveCreateContainer", XGR_E_INVALIDARG);
     }
     *result = nullptr;
+    if (!IsValidGameSaveContainerName(name)) {
+        return RecordHr("XGameSaveCreateContainer", XGR_E_GS_INVALID_CONTAINER_NAME);
+    }
     std::shared_ptr<XGameSaveProvider> prov;
     {
         auto& rt = GetRuntime();
@@ -5630,12 +5960,16 @@ void OPENSCARLETT_GDK_CALL XGameStreamingUninitialize(void) {
 
 bool OPENSCARLETT_GDK_CALL XGameStreamingIsStreaming(void) {
     RecordOk("XGameStreamingIsStreaming");
-    return false;
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.streaming_mutex);
+    return rt.streaming_simulated;
 }
 
 uint32_t OPENSCARLETT_GDK_CALL XGameStreamingGetClientCount(void) {
     RecordOk("XGameStreamingGetClientCount");
-    return 0u;
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.streaming_mutex);
+    return rt.streaming_simulated ? 1u : 0u;
 }
 
 XGameResult OPENSCARLETT_GDK_CALL XGameStreamingGetClients(
@@ -5645,29 +5979,55 @@ XGameResult OPENSCARLETT_GDK_CALL XGameStreamingGetClients(
     if (!clientsUsed || (clientCount > 0u && !clients)) {
         return RecordHr("XGameStreamingGetClients", XGR_E_INVALIDARG);
     }
-    *clientsUsed = 0u;
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.streaming_mutex);
+    if (rt.streaming_simulated && rt.streaming_client_id != 0ull) {
+        if (clientCount > 0u && clients) {
+            clients[0] = rt.streaming_client_id;
+            *clientsUsed = 1u;
+        } else {
+            *clientsUsed = 0u;
+        }
+    } else {
+        *clientsUsed = 0u;
+    }
     return RecordHr("XGameStreamingGetClients", XGR_S_OK);
 }
 
 XGameStreamingConnectionState OPENSCARLETT_GDK_CALL XGameStreamingGetConnectionState(
-    XGameStreamingClientId /*client*/) {
+    XGameStreamingClientId client) {
     RecordOk("XGameStreamingGetConnectionState");
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.streaming_mutex);
+    if (rt.streaming_simulated &&
+        (client == rt.streaming_client_id || client == 0ull)) {
+        return XGameStreamingConnectionState_Connected;
+    }
     return XGameStreamingConnectionState_Disconnected;
 }
 
 XGameResult OPENSCARLETT_GDK_CALL XGameStreamingRegisterConnectionStateChanged(
-    XTaskQueueHandle /*queue*/,
-    void* /*context*/,
+    XTaskQueueHandle queue,
+    void* context,
     XGameStreamingConnectionStateChangedCallback callback,
     XTaskQueueRegistrationToken* token) {
+    if (token) {
+        token->token = 0ull;
+    }
     if (!callback || !token) {
         return RecordHr("XGameStreamingRegisterConnectionStateChanged", XGR_E_INVALIDARG);
     }
-    auto& rt = GetRuntime();
-    std::lock_guard<std::mutex> lk(rt.reg_mutex);
-    const uint64_t tok = rt.next_reg_token++;
-    rt.live_reg_tokens[tok] = kRegGameStreamingConnection;
-    token->token = tok;
+    if (queue != nullptr && !LookupQueue(queue)) {
+        return RecordHr("XGameStreamingRegisterConnectionStateChanged", XGR_E_HANDLE);
+    }
+    const XTaskQueueRegistrationToken reg = AllocateRegToken(kRegGameStreamingConnection);
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.streaming_mutex);
+        rt.streaming_conn_listeners.push_back(
+            StreamingConnListenerEntry{reg.token, queue, context, callback});
+    }
+    *token = reg;
     return RecordHr("XGameStreamingRegisterConnectionStateChanged", XGR_S_OK);
 }
 
@@ -5675,17 +6035,19 @@ bool OPENSCARLETT_GDK_CALL XGameStreamingUnregisterConnectionStateChanged(
     XTaskQueueRegistrationToken token,
     bool /*wait*/) {
     RecordOk("XGameStreamingUnregisterConnectionStateChanged");
-    if (token.token == 0ull) {
-        return false;
+    const bool removed = ReleaseRegToken(kRegGameStreamingConnection, token);
+    if (removed) {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.streaming_mutex);
+        rt.streaming_conn_listeners.erase(
+            std::remove_if(rt.streaming_conn_listeners.begin(),
+                           rt.streaming_conn_listeners.end(),
+                           [&](const StreamingConnListenerEntry& e) {
+                               return e.token == token.token;
+                           }),
+            rt.streaming_conn_listeners.end());
     }
-    auto& rt = GetRuntime();
-    std::lock_guard<std::mutex> lk(rt.reg_mutex);
-    auto it = rt.live_reg_tokens.find(token.token);
-    if (it == rt.live_reg_tokens.end() || it->second != kRegGameStreamingConnection) {
-        return false;
-    }
-    rt.live_reg_tokens.erase(it);
-    return true;
+    return removed;
 }
 
 void OPENSCARLETT_GDK_CALL XGameStreamingHideTouchControls(void) {
@@ -5703,14 +6065,21 @@ void OPENSCARLETT_GDK_CALL XGameStreamingShowTouchControlLayout(const char* layo
 }
 
 XGameResult OPENSCARLETT_GDK_CALL XGameStreamingGetStreamPhysicalDimensions(
-    XGameStreamingClientId /*client*/,
+    XGameStreamingClientId client,
     uint32_t* horizontalMm,
     uint32_t* verticalMm) {
     if (!horizontalMm || !verticalMm) {
         return RecordHr("XGameStreamingGetStreamPhysicalDimensions", XGR_E_INVALIDARG);
     }
-    *horizontalMm = 0u;
-    *verticalMm = 0u;
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.streaming_mutex);
+    if (rt.streaming_simulated && (client == rt.streaming_client_id || client == 0ull)) {
+        *horizontalMm = 155u;
+        *verticalMm = 72u;
+    } else {
+        *horizontalMm = 0u;
+        *verticalMm = 0u;
+    }
     return RecordHr("XGameStreamingGetStreamPhysicalDimensions", XGR_S_OK);
 }
 
@@ -5728,23 +6097,170 @@ XGameResult OPENSCARLETT_GDK_CALL XGameStreamingGetServerLocationName(
 }
 
 XGameResult OPENSCARLETT_GDK_CALL XGameStreamingGetLastFrameDisplayed(
-    XGameStreamingClientId /*client*/,
+    XGameStreamingClientId client,
     uint64_t* frameId) {
     if (!frameId) {
         return RecordHr("XGameStreamingGetLastFrameDisplayed", XGR_E_INVALIDARG);
     }
-    *frameId = 0ull;
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.streaming_mutex);
+    if (rt.streaming_simulated && (client == rt.streaming_client_id || client == 0ull)) {
+        *frameId = ++rt.streaming_frame_counter;
+    } else {
+        *frameId = 0ull;
+    }
     return RecordHr("XGameStreamingGetLastFrameDisplayed", XGR_S_OK);
 }
 
 XGameResult OPENSCARLETT_GDK_CALL XGameStreamingIsTouchInputEnabledOnClient(
-    XGameStreamingClientId /*client*/,
+    XGameStreamingClientId client,
     bool* touchInputEnabled) {
     if (!touchInputEnabled) {
         return RecordHr("XGameStreamingIsTouchInputEnabledOnClient", XGR_E_INVALIDARG);
     }
-    *touchInputEnabled = false;
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.streaming_mutex);
+    if (rt.streaming_simulated && (client == rt.streaming_client_id || client == 0ull)) {
+        *touchInputEnabled = rt.streaming_touch_enabled;
+    } else {
+        *touchInputEnabled = false;
+    }
     return RecordHr("XGameStreamingIsTouchInputEnabledOnClient", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameStreamingGetDisplayDetails(
+    XGameStreamingClientId /*client*/,
+    uint32_t maxSupportedPixels,
+    float /*widestSupportedAspectRatio*/,
+    float /*tallestSupportedAspectRatio*/,
+    XGameStreamingDisplayDetails* displayDetails) {
+    if (!displayDetails) {
+        return RecordHr("XGameStreamingGetDisplayDetails", XGR_E_INVALIDARG);
+    }
+    std::memset(displayDetails, 0, sizeof(*displayDetails));
+    uint32_t w = 1920u;
+    uint32_t h = 1080u;
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.streaming_mutex);
+        if (rt.streaming_simulated && rt.streaming_width > 0u && rt.streaming_height > 0u) {
+            w = rt.streaming_width;
+            h = rt.streaming_height;
+        }
+    }
+    if (maxSupportedPixels > 0u &&
+        static_cast<uint64_t>(w) * static_cast<uint64_t>(h) > static_cast<uint64_t>(maxSupportedPixels)) {
+        const double scale = std::sqrt(
+            static_cast<double>(maxSupportedPixels) /
+            (static_cast<double>(w) * static_cast<double>(h)));
+        w = std::max<uint32_t>(320u, static_cast<uint32_t>(static_cast<double>(w) * scale));
+        h = std::max<uint32_t>(180u, static_cast<uint32_t>(static_cast<double>(h) * scale));
+    }
+    displayDetails->preferredWidth = w;
+    displayDetails->preferredHeight = h;
+    displayDetails->safeAreaLeft = 0;
+    displayDetails->safeAreaTop = 0;
+    displayDetails->safeAreaRight = static_cast<int32_t>(w);
+    displayDetails->safeAreaBottom = static_cast<int32_t>(h);
+    displayDetails->maxWidth = std::max<uint32_t>(w, 3840u);
+    displayDetails->maxHeight = std::max<uint32_t>(h, 2160u);
+    displayDetails->maxPixels = displayDetails->maxWidth * displayDetails->maxHeight;
+    displayDetails->flags = 0u;
+    return RecordHr("XGameStreamingGetDisplayDetails", XGR_S_OK);
+}
+
+size_t OPENSCARLETT_GDK_CALL XGameStreamingGetTouchBundleVersionNameSize(
+    XGameStreamingClientId /*client*/) {
+    RecordOk("XGameStreamingGetTouchBundleVersionNameSize");
+    return sizeof("1.0.0");
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameStreamingGetTouchBundleVersion(
+    XGameStreamingClientId /*client*/,
+    size_t versionNameSize,
+    char* versionName) {
+    const std::string ver = "1.0.0";
+    return RecordHr("XGameStreamingGetTouchBundleVersion",
+                    CopyStringResult(ver, versionNameSize, versionName, nullptr));
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameStreamingGetStreamLatency(
+    XGameStreamingClientId client,
+    uint32_t* averageInputLatencyUs,
+    uint32_t* averageOutputLatencyUs,
+    uint32_t* standardDeviationUs) {
+    auto& rt = GetRuntime();
+    uint32_t lat_us = 0u;
+    {
+        std::lock_guard<std::mutex> lk(rt.streaming_mutex);
+        if (rt.streaming_simulated && (client == rt.streaming_client_id || client == 0ull)) {
+            lat_us = rt.streaming_latency_ms * 1000u;
+        }
+    }
+    if (averageInputLatencyUs) *averageInputLatencyUs = lat_us;
+    if (averageOutputLatencyUs) *averageOutputLatencyUs = lat_us;
+    if (standardDeviationUs) *standardDeviationUs = lat_us / 10u;
+    return RecordHr("XGameStreamingGetStreamLatency", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL OpenScarlettGdkSetSimulatedStreamingState(
+    int streaming,
+    XGameStreamingClientId clientId,
+    uint32_t width,
+    uint32_t height,
+    uint32_t latencyMs,
+    int touchEnabled) {
+    std::vector<StreamingConnListenerEntry> listeners;
+    XGameStreamingClientId notify_client = clientId;
+    const XGameStreamingConnectionState new_state =
+        (streaming != 0) ? XGameStreamingConnectionState_Connected
+                         : XGameStreamingConnectionState_Disconnected;
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.streaming_mutex);
+        if (streaming == 0 && notify_client == 0ull) {
+            notify_client = rt.streaming_client_id;
+        }
+        rt.streaming_simulated = (streaming != 0);
+        rt.streaming_client_id = (streaming != 0) ? (clientId != 0ull ? clientId : 0x57524D01ull) : 0ull;
+        if (streaming != 0) {
+            notify_client = rt.streaming_client_id;
+        }
+        rt.streaming_width = (width > 0u) ? width : 1920u;
+        rt.streaming_height = (height > 0u) ? height : 1080u;
+        rt.streaming_latency_ms = latencyMs;
+        rt.streaming_touch_enabled = (touchEnabled != 0);
+        listeners = rt.streaming_conn_listeners;
+    }
+
+    struct StreamConnDispatchCtx {
+        XGameStreamingConnectionStateChangedCallback cb = nullptr;
+        void* ctx = nullptr;
+        XGameStreamingClientId client = 0ull;
+        XGameStreamingConnectionState state = XGameStreamingConnectionState_Disconnected;
+    };
+    auto dispatch_trampoline = [](void* raw, bool canceled) {
+        std::unique_ptr<StreamConnDispatchCtx> h(static_cast<StreamConnDispatchCtx*>(raw));
+        if (!canceled && h && h->cb) {
+            h->cb(h->ctx, h->client, h->state);
+        }
+    };
+    for (const auto& l : listeners) {
+        if (!l.callback) continue;
+        if (l.queue != nullptr && LookupQueue(l.queue) != nullptr) {
+            auto* dctx = new (std::nothrow)
+                StreamConnDispatchCtx{l.callback, l.context, notify_client, new_state};
+            if (dctx) {
+                if (XTaskQueueSubmitCallback(
+                        l.queue, XTaskQueuePort_Completion, dctx, +dispatch_trampoline) < 0) {
+                    delete dctx;
+                }
+            }
+        } else {
+            l.callback(l.context, notify_client, new_state);
+        }
+    }
+    return RecordHr("OpenScarlettGdkSetSimulatedStreamingState", XGR_S_OK);
 }
 
 // ===========================================================================
@@ -6552,6 +7068,13 @@ std::vector<uint8_t> SynthesizeDeterministicWav(const char* text, bool is_male) 
 
 extern "C" {
 
+XDisplayHdrModeResult OPENSCARLETT_GDK_CALL XDisplayGetHdrMode(
+    XDisplayHdrModeInfo* displayHdrModeInfo) {
+    RecordOk("XDisplayGetHdrMode");
+    return XDisplayTryEnableHdrMode(
+        XDisplayHdrModePreference_PreferRefreshRate, displayHdrModeInfo);
+}
+
 XDisplayHdrModeResult OPENSCARLETT_GDK_CALL XDisplayTryEnableHdrMode(
     XDisplayHdrModePreference preferredMode,
     XDisplayHdrModeInfo* displayHdrModeInfo) {
@@ -6665,10 +7188,533 @@ XGameResult OPENSCARLETT_GDK_CALL XLaunchUri(
     return RecordHr("XLaunchUri", XGR_S_OK);
 }
 
+// ===========================================================================
+// Optional Non-Blocking Native Win32 Host System UI Mode (Opt-In)
+// Safe headless/CI completion remains the default unless explicitly enabled
+// via OPENSCARLETT_NATIVE_SYSTEM_UI=1 or OpenScarlettGdkSetNativeSystemUiMode.
+// ===========================================================================
+}  // extern "C"
+
+namespace {
+
+bool ShouldUseNativeSystemUi(uint32_t& out_auto_dismiss_ms) {
+    out_auto_dismiss_ms = 0u;
+    if (GetEnvString("OPENSCARLETT_HEADLESS") == "1") {
+        return false;
+    }
+    auto& rt = GetRuntime();
+    if (rt.native_ui_explicit.load(std::memory_order_acquire)) {
+        out_auto_dismiss_ms = rt.native_ui_auto_dismiss_ms.load(std::memory_order_acquire);
+        return rt.native_ui_enabled.load(std::memory_order_acquire);
+    }
+    if (GetEnvString("OPENSCARLETT_NATIVE_SYSTEM_UI") == "1") {
+        const std::string ms_str = GetEnvString("OPENSCARLETT_NATIVE_SYSTEM_UI_AUTO_DISMISS_MS");
+        if (!ms_str.empty()) {
+            try {
+                out_auto_dismiss_ms = static_cast<uint32_t>(std::stoul(ms_str));
+            } catch (...) {
+                out_auto_dismiss_ms = 0u;
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+#if defined(_WIN32)
+constexpr const wchar_t* kNativeSysUiClassName = L"OpenScarlettNativeSystemUiDialog";
+constexpr UINT kNativeSysUiMsgCancel = WM_APP + 1u;
+constexpr int kCtrlIdBtnBase = 1000;
+constexpr int kCtrlIdEdit = 1010;
+constexpr int kCtrlIdList = 1020;
+
+enum class NativeDialogKind : uint32_t {
+    Message = 0,
+    TextEntry = 1,
+    PlayerPicker = 2,
+};
+
+std::wstring Utf8ToWideUi(const std::string& utf8) {
+    if (utf8.empty()) return {};
+    const int needed = ::MultiByteToWideChar(
+        CP_UTF8, 0u, utf8.data(), static_cast<int>(utf8.size()), nullptr, 0);
+    if (needed <= 0) return {};
+    std::wstring out(static_cast<size_t>(needed), L'\0');
+    ::MultiByteToWideChar(
+        CP_UTF8, 0u, utf8.data(), static_cast<int>(utf8.size()), out.data(), needed);
+    return out;
+}
+
+std::string WideToUtf8Ui(const std::wstring& wide) {
+    if (wide.empty()) return {};
+    const int needed = ::WideCharToMultiByte(
+        CP_UTF8, 0u, wide.data(), static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr);
+    if (needed <= 0) return {};
+    std::string out(static_cast<size_t>(needed), '\0');
+    ::WideCharToMultiByte(
+        CP_UTF8, 0u, wide.data(), static_cast<int>(wide.size()), out.data(), needed, nullptr, nullptr);
+    return out;
+}
+
+struct NativeDialogState {
+    NativeDialogKind kind = NativeDialogKind::Message;
+    XAsyncBlock* async_block = nullptr;
+    uint32_t auto_dismiss_ms = 0u;
+
+    std::string title;
+    std::string body;
+    std::string buttons[3];
+    uint32_t default_button = 0u;
+    uint32_t cancel_button = 0u;
+    std::string default_text;
+    uint32_t max_text_len = 0u;
+    std::vector<uint64_t> candidate_players;
+    std::vector<uint64_t> preselected_players;
+    uint32_t min_selection = 0u;
+    uint32_t max_selection = 0u;
+
+    std::mutex state_mutex;
+    HWND hwnd = nullptr;
+    HWND ctrl_edit = nullptr;
+    HWND ctrl_list = nullptr;
+    std::atomic<bool> canceled{false};
+    bool auto_dismissed = false;
+    bool user_canceled = false;
+    XGameResult result_hr = XGR_S_OK;
+    uint32_t chosen_button = 0u;
+    std::string captured_text;
+    std::vector<uint64_t> captured_players;
+};
+
+void CaptureNativeDialogControls(NativeDialogState* st) {
+    if (!st) return;
+    if (st->kind == NativeDialogKind::TextEntry) {
+        std::string txt = st->default_text;
+        if (st->ctrl_edit != nullptr) {
+            const int len = ::GetWindowTextLengthW(st->ctrl_edit);
+            if (len >= 0) {
+                std::wstring wbuf(static_cast<size_t>(len) + 1u, L'\0');
+                const int got = ::GetWindowTextW(st->ctrl_edit, wbuf.data(), len + 1);
+                wbuf.resize(got > 0 ? static_cast<size_t>(got) : 0u);
+                txt = WideToUtf8Ui(wbuf);
+            }
+        }
+        if (st->max_text_len > 0u && txt.size() > st->max_text_len) {
+            txt.resize(st->max_text_len);
+        }
+        std::lock_guard<std::mutex> lk(st->state_mutex);
+        st->captured_text = std::move(txt);
+    } else if (st->kind == NativeDialogKind::PlayerPicker) {
+        std::vector<uint64_t> picked;
+        if (st->ctrl_list != nullptr && !st->candidate_players.empty()) {
+            const LRESULT sel_count = ::SendMessageW(st->ctrl_list, LB_GETSELCOUNT, 0u, 0);
+            if (sel_count > 0) {
+                std::vector<int> indices(static_cast<size_t>(sel_count), 0);
+                const LRESULT got = ::SendMessageW(
+                    st->ctrl_list,
+                    LB_GETSELITEMS,
+                    static_cast<WPARAM>(indices.size()),
+                    reinterpret_cast<LPARAM>(indices.data()));
+                for (LRESULT i = 0; i < got; ++i) {
+                    const int idx = indices[static_cast<size_t>(i)];
+                    if (idx >= 0 && static_cast<size_t>(idx) < st->candidate_players.size()) {
+                        picked.push_back(st->candidate_players[static_cast<size_t>(idx)]);
+                        if (st->max_selection > 0u && picked.size() >= st->max_selection) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if (picked.empty() && !st->preselected_players.empty()) {
+            picked = st->preselected_players;
+        }
+        std::lock_guard<std::mutex> lk(st->state_mutex);
+        st->captured_players = std::move(picked);
+    }
+}
+
+LRESULT CALLBACK NativeSysUiWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_NCCREATE) {
+        auto* cs = reinterpret_cast<const CREATESTRUCTW*>(lParam);
+        if (cs && cs->lpCreateParams) {
+            ::SetWindowLongPtrW(
+                hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
+        }
+        return ::DefWindowProcW(hwnd, msg, wParam, lParam);
+    }
+    auto* st = reinterpret_cast<NativeDialogState*>(::GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    switch (msg) {
+        case WM_CREATE: {
+            if (!st) return 0;
+            HINSTANCE hinst = ::GetModuleHandleW(nullptr);
+            const std::wstring body_w = Utf8ToWideUi(st->body);
+            ::CreateWindowExW(
+                0u, L"STATIC", body_w.c_str(),
+                WS_CHILD | WS_VISIBLE,
+                16, 12, 380, 44, hwnd, nullptr, hinst, nullptr);
+            if (st->kind == NativeDialogKind::Message) {
+                int bx = 16;
+                for (int i = 0; i < 3; ++i) {
+                    if (st->buttons[i].empty()) continue;
+                    const std::wstring btn_w = Utf8ToWideUi(st->buttons[i]);
+                    ::CreateWindowExW(
+                        0u, L"BUTTON", btn_w.c_str(),
+                        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                        bx, 72, 112, 28,
+                        hwnd,
+                        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCtrlIdBtnBase + i)),
+                        hinst, nullptr);
+                    bx += 124;
+                }
+            } else if (st->kind == NativeDialogKind::TextEntry) {
+                const std::wstring init_w = Utf8ToWideUi(st->default_text);
+                st->ctrl_edit = ::CreateWindowExW(
+                    WS_EX_CLIENTEDGE, L"EDIT", init_w.c_str(),
+                    WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL,
+                    16, 62, 380, 26,
+                    hwnd,
+                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCtrlIdEdit)),
+                    hinst, nullptr);
+                if (st->ctrl_edit && st->max_text_len > 0u) {
+                    ::SendMessageW(
+                        st->ctrl_edit, EM_SETLIMITTEXT, static_cast<WPARAM>(st->max_text_len), 0);
+                }
+                ::CreateWindowExW(
+                    0u, L"BUTTON", L"OK", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+                    16, 98, 96, 28, hwnd,
+                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCtrlIdBtnBase)), hinst, nullptr);
+                ::CreateWindowExW(
+                    0u, L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                    124, 98, 96, 28, hwnd,
+                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCtrlIdBtnBase + 1)), hinst, nullptr);
+            } else if (st->kind == NativeDialogKind::PlayerPicker) {
+                st->ctrl_list = ::CreateWindowExW(
+                    WS_EX_CLIENTEDGE, L"LISTBOX", L"",
+                    WS_CHILD | WS_VISIBLE | LBS_MULTIPLESEL | WS_VSCROLL,
+                    16, 60, 380, 92,
+                    hwnd,
+                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCtrlIdList)),
+                    hinst, nullptr);
+                if (st->ctrl_list) {
+                    for (size_t i = 0u; i < st->candidate_players.size(); ++i) {
+                        const uint64_t xuid = st->candidate_players[i];
+                        wchar_t label[64]{};
+                        std::swprintf(label, 64u, L"Player 0x%016llX",
+                                      static_cast<unsigned long long>(xuid));
+                        const LRESULT idx = ::SendMessageW(
+                            st->ctrl_list, LB_ADDSTRING, 0u, reinterpret_cast<LPARAM>(label));
+                        const bool pre =
+                            std::find(st->preselected_players.begin(),
+                                      st->preselected_players.end(),
+                                      xuid) != st->preselected_players.end();
+                        if (pre && idx >= 0) {
+                            ::SendMessageW(st->ctrl_list, LB_SETSEL, TRUE, idx);
+                        }
+                    }
+                }
+                ::CreateWindowExW(
+                    0u, L"BUTTON", L"Select", WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+                    16, 160, 96, 28, hwnd,
+                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCtrlIdBtnBase)), hinst, nullptr);
+                ::CreateWindowExW(
+                    0u, L"BUTTON", L"Cancel", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                    124, 160, 96, 28, hwnd,
+                    reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCtrlIdBtnBase + 1)), hinst, nullptr);
+            }
+            if (st->auto_dismiss_ms > 0u) {
+                ::SetTimer(hwnd, 1u, static_cast<UINT>(st->auto_dismiss_ms), nullptr);
+            }
+            return 0;
+        }
+        case WM_TIMER: {
+            if (st && wParam == 1u) {
+                ::KillTimer(hwnd, 1u);
+                st->auto_dismissed = true;
+                if (st->kind == NativeDialogKind::Message) {
+                    st->chosen_button = st->default_button;
+                } else {
+                    CaptureNativeDialogControls(st);
+                }
+                ::DestroyWindow(hwnd);
+                return 0;
+            }
+            break;
+        }
+        case WM_COMMAND: {
+            if (st) {
+                const int id = static_cast<int>(LOWORD(wParam));
+                if (st->kind == NativeDialogKind::Message &&
+                    id >= kCtrlIdBtnBase && id < kCtrlIdBtnBase + 3) {
+                    st->chosen_button = static_cast<uint32_t>(id - kCtrlIdBtnBase);
+                    ::DestroyWindow(hwnd);
+                    return 0;
+                }
+                if (st->kind == NativeDialogKind::TextEntry ||
+                    st->kind == NativeDialogKind::PlayerPicker) {
+                    if (id == kCtrlIdBtnBase) {
+                        CaptureNativeDialogControls(st);
+                        ::DestroyWindow(hwnd);
+                        return 0;
+                    }
+                    if (id == kCtrlIdBtnBase + 1) {
+                        st->result_hr = XGR_E_ABORT;
+                        st->user_canceled = true;
+                        ::DestroyWindow(hwnd);
+                        return 0;
+                    }
+                }
+            }
+            break;
+        }
+        case kNativeSysUiMsgCancel: {
+            if (st) {
+                st->result_hr = XGR_E_ABORT;
+                st->user_canceled = true;
+            }
+            ::DestroyWindow(hwnd);
+            return 0;
+        }
+        case WM_CLOSE: {
+            if (st) {
+                if (st->kind == NativeDialogKind::Message) {
+                    st->chosen_button = st->cancel_button;
+                } else {
+                    st->result_hr = XGR_E_ABORT;
+                    st->user_canceled = true;
+                }
+            }
+            ::DestroyWindow(hwnd);
+            return 0;
+        }
+        case WM_DESTROY:
+            ::PostQuitMessage(0);
+            return 0;
+        default:
+            break;
+    }
+    return ::DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+void EnsureNativeSysUiClassRegistered() {
+    static std::once_flag once;
+    std::call_once(once, []() {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = &NativeSysUiWndProc;
+        wc.hInstance = ::GetModuleHandleW(nullptr);
+        wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+        wc.lpszClassName = kNativeSysUiClassName;
+        (void)::RegisterClassExW(&wc);
+    });
+}
+
+struct NativeDialogProviderHolder {
+    std::shared_ptr<NativeDialogState> state;
+};
+
+XGameResult OPENSCARLETT_GDK_CALL NativeDialogAsyncProvider(
+    XAsyncOp op,
+    const XAsyncProviderData* data) {
+    auto* holder = static_cast<NativeDialogProviderHolder*>(data->context);
+    auto st = holder ? holder->state : nullptr;
+    switch (op) {
+        case XAsyncOp_Begin:
+            return XGR_S_OK;
+        case XAsyncOp_Cancel: {
+            if (st) {
+                st->canceled.store(true, std::memory_order_release);
+                HWND h = nullptr;
+                {
+                    std::lock_guard<std::mutex> lk(st->state_mutex);
+                    h = st->hwnd;
+                }
+                if (h) {
+                    ::PostMessageW(h, kNativeSysUiMsgCancel, 0u, 0);
+                }
+            }
+            return XGR_S_OK;
+        }
+        case XAsyncOp_GetResult: {
+            if (!st) return XGR_E_FAIL;
+            std::lock_guard<std::mutex> lk(st->state_mutex);
+            if (st->kind == NativeDialogKind::Message) {
+                if (!data->buffer || data->bufferSize < sizeof(uint32_t)) {
+                    return XGR_E_NOT_SUFFICIENT_BUFFER;
+                }
+                std::memcpy(data->buffer, &st->chosen_button, sizeof(uint32_t));
+                return XGR_S_OK;
+            }
+            if (st->kind == NativeDialogKind::TextEntry) {
+                const size_t needed = st->captured_text.size() + 1u;
+                if (!data->buffer || data->bufferSize < needed) {
+                    return XGR_E_NOT_SUFFICIENT_BUFFER;
+                }
+                std::memcpy(data->buffer, st->captured_text.c_str(), needed);
+                return XGR_S_OK;
+            }
+            const size_t bytes = st->captured_players.size() * sizeof(uint64_t);
+            if (bytes > 0u) {
+                if (!data->buffer || data->bufferSize < bytes) {
+                    return XGR_E_NOT_SUFFICIENT_BUFFER;
+                }
+                std::memcpy(data->buffer, st->captured_players.data(), bytes);
+            }
+            return XGR_S_OK;
+        }
+        case XAsyncOp_Cleanup:
+            delete holder;
+            return XGR_S_OK;
+        default:
+            return XGR_S_OK;
+    }
+}
+
+void RunNativeDialogThread(std::shared_ptr<NativeDialogState> st) {
+    EnsureNativeSysUiClassRegistered();
+    auto& rt = GetRuntime();
+    rt.native_ui_dialogs_opened.fetch_add(1u, std::memory_order_relaxed);
+
+    const std::wstring title_w =
+        Utf8ToWideUi(st->title.empty() ? "OpenScarlett System UI" : st->title);
+    const int win_h = (st->kind == NativeDialogKind::PlayerPicker) ? 240 : 176;
+    const DWORD style = (st->auto_dismiss_ms > 0u)
+                            ? (WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU)
+                            : (WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_VISIBLE);
+    HWND hwnd = ::CreateWindowExW(
+        0u,
+        kNativeSysUiClassName,
+        title_w.c_str(),
+        style,
+        CW_USEDEFAULT,
+        CW_USEDEFAULT,
+        430,
+        win_h,
+        nullptr,
+        nullptr,
+        ::GetModuleHandleW(nullptr),
+        st.get());
+
+    if (hwnd) {
+        {
+            std::lock_guard<std::mutex> lk(st->state_mutex);
+            st->hwnd = hwnd;
+        }
+        if (st->canceled.load(std::memory_order_acquire)) {
+            ::PostMessageW(hwnd, kNativeSysUiMsgCancel, 0u, 0);
+        } else if (st->auto_dismiss_ms == 0u) {
+            ::ShowWindow(hwnd, SW_SHOWNORMAL);
+            ::UpdateWindow(hwnd);
+        }
+
+        MSG msg{};
+        while (::GetMessageW(&msg, nullptr, 0u, 0u) > 0) {
+            ::TranslateMessage(&msg);
+            ::DispatchMessageW(&msg);
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(st->state_mutex);
+            st->hwnd = nullptr;
+            st->ctrl_edit = nullptr;
+            st->ctrl_list = nullptr;
+        }
+    } else {
+        // Headless/non-interactive session fallback: still complete cleanly without hanging.
+        if (st->kind == NativeDialogKind::Message) {
+            st->chosen_button = st->default_button;
+        } else if (st->kind == NativeDialogKind::TextEntry) {
+            st->captured_text = st->default_text;
+        } else {
+            st->captured_players = st->preselected_players;
+        }
+        st->auto_dismissed = true;
+    }
+
+    if (st->auto_dismissed) {
+        rt.native_ui_dialogs_auto_dismissed.fetch_add(1u, std::memory_order_relaxed);
+    }
+    if (st->user_canceled || st->canceled.load(std::memory_order_acquire)) {
+        rt.native_ui_dialogs_canceled.fetch_add(1u, std::memory_order_relaxed);
+        XAsyncComplete(st->async_block, XGR_E_ABORT, 0u);
+        return;
+    }
+
+    rt.native_ui_dialogs_completed.fetch_add(1u, std::memory_order_relaxed);
+    size_t req_bytes = 0u;
+    {
+        std::lock_guard<std::mutex> lk(st->state_mutex);
+        if (st->kind == NativeDialogKind::Message) {
+            req_bytes = sizeof(uint32_t);
+        } else if (st->kind == NativeDialogKind::TextEntry) {
+            req_bytes = st->captured_text.size() + 1u;
+        } else {
+            req_bytes = st->captured_players.size() * sizeof(uint64_t);
+        }
+    }
+    XAsyncComplete(st->async_block, st->result_hr, req_bytes);
+}
+
+XGameResult StartNativeDialogAsync(
+    XAsyncBlock* async,
+    const void* identity,
+    const char* identity_name,
+    std::shared_ptr<NativeDialogState> st) {
+    auto* holder = new (std::nothrow) NativeDialogProviderHolder{st};
+    if (!holder) {
+        return XGR_E_OUTOFMEMORY;
+    }
+    const XGameResult hr = XAsyncBegin(
+        async, holder, identity, identity_name, &NativeDialogAsyncProvider);
+    if (hr < 0) {
+        delete holder;
+        return hr;
+    }
+    std::thread(&RunNativeDialogThread, std::move(st)).detach();
+    return XGR_S_OK;
+}
+#endif
+
+}  // namespace
+
+extern "C" {
+
+XGameResult OPENSCARLETT_GDK_CALL OpenScarlettGdkSetNativeSystemUiMode(
+    int enabled,
+    uint32_t autoDismissMs) {
+    auto& rt = GetRuntime();
+    rt.native_ui_enabled.store(enabled != 0, std::memory_order_release);
+    rt.native_ui_auto_dismiss_ms.store(autoDismissMs, std::memory_order_release);
+    rt.native_ui_explicit.store(true, std::memory_order_release);
+    return RecordHr("OpenScarlettGdkSetNativeSystemUiMode", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL OpenScarlettGdkGetNativeSystemUiStats(
+    uint32_t* outDialogsOpened,
+    uint32_t* outDialogsCompleted,
+    uint32_t* outDialogsAutoDismissed,
+    uint32_t* outDialogsCanceled) {
+    auto& rt = GetRuntime();
+    if (outDialogsOpened) {
+        *outDialogsOpened = rt.native_ui_dialogs_opened.load(std::memory_order_relaxed);
+    }
+    if (outDialogsCompleted) {
+        *outDialogsCompleted = rt.native_ui_dialogs_completed.load(std::memory_order_relaxed);
+    }
+    if (outDialogsAutoDismissed) {
+        *outDialogsAutoDismissed =
+            rt.native_ui_dialogs_auto_dismissed.load(std::memory_order_relaxed);
+    }
+    if (outDialogsCanceled) {
+        *outDialogsCanceled = rt.native_ui_dialogs_canceled.load(std::memory_order_relaxed);
+    }
+    return RecordHr("OpenScarlettGdkGetNativeSystemUiStats", XGR_S_OK);
+}
+
 XGameResult OPENSCARLETT_GDK_CALL XGameUIShowMessageDialogAsync(
     XAsyncBlock* async,
-    const char* /*titleText*/,
-    const char* /*contentText*/,
+    const char* titleText,
+    const char* contentText,
     const char* firstButtonText,
     const char* secondButtonText,
     const char* thirdButtonText,
@@ -6707,6 +7753,29 @@ XGameResult OPENSCARLETT_GDK_CALL XGameUIShowMessageDialogAsync(
             chosen = cand;
         }
     }
+#if defined(_WIN32)
+    uint32_t auto_dismiss_ms = 0u;
+    if (ShouldUseNativeSystemUi(auto_dismiss_ms)) {
+        auto st = std::make_shared<NativeDialogState>();
+        st->kind = NativeDialogKind::Message;
+        st->async_block = async;
+        st->auto_dismiss_ms = auto_dismiss_ms;
+        st->title = titleText ? titleText : "";
+        st->body = contentText ? contentText : "";
+        if (firstButtonText) st->buttons[0] = firstButtonText;
+        if (secondButtonText) st->buttons[1] = secondButtonText;
+        if (thirdButtonText) st->buttons[2] = thirdButtonText;
+        st->default_button = static_cast<uint32_t>(chosen);
+        st->cancel_button = static_cast<uint32_t>(cancelButton);
+        st->chosen_button = static_cast<uint32_t>(chosen);
+        return RecordHr(
+            "XGameUIShowMessageDialogAsync",
+            StartNativeDialogAsync(async, kIdGameUiMessageDialog, kIdGameUiMessageDialog, std::move(st)));
+    }
+#else
+    (void)titleText;
+    (void)contentText;
+#endif
     auto* ctx = new (std::nothrow) GameUiMessageDialogCtx{chosen};
     if (!ctx) {
         return RecordHr("XGameUIShowMessageDialogAsync", XGR_E_OUTOFMEMORY);
@@ -6741,8 +7810,8 @@ XGameResult OPENSCARLETT_GDK_CALL XGameUIShowMessageDialogResult(
 
 XGameResult OPENSCARLETT_GDK_CALL XGameUIShowTextEntryAsync(
     XAsyncBlock* async,
-    const char* /*titleText*/,
-    const char* /*descriptionText*/,
+    const char* titleText,
+    const char* descriptionText,
     const char* defaultText,
     XGameUITextEntryInputScope /*inputScope*/,
     uint32_t maxTextLength) {
@@ -6756,6 +7825,25 @@ XGameResult OPENSCARLETT_GDK_CALL XGameUIShowTextEntryAsync(
     if (maxTextLength > 0u && text.size() > maxTextLength) {
         text.resize(maxTextLength);
     }
+#if defined(_WIN32)
+    uint32_t auto_dismiss_ms = 0u;
+    if (ShouldUseNativeSystemUi(auto_dismiss_ms)) {
+        auto st = std::make_shared<NativeDialogState>();
+        st->kind = NativeDialogKind::TextEntry;
+        st->async_block = async;
+        st->auto_dismiss_ms = auto_dismiss_ms;
+        st->title = titleText ? titleText : "";
+        st->body = descriptionText ? descriptionText : "";
+        st->default_text = std::move(text);
+        st->max_text_len = maxTextLength;
+        return RecordHr(
+            "XGameUIShowTextEntryAsync",
+            StartNativeDialogAsync(async, kIdGameUiTextEntry, kIdGameUiTextEntry, std::move(st)));
+    }
+#else
+    (void)titleText;
+    (void)descriptionText;
+#endif
     auto* ctx = new (std::nothrow) GameUiTextEntryCtx{std::move(text)};
     if (!ctx) {
         return RecordHr("XGameUIShowTextEntryAsync", XGR_E_OUTOFMEMORY);
@@ -6814,7 +7902,7 @@ XGameResult OPENSCARLETT_GDK_CALL XGameUIShowTextEntryResult(
 XGameResult OPENSCARLETT_GDK_CALL XGameUIShowPlayerPickerAsync(
     XAsyncBlock* async,
     XUserHandle /*requestingUser*/,
-    const char* /*promptText*/,
+    const char* promptText,
     uint32_t selectFromPlayersCount,
     const uint64_t* selectFromPlayers,
     uint32_t preSelectedPlayersCount,
@@ -6829,33 +7917,56 @@ XGameResult OPENSCARLETT_GDK_CALL XGameUIShowPlayerPickerAsync(
         return RecordHr("XGameUIShowPlayerPickerAsync", XGR_E_INVALIDARG);
     }
 
-    auto* ctx = new (std::nothrow) GameUiPlayerPickerCtx();
-    if (!ctx) {
-        return RecordHr("XGameUIShowPlayerPickerAsync", XGR_E_OUTOFMEMORY);
-    }
-
+    std::vector<uint64_t> selected;
     auto contains = [&](uint64_t id) {
-        return std::find(ctx->selected_players.begin(), ctx->selected_players.end(), id) !=
-               ctx->selected_players.end();
+        return std::find(selected.begin(), selected.end(), id) != selected.end();
     };
-    for (uint32_t i = 0; i < preSelectedPlayersCount && ctx->selected_players.size() < maxSelectionCount; ++i) {
+    for (uint32_t i = 0; i < preSelectedPlayersCount && selected.size() < maxSelectionCount; ++i) {
         if (!contains(preSelectedPlayers[i])) {
-            ctx->selected_players.push_back(preSelectedPlayers[i]);
+            selected.push_back(preSelectedPlayers[i]);
         }
     }
     const uint32_t target_min =
         (minSelectionCount > 0u)
             ? minSelectionCount
-            : ((ctx->selected_players.empty() && selectFromPlayersCount > 0u && maxSelectionCount > 0u)
-                   ? 1u
-                   : 0u);
-    for (uint32_t i = 0; i < selectFromPlayersCount && ctx->selected_players.size() < target_min &&
-                         ctx->selected_players.size() < maxSelectionCount;
+            : ((selected.empty() && selectFromPlayersCount > 0u && maxSelectionCount > 0u) ? 1u : 0u);
+    for (uint32_t i = 0; i < selectFromPlayersCount && selected.size() < target_min &&
+                         selected.size() < maxSelectionCount;
          ++i) {
         if (!contains(selectFromPlayers[i])) {
-            ctx->selected_players.push_back(selectFromPlayers[i]);
+            selected.push_back(selectFromPlayers[i]);
         }
     }
+
+#if defined(_WIN32)
+    uint32_t auto_dismiss_ms = 0u;
+    if (ShouldUseNativeSystemUi(auto_dismiss_ms)) {
+        auto st = std::make_shared<NativeDialogState>();
+        st->kind = NativeDialogKind::PlayerPicker;
+        st->async_block = async;
+        st->auto_dismiss_ms = auto_dismiss_ms;
+        st->title = "Select Players";
+        st->body = promptText ? promptText : "";
+        if (selectFromPlayers && selectFromPlayersCount > 0u) {
+            st->candidate_players.assign(
+                selectFromPlayers, selectFromPlayers + selectFromPlayersCount);
+        }
+        st->preselected_players = std::move(selected);
+        st->min_selection = minSelectionCount;
+        st->max_selection = maxSelectionCount;
+        return RecordHr(
+            "XGameUIShowPlayerPickerAsync",
+            StartNativeDialogAsync(async, kIdGameUiPlayerPicker, kIdGameUiPlayerPicker, std::move(st)));
+    }
+#else
+    (void)promptText;
+#endif
+
+    auto* ctx = new (std::nothrow) GameUiPlayerPickerCtx();
+    if (!ctx) {
+        return RecordHr("XGameUIShowPlayerPickerAsync", XGR_E_OUTOFMEMORY);
+    }
+    ctx->selected_players = std::move(selected);
 
     XGameResult hr = XAsyncBegin(
         async, ctx, kIdGameUiPlayerPicker, kIdGameUiPlayerPicker, &GameUiPlayerPickerProvider);
@@ -8970,8 +10081,8 @@ XGameResult OPENSCARLETT_GDK_CALL XGameUiSetNotificationPositionHint(
 
 XGameResult OPENSCARLETT_GDK_CALL XGameUiShowMessageDialogAsync(
     XAsyncBlock* async,
-    const char* /*titleText*/,
-    const char* /*contentText*/,
+    const char* titleText,
+    const char* contentText,
     const char* firstButtonText,
     const char* secondButtonText,
     const char* thirdButtonText,
@@ -9010,6 +10121,29 @@ XGameResult OPENSCARLETT_GDK_CALL XGameUiShowMessageDialogAsync(
             chosen = cand;
         }
     }
+#if defined(_WIN32)
+    uint32_t auto_dismiss_ms = 0u;
+    if (ShouldUseNativeSystemUi(auto_dismiss_ms)) {
+        auto st = std::make_shared<NativeDialogState>();
+        st->kind = NativeDialogKind::Message;
+        st->async_block = async;
+        st->auto_dismiss_ms = auto_dismiss_ms;
+        st->title = titleText ? titleText : "";
+        st->body = contentText ? contentText : "";
+        if (firstButtonText) st->buttons[0] = firstButtonText;
+        if (secondButtonText) st->buttons[1] = secondButtonText;
+        if (thirdButtonText) st->buttons[2] = thirdButtonText;
+        st->default_button = static_cast<uint32_t>(chosen);
+        st->cancel_button = static_cast<uint32_t>(cancelButton);
+        st->chosen_button = static_cast<uint32_t>(chosen);
+        return RecordHr(
+            "XGameUiShowMessageDialogAsync",
+            StartNativeDialogAsync(async, kIdUiMessageDialog, kIdUiMessageDialog, std::move(st)));
+    }
+#else
+    (void)titleText;
+    (void)contentText;
+#endif
     return RecordHr(
         "XGameUiShowMessageDialogAsync",
         StartPodAsync<XGameUiMessageDialogButton>(
@@ -9052,18 +10186,40 @@ XGameResult OPENSCARLETT_GDK_CALL XGameUiShowErrorDialogResult(XAsyncBlock* asyn
 
 XGameResult OPENSCARLETT_GDK_CALL XGameUiShowTextEntryAsync(
     XAsyncBlock* async,
-    const char* /*titleText*/,
-    const char* /*descriptionText*/,
+    const char* titleText,
+    const char* descriptionText,
     const char* defaultText,
     XGameUiTextEntryInputScope /*inputScope*/,
     uint32_t maxTextLength) {
     if (!async) {
         return RecordHr("XGameUiShowTextEntryAsync", XGR_E_INVALIDARG);
     }
-    std::string text = defaultText ? defaultText : "";
+    std::string text = GetEnvString("OPENSCARLETT_UI_TEXT_ENTRY");
+    if (text.empty() && defaultText) {
+        text = defaultText;
+    }
     if (maxTextLength > 0 && text.size() > maxTextLength) {
         text.resize(maxTextLength);
     }
+#if defined(_WIN32)
+    uint32_t auto_dismiss_ms = 0u;
+    if (ShouldUseNativeSystemUi(auto_dismiss_ms)) {
+        auto st = std::make_shared<NativeDialogState>();
+        st->kind = NativeDialogKind::TextEntry;
+        st->async_block = async;
+        st->auto_dismiss_ms = auto_dismiss_ms;
+        st->title = titleText ? titleText : "";
+        st->body = descriptionText ? descriptionText : "";
+        st->default_text = std::move(text);
+        st->max_text_len = maxTextLength;
+        return RecordHr(
+            "XGameUiShowTextEntryAsync",
+            StartNativeDialogAsync(async, kIdUiTextEntry, kIdUiTextEntry, std::move(st)));
+    }
+#else
+    (void)titleText;
+    (void)descriptionText;
+#endif
     return RecordHr(
         "XGameUiShowTextEntryAsync",
         StartStringAsync(async, kIdUiTextEntry, kIdUiTextEntry, std::move(text)));
@@ -9107,6 +10263,105 @@ XGameResult OPENSCARLETT_GDK_CALL XGameUiShowTextEntryResult(
     return RecordHr("XGameUiShowTextEntryResult", hr);
 }
 
+XGameResult OPENSCARLETT_GDK_CALL XGameUiTextEntryOpen(
+    const XGameUiTextEntryOptions* options,
+    uint32_t maxLength,
+    const char* initialText,
+    uint32_t cursorIndex,
+    XGameUiTextEntryHandle* handle) {
+    if (!options || !handle || maxLength == 0u) {
+        return RecordHr("XGameUiTextEntryOpen", XGR_E_INVALIDARG);
+    }
+    *handle = nullptr;
+    auto obj = std::make_shared<XGameUiTextEntryObject>();
+    obj->options = *options;
+    obj->max_length = maxLength;
+    obj->text = initialText ? initialText : "";
+    if (obj->text.size() > maxLength) {
+        obj->text.resize(maxLength);
+    }
+    obj->cursor_index = std::min<uint32_t>(cursorIndex, static_cast<uint32_t>(obj->text.size()));
+    obj->change_flags = XGameUiTextEntryChangeTypeFlags_TextChanged;
+    XGameUiTextEntryHandle raw = obj.get();
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.text_entry_mutex);
+        rt.live_text_entries[raw] = std::move(obj);
+    }
+    RegisterHandleIfNeeded(raw, XSystemHandleType_GameUiTextEntry);
+    *handle = raw;
+    return RecordHr("XGameUiTextEntryOpen", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUiTextEntryGetState(
+    XGameUiTextEntryHandle handle,
+    XGameUiTextEntryChangeTypeFlags* changeType,
+    uint32_t* cursorIndex,
+    uint32_t* imeClauseStartIndex,
+    uint32_t* imeClauseEndIndex,
+    uint32_t bufferSize,
+    char* buffer) {
+    if (!handle || !changeType) {
+        return RecordHr("XGameUiTextEntryGetState", XGR_E_INVALIDARG);
+    }
+    std::shared_ptr<XGameUiTextEntryObject> obj;
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.text_entry_mutex);
+        auto it = rt.live_text_entries.find(handle);
+        if (it == rt.live_text_entries.end()) {
+            return RecordHr("XGameUiTextEntryGetState", XGR_E_HANDLE);
+        }
+        obj = it->second;
+    }
+    std::lock_guard<std::mutex> olk(obj->mutex);
+    *changeType = static_cast<XGameUiTextEntryChangeTypeFlags>(obj->change_flags);
+    obj->change_flags = XGameUiTextEntryChangeTypeFlags_None;
+    if (cursorIndex) *cursorIndex = obj->cursor_index;
+    if (imeClauseStartIndex) *imeClauseStartIndex = 0u;
+    if (imeClauseEndIndex) *imeClauseEndIndex = 0u;
+    if (buffer && bufferSize > 0u) {
+        const size_t n = std::min<size_t>(obj->text.size(), static_cast<size_t>(bufferSize - 1u));
+        if (n > 0u) {
+            std::memcpy(buffer, obj->text.data(), n);
+        }
+        buffer[n] = '\0';
+    }
+    return RecordHr("XGameUiTextEntryGetState", XGR_S_OK);
+}
+
+XGameResult OPENSCARLETT_GDK_CALL XGameUiTextEntryUpdatePositionHint(
+    XGameUiTextEntryHandle handle,
+    XGameUiTextEntryPositionHint positionHint) {
+    if (!handle) {
+        return RecordHr("XGameUiTextEntryUpdatePositionHint", XGR_E_INVALIDARG);
+    }
+    std::shared_ptr<XGameUiTextEntryObject> obj;
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.text_entry_mutex);
+        auto it = rt.live_text_entries.find(handle);
+        if (it == rt.live_text_entries.end()) {
+            return RecordHr("XGameUiTextEntryUpdatePositionHint", XGR_E_HANDLE);
+        }
+        obj = it->second;
+    }
+    std::lock_guard<std::mutex> olk(obj->mutex);
+    obj->options.positionHint = positionHint;
+    return RecordHr("XGameUiTextEntryUpdatePositionHint", XGR_S_OK);
+}
+
+void OPENSCARLETT_GDK_CALL XGameUiTextEntryClose(XGameUiTextEntryHandle handle) {
+    RecordOk("XGameUiTextEntryClose");
+    if (!handle) return;
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.text_entry_mutex);
+        rt.live_text_entries.erase(handle);
+    }
+    MarkHandleClosed(handle);
+}
+
 XGameResult OPENSCARLETT_GDK_CALL XGameUiShowAchievementsAsync(
     XAsyncBlock* async,
     XUserHandle /*requestingUser*/,
@@ -9129,26 +10384,67 @@ XGameResult OPENSCARLETT_GDK_CALL XGameUiShowAchievementsResult(XAsyncBlock* asy
 XGameResult OPENSCARLETT_GDK_CALL XGameUiShowPlayerPickerAsync(
     XAsyncBlock* async,
     XUserHandle /*requestingUser*/,
-    const char* /*promptText*/,
-    uint32_t /*selectFromPlayersCount*/,
-    const uint64_t* /*selectFromPlayers*/,
+    const char* promptText,
+    uint32_t selectFromPlayersCount,
+    const uint64_t* selectFromPlayers,
     uint32_t preSelectedPlayersCount,
     const uint64_t* preSelectedPlayers,
-    uint32_t /*minSelectionCount*/,
+    uint32_t minSelectionCount,
     uint32_t maxSelectionCount) {
-    if (!async) {
+    if (!async || minSelectionCount > maxSelectionCount) {
         return RecordHr("XGameUiShowPlayerPickerAsync", XGR_E_INVALIDARG);
     }
+    if ((selectFromPlayersCount > 0u && !selectFromPlayers) ||
+        (preSelectedPlayersCount > 0u && !preSelectedPlayers)) {
+        return RecordHr("XGameUiShowPlayerPickerAsync", XGR_E_INVALIDARG);
+    }
+    std::vector<uint64_t> selected;
+    auto contains = [&](uint64_t id) {
+        return std::find(selected.begin(), selected.end(), id) != selected.end();
+    };
+    const uint32_t cap = (maxSelectionCount > 0u) ? maxSelectionCount : preSelectedPlayersCount;
+    for (uint32_t i = 0u; i < preSelectedPlayersCount && selected.size() < cap; ++i) {
+        if (!contains(preSelectedPlayers[i])) {
+            selected.push_back(preSelectedPlayers[i]);
+        }
+    }
+    if (minSelectionCount > 0u && selectFromPlayers) {
+        for (uint32_t i = 0u;
+             i < selectFromPlayersCount && selected.size() < minSelectionCount && selected.size() < maxSelectionCount;
+             ++i) {
+            if (!contains(selectFromPlayers[i])) {
+                selected.push_back(selectFromPlayers[i]);
+            }
+        }
+    }
+#if defined(_WIN32)
+    uint32_t auto_dismiss_ms = 0u;
+    if (ShouldUseNativeSystemUi(auto_dismiss_ms)) {
+        auto st = std::make_shared<NativeDialogState>();
+        st->kind = NativeDialogKind::PlayerPicker;
+        st->async_block = async;
+        st->auto_dismiss_ms = auto_dismiss_ms;
+        st->title = "Select Players";
+        st->body = promptText ? promptText : "";
+        if (selectFromPlayers && selectFromPlayersCount > 0u) {
+            st->candidate_players.assign(
+                selectFromPlayers, selectFromPlayers + selectFromPlayersCount);
+        }
+        st->preselected_players = std::move(selected);
+        st->min_selection = minSelectionCount;
+        st->max_selection = maxSelectionCount;
+        return RecordHr(
+            "XGameUiShowPlayerPickerAsync",
+            StartNativeDialogAsync(async, kIdUiPlayerPicker, kIdUiPlayerPicker, std::move(st)));
+    }
+#else
+    (void)promptText;
+#endif
     auto* ctx = new (std::nothrow) UiPlayerPickerAsyncCtx();
     if (!ctx) {
         return RecordHr("XGameUiShowPlayerPickerAsync", XGR_E_OUTOFMEMORY);
     }
-    if (preSelectedPlayers && preSelectedPlayersCount > 0) {
-        const uint32_t limit =
-            (maxSelectionCount > 0) ? std::min(preSelectedPlayersCount, maxSelectionCount)
-                                    : preSelectedPlayersCount;
-        ctx->players.assign(preSelectedPlayers, preSelectedPlayers + limit);
-    }
+    ctx->players = std::move(selected);
     XGameResult hr = XAsyncBegin(
         async, ctx, kIdUiPlayerPicker, kIdUiPlayerPicker, &UiPlayerPickerProvider);
     if (hr < 0) {
@@ -9788,12 +11084,53 @@ OPENSCARLETT_GDK_API XGameResult OPENSCARLETT_GDK_CALL XErrorGetOptions(
 }
 
 uint32_t OPENSCARLETT_GDK_CALL XGameEventWrite(
-    uint64_t /*regHandle*/,
-    const XGameEventDescriptor* /*eventDescriptor*/,
-    uint32_t /*userDataCount*/,
-    XGameEventDataDescriptor* /*userData*/) {
+    uint64_t regHandle,
+    const XGameEventDescriptor* eventDescriptor,
+    uint32_t userDataCount,
+    XGameEventDataDescriptor* userData) {
+    if (userDataCount > 0u && !userData) {
+        RecordHr("XGameEventWrite", XGR_E_INVALIDARG);
+        return 87u;  // ERROR_INVALID_PARAMETER
+    }
+    uint64_t total_bytes = 0u;
+    for (uint32_t i = 0u; i < userDataCount; ++i) {
+        total_bytes += static_cast<uint64_t>(userData[i].size);
+    }
+    {
+        auto& rt = GetRuntime();
+        std::lock_guard<std::mutex> lk(rt.event_mutex);
+        ++rt.event_total_count;
+        rt.event_total_bytes += total_bytes;
+        GameEventRecord rec{};
+        rec.seq = rt.event_total_count;
+        rec.reg_handle = regHandle;
+        if (eventDescriptor) {
+            rec.event_id = eventDescriptor->id;
+            rec.version = eventDescriptor->version;
+            rec.level = eventDescriptor->level;
+            rec.keyword = eventDescriptor->keyword;
+        }
+        rec.data_count = userDataCount;
+        rec.data_bytes = total_bytes;
+        if (rt.event_ring.size() >= 256u) {
+            rt.event_ring.pop_front();
+        }
+        rt.event_ring.push_back(rec);
+    }
     RecordOk("XGameEventWrite");
     return 0u;  // ERROR_SUCCESS
+}
+
+XGameResult OPENSCARLETT_GDK_CALL OpenScarlettGdkGetGameEventStats(
+    uint64_t* outTotalEvents,
+    uint64_t* outTotalBytes,
+    uint32_t* outBufferedEvents) {
+    auto& rt = GetRuntime();
+    std::lock_guard<std::mutex> lk(rt.event_mutex);
+    if (outTotalEvents) *outTotalEvents = rt.event_total_count;
+    if (outTotalBytes) *outTotalBytes = rt.event_total_bytes;
+    if (outBufferedEvents) *outBufferedEvents = static_cast<uint32_t>(rt.event_ring.size());
+    return RecordHr("OpenScarlettGdkGetGameEventStats", XGR_S_OK);
 }
 
 void OPENSCARLETT_GDK_CALL XLaunchNewGame(
@@ -10501,7 +11838,7 @@ const ComVtableSlot g_com_vtbl_user[] = {
     /* 12 */ OS_COM_SLOT(XUserFindUserById),
     /* 13 */ OS_COM_SLOT(XUserGetIsGuest),
     /* 14 */ OS_COM_SLOT(XUserGetState),
-    /* 15 */ OS_COM_UNIMPL(),
+    /* 15 */ OS_COM_SLOT(XUserGetGamertag),
     /* 16 */ OS_COM_SLOT(XUserGetGamerPictureAsync),
     /* 17 */ OS_COM_SLOT(XUserGetGamerPictureResultSize),
     /* 18 */ OS_COM_SLOT(XUserGetGamerPictureResult),
@@ -10534,7 +11871,7 @@ const ComVtableSlot g_com_vtbl_user_gamertag[] = {
 // 3. CLSID={03F0FE74-FDD9-4E5C-B630-F9339C47ACC5} IID={35F07670-706E-4BFB-9476-090798C5EBF3}
 const ComVtableSlot g_com_vtbl_display_hdr[] = {
     OS_COM_IUNKNOWN_SLOTS,
-    /*  3 */ OS_COM_UNIMPL(),
+    /*  3 */ OS_COM_SLOT(XDisplayGetHdrMode),
     /*  4 */ OS_COM_SLOT(XDisplayTryEnableHdrMode),
 };
 
@@ -10553,7 +11890,7 @@ const ComVtableSlot g_com_vtbl_async_taskqueue[] = {
     /*  5 */ OS_COM_SLOT(XAsyncCancel),
     /*  6 */ OS_COM_SLOT(XAsyncRun),
     /*  7 */ OS_COM_SLOT(XAsyncBegin),
-    /*  8 */ OS_COM_UNIMPL(),
+    /*  8 */ OS_COM_SLOT(XAsyncBeginAlloc),
     /*  9 */ OS_COM_SLOT(XAsyncSchedule),
     /* 10 */ OS_COM_SLOT(XAsyncComplete),
     /* 11 */ OS_COM_SLOT(XAsyncGetResult),
@@ -10880,10 +12217,10 @@ const ComVtableSlot g_com_vtbl_game_ui[] = {
     /* 17 */ OS_COM_SLOT(XGameUiShowTextEntryAsync),
     /* 18 */ OS_COM_SLOT(XGameUiShowTextEntryResultSize),
     /* 19 */ OS_COM_SLOT(XGameUiShowTextEntryResult),
-    /* 20 */ OS_COM_UNIMPL(),
-    /* 21 */ OS_COM_UNIMPL(),
-    /* 22 */ OS_COM_UNIMPL(),
-    /* 23 */ OS_COM_UNIMPL(),
+    /* 20 */ OS_COM_SLOT(XGameUiTextEntryOpen),
+    /* 21 */ OS_COM_SLOT(XGameUiTextEntryGetState),
+    /* 22 */ OS_COM_SLOT(XGameUiTextEntryUpdatePositionHint),
+    /* 23 */ OS_COM_SLOT(XGameUiTextEntryClose),
     /* 24 */ OS_COM_SLOT(XGameUiShowWebAuthenticationAsync),
     /* 25 */ OS_COM_SLOT(XGameUiShowWebAuthenticationResultSize),
     /* 26 */ OS_COM_SLOT(XGameUiShowWebAuthenticationResult),
@@ -10926,18 +12263,18 @@ const ComVtableSlot g_com_vtbl_game_streaming[] = {
     OS_COM_IUNKNOWN_SLOTS,
     /*  3 */ OS_COM_SLOT(XGameStreamingInitialize),
     /*  4 */ OS_COM_SLOT(XGameStreamingUninitialize),
-    /*  5 */ OS_COM_UNIMPL(),
+    /*  5 */ OS_COM_SLOT(XGameStreamingGetClients),
     /*  6 */ reinterpret_cast<ComVtableSlot>(&ComThunk_XGameStreamingRegisterClientPropertiesChanged),
     /*  7 */ OS_COM_SLOT(XGameStreamingUnregisterConnectionStateChanged),
     /*  8 */ OS_COM_SLOT(XGameStreamingGetStreamPhysicalDimensions),
-    /*  9 */ OS_COM_UNIMPL(),
-    /* 10 */ OS_COM_UNIMPL(),
-    /* 11 */ OS_COM_UNIMPL(),
+    /*  9 */ OS_COM_SLOT(XGameStreamingGetDisplayDetails),
+    /* 10 */ OS_COM_SLOT(XGameStreamingGetTouchBundleVersionNameSize),
+    /* 11 */ OS_COM_SLOT(XGameStreamingIsTouchInputEnabledOnClient),
     /* 12 */ OS_COM_SLOT(XGameStreamingRegisterConnectionStateChanged),
     /* 13 */ OS_COM_SLOT(XGameStreamingUnregisterConnectionStateChanged),
     /* 14 */ OS_COM_SLOT(XGameStreamingGetConnectionState),
-    /* 15 */ OS_COM_UNIMPL(),
-    /* 16 */ OS_COM_UNIMPL(),
+    /* 15 */ OS_COM_SLOT(XGameStreamingGetClientCount),
+    /* 16 */ OS_COM_SLOT(XGameStreamingGetLastFrameDisplayed),
     /* 17 */ OS_COM_SLOT(XGameStreamingIsStreaming),
 };
 
@@ -10993,6 +12330,9 @@ constexpr RealComInterfaceMapping kRealComMappings[] = {
     {{0x03F0FE74u, 0xFDD9u, 0x4E5Cu, {0xB6, 0x30, 0xF9, 0x33, 0x9C, 0x47, 0xAC, 0xC5}},
      {0x35F07670u, 0x706Eu, 0x4BFBu, {0x94, 0x76, 0x09, 0x07, 0x98, 0xC5, 0xEB, 0xF3}},
      kComDisplayHdr},
+    {{0x03F0FE74u, 0xFDD9u, 0x4E5Cu, {0xB6, 0x30, 0xF9, 0x33, 0x9C, 0x47, 0xAC, 0xC5}},
+     {0x03F0FE74u, 0xFDD9u, 0x4E5Cu, {0xB6, 0x30, 0xF9, 0x33, 0x9C, 0x47, 0xAC, 0xC5}},
+     kComDisplayHdr},
     // 4. XGameInvite
     {{0x0651AAE2u, 0x4012u, 0x4077u, {0xBF, 0x84, 0x8B, 0x90, 0x97, 0x09, 0x0E, 0x2C}},
      {0x0651AAE2u, 0x4012u, 0x4077u, {0xBF, 0x84, 0x8B, 0x90, 0x97, 0x09, 0x0E, 0x2C}},
@@ -11040,6 +12380,9 @@ constexpr RealComInterfaceMapping kRealComMappings[] = {
     {{0x7D824997u, 0x10DCu, 0x45ABu, {0x86, 0xB7, 0x27, 0x37, 0x76, 0x7C, 0x0B, 0xF1}},
      {0x0CC6A956u, 0xE7E1u, 0x4FDFu, {0x93, 0x41, 0x9D, 0x5D, 0xA6, 0x49, 0xEB, 0xC8}},
      kComUserDeviceAudio},
+    {{0x7D824997u, 0x10DCu, 0x45ABu, {0x86, 0xB7, 0x27, 0x37, 0x76, 0x7C, 0x0B, 0xF1}},
+     {0x7D824997u, 0x10DCu, 0x45ABu, {0x86, 0xB7, 0x27, 0x37, 0x76, 0x7C, 0x0B, 0xF1}},
+     kComUserDeviceAudio},
     // 13. XGameRuntimeIsFeatureAvailable
     {{0x8836FE87u, 0xEDB9u, 0x4FE3u, {0x8D, 0xAD, 0x05, 0xF0, 0xD2, 0xCD, 0x5B, 0x40}},
      {0x8836FE87u, 0xEDB9u, 0x4FE3u, {0x8D, 0xAD, 0x05, 0xF0, 0xD2, 0xCD, 0x5B, 0x40}},
@@ -11071,12 +12414,15 @@ constexpr RealComInterfaceMapping kRealComMappings[] = {
     {{0xBBFBDCC7u, 0xBFE7u, 0x409Bu, {0xA5, 0xCA, 0xED, 0xF0, 0x54, 0x96, 0x0B, 0x4D}},
      {0xBBFBDCC7u, 0xBFE7u, 0x409Bu, {0xA5, 0xCA, 0xED, 0xF0, 0x54, 0x96, 0x0B, 0x4D}},
      kComGameEvent},
-    // 20. XGameUi (GDK 2022+ and legacy GDK 2021 IIDs)
+    // 20. XGameUi (GDK 2022+ and legacy GDK 2021 IIDs + self-IID)
     {{0xDFCD4649u, 0x4FF8u, 0x4043u, {0xBA, 0x07, 0x35, 0xD6, 0x07, 0xDF, 0x98, 0xB0}},
      {0x72C4E70Fu, 0x4A67u, 0x481Bu, {0xBB, 0x84, 0xAA, 0x72, 0xED, 0xA1, 0x4F, 0xE5}},
      kComGameUi},
     {{0xDFCD4649u, 0x4FF8u, 0x4043u, {0xBA, 0x07, 0x35, 0xD6, 0x07, 0xDF, 0x98, 0xB0}},
      {0xFC0B9BD0u, 0x8898u, 0x4643u, {0xBE, 0xE0, 0x4E, 0xE6, 0xEE, 0x03, 0x4C, 0xB6}},
+     kComGameUi},
+    {{0xDFCD4649u, 0x4FF8u, 0x4043u, {0xBA, 0x07, 0x35, 0xD6, 0x07, 0xDF, 0x98, 0xB0}},
+     {0xDFCD4649u, 0x4FF8u, 0x4043u, {0xBA, 0x07, 0x35, 0xD6, 0x07, 0xDF, 0x98, 0xB0}},
      kComGameUi},
     // 21. XSystem ConsoleId + SandboxId + AppSpecificDeviceId
     {{0xE349BD1Au, 0xFC20u, 0x4E40u, {0xB9, 0x9C, 0x41, 0x78, 0xCC, 0x6B, 0x40, 0x9F}},
@@ -11092,6 +12438,9 @@ constexpr RealComInterfaceMapping kRealComMappings[] = {
     // 23. XGameStreaming
     {{0x0A2192AAu, 0xB2D5u, 0x4D58u, {0x83, 0xBE, 0x38, 0x3B, 0x6D, 0x80, 0x79, 0x9E}},
      {0x5F5E5169u, 0x746Cu, 0x4001u, {0xAD, 0x1C, 0xDA, 0x72, 0x8D, 0x01, 0xC9, 0xEB}},
+     kComGameStreaming},
+    {{0x0A2192AAu, 0xB2D5u, 0x4D58u, {0x83, 0xBE, 0x38, 0x3B, 0x6D, 0x80, 0x79, 0x9E}},
+     {0x0A2192AAu, 0xB2D5u, 0x4D58u, {0x83, 0xBE, 0x38, 0x3B, 0x6D, 0x80, 0x79, 0x9E}},
      kComGameStreaming},
 };
 
