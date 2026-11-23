@@ -78,6 +78,12 @@ if(TEST test_s14_shader_sm66_779)
         COST 90
     )
 endif()
+if(TEST test_s15_rdna2_bench_trap_harness)
+    set_tests_properties(test_s15_rdna2_bench_trap_harness PROPERTIES
+        RUN_SERIAL TRUE
+        COST 85
+    )
+endif()
 
 # 3. Serialize tests that create desktop HWNDs / Win32 swapchains / focus checks.
 foreach(_win_test
