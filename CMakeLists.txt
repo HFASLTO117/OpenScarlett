@@ -170,6 +170,10 @@ foreach(_os_module_cmake
     cmake/s15_w2_shaders.cmake
     cmake/s15_w3_graphics.cmake
     cmake/s15_w4_shims.cmake
+    cmake/s16_w1_graphics.cmake
+    cmake/s16_w2_shaders.cmake
+    cmake/s16_w3_media_storage.cmake
+    cmake/s16_w4_os_shims.cmake
     cmake/build_speedups.cmake
 )
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_os_module_cmake}")

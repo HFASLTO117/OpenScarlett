@@ -54,22 +54,23 @@ if(WIN32)
     _openscarlett_configure_s7_target(test_rdna2_lockstep_isa)
 
     # -------------------------------------------------------------------------
-    # Worker 3: 6 New Fixed-Return Stub DLLs + PE/GDK Runtime Parity
+    # Worker 3: 6 Standalone Media & Diagnostic Shim DLLs + PE/GDK Runtime Parity
     # -------------------------------------------------------------------------
     foreach(_s7_dll_spec
-        "mflnmhelp|OPENSCARLETT_S7_TARGET_MFLNMHELP|"
-        "mfhevcdec|OPENSCARLETT_S7_TARGET_MFHEVCDEC|"
-        "gamecoreclient|OPENSCARLETT_S7_TARGET_GAMECORECLIENT|"
-        "minuserx|OPENSCARLETT_S7_TARGET_MINUSERX|user32"
-        "xtfpix|OPENSCARLETT_S7_TARGET_XTFPIX|"
-        "xtfdebugmonitor|OPENSCARLETT_S7_TARGET_XTFDEBUGMONITOR|"
+        "mflnmhelp|src/shims/mflnmhelp_shim.cpp|OPENSCARLETT_S7_TARGET_MFLNMHELP|"
+        "mfhevcdec|src/shims/mfhevcdec_shim.cpp|OPENSCARLETT_S7_TARGET_MFHEVCDEC|"
+        "gamecoreclient|src/shims/sprint7_diag_shims.cpp|OPENSCARLETT_S7_TARGET_GAMECORECLIENT|"
+        "minuserx|src/shims/sprint7_diag_shims.cpp|OPENSCARLETT_S7_TARGET_MINUSERX|user32"
+        "xtfpix|src/shims/sprint7_diag_shims.cpp|OPENSCARLETT_S7_TARGET_XTFPIX|"
+        "xtfdebugmonitor|src/shims/sprint7_diag_shims.cpp|OPENSCARLETT_S7_TARGET_XTFDEBUGMONITOR|"
     )
         string(REPLACE "|" ";" _s7_parts "${_s7_dll_spec}")
         list(GET _s7_parts 0 _s7_name)
-        list(GET _s7_parts 1 _s7_macro)
-        list(GET _s7_parts 2 _s7_extra_lib)
+        list(GET _s7_parts 1 _s7_src)
+        list(GET _s7_parts 2 _s7_macro)
+        list(GET _s7_parts 3 _s7_extra_lib)
 
-        add_library(${_s7_name} SHARED src/shims/sprint7_diag_shims.cpp)
+        add_library(${_s7_name} SHARED ${_s7_src})
         set_target_properties(${_s7_name} PROPERTIES PREFIX "" OUTPUT_NAME "${_s7_name}")
         target_compile_definitions(${_s7_name} PRIVATE ${_s7_macro}=1)
         target_link_libraries(${_s7_name} PRIVATE openscarlett_core)
