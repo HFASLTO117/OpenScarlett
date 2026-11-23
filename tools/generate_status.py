@@ -456,7 +456,7 @@ def collect_components(
             what_works=(
                 "Live 60 FPS **Freedoom: Phase 1**, `ScarlettArena`, shadowed/skinned BC1+BC3 3D dual-API GDK scene (`gdk_3d_scene`), official MIT `Xbox-GDK-Samples`, and commercial shipping GDK thunks (`Alexandria IV DEMO`). **Commercial retail Xbox Series games are not playable yet** — join Discord to help test real unpacked GDKs!"
             ),
-            verified_on="GTX 1650 Ti + WARP + 6 community NVIDIA/AMD PCs (`test_scarlett_game_live`, `test_gdk_3d_scene_dual_api`, `test_dxr_live`)",
+            verified_on="GTX 1650 Ti + WARP + 10 community NVIDIA/AMD PCs (`test_scarlett_game_live`, `test_gdk_3d_scene_dual_api`, `test_dxr_live`)",
         ),
     ]
 
@@ -754,7 +754,7 @@ def render_dashboard_html(
             {"tier": "NVIDIA Blackwell", "status": "verified", "detail": "RTX 5060 · RTX 5070 (Win11 25H2/26H2, DXR=12, Vulkan 1.4.357)"},
             {"tier": "AMD RDNA 3 & 4", "status": "verified", "detail": "RX 7600 · RX 7900 XTX · RX 9070 XT (Win11 26H2, Wave64, DXR=11, 67/67 Pass)"},
             {"tier": "Software Fallback", "status": "verified", "detail": "D3D12 WARP (Windows 10/11 & CI runners)"},
-            {"tier": "AMD RX 6000 (RDNA2)", "status": "needed", "detail": "Native RDNA2 (Series X|S sibling) — tester needed"},
+            {"tier": "AMD RX 6000 (RDNA2)", "status": "needed", "detail": "RX 6750 XT tested (60/62; RDNA2 fixes landed — re-test welcome)"},
             {"tier": "Intel Arc (A / B)", "status": "needed", "detail": "Arc B390 Battlemage tested (60/67; mesh PSO, Vulkan subpass & VOPC fixes landed — re-test welcome)"},
             {"tier": "Handheld APUs", "status": "needed", "detail": "ROG Ally / Legion Go / Steam Deck Windows — tester needed"},
         ]
