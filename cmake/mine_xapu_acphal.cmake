@@ -16,3 +16,7 @@ endif()
 # 2. Unit test dynamically loading xapu.dll and AcpHal.dll via LoadLibraryW / GetProcAddress
 openscarlett_add_test(test_mine_xapu_acphal tests/test_mine_xapu_acphal.cpp)
 add_dependencies(test_mine_xapu_acphal xapu AcpHal)
+
+# 3. Clean-room regression test suite for Minecraft Preview perf & hardening
+openscarlett_add_test(test_minecraft_perf_hardening tests/test_minecraft_perf_hardening.cpp)
+add_dependencies(test_minecraft_perf_hardening openscarlett_hook XAudio2_9 AcpHal xapu dstorage_xs d3d12_xs)

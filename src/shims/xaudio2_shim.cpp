@@ -982,7 +982,8 @@ public:
         if (destroying_.load(std::memory_order_acquire)) {
             return RecordHr("IXAudio2SourceVoice::SubmitSourceBuffer", OS_XAUDIO2_E_INVALID_CALL, 9);
         }
-        if (!pBuffer || (pBuffer->AudioBytes > 0 && !pBuffer->pAudioData)) {
+        if (!pBuffer || (pBuffer->AudioBytes > 0 && !pBuffer->pAudioData) ||
+            pBuffer->AudioBytes > 0x80000000u) {
             return RecordHr("IXAudio2SourceVoice::SubmitSourceBuffer", OS_XAUDIO2_E_INVALIDARG, 9);
         }
 
@@ -1118,26 +1119,49 @@ public:
         }
         uint32_t total_frames = static_cast<uint32_t>(decoded.size() / std::max<uint32_t>(1u, eff_ch));
 
+        const uint32_t orig_total_frames = total_frames;
         uint32_t play_slice_start = 0u;
-        if (pBuffer->PlayBegin > 0 || pBuffer->PlayLength > 0) {
-            play_slice_start = std::min<uint32_t>(pBuffer->PlayBegin, total_frames);
-            const uint32_t max_avail = total_frames - play_slice_start;
-            const uint32_t len = (pBuffer->PlayLength > 0)
+        if (pBuffer->PlayBegin > 0u || pBuffer->PlayLength > 0u) {
+            play_slice_start = std::min<uint32_t>(pBuffer->PlayBegin, orig_total_frames);
+            const uint32_t max_avail = orig_total_frames - play_slice_start;
+            const uint32_t len = (pBuffer->PlayLength > 0u)
                                      ? std::min<uint32_t>(pBuffer->PlayLength, max_avail)
                                      : max_avail;
-            std::vector<float> sliced(len * eff_ch);
-            if (len > 0) {
-                std::memcpy(sliced.data(), decoded.data() + play_slice_start * eff_ch,
-                            len * eff_ch * sizeof(float));
+            std::vector<float> sliced(static_cast<size_t>(len) * eff_ch);
+            if (len > 0u) {
+                std::memcpy(sliced.data(),
+                            decoded.data() + static_cast<size_t>(play_slice_start) * eff_ch,
+                            static_cast<size_t>(len) * eff_ch * sizeof(float));
             }
             decoded = std::move(sliced);
             total_frames = len;
         }
+        const uint64_t play_end = static_cast<uint64_t>(play_slice_start) + total_frames;
 
-        const uint32_t adj_loop_begin =
-            (pBuffer->LoopBegin >= play_slice_start)
-                ? std::min<uint32_t>(pBuffer->LoopBegin - play_slice_start, total_frames)
-                : 0u;
+        // Enforce XAudio2 play/loop region invariants cleanly:
+        // - LoopCount == 0 or empty play slice clears LoopBegin/LoopLength to 0.
+        // - Otherwise clamp [LoopBegin, LoopBegin + LoopLength) into [play_slice_start, play_end);
+        //   if disjoint or empty after clamping, disable looping cleanly.
+        uint32_t adj_loop_begin = 0u;
+        uint32_t adj_loop_length = 0u;
+        uint32_t eff_loop_count = 0u;
+        if (pBuffer->LoopCount > 0u && total_frames > 0u) {
+            const uint64_t raw_loop_begin = static_cast<uint64_t>(pBuffer->LoopBegin);
+            const uint64_t raw_loop_end =
+                (pBuffer->LoopLength > 0u)
+                    ? (raw_loop_begin + static_cast<uint64_t>(pBuffer->LoopLength))
+                    : play_end;
+            if (raw_loop_begin < play_end && raw_loop_end > static_cast<uint64_t>(play_slice_start)) {
+                const uint64_t clamped_begin =
+                    std::max<uint64_t>(raw_loop_begin, static_cast<uint64_t>(play_slice_start));
+                const uint64_t clamped_end = std::min<uint64_t>(raw_loop_end, play_end);
+                if (clamped_end > clamped_begin) {
+                    adj_loop_begin = static_cast<uint32_t>(clamped_begin - play_slice_start);
+                    adj_loop_length = static_cast<uint32_t>(clamped_end - clamped_begin);
+                    eff_loop_count = pBuffer->LoopCount;
+                }
+            }
+        }
 
         auto* qb = new (std::nothrow) QueuedAudioBuffer();
         if (!qb) {
@@ -1148,10 +1172,8 @@ public:
         qb->total_frames = total_frames;
         qb->play_cursor = 0.0;
         qb->loop_begin = adj_loop_begin;
-        qb->loop_length = (pBuffer->LoopLength > 0 && qb->loop_begin + pBuffer->LoopLength <= total_frames)
-                              ? pBuffer->LoopLength
-                              : (total_frames - qb->loop_begin);
-        qb->loops_remaining = pBuffer->LoopCount;
+        qb->loop_length = adj_loop_length;
+        qb->loops_remaining = eff_loop_count;
         qb->end_of_stream = (pBuffer->Flags & OS_XAUDIO2_END_OF_STREAM) != 0;
         qb->context = pBuffer->pContext;
 

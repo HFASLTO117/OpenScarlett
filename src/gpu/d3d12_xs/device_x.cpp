@@ -3307,15 +3307,26 @@ HRESULT STDMETHODCALLTYPE DeviceX::CheckFeatureSupport(
 
 HRESULT STDMETHODCALLTYPE DeviceX::CreateDescriptorHeap(
     const D3D12_DESCRIPTOR_HEAP_DESC* pDescriptorHeapDesc, REFIID riid, void** ppvHeap) {
+    D3D12_DESCRIPTOR_HEAP_DESC clean_desc{};
+    const D3D12_DESCRIPTOR_HEAP_DESC* eff_desc = pDescriptorHeapDesc;
+    if (pDescriptorHeapDesc &&
+        (pDescriptorHeapDesc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_RTV ||
+         pDescriptorHeapDesc->Type == D3D12_DESCRIPTOR_HEAP_TYPE_DSV) &&
+        (pDescriptorHeapDesc->Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0) {
+        clean_desc = *pDescriptorHeapDesc;
+        clean_desc.Flags = static_cast<D3D12_DESCRIPTOR_HEAP_FLAGS>(
+            clean_desc.Flags & ~D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE);
+        eff_desc = &clean_desc;
+    }
     if (!ppvHeap) {
-        const HRESULT hr = host_dev_->CreateDescriptorHeap(pDescriptorHeapDesc, riid, nullptr);
+        const HRESULT hr = host_dev_->CreateDescriptorHeap(eff_desc, riid, nullptr);
         RecordDev("ID3D12DeviceX::CreateDescriptorHeap", 14, hr);
         return hr;
     }
     *ppvHeap = nullptr;
     ID3D12DescriptorHeap* host_heap = nullptr;
     HRESULT hr = host_dev_->CreateDescriptorHeap(
-        pDescriptorHeapDesc, OS_D3D12_IID(ID3D12DescriptorHeap), reinterpret_cast<void**>(&host_heap));
+        eff_desc, OS_D3D12_IID(ID3D12DescriptorHeap), reinterpret_cast<void**>(&host_heap));
     if (FAILED(hr) || !host_heap) {
         RecordDev("ID3D12DeviceX::CreateDescriptorHeap", 14, hr);
         return hr;

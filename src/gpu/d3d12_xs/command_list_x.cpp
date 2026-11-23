@@ -1380,19 +1380,34 @@ void STDMETHODCALLTYPE CommandListX::ResourceBarrier(
         bool emit = true;
         switch (b.Type) {
             case D3D12_RESOURCE_BARRIER_TYPE_TRANSITION: {
-                b.Transition.pResource = UnwrapResource(pBarriers[i].Transition.pResource);
+                bool has_cached_info = false;
+                bool is_upload_or_readback = false;
+                bool is_buffer = false;
+                b.Transition.pResource = UnwrapResourceWithBarrierInfo(
+                    pBarriers[i].Transition.pResource,
+                    has_cached_info,
+                    is_upload_or_readback,
+                    is_buffer);
                 // Desktop D3D12 forbids state transitions on UPLOAD/READBACK heaps (unlike Xbox UMA).
                 if (b.Transition.pResource != nullptr) {
-                    D3D12_HEAP_PROPERTIES hp{};
-                    if (SUCCEEDED(b.Transition.pResource->GetHeapProperties(&hp, nullptr)) &&
-                        (hp.Type == D3D12_HEAP_TYPE_UPLOAD || hp.Type == D3D12_HEAP_TYPE_READBACK)) {
+                    if (!has_cached_info) {
+                        D3D12_HEAP_PROPERTIES hp{};
+                        if (SUCCEEDED(b.Transition.pResource->GetHeapProperties(&hp, nullptr)) &&
+                            (hp.Type == D3D12_HEAP_TYPE_UPLOAD || hp.Type == D3D12_HEAP_TYPE_READBACK)) {
+                            is_upload_or_readback = true;
+                        }
+                        if (!is_upload_or_readback) {
+                            is_buffer = (b.Transition.pResource->GetDesc().Dimension ==
+                                         D3D12_RESOURCE_DIMENSION_BUFFER);
+                        }
+                    }
+                    if (is_upload_or_readback) {
                         emit = false;
                         break;
                     }
                     // Desktop D3D12 forbids buffer-only state bits on texture resources
                     // (Xbox titles sometimes pass GENERIC_READ or VB/IB bits on textures).
-                    const D3D12_RESOURCE_DESC rdesc = b.Transition.pResource->GetDesc();
-                    if (rdesc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+                    if (!is_buffer) {
                         constexpr UINT kBufferOnlyBits =
                             static_cast<UINT>(D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER) |
                             static_cast<UINT>(D3D12_RESOURCE_STATE_INDEX_BUFFER) |

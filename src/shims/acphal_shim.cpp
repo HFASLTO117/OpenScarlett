@@ -399,16 +399,20 @@ struct ApuHeapPool {
     }
 
     bool AllocateApuRange(uint32_t span, uint32_t alignment, APU_ADDRESS* out_addr) {
+        if (span == 0u || alignment == 0u) return false;
         for (size_t i = 0; i < free_ranges.size(); ++i) {
             const uint64_t r_start = free_ranges[i].start;
             const uint64_t r_end = r_start + free_ranges[i].size;
             const uint64_t aligned = AlignUpU64(r_start, alignment);
-            if (aligned < r_start || aligned + span > r_end || aligned > 0xFFFFFFFFull) {
+            if (aligned < r_start || aligned > 0xFFFFFFFFull) {
+                continue;
+            }
+            const uint64_t alloc_end = aligned + static_cast<uint64_t>(span);
+            if (alloc_end < aligned || alloc_end > r_end || alloc_end > 0x100000000ull) {
                 continue;
             }
 
             const uint32_t alloc_start = static_cast<uint32_t>(aligned);
-            const uint64_t alloc_end = aligned + span;
             const uint32_t prefix_size = static_cast<uint32_t>(aligned - r_start);
             const uint32_t suffix_size = static_cast<uint32_t>(r_end - alloc_end);
 
@@ -434,12 +438,26 @@ struct ApuHeapPool {
 
     void FreeApuRange(APU_ADDRESS start, uint32_t span) {
         if (span == 0u) return;
+        const uint64_t entry_start = start;
+        const uint64_t entry_end = entry_start + static_cast<uint64_t>(span);
+        if (entry_end < entry_start || entry_end > 0x100000000ull) return;
+
         ApuFreeRange entry{start, span};
         auto it = std::lower_bound(
             free_ranges.begin(),
             free_ranges.end(),
             entry.start,
             [](const ApuFreeRange& r, uint32_t addr) { return r.start < addr; });
+        // Reject overlapping range insertions so a double-free cannot corrupt the free list.
+        if (it != free_ranges.end() && entry_end > it->start) {
+            return;
+        }
+        if (it != free_ranges.begin()) {
+            const auto prev = it - 1;
+            if (static_cast<uint64_t>(prev->start) + prev->size > entry_start) {
+                return;
+            }
+        }
         it = free_ranges.insert(it, entry);
 
         // Coalesce with next range if contiguous.
@@ -795,30 +813,74 @@ int32_t OPENSCARLETT_ACPHAL_CALL AcpHalAllocateShapeContexts(
             const_cast<AcpHalShapeContexts*>(pRequested));
 
         std::lock_guard<std::mutex> lk(g_shape_alloc_mutex);
-        auto alloc_array = [](uint32_t count, uint32_t elem_bytes) -> void* {
-            if (count == 0u) return nullptr;
-            const uint32_t total = count * elem_bytes;
+        // Upfront 64-bit overflow and sanity validation across all 6 SHAPE context arrays.
+        constexpr uint64_t kMaxSingleShapeArrayBytes = 256ull * 1024ull * 1024ull;
+        const uint32_t counts[6] = {
+            xbox_ctx->numSrcContexts,
+            xbox_ctx->numEqCompContexts,
+            xbox_ctx->numFiltVolContexts,
+            xbox_ctx->numDmaContexts,
+            xbox_ctx->numXmaContexts,
+            xbox_ctx->numPcmContexts,
+        };
+        const uint32_t elem_sizes[6] = {32u, 32u, 32u, 16u, 64u, 64u};
+        uint32_t byte_sizes[6] = {0u, 0u, 0u, 0u, 0u, 0u};
+        for (size_t i = 0; i < 6u; ++i) {
+            const uint64_t prod = static_cast<uint64_t>(counts[i]) * elem_sizes[i];
+            if (prod > kMaxSingleShapeArrayBytes || prod > 0xFFFFFFFFull) {
+                return RecordHr("AcpHalAllocateShapeContexts", ACPHAL_E_OUTOFMEMORY);
+            }
+            byte_sizes[i] = static_cast<uint32_t>(prod);
+        }
+
+        // Transactional allocation: allocate into temporaries and roll back on any failure
+        // without clobbering existing pointers in xbox_ctx.
+        void* tmp_ptrs[6] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+        bool from_apu[6] = {false, false, false, false, false, false};
+        bool ok = true;
+        for (size_t i = 0; i < 6u; ++i) {
+            if (byte_sizes[i] == 0u) {
+                continue;
+            }
             void* va = nullptr;
             APU_ADDRESS pa = APU_INVALID_ADDRESS;
-            if (ApuHeapManager::Instance().Alloc(&va, &pa, total, 64u, APU_ALLOC_CACHED) == ACPHAL_S_OK && va) {
-                g_xbox_shape_buffers.push_back(va);
-                return va;
+            if (ApuHeapManager::Instance().Alloc(&va, &pa, byte_sizes[i], 64u, APU_ALLOC_CACHED) == ACPHAL_S_OK && va) {
+                tmp_ptrs[i] = va;
+                from_apu[i] = true;
+            } else {
+                va = AlignedAllocHost(byte_sizes[i], 64u);
+                if (!va) {
+                    ok = false;
+                    break;
+                }
+                std::memset(va, 0, byte_sizes[i]);
+                tmp_ptrs[i] = va;
+                from_apu[i] = false;
             }
-            // Fallback to host aligned memory if APU heap is full.
-            va = AlignedAllocHost(total, 64u);
-            if (va) {
-                std::memset(va, 0, total);
-                g_xbox_shape_buffers.push_back(va);
+        }
+        if (!ok) {
+            for (size_t i = 0; i < 6u; ++i) {
+                if (!tmp_ptrs[i]) continue;
+                if (from_apu[i]) {
+                    (void)ApuHeapManager::Instance().Free(tmp_ptrs[i]);
+                } else {
+                    AlignedFreeHost(tmp_ptrs[i]);
+                }
             }
-            return va;
-        };
+            return RecordHr("AcpHalAllocateShapeContexts", ACPHAL_E_OUTOFMEMORY);
+        }
 
-        xbox_ctx->srcContexts = alloc_array(xbox_ctx->numSrcContexts, 32u);
-        xbox_ctx->eqCompContexts = alloc_array(xbox_ctx->numEqCompContexts, 32u);
-        xbox_ctx->filtVolContexts = alloc_array(xbox_ctx->numFiltVolContexts, 32u);
-        xbox_ctx->dmaContexts = alloc_array(xbox_ctx->numDmaContexts, 16u);
-        xbox_ctx->xmaContexts = alloc_array(xbox_ctx->numXmaContexts, 64u);
-        xbox_ctx->pcmContexts = alloc_array(xbox_ctx->numPcmContexts, 64u);
+        for (size_t i = 0; i < 6u; ++i) {
+            if (tmp_ptrs[i]) {
+                g_xbox_shape_buffers.push_back(tmp_ptrs[i]);
+            }
+        }
+        xbox_ctx->srcContexts = tmp_ptrs[0];
+        xbox_ctx->eqCompContexts = tmp_ptrs[1];
+        xbox_ctx->filtVolContexts = tmp_ptrs[2];
+        xbox_ctx->dmaContexts = tmp_ptrs[3];
+        xbox_ctx->xmaContexts = tmp_ptrs[4];
+        xbox_ctx->pcmContexts = tmp_ptrs[5];
         return RecordHr("AcpHalAllocateShapeContexts", ACPHAL_S_OK);
     }
 

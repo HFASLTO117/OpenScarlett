@@ -128,14 +128,29 @@ public:
             static_cast<uintptr_t>(0x5841505500000000ull | (handle_val & 0xFFFFFFFFull)));
 
         if (is_xbox_retail) {
-            // Allocate generous shared memory backing (fmod.dll indexes up to streamCount * 0xE000).
-            const size_t min_bytes = static_cast<size_t>(params.streamCount) * 0x10000ull;
-            const size_t alloc_bytes = std::max<size_t>(params.sharedMemoryBytes, min_bytes);
-            state->shared_memory.assign(alloc_bytes, 0u);
             auto* out_shm = static_cast<XboxXApuSharedMem*>(arg2);
+            auto* out_handle = static_cast<XAPU_CONNECTION_HANDLE*>(arg3);
+            out_shm->baseAddress = nullptr;
+            out_shm->sizeBytes = 0ull;
+            *out_handle = nullptr;
+
+            // Allocate generous shared memory backing (fmod.dll indexes up to streamCount * 0xE000),
+            // using checked 64-bit arithmetic and OOM rollback so outputs stay zeroed on failure.
+            constexpr uint64_t kMaxRetailShmBytes = 512ull * 1024ull * 1024ull;
+            const uint64_t min_bytes = static_cast<uint64_t>(params.streamCount) * 0x10000ull;
+            const uint64_t alloc_bytes = std::max<uint64_t>(params.sharedMemoryBytes, min_bytes);
+            if (alloc_bytes == 0ull || alloc_bytes > kMaxRetailShmBytes) {
+                return XAPU_E_OUTOFMEMORY;
+            }
+            try {
+                state->shared_memory.assign(static_cast<size_t>(alloc_bytes), 0u);
+            } catch (const std::bad_alloc&) {
+                state->shared_memory.clear();
+                return XAPU_E_OUTOFMEMORY;
+            }
             out_shm->baseAddress = state->shared_memory.data();
             out_shm->sizeBytes = alloc_bytes;
-            *static_cast<XAPU_CONNECTION_HANDLE*>(arg3) = raw_handle;
+            *out_handle = raw_handle;
         } else {
             *static_cast<XAPU_CONNECTION_HANDLE*>(arg1) = raw_handle;
         }

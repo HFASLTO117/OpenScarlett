@@ -116,6 +116,7 @@ foreach(_vfs_test
     test_loader_child_hook_parity
     test_s12_os_loader_gameinput
     test_gdkx_untouched_samples
+    test_minecraft_perf_hardening
 )
     _openscarlett_add_test_lock(${_vfs_test} vfs_saves)
 endforeach()

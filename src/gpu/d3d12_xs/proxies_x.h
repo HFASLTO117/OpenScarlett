@@ -697,6 +697,11 @@ private:
 // Safe for nullptr, wrapped proxies, AND raw host D3D12 pointers alike.
 // ---------------------------------------------------------------------------
 ID3D12Resource* UnwrapResource(ID3D12Resource* maybe_wrapped) noexcept;
+ID3D12Resource* UnwrapResourceWithBarrierInfo(
+    ID3D12Resource* maybe_wrapped,
+    bool& out_has_cached_info,
+    bool& out_is_upload_or_readback,
+    bool& out_is_buffer) noexcept;
 ID3D12Heap* UnwrapHeap(ID3D12Heap* maybe_wrapped) noexcept;
 ID3D12DescriptorHeap* UnwrapDescriptorHeap(ID3D12DescriptorHeap* maybe_wrapped) noexcept;
 ID3D12PipelineState* UnwrapPipelineState(ID3D12PipelineState* maybe_wrapped) noexcept;

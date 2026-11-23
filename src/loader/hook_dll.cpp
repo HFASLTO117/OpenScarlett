@@ -1763,10 +1763,13 @@ bool ResolveVirtualCreatePathW(std::wstring_view virtual_path,
                                const char* api_tag,
                                DWORD dwDesiredAccess,
                                DWORD dwCreationDisposition,
+                               DWORD dwFlagsAndAttributes,
                                std::wstring& out_host_path,
+                               DWORD& out_effective_disposition,
                                bool& out_passthrough,
                                DWORD& out_error) {
     out_host_path.clear();
+    out_effective_disposition = dwCreationDisposition;
     out_passthrough = false;
     out_error = ERROR_SUCCESS;
 
@@ -1813,8 +1816,43 @@ bool ResolveVirtualCreatePathW(std::wstring_view virtual_path,
         } else if (dwCreationDisposition == CREATE_ALWAYS) {
             st = g_vfs.TranslateForAccessW(
                 virtual_path, openscarlett::VfsAccessMode::WriteCreate, out_host_path, &was_whiteout, true);
-        } else if (dwCreationDisposition == TRUNCATE_EXISTING ||
-                   dwCreationDisposition == OPEN_EXISTING) {
+        } else if (dwCreationDisposition == TRUNCATE_EXISTING) {
+            // Validate traversal / whiteout / visibility before touching the overlay.
+            st = g_vfs.TranslateForAccessW(
+                virtual_path, openscarlett::VfsAccessMode::ReadOnly, out_host_path, &was_whiteout, true);
+            if (st == openscarlett::VfsTranslateStatus::Translated) {
+                // Win32 CreateFileW/CreateFile2 require GENERIC_WRITE (or GENERIC_ALL) for TRUNCATE_EXISTING.
+                if ((dwDesiredAccess & (GENERIC_WRITE | GENERIC_ALL)) == 0) {
+                    out_error = ERROR_INVALID_PARAMETER;
+                    return false;
+                }
+                bool is_dir = false;
+                if (!g_vfs.IsVisibleGamePathW(virtual_path, &is_dir)) {
+                    out_error = ERROR_FILE_NOT_FOUND;
+                    return false;
+                }
+                if (is_dir) {
+                    out_error = ((dwFlagsAndAttributes & FILE_FLAG_BACKUP_SEMANTICS) != 0)
+                                    ? ERROR_INVALID_PARAMETER
+                                    : ERROR_ACCESS_DENIED;
+                    return false;
+                }
+                // Route directly to the CoW overlay without copying the base file or creating
+                // a 0-byte placeholder ahead of time. If the file does not yet exist in the
+                // overlay, rewrite TRUNCATE_EXISTING -> CREATE_ALWAYS so the native open
+                // creates the truncated overlay file atomically on success.
+                std::wstring overlay_path;
+                st = g_vfs.TranslateForAccessW(
+                    virtual_path, openscarlett::VfsAccessMode::WriteCreate, overlay_path, &was_whiteout, true);
+                if (st == openscarlett::VfsTranslateStatus::Translated) {
+                    out_host_path = std::move(overlay_path);
+                    const DWORD ovl_attrs = ::GetFileAttributesW(out_host_path.c_str());
+                    if (ovl_attrs == INVALID_FILE_ATTRIBUTES) {
+                        out_effective_disposition = CREATE_ALWAYS;
+                    }
+                }
+            }
+        } else if (dwCreationDisposition == OPEN_EXISTING) {
             st = g_vfs.TranslateForAccessW(
                 virtual_path, openscarlett::VfsAccessMode::WriteModify, out_host_path, &was_whiteout, true);
         } else {
@@ -1903,19 +1941,22 @@ HANDLE CreateVirtualFileW(std::wstring_view virtual_path,
                           DWORD dwFlagsAndAttributes,
                           HANDLE hTemplateFile) {
     std::wstring host_path;
+    DWORD effective_disposition = dwCreationDisposition;
     bool passthrough = false;
     DWORD resolve_err = ERROR_SUCCESS;
+    PfnCreateFileW real_cfw = g_real_CreateFileW ? g_real_CreateFileW : &::CreateFileW;
     if (!ResolveVirtualCreatePathW(virtual_path, api_tag, dwDesiredAccess, dwCreationDisposition,
-                                   host_path, passthrough, resolve_err)) {
+                                   dwFlagsAndAttributes, host_path, effective_disposition,
+                                   passthrough, resolve_err)) {
         if (passthrough) {
             const std::wstring passthrough_path(virtual_path);
-            HANDLE h = g_real_CreateFileW(passthrough_path.c_str(),
-                                          dwDesiredAccess,
-                                          dwShareMode,
-                                          lpSecurityAttributes,
-                                          dwCreationDisposition,
-                                          dwFlagsAndAttributes,
-                                          hTemplateFile);
+            HANDLE h = real_cfw(passthrough_path.c_str(),
+                                dwDesiredAccess,
+                                dwShareMode,
+                                lpSecurityAttributes,
+                                dwCreationDisposition,
+                                dwFlagsAndAttributes,
+                                hTemplateFile);
             if (h == INVALID_HANDLE_VALUE) {
                 const DWORD e = ::GetLastError();
                 TraceVfsFailureW(api_tag, virtual_path, passthrough_path, dwDesiredAccess, dwCreationDisposition, e);
@@ -1928,13 +1969,13 @@ HANDLE CreateVirtualFileW(std::wstring_view virtual_path,
         return INVALID_HANDLE_VALUE;
     }
 
-    HANDLE h = g_real_CreateFileW(host_path.c_str(),
-                                  dwDesiredAccess,
-                                  dwShareMode,
-                                  lpSecurityAttributes,
-                                  dwCreationDisposition,
-                                  dwFlagsAndAttributes,
-                                  hTemplateFile);
+    HANDLE h = real_cfw(host_path.c_str(),
+                        dwDesiredAccess,
+                        dwShareMode,
+                        lpSecurityAttributes,
+                        effective_disposition,
+                        dwFlagsAndAttributes,
+                        hTemplateFile);
     DWORD err = ::GetLastError();
     if (h == INVALID_HANDLE_VALUE) {
         TraceVfsFailureW(api_tag, virtual_path, host_path, dwDesiredAccess, dwCreationDisposition, err);
@@ -2000,10 +2041,14 @@ HANDLE WINAPI Hook_CreateFile2(LPCWSTR lpFileName,
         !ShouldPassThroughHostDDriveW(lpFileName)) {
         ScopedVfsHookGuard guard;
         std::wstring host_path;
+        DWORD effective_disposition = dwCreationDisposition;
         bool passthrough = false;
         DWORD resolve_err = ERROR_SUCCESS;
+        const DWORD flags_and_attrs =
+            pCreateExParams ? (pCreateExParams->dwFileFlags | pCreateExParams->dwFileAttributes) : 0u;
         if (!ResolveVirtualCreatePathW(lpFileName, "CreateFile2", dwDesiredAccess, dwCreationDisposition,
-                                       host_path, passthrough, resolve_err)) {
+                                       flags_and_attrs, host_path, effective_disposition,
+                                       passthrough, resolve_err)) {
             if (!passthrough) {
                 ::SetLastError(resolve_err);
                 return INVALID_HANDLE_VALUE;
@@ -2012,7 +2057,7 @@ HANDLE WINAPI Hook_CreateFile2(LPCWSTR lpFileName,
             HANDLE h = g_real_CreateFile2(host_path.c_str(),
                                           dwDesiredAccess,
                                           dwShareMode,
-                                          dwCreationDisposition,
+                                          effective_disposition,
                                           pCreateExParams);
             DWORD err = ::GetLastError();
             openscarlett::CallTelemetry::Global().Record(
@@ -4864,6 +4909,24 @@ __declspec(dllexport) BOOL WINAPI OpenScarlettHook_ReplaceFileW(
     DWORD dwReplaceFlags) {
     return Hook_ReplaceFileW(
         lpReplacedFileName, lpReplacementFileName, lpBackupFileName, dwReplaceFlags, nullptr, nullptr);
+}
+
+__declspec(dllexport) HANDLE WINAPI OpenScarlettHook_CreateFileW(
+    LPCWSTR lpFileName,
+    DWORD dwDesiredAccess,
+    DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    DWORD dwCreationDisposition,
+    DWORD dwFlagsAndAttributes,
+    HANDLE hTemplateFile) {
+    return Hook_CreateFileW(
+        lpFileName,
+        dwDesiredAccess,
+        dwShareMode,
+        lpSecurityAttributes,
+        dwCreationDisposition,
+        dwFlagsAndAttributes,
+        hTemplateFile);
 }
 
 __declspec(dllexport) HANDLE WINAPI OpenScarlettHook_FindFirstFileA(
