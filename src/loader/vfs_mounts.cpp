@@ -2389,6 +2389,25 @@ bool VfsMounts::TryMapHostPathToVirtualW(std::wstring_view host_path,
         while (s.size() > 3 && s.back() == L'\\') {
             s.pop_back();
         }
+#if defined(_WIN32)
+        // Expand Windows 8.3 short path components (e.g. C:\Users\RUNNER~1\... -> runneradmin)
+        // so GetFinalPathNameByHandleW long paths match VFS mount roots configured via %TEMP%.
+        if (s.find(L'~') != std::wstring::npos) {
+            std::wstring expanded(std::max<size_t>(s.size() + 64u, 512u), L'\0');
+            DWORD got = ::GetLongPathNameW(s.c_str(), expanded.data(), static_cast<DWORD>(expanded.size()));
+            if (got >= expanded.size()) {
+                expanded.resize(static_cast<size_t>(got) + 1u);
+                got = ::GetLongPathNameW(s.c_str(), expanded.data(), static_cast<DWORD>(expanded.size()));
+            }
+            if (got > 0u && got < expanded.size()) {
+                expanded.resize(got);
+                while (expanded.size() > 3 && expanded.back() == L'\\') {
+                    expanded.pop_back();
+                }
+                s = std::move(expanded);
+            }
+        }
+#endif
         return s;
     };
 
