@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstdarg>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -15,6 +17,87 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
+namespace {
+
+using PfnXAsyncBegin = XGameResult(OPENSCARLETT_GDK_CALL*)(XAsyncBlock*, void*, const void*, const char*, XAsyncProvider);
+using PfnXAsyncSchedule = XGameResult(OPENSCARLETT_GDK_CALL*)(XAsyncBlock*, uint32_t);
+using PfnXAsyncComplete = void(OPENSCARLETT_GDK_CALL*)(XAsyncBlock*, XGameResult, size_t);
+using PfnXAsyncGetResult = XGameResult(OPENSCARLETT_GDK_CALL*)(XAsyncBlock*, const void*, size_t, void*, size_t*);
+
+struct DynamicXgrAsyncApi {
+    PfnXAsyncBegin begin = nullptr;
+    PfnXAsyncSchedule schedule = nullptr;
+    PfnXAsyncComplete complete = nullptr;
+    PfnXAsyncGetResult get_result = nullptr;
+
+    DynamicXgrAsyncApi() {
+#if defined(_WIN32)
+        HMODULE mod = nullptr;
+        HMODULE self = nullptr;
+        if (GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCWSTR>(&DynamicXgrAsyncApi::Get),
+                &self) && self) {
+            wchar_t path_buf[MAX_PATH * 2]{};
+            const DWORD len = GetModuleFileNameW(self, path_buf, static_cast<DWORD>(sizeof(path_buf) / sizeof(wchar_t)));
+            if (len > 0u && len < (sizeof(path_buf) / sizeof(wchar_t))) {
+                std::wstring dir(path_buf, len);
+                const size_t slash = dir.find_last_of(L"\\/");
+                if (slash != std::wstring::npos) {
+                    const std::wstring sibling = dir.substr(0, slash + 1u) + L"xgameruntime.dll";
+                    mod = LoadLibraryExW(sibling.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+                }
+            }
+        }
+        if (!mod) {
+            mod = GetModuleHandleW(L"xgameruntime.dll");
+        }
+        if (mod) {
+            begin = reinterpret_cast<PfnXAsyncBegin>(GetProcAddress(mod, "XAsyncBegin"));
+            schedule = reinterpret_cast<PfnXAsyncSchedule>(GetProcAddress(mod, "XAsyncSchedule"));
+            complete = reinterpret_cast<PfnXAsyncComplete>(GetProcAddress(mod, "XAsyncComplete"));
+            get_result = reinterpret_cast<PfnXAsyncGetResult>(GetProcAddress(mod, "XAsyncGetResult"));
+        }
+#endif
+    }
+
+    static const DynamicXgrAsyncApi& Get() {
+        static const DynamicXgrAsyncApi api;
+        return api;
+    }
+};
+
+XGameResult DynXAsyncBegin(XAsyncBlock* asyncBlock, void* context, const void* identity,
+                           const char* identityName, XAsyncProvider provider) {
+    const auto& api = DynamicXgrAsyncApi::Get();
+    return api.begin ? api.begin(asyncBlock, context, identity, identityName, provider) : XGR_E_FAIL;
+}
+
+XGameResult DynXAsyncSchedule(XAsyncBlock* asyncBlock, uint32_t delayInMs) {
+    const auto& api = DynamicXgrAsyncApi::Get();
+    return api.schedule ? api.schedule(asyncBlock, delayInMs) : XGR_E_FAIL;
+}
+
+void DynXAsyncComplete(XAsyncBlock* asyncBlock, XGameResult result, size_t requiredBufferSize) {
+    const auto& api = DynamicXgrAsyncApi::Get();
+    if (api.complete) {
+        api.complete(asyncBlock, result, requiredBufferSize);
+    }
+}
+
+XGameResult DynXAsyncGetResult(XAsyncBlock* asyncBlock, const void* identity,
+                               size_t bufferSize, void* buffer, size_t* bufferUsed) {
+    const auto& api = DynamicXgrAsyncApi::Get();
+    return api.get_result ? api.get_result(asyncBlock, identity, bufferSize, buffer, bufferUsed) : XGR_E_FAIL;
+}
+
+}  // namespace
 
 constexpr uint32_t kMagicHttpCall = 0x48434341u;    // 'HCCA'
 constexpr uint32_t kMagicWebSocket = 0x48435753u;   // 'HCWS'
@@ -137,6 +220,7 @@ struct HcState {
     uint32_t init_count = 0;
     uint64_t next_call_id = 1ull;
     bool trace_to_debugger = false;
+    std::atomic<bool> trace_etw_enabled{false};
     HCTraceLevel trace_level = HCTraceLevel_Off;
     std::unordered_map<HCCallObject*, std::shared_ptr<HCCallObject>> live_calls;
     std::unordered_map<HCWebSocketObject*, std::shared_ptr<HCWebSocketObject>> live_websockets;
@@ -335,7 +419,7 @@ XGameResult OPENSCARLETT_GDK_CALL HcWebSocketAsyncProvider(
             return XGR_S_OK;
         case XAsyncOp_DoWork: {
             if (!ctx || !ctx->ws) {
-                XAsyncComplete(data->async, XGR_E_INVALIDARG, 0);
+                DynXAsyncComplete(data->async, XGR_E_INVALIDARG, 0);
                 return XGR_E_PENDING;
             }
             {
@@ -353,7 +437,7 @@ XGameResult OPENSCARLETT_GDK_CALL HcWebSocketAsyncProvider(
             ctx->result.websocket = ctx->ws.get();
             ctx->result.errorCode = OS_SHIM_S_OK;
             ctx->result.platformErrorCode = 0u;
-            XAsyncComplete(data->async, XGR_S_OK, sizeof(WebSocketCompletionResult));
+            DynXAsyncComplete(data->async, XGR_S_OK, sizeof(WebSocketCompletionResult));
             return XGR_E_PENDING;
         }
         case XAsyncOp_GetResult: {
@@ -384,7 +468,7 @@ XGameResult OPENSCARLETT_GDK_CALL HcPerformProvider(
             return XGR_S_OK;
         case XAsyncOp_DoWork: {
             if (!ctx || !ctx->call) {
-                XAsyncComplete(data->async, XGR_E_INVALIDARG, 0);
+                DynXAsyncComplete(data->async, XGR_E_INVALIDARG, 0);
                 return XGR_E_PENDING;
             }
             std::string method;
@@ -454,7 +538,7 @@ XGameResult OPENSCARLETT_GDK_CALL HcPerformProvider(
                 ctx->call->completed = true;
             }
 
-            XAsyncComplete(data->async, XGR_S_OK, 0);
+            DynXAsyncComplete(data->async, XGR_S_OK, 0);
             return XGR_E_PENDING;
         }
         case XAsyncOp_Cleanup:
@@ -480,7 +564,7 @@ XGameResult OPENSCARLETT_GDK_CALL HcCleanupProvider(
             if (st.init_count == 0u) {
                 st.mocks.clear();
             }
-            XAsyncComplete(data->async, XGR_S_OK, 0);
+            DynXAsyncComplete(data->async, XGR_S_OK, 0);
             return XGR_E_PENDING;
         }
         default:
@@ -515,13 +599,13 @@ int32_t OS_SHIM_CALL HCCleanupAsync(XAsyncBlock* async) {
     if (!async) {
         return RecordHr("HCCleanupAsync", OS_SHIM_E_INVALIDARG);
     }
-    XGameResult hr = XAsyncBegin(async, nullptr, kIdHcCleanup, kIdHcCleanup, &HcCleanupProvider);
+    XGameResult hr = DynXAsyncBegin(async, nullptr, kIdHcCleanup, kIdHcCleanup, &HcCleanupProvider);
     if (hr < 0) {
         return RecordHr("HCCleanupAsync", hr);
     }
-    hr = XAsyncSchedule(async, 0u);
+    hr = DynXAsyncSchedule(async, 0u);
     if (hr < 0) {
-        XAsyncComplete(async, hr, 0);
+        DynXAsyncComplete(async, hr, 0);
     }
     return RecordHr("HCCleanupAsync", hr);
 }
@@ -541,11 +625,44 @@ void OS_SHIM_CALL HCTraceSetTraceToDebugger(bool traceToDebugger) {
     RecordOk("HCTraceSetTraceToDebugger");
 }
 
+OS_HC_API void OS_SHIM_CALL HCTraceSetEtwEnabled(bool enabled) {
+    GetHc().trace_etw_enabled.store(enabled, std::memory_order_relaxed);
+    RecordOk("HCTraceSetEtwEnabled");
+}
+
+OS_HC_API void OS_SHIM_CDECL HCTraceImplMessage(
+    const char* areaName,
+    HCTraceLevel level,
+    const char* format,
+    ...) {
+    (void)areaName;
+    (void)level;
+    if (format) {
+        va_list args;
+        va_start(args, format);
+        char buf[512]{};
+        std::vsnprintf(buf, sizeof(buf), format, args);
+        va_end(args);
+        (void)buf;
+    }
+    RecordOk("HCTraceImplMessage");
+}
+
 int32_t OS_SHIM_CALL HCSettingsSetTraceLevel(HCTraceLevel traceLevel) {
     auto& st = GetHc();
     std::lock_guard<std::mutex> lk(st.mutex);
     st.trace_level = traceLevel;
     return RecordHr("HCSettingsSetTraceLevel", OS_SHIM_S_OK);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCSettingsGetTraceLevel(HCTraceLevel* traceLevel) {
+    if (!traceLevel) {
+        return RecordHr("HCSettingsGetTraceLevel", OS_SHIM_E_INVALIDARG);
+    }
+    auto& st = GetHc();
+    std::lock_guard<std::mutex> lk(st.mutex);
+    *traceLevel = st.trace_level;
+    return RecordHr("HCSettingsGetTraceLevel", OS_SHIM_S_OK);
 }
 
 int32_t OS_SHIM_CALL HCHttpCallCreate(HCCallHandle* call) {
@@ -686,14 +803,14 @@ int32_t OS_SHIM_CALL HCHttpCallPerformAsync(HCCallHandle call, XAsyncBlock* asyn
         return RecordHr("HCHttpCallPerformAsync", OS_SHIM_E_OUTOFMEMORY);
     }
 
-    XGameResult hr = XAsyncBegin(asyncBlock, ctx, kIdHcPerform, kIdHcPerform, &HcPerformProvider);
+    XGameResult hr = DynXAsyncBegin(asyncBlock, ctx, kIdHcPerform, kIdHcPerform, &HcPerformProvider);
     if (hr < 0) {
         delete ctx;
         return RecordHr("HCHttpCallPerformAsync", hr);
     }
-    hr = XAsyncSchedule(asyncBlock, 0u);
+    hr = DynXAsyncSchedule(asyncBlock, 0u);
     if (hr < 0) {
-        XAsyncComplete(asyncBlock, hr, 0);
+        DynXAsyncComplete(asyncBlock, hr, 0);
     }
     return RecordHr("HCHttpCallPerformAsync", hr);
 }
@@ -967,6 +1084,21 @@ OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestSetRetryCacheId(
     return RecordHr("HCHttpCallRequestSetRetryCacheId", OS_SHIM_S_OK);
 }
 
+OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestGetRetryCacheId(
+    HCCallHandle call,
+    uint32_t* retryAfterCacheId) {
+    if (!call || !retryAfterCacheId) {
+        return RecordHr("HCHttpCallRequestGetRetryCacheId", OS_SHIM_E_INVALIDARG);
+    }
+    auto obj = LookupCall(call);
+    if (!obj) {
+        return RecordHr("HCHttpCallRequestGetRetryCacheId", OS_SHIM_E_HANDLE);
+    }
+    std::lock_guard<std::mutex> lk(obj->mutex);
+    *retryAfterCacheId = obj->retry_cache_id;
+    return RecordHr("HCHttpCallRequestGetRetryCacheId", OS_SHIM_S_OK);
+}
+
 OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestSetSSLValidation(
     HCCallHandle call,
     bool sslValidation) {
@@ -989,6 +1121,17 @@ OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestGetUrl(
     *method = obj->method.c_str();
     *url = obj->url.c_str();
     return RecordHr("HCHttpCallRequestGetUrl", OS_SHIM_S_OK);
+}
+
+OS_HC_API int32_t OS_SHIM_CALL HCHttpCallGetRequestUrl(
+    HCCallHandle call,
+    const char** url) {
+    if (!call || !url) {
+        return RecordHr("HCHttpCallGetRequestUrl", OS_SHIM_E_INVALIDARG);
+    }
+    const char* ignored_method = nullptr;
+    const int32_t hr = HCHttpCallRequestGetUrl(call, &ignored_method, url);
+    return RecordHr("HCHttpCallGetRequestUrl", hr);
 }
 
 OS_HC_API int32_t OS_SHIM_CALL HCHttpCallRequestGetNumHeaders(
@@ -1283,14 +1426,14 @@ OS_HC_API int32_t OS_SHIM_CALL HCWebSocketConnectAsync(
     ctx->sub_protocol = subProtocol ? subProtocol : "";
     ctx->op_kind = 0u;
 
-    XGameResult hr = XAsyncBegin(asyncBlock, ctx, kIdWsConnect, kIdWsConnect, &HcWebSocketAsyncProvider);
+    XGameResult hr = DynXAsyncBegin(asyncBlock, ctx, kIdWsConnect, kIdWsConnect, &HcWebSocketAsyncProvider);
     if (hr < 0) {
         delete ctx;
         return RecordHr("HCWebSocketConnectAsync", hr);
     }
-    hr = XAsyncSchedule(asyncBlock, 0u);
+    hr = DynXAsyncSchedule(asyncBlock, 0u);
     if (hr < 0) {
-        XAsyncComplete(asyncBlock, hr, 0);
+        DynXAsyncComplete(asyncBlock, hr, 0);
     }
     return RecordHr("HCWebSocketConnectAsync", hr);
 }
@@ -1301,7 +1444,7 @@ OS_HC_API int32_t OS_SHIM_CALL HCGetWebSocketConnectResult(
     if (!asyncBlock || !result) {
         return RecordHr("HCGetWebSocketConnectResult", OS_SHIM_E_INVALIDARG);
     }
-    XGameResult hr = XAsyncGetResult(
+    XGameResult hr = DynXAsyncGetResult(
         asyncBlock, kIdWsConnect, sizeof(WebSocketCompletionResult), result, nullptr);
     return RecordHr("HCGetWebSocketConnectResult", hr);
 }
@@ -1335,14 +1478,14 @@ OS_HC_API int32_t OS_SHIM_CALL HCWebSocketSendMessageAsync(
     ctx->text_payload = message;
     ctx->op_kind = 1u;
 
-    XGameResult hr = XAsyncBegin(asyncBlock, ctx, kIdWsSend, kIdWsSend, &HcWebSocketAsyncProvider);
+    XGameResult hr = DynXAsyncBegin(asyncBlock, ctx, kIdWsSend, kIdWsSend, &HcWebSocketAsyncProvider);
     if (hr < 0) {
         delete ctx;
         return RecordHr("HCWebSocketSendMessageAsync", hr);
     }
-    hr = XAsyncSchedule(asyncBlock, 0u);
+    hr = DynXAsyncSchedule(asyncBlock, 0u);
     if (hr < 0) {
-        XAsyncComplete(asyncBlock, hr, 0);
+        DynXAsyncComplete(asyncBlock, hr, 0);
     }
     return RecordHr("HCWebSocketSendMessageAsync", hr);
 }
@@ -1353,7 +1496,7 @@ OS_HC_API int32_t OS_SHIM_CALL HCGetWebSocketSendMessageResult(
     if (!asyncBlock || !result) {
         return RecordHr("HCGetWebSocketSendMessageResult", OS_SHIM_E_INVALIDARG);
     }
-    XGameResult hr = XAsyncGetResult(
+    XGameResult hr = DynXAsyncGetResult(
         asyncBlock, kIdWsSend, sizeof(WebSocketCompletionResult), result, nullptr);
     return RecordHr("HCGetWebSocketSendMessageResult", hr);
 }
@@ -1390,15 +1533,15 @@ OS_HC_API int32_t OS_SHIM_CALL HCWebSocketSendBinaryMessageAsync(
     }
     ctx->op_kind = 2u;
 
-    XGameResult hr = XAsyncBegin(
+    XGameResult hr = DynXAsyncBegin(
         asyncBlock, ctx, kIdWsSendBin, kIdWsSendBin, &HcWebSocketAsyncProvider);
     if (hr < 0) {
         delete ctx;
         return RecordHr("HCWebSocketSendBinaryMessageAsync", hr);
     }
-    hr = XAsyncSchedule(asyncBlock, 0u);
+    hr = DynXAsyncSchedule(asyncBlock, 0u);
     if (hr < 0) {
-        XAsyncComplete(asyncBlock, hr, 0);
+        DynXAsyncComplete(asyncBlock, hr, 0);
     }
     return RecordHr("HCWebSocketSendBinaryMessageAsync", hr);
 }

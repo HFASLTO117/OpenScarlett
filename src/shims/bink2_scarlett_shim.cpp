@@ -17,12 +17,55 @@ namespace {
 
 constexpr const char* kModName = "Bink2Scarlett.dll";
 
+using BinkAllocFn = void* (*)(uint64_t);
+using BinkFreeFn = void (*)(void*);
+
+struct BinkPlaneLayout {
+    int32_t Allocate;
+    void* Buffer;
+    uint32_t BufferPitch;
+};
+
+struct BinkFramePlaneSetLayout {
+    BinkPlaneLayout YPlane;
+    BinkPlaneLayout cRPlane;
+    BinkPlaneLayout cBPlane;
+    BinkPlaneLayout APlane;
+};
+
+constexpr uint32_t kBinkMaxFrameBuffers = 2u;
+
+struct BinkFrameBuffersLayout {
+    int32_t TotalFrames;
+    uint32_t YABufferWidth;
+    uint32_t YABufferHeight;
+    uint32_t cRcBBufferWidth;
+    uint32_t cRcBBufferHeight;
+    uint32_t FrameNum;
+    BinkFramePlaneSetLayout Frames[kBinkMaxFrameBuffers];
+};
+
+static_assert(sizeof(void*) != 8 || sizeof(BinkPlaneLayout) == 24, "Unexpected BinkPlaneLayout size");
+static_assert(sizeof(void*) != 8 || sizeof(BinkFramePlaneSetLayout) == 96, "Unexpected BinkFramePlaneSetLayout size");
+static_assert(sizeof(void*) != 8 || sizeof(BinkFrameBuffersLayout) == 216, "Unexpected BinkFrameBuffersLayout size");
+
+struct AsyncThreadState {
+    bool active = false;
+    bool stop_requested = false;
+    const void* param = nullptr;
+};
+
 struct BinkSession {
     BinkStruct pub{};  // Must be first member so HBink == &session->pub
     openscarlett::Bink2Decoder decoder;
     openscarlett::Bink2DecodedFrame cached_frame{};
     bool has_cached_frame = false;
     bool needs_seek = false;
+    bool async_frame_done = false;
+    bool will_loop = false;
+    bool has_registered_fb = false;
+    BinkFrameBuffersLayout registered_fb{};
+    std::unordered_map<uint32_t, int32_t> track_volumes;
     uint32_t total_decoded_frames = 0;
 };
 
@@ -30,6 +73,12 @@ struct BinkGlobalState {
     std::mutex mutex;
     std::string last_error;
     std::unordered_map<HBink, std::unique_ptr<BinkSession>> sessions;
+    BinkAllocFn alloc_fn = nullptr;
+    BinkFreeFn free_fn = nullptr;
+    const void* os_file_callbacks = nullptr;
+    void* sound_open_fn = nullptr;
+    uint64_t sound_param = 0;
+    std::unordered_map<int32_t, AsyncThreadState> async_threads;
     std::mutex gpu_mutex;
     std::unique_ptr<openscarlett::Bink2GpuColorConverter> gpu_hw;
     std::unique_ptr<openscarlett::Bink2GpuColorConverter> gpu_warp;
@@ -447,6 +496,303 @@ OS_BINK2_API int32_t OS_SHIM_CALL BinkGetGpuConverterStats(
     if (outCpuFallbacks) *outCpuFallbacks = st.cpu_fallback_conversions;
     RecordOk("BinkGetGpuConverterStats");
     return 0;
+}
+
+OS_BINK2_API int32_t OS_SHIM_CALL BinkDoFrameAsyncMulti(
+    HBink bnk,
+    uint32_t* threads,
+    int32_t thread_count) {
+    (void)threads;
+    (void)thread_count;
+    if (!bnk) {
+        SetLastErrorStr("BinkDoFrameAsyncMulti: invalid Bink handle");
+        RecordErr("BinkDoFrameAsyncMulti");
+        return 0;
+    }
+    const int32_t rc = BinkDoFrame(bnk);
+    if (rc != 0) {
+        RecordErr("BinkDoFrameAsyncMulti");
+        return 0;
+    }
+    {
+        auto& g = GetBinkState();
+        std::lock_guard<std::mutex> lk(g.mutex);
+        if (BinkSession* s = LookupSessionLocked(g, bnk)) {
+            s->async_frame_done = true;
+        }
+    }
+    RecordOk("BinkDoFrameAsyncMulti");
+    return 1;
+}
+
+OS_BINK2_API int32_t OS_SHIM_CALL BinkDoFrameAsyncWait(HBink bnk, int64_t us) {
+    (void)us;
+    auto& g = GetBinkState();
+    std::lock_guard<std::mutex> lk(g.mutex);
+    BinkSession* s = LookupSessionLocked(g, bnk);
+    if (s) {
+        s->async_frame_done = true;
+        RecordOk("BinkDoFrameAsyncWait");
+    } else {
+        RecordErr("BinkDoFrameAsyncWait");
+    }
+    // Always return 1 (complete) so callers never spinloop waiting on async decode.
+    return 1;
+}
+
+OS_BINK2_API void OS_SHIM_CALL BinkFreeGlobals(void) {
+    {
+        auto& g = GetBinkState();
+        std::scoped_lock lk(g.mutex, g.gpu_mutex);
+        for (auto& kv : g.sessions) {
+            if (kv.second) {
+                kv.second->decoder.Close();
+            }
+        }
+        g.sessions.clear();
+        g.last_error.clear();
+        g.alloc_fn = nullptr;
+        g.free_fn = nullptr;
+        g.os_file_callbacks = nullptr;
+        g.sound_open_fn = nullptr;
+        g.sound_param = 0;
+        g.async_threads.clear();
+        if (g.gpu_hw) {
+            g.gpu_hw->Shutdown();
+            g.gpu_hw.reset();
+        }
+        if (g.gpu_warp) {
+            g.gpu_warp->Shutdown();
+            g.gpu_warp.reset();
+        }
+    }
+    RecordOk("BinkFreeGlobals");
+}
+
+OS_BINK2_API void OS_SHIM_CALL BinkGetFrameBuffersInfo(HBink bnk, void* fbset) {
+    if (!fbset) {
+        RecordErr("BinkGetFrameBuffersInfo");
+        return;
+    }
+    std::memset(fbset, 0, sizeof(BinkFrameBuffersLayout));
+    auto& g = GetBinkState();
+    std::lock_guard<std::mutex> lk(g.mutex);
+    BinkSession* s = LookupSessionLocked(g, bnk);
+    if (!s) {
+        RecordErr("BinkGetFrameBuffersInfo");
+        return;
+    }
+
+    const uint32_t width = s->pub.Width;
+    const uint32_t height = s->pub.Height;
+    const uint32_t chroma_w = (width > 0u) ? ((width + 1u) / 2u) : 0u;
+    const uint32_t chroma_h = (height > 0u) ? ((height + 1u) / 2u) : 0u;
+    const uint32_t y_pitch = (width + 15u) & ~15u;
+    const uint32_t c_pitch = (chroma_w + 15u) & ~15u;
+
+    auto* out = static_cast<BinkFrameBuffersLayout*>(fbset);
+    out->TotalFrames = 1;
+    out->YABufferWidth = width;
+    out->YABufferHeight = height;
+    out->cRcBBufferWidth = chroma_w;
+    out->cRcBBufferHeight = chroma_h;
+    out->FrameNum = 0u;
+
+    out->Frames[0].YPlane.Allocate = 1;
+    out->Frames[0].YPlane.Buffer = nullptr;
+    out->Frames[0].YPlane.BufferPitch = y_pitch;
+
+    out->Frames[0].cRPlane.Allocate = 1;
+    out->Frames[0].cRPlane.Buffer = nullptr;
+    out->Frames[0].cRPlane.BufferPitch = c_pitch;
+
+    out->Frames[0].cBPlane.Allocate = 1;
+    out->Frames[0].cBPlane.Buffer = nullptr;
+    out->Frames[0].cBPlane.BufferPitch = c_pitch;
+
+    out->Frames[0].APlane.Allocate = 0;
+    out->Frames[0].APlane.Buffer = nullptr;
+    out->Frames[0].APlane.BufferPitch = 0u;
+
+    RecordOk("BinkGetFrameBuffersInfo");
+}
+
+OS_BINK2_API uint32_t OS_SHIM_CALL BinkGetKeyFrame(
+    HBink bnk,
+    uint32_t frame,
+    int32_t flags) {
+    (void)flags;
+    auto& g = GetBinkState();
+    std::lock_guard<std::mutex> lk(g.mutex);
+    BinkSession* s = LookupSessionLocked(g, bnk);
+    uint32_t keyframe = (frame > 0u) ? frame : 1u;
+    if (s) {
+        if (s->pub.Frames > 0u && keyframe > s->pub.Frames) {
+            keyframe = s->pub.Frames;
+        }
+        RecordOk("BinkGetKeyFrame");
+    } else {
+        RecordErr("BinkGetKeyFrame");
+    }
+    return keyframe;
+}
+
+OS_BINK2_API int32_t OS_SHIM_CALL BinkGetPlatformInfo(int32_t bink_enum, void* output) {
+    (void)bink_enum;
+    if (output) {
+        *static_cast<uint32_t*>(output) = 0u;
+    }
+    RecordOk("BinkGetPlatformInfo");
+    return 1;
+}
+
+OS_BINK2_API HBink OS_SHIM_CALL BinkOpenWithOptions(
+    const char* name,
+    const void* open_options,
+    uint32_t flags) {
+    (void)open_options;
+    HBink h = BinkOpen(name, flags);
+    if (h) {
+        RecordOk("BinkOpenWithOptions");
+    } else {
+        RecordErr("BinkOpenWithOptions");
+    }
+    return h;
+}
+
+OS_BINK2_API void OS_SHIM_CALL BinkRegisterFrameBuffers(HBink bnk, void* fbset) {
+    auto& g = GetBinkState();
+    std::lock_guard<std::mutex> lk(g.mutex);
+    BinkSession* s = LookupSessionLocked(g, bnk);
+    if (!s) {
+        RecordErr("BinkRegisterFrameBuffers");
+        return;
+    }
+    if (fbset) {
+        std::memcpy(&s->registered_fb, fbset, sizeof(BinkFrameBuffersLayout));
+        s->has_registered_fb = true;
+    } else {
+        std::memset(&s->registered_fb, 0, sizeof(BinkFrameBuffersLayout));
+        s->has_registered_fb = false;
+    }
+    RecordOk("BinkRegisterFrameBuffers");
+}
+
+OS_BINK2_API int32_t OS_SHIM_CALL BinkRequestStopAsyncThreadsMulti(
+    uint32_t* threads,
+    int32_t thread_count) {
+    auto& g = GetBinkState();
+    std::lock_guard<std::mutex> lk(g.mutex);
+    if (threads && thread_count > 0) {
+        for (int32_t i = 0; i < thread_count; ++i) {
+            g.async_threads[static_cast<int32_t>(threads[i])].stop_requested = true;
+        }
+    } else if (!threads) {
+        for (auto& kv : g.async_threads) {
+            kv.second.stop_requested = true;
+        }
+    }
+    RecordOk("BinkRequestStopAsyncThreadsMulti");
+    return 1;
+}
+
+OS_BINK2_API void OS_SHIM_CALL BinkSetMemory(
+    void* (*alloc_fn)(uint64_t),
+    void (*free_fn)(void*)) {
+    auto& g = GetBinkState();
+    std::lock_guard<std::mutex> lk(g.mutex);
+    g.alloc_fn = alloc_fn;
+    g.free_fn = free_fn;
+    RecordOk("BinkSetMemory");
+}
+
+OS_BINK2_API void OS_SHIM_CALL BinkSetOSFileCallbacks(const void* callbacks) {
+    auto& g = GetBinkState();
+    std::lock_guard<std::mutex> lk(g.mutex);
+    g.os_file_callbacks = callbacks;
+    RecordOk("BinkSetOSFileCallbacks");
+}
+
+OS_BINK2_API int32_t OS_SHIM_CALL BinkSetSoundSystem(void* open_fn, uint64_t param) {
+    auto& g = GetBinkState();
+    std::lock_guard<std::mutex> lk(g.mutex);
+    g.sound_open_fn = open_fn;
+    g.sound_param = param;
+    RecordOk("BinkSetSoundSystem");
+    return 1;
+}
+
+OS_BINK2_API void OS_SHIM_CALL BinkSetVolume(
+    HBink bnk,
+    uint32_t trackid,
+    int32_t volume) {
+    auto& g = GetBinkState();
+    std::lock_guard<std::mutex> lk(g.mutex);
+    BinkSession* s = LookupSessionLocked(g, bnk);
+    if (!s) {
+        RecordErr("BinkSetVolume");
+        return;
+    }
+    s->track_volumes[trackid] = volume;
+    RecordOk("BinkSetVolume");
+}
+
+OS_BINK2_API void OS_SHIM_CALL BinkSetWillLoop(HBink bnk, int32_t onoff) {
+    auto& g = GetBinkState();
+    std::lock_guard<std::mutex> lk(g.mutex);
+    BinkSession* s = LookupSessionLocked(g, bnk);
+    if (!s) {
+        RecordErr("BinkSetWillLoop");
+        return;
+    }
+    s->will_loop = (onoff != 0);
+    RecordOk("BinkSetWillLoop");
+}
+
+OS_BINK2_API int32_t OS_SHIM_CALL BinkShouldSkip(HBink bnk) {
+    auto& g = GetBinkState();
+    std::lock_guard<std::mutex> lk(g.mutex);
+    BinkSession* s = LookupSessionLocked(g, bnk);
+    if (s) {
+        RecordOk("BinkShouldSkip");
+    } else {
+        RecordErr("BinkShouldSkip");
+    }
+    return 0;
+}
+
+OS_BINK2_API int32_t OS_SHIM_CALL BinkStartAsyncThread(
+    int32_t thread_num,
+    const void* thread_param) {
+    auto& g = GetBinkState();
+    std::lock_guard<std::mutex> lk(g.mutex);
+    AsyncThreadState& slot = g.async_threads[thread_num];
+    slot.active = true;
+    slot.stop_requested = false;
+    slot.param = thread_param;
+    RecordOk("BinkStartAsyncThread");
+    return 1;
+}
+
+OS_BINK2_API int32_t OS_SHIM_CALL BinkWaitStopAsyncThreadsMulti(
+    uint32_t* threads,
+    int32_t thread_count) {
+    auto& g = GetBinkState();
+    std::lock_guard<std::mutex> lk(g.mutex);
+    if (threads && thread_count > 0) {
+        for (int32_t i = 0; i < thread_count; ++i) {
+            AsyncThreadState& slot = g.async_threads[static_cast<int32_t>(threads[i])];
+            slot.active = false;
+            slot.stop_requested = false;
+        }
+    } else if (!threads) {
+        for (auto& kv : g.async_threads) {
+            kv.second.active = false;
+            kv.second.stop_requested = false;
+        }
+    }
+    RecordOk("BinkWaitStopAsyncThreadsMulti");
+    return 1;
 }
 
 }  // extern "C"

@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -426,6 +427,32 @@ public:
         return XAPU_S_OK;
     }
 
+    int32_t GetResultCount(
+        XAPU_CONNECTION_HANDLE connection,
+        uint32_t* out_result_count) {
+        if (!out_result_count || !IsWritablePointer(out_result_count, sizeof(uint32_t))) {
+            return XAPU_E_INVALIDARG;
+        }
+        *out_result_count = 0u;
+
+        if (!connection) {
+            return XAPU_E_INVALIDARG;
+        }
+
+        std::shared_ptr<XApuConnectionState> state = Lookup(connection);
+        if (!state) {
+            return XAPU_E_INVALIDARG;
+        }
+
+        std::lock_guard<std::mutex> lk(state->queue_mutex);
+        const size_t count = state->xbox_retail_mode
+                                 ? state->xbox_result_queue.size()
+                                 : state->result_queue.size();
+        const size_t max_u32 = static_cast<size_t>((std::numeric_limits<uint32_t>::max)());
+        *out_result_count = static_cast<uint32_t>((std::min)(count, max_u32));
+        return XAPU_S_OK;
+    }
+
     int32_t Disconnect(XAPU_CONNECTION_HANDLE connection) {
         if (!connection) {
             return XAPU_E_HANDLE;
@@ -505,6 +532,14 @@ OPENSCARLETT_XAPU_API int32_t OPENSCARLETT_XAPU_CALL XApuDequeueResult(
         "XApuDequeueResult",
         XApuRegistry::Instance().DequeueResult(
             connection, resultBuffer, resultBufferSize, outResultSize));
+}
+
+OPENSCARLETT_XAPU_API int32_t OPENSCARLETT_XAPU_CALL XApuGetResultCount(
+    XAPU_CONNECTION_HANDLE connection,
+    uint32_t* resultCount) {
+    return RecordHr(
+        "XApuGetResultCount",
+        XApuRegistry::Instance().GetResultCount(connection, resultCount));
 }
 
 OPENSCARLETT_XAPU_API int32_t OPENSCARLETT_XAPU_CALL XApuDisconnect(

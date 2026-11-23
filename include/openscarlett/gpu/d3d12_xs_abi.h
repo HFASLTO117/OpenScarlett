@@ -921,6 +921,9 @@ OPENSCARLETT_D3D12_API HRESULT WINAPI DXGIXSetFrameNotification(
     HANDLE hEvent);
 
 // Xbox GDKX process priority, active device lookup, frame pacing & error reporting helpers.
+OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxSetProcessDebugFlags(
+    D3D12XBOX_PROCESS_DEBUG_FLAGS Flags);
+
 OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxSetProcessGpuPriority(
     D3D12XBOX_PROCESS_GPU_PRIORITY Priority);
 

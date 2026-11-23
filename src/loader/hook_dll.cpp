@@ -353,6 +353,7 @@ using PfnCreateProcessW = BOOL(WINAPI*)(LPCWSTR,
                                         LPPROCESS_INFORMATION);
 using PfnExitProcess = VOID(WINAPI*)(UINT);
 using PfnOutputDebugStringA = VOID(WINAPI*)(LPCSTR);
+using PfnWinHttpConnect = LPVOID(WINAPI*)(LPVOID, LPCWSTR, WORD, DWORD);
 
 PfnLoadLibraryA g_real_LoadLibraryA = nullptr;
 PfnLoadLibraryW g_real_LoadLibraryW = nullptr;
@@ -370,6 +371,7 @@ PfnCreateFileW g_real_CreateFileW = nullptr;
 PfnCreateFile2 g_real_CreateFile2 = nullptr;
 PfnCloseHandle g_real_CloseHandle = nullptr;
 PfnGetFinalPathNameByHandleW g_real_GetFinalPathNameByHandleW = nullptr;
+PfnCreateFile2 g_kernelbase_CreateFile2 = nullptr;
 PfnGetFileAttributesA g_real_GetFileAttributesA = nullptr;
 PfnGetFileAttributesW g_real_GetFileAttributesW = nullptr;
 PfnGetFileAttributesExA g_real_GetFileAttributesExA = nullptr;
@@ -403,6 +405,8 @@ PfnCreateProcessA g_kernelbase_CreateProcessA = nullptr;
 PfnCreateProcessW g_kernelbase_CreateProcessW = nullptr;
 PfnExitProcess g_real_ExitProcess = nullptr;
 PfnOutputDebugStringA g_real_OutputDebugStringA = nullptr;
+PfnWinHttpConnect g_real_WinHttpConnect = nullptr;
+bool g_offline_block_winhttp = false;
 bool g_trace_ods = false;
 PfnNtCreateFile g_real_NtCreateFile = nullptr;
 PfnNtOpenFile g_real_NtOpenFile = nullptr;
@@ -675,6 +679,7 @@ bool IsHookableImportDll(const char* dll_name) {
     if (lo == "kernel32.dll" ||
         lo == "kernelbase.dll" ||
         lo == "ntdll.dll" ||
+        (g_offline_block_winhttp && lo == "winhttp.dll") ||
         lo.rfind("api-ms-win-core-", 0) == 0) {
         return true;
     }
@@ -4972,6 +4977,90 @@ VOID WINAPI Hook_OutputDebugStringA(LPCSTR lpOutputString) {
     }
 }
 
+LPVOID WINAPI Hook_WinHttpConnect(LPVOID hSession, LPCWSTR pswzServerName, WORD nServerPort, DWORD dwReserved) {
+    if (g_offline_block_winhttp) {
+        ::SetLastError(12029u /*ERROR_WINHTTP_CANNOT_CONNECT*/);
+        return nullptr;
+    }
+    return g_real_WinHttpConnect
+               ? g_real_WinHttpConnect(hSession, pswzServerName, nServerPort, dwReserved)
+               : nullptr;
+}
+
+LONG CALLBACK Zen2IllegalInstructionVeh(PEXCEPTION_POINTERS ep) {
+    if (!ep || !ep->ExceptionRecord || !ep->ContextRecord ||
+        ep->ExceptionRecord->ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    auto* ctx = ep->ContextRecord;
+    auto* p = reinterpret_cast<uint8_t*>(ctx->Rip);
+    if (!p) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    // 1. AMD Zen 2 CLZERO (0F 01 FC): zeroes the 64-byte cache line at [RAX & ~63].
+    if (p[0] == 0x0Fu && p[1] == 0x01u && p[2] == 0xFCu) {
+        void* line = reinterpret_cast<void*>(ctx->Rax & ~63ull);
+        std::memset(line, 0, 64u);
+        ctx->Rip += 3u;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    // 2. AMD Zen 2 MCOMMIT (F3 0F 01 FA): memory-commit barrier -> NOP on desktop x86-64.
+    if (p[0] == 0xF3u && p[1] == 0x0Fu && p[2] == 0x01u && p[3] == 0xFAu) {
+        DWORD old_prot = 0;
+        if (::VirtualProtect(p, 4u, PAGE_EXECUTE_READWRITE, &old_prot)) {
+            std::memset(p, 0x90, 4u);
+            ::VirtualProtect(p, 4u, old_prot, &old_prot);
+            ::FlushInstructionCache(::GetCurrentProcess(), p, 4u);
+        }
+        ctx->Rip += 4u;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    // 3. CLWB (66 [REX] 0F AE /6) and CLFLUSHOPT (66 [REX] 0F AE /7):
+    //    Supported on Xbox Series X Zen 2 and Intel Ice Lake+, missing on Intel Skylake/Coffee Lake.
+    //    Hot-patch to NOPs so tight descriptor/cache-flush loops run at native speed without re-trapping.
+    if (p[0] == 0x66u) {
+        size_t idx = 1u;
+        if ((p[idx] & 0xF0u) == 0x40u) {
+            ++idx;  // REX prefix
+        }
+        if (p[idx] == 0x0Fu && p[idx + 1u] == 0xAEu) {
+            const uint8_t modrm = p[idx + 2u];
+            const uint8_t mod = static_cast<uint8_t>((modrm >> 6u) & 3u);
+            const uint8_t reg = static_cast<uint8_t>((modrm >> 3u) & 7u);
+            const uint8_t rm = static_cast<uint8_t>(modrm & 7u);
+            if (mod != 3u && (reg == 6u || reg == 7u)) {
+                size_t len = idx + 3u;
+                if (rm == 4u) {
+                    const uint8_t sib = p[len++];
+                    if (mod == 0u && (sib & 7u) == 5u) {
+                        len += 4u;
+                    }
+                } else if (mod == 0u && rm == 5u) {
+                    len += 4u;
+                }
+                if (mod == 1u) {
+                    len += 1u;
+                } else if (mod == 2u) {
+                    len += 4u;
+                }
+                DWORD old_prot = 0;
+                if (::VirtualProtect(p, len, PAGE_EXECUTE_READWRITE, &old_prot)) {
+                    std::memset(p, 0x90, len);
+                    ::VirtualProtect(p, len, old_prot, &old_prot);
+                    ::FlushInstructionCache(::GetCurrentProcess(), p, len);
+                }
+                ctx->Rip += len;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
+    }
+
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 VOID WINAPI Hook_ExitProcess(UINT uExitCode) {
     if (g_trace_ods && uExitCode != 0u) {
         const DWORD last_err = ::GetLastError();
@@ -5154,6 +5243,8 @@ void* ResolveHookForSymbol(const char* name) {
          reinterpret_cast<void**>(&g_real_ExitProcess)},
         {"OutputDebugStringA", reinterpret_cast<void*>(&Hook_OutputDebugStringA),
          reinterpret_cast<void**>(&g_real_OutputDebugStringA)},
+        {"WinHttpConnect", reinterpret_cast<void*>(&Hook_WinHttpConnect),
+         reinterpret_cast<void**>(&g_real_WinHttpConnect)},
         {"NtCreateFile", reinterpret_cast<void*>(&Hook_NtCreateFile),
          reinterpret_cast<void**>(&g_real_NtCreateFile)},
         {"NtOpenFile", reinterpret_cast<void*>(&Hook_NtOpenFile),
@@ -5201,12 +5292,14 @@ void* ResolveHookForRealAddress(ULONGLONG addr) {
     if (void* p = match(g_real_GetModuleFileNameA, &Hook_GetModuleFileNameA)) return p;
     if (void* p = match(g_real_GetModuleFileNameW, &Hook_GetModuleFileNameW)) return p;
     if (void* p = match(g_real_GetProcAddress, &Hook_GetProcAddress)) return p;
+    if (void* p = match(g_kernelbase_CreateFile2, &Hook_CreateFile2)) return p;
     if (void* p = match(g_real_CreateProcessA, &Hook_CreateProcessA)) return p;
     if (void* p = match(g_real_CreateProcessW, &Hook_CreateProcessW)) return p;
     if (void* p = match(g_kernelbase_CreateProcessA, &Hook_CreateProcessA)) return p;
     if (void* p = match(g_kernelbase_CreateProcessW, &Hook_CreateProcessW)) return p;
     if (void* p = match(g_real_ExitProcess, &Hook_ExitProcess)) return p;
     if (void* p = match(g_real_OutputDebugStringA, &Hook_OutputDebugStringA)) return p;
+    if (void* p = match(g_real_WinHttpConnect, &Hook_WinHttpConnect)) return p;
     if (void* p = match(g_real_NtCreateFile, &Hook_NtCreateFile)) return p;
     if (void* p = match(g_real_NtOpenFile, &Hook_NtOpenFile)) return p;
     if (void* p = match(g_real_NtQueryAttributesFile, &Hook_NtQueryAttributesFile)) return p;
@@ -5834,8 +5927,12 @@ bool InitializeHookRuntime(HMODULE self_mod) {
     g_real_CreateFileA = reinterpret_cast<PfnCreateFileA>(::GetProcAddress(k32, "CreateFileA"));
     g_real_CreateFileW = reinterpret_cast<PfnCreateFileW>(::GetProcAddress(k32, "CreateFileW"));
     g_real_CreateFile2 = reinterpret_cast<PfnCreateFile2>(::GetProcAddress(k32, "CreateFile2"));
-    if (!g_real_CreateFile2 && g_kernelbase_mod != nullptr) {
-        g_real_CreateFile2 = reinterpret_cast<PfnCreateFile2>(::GetProcAddress(g_kernelbase_mod, "CreateFile2"));
+    if (g_kernelbase_mod != nullptr) {
+        g_kernelbase_CreateFile2 =
+            reinterpret_cast<PfnCreateFile2>(::GetProcAddress(g_kernelbase_mod, "CreateFile2"));
+        if (g_real_CreateFile2 == nullptr) {
+            g_real_CreateFile2 = g_kernelbase_CreateFile2;
+        }
     }
     g_real_CloseHandle = reinterpret_cast<PfnCloseHandle>(::GetProcAddress(k32, "CloseHandle"));
     g_real_GetFinalPathNameByHandleW = reinterpret_cast<PfnGetFinalPathNameByHandleW>(
@@ -5881,6 +5978,16 @@ bool InitializeHookRuntime(HMODULE self_mod) {
     g_real_ExitProcess = reinterpret_cast<PfnExitProcess>(::GetProcAddress(k32, "ExitProcess"));
     g_real_OutputDebugStringA =
         reinterpret_cast<PfnOutputDebugStringA>(::GetProcAddress(k32, "OutputDebugStringA"));
+    {
+        char off_buf[16]{};
+        const DWORD off_len = ::GetEnvironmentVariableA("OPENSCARLETT_OFFLINE", off_buf, static_cast<DWORD>(sizeof(off_buf)));
+        g_offline_block_winhttp = (off_len > 0u && off_buf[0] != '0');
+        HMODULE h_winhttp = ::GetModuleHandleW(L"winhttp.dll");
+        if (h_winhttp != nullptr) {
+            g_real_WinHttpConnect =
+                reinterpret_cast<PfnWinHttpConnect>(::GetProcAddress(h_winhttp, "WinHttpConnect"));
+        }
+    }
     g_trace_ods = (ReadEnvW(L"OPENSCARLETT_TRACE_ODS") == L"1");
     if (g_ntdll_mod != nullptr) {
         g_real_NtCreateFile =
@@ -6022,6 +6129,9 @@ bool InitializeHookRuntime(HMODULE self_mod) {
             lsa_loaded ? 1 : 0,
             -1);
     }
+
+    // Install Zen 2 CLWB/CLFLUSHOPT/CLZERO/MCOMMIT emulation VEH for pre-Ice-Lake Intel CPUs.
+    ::AddVectoredExceptionHandler(1u, &Zen2IllegalInstructionVeh);
 
     g_probe_unknown_imports = openscarlett::IsProbeUnknownImportsEnabledByEnv();
     if (g_probe_unknown_imports) {

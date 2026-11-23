@@ -601,7 +601,9 @@ public:
             initialized_ = true;
         }
 
-        ApuHeapPool& pool = is_non_cached ? non_cached_ : cached_;
+        const bool use_non_cached =
+            is_non_cached && (non_cached_.capacity > 0u || cached_.capacity == 0u);
+        ApuHeapPool& pool = use_non_cached ? non_cached_ : cached_;
         const uint64_t cur_used = static_cast<uint64_t>(pool.bytes_allocated) + pool.bytes_lost;
         if (span64 > pool.capacity || cur_used > pool.capacity || span64 > pool.capacity - cur_used) {
             return ACPHAL_E_OUTOFMEMORY;
@@ -640,7 +642,7 @@ public:
         rec.requested_size = size_in_bytes;
         rec.pad_bytes = pad_bytes;
         rec.apu_span = apu_span;
-        rec.non_cached = is_non_cached;
+        rec.non_cached = use_non_cached;
 
         by_va_[va_key] = rec;
         by_apu_[apu_addr] = va_key;

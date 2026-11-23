@@ -35,6 +35,11 @@
 #pragma comment(linker, "/export:XMemGetAllocationAttributes=XMemShim_XMemGetAllocationAttributes")
 #pragma comment(linker, "/export:XMemMapPhysicalPages=XMemShim_XMemMapPhysicalPages")
 #pragma comment(linker, "/export:XMemUnmapPhysicalPages=XMemShim_XMemUnmapPhysicalPages")
+#pragma comment(linker, "/export:XMemAllocatePhysicalPages=XMemShim_XMemAllocatePhysicalPages")
+#pragma comment(linker, "/export:XMemFreePhysicalPages=XMemShim_XMemFreePhysicalPages")
+#pragma comment(linker, "/export:XMemMapPhysicalPagesScatter=XMemShim_XMemMapPhysicalPagesScatter")
+#pragma comment(linker, "/export:XMemIsToolsMemAvailable=XMemShim_XMemIsToolsMemAvailable")
+#pragma comment(linker, "/export:XMemVirtualAlloc=XMemShim_XMemVirtualAlloc")
 #pragma comment(linker, "/export:XMemGetWorkingSetStatistics=XMemShim_XMemGetWorkingSetStatistics")
 #pragma comment(linker, "/export:XMemTransferMemory=XMemShim_XMemTransferMemory")
 #pragma comment(linker, "/export:XMemGetTelemetryCallCountForTest=XMemShim_GetTelemetryCallCountForTest")
@@ -58,7 +63,25 @@ struct XMemHookTable {
 };
 
 XMemHookTable& GetHookTable() {
-    static XMemHookTable* s_hooks = new XMemHookTable();
+    static XMemHookTable* s_hooks = []() {
+        auto* h = new XMemHookTable();
+#if defined(_WIN32)
+        // Retail Xbox Series X|S titles export __XMemAllocationHooks__ from the main EXE:
+        //   [+0x00] = XMemAllocHookFn (void* (*)(size_t, uint64_t))
+        //   [+0x08] = XMemFreeHookFn  (void  (*)(void*, uint64_t))
+        // Bind automatically on startup (overridable via XMemSetAllocationHooks).
+        HMODULE main_mod = ::GetModuleHandleW(nullptr);
+        if (main_mod) {
+            const auto* tbl = reinterpret_cast<const uintptr_t*>(
+                ::GetProcAddress(main_mod, "__XMemAllocationHooks__"));
+            if (tbl && tbl[0] >= 0x10000ull && tbl[1] >= 0x10000ull) {
+                h->alloc_hook.store(reinterpret_cast<XMemAllocHookFn>(tbl[0]), std::memory_order_release);
+                h->free_hook.store(reinterpret_cast<XMemFreeHookFn>(tbl[1]), std::memory_order_release);
+            }
+        }
+#endif
+        return h;
+    }();
     return *s_hooks;
 }
 
@@ -237,11 +260,56 @@ int32_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemGetAllocationAttributes(
 void* OPENSCARLETT_KERNELX_CALL XMemShim_XMemMapPhysicalPages(
     void* virtualAddress,
     uint64_t numberOfPages,
-    uint32_t flAllocationType,
-    uint32_t flProtect,
-    const uint64_t* pPageArray) {
-    void* ptr = ::XMemMapPhysicalPages(
-        virtualAddress, numberOfPages, flAllocationType, flProtect, pPageArray);
+    uintptr_t arg2,
+    uint32_t arg3,
+    const uint64_t* arg4) {
+    // Support BOTH:
+    //  - Retail Xbox Series X 3-arg ABI: XMemMapPhysicalPages(va, numPages, pPageArray)
+    //  - Legacy 5-arg ABI: XMemMapPhysicalPages(va, numPages, flAllocationType, flProtect, pPageArray)
+    bool is_three_arg = false;
+#if defined(_WIN32)
+    if (arg2 >= 0x10000ull) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<const void*>(arg2), &mbi, sizeof(mbi)) != 0u &&
+            mbi.State == MEM_COMMIT &&
+            (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                            PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0u) {
+            is_three_arg = true;
+        }
+    }
+#endif
+    void* ptr = nullptr;
+    if (is_three_arg) {
+        ptr = ::XMemMapPhysicalPages(
+            virtualAddress,
+            numberOfPages,
+            0x10000000u /*MEM_GRAPHICS*/,
+            0x04u /*PAGE_READWRITE*/,
+            reinterpret_cast<const uint64_t*>(arg2));
+    } else {
+        ptr = ::XMemMapPhysicalPages(
+            virtualAddress,
+            numberOfPages,
+            static_cast<uint32_t>(arg2),
+            arg3,
+            arg4);
+    }
+    static const bool trace_xmem_map = []() {
+#if defined(_WIN32)
+        char buf[16] = {};
+        const DWORD n = GetEnvironmentVariableA("OPENSCARLETT_TRACE_XMEM", buf, static_cast<DWORD>(sizeof(buf)));
+        return n > 0u && buf[0] != '0';
+#else
+        return false;
+#endif
+    }();
+    if (trace_xmem_map) {
+        std::fprintf(stderr,
+            "[OpenScarlett][xmem] XMemMapPhysicalPages va=%p count=%llu 3arg=%d arg2=0x%llX -> %p\n",
+            virtualAddress, static_cast<unsigned long long>(numberOfPages),
+            is_three_arg ? 1 : 0, static_cast<unsigned long long>(arg2), ptr);
+        std::fflush(stderr);
+    }
     RecordOutcome("XMemMapPhysicalPages", ptr != nullptr);
     return ptr;
 }
@@ -252,6 +320,167 @@ int32_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemUnmapPhysicalPages(
     const int32_t ok = ::XMemUnmapPhysicalPages(virtualAddress, numberOfPages);
     RecordOutcome("XMemUnmapPhysicalPages", ok != 0);
     return ok;
+}
+
+int32_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemAllocatePhysicalPages(
+    uint32_t flAllocationType,
+    uint64_t* pNumberOfPages,
+    uint64_t* pPageArray) {
+    const uint64_t req = pNumberOfPages ? *pNumberOfPages : 0ull;
+    const int32_t ok = ::AllocateTitlePhysicalPages(
+        nullptr, flAllocationType, pNumberOfPages, pPageArray);
+    static const bool trace_xmem_alloc = []() {
+#if defined(_WIN32)
+        char buf[16] = {};
+        const DWORD n = GetEnvironmentVariableA("OPENSCARLETT_TRACE_XMEM", buf, static_cast<DWORD>(sizeof(buf)));
+        return n > 0u && buf[0] != '0';
+#else
+        return false;
+#endif
+    }();
+    if (trace_xmem_alloc) {
+        std::fprintf(stderr,
+            "[OpenScarlett][xmem] XMemAllocatePhysicalPages flags=0x%X req=%llu got=%llu pfn0=0x%llX -> %d\n",
+            flAllocationType, static_cast<unsigned long long>(req),
+            static_cast<unsigned long long>(pNumberOfPages ? *pNumberOfPages : 0ull),
+            static_cast<unsigned long long>((ok && pPageArray && req > 0) ? pPageArray[0] : 0ull),
+            ok);
+        std::fflush(stderr);
+    }
+    RecordOutcome("XMemAllocatePhysicalPages", ok != 0);
+    return ok;
+}
+
+int32_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemFreePhysicalPages(
+    uint64_t numberOfPages,
+    const uint64_t* pPageArray) {
+    const int32_t ok = ::FreeTitlePhysicalPages(nullptr, numberOfPages, pPageArray);
+    RecordOutcome("XMemFreePhysicalPages", ok != 0);
+    return ok;
+}
+
+int32_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemMapPhysicalPagesScatter(
+    void* const* addresses,
+    uint64_t count,
+    const uint64_t* tokens) {
+    if (!addresses || count == 0u) {
+#if defined(_WIN32)
+        SetLastError(87u);
+#endif
+        RecordOutcome("XMemMapPhysicalPagesScatter", false);
+        return 0;
+    }
+
+#if defined(_WIN32)
+    {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(addresses, &mbi, sizeof(mbi)) == 0u ||
+            mbi.State != MEM_COMMIT ||
+            (mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                            PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) == 0u) {
+            SetLastError(87u);
+            RecordOutcome("XMemMapPhysicalPagesScatter", false);
+            return 0;
+        }
+        if (tokens != nullptr) {
+            MEMORY_BASIC_INFORMATION mbi_tok{};
+            if (VirtualQuery(tokens, &mbi_tok, sizeof(mbi_tok)) == 0u ||
+                mbi_tok.State != MEM_COMMIT ||
+                (mbi_tok.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                                    PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) == 0u) {
+                SetLastError(87u);
+                RecordOutcome("XMemMapPhysicalPagesScatter", false);
+                return 0;
+            }
+        }
+    }
+#endif
+
+    if (reinterpret_cast<uintptr_t>(addresses[0]) < 0x10000ull) {
+#if defined(_WIN32)
+        SetLastError(87u);
+#endif
+        RecordOutcome("XMemMapPhysicalPagesScatter", false);
+        return 0;
+    }
+
+    bool all_ok = true;
+    for (uint64_t i = 0u; i < count; ++i) {
+        void* va = addresses[i];
+        if (reinterpret_cast<uintptr_t>(va) < 0x10000ull) {
+            if (tokens != nullptr) {
+                for (uint64_t j = 0u; j < i; ++j) {
+                    (void)::XMemUnmapPhysicalPages(addresses[j], 1u);
+                }
+            }
+#if defined(_WIN32)
+            SetLastError(87u);
+#endif
+            all_ok = false;
+            break;
+        }
+        if (tokens != nullptr) {
+            void* mapped = ::XMemMapPhysicalPages(
+                va,
+                1u,
+                0x10000000u /*MEM_GRAPHICS*/,
+                0x04u /*PAGE_READWRITE*/,
+                &tokens[i]);
+            if (!mapped) {
+                for (uint64_t j = 0u; j < i; ++j) {
+                    (void)::XMemUnmapPhysicalPages(addresses[j], 1u);
+                }
+                all_ok = false;
+                break;
+            }
+        } else {
+            if (::XMemUnmapPhysicalPages(va, 1u) == 0) {
+                all_ok = false;
+            }
+        }
+    }
+
+    RecordOutcome("XMemMapPhysicalPagesScatter", all_ok);
+    return all_ok ? 1 : 0;
+}
+
+int32_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemIsToolsMemAvailable(void) {
+    RecordOutcome("XMemIsToolsMemAvailable", true);
+    return 0;
+}
+
+void* OPENSCARLETT_KERNELX_CALL XMemShim_XMemVirtualAlloc(
+    void* lpAddress,
+    size_t dwSize,
+    uint32_t flAllocationType,
+    uint32_t dwMemoryType,
+    uint32_t flProtect) {
+    (void)dwMemoryType;
+    void* ptr = ::KernelXVirtualAllocFromApp(lpAddress, dwSize, flAllocationType, flProtect);
+    static const bool trace_xmem = []() {
+#if defined(_WIN32)
+        char buf[16] = {};
+        const DWORD n = GetEnvironmentVariableA("OPENSCARLETT_TRACE_XMEM", buf, static_cast<DWORD>(sizeof(buf)));
+        return n > 0u && buf[0] != '0';
+#else
+        return false;
+#endif
+    }();
+    if (trace_xmem) {
+        std::fprintf(stderr,
+            "[OpenScarlett][xmem] XMemVirtualAlloc addr=%p size=0x%zX alloc=0x%X memType=0x%X prot=0x%X -> %p\n",
+            lpAddress, dwSize, flAllocationType, dwMemoryType, flProtect, ptr);
+        std::fflush(stderr);
+    }
+    if (!ptr && trace_xmem) {
+        std::fprintf(stderr,
+            "[OpenScarlett][xmem] XMemVirtualAlloc FAILED addr=%p size=%zu alloc=0x%X memType=0x%X prot=0x%X err=%lu\n",
+            lpAddress, dwSize, flAllocationType, dwMemoryType, flProtect,
+            static_cast<unsigned long>(GetLastError()));
+        std::fflush(stderr);
+    }
+    RecordOutcome("XMemVirtualAlloc", ptr != nullptr);
+    return ptr;
 }
 
 int32_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemGetWorkingSetStatistics(

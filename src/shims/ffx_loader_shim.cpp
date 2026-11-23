@@ -3,6 +3,7 @@
 #include "openscarlett/core/telemetry.h"
 
 #include <mutex>
+#include <string>
 
 #if defined(_WIN32)
 #  include <windows.h>
@@ -32,10 +33,32 @@ const UpscalerApi2Table& ResolveUpscalerApi2() {
     static UpscalerApi2Table table{};
     static std::once_flag once;
     std::call_once(once, []() {
-        // Ensure amd_fidelityfx_upscaler_xbox.dll is bound via static import reference.
-        (void)ffxUpscalerGetVersion();
 #if defined(_WIN32)
-        HMODULE mod = ::GetModuleHandleA("amd_fidelityfx_upscaler_xbox.dll");
+        // Load our sibling amd_fidelityfx_upscaler_xbox.dll from the same directory as this loader
+        // DLL rather than statically importing an internal helper, avoiding STATUS_ENTRYPOINT_NOT_FOUND
+        // when a guest title ships its own amd_fidelityfx_upscaler_xbox.dll in the executable directory.
+        HMODULE mod = nullptr;
+        HMODULE self = nullptr;
+        if (::GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCWSTR>(&ResolveUpscalerApi2),
+                &self) && self) {
+            wchar_t path_buf[MAX_PATH * 2]{};
+            const DWORD len = ::GetModuleFileNameW(
+                self, path_buf, static_cast<DWORD>(sizeof(path_buf) / sizeof(wchar_t)));
+            if (len > 0u && len < (sizeof(path_buf) / sizeof(wchar_t))) {
+                std::wstring dir(path_buf, len);
+                const size_t slash = dir.find_last_of(L"\\/");
+                if (slash != std::wstring::npos) {
+                    const std::wstring sibling =
+                        dir.substr(0, slash + 1u) + L"amd_fidelityfx_upscaler_xbox.dll";
+                    mod = ::LoadLibraryExW(sibling.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+                }
+            }
+        }
+        if (!mod) {
+            mod = ::GetModuleHandleA("amd_fidelityfx_upscaler_xbox.dll");
+        }
         if (!mod) {
             mod = ::LoadLibraryA("amd_fidelityfx_upscaler_xbox.dll");
         }

@@ -549,6 +549,7 @@ DllRoutingTable::DllRoutingTable() {
         {"xg_xs.dll", 1, false, false},
         {"AcpHal.dll", 1, false, false},
         {"xapu.dll", 1, false, false},
+        {"chad.dll", 1, false, false},
         {"dstorage_xs.dll", 1, false, false},
         {"winrt_xs.dll", 1, false, false},
         {"xmem.dll", 1, false, false},

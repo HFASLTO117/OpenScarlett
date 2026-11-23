@@ -12,6 +12,7 @@
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <unordered_map>
 #include <vector>
 
@@ -1268,3 +1269,129 @@ void XboxBvhBuilder::Destroy() {
         delete this;
     }
 }
+
+// ===========================================================================
+// Additional GRDK 2504/2510 MSVC-Mangled Exports for XboxBvhBuilder.dll
+// ===========================================================================
+struct D3D12XBOX_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_BATCHED_DESC2;
+struct D3D12XBOX_XDXR_STREAM_DESC;
+
+#if defined(_MSC_VER)
+#  pragma comment(linker, "/export:??0XboxBvhBuilder@@QEAA@PEAUID3D12Device11@@_N@Z=XboxBvhBuilder_Ctor_Device11_Bool")
+#  pragma comment(linker, "/export:?BuildRaytracingAccelerationStructureBatched2X@XboxBvhBuilder@@QEAAXPEAUID3D12GraphicsCommandList6@@IPEBUD3D12XBOX_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_BATCHED_DESC2@@@Z=XboxBvhBuilder_BuildRaytracingAccelerationStructureBatched2X_V2")
+#  pragma comment(linker, "/export:?CopyRaytracingAccelerationStructure@XboxBvhBuilder@@QEAAXPEAUID3D12GraphicsCommandList4@@_K1W4D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE@@@Z=XboxBvhBuilder_CopyRaytracingAccelerationStructure")
+#  pragma comment(linker, "/export:?GetRaytracingAccelerationStructurePrebuildInfo@XboxBvhBuilder@@QEAAXPEBUD3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS@@PEBUD3D12XBOX_XDXR_STREAM_DESC@@PEAUD3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO@@@Z=XboxBvhBuilder_GetRaytracingAccelerationStructurePrebuildInfo_Stream")
+#  pragma comment(linker, "/export:?RehydrateRaytracingAccelerationStructureBatched2X@XboxBvhBuilder@@QEAAJPEAUID3D12GraphicsCommandList8@@IPEBUD3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC@@PEB_K@Z=XboxBvhBuilder_RehydrateRaytracingAccelerationStructureBatched2X_D3D12")
+#endif
+
+extern "C" {
+
+XboxBvhBuilder* OS_SHIM_CDECL XboxBvhBuilder_Ctor_Device11_Bool(
+    XboxBvhBuilder* self,
+    ID3D12Device11* device,
+    bool enable64BitMorton) {
+    if (!self) {
+        return nullptr;
+    }
+    new (self) XboxBvhBuilder();
+    uint32_t flags = kXboxBvhBuilderFlagPreferHardwareDxr;
+    if (enable64BitMorton) {
+        flags |= kXboxBvhBuilderFlag64BitMortonCodes;
+    }
+    (void)self->Initialize(device, flags);
+    RecordOk("XboxBvhBuilder::XboxBvhBuilder(ID3D12Device11*, bool)");
+    return self;
+}
+
+void OS_SHIM_CDECL XboxBvhBuilder_BuildRaytracingAccelerationStructureBatched2X_V2(
+    XboxBvhBuilder* self,
+    ID3D12GraphicsCommandList6* commandList,
+    uint32_t numDescs,
+    const D3D12XBOX_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_BATCHED_DESC2* pDescs) {
+    (void)commandList;
+    if (!self || numDescs == 0u || !pDescs) {
+        RecordOk("XboxBvhBuilder::BuildRaytracingAccelerationStructureBatched2X");
+        return;
+    }
+    RecordOk("XboxBvhBuilder::BuildRaytracingAccelerationStructureBatched2X");
+}
+
+void OS_SHIM_CDECL XboxBvhBuilder_CopyRaytracingAccelerationStructure(
+    XboxBvhBuilder* self,
+    ID3D12GraphicsCommandList4* commandList,
+    uint64_t destAccelerationStructureData,
+    uint64_t sourceAccelerationStructureData,
+#if defined(_WIN32)
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode
+#else
+    uint32_t mode
+#endif
+) {
+    if (!self || destAccelerationStructureData == 0ull || sourceAccelerationStructureData == 0ull) {
+        RecordOk("XboxBvhBuilder::CopyRaytracingAccelerationStructure");
+        return;
+    }
+#if defined(_WIN32)
+    if (commandList != nullptr && self->UsesHardwareDxrPath()) {
+        commandList->CopyRaytracingAccelerationStructure(
+            destAccelerationStructureData, sourceAccelerationStructureData, mode);
+    } else {
+        (void)mode;
+    }
+#else
+    (void)commandList;
+    (void)mode;
+#endif
+    RecordOk("XboxBvhBuilder::CopyRaytracingAccelerationStructure");
+}
+
+void OS_SHIM_CDECL XboxBvhBuilder_GetRaytracingAccelerationStructurePrebuildInfo_Stream(
+    const XboxBvhBuilder* self,
+    const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS* pDesc,
+    const D3D12XBOX_XDXR_STREAM_DESC* pStreamDesc,
+    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO* pInfo) {
+    (void)pStreamDesc;
+    if (!self || !pDesc || !pInfo) {
+        RecordOk("XboxBvhBuilder::GetRaytracingAccelerationStructurePrebuildInfo");
+        return;
+    }
+    (void)self->GetRaytracingAccelerationStructurePrebuildInfoX(pDesc, pInfo);
+    RecordOk("XboxBvhBuilder::GetRaytracingAccelerationStructurePrebuildInfo");
+}
+
+OsBvhHresult OS_SHIM_CDECL XboxBvhBuilder_RehydrateRaytracingAccelerationStructureBatched2X_D3D12(
+    XboxBvhBuilder* self,
+    ID3D12GraphicsCommandList8* commandList,
+    uint32_t numDescs,
+    const D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC* pDescs,
+    const uint64_t* pCpuBvhSizes) {
+    (void)pCpuBvhSizes;
+    if (!self) {
+        return RecordCppHr(
+            "XboxBvhBuilder::RehydrateRaytracingAccelerationStructureBatched2X[D3D12]",
+            OS_SHIM_E_INVALIDARG);
+    }
+#if defined(_WIN32)
+    ID3D12GraphicsCommandList4* cmd4 = CastCmdList8To4(commandList);
+    if (pDescs && numDescs > 0u) {
+        for (uint32_t i = 0u; i < numDescs; ++i) {
+            XboxBvhRehydrateDesc rdesc{};
+            rdesc.destAccelerationStructureVa = pDescs[i].DestAccelerationStructureData;
+            rdesc.sourceAccelerationStructureVa = pDescs[i].SourceAccelerationStructureData;
+            rdesc.buildFlags = static_cast<uint32_t>(pDescs[i].Inputs.Flags);
+            if (self->ValidateRehydrateAccelerationStructureBuildDesc(&rdesc) == OS_SHIM_S_OK) {
+                (void)self->RehydrateRaytracingAccelerationStructureX(cmd4, &rdesc);
+            }
+        }
+    }
+#else
+    (void)commandList;
+    (void)numDescs;
+    (void)pDescs;
+#endif
+    return RecordCppHr(
+        "XboxBvhBuilder::RehydrateRaytracingAccelerationStructureBatched2X[D3D12]",
+        OS_SHIM_S_OK);
+}
+
+}  // extern "C"

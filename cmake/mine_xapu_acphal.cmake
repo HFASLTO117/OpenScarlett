@@ -13,6 +13,18 @@ if(MSVC)
     target_compile_options(xapu PRIVATE /W4)
 endif()
 
+# 1b. chad.dll (Xbox Scarlett CHAD / XDSP hardware DSP codec & stream API)
+add_library(chad SHARED src/shims/chad_shim.cpp)
+set_target_properties(chad PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME "chad"
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}"
+)
+target_link_libraries(chad PRIVATE openscarlett_core)
+if(MSVC)
+    target_compile_options(chad PRIVATE /W4)
+endif()
+
 # 2. Unit test dynamically loading xapu.dll and AcpHal.dll via LoadLibraryW / GetProcAddress
 openscarlett_add_test(test_mine_xapu_acphal tests/test_mine_xapu_acphal.cpp)
 add_dependencies(test_mine_xapu_acphal xapu AcpHal)

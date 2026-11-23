@@ -257,7 +257,70 @@ Status UnifiedMemoryManager::AllocatePhysicalPages(size_t size,
 #if defined(_WIN32)
     const DWORD hi = static_cast<DWORD>((static_cast<uint64_t>(aligned_size) >> 32) & 0xFFFFFFFFull);
     const DWORD lo = static_cast<DWORD>(static_cast<uint64_t>(aligned_size) & 0xFFFFFFFFull);
-    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, hi, lo, nullptr);
+    bool prefer_sparse = false;
+    if (aligned_size >= (64ull * 1024ull * 1024ull)) {
+        MEMORYSTATUSEX ms{};
+        ms.dwLength = sizeof(ms);
+        if (GlobalMemoryStatusEx(&ms) &&
+            ms.ullAvailPageFile < static_cast<DWORDLONG>(aligned_size) + (2ull * 1024ull * 1024ull * 1024ull)) {
+            prefer_sparse = true;
+        }
+    }
+    HANDLE section = prefer_sparse
+                         ? nullptr
+                         : CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, hi, lo, nullptr);
+    if (!section) {
+        // Fallback when Windows pagefile commit limit is exhausted on 8-16 GiB hosts:
+        // back the section with an NTFS sparse file (FSCTL_SET_SPARSE + FILE_FLAG_DELETE_ON_CLOSE)
+        // placed beside the OpenScarlett DLL so MapViewOfFile3(MEM_REPLACE_PLACEHOLDER) still works
+        // natively with zero commit charge and zero disk blocks for untouched pages.
+        HMODULE self_mod = nullptr;
+        wchar_t dir_buf[MAX_PATH * 2]{};
+        std::wstring backing_dir;
+        if (GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCWSTR>(&UnifiedMemoryManager::SupportsOsPlaceholders),
+                &self_mod) && self_mod) {
+            const DWORD n = GetModuleFileNameW(self_mod, dir_buf, static_cast<DWORD>(sizeof(dir_buf) / sizeof(wchar_t)));
+            if (n > 0u && n < (sizeof(dir_buf) / sizeof(wchar_t))) {
+                std::wstring p(dir_buf, n);
+                const size_t sl = p.find_last_of(L"\\/");
+                if (sl != std::wstring::npos) {
+                    backing_dir = p.substr(0, sl) + L"\\.xmem_sparse";
+                }
+            }
+        }
+        if (!backing_dir.empty()) {
+            CreateDirectoryW(backing_dir.c_str(), nullptr);
+            static std::atomic<uint64_t> s_phys_sparse_seq{1};
+            const uint64_t seq = s_phys_sparse_seq.fetch_add(1, std::memory_order_relaxed);
+            wchar_t file_path[MAX_PATH * 2]{};
+            std::swprintf(file_path, sizeof(file_path) / sizeof(wchar_t),
+                          L"%ls\\xphys_%lu_%llu.bin",
+                          backing_dir.c_str(),
+                          static_cast<unsigned long>(GetCurrentProcessId()),
+                          static_cast<unsigned long long>(seq));
+            HANDLE hf = CreateFileW(
+                file_path,
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr,
+                CREATE_ALWAYS,
+                FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+                nullptr);
+            if (hf != INVALID_HANDLE_VALUE) {
+                constexpr DWORD kFsctlSetSparse = 0x000900C4u;
+                DWORD bytes_ret = 0;
+                (void)DeviceIoControl(hf, kFsctlSetSparse, nullptr, 0, nullptr, 0, &bytes_ret, nullptr);
+                LARGE_INTEGER li{};
+                li.QuadPart = static_cast<LONGLONG>(aligned_size);
+                if (SetFilePointerEx(hf, li, nullptr, FILE_BEGIN) && SetEndOfFile(hf)) {
+                    section = CreateFileMappingW(hf, nullptr, PAGE_READWRITE, hi, lo, nullptr);
+                }
+                CloseHandle(hf);
+            }
+        }
+    }
     if (!section) {
         return Status::Error(StatusCode::OutOfMemory, "CreateFileMappingW failed for physical page pool");
     }

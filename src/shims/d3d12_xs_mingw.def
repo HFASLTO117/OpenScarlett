@@ -52,6 +52,7 @@ EXPORTS
     DXGIXSetFrameNotification
     D3D12SDKVersion DATA
     D3D12SDKPath DATA
+    D3D12XboxSetProcessDebugFlags
     D3D12XboxSetProcessGpuPriority
     D3D12XboxGetProcessGpuPriority
     D3D12XboxSetProcessMemoryPriority
