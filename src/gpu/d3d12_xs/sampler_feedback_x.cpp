@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <climits>
 #include <cstring>
 #include <mutex>
@@ -355,6 +356,7 @@ struct SamplerFeedbackManager::Impl {
     uint64_t readback_fence_val = 0ull;
 
     std::unordered_map<ID3D12Resource*, TrackedFeedbackMap> maps;
+    std::atomic<uint32_t> map_count{0u};
     std::unordered_map<size_t, SamplerFeedbackViewRecord> views_by_cpu_handle;
     // Keeps transient upload/staging resources alive for caller-recorded command lists until Shutdown.
     std::vector<LocalComPtr<ID3D12Resource>> transient_resources;
@@ -690,6 +692,7 @@ struct SamplerFeedbackManager::Impl {
         transient_resources.clear();
         views_by_cpu_handle.clear();
         maps.clear();
+        map_count.store(0u, std::memory_order_release);
         readback_cmd.Reset();
         readback_alloc.Reset();
         readback_fence.Reset();
@@ -949,6 +952,7 @@ Status SamplerFeedbackManager::CreateFeedbackMap(
         impl_->PopulateMapInfo(entry, *out_info);
     }
     impl_->maps[key] = std::move(entry);
+    impl_->map_count.store(static_cast<uint32_t>(impl_->maps.size()), std::memory_order_release);
     return Status::Ok();
 }
 
@@ -998,6 +1002,7 @@ Status SamplerFeedbackManager::RegisterExternalFeedbackMap(
         impl_->PopulateMapInfo(entry, *out_info);
     }
     impl_->maps[feedback_resource] = std::move(entry);
+    impl_->map_count.store(static_cast<uint32_t>(impl_->maps.size()), std::memory_order_release);
     return Status::Ok();
 }
 
@@ -1018,13 +1023,16 @@ Status SamplerFeedbackManager::UnregisterFeedbackMap(ID3D12Resource* feedback_re
         }
     }
     impl_->maps.erase(it);
+    impl_->map_count.store(static_cast<uint32_t>(impl_->maps.size()), std::memory_order_release);
     return Status::Ok();
 }
 
 void SamplerFeedbackManager::NotifyResourceDestroyed(ID3D12Resource* host_resource) noexcept {
     if (!host_resource || !impl_) return;
+    if (impl_->map_count.load(std::memory_order_acquire) == 0u) return;
     std::lock_guard<std::mutex> lock(impl_->mutex);
     impl_->maps.erase(host_resource);
+    impl_->map_count.store(static_cast<uint32_t>(impl_->maps.size()), std::memory_order_release);
     for (auto& [key, entry] : impl_->maps) {
         (void)key;
         if (entry.paired_target == host_resource) {
@@ -1045,6 +1053,7 @@ bool SamplerFeedbackManager::LookupFeedbackMap(
     ID3D12Resource* feedback_resource,
     SamplerFeedbackMapInfo& out_info) const {
     if (!feedback_resource || !impl_) return false;
+    if (impl_->map_count.load(std::memory_order_acquire) == 0u) return false;
     std::lock_guard<std::mutex> lock(impl_->mutex);
     const auto it = impl_->maps.find(feedback_resource);
     if (it == impl_->maps.end()) return false;

@@ -1823,9 +1823,12 @@ void DeviceX::NotifyResourceDestroyed(ID3D12Resource* host_resource) noexcept {
         std::lock_guard<std::mutex> lock(buffer_va_mutex_);
         buffer_va_map_.erase(host_resource);
     }
-    {
+    if (tile_mode_count_.load(std::memory_order_acquire) != 0u) {
         std::lock_guard<std::mutex> lock(tile_mode_mutex_);
-        resource_tile_modes_.erase(host_resource);
+        if (resource_tile_modes_.erase(host_resource) > 0u) {
+            tile_mode_count_.store(
+                static_cast<uint32_t>(resource_tile_modes_.size()), std::memory_order_release);
+        }
     }
     {
         uint64_t mirrored_va = 0ull;
@@ -7882,6 +7885,9 @@ HRESULT DeviceX::FlushMirroredTitleVaPagesOnQueue(
 }
 
 XG_TILE_MODE DeviceX::GetTrackedResourceTileMode(ID3D12Resource* host_resource) const noexcept {
+    if (!host_resource || tile_mode_count_.load(std::memory_order_acquire) == 0u) {
+        return XG_TILE_MODE_LINEAR;
+    }
     host_resource = UnwrapResource(host_resource);
     if (!host_resource) return XG_TILE_MODE_LINEAR;
     std::lock_guard<std::mutex> lock(tile_mode_mutex_);
@@ -7898,6 +7904,8 @@ void DeviceX::SetTrackedResourceTileMode(ID3D12Resource* host_resource, XG_TILE_
     } else {
         resource_tile_modes_[host_resource] = mode;
     }
+    tile_mode_count_.store(
+        static_cast<uint32_t>(resource_tile_modes_.size()), std::memory_order_release);
 }
 
 bool DeviceX::EnsureXgGpuUntilerReady() {

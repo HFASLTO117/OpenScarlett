@@ -2,7 +2,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 
 #if defined(_WIN32)
@@ -19,43 +21,91 @@ using PfnHookRecordCall = void(__cdecl*)(const char* module_name,
                                          uint8_t outcome,
                                          int32_t hr,
                                          int32_t vtable_slot);
+using PfnHookIsTelemetryActive = int(__cdecl*)();
 
-void ForwardToHookDllIfPresent(const std::string& module_name,
-                               const std::string& symbol_name,
+struct HookForwardCache {
+    std::atomic<int> init_state{0};  // 0 = unchecked, 1 = forward, 2 = self/disabled
+    std::atomic<PfnHookRecordCall> record_fn{nullptr};
+    std::atomic<PfnHookIsTelemetryActive> active_fn{nullptr};
+};
+
+HookForwardCache& GetHookForwardCache() {
+    static HookForwardCache cache;
+    return cache;
+}
+
+void EnsureHookForwardResolved(HookForwardCache& cache) noexcept {
+    int state = cache.init_state.load(std::memory_order_acquire);
+    if (state != 0) return;
+
+    HMODULE hook_mod = GetModuleHandleA("openscarlett_hook.dll");
+    if (!hook_mod) return;
+
+    HMODULE self_mod = nullptr;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCSTR>(&EnsureHookForwardResolved),
+                       &self_mod);
+    if (self_mod == hook_mod) {
+        cache.init_state.store(2, std::memory_order_release);
+        return;
+    }
+
+    auto rec_fn = reinterpret_cast<PfnHookRecordCall>(
+        GetProcAddress(hook_mod, "OpenScarlettHook_RecordCall"));
+    auto act_fn = reinterpret_cast<PfnHookIsTelemetryActive>(
+        GetProcAddress(hook_mod, "OpenScarlettHook_IsTelemetryActive"));
+    if (act_fn) {
+        cache.active_fn.store(act_fn, std::memory_order_release);
+    }
+    if (rec_fn) {
+        cache.record_fn.store(rec_fn, std::memory_order_release);
+        cache.init_state.store(1, std::memory_order_release);
+    }
+}
+
+void ForwardToHookDllIfPresent(const char* module_name,
+                               const char* symbol_name,
                                CallOutcome outcome,
                                int32_t hr,
                                int32_t vtable_slot) {
-    static std::atomic<int> init_state{0};  // 0 = unchecked, 1 = forward, 2 = self/disabled
-    static std::atomic<PfnHookRecordCall> cached_fn{nullptr};
-
-    int state = init_state.load(std::memory_order_acquire);
+    auto& cache = GetHookForwardCache();
+    int state = cache.init_state.load(std::memory_order_acquire);
     if (state == 2) return;
-
-    PfnHookRecordCall fn = cached_fn.load(std::memory_order_acquire);
-    if (!fn) {
-        HMODULE hook_mod = GetModuleHandleA("openscarlett_hook.dll");
-        if (!hook_mod) return;
-        HMODULE self_mod = nullptr;
-        GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           reinterpret_cast<LPCSTR>(&ForwardToHookDllIfPresent),
-                           &self_mod);
-        if (self_mod == hook_mod) {
-            init_state.store(2, std::memory_order_release);
-            return;
-        }
-        fn = reinterpret_cast<PfnHookRecordCall>(
-            GetProcAddress(hook_mod, "OpenScarlettHook_RecordCall"));
-        if (fn) {
-            cached_fn.store(fn, std::memory_order_release);
-            init_state.store(1, std::memory_order_release);
-        }
+    if (state == 0) {
+        EnsureHookForwardResolved(cache);
+        state = cache.init_state.load(std::memory_order_acquire);
+        if (state != 1) return;
     }
-    if (fn) {
-        fn(module_name.c_str(), symbol_name.c_str(), static_cast<uint8_t>(outcome), hr, vtable_slot);
+    if (auto act_fn = cache.active_fn.load(std::memory_order_acquire)) {
+        if (act_fn() == 0) return;
+    }
+    if (auto fn = cache.record_fn.load(std::memory_order_acquire)) {
+        fn(module_name, symbol_name, static_cast<uint8_t>(outcome), hr, vtable_slot);
     }
 }
 #endif
+
+inline uint64_t HashKey(const char* mod, const char* sym, int32_t slot) noexcept {
+    uint64_t h = 14695981039346656037ull;
+    if (mod) {
+        for (const unsigned char* p = reinterpret_cast<const unsigned char*>(mod); *p; ++p) {
+            h ^= *p;
+            h *= 1099511628211ull;
+        }
+    }
+    h ^= 0x21ull;
+    h *= 1099511628211ull;
+    if (sym) {
+        for (const unsigned char* p = reinterpret_cast<const unsigned char*>(sym); *p; ++p) {
+            h ^= *p;
+            h *= 1099511628211ull;
+        }
+    }
+    h ^= static_cast<uint64_t>(static_cast<uint32_t>(slot));
+    h *= 1099511628211ull;
+    return h;
+}
 
 std::string EscapeJson(const std::string& s) {
     std::string out;
@@ -80,9 +130,103 @@ CallTelemetry& CallTelemetry::Global() {
     return instance;
 }
 
+bool CallTelemetry::IsHookTelemetryActive() noexcept {
+#if defined(_WIN32)
+    auto& cache = GetHookForwardCache();
+    int state = cache.init_state.load(std::memory_order_acquire);
+    if (state == 0) {
+        EnsureHookForwardResolved(cache);
+        state = cache.init_state.load(std::memory_order_acquire);
+    }
+    if (state == 1) {
+        if (auto act_fn = cache.active_fn.load(std::memory_order_acquire)) {
+            return act_fn() != 0;
+        }
+        return true;
+    }
+#endif
+    return false;
+}
+
 void CallTelemetry::Reset() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    entries_.clear();
+    for (auto& shard : shards_) {
+        std::unique_lock<std::shared_mutex> lock(shard.mutex);
+        shard.buckets.clear();
+    }
+}
+
+void CallTelemetry::Record(const char* module_name,
+                           const char* symbol_name,
+                           CallOutcome outcome,
+                           int32_t hr,
+                           int32_t vtable_slot) {
+    const char* mod = module_name ? module_name : "";
+    const char* sym = symbol_name ? symbol_name : "";
+    const uint64_t h = HashKey(mod, sym, vtable_slot);
+    auto& shard = shards_[static_cast<size_t>(h) & (kShardCount - 1u)];
+
+    auto bump = [&](AtomicEntry& e) noexcept {
+        e.total_calls.fetch_add(1ull, std::memory_order_relaxed);
+        e.last_hr.store(hr, std::memory_order_relaxed);
+        switch (outcome) {
+            case CallOutcome::Ok:
+                e.ok_calls.fetch_add(1ull, std::memory_order_relaxed);
+                break;
+            case CallOutcome::StubOk:
+                e.stub_calls.fetch_add(1ull, std::memory_order_relaxed);
+                break;
+            case CallOutcome::NotImplemented:
+                e.not_impl_calls.fetch_add(1ull, std::memory_order_relaxed);
+                break;
+            case CallOutcome::Error:
+                e.error_calls.fetch_add(1ull, std::memory_order_relaxed);
+                break;
+        }
+    };
+
+    bool recorded = false;
+    {
+        std::shared_lock<std::shared_mutex> rlock(shard.mutex);
+        auto it = shard.buckets.find(h);
+        if (it != shard.buckets.end()) {
+            for (const auto& entry_ptr : it->second) {
+                if (entry_ptr->vtable_slot == vtable_slot &&
+                    entry_ptr->module_name == mod &&
+                    entry_ptr->symbol_name == sym) {
+                    bump(*entry_ptr);
+                    recorded = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!recorded) {
+        std::unique_lock<std::shared_mutex> wlock(shard.mutex);
+        auto& vec = shard.buckets[h];
+        AtomicEntry* found = nullptr;
+        for (const auto& entry_ptr : vec) {
+            if (entry_ptr->vtable_slot == vtable_slot &&
+                entry_ptr->module_name == mod &&
+                entry_ptr->symbol_name == sym) {
+                found = entry_ptr.get();
+                break;
+            }
+        }
+        if (!found) {
+            auto node = std::make_unique<AtomicEntry>();
+            node->module_name = mod;
+            node->symbol_name = sym;
+            node->vtable_slot = vtable_slot;
+            found = node.get();
+            vec.push_back(std::move(node));
+        }
+        bump(*found);
+    }
+
+#if defined(_WIN32)
+    ForwardToHookDllIfPresent(mod, sym, outcome, hr, vtable_slot);
+#endif
 }
 
 void CallTelemetry::Record(const std::string& module_name,
@@ -90,35 +234,28 @@ void CallTelemetry::Record(const std::string& module_name,
                            CallOutcome outcome,
                            int32_t hr,
                            int32_t vtable_slot) {
-    std::string key = module_name + "!" + symbol_name + "#" + std::to_string(vtable_slot);
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto& e = entries_[key];
-        if (e.total_calls == 0) {
-            e.module_name = module_name;
-            e.symbol_name = symbol_name;
-            e.vtable_slot = vtable_slot;
-        }
-        ++e.total_calls;
-        e.last_hr = hr;
-        switch (outcome) {
-            case CallOutcome::Ok: ++e.ok_calls; break;
-            case CallOutcome::StubOk: ++e.stub_calls; break;
-            case CallOutcome::NotImplemented: ++e.not_impl_calls; break;
-            case CallOutcome::Error: ++e.error_calls; break;
-        }
-    }
-#if defined(_WIN32)
-    ForwardToHookDllIfPresent(module_name, symbol_name, outcome, hr, vtable_slot);
-#endif
+    Record(module_name.c_str(), symbol_name.c_str(), outcome, hr, vtable_slot);
 }
 
 std::vector<CallTraceEntry> CallTelemetry::Snapshot() const {
-    std::lock_guard<std::mutex> lock(mutex_);
     std::vector<CallTraceEntry> out;
-    out.reserve(entries_.size());
-    for (const auto& [_, e] : entries_) {
-        out.push_back(e);
+    for (const auto& shard : shards_) {
+        std::shared_lock<std::shared_mutex> lock(shard.mutex);
+        for (const auto& [_, vec] : shard.buckets) {
+            for (const auto& entry_ptr : vec) {
+                CallTraceEntry e{};
+                e.module_name = entry_ptr->module_name;
+                e.symbol_name = entry_ptr->symbol_name;
+                e.vtable_slot = entry_ptr->vtable_slot;
+                e.total_calls = entry_ptr->total_calls.load(std::memory_order_relaxed);
+                e.ok_calls = entry_ptr->ok_calls.load(std::memory_order_relaxed);
+                e.stub_calls = entry_ptr->stub_calls.load(std::memory_order_relaxed);
+                e.not_impl_calls = entry_ptr->not_impl_calls.load(std::memory_order_relaxed);
+                e.error_calls = entry_ptr->error_calls.load(std::memory_order_relaxed);
+                e.last_hr = entry_ptr->last_hr.load(std::memory_order_relaxed);
+                out.push_back(std::move(e));
+            }
+        }
     }
     std::sort(out.begin(), out.end(), [](const CallTraceEntry& a, const CallTraceEntry& b) {
         if (a.not_impl_calls != b.not_impl_calls) return a.not_impl_calls > b.not_impl_calls;

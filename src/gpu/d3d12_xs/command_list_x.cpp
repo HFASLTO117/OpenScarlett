@@ -131,6 +131,7 @@ struct PlacedTiledResourceRecord {
 struct PlacedTiledRegistry {
     std::mutex mutex;
     std::unordered_map<ID3D12Resource*, PlacedTiledResourceRecord> map;
+    std::atomic<uint32_t> count{0u};
 };
 
 PlacedTiledRegistry& GetPlacedTiledRegistry() {
@@ -138,7 +139,14 @@ PlacedTiledRegistry& GetPlacedTiledRegistry() {
     return reg;
 }
 
+std::atomic<bool> g_retail_fast_cmdlist{false};
+
 inline void RecordList(const char* method, int32_t slot, HRESULT hr = S_OK) {
+    if (hr == S_OK &&
+        g_retail_fast_cmdlist.load(std::memory_order_relaxed) &&
+        !openscarlett::CallTelemetry::IsHookTelemetryActive()) {
+        return;
+    }
     openscarlett::CallOutcome outcome = openscarlett::CallOutcome::Ok;
     if (hr == E_NOTIMPL || hr == E_NOINTERFACE) {
         outcome = openscarlett::CallOutcome::NotImplemented;
@@ -319,7 +327,12 @@ private:
 
 CommandListX::CommandListX(DeviceX* parent_device, ID3D12GraphicsCommandList* host_list)
     : device_x_(parent_device), host_list_(host_list) {
-    if (device_x_) device_x_->AddRef();
+    if (device_x_) {
+        device_x_->AddRef();
+        if (device_x_->IsRetailScarlettAbi()) {
+            g_retail_fast_cmdlist.store(true, std::memory_order_relaxed);
+        }
+    }
 #ifdef __ID3D12GraphicsCommandList7_INTERFACE_DEFINED__
     ext_proxy_ = new (std::nothrow) CommandListExtendedProxy(this);
 #endif
@@ -358,6 +371,7 @@ CommandListX::CommandListX(DeviceX* parent_device, ID3D12GraphicsCommandList* ho
 }
 
 CommandListX::~CommandListX() {
+    ReleaseAlignedStagingRing();
     ReleaseTiledTransientResources();
     {
         auto& reg = GetCommandListRegistry();
@@ -638,6 +652,16 @@ HRESULT STDMETHODCALLTYPE CommandListX::Reset(
         diag_ops_.clear();
     }
     ReleaseTiledTransientResources();
+    aligned_staging_slot_idx_ = (aligned_staging_slot_idx_ + 1u) % kAlignedStagingRingSlots;
+    {
+        auto& slot = aligned_staging_ring_[aligned_staging_slot_idx_];
+        slot.cursor = 0ull;
+        slot.state = D3D12_RESOURCE_STATE_COMMON;
+        for (ID3D12Resource* old_res : slot.retired_buffers) {
+            if (old_res) old_res->Release();
+        }
+        slot.retired_buffers.clear();
+    }
     depth_bias_.store(0.0f, std::memory_order_relaxed);
     depth_bias_clamp_.store(0.0f, std::memory_order_relaxed);
     slope_scaled_depth_bias_.store(0.0f, std::memory_order_relaxed);
@@ -1081,8 +1105,8 @@ void STDMETHODCALLTYPE CommandListX::CopyTextureRegion(
 
     // Xbox Series X allows 64/256-byte PlacedFootprint.Offset alignment (smaller than desktop PC
     // D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT = 512) and smaller RowPitch alignment (desktop requires 256).
-    // Stage any unaligned buffer-to-texture upload through a 512-byte-aligned transient DEFAULT buffer
-    // using CopyBufferRegion (which has 1-byte offset alignment) so desktop CopyTextureRegion succeeds!
+    // Sub-allocate 512-byte-aligned slices from our reusable 4-slot DEFAULT staging ring using
+    // CopyBufferRegion (which has 1-byte offset alignment) with zero per-call WDDM allocations!
     D3D12_TEXTURE_COPY_LOCATION aligned_src_loc{};
     if (device_x_ && device_x_->HostDevice() && dst_ptr && src_ptr &&
         src_ptr->Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT && src_ptr->pResource != nullptr) {
@@ -1101,54 +1125,34 @@ void STDMETHODCALLTYPE CommandListX::CopyTextureRegion(
             const UINT aligned_pitch = (fp.RowPitch + 255u) & ~255u;
             const UINT64 src_buf_width = src_ptr->pResource->GetDesc().Width;
             const UINT64 src_avail = (src_buf_width > src_off) ? (src_buf_width - src_off) : 0ull;
-            const UINT64 staging_bytes = std::max<UINT64>(
-                65536ull, ((total_rows * static_cast<UINT64>(aligned_pitch)) + 65535ull) & ~65535ull);
+            const UINT64 slice_bytes = (total_rows * static_cast<UINT64>(aligned_pitch) + 511ull) & ~511ull;
 
-            D3D12_HEAP_PROPERTIES def_hp{};
-            def_hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-            D3D12_RESOURCE_DESC tmp_desc{};
-            tmp_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            tmp_desc.Alignment = 0ull;
-            tmp_desc.Width = staging_bytes;
-            tmp_desc.Height = 1u;
-            tmp_desc.DepthOrArraySize = 1u;
-            tmp_desc.MipLevels = 1u;
-            tmp_desc.Format = DXGI_FORMAT_UNKNOWN;
-            tmp_desc.SampleDesc.Count = 1u;
-            tmp_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-            tmp_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
-
-            ID3D12Resource* tmp_buf = nullptr;
-            if (src_avail > 0ull &&
-                SUCCEEDED(device_x_->HostDevice()->CreateCommittedResource(
-                    &def_hp, D3D12_HEAP_FLAG_NONE, &tmp_desc,
-                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                    IID_PPV_ARGS(&tmp_buf))) && tmp_buf) {
-                TrackTiledTransientResource(tmp_buf);
+            ID3D12Resource* stage_buf = nullptr;
+            UINT64 stage_off = 0ull;
+            D3D12_RESOURCE_STATES stage_state = D3D12_RESOURCE_STATE_COPY_DEST;
+            if (src_avail > 0ull && slice_bytes > 0ull &&
+                AcquireAlignedStagingSlice(slice_bytes, stage_buf, stage_off, stage_state) && stage_buf) {
+                if (stage_state != D3D12_RESOURCE_STATE_COPY_DEST) {
+                    TransitionAlignedStagingState(D3D12_RESOURCE_STATE_COPY_DEST);
+                }
                 if (!bad_pitch) {
                     const UINT64 raw_bytes = total_rows * static_cast<UINT64>(fp.RowPitch);
                     const UINT64 copy_bytes = std::min<UINT64>(raw_bytes, src_avail);
-                    host_list_->CopyBufferRegion(tmp_buf, 0ull, src_ptr->pResource, src_off, copy_bytes);
+                    host_list_->CopyBufferRegion(stage_buf, stage_off, src_ptr->pResource, src_off, copy_bytes);
                 } else {
                     for (UINT64 r = 0ull; r < total_rows; ++r) {
                         const UINT64 r_src = src_off + r * static_cast<UINT64>(fp.RowPitch);
                         if (r_src >= src_buf_width) break;
                         const UINT64 r_len = std::min<UINT64>(fp.RowPitch, src_buf_width - r_src);
-                        host_list_->CopyBufferRegion(tmp_buf, r * static_cast<UINT64>(aligned_pitch),
+                        host_list_->CopyBufferRegion(stage_buf, stage_off + r * static_cast<UINT64>(aligned_pitch),
                                                      src_ptr->pResource, r_src, r_len);
                     }
                 }
-                D3D12_RESOURCE_BARRIER to_src{};
-                to_src.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                to_src.Transition.pResource = tmp_buf;
-                to_src.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                to_src.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-                to_src.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-                host_list_->ResourceBarrier(1u, &to_src);
+                TransitionAlignedStagingState(D3D12_RESOURCE_STATE_COPY_SOURCE);
 
                 aligned_src_loc = *src_ptr;
-                aligned_src_loc.pResource = tmp_buf;
-                aligned_src_loc.PlacedFootprint.Offset = 0ull;
+                aligned_src_loc.pResource = stage_buf;
+                aligned_src_loc.PlacedFootprint.Offset = stage_off;
                 aligned_src_loc.PlacedFootprint.Footprint.RowPitch = aligned_pitch;
                 src_ptr = &aligned_src_loc;
             }
@@ -1159,40 +1163,24 @@ void STDMETHODCALLTYPE CommandListX::CopyTextureRegion(
         dst_loc.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT &&
         (dst_loc.PlacedFootprint.Offset & (D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1ull)) != 0ull) {
         const uint64_t fp_bytes = ComputePlacedFootprintByteSize(dst_loc.PlacedFootprint.Footprint);
-        if (fp_bytes > 0ull) {
-            D3D12_HEAP_PROPERTIES def_hp{};
-            def_hp.Type = D3D12_HEAP_TYPE_DEFAULT;
-            D3D12_RESOURCE_DESC stage_desc{};
-            stage_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-            stage_desc.Width = (fp_bytes + 511ull) & ~511ull;
-            stage_desc.Height = 1u;
-            stage_desc.DepthOrArraySize = 1u;
-            stage_desc.MipLevels = 1u;
-            stage_desc.SampleDesc.Count = 1u;
-            stage_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-            ID3D12Resource* stage_buf = nullptr;
-            if (SUCCEEDED(device_x_->HostDevice()->CreateCommittedResource(
-                    &def_hp, D3D12_HEAP_FLAG_NONE, &stage_desc,
-                    D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                    OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&stage_buf))) &&
-                stage_buf) {
-                TrackTiledTransientResource(stage_buf);
-                D3D12_TEXTURE_COPY_LOCATION aligned_dst = dst_loc;
-                aligned_dst.pResource = stage_buf;
-                aligned_dst.PlacedFootprint.Offset = 0ull;
-                host_list_->CopyTextureRegion(&aligned_dst, DstX, DstY, DstZ, src_ptr, pSrcBox);
-                D3D12_RESOURCE_BARRIER tb{};
-                tb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-                tb.Transition.pResource = stage_buf;
-                tb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                tb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
-                tb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-                host_list_->ResourceBarrier(1u, &tb);
-                host_list_->CopyBufferRegion(dst_loc.pResource, dst_loc.PlacedFootprint.Offset, stage_buf, 0ull, fp_bytes);
-                RecordList("ID3D12GraphicsCommandListX::CopyTextureRegion[AlignedFootprintStage]", 16, S_OK);
-                RecordList("ID3D12GraphicsCommandListX::CopyTextureRegion", 16, S_OK);
-                return;
+        const UINT64 slice_bytes = (fp_bytes + 511ull) & ~511ull;
+        ID3D12Resource* stage_buf = nullptr;
+        UINT64 stage_off = 0ull;
+        D3D12_RESOURCE_STATES stage_state = D3D12_RESOURCE_STATE_COPY_DEST;
+        if (fp_bytes > 0ull &&
+            AcquireAlignedStagingSlice(slice_bytes, stage_buf, stage_off, stage_state) && stage_buf) {
+            if (stage_state != D3D12_RESOURCE_STATE_COPY_DEST) {
+                TransitionAlignedStagingState(D3D12_RESOURCE_STATE_COPY_DEST);
             }
+            D3D12_TEXTURE_COPY_LOCATION aligned_dst = dst_loc;
+            aligned_dst.pResource = stage_buf;
+            aligned_dst.PlacedFootprint.Offset = stage_off;
+            host_list_->CopyTextureRegion(&aligned_dst, DstX, DstY, DstZ, src_ptr, pSrcBox);
+            TransitionAlignedStagingState(D3D12_RESOURCE_STATE_COPY_SOURCE);
+            host_list_->CopyBufferRegion(dst_loc.pResource, dst_loc.PlacedFootprint.Offset, stage_buf, stage_off, fp_bytes);
+            RecordList("ID3D12GraphicsCommandListX::CopyTextureRegion[AlignedFootprintStage]", 16, S_OK);
+            RecordList("ID3D12GraphicsCommandListX::CopyTextureRegion", 16, S_OK);
+            return;
         }
     }
 
@@ -3079,7 +3067,7 @@ HRESULT STDMETHODCALLTYPE CommandListX::GetCommandListExtState(
 }
 
 void CommandListX::RecordMirroredResourceGpuWrite(ID3D12Resource* host_resource) {
-    if (!device_x_ || !host_resource) return;
+    if (!device_x_ || !host_resource || !device_x_->HasMirroredTitleVaRegions()) return;
     uint64_t title_va = 0ull;
     if (!device_x_->LookupMirroredTitleVaForResource(host_resource, title_va) || title_va == 0ull) {
         return;
@@ -3112,6 +3100,98 @@ void CommandListX::ExtractDeferredCpuOps(
 // Sprint 13 Placed Tiled Texture Management, Copy Bridging & Barrier Coherency
 // (Leonida #1674)
 // ---------------------------------------------------------------------------
+bool CommandListX::AcquireAlignedStagingSlice(
+    UINT64 required_bytes,
+    ID3D12Resource*& out_buf,
+    UINT64& out_offset,
+    D3D12_RESOURCE_STATES& out_current_state) {
+    out_buf = nullptr;
+    out_offset = 0ull;
+    out_current_state = D3D12_RESOURCE_STATE_COPY_DEST;
+    if (!device_x_ || !device_x_->HostDevice() || required_bytes == 0ull) return false;
+
+    auto& slot = aligned_staging_ring_[aligned_staging_slot_idx_];
+    const UINT64 aligned_cursor = (slot.cursor + 511ull) & ~511ull;
+    const UINT64 aligned_req = (required_bytes + 511ull) & ~511ull;
+
+    if (slot.buffer && aligned_cursor + aligned_req <= slot.capacity) {
+        out_buf = slot.buffer;
+        out_offset = aligned_cursor;
+        out_current_state = slot.state;
+        slot.cursor = aligned_cursor + aligned_req;
+        return true;
+    }
+
+    // Grow buffer (min 4 MiB, or next power-of-two / 64 KiB aligned above requested size).
+    UINT64 new_cap = std::max<UINT64>(4ull * 1024ull * 1024ull, slot.capacity * 2ull);
+    const UINT64 min_need = (aligned_req + 65535ull) & ~65535ull;
+    if (new_cap < min_need) new_cap = min_need;
+
+    D3D12_HEAP_PROPERTIES def_hp{};
+    def_hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    desc.Alignment = 0ull;
+    desc.Width = new_cap;
+    desc.Height = 1u;
+    desc.DepthOrArraySize = 1u;
+    desc.MipLevels = 1u;
+    desc.Format = DXGI_FORMAT_UNKNOWN;
+    desc.SampleDesc.Count = 1u;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+    ID3D12Resource* new_buf = nullptr;
+    if (FAILED(device_x_->HostDevice()->CreateCommittedResource(
+            &def_hp, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_COMMON, nullptr,
+            OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&new_buf))) ||
+        !new_buf) {
+        return false;
+    }
+    if (slot.buffer) {
+        slot.retired_buffers.push_back(slot.buffer);
+    }
+    slot.buffer = new_buf;
+    slot.capacity = new_cap;
+    slot.cursor = aligned_req;
+    slot.state = D3D12_RESOURCE_STATE_COMMON;
+    out_buf = slot.buffer;
+    out_offset = 0ull;
+    out_current_state = D3D12_RESOURCE_STATE_COMMON;
+    return true;
+}
+
+void CommandListX::TransitionAlignedStagingState(D3D12_RESOURCE_STATES new_state) {
+    auto& slot = aligned_staging_ring_[aligned_staging_slot_idx_];
+    if (!slot.buffer || !host_list_ || slot.state == new_state) return;
+    D3D12_RESOURCE_BARRIER tb{};
+    tb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    tb.Transition.pResource = slot.buffer;
+    tb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    tb.Transition.StateBefore = slot.state;
+    tb.Transition.StateAfter = new_state;
+    host_list_->ResourceBarrier(1u, &tb);
+    slot.state = new_state;
+}
+
+void CommandListX::ReleaseAlignedStagingRing() {
+    for (uint32_t i = 0u; i < kAlignedStagingRingSlots; ++i) {
+        auto& slot = aligned_staging_ring_[i];
+        if (slot.buffer) {
+            slot.buffer->Release();
+            slot.buffer = nullptr;
+        }
+        for (ID3D12Resource* old_res : slot.retired_buffers) {
+            if (old_res) old_res->Release();
+        }
+        slot.retired_buffers.clear();
+        slot.capacity = 0ull;
+        slot.cursor = 0ull;
+        slot.state = D3D12_RESOURCE_STATE_COPY_DEST;
+    }
+}
+
 void CommandListX::TrackTiledTransientResource(ID3D12Resource* res) {
     if (!res) return;
     std::lock_guard<std::mutex> lock(tiled_transient_mutex_);
@@ -3237,6 +3317,7 @@ HRESULT STDMETHODCALLTYPE CommandListX::RegisterPlacedTiledTexture(
         auto& reg = GetPlacedTiledRegistry();
         std::lock_guard<std::mutex> lock(reg.mutex);
         reg.map[host_res] = std::move(rec);
+        reg.count.store(static_cast<uint32_t>(reg.map.size()), std::memory_order_release);
     }
     if (device_x_) {
         device_x_->SetTrackedResourceTileMode(host_res, tile_mode);
@@ -3252,6 +3333,7 @@ HRESULT STDMETHODCALLTYPE CommandListX::UnregisterPlacedTiledTexture(
     auto& reg = GetPlacedTiledRegistry();
     std::lock_guard<std::mutex> lock(reg.mutex);
     const size_t erased = reg.map.erase(host_res);
+    reg.count.store(static_cast<uint32_t>(reg.map.size()), std::memory_order_release);
     return (erased > 0u) ? S_OK : S_FALSE;
 }
 
@@ -3365,6 +3447,7 @@ bool CommandListX::TryBridgePlacedTiledCopyTextureRegion(
     const D3D12_TEXTURE_COPY_LOCATION& src_loc,
     const D3D12_BOX* src_box) {
     if (!device_x_ || !device_x_->HostDevice() || !host_list_) return false;
+    if (GetPlacedTiledRegistry().count.load(std::memory_order_acquire) == 0u) return false;
     ID3D12Device* host_dev = device_x_->HostDevice();
 
     PlacedTiledResourceRecord dst_snap{};
@@ -3903,6 +3986,7 @@ bool CommandListX::TryBridgePlacedTiledCopyResource(
     ID3D12Resource* host_dst,
     ID3D12Resource* host_src) {
     if (!host_dst || !host_src || !host_list_) return false;
+    if (GetPlacedTiledRegistry().count.load(std::memory_order_acquire) == 0u) return false;
 
     PlacedTiledResourceRecord dst_snap{};
     PlacedTiledResourceRecord src_snap{};
@@ -4018,6 +4102,7 @@ bool CommandListX::TryBridgePlacedTiledCopyTiles(
     UINT64 buffer_offset_bytes,
     D3D12_TILE_COPY_FLAGS flags) {
     if (!host_tiled_res || !host_buffer || !start_coord) return false;
+    if (GetPlacedTiledRegistry().count.load(std::memory_order_acquire) == 0u) return false;
     PlacedTiledResourceRecord snap{};
     {
         auto& reg = GetPlacedTiledRegistry();
@@ -4069,6 +4154,7 @@ void CommandListX::TrackPlacedTiledResourceBarriers(
     std::vector<D3D12_RESOURCE_BARRIER>& extra_coherency_barriers) {
     if (!unwrapped_barriers || num_barriers == 0u) return;
     auto& reg = GetPlacedTiledRegistry();
+    if (reg.count.load(std::memory_order_acquire) == 0u) return;
     std::lock_guard<std::mutex> lock(reg.mutex);
     if (reg.map.empty()) return;
 

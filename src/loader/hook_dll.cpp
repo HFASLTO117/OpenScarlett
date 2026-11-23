@@ -4555,12 +4555,22 @@ bool InitializeHookRuntime(HMODULE self_mod) {
 
 extern "C" {
 
+__declspec(dllexport) int __cdecl OpenScarlettHook_IsTelemetryActive() {
+    if (g_shutting_down.load(std::memory_order_acquire)) {
+        return 0;
+    }
+    return (g_probe_unknown_imports || !g_telemetry_path_utf8.empty()) ? 1 : 0;
+}
+
 __declspec(dllexport) void __cdecl OpenScarlettHook_RecordCall(const char* module_name,
                                                                const char* symbol_name,
                                                                uint8_t outcome,
                                                                int32_t hr,
                                                                int32_t vtable_slot) {
     if (g_shutting_down.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (!g_probe_unknown_imports && g_telemetry_path_utf8.empty()) {
         return;
     }
     const uint8_t clamped = (outcome <= 3u) ? outcome : 3u;

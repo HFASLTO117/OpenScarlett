@@ -942,6 +942,7 @@ private:
     std::unordered_map<ID3D12Resource*, TrackedBufferVa> buffer_va_map_;
     mutable std::mutex tile_mode_mutex_;
     std::unordered_map<ID3D12Resource*, XG_TILE_MODE> resource_tile_modes_;
+    std::atomic<uint32_t> tile_mode_count_{0u};
     mutable std::mutex mirrored_res_mutex_;
     std::unordered_map<ID3D12Resource*, uint64_t> mirrored_res_to_va_;
     std::atomic<uint32_t> mirrored_va_count_{0u};

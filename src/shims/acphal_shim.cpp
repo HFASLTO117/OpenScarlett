@@ -493,6 +493,9 @@ public:
     }
 
     int32_t CreateHeap(uint32_t cached_bytes, uint32_t non_cached_bytes) {
+        if (cached_bytes == 0u && non_cached_bytes == 0u) {
+            return ACPHAL_E_INVALIDARG;
+        }
         std::lock_guard<std::mutex> lk(mutex_);
         const uint32_t cached_used = cached_.bytes_allocated + cached_.bytes_lost;
         const uint32_t non_cached_used = non_cached_.bytes_allocated + non_cached_.bytes_lost;
