@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <list>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -834,6 +835,8 @@ private:
         uint64_t gpu_va = 0ull;
         uint64_t size_bytes = 0ull;
         uint64_t guest_va = 0ull;
+        const uint8_t* mapped_cpu_ptr = nullptr;
+        bool owns_persistent_map = false;
     };
 
     void TrackBufferVaResource(
@@ -938,8 +941,10 @@ private:
     std::mutex xg_untiler_mutex_;
     bool xg_untiler_attempted_ = false;
 
-    mutable std::mutex buffer_va_mutex_;
+    mutable std::shared_mutex buffer_va_mutex_;
     std::unordered_map<ID3D12Resource*, TrackedBufferVa> buffer_va_map_;
+    std::map<D3D12_GPU_VIRTUAL_ADDRESS, ID3D12Resource*> buffer_va_by_gpu_;
+    std::atomic<uint64_t> buffer_va_gen_{1ull};
     mutable std::mutex tile_mode_mutex_;
     std::unordered_map<ID3D12Resource*, XG_TILE_MODE> resource_tile_modes_;
     std::atomic<uint32_t> tile_mode_count_{0u};
@@ -1106,12 +1111,12 @@ private:
     std::atomic<uint64_t> vline_notifications_signaled_{0ull};
     std::atomic<uint64_t> frame_notifications_signaled_{0ull};
 
-    // 256-byte CBV alignment ring buffer for Xbox 16-byte-aligned root CBVs on desktop D3D12.
+    // Lock-free 256-byte CBV alignment ring buffer for Xbox 16-byte-aligned root CBVs on desktop D3D12.
     std::mutex cbv_align_mutex_;
     ID3D12Resource* cbv_align_ring_ = nullptr;
-    uint8_t* cbv_align_ring_cpu_ = nullptr;
-    D3D12_GPU_VIRTUAL_ADDRESS cbv_align_ring_gpu_ = 0ull;
-    uint32_t cbv_align_ring_cursor_ = 0u;
+    std::atomic<uint8_t*> cbv_align_ring_cpu_{nullptr};
+    std::atomic<D3D12_GPU_VIRTUAL_ADDRESS> cbv_align_ring_gpu_{0ull};
+    std::atomic<uint32_t> cbv_align_ring_cursor_{0u};
 };
 
 }  // namespace openscarlett::d3d12_xs

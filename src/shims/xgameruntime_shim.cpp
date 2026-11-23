@@ -11242,15 +11242,18 @@ XGameResult OPENSCARLETT_GDK_CALL QueryApiImpl(
         }
     }
 
+    // Fast path: known real GDK CLSIDs always use the 3-arg COM ABI (clsid, iid, ppv) —
+    // avoid kernel VirtualQuery syscalls on every GDK thunk call!
+    const bool known_clsid_three_arg =
+        apiId && ppApiVtable && ppApiVtable3 && IsKnownRealGdkClsid(*apiId);
     const bool is_three_arg =
-        apiId && ppApiVtable &&
-        (!IsWritableMemoryPtr(ppApiVtable) ||
-         (IsKnownRealGdkClsid(*apiId) && ppApiVtable3 && IsWritableMemoryPtr(ppApiVtable3)));
+        known_clsid_three_arg ||
+        (apiId && ppApiVtable && !IsWritableMemoryPtr(ppApiVtable));
 
     if (is_three_arg) {
         const auto* clsid = apiId;
         const auto* iid = reinterpret_cast<const XgrGuid*>(ppApiVtable);
-        if (!ppApiVtable3 || !IsWritableMemoryPtr(ppApiVtable3)) {
+        if (!ppApiVtable3 || (!known_clsid_three_arg && !IsWritableMemoryPtr(ppApiVtable3))) {
             return RecordHr("QueryApiImpl", XGR_E_POINTER);
         }
         *ppApiVtable3 = nullptr;
