@@ -122,6 +122,9 @@ jobs:
             Copy-Item "build/OpenScarlettLauncher.exe" $stage
           }
           Get-ChildItem "build" -Filter "*.dll" | Copy-Item -Destination $stage
+          if (-not (Test-Path (Join-Path $stage "dxcompiler_xs.dll"))) {
+            throw "Missing required UE5 Scarlett shim dxcompiler_xs.dll in release stage!"
+          }
           Get-ChildItem "build" -Filter "test_*.exe" | Copy-Item -Destination $stage
           Get-ChildItem "build" -Filter "gdk_*.exe" | Copy-Item -Destination $stage
           Get-ChildItem "build" -Filter "Scarlett*.exe" | Copy-Item -Destination $stage
@@ -385,6 +388,7 @@ jobs:
             GameInput
             AcpHal
             dstorage_xs
+            dxcompiler_xs
             Microsoft.Xbox.Services.GDK.C
             pixevt
             xcrdapi

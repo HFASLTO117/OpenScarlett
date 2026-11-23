@@ -167,6 +167,11 @@ $TestDescriptions = @{
     'test_s13_vk_xg_tiled.exe'         = 'Sprint 13 Vulkan OPTIONS2/7 & VK_EXT_custom_border_color, placed tiled textures in CommandListX/XG untiler & stencil/HTILE parity'
     'test_s13_shader_cfg_safety.exe'   = 'Sprint 13 RDNA2 MIMG R128/TFE/LWE refusal, poisoned mutex recovery, CFG canonicalization, V# slot-0/LDS & 764/779 GPU opcodes'
     'test_s13_gdk_offline_ntdll.exe'   = 'Sprint 13 offline-first XSTS default (OPENSCARLETT_MOCK_XSTS=1 opt-in), XTaskQueue waiter re-arm/drain, dialog/XError & UMS/wldp shims'
+    'test_ue5_dxc_xcrdapi_xg.exe'      = 'UE5 Scarlett bringup: dxcompiler_xs DxcCreateInstance/2, XCRDAPI DStorageGetFactory & xg_xs XGCreateTextureComputer (1D/2D/3D)'
+    'test_ue5_d3d12_exports.exe'       = 'UE5 Scarlett bringup: 42 byte-exact IID_ID3D12* GUID data exports & 9 D3D12Xbox* process/device/frame helpers'
+    'test_ue5_acphal_xmem_mfplat.exe'  = 'UE5 Scarlett bringup: AcpHal thread-safe APU heap, XMem allocation hooks & 46 System32 MFPlat forwarded exports'
+    'test_ue5_probe_static_stub.exe'   = 'UE5 Scarlett bringup: dxcompiler_xs routing, --probe-unknown-imports PE32+ static stub synthesis & Launcher report copy'
+    'test_ue5_matrix_import_bringup.exe' = 'UE5 Matrix Awakens E2E: isolated 7-DLL guest PE (zero guest DLLs) booted via openscarlett run on HW GPU & WARP (0 missing exports)'
 }
 
 Write-Host ''

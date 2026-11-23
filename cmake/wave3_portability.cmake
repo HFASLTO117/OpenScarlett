@@ -88,6 +88,7 @@ set(_openscarlett_known_targets
     XAudio2_9
     AcpHal
     dstorage_xs
+    dxcompiler_xs
     Microsoft.Xbox.Services.GDK.C
     pixevt
     xmem

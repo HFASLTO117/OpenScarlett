@@ -138,6 +138,7 @@ foreach(_os_module_cmake
     cmake/ue5_d3d12_exports.cmake
     cmake/ue5_acphal_xmem_mfplat.cmake
     cmake/ue5_loader_probe.cmake
+    cmake/ue5_matrix_integration.cmake
 )
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_os_module_cmake}")
         include("${CMAKE_CURRENT_SOURCE_DIR}/${_os_module_cmake}")
