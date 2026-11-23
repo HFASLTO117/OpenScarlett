@@ -19,7 +19,7 @@
     <rect width="900" height="542" fill="#0d1117"/>
     <rect x="0" y="0" width="900" height="3" fill="url(#accentBar)"/>
     <text class="h1" x="28" y="40">OpenScarlett — Honest Subsystem Progress (Early Alpha)</text>
-    <text class="sub" x="28" y="62">Windows 10/11 x64 · MIT · 89/89 tests passing · 32 DLLs (1315 exports) · 779/779 RDNA2 ops · 12 PCs</text>
+    <text class="sub" x="28" y="62">Windows 10/11 x64 · MIT · 89/89 tests passing · 33 DLLs (1360 exports) · 779/779 RDNA2 ops · 12 PCs</text>
     <line x1="28" y1="82" x2="872" y2="82" stroke="#21262d" stroke-width="1"/>
     <text class="name" x="28" y="118">Xbox RDNA2 Shader Translator</text>
     <text class="desc" x="28" y="135">779/779 GFX10.3 ops (775 GPU + 4 trap), all 7 stages GPU-verified &amp; MT async PSO cache</text>
@@ -45,10 +45,10 @@
     <rect x="648" y="222" width="176" height="10" rx="5" fill="#2ea043"/>
     <text class="pct" x="872" y="231" text-anchor="end">100%</text>
     <line x1="28" y1="252" x2="872" y2="252" stroke="#161b22" stroke-width="1"/>
-    <text class="name" x="28" y="274">Xbox Live, GDK &amp; OS Shims (32 DLLs)</text>
-    <text class="desc" x="28" y="291">29 high-coverage, 3 partial, 0 stub DLLs — 292/292 thunks, WinRT, IOCP &amp; native UI</text>
+    <text class="name" x="28" y="274">Xbox Live, GDK &amp; OS Shims (33 DLLs)</text>
+    <text class="desc" x="28" y="291">30 high-coverage, 3 partial, 0 stub DLLs — 292/292 thunks, WinRT, IOCP &amp; native UI</text>
     <rect x="498" y="268" width="132" height="22" rx="11" fill="#2ea043"/>
-    <text class="pill" x="564" y="283" text-anchor="middle">29/32 Full DLLs</text>
+    <text class="pill" x="564" y="283" text-anchor="middle">30/33 Full DLLs</text>
     <rect x="648" y="274" width="176" height="10" rx="5" fill="#21262d"/>
     <rect x="648" y="274" width="176" height="10" rx="5" fill="#2ea043"/>
     <text class="pct" x="872" y="283" text-anchor="end">100%</text>
@@ -78,7 +78,7 @@
     <text class="pct" x="872" y="439" text-anchor="end">100%</text>
     <line x1="28" y1="460" x2="872" y2="460" stroke="#161b22" stroke-width="1"/>
     <text class="name" x="28" y="482">Real-World Game Compatibility</text>
-    <text class="desc" x="28" y="499">Minecraft Preview 60 FPS 3D live · 6/6 GDKX samples · UE5 in bring-up</text>
+    <text class="desc" x="28" y="499">Minecraft 60 FPS 3D · GRDK 2504/2510 Stops 1-17 cleared · UE5 4K PresentX (#37)</text>
     <rect x="498" y="476" width="132" height="22" rx="11" fill="#d29922"/>
     <text class="pill" x="564" y="491" text-anchor="middle">Minecraft 60 FPS</text>
     <rect x="648" y="482" width="176" height="10" rx="5" fill="#21262d"/>

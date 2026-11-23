@@ -171,6 +171,7 @@ def collect_dlls(build_dir: pathlib.Path) -> list[DllInfo]:
         ("amd_fidelityfx_loader_xbox.dll", "partial", 5, "FidelityFX context loader & version dispatch"),
         ("AcpHal.dll", "partial", 3, "Shape/audio DSP queue forwarding to software XMA2"),
         ("xapu.dll", "high", 13, "Retail Xbox XApu audio/APU connection & command queue ABI for FMOD"),
+        ("chad.dll", "high", 5, "Retail Xbox Scarlett CHAD / XDsp* hardware DSP codec & stream API"),
         ("pixevt.dll", "stub", 13, "PIX begin/end event & marker telemetry stubs"),
         ("hix_xs.dll", "stub", 11, "Hang-dump & debug telemetry forward stubs"),
         ("KernelTraceControl.dll", "stub", 9, "ETW kernel trace control fixed-return stubs"),
@@ -197,6 +198,7 @@ def collect_dlls(build_dir: pathlib.Path) -> list[DllInfo]:
     has_s16_gfx = has("tests/test_s16_graphics_completeness.cpp")
     has_s16_media = has("tests/test_s16_media_storage_audio.cpp")
     has_s16_os = has("tests/test_s16_os_vfs_gdk_shims.cpp")
+    has_chad = has("src/shims/chad_shim.cpp")
 
     out: list[DllInfo] = []
     for name, tier, fallback_exp, note in catalog:
@@ -209,11 +211,11 @@ def collect_dlls(build_dir: pathlib.Path) -> list[DllInfo]:
         if name == "d3d12_xs.dll" and has_proxies:
             tier = "high"
             note = (
-                "Full Xbox COM proxies (retail Scarlett ABI, Resource1/2/Heap1), page-at-a-time descriptor heaps, >2048 virtualized sampler heap, GetGpuHardwareConfigurationX, Copy Engine queue, D3D12+Vk ExecuteIndirect, live GPU FMASK/DCC/HTILE resolve, lock-free 64 MiB CBV align ring, async 3-slot PresentX, cross-IHV hardening, VRAM residency hygiene, 42 IID GUIDs & Vulkan 1.4 dynamic rendering"
-                if (has_s16_gfx and has_mine_perf)
+                "Full Xbox COM proxies (192-slot ID3D12Device11 retail Scarlett proxy, DescriptorHeap +0x10/+0x18 CPU base, VirtualDxgiOutput slot 21, GRDK >=0x20004 PresentX slot 32), page-at-a-time descriptor heaps, >2048 virtualized sampler heap, Copy queue, D3D12+Vk ExecuteIndirect, live GPU FMASK/DCC/HTILE resolve, 64 MiB CBV ring, depth-aware MSAA clamp, VRAM residency & Vulkan 1.4 dynamic rendering"
+                if (has_s16_gfx and has_mine_perf and has_chad)
                 else (
-                    "Full Xbox COM proxies (retail Scarlett ABI, Resource1/2/Heap1), lock-free 64 MiB CBV align ring + L0 WRITE_BACK upload buffers, async 3-slot PresentX ring, cached barrier unwrap, 42 IID_ID3D12* GUID exports, D3D12Xbox* helpers, Agility SDK, Enhanced Barriers, oversized placed-tex promotion, live MSAA clamp, VRAM residency, HDR10 & Vulkan routing"
-                    if (has_s15_gfx and has_ue5 and has_mine_perf)
+                    "Full Xbox COM proxies (retail Scarlett ABI, Resource1/2/Heap1), page-at-a-time descriptor heaps, >2048 virtualized sampler heap, GetGpuHardwareConfigurationX, Copy Engine queue, D3D12+Vk ExecuteIndirect, live GPU FMASK/DCC/HTILE resolve, lock-free 64 MiB CBV align ring, async 3-slot PresentX, cross-IHV hardening, VRAM residency hygiene, 42 IID GUIDs & Vulkan 1.4 dynamic rendering"
+                    if (has_s16_gfx and has_mine_perf)
                     else "Full Xbox COM proxies (incl. Resource1/2, Heap1), Agility SDK, Enhanced Barriers, live VRAM residency, HDR10 PresentX & Vulkan routing"
                 )
             )
@@ -277,7 +279,13 @@ def collect_dlls(build_dir: pathlib.Path) -> list[DllInfo]:
             tier = "high"
             note = "Console DirectStorage (DStorageGetFactory/SetConfiguration*) forwarding, breadcrumbs & container staging"
         if name == "xmem.dll" and has_ue5:
-            note = "XMemAlloc/Free/Default, XMemSetAllocationHooks, XMemCheckDefaultHeaps, 2-arg working set stats, XMemTransferMemory & virtual query"
+            note = (
+                "XMemAlloc/Free/Default, __XMemAllocationHooks__ auto-binding, MEM_RESERVE_PLACEHOLDER splits, multiple-of-16 PFNs, NTFS sparse-file commit fallback, XMemCheckDefaultHeaps & virtual query"
+                if has_chad
+                else "XMemAlloc/Free/Default, XMemSetAllocationHooks, XMemCheckDefaultHeaps, 2-arg working set stats, XMemTransferMemory & virtual query"
+            )
+        if name == "GameInput.dll" and has_s16_os:
+            note = "XInput-first polling (instant startup/Alt-Tab/replug) + opt-in System32 GIP, overflow-free QPC >10.67d timestamps, live Raw Mouse + opt-in F8 cursor lock (#41) & impulse-trigger rumble"
         if name == "XboxBvhBuilder.dll" and has_s14_bvh:
             tier = "high"
             note = "Real C++ XboxBvhBuilder ABI (24 mangled + 9 C exports), dual-path BVH4 rehydration & SAH BVH"
@@ -300,7 +308,7 @@ def collect_dlls(build_dir: pathlib.Path) -> list[DllInfo]:
                 else "Standard @1-@4 ordinal pinning, live WASAPI, 128 voices, submix/reverb APOs, XMA2/Opus/ADPCM & X3DAudio"
             )
         if name == "xgameruntime.dll" and has_s16_os:
-            note = "292/292 shipping thunks, zero-VirtualQuery 24 COM QueryApiImpl interfaces (0 OS_COM_UNIMPL in threading/display/user/event/ui/streaming), XAsync idle safety, XGameSave name validation & opt-in native Win32 System UI"
+            note = "292/292 shipping thunks, zero-VirtualQuery 24 COM QueryApiImpl interfaces (0 OS_COM_UNIMPL in threading/display/user/event/ui/streaming), XAsync idle safety, Base64 XGameSave container names & opt-in native Win32 System UI"
         if name == "libHttpClient.GDK.dll" and has_s14_ffx:
             tier = "high"
             note = "Offline/HTTP request queue, WebSocket C ABI, HCHttpCall* getters/setters & XAsync lifecycle"
@@ -424,7 +432,7 @@ def collect_components(
             pill_label="12 PCs Verified" if gfx_pct >= 85 else "Partial (12 PCs)",
             pct=gfx_pct,
             what_works=(
-                "All 13 Xbox COM proxies (retail Scarlett ABI, `Resource1/2`, `Heap1`), page-at-a-time 64 KiB descriptor heaps & >2048 virtualized sampler heap, `GetGpuHardwareConfigurationX`, dedicated Copy Engine queue parity, full D3D12 + Vulkan 1.4 `ExecuteIndirect` (root constants, `DispatchMesh`, `pCountBuffer`, arg/VA validation), live GPU compute `FMASK` MSAA / `DCC` 2:1+4:1 / `HTILE` HiZ resolve & decompression (`cs_6_5` + SPIR-V), Vulkan 1.4 dynamic rendering multi-pass RT/depth resolve & `OPENSCARLETT_VK_GPU` fallback, strict cross-IHV capability sanitization (Intel Arc/NVIDIA/AMD/128 MB UMA), Agility SDK, Enhanced Barriers, HDR10/scRGB `PresentX` & VRAM residency live-heap protection."
+                "All 13 Xbox COM proxies (192-slot `ID3D12Device11` retail Scarlett proxy, `ScarlettRetailDescriptorHeapProxy` +0x10/+0x18 CPU base, `VirtualDxgiOutput` Xbox slot 21, GRDK `>=0x20004` `PresentX` slot 32, `Resource1/2`, `Heap1`), page-at-a-time 64 KiB descriptor heaps & >2048 virtualized sampler heap, `GetGpuHardwareConfigurationX`, dedicated Copy Engine queue parity, full D3D12 + Vulkan 1.4 `ExecuteIndirect` (root constants, `DispatchMesh`, `pCountBuffer`, arg/VA validation), live GPU compute `FMASK` MSAA / `DCC` 2:1+4:1 / `HTILE` HiZ resolve & decompression (`cs_6_5` + SPIR-V), depth-format-aware MSAA clamping, Vulkan 1.4 dynamic rendering multi-pass RT/depth resolve & `OPENSCARLETT_VK_GPU` fallback, strict cross-IHV capability sanitization (Intel Arc/NVIDIA/AMD/pre-Turing Pascal/128 MB UMA), Agility SDK, Enhanced Barriers, HDR10/scRGB `PresentX` & VRAM residency live-heap protection."
                 if has_s16_gfx
                 else "All 13 Xbox COM proxies (`DeviceX`, `CommandQueueX`, `CommandListX`, `ResourceX` 1/2, `HeapX` 1, `DescriptorHeapX`, `PipelineStateX`, `RootSignatureX`, `FenceX`, `CommandAllocatorX`, `QueryHeapX`, `CommandSignatureX`, `StateObjectX`), Agility SDK & unwrapped Enhanced Barriers, live VRAM residency + sparse Window-0 isolation, 6-thread multi-queue (`Direct`/`Compute`/`Copy`) `FenceX` sync, `WriteBufferImmediate`/`SetViewInstanceMask`/`OMSetDepthBounds`/`SetSamplePositions`, direct `d3d12_xs`->Vulkan 1.4 routing, `VK_EXT_mesh_shader`, HDR10/scRGB `PresentX`, GPU compute untiler/retiler (`cs_6_5` + SPIR-V) & `xg_xs` 2D/3D/MSAA `HTILE`/`DCC`/`CMASK` fast-clear passthrough."
             ),
@@ -447,7 +455,7 @@ def collect_components(
             pill_label="Live Verified" if mem_pct >= 85 else "Partial",
             pct=mem_pct,
             what_works=(
-                "Win10/11 `VirtualAlloc2`/`MapViewOfFile3` 64 KiB & 4 MiB aliasing, `GpuTilePool`, 64-bit `TitleVAMirror` (`MEM_WRITE_WATCH` / `GetWriteWatch` dirty-page GPU flush & fence-synced readback), raw RDNA2 `V#`/`T#`/`S#` & root-SGPR `s0..s15` bindless bridge (D3D12 SM 6.6 + Vulkan `VK_EXT_descriptor_indexing`), live-heap-safe VRAM residency hygiene (never auto-evicts active/pinned/in-flight heaps without explicit budget override), `XMemVirtualQuery` + ERA attributes, and hardened DirectStorage X2 (`RetrieveErrorRecord` reset, `DuplicateHandle` event signaling, race-free shutdown & MT soak)."
+                "Win10/11 `VirtualAlloc2`/`MapViewOfFile3` 64 KiB & 4 MiB aliasing, `MEM_RESERVE_PLACEHOLDER`/`MEM_REPLACE_PLACEHOLDER` splits, multiple-of-16 PFNs, NTFS sparse-file commit fallback, `__XMemAllocationHooks__` auto-binding, `GpuTilePool`, 64-bit `TitleVAMirror` (`MEM_WRITE_WATCH` / `GetWriteWatch` dirty-page GPU flush & fence-synced readback), raw RDNA2 `V#`/`T#`/`S#` & root-SGPR `s0..s15` bindless bridge (D3D12 SM 6.6 + Vulkan `VK_EXT_descriptor_indexing`), live-heap-safe VRAM residency hygiene (never auto-evicts active/pinned/in-flight heaps without explicit budget override), `XMemVirtualQuery` + ERA attributes, and hardened DirectStorage X2 (`RetrieveErrorRecord` reset, `DuplicateHandle` event signaling, race-free shutdown & MT soak)."
                 if (has_s16_gfx and has_s16_media)
                 else "Win10/11 `VirtualAlloc2`/`MapViewOfFile3` 64 KiB & 4 MiB aliasing, `GpuTilePool`, 64-bit `TitleVAMirror` (`MEM_WRITE_WATCH` / `GetWriteWatch` dirty-page GPU flush & fence-synced readback), raw RDNA2 `V#`/`T#`/`S#` & root-SGPR `s0..s15` bindless bridge (D3D12 SM 6.6 + Vulkan `VK_EXT_descriptor_indexing`), `XMemVirtualQuery` + ERA attributes, and `dstorage_xs` cancellation & physical-page decompression."
             ),
@@ -466,7 +474,7 @@ def collect_components(
             pill_label=f"{high_dlls}/{len(dlls)} Full DLLs",
             pct=dll_pct,
             what_works=(
-                f"{len(dlls)} shimmed DLLs (`{sum(d.exports for d in dlls)}` PE exports, **`0` stub-tier DLLs**): `xgameruntime` (**292/292** shipping thunks, zero-VirtualQuery 24 COM `QueryApiImpl` interfaces with `0` unimplemented slots across threading/`XDisplay`/`XUserDevice`/`XGameEvent`/`XGameUi`/`XGameStreaming`, `XAsync` idle no-op safety, `XGameSaveCreateContainer` name validation & opt-in non-blocking Win32 native System UI), `kernelx` 7-core/14-thread affinity remap, `winrt_xs` ({winrt_exports} exports), `XCurl`, `XSAPI` (178), `GameInput`, plus stateful `hix_xs`, Windows IOCP `xbtp`, `xtfpix`, `gamecoreclient`, `minuserx` & `xtfdebugmonitor`."
+                f"{len(dlls)} shimmed DLLs (`{sum(d.exports for d in dlls)}` PE exports, **`0` stub-tier DLLs**): `xgameruntime` (**292/292** shipping thunks, zero-VirtualQuery 24 COM `QueryApiImpl` interfaces with `0` unimplemented slots across threading/`XDisplay`/`XUserDevice`/`XGameEvent`/`XGameUi`/`XGameStreaming`, `XAsync` idle no-op safety, Base64 `XGameSaveCreateContainer` names & opt-in non-blocking Win32 native System UI), `chad.dll` (`XDsp*`), `kernelx` 7-core/14-thread affinity remap, `winrt_xs` ({winrt_exports} exports), `XCurl`, `XSAPI` (178), `GameInput` (XInput-first + opt-in System32 GIP + opt-in `F8` cursor lock `#41` + >10.67-day QPC overflow fix), plus stateful `hix_xs`, Windows IOCP `xbtp`, `xtfpix`, `gamecoreclient`, `minuserx` & `xtfdebugmonitor`."
                 if has_s16_os
                 else f"{len(dlls)} shimmed DLLs (`{sum(d.exports for d in dlls)}` PE exports): `xgameruntime` (**292/292** shipping `XGamingRuntimeThunks.dll` parity, 24 COM `QueryApiImpl` interfaces, non-blocking offline XSTS/JWT & XStore license checks, exact `XTaskQueue` port delivery), `kernelx` 7-core/14-thread CPU affinity remapping, `winrt_xs` ({winrt_exports} exports, `CoreApplication`/`CoreWindow`/`ApplicationView`/`DisplayInformation` lifecycle & `IReferenceTracker` `E_NOINTERFACE`), `XCurl` (16/16 + offline XSTS HTTP 200 synthesis), `XSAPI` (178), and `GameInput`."
             ),
@@ -512,7 +520,7 @@ def collect_components(
             pill_label="Live Verified",
             pct=loader_pct,
             what_works=(
-                f"`MicrosoftGame.Config` XML loader, nested `G:` CoW overlay VFS with `TRUNCATE_EXISTING`/`FILE_OVERWRITE` read-only CoW copy-up, merged `NtQueryDirectoryFile`/`Ex` + `NtSetInformationFile` (whiteout/rename/EOF) + normalized `GetFinalPathNameByHandleW`, zero `C:\\` path leaks, `System32`-first `KnownDLL` resolution, RVA-0 reloc & `.xdata` v2/v3 unwind checks, Kahn topo init, {len(dlls)}-DLL routing, `CreateProcessW/A` child-process APC hook propagation, `--probe-unknown-imports` static PE stub synthesis, Win32 VEH crash/50-call ring, and `OPENSCARLETT_CAPTURE_DIR` dumper."
+                f"`MicrosoftGame.Config` XML loader, nested `G:` CoW overlay VFS with `TRUNCATE_EXISTING`/`FILE_OVERWRITE` read-only CoW copy-up, merged `NtQueryDirectoryFile`/`Ex` + `NtSetInformationFile` (whiteout/rename/EOF) + normalized `GetFinalPathNameByHandleW`, zero `C:\\` path leaks (`C:`-drive `%TEMP%` fallback parity `#40`), dynamic sibling anti-shadowing (`xgameruntime`/`amd_fidelityfx_upscaler_xbox`), `System32`-first `KnownDLL` resolution, RVA-0 reloc & `.xdata` v2/v3 unwind checks, Kahn topo init, {len(dlls)}-DLL routing, `CreateProcessW/A` child-process APC hook propagation, `OPENSCARLETT_OFFLINE=1` WinHTTP guard, Zen 2 `CLWB`/`CLFLUSHOPT`/`CLZERO`/`MCOMMIT` VEH hot-patching, `--probe-unknown-imports` static PE stub synthesis, Win32 VEH crash/50-call ring, and `OPENSCARLETT_CAPTURE_DIR` dumper."
                 if has_s16_os
                 else f"`MicrosoftGame.Config` XML loader, nested `G:` CoW overlay VFS, `System32`-first `KnownDLL` resolution, RVA-0 reloc & `.xdata` v2/v3 unwind checks, Kahn topo init, {len(dlls)}-DLL routing, `CreateProcessW/A` child-process APC hook propagation, `--probe-unknown-imports` x64 `E_NOTIMPL` trampoline pool, Win32 VEH crash/50-call API ring buffer, and `OPENSCARLETT_CAPTURE_DIR` frame/shader dumper."
             ),
@@ -560,22 +568,22 @@ def collect_components(
         Component(
             short_name="Real-World Game Compatibility",
             plain_summary=(
-                "Minecraft Preview 60 FPS 3D live · 6/6 GDKX samples · UE5 in bring-up"
+                "Minecraft 60 FPS 3D · GRDK 2504/2510 Stops 1-17 cleared · UE5 4K PresentX (#37)"
                 if has_mine_perf
                 else "6/6 untouched GDKX samples & Freedoom live · Minecraft & UE5 in bring-up"
             ),
-            tech_name="Real-World Title Compatibility (Minecraft Preview 60 FPS, Untouched GDKX Samples & Active Bring-Up)",
+            tech_name="Real-World Title Compatibility (Minecraft 60 FPS, GRDK 2504/2510 Stops 1–17 & UE5 4K PresentX)",
             area="Compatibility",
             stage="Partial",
             pill_label="Minecraft 60 FPS" if has_mine_perf else "Active Bring-Up",
             pct=compat_pct,
             what_works=(
-                "Live **retail Xbox Series X Minecraft Preview (`1.18.3064.0`)** booting to menus, saving/loading LevelDB worlds on `P:\\`, and rendering flicker-free 3D worlds at **locked 60 FPS** (12-chunk render distance, 8× AA, Fancy Graphics, edge-to-edge borderless fullscreen) on GTX 1650 Ti (~14% CPU, ~40% spare render headroom; `OPENSCARLETT_FCAP=0` for uncapped FPS); live **6/6 untouched MIT `_GAMING_XBOX_SCARLETT` samples** at 4K; 60 FPS **Freedoom: Phase 1** & `ScarlettArena`; shadowed/skinned BC1+BC3 3D dual-API GDK scene (`gdk_3d_scene`); shipping commercial GDK thunks (`Alexandria IV DEMO`, `0 E_NOINTERFACE`); and 7-DLL **UE5 (*The Matrix Awakens*)** import surface merged with active runtime bring-up underway."
+                "Live **retail Xbox Series X Minecraft Preview (`1.18.3064.0`)** booting to menus, saving/loading Base64 `P:\\` LevelDB worlds (`ZAQEa-bIAAA=`), and rendering flicker-free 3D worlds at **locked 60 FPS** (12-chunk render distance, 8× AA, Fancy Graphics, borderless fullscreen, XInput-first + opt-in `F8` cursor-lock `#41`, >10.67-day QPC fix) on GTX 1650 Ti (~14% CPU, ~40% spare render headroom); **retail GRDK `2504`/`2510` boot Stops `1–17` cleared on `main`** (`chad.dll`, 587/587 retail imports, `__XMemAllocationHooks__`, placeholder splits, NTFS sparse commit, 192-slot `ID3D12Device11` proxy, 4K RT + BVH init, Zen 2 `CLWB`/`CLFLUSHOPT`/`CLZERO`/`MCOMMIT` VEH hot-patching); **UE5 *The Matrix Awakens*** booting 100s crash-free through 43,407 shaders & WorldPartition 253 cells to `3840×2160` 4K `PresentX` on `feat/ue5-matrix-awakens-imports` (`#37`, `XDAT`/`XBCH`/`FSSM` shaders next); live **6/6 untouched MIT `_GAMING_XBOX_SCARLETT` samples** at 4K; 60 FPS **Freedoom: Phase 1** & `ScarlettArena`; `gdk_3d_scene`; and shipping GDK thunks (`Alexandria IV DEMO`, `0 E_NOINTERFACE`)."
                 if has_mine_perf
                 else "Live **6/6 untouched MIT `_GAMING_XBOX_SCARLETT` samples** at 4K, 60 FPS **Freedoom: Phase 1**, `ScarlettArena`, shadowed/skinned BC1+BC3 3D dual-API GDK scene (`gdk_3d_scene`), shipping commercial GDK thunks (`Alexandria IV DEMO`, `0 E_NOINTERFACE`), and next-gen flagship open-world AAA gap audit closed on `main`. Active commercial bring-up underway on **Minecraft (Xbox Series Preview)** and **UE5 (*The Matrix Awakens*)** — join Discord to help test real unpacked GDKs!"
             ),
             verified_on=(
-                "GTX 1650 Ti + WARP + 11 community NVIDIA/AMD PCs (live retail Minecraft Preview `1.18.3064.0`, `test_minecraft_perf_hardening`, `test_mine_xapu_acphal`, `test_ue5_matrix_import_bringup`, `test_gdkx_untouched_samples`, `test_scarlett_game_live`, `test_gdk_3d_scene_dual_api`, `test_real_gdk_thunks_live`)"
+                "GTX 1650 Ti + WARP + 11 community NVIDIA/AMD PCs (live retail Minecraft Preview `1.18.3064.0`, GRDK 2504/2510 Stops 1–17, UE5 *The Matrix Awakens* 4K `PresentX` `#37`, `test_minecraft_perf_hardening`, `test_mine_xapu_acphal`, `test_ue5_matrix_import_bringup`, `test_gdkx_untouched_samples`, `test_scarlett_game_live`, `test_gdk_3d_scene_dual_api`, `test_real_gdk_thunks_live`)"
                 if has_mine_perf
                 else "GTX 1650 Ti + WARP + 11 community NVIDIA/AMD PCs (`test_gdkx_untouched_samples`, `test_scarlett_game_live`, `test_gdk_3d_scene_dual_api`, `test_real_gdk_thunks_live`, `test_mine_xapu_acphal`)"
             ),
@@ -877,6 +885,7 @@ def render_dashboard_html(
             {"tier": "NVIDIA Blackwell", "status": "verified", "detail": "RTX 5060 · RTX 5070 · RTX 5090 (Win11 25H2/26H2, DXR=12, Vulkan 1.4.351–357, 67/67 Pass)"},
             {"tier": "AMD RDNA 3 & 4", "status": "verified", "detail": "RX 7600 · RX 7900 XTX · RX 9070 XT (Win11 26H2, Wave64, DXR=11, 67/67 Pass)"},
             {"tier": "Software Fallback", "status": "verified", "detail": "D3D12 WARP (Windows 10/11 & CI runners)"},
+            {"tier": "NVIDIA Pascal (Pre-Turing)", "status": "needed", "detail": "GeForce MX250 tested (66/67; MeshShaderTier>=1 gate fix landed in f99d57e — re-test welcome)"},
             {"tier": "AMD RX 6000 (RDNA2)", "status": "needed", "detail": "RX 6750 XT tested (60/62; RDNA2 fixes landed — re-test welcome)"},
             {"tier": "Intel Arc (A / B)", "status": "needed", "detail": "Arc B390 Battlemage tested (60/67; mesh PSO, Vulkan subpass & VOPC fixes landed — re-test welcome)"},
             {"tier": "Handheld APUs", "status": "needed", "detail": "Ryzen Z1 Extreme / Radeon 780M tested (64/67; sv64_vopc_p1 fix landed — re-test welcome; Steam Deck Windows needed)"},
@@ -1141,9 +1150,14 @@ def render_dashboard_html(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--build-dir", type=pathlib.Path, default=ROOT / "build")
+    parser.add_argument("--ctest", type=str, default=None, help="Fallback PASSED/TOTAL when LastTest.log is absent")
     args = parser.parse_args()
 
     ctest = read_ctest(args.build_dir)
+    if ctest is None and args.ctest:
+        m = re.match(r"^\s*(\d+)\s*/\s*(\d+)\s*$", args.ctest)
+        if m:
+            ctest = (int(m.group(1)), int(m.group(2)))
     families, op_dec, op_tot, corp_pass, corp_tot = measure_rdna2_families()
     dlls = collect_dlls(args.build_dir)
     trans_items = collect_translation_items()
