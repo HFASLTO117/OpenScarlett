@@ -690,7 +690,7 @@ public:
         const int win_h = ScalePx(760, init_dpi);
 
         const std::wstring title =
-            L"OpenScarlett Launcher — " + Utf8ToWide(kOpenScarlettAppVersion);
+            L"OpenScarlett Launcher \x2014 " + Utf8ToWide(kOpenScarlettAppVersion);
         hwnd_ = ::CreateWindowExW(
             WS_EX_ACCEPTFILES,
             kMainClassName,
@@ -1694,7 +1694,7 @@ private:
         };
         const std::wstring exit_str =
             last_launch_.launched ? std::to_wstring(last_launch_.exit_code)
-                                  : (launch_running_.load() ? L"Running..." : L"—");
+                                  : (launch_running_.load() ? L"Running..." : L"\x2014");
         Metric items[4] = {
             {L"Total API Calls", std::to_wstring(last_launch_.total_calls), br_d2d_blue_.Get()},
             {L"Tracked Symbols", std::to_wstring(last_launch_.tracked_symbols), br_d2d_text_.Get()},
@@ -1757,7 +1757,7 @@ private:
                << hw_result_.passed_count << L" / " << hw_result_.total_count
                << L" passed  (" << hw_result_.failed_count << L" failed)";
         } else {
-            ss << L"Idle — ready to run full hardware verification suite (~60 seconds)";
+            ss << L"Idle \x2014 ready to run full hardware verification suite (~60 seconds)";
         }
         const std::wstring prog_txt = ss.str();
         if (tf_body_) {

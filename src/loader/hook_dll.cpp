@@ -5541,6 +5541,7 @@ void PatchModuleImports(HMODULE mod) {
     ::ReleaseSRWLockExclusive(&g_patch_lock);
 
     // 3. Rebind static & delay-load IAT slots for routed/aliased Xbox shims (outside g_patch_lock).
+    bool has_deferred_unbound = false;
     for (const auto& entry : deferred_shim_iats) {
         HMODULE shim_mod = g_real_GetModuleHandleW
                                ? g_real_GetModuleHandleW(entry.decision.resolved_path.c_str())
@@ -5576,7 +5577,16 @@ void PatchModuleImports(HMODULE mod) {
                         -1);
                 }
             }
+        } else if (!g_initialized.load(std::memory_order_acquire)) {
+            // Still inside DllMain loader lock: defer rebinding until the first post-init sweep.
+            has_deferred_unbound = true;
         }
+    }
+
+    if (has_deferred_unbound) {
+        ::AcquireSRWLockExclusive(&g_patch_lock);
+        g_patched_modules.erase(mod);
+        ::ReleaseSRWLockExclusive(&g_patch_lock);
     }
 
     InspectModuleTlsAndPdata(mod, base, nt, image_size);
@@ -6334,18 +6344,6 @@ __declspec(dllexport) BOOL WINAPI OpenScarlettHook_CopyFileA(
     LPCSTR lpNewFileName,
     BOOL bFailIfExists) {
     return Hook_CopyFileA(lpExistingFileName, lpNewFileName, bFailIfExists);
-}
-
-__declspec(dllexport) HANDLE WINAPI OpenScarlettHook_CreateFileW(
-    LPCWSTR lpFileName,
-    DWORD dwDesiredAccess,
-    DWORD dwShareMode,
-    LPSECURITY_ATTRIBUTES lpSecurityAttributes,
-    DWORD dwCreationDisposition,
-    DWORD dwFlagsAndAttributes,
-    HANDLE hTemplateFile) {
-    return Hook_CreateFileW(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes,
-                            dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
 }
 
 __declspec(dllexport) HANDLE WINAPI OpenScarlettHook_CreateFileA(

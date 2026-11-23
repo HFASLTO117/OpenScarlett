@@ -4335,6 +4335,22 @@ XGameResult OPENSCARLETT_GDK_CALL XUserFindForDevice(
             }
         }
     }
+    // On Xbox Series X|S GDK, keyboards (GameInputFamilyI8042 = 4) and mice (GameInputFamilyHid = 3)
+    // are system peripherals not bound to an Xbox user unless explicitly associated.
+    // OpenScarlett GameInput device IDs encode {'O', 'S', slot, deviceFamily, 0...}.
+    if (deviceId->value[0] == 0x4Fu && deviceId->value[1] == 0x53u &&
+        (deviceId->value[3] == 3u || deviceId->value[3] == 4u)) {
+        bool zero_tail = true;
+        for (size_t i = 4u; i < sizeof(deviceId->value); ++i) {
+            if (deviceId->value[i] != 0u) {
+                zero_tail = false;
+                break;
+            }
+        }
+        if (zero_tail) {
+            return RecordHr("XUserFindForDevice", XGR_E_NOT_FOUND);
+        }
+    }
     if (!rt.live_users.empty()) {
         auto it = rt.live_users.begin();
         it->second->ref_count.fetch_add(1, std::memory_order_relaxed);

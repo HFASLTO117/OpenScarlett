@@ -481,6 +481,23 @@ OpenScarlettGameInputConsumeFrameMouseDelta(
     IGameInput* input,
     GameInputRawMouseFrameDelta* outDelta);
 
+// Process-wide window/input broadcast helpers invoked by d3d12_xs SubclassWndProc
+// (keeps GameInputCreate at ordinal #1).
+constexpr uint32_t GameInputWinEventTargetHwnd = 1u;
+constexpr uint32_t GameInputWinEventFocus = 2u;
+constexpr uint32_t GameInputWinEventDeviceChange = 3u;
+constexpr uint32_t GameInputWinEventMouseWheel = 4u;
+
+OPENSCARLETT_GAMEINPUT_API int32_t OPENSCARLETT_GAMEINPUT_CALL
+OpenScarlettGameInputBroadcastRawInput(void* hRawInput);
+
+OPENSCARLETT_GAMEINPUT_API int32_t OPENSCARLETT_GAMEINPUT_CALL
+OpenScarlettGameInputBroadcastWindowEvent(
+    void* hwnd,
+    uint32_t eventKind,
+    int32_t param1,
+    int32_t param2);
+
 #ifdef __cplusplus
 }
 #endif

@@ -49,6 +49,10 @@ constexpr uint32_t kUiNavContext1 = 0x00000100u;
 constexpr uint32_t kUiNavContext2 = 0x00000200u;
 constexpr uint32_t kUiNavPageUp = 0x00001000u;
 constexpr uint32_t kUiNavPageDown = 0x00002000u;
+constexpr uint32_t kUiNavScrollUp = 0x00010000u;
+constexpr uint32_t kUiNavScrollDown = 0x00020000u;
+constexpr uint32_t kUiNavScrollLeft = 0x00040000u;
+constexpr uint32_t kUiNavScrollRight = 0x00080000u;
 
 struct OsGameInputUiNavigationState {
     uint32_t buttons;
@@ -185,10 +189,12 @@ struct XInputApi {
 #if defined(_WIN32)
     using PfnGetState = DWORD(WINAPI*)(DWORD, OsXInputState*);
     using PfnSetState = DWORD(WINAPI*)(DWORD, OsXInputVibration*);
+    using PfnEnable = void(WINAPI*)(BOOL);
 
     HMODULE module = nullptr;
     PfnGetState get_state = nullptr;
     PfnSetState set_state = nullptr;
+    PfnEnable enable = nullptr;
 #endif
 };
 
@@ -205,6 +211,11 @@ const XInputApi& GetXInput() {
                 reinterpret_cast<void*>(GetProcAddress(a.module, "XInputGetState")));
             a.set_state = reinterpret_cast<XInputApi::PfnSetState>(
                 reinterpret_cast<void*>(GetProcAddress(a.module, "XInputSetState")));
+            a.enable = reinterpret_cast<XInputApi::PfnEnable>(
+                reinterpret_cast<void*>(GetProcAddress(a.module, "XInputEnable")));
+            if (a.enable) {
+                a.enable(TRUE);
+            }
         }
 #endif
         return a;
@@ -247,6 +258,10 @@ uint32_t DeriveUiNavigationButtons(
     if ((gp.buttons & GameInputGamepadDPadRight) || gp.leftThumbstickX > 0.5f) nav |= kUiNavRight;
     if (gp.buttons & GameInputGamepadLeftShoulder) nav |= kUiNavPageUp;
     if (gp.buttons & GameInputGamepadRightShoulder) nav |= kUiNavPageDown;
+    if (gp.rightThumbstickY > 0.5f) nav |= kUiNavScrollUp;
+    if (gp.rightThumbstickY < -0.5f) nav |= kUiNavScrollDown;
+    if (gp.rightThumbstickX < -0.5f) nav |= kUiNavScrollLeft;
+    if (gp.rightThumbstickX > 0.5f) nav |= kUiNavScrollRight;
 
     for (const auto& k : keys) {
         switch (k.virtualKey) {
@@ -356,97 +371,224 @@ void ApplyVirtualGamepadFallback(
     }
 }
 
-void PollGamepadAndKeyboard(
+struct XInputSlotTracker {
+    static constexpr uint64_t kDisconnectedReprobeIntervalUs = 500000ull;  // 500 ms gentle probe
+
+    std::mutex mutex;
+    bool slot_connected[4]{false, false, false, false};
+    uint32_t slot_last_pkt[4]{0u, 0u, 0u, 0u};
+    bool slot_has_pkt[4]{false, false, false, false};
+    uint64_t slot_last_probe_us[4]{0ull, 0ull, 0ull, 0ull};
+    uint32_t active_slot = 0u;
+    std::atomic<bool> force_reprobe{true};
+    std::atomic<bool> enable_refresh_pending{false};
+};
+
+bool HasActiveGamepadInput(const OsXInputGamepad& g) noexcept {
+    if (g.wButtons != 0u) return true;
+    if (g.bLeftTrigger > 30u || g.bRightTrigger > 30u) return true;
+    if (g.sThumbLX > 7849 || g.sThumbLX < -7849) return true;
+    if (g.sThumbLY > 7849 || g.sThumbLY < -7849) return true;
+    if (g.sThumbRX > 8689 || g.sThumbRX < -8689) return true;
+    if (g.sThumbRY > 8689 || g.sThumbRY < -8689) return true;
+    return false;
+}
+
+void TranslateXInputToGameInput(const OsXInputGamepad& g, GameInputGamepadState& out) noexcept {
+    const uint16_t b = g.wButtons;
+    uint32_t gb = GameInputGamepadNone;
+    if (b & kXiDpadUp) gb |= GameInputGamepadDPadUp;
+    if (b & kXiDpadDown) gb |= GameInputGamepadDPadDown;
+    if (b & kXiDpadLeft) gb |= GameInputGamepadDPadLeft;
+    if (b & kXiDpadRight) gb |= GameInputGamepadDPadRight;
+    if (b & kXiStart) gb |= GameInputGamepadMenu;
+    if (b & kXiBack) gb |= GameInputGamepadView;
+    if (b & kXiLeftThumb) gb |= GameInputGamepadLeftThumbstick;
+    if (b & kXiRightThumb) gb |= GameInputGamepadRightThumbstick;
+    if (b & kXiLeftShoulder) gb |= GameInputGamepadLeftShoulder;
+    if (b & kXiRightShoulder) gb |= GameInputGamepadRightShoulder;
+    if (b & kXiA) gb |= GameInputGamepadA;
+    if (b & kXiB) gb |= GameInputGamepadB;
+    if (b & kXiX) gb |= GameInputGamepadX;
+    if (b & kXiY) gb |= GameInputGamepadY;
+    out.buttons = gb;
+    out.leftTrigger = NormalizeTrigger(g.bLeftTrigger, 30);
+    out.rightTrigger = NormalizeTrigger(g.bRightTrigger, 30);
+    out.leftThumbstickX = NormalizeStick(g.sThumbLX, 7849);
+    out.leftThumbstickY = NormalizeStick(g.sThumbLY, 7849);
+    out.rightThumbstickX = NormalizeStick(g.sThumbRX, 8689);
+    out.rightThumbstickY = NormalizeStick(g.sThumbRY, 8689);
+}
+
+bool PollPhysicalXInputGamepad(
+    XInputSlotTracker& tracker,
     uint32_t preferred_slot,
-    bool virtual_gamepad_fallback_enabled,
-    uint32_t raw_mouse_buttons,
-    int64_t raw_mouse_dx,
-    int64_t raw_mouse_dy,
     GameInputGamepadState& out_gamepad,
-    std::vector<GameInputKeyState>& out_keys,
     uint32_t& out_active_slot) {
     out_gamepad = GameInputGamepadState{};
-    out_keys.clear();
     out_active_slot = preferred_slot;
-
 #if defined(_WIN32)
-    bool physical_pad_found = false;
     const XInputApi& xi = GetXInput();
-    if (xi.get_state) {
-        OsXInputState st{};
-        DWORD last_rc = xi.get_state(preferred_slot, &st);
-        if (last_rc == ERROR_SUCCESS) {
-            physical_pad_found = true;
-            out_active_slot = preferred_slot;
-        } else {
-            for (DWORD slot = 0; slot < 4; ++slot) {
-                DWORD rc = xi.get_state(slot, &st);
-                if (rc == ERROR_SUCCESS) {
-                    physical_pad_found = true;
-                    out_active_slot = static_cast<uint32_t>(slot);
+    if (!xi.get_state) {
+        return false;
+    }
+    if (tracker.enable_refresh_pending.exchange(false, std::memory_order_acq_rel) && xi.enable) {
+        xi.enable(TRUE);
+    }
+
+    const uint64_t now_us = QueryTimestampMicros();
+    const bool do_full_probe = tracker.force_reprobe.exchange(false, std::memory_order_acq_rel);
+
+    OsXInputState states[4]{};
+    bool polled_ok[4]{false, false, false, false};
+    DWORD last_rc = ERROR_DEVICE_NOT_CONNECTED;
+    uint32_t active_input_slot = 4u;
+    uint32_t first_connected_slot = 4u;
+    uint32_t chosen_slot = 4u;
+
+    {
+        std::lock_guard<std::mutex> lk(tracker.mutex);
+        if (preferred_slot < 4u && tracker.slot_connected[preferred_slot]) {
+            tracker.active_slot = preferred_slot;
+        }
+        for (DWORD slot = 0u; slot < 4u; ++slot) {
+            const bool should_poll =
+                tracker.slot_connected[slot] ||
+                do_full_probe ||
+                tracker.slot_last_probe_us[slot] == 0ull ||
+                (now_us >= tracker.slot_last_probe_us[slot] + XInputSlotTracker::kDisconnectedReprobeIntervalUs);
+            if (!should_poll) {
+                continue;
+            }
+            tracker.slot_last_probe_us[slot] = now_us;
+            const DWORD rc = xi.get_state(slot, &states[slot]);
+            if (rc == ERROR_SUCCESS) {
+                polled_ok[slot] = true;
+                last_rc = ERROR_SUCCESS;
+                tracker.slot_connected[slot] = true;
+                if (first_connected_slot >= 4u) {
+                    first_connected_slot = static_cast<uint32_t>(slot);
+                }
+                const bool pkt_changed =
+                    tracker.slot_has_pkt[slot] && (states[slot].dwPacketNumber != tracker.slot_last_pkt[slot]);
+                tracker.slot_last_pkt[slot] = states[slot].dwPacketNumber;
+                tracker.slot_has_pkt[slot] = true;
+                if (active_input_slot >= 4u && (pkt_changed || HasActiveGamepadInput(states[slot].Gamepad))) {
+                    active_input_slot = static_cast<uint32_t>(slot);
+                }
+            } else {
+                if (tracker.slot_connected[slot]) {
+                    tracker.slot_connected[slot] = false;
+                    tracker.slot_has_pkt[slot] = false;
+                    tracker.force_reprobe.store(true, std::memory_order_release);
+                }
+                if (last_rc != ERROR_SUCCESS) {
                     last_rc = rc;
-                    break;
                 }
             }
         }
-        static const std::string s_trace_gi_path = []() {
-            char buf[512]{};
-            DWORD n = ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_GAMEINPUT", buf, sizeof(buf));
-            return (n > 0 && n < sizeof(buf)) ? std::string(buf, n) : std::string{};
-        }();
-        if (!s_trace_gi_path.empty()) {
-            static std::atomic<uint32_t> s_prev_state{0xFFFFFFFFu};
-            const uint32_t packed = (physical_pad_found ? 0x80000000u : 0u) |
-                                    ((out_active_slot & 0xFu) << 16) |
-                                    (physical_pad_found ? static_cast<uint32_t>(st.Gamepad.wButtons) : (last_rc & 0xFFFFu));
-            if (s_prev_state.exchange(packed, std::memory_order_relaxed) != packed) {
-                char msg[220];
-                std::snprintf(msg, sizeof(msg),
-                              "[GameInput] XInput found=%d slot=%u rc=%lu pkt=%u btn=0x%04X lx=%d ly=%d\n",
-                              physical_pad_found ? 1 : 0, out_active_slot, static_cast<unsigned long>(last_rc),
-                              st.dwPacketNumber, physical_pad_found ? st.Gamepad.wButtons : 0u,
-                              physical_pad_found ? static_cast<int>(st.Gamepad.sThumbLX) : 0,
-                              physical_pad_found ? static_cast<int>(st.Gamepad.sThumbLY) : 0);
-                ::OutputDebugStringA(msg);
-                if (s_trace_gi_path != "1") {
-                    FILE* f = nullptr;
-                    if (::fopen_s(&f, s_trace_gi_path.c_str(), "a") == 0 && f) {
-                        std::fputs(msg, f);
-                        std::fclose(f);
-                    }
-                }
-            }
-        }
-        if (physical_pad_found) {
-            const uint16_t b = st.Gamepad.wButtons;
-            uint32_t gb = GameInputGamepadNone;
-            if (b & kXiDpadUp) gb |= GameInputGamepadDPadUp;
-            if (b & kXiDpadDown) gb |= GameInputGamepadDPadDown;
-            if (b & kXiDpadLeft) gb |= GameInputGamepadDPadLeft;
-            if (b & kXiDpadRight) gb |= GameInputGamepadDPadRight;
-            if (b & kXiStart) gb |= GameInputGamepadMenu;
-            if (b & kXiBack) gb |= GameInputGamepadView;
-            if (b & kXiLeftThumb) gb |= GameInputGamepadLeftThumbstick;
-            if (b & kXiRightThumb) gb |= GameInputGamepadRightThumbstick;
-            if (b & kXiLeftShoulder) gb |= GameInputGamepadLeftShoulder;
-            if (b & kXiRightShoulder) gb |= GameInputGamepadRightShoulder;
-            if (b & kXiA) gb |= GameInputGamepadA;
-            if (b & kXiB) gb |= GameInputGamepadB;
-            if (b & kXiX) gb |= GameInputGamepadX;
-            if (b & kXiY) gb |= GameInputGamepadY;
-            out_gamepad.buttons = gb;
-            out_gamepad.leftTrigger = NormalizeTrigger(st.Gamepad.bLeftTrigger, 30);
-            out_gamepad.rightTrigger = NormalizeTrigger(st.Gamepad.bRightTrigger, 30);
-            out_gamepad.leftThumbstickX = NormalizeStick(st.Gamepad.sThumbLX, 7849);
-            out_gamepad.leftThumbstickY = NormalizeStick(st.Gamepad.sThumbLY, 7849);
-            out_gamepad.rightThumbstickX = NormalizeStick(st.Gamepad.sThumbRX, 8689);
-            out_gamepad.rightThumbstickY = NormalizeStick(st.Gamepad.sThumbRY, 8689);
+
+        if (active_input_slot < 4u) {
+            chosen_slot = active_input_slot;
+            tracker.active_slot = chosen_slot;
+        } else if (tracker.active_slot < 4u && polled_ok[tracker.active_slot]) {
+            chosen_slot = tracker.active_slot;
+        } else if (preferred_slot < 4u && polled_ok[preferred_slot]) {
+            chosen_slot = preferred_slot;
+            tracker.active_slot = chosen_slot;
+        } else if (first_connected_slot < 4u) {
+            chosen_slot = first_connected_slot;
+            tracker.active_slot = chosen_slot;
         }
     }
 
+    const bool physical_pad_found = (chosen_slot < 4u);
+    if (physical_pad_found) {
+        out_active_slot = chosen_slot;
+        TranslateXInputToGameInput(states[chosen_slot].Gamepad, out_gamepad);
+    }
+
+    static const std::string s_trace_gi_path = []() {
+        char buf[512]{};
+        DWORD n = ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_GAMEINPUT", buf, sizeof(buf));
+        return (n > 0 && n < sizeof(buf)) ? std::string(buf, n) : std::string{};
+    }();
+    if (!s_trace_gi_path.empty()) {
+        static std::atomic<uint32_t> s_prev_state{0xFFFFFFFFu};
+        const uint32_t packed = (physical_pad_found ? 0x80000000u : 0u) |
+                                ((out_active_slot & 0xFu) << 16) |
+                                (physical_pad_found ? static_cast<uint32_t>(states[chosen_slot].Gamepad.wButtons)
+                                                    : (last_rc & 0xFFFFu));
+        if (s_prev_state.exchange(packed, std::memory_order_relaxed) != packed) {
+            char msg[220];
+            std::snprintf(msg, sizeof(msg),
+                          "[GameInput] XInput found=%d slot=%u rc=%lu pkt=%u btn=0x%04X lx=%d ly=%d\n",
+                          physical_pad_found ? 1 : 0, out_active_slot, static_cast<unsigned long>(last_rc),
+                          physical_pad_found ? states[chosen_slot].dwPacketNumber : 0u,
+                          physical_pad_found ? states[chosen_slot].Gamepad.wButtons : 0u,
+                          physical_pad_found ? static_cast<int>(states[chosen_slot].Gamepad.sThumbLX) : 0,
+                          physical_pad_found ? static_cast<int>(states[chosen_slot].Gamepad.sThumbLY) : 0);
+            ::OutputDebugStringA(msg);
+            if (s_trace_gi_path != "1") {
+                FILE* f = nullptr;
+                if (::fopen_s(&f, s_trace_gi_path.c_str(), "a") == 0 && f) {
+                    std::fputs(msg, f);
+                    std::fclose(f);
+                }
+            }
+        }
+    }
+    return physical_pad_found;
+#else
+    (void)tracker;
+    (void)preferred_slot;
+    return false;
+#endif
+}
+
+uint32_t ResolveAsciiCodePointForVk(uint8_t vk, bool shift, bool caps) noexcept {
+    if (vk >= 'A' && vk <= 'Z') {
+        const bool upper = (shift != caps);
+        return upper ? static_cast<uint32_t>(vk) : static_cast<uint32_t>(vk + ('a' - 'A'));
+    }
+    if (vk >= '0' && vk <= '9') {
+        static constexpr char kShiftedDigits[10] = {')', '!', '@', '#', '$', '%', '^', '&', '*', '('};
+        return shift ? static_cast<uint32_t>(static_cast<unsigned char>(kShiftedDigits[vk - '0']))
+                     : static_cast<uint32_t>(vk);
+    }
+    switch (vk) {
+        case 0x20u: return ' ';
+        case 0xBAu: return shift ? ':' : ';';   // VK_OEM_1
+        case 0xBBu: return shift ? '+' : '=';   // VK_OEM_PLUS
+        case 0xBCu: return shift ? '<' : ',';   // VK_OEM_COMMA
+        case 0xBDu: return shift ? '_' : '-';   // VK_OEM_MINUS
+        case 0xBEu: return shift ? '>' : '.';   // VK_OEM_PERIOD
+        case 0xBFu: return shift ? '?' : '/';   // VK_OEM_2
+        case 0xC0u: return shift ? '~' : '`';   // VK_OEM_3
+        case 0xDBu: return shift ? '{' : '[';   // VK_OEM_4
+        case 0xDCu: return shift ? '|' : '\\';  // VK_OEM_5
+        case 0xDDu: return shift ? '}' : ']';   // VK_OEM_6
+        case 0xDEu: return shift ? '"' : '\'';  // VK_OEM_7
+        case 0x60u: case 0x61u: case 0x62u: case 0x63u: case 0x64u:
+        case 0x65u: case 0x66u: case 0x67u: case 0x68u: case 0x69u:
+            return static_cast<uint32_t>('0' + (vk - 0x60u));
+        case 0x6Au: return '*';
+        case 0x6Bu: return '+';
+        case 0x6Du: return '-';
+        case 0x6Eu: return '.';
+        case 0x6Fu: return '/';
+        default: return 0u;
+    }
+}
+
+void PollHostKeyboard(std::vector<GameInputKeyState>& out_keys) {
+    out_keys.clear();
+#if defined(_WIN32)
     auto is_down = [](int vk) -> bool {
         return (GetAsyncKeyState(vk) & 0x8000) != 0;
     };
+    const bool shift_down = is_down(VK_LSHIFT) || is_down(VK_RSHIFT) || is_down(VK_SHIFT);
+    const bool caps_on = (GetKeyState(VK_CAPITAL) & 1) != 0;
 
     static constexpr uint8_t kTrackedVks[] = {
         'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M',
@@ -456,33 +598,38 @@ void PollGamepadAndKeyboard(
         VK_F7, VK_F8, VK_F9, VK_F10, VK_F11, VK_F12,
         VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT,
         VK_LSHIFT, VK_RSHIFT, VK_LCONTROL, VK_RCONTROL, VK_LMENU, VK_RMENU,
-        VK_RETURN, VK_SPACE, VK_ESCAPE, VK_TAB, VK_BACK
+        VK_RETURN, VK_SPACE, VK_ESCAPE, VK_TAB, VK_BACK,
+        VK_DELETE, VK_INSERT, VK_HOME, VK_END, VK_PRIOR, VK_NEXT, VK_CAPITAL,
+        VK_NUMPAD0, VK_NUMPAD1, VK_NUMPAD2, VK_NUMPAD3, VK_NUMPAD4,
+        VK_NUMPAD5, VK_NUMPAD6, VK_NUMPAD7, VK_NUMPAD8, VK_NUMPAD9,
+        VK_MULTIPLY, VK_ADD, VK_SUBTRACT, VK_DECIMAL, VK_DIVIDE,
+        VK_OEM_1, VK_OEM_PLUS, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD,
+        VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7, VK_OEM_102
     };
     for (uint8_t vk : kTrackedVks) {
         if (is_down(vk)) {
             GameInputKeyState ks{};
             ks.virtualKey = vk;
             ks.scanCode = MapVirtualKeyA(vk, MAPVK_VK_TO_VSC);
-            ks.codePoint = (vk >= 0x20 && vk <= 0x7E) ? vk : 0u;
+            ks.codePoint = ResolveAsciiCodePointForVk(vk, shift_down, caps_on);
             ks.isDeadKey = false;
             out_keys.push_back(ks);
         }
     }
+#endif
+}
 
-    if (!physical_pad_found && virtual_gamepad_fallback_enabled) {
-        uint32_t eff_mouse_buttons = raw_mouse_buttons;
-        if (is_down(VK_LBUTTON)) eff_mouse_buttons |= GameInputMouseLeftButton;
-        if (is_down(VK_RBUTTON)) eff_mouse_buttons |= GameInputMouseRightButton;
-        if (is_down(VK_MBUTTON)) eff_mouse_buttons |= GameInputMouseMiddleButton;
-        if (is_down(VK_XBUTTON1)) eff_mouse_buttons |= GameInputMouseButton4;
-        if (is_down(VK_XBUTTON2)) eff_mouse_buttons |= GameInputMouseButton5;
-        ApplyVirtualGamepadFallback(out_gamepad, out_keys, eff_mouse_buttons, raw_mouse_dx, raw_mouse_dy);
-    }
+uint32_t PollHostMouseButtonsMask() noexcept {
+#if defined(_WIN32)
+    uint32_t btns = GameInputMouseNone;
+    if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0) btns |= GameInputMouseLeftButton;
+    if ((GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0) btns |= GameInputMouseRightButton;
+    if ((GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0) btns |= GameInputMouseMiddleButton;
+    if ((GetAsyncKeyState(VK_XBUTTON1) & 0x8000) != 0) btns |= GameInputMouseButton4;
+    if ((GetAsyncKeyState(VK_XBUTTON2) & 0x8000) != 0) btns |= GameInputMouseButton5;
+    return btns;
 #else
-    (void)preferred_slot;
-    if (virtual_gamepad_fallback_enabled) {
-        ApplyVirtualGamepadFallback(out_gamepad, out_keys, raw_mouse_buttons, raw_mouse_dx, raw_mouse_dy);
-    }
+    return GameInputMouseNone;
 #endif
 }
 
@@ -975,6 +1122,7 @@ struct LiveGameInputRegistry {
     std::unordered_set<GameInputImpl*> instances;
     std::unordered_set<GameInputDeviceImpl*> devices;
     std::unordered_set<GameInputReadingImpl*> readings;
+    std::atomic<void*> global_target_hwnd{nullptr};
 };
 
 LiveGameInputRegistry& GetLiveGameInputRegistry() {
@@ -995,7 +1143,7 @@ public:
             "OpenScarlett Xbox Wireless Controller (XInput + Keyboard)");
         keyboard_device_ = CreateTrackedDevice(
             1u,
-            GameInputKindKeyboard | GameInputKindUiNavigation,
+            GameInputKindKeyboard,
             0x045Eu, 0x00DBu,
             GameInputFamilyI8042,
             GameInputRumbleNone,
@@ -1028,6 +1176,10 @@ public:
         slot_devices_[2u] = mouse_device_;
 
         auto& reg = GetLiveGameInputRegistry();
+        void* known_hwnd = reg.global_target_hwnd.load(std::memory_order_acquire);
+        if (known_hwnd) {
+            target_hwnd_.store(known_hwnd, std::memory_order_release);
+        }
         std::lock_guard<std::mutex> lk(reg.mutex);
         reg.instances.insert(this);
     }
@@ -1130,28 +1282,28 @@ public:
         }
 
         const bool input_allowed = ShouldAllowInput();
-        GameInputMouseState mouse_snapshot{};
-        int64_t raw_dx = 0;
-        int64_t raw_dy = 0;
-        {
-            std::lock_guard<std::mutex> mlk(raw_mouse_mutex_);
-            if (input_allowed) {
-                mouse_snapshot.buttons = mouse_buttons_;
-                mouse_snapshot.positionX = mouse_cumulative_x_;
-                mouse_snapshot.positionY = mouse_cumulative_y_;
-                mouse_snapshot.wheelX = mouse_cumulative_wheel_x_;
-                mouse_snapshot.wheelY = mouse_cumulative_wheel_y_;
-                raw_dx = pending_mouse_dx_;
-                raw_dy = pending_mouse_dy_;
-            }
+        const bool was_allowed = prev_input_allowed_.exchange(input_allowed, std::memory_order_acq_rel);
+        if (input_allowed && !was_allowed) {
+            OnFocusGained();
+        } else if (!input_allowed && was_allowed) {
+            OnFocusLost();
         }
 
-        GameInputGamepadState gp{};
-        std::vector<GameInputKeyState> keys;
+        const bool want_all = (inputKind == GameInputKindUnknown);
+        const bool want_gamepad =
+            want_all ||
+            ((inputKind & (GameInputKindGamepad | GameInputKindController | GameInputKindUiNavigation)) != 0u);
+        const bool want_keyboard =
+            want_all ||
+            ((inputKind & (GameInputKindKeyboard | GameInputKindUiNavigation)) != 0u);
+        const bool want_mouse =
+            want_all || ((inputKind & GameInputKindMouse) != 0u);
         const bool vpad_fallback = virtual_gamepad_fallback_.load(std::memory_order_acquire);
 
         bool use_injected = false;
         bool injected_gp_explicit = false;
+        GameInputGamepadState gp{};
+        std::vector<GameInputKeyState> keys;
         if (input_allowed) {
             std::lock_guard<std::mutex> lk(mutex_);
             if (test_inject_enabled_.load(std::memory_order_acquire)) {
@@ -1162,24 +1314,58 @@ public:
             }
         }
 
-        if (input_allowed && use_injected && !injected_gp_explicit && vpad_fallback) {
+        GameInputMouseState mouse_snapshot{};
+        int64_t raw_dx = 0;
+        int64_t raw_dy = 0;
+        if (want_mouse || (want_gamepad && vpad_fallback)) {
+            std::lock_guard<std::mutex> mlk(raw_mouse_mutex_);
+            if (input_allowed) {
+                if (!use_injected && total_mouse_packets_ == 0ull &&
+                    !raw_mouse_registered_.load(std::memory_order_acquire)) {
+                    PollFallbackCursorMouseLocked();
+                    mouse_snapshot.buttons = fallback_mouse_buttons_;
+                    mouse_snapshot.positionX = fallback_mouse_x_;
+                    mouse_snapshot.positionY = fallback_mouse_y_;
+                    mouse_snapshot.wheelX = fallback_wheel_x_;
+                    mouse_snapshot.wheelY = fallback_wheel_y_;
+                    raw_dx = fallback_last_dx_;
+                    raw_dy = fallback_last_dy_;
+                } else {
+                    mouse_snapshot.buttons = mouse_buttons_;
+                    mouse_snapshot.positionX = mouse_cumulative_x_;
+                    mouse_snapshot.positionY = mouse_cumulative_y_;
+                    mouse_snapshot.wheelX = mouse_cumulative_wheel_x_;
+                    mouse_snapshot.wheelY = mouse_cumulative_wheel_y_;
+                    raw_dx = pending_mouse_dx_;
+                    raw_dy = pending_mouse_dy_;
+                }
+            }
+        }
+
+        if (input_allowed && use_injected && !injected_gp_explicit && vpad_fallback && want_gamepad) {
             // Synthesize virtual gamepad state from injected keyboard + raw mouse state.
             ApplyVirtualGamepadFallback(gp, keys, mouse_snapshot.buttons, raw_dx, raw_dy);
         }
 
         if (input_allowed && !use_injected) {
-            uint32_t active_slot = target_dev->ActiveSlot();
-            PollGamepadAndKeyboard(
-                active_slot,
-                vpad_fallback,
-                mouse_snapshot.buttons,
-                raw_dx,
-                raw_dy,
-                gp,
-                keys,
-                active_slot);
-            if (target_dev == default_device_) {
-                target_dev->SetActiveSlot(active_slot);
+            bool physical_pad_found = false;
+            if (want_gamepad && (target_dev->SupportedInput() & GameInputKindGamepad) != 0u) {
+                uint32_t active_slot = target_dev->ActiveSlot();
+                physical_pad_found = PollPhysicalXInputGamepad(
+                    xinput_tracker_, active_slot, gp, active_slot);
+                if (target_dev == default_device_) {
+                    target_dev->SetActiveSlot(active_slot);
+                }
+            }
+            const bool need_keys_for_vpad =
+                want_gamepad && !physical_pad_found && vpad_fallback &&
+                (target_dev->SupportedInput() & GameInputKindGamepad) != 0u;
+            if (want_keyboard || need_keys_for_vpad) {
+                PollHostKeyboard(keys);
+            }
+            if (need_keys_for_vpad) {
+                const uint32_t eff_mouse_buttons = mouse_snapshot.buttons | PollHostMouseButtonsMask();
+                ApplyVirtualGamepadFallback(gp, keys, eff_mouse_buttons, raw_dx, raw_dy);
             }
         }
 
@@ -1719,24 +1905,64 @@ public:
             data_size < sizeof(RAWINPUTHEADER)) {
             return GAMEINPUT_E_INVALIDARG;
         }
-        std::vector<uint8_t> buf(data_size);
+        uint8_t stack_buf[128]{};
+        std::vector<uint8_t> heap_buf;
+        uint8_t* ptr = stack_buf;
+        if (data_size > sizeof(stack_buf)) {
+            heap_buf.resize(data_size);
+            ptr = heap_buf.data();
+        }
         if (::GetRawInputData(reinterpret_cast<HRAWINPUT>(h_raw_input),
                               RID_INPUT,
-                              buf.data(),
+                              ptr,
                               &data_size,
                               sizeof(RAWINPUTHEADER)) != data_size) {
             return GAMEINPUT_E_INVALIDARG;
         }
-        const auto* raw = reinterpret_cast<const RAWINPUT*>(buf.data());
+        const auto* raw = reinterpret_cast<const RAWINPUT*>(ptr);
         if (raw->header.dwType != RIM_TYPEMOUSE) {
             return GAMEINPUT_S_OK;
         }
-        const RAWMOUSE& m = raw->data.mouse;
+        ApplyDecodedRawMouse(raw->data.mouse);
+        return GAMEINPUT_S_OK;
+#else
+        (void)h_raw_input;
+        return GAMEINPUT_E_INVALIDARG;
+#endif
+    }
+
+#if defined(_WIN32)
+    void ApplyDecodedRawMouse(const RAWMOUSE& m) {
+        std::lock_guard<std::mutex> lk(raw_mouse_mutex_);
+        // Seed cumulative position from cursor fallback on the very first Raw Input packet
+        // so the title never sees a sudden coordinate jump on transition.
+        if (total_mouse_packets_ == 0ull && (fallback_mouse_x_ != 0 || fallback_mouse_y_ != 0 ||
+                                             fallback_wheel_x_ != 0 || fallback_wheel_y_ != 0)) {
+            mouse_cumulative_x_ = fallback_mouse_x_;
+            mouse_cumulative_y_ = fallback_mouse_y_;
+            mouse_cumulative_wheel_x_ = fallback_wheel_x_;
+            mouse_cumulative_wheel_y_ = fallback_wheel_y_;
+            mouse_buttons_ = fallback_mouse_buttons_;
+        }
+
         int32_t dx = 0;
         int32_t dy = 0;
         if ((m.usFlags & MOUSE_MOVE_ABSOLUTE) == 0u) {
             dx = static_cast<int32_t>(m.lLastX);
             dy = static_cast<int32_t>(m.lLastY);
+        } else {
+            const bool vdesk = (m.usFlags & MOUSE_VIRTUAL_DESKTOP) != 0u;
+            const int32_t w = ::GetSystemMetrics(vdesk ? SM_CXVIRTUALSCREEN : SM_CXSCREEN);
+            const int32_t h = ::GetSystemMetrics(vdesk ? SM_CYVIRTUALSCREEN : SM_CYSCREEN);
+            const int32_t px = (w > 0) ? static_cast<int32_t>((static_cast<int64_t>(m.lLastX) * w) / 65535LL) : 0;
+            const int32_t py = (h > 0) ? static_cast<int32_t>((static_cast<int64_t>(m.lLastY) * h) / 65535LL) : 0;
+            if (abs_mouse_valid_) {
+                dx = px - abs_mouse_last_x_;
+                dy = py - abs_mouse_last_y_;
+            }
+            abs_mouse_last_x_ = px;
+            abs_mouse_last_y_ = py;
+            abs_mouse_valid_ = true;
         }
         int32_t wx = 0;
         int32_t wy = 0;
@@ -1748,7 +1974,6 @@ public:
             wx = static_cast<int16_t>(m.usButtonData);
         }
 #endif
-        std::lock_guard<std::mutex> lk(raw_mouse_mutex_);
         uint32_t btns = mouse_buttons_;
         if (m.usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN) btns |= GameInputMouseLeftButton;
         if (m.usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP) btns &= ~GameInputMouseLeftButton;
@@ -1761,11 +1986,45 @@ public:
         if (m.usButtonFlags & RI_MOUSE_BUTTON_5_DOWN) btns |= GameInputMouseButton5;
         if (m.usButtonFlags & RI_MOUSE_BUTTON_5_UP) btns &= ~GameInputMouseButton5;
         AccumulateRawMousePacketLocked(dx, dy, wx, wy, btns);
-        return GAMEINPUT_S_OK;
-#else
-        (void)h_raw_input;
-        return GAMEINPUT_E_INVALIDARG;
+    }
 #endif
+
+    void OnFocusGained() noexcept {
+        xinput_tracker_.force_reprobe.store(true, std::memory_order_release);
+        xinput_tracker_.enable_refresh_pending.store(true, std::memory_order_release);
+        std::lock_guard<std::mutex> lk(raw_mouse_mutex_);
+        cursor_fallback_valid_ = false;
+        abs_mouse_valid_ = false;
+        fallback_last_dx_ = 0;
+        fallback_last_dy_ = 0;
+        if (!test_inject_enabled_.load(std::memory_order_acquire)) {
+            const uint32_t live_btns = PollHostMouseButtonsMask();
+            mouse_buttons_ = live_btns;
+            fallback_mouse_buttons_ = live_btns;
+        }
+    }
+
+    void OnFocusLost() noexcept {
+        std::lock_guard<std::mutex> lk(raw_mouse_mutex_);
+        mouse_buttons_ = GameInputMouseNone;
+        fallback_mouse_buttons_ = GameInputMouseNone;
+        cursor_fallback_valid_ = false;
+        abs_mouse_valid_ = false;
+        fallback_last_dx_ = 0;
+        fallback_last_dy_ = 0;
+    }
+
+    void OnDeviceChange() noexcept {
+        xinput_tracker_.force_reprobe.store(true, std::memory_order_release);
+        xinput_tracker_.enable_refresh_pending.store(true, std::memory_order_release);
+    }
+
+    void AccumulateFallbackWheel(int32_t wx, int32_t wy) noexcept {
+        std::lock_guard<std::mutex> lk(raw_mouse_mutex_);
+        if (total_mouse_packets_ == 0ull) {
+            fallback_wheel_x_ += static_cast<int64_t>(wx);
+            fallback_wheel_y_ += static_cast<int64_t>(wy);
+        }
     }
 
     void InjectRawMouseDelta(int32_t dx, int32_t dy, int32_t wx, int32_t wy, uint32_t buttons) {
@@ -1873,8 +2132,37 @@ private:
         raw_mouse_ring_.push_back(pkt);
     }
 
+    void PollFallbackCursorMouseLocked() noexcept {
 #if defined(_WIN32)
-    static bool ProcessOwnsVisibleGuiWindow() noexcept {
+        POINT pt{};
+        if (::GetCursorPos(&pt) != FALSE) {
+            if (cursor_fallback_valid_) {
+                const int64_t dx = static_cast<int64_t>(pt.x - cursor_fallback_last_.x);
+                const int64_t dy = static_cast<int64_t>(pt.y - cursor_fallback_last_.y);
+                fallback_mouse_x_ += dx;
+                fallback_mouse_y_ += dy;
+                fallback_last_dx_ = dx;
+                fallback_last_dy_ = dy;
+            } else {
+                fallback_last_dx_ = 0;
+                fallback_last_dy_ = 0;
+            }
+            cursor_fallback_last_ = pt;
+            cursor_fallback_valid_ = true;
+        }
+        fallback_mouse_buttons_ = PollHostMouseButtonsMask();
+#endif
+    }
+
+#if defined(_WIN32)
+    static bool ProcessOwnsVisibleGuiWindowCached() noexcept {
+        static std::atomic<uint64_t> s_last_check_us{0ull};
+        static std::atomic<bool> s_cached_found{false};
+        const uint64_t now_us = QueryTimestampMicros();
+        const uint64_t prev_us = s_last_check_us.load(std::memory_order_acquire);
+        if (prev_us != 0ull && now_us < prev_us + 100000ull) {
+            return s_cached_found.load(std::memory_order_acquire);
+        }
         struct EnumCtx {
             DWORD self_pid;
             HWND console_hwnd;
@@ -1900,6 +2188,8 @@ private:
                 return TRUE;
             },
             reinterpret_cast<LPARAM>(&ctx));
+        s_cached_found.store(ctx.found, std::memory_order_release);
+        s_last_check_us.store(now_us, std::memory_order_release);
         return ctx.found;
     }
 #endif
@@ -1911,16 +2201,28 @@ private:
         }
 #if defined(_WIN32)
         HWND fg = GetForegroundWindow();
+        const DWORD self_pid = GetCurrentProcessId();
         HWND target = reinterpret_cast<HWND>(target_hwnd_.load(std::memory_order_acquire));
         if (target && IsWindow(target) != FALSE) {
             if (!fg) {
                 return false;
             }
-            return (fg == target) ||
-                   (IsChild(target, fg) != FALSE) ||
-                   (GetAncestor(fg, GA_ROOTOWNER) == target);
+            if ((fg == target) ||
+                (IsChild(target, fg) != FALSE) ||
+                (GetAncestor(fg, GA_ROOTOWNER) == target) ||
+                (GetAncestor(fg, GA_ROOTOWNER) == GetAncestor(target, GA_ROOTOWNER))) {
+                return true;
+            }
+            // If an explicit target window was set (e.g., focus gating test or multi-window title),
+            // allow only if fg belongs to this process AND isn't a different unrelated window when
+            // explicit focus policy is set.
+            if ((policy & (GameInputDisableBackgroundInput | GameInputExclusiveForegroundInput)) != 0u) {
+                return false;
+            }
+            DWORD fg_pid = 0;
+            GetWindowThreadProcessId(fg, &fg_pid);
+            return (fg_pid == self_pid);
         }
-        const DWORD self_pid = GetCurrentProcessId();
         if (fg) {
             DWORD fg_pid = 0;
             GetWindowThreadProcessId(fg, &fg_pid);
@@ -1939,7 +2241,7 @@ private:
         if (test_inject_enabled_.load(std::memory_order_acquire)) {
             return true;
         }
-        return !ProcessOwnsVisibleGuiWindow();
+        return !ProcessOwnsVisibleGuiWindowCached();
 #else
         return true;
 #endif
@@ -1948,6 +2250,8 @@ private:
     std::atomic<uint32_t> ref_count_{1};
     std::atomic<uint32_t> focus_policy_{GameInputDefaultFocusPolicy};
     std::atomic<void*> target_hwnd_{nullptr};
+    std::atomic<bool> prev_input_allowed_{true};
+    XInputSlotTracker xinput_tracker_;
     GameInputDeviceImpl* default_device_ = nullptr;
     GameInputDeviceImpl* keyboard_device_ = nullptr;
     GameInputDeviceImpl* mouse_device_ = nullptr;
@@ -1981,6 +2285,20 @@ private:
     uint32_t pending_packet_count_ = 0u;
     uint64_t total_mouse_packets_ = 0ull;
     std::deque<RawMousePacket> raw_mouse_ring_;
+    bool abs_mouse_valid_ = false;
+    int32_t abs_mouse_last_x_ = 0;
+    int32_t abs_mouse_last_y_ = 0;
+    bool cursor_fallback_valid_ = false;
+#if defined(_WIN32)
+    POINT cursor_fallback_last_{};
+#endif
+    int64_t fallback_mouse_x_ = 0;
+    int64_t fallback_mouse_y_ = 0;
+    int64_t fallback_wheel_x_ = 0;
+    int64_t fallback_wheel_y_ = 0;
+    int64_t fallback_last_dx_ = 0;
+    int64_t fallback_last_dy_ = 0;
+    uint32_t fallback_mouse_buttons_ = GameInputMouseNone;
 };
 
 GameInputImpl* AcquireLiveGameInput(IGameInput* input) {
@@ -2275,6 +2593,125 @@ OpenScarlettGameInputSetVirtualGamepadFallback(
     impl->SetVirtualGamepadFallback(enable != 0);
     impl->Release();
     return RecordHr("OpenScarlettGameInputSetVirtualGamepadFallback", GAMEINPUT_S_OK);
+}
+
+OPENSCARLETT_GAMEINPUT_API int32_t OPENSCARLETT_GAMEINPUT_CALL
+OpenScarlettGameInputBroadcastRawInput(void* hRawInput) {
+#if defined(_WIN32)
+    if (!hRawInput) {
+        return GAMEINPUT_E_INVALIDARG;
+    }
+    UINT data_size = 0u;
+    if (::GetRawInputData(reinterpret_cast<HRAWINPUT>(hRawInput),
+                          RID_INPUT,
+                          nullptr,
+                          &data_size,
+                          sizeof(RAWINPUTHEADER)) != 0u ||
+        data_size < sizeof(RAWINPUTHEADER)) {
+        return GAMEINPUT_E_INVALIDARG;
+    }
+    uint8_t stack_buf[128]{};
+    std::vector<uint8_t> heap_buf;
+    uint8_t* ptr = stack_buf;
+    if (data_size > sizeof(stack_buf)) {
+        heap_buf.resize(data_size);
+        ptr = heap_buf.data();
+    }
+    if (::GetRawInputData(reinterpret_cast<HRAWINPUT>(hRawInput),
+                          RID_INPUT,
+                          ptr,
+                          &data_size,
+                          sizeof(RAWINPUTHEADER)) != data_size) {
+        return GAMEINPUT_E_INVALIDARG;
+    }
+    const auto* raw = reinterpret_cast<const RAWINPUT*>(ptr);
+    if (raw->header.dwType != RIM_TYPEMOUSE) {
+        return GAMEINPUT_S_OK;
+    }
+    std::vector<GameInputImpl*> live;
+    {
+        auto& reg = GetLiveGameInputRegistry();
+        std::lock_guard<std::mutex> lk(reg.mutex);
+        live.reserve(reg.instances.size());
+        for (auto* inst : reg.instances) {
+            if (inst) {
+                inst->AddRef();
+                live.push_back(inst);
+            }
+        }
+    }
+    for (auto* inst : live) {
+        inst->ApplyDecodedRawMouse(raw->data.mouse);
+        inst->Release();
+    }
+    return GAMEINPUT_S_OK;
+#else
+    (void)hRawInput;
+    return GAMEINPUT_E_INVALIDARG;
+#endif
+}
+
+OPENSCARLETT_GAMEINPUT_API int32_t OPENSCARLETT_GAMEINPUT_CALL
+OpenScarlettGameInputBroadcastWindowEvent(
+    void* hwnd,
+    uint32_t eventKind,
+    int32_t param1,
+    int32_t param2) {
+    auto& reg = GetLiveGameInputRegistry();
+    if (eventKind == GameInputWinEventTargetHwnd && hwnd) {
+#if defined(_WIN32)
+        if (::IsWindow(reinterpret_cast<HWND>(hwnd)) != FALSE &&
+            ::IsWindowVisible(reinterpret_cast<HWND>(hwnd)) != FALSE) {
+            reg.global_target_hwnd.store(hwnd, std::memory_order_release);
+        }
+#else
+        reg.global_target_hwnd.store(hwnd, std::memory_order_release);
+#endif
+    }
+    std::vector<GameInputImpl*> live;
+    {
+        std::lock_guard<std::mutex> lk(reg.mutex);
+        live.reserve(reg.instances.size());
+        for (auto* inst : reg.instances) {
+            if (inst) {
+                inst->AddRef();
+                live.push_back(inst);
+            }
+        }
+    }
+    for (auto* inst : live) {
+        switch (eventKind) {
+            case GameInputWinEventTargetHwnd:
+                if (hwnd) {
+#if defined(_WIN32)
+                    if (::IsWindow(reinterpret_cast<HWND>(hwnd)) != FALSE &&
+                        ::IsWindowVisible(reinterpret_cast<HWND>(hwnd)) != FALSE) {
+                        inst->SetTargetWindow(hwnd);
+                    }
+#else
+                    inst->SetTargetWindow(hwnd);
+#endif
+                }
+                break;
+            case GameInputWinEventFocus:
+                if (param1 != 0) {
+                    inst->OnFocusGained();
+                } else {
+                    inst->OnFocusLost();
+                }
+                break;
+            case GameInputWinEventDeviceChange:
+                inst->OnDeviceChange();
+                break;
+            case GameInputWinEventMouseWheel:
+                inst->AccumulateFallbackWheel(param1, param2);
+                break;
+            default:
+                break;
+        }
+        inst->Release();
+    }
+    return GAMEINPUT_S_OK;
 }
 
 }  // extern "C"

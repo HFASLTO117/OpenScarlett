@@ -633,9 +633,17 @@ void RunWindowingAndInputSuite(bool use_warp) {
     }
 
     // -------------------------------------------------------------------------
-    // 7. WM_CLOSE clean exit notification, PostQuitMessage, and WndProc restore
+    // 7. Focus/DeviceChange/Wheel subclass bridge, WM_CLOSE, PostQuitMessage, and WndProc restore
     // -------------------------------------------------------------------------
     OS_REQUIRE(GetWindowLongPtrW(hwnd, GWLP_WNDPROC) != orig_wndproc);
+    // Exercise focus loss/regain, device-change, and wheel forwarding through the PresentX subclass proc.
+    SendMessageW(hwnd, WM_ACTIVATEAPP, FALSE, 0);
+    SendMessageW(hwnd, WM_KILLFOCUS, 0, 0);
+    SendMessageW(hwnd, WM_ACTIVATEAPP, TRUE, 0);
+    SendMessageW(hwnd, WM_SETFOCUS, 0, 0);
+    SendMessageW(hwnd, WM_DEVICECHANGE, 0x0007u /*DBT_DEVNODES_CHANGED*/, 0);
+    SendMessageW(hwnd, WM_MOUSEWHEEL, MAKEWPARAM(0, WHEEL_DELTA), 0);
+
     OS_REQUIRE(SUCCEEDED(OpenScarlettD3D12SetWindowCloseBehavior(queue.Get(), 1)));
 
     SendMessageW(hwnd, WM_CLOSE, 0, 0);
@@ -643,8 +651,22 @@ void RunWindowingAndInputSuite(bool use_warp) {
     OS_REQUIRE(state.close_requested == 1u);
 
     MSG quit_msg{};
-    OS_REQUIRE(PeekMessageW(&quit_msg, nullptr, WM_QUIT, WM_QUIT, PM_REMOVE) != FALSE);
-    OS_REQUIRE(quit_msg.message == WM_QUIT);
+    bool saw_quit = false;
+    for (int drain = 0; drain < 64; ++drain) {
+        if (PeekMessageW(&quit_msg, nullptr, WM_QUIT, WM_QUIT, PM_REMOVE) != FALSE) {
+            saw_quit = (quit_msg.message == WM_QUIT);
+            break;
+        }
+        MSG other{};
+        if (PeekMessageW(&other, nullptr, 0, 0, PM_REMOVE) == FALSE) {
+            break;
+        }
+        if (other.message == WM_QUIT) {
+            saw_quit = true;
+            break;
+        }
+    }
+    OS_REQUIRE(saw_quit);
 
     // Tear down D3D12X objects and confirm original WndProc is restored cleanly.
     rtv_heap.Reset();

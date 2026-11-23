@@ -374,6 +374,9 @@ private:
     int64_t last_paced_qpc_ = 0;
     int64_t last_present_qpc_ = 0;
     HANDLE pacing_timer_ = nullptr;
+    bool pacing_timer_high_res_ = false;
+    uint32_t cached_monitor_refresh_hz_ = 0u;
+    HWND cached_monitor_hwnd_ = nullptr;
     uint32_t fcap_override_fps_ = 0u;
     bool fcap_override_active_ = false;
     uint32_t last_effective_interval_us_ = 0u;

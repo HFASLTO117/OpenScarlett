@@ -1919,16 +1919,31 @@ LauncherRunResult LaunchTargetWithProbeOption(
 
     const std::filesystem::path shim_dir = req.shim_dir.empty() ? bundle_dir : req.shim_dir;
 
-    // Build an isolated telemetry output path under %TEMP% (never hardcoded to C:\).
-    std::filesystem::path temp_dir;
-    const std::string temp_env = GetEnvVarUtf8(L"TEMP");
-    if (!temp_env.empty()) {
-        temp_dir = std::filesystem::path(Utf8ToWide(temp_env));
-    } else {
-        temp_dir = std::filesystem::temp_directory_path(ec);
+    // Build an isolated telemetry output path anchored to OPENSCARLETT_WORK_DIR or bundle_dir
+    // (staying off C:\ whenever the bundle/work directory is writable), falling back to %TEMP%.
+    std::filesystem::path tel_dir;
+    const std::string work_env = GetEnvVarUtf8(L"OPENSCARLETT_WORK_DIR");
+    if (!work_env.empty()) {
+        tel_dir = std::filesystem::path(Utf8ToWide(work_env)) / L"launcher_telemetry";
+        std::filesystem::create_directories(tel_dir, ec);
     }
-    const std::filesystem::path tel_dir = temp_dir / L"openscarlett_launcher_telemetry";
-    std::filesystem::create_directories(tel_dir, ec);
+    if (tel_dir.empty() || ec) {
+        ec.clear();
+        tel_dir = bundle_dir / L".openscarlett_telemetry";
+        std::filesystem::create_directories(tel_dir, ec);
+    }
+    if (ec) {
+        ec.clear();
+        std::filesystem::path temp_dir;
+        const std::string temp_env = GetEnvVarUtf8(L"TEMP");
+        if (!temp_env.empty()) {
+            temp_dir = std::filesystem::path(Utf8ToWide(temp_env));
+        } else {
+            temp_dir = std::filesystem::temp_directory_path(ec);
+        }
+        tel_dir = temp_dir / L"openscarlett_launcher_telemetry";
+        std::filesystem::create_directories(tel_dir, ec);
+    }
 
     const std::filesystem::path target_fs(Utf8ToWide(req.target_path));
     std::string stem = PathToUtf8(target_fs.stem());

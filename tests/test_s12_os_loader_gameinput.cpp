@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "openscarlett/audio/xaudio2_abi.h"
+#include "openscarlett/core/telemetry.h"
 #include "openscarlett/gdk/xgameruntime_abi.h"
 #include "openscarlett/input/gameinput_abi.h"
 #include "openscarlett/kernel/console_lsa_policy.h"
@@ -764,8 +765,90 @@ void TestGameInputS12() {
     reading->Release();
 
     OS_REQUIRE(OpenScarlettGameInputInjectTestState(gi, nullptr, nullptr, 0u, 0) == GAMEINPUT_S_OK);
+
+    // 4e. Ordinal #1 ABI guard: GameInputCreate MUST remain Export Ordinal #1 for retail Xbox PE imports!
+    const void* ord1_proc = reinterpret_cast<const void*>(::GetProcAddress(gi_mod, MAKEINTRESOURCEA(1)));
+    const void* name_proc = reinterpret_cast<const void*>(::GetProcAddress(gi_mod, "GameInputCreate"));
+    OS_REQUIRE(ord1_proc != nullptr && ord1_proc == name_proc);
+
+    // 4f. Verify keyboard_device_ does not hijack UiNavigation from default gamepad device,
+    //     and OpenScarlettGameInputBroadcastWindowEvent handles focus loss/regain, device change, & wheel cleanly.
+    IGameInputDevice* kb_dev = nullptr;
+    IGameInputDevice* ms_dev = nullptr;
+    OS_REQUIRE(get_dev(gi, GameInputKindKeyboard, &kb_dev) == GAMEINPUT_S_OK && kb_dev != nullptr);
+    OS_REQUIRE(get_dev(gi, GameInputKindMouse, &ms_dev) == GAMEINPUT_S_OK && ms_dev != nullptr);
+    OS_REQUIRE((kb_dev->GetDeviceInfo()->supportedInput & GameInputKindUiNavigation) == 0u);
+    OS_REQUIRE((kb_dev->GetDeviceInfo()->supportedInput & GameInputKindKeyboard) != 0u);
+    OS_REQUIRE((ms_dev->GetDeviceInfo()->supportedInput & GameInputKindMouse) != 0u);
+    kb_dev->Release();
+    ms_dev->Release();
+
+    // Create a fresh GameInput instance with zero raw packets to verify fallback wheel + focus-loss button clear.
+    IGameInput* gi_ev = nullptr;
+    OS_REQUIRE(GameInputCreate(&gi_ev) == GAMEINPUT_S_OK && gi_ev != nullptr);
+    gi_ev->SetFocusPolicy(GameInputEnableBackgroundInput);
+    OS_REQUIRE(OpenScarlettGameInputBroadcastWindowEvent(
+                   nullptr, GameInputWinEventMouseWheel, 0, 240) == GAMEINPUT_S_OK);
+    {
+        IGameInputReading* wr = nullptr;
+        OS_REQUIRE(gi_ev->GetCurrentReading(GameInputKindMouse, nullptr, &wr) == GAMEINPUT_S_OK && wr != nullptr);
+        GameInputMouseState wms{};
+        OS_REQUIRE(wr->GetMouseState(&wms));
+        OS_REQUIRE(wms.wheelY == 240);
+        wr->Release();
+    }
+    OS_REQUIRE(OpenScarlettGameInputInjectRawMouseDelta(
+                   gi_ev, 5, -3, 0, 0, GameInputMouseLeftButton | GameInputMouseRightButton) == GAMEINPUT_S_OK);
+    OS_REQUIRE(OpenScarlettGameInputBroadcastWindowEvent(
+                   nullptr, GameInputWinEventFocus, 0, 0) == GAMEINPUT_S_OK);
+    {
+        IGameInputReading* fr = nullptr;
+        OS_REQUIRE(gi_ev->GetCurrentReading(GameInputKindMouse, nullptr, &fr) == GAMEINPUT_S_OK && fr != nullptr);
+        GameInputMouseState fms{};
+        OS_REQUIRE(fr->GetMouseState(&fms));
+        OS_REQUIRE(fms.buttons == GameInputMouseNone);  // Focus loss clears stuck mouse buttons!
+        fr->Release();
+    }
+    OS_REQUIRE(OpenScarlettGameInputBroadcastWindowEvent(
+                   nullptr, GameInputWinEventFocus, 1, 0) == GAMEINPUT_S_OK);
+    OS_REQUIRE(OpenScarlettGameInputBroadcastWindowEvent(
+                   nullptr, GameInputWinEventDeviceChange, 0, 0) == GAMEINPUT_S_OK);
+    gi_ev->Release();
+
+    // 4g. CallTelemetry thread-local hot-path cache: exact counts under contention + safe generation Reset().
+    {
+        openscarlett::CallTelemetry local_tel;
+        constexpr int kThreads = 4;
+        constexpr int kIters = 1000;
+        std::vector<std::thread> workers;
+        for (int t = 0; t < kThreads; ++t) {
+            workers.emplace_back([&]() {
+                for (int i = 0; i < kIters; ++i) {
+                    local_tel.Record("d3d12_xs.dll", "ID3D12GraphicsCommandListX::DrawIndexedInstanced",
+                                     openscarlett::CallOutcome::Ok, 0, 13);
+                }
+            });
+        }
+        for (auto& w : workers) w.join();
+        auto snap1 = local_tel.Snapshot();
+        OS_REQUIRE(snap1.size() == 1u);
+        OS_REQUIRE(snap1[0].total_calls == static_cast<uint64_t>(kThreads * kIters));
+        OS_REQUIRE(snap1[0].ok_calls == static_cast<uint64_t>(kThreads * kIters));
+
+        local_tel.Reset();
+        OS_REQUIRE(local_tel.Snapshot().empty());
+        for (int i = 0; i < 25; ++i) {
+            local_tel.Record("d3d12_xs.dll", "ID3D12GraphicsCommandListX::DrawIndexedInstanced",
+                             openscarlett::CallOutcome::Ok, 0, 13);
+        }
+        auto snap2 = local_tel.Snapshot();
+        OS_REQUIRE(snap2.size() == 1u);
+        OS_REQUIRE(snap2[0].total_calls == 25ull);
+        OS_REQUIRE(snap2[0].ok_calls == 25ull);
+    }
+
     gi->Release();
-    std::printf("[PASS] GameInput user-before-connect, rumble+triggers & KB/mouse virtual pad\n");
+    std::printf("[PASS] GameInput user-before-connect, rumble+triggers, ordinal #1, window events & TLS telemetry\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -863,6 +946,27 @@ void TestXGameRuntimeS12(const fs::path& scratch) {
     OS_REQUIRE(XUserRegisterForChangeEvent(nullptr, nullptr, &DummyChangeCb, &tok) == XGR_S_OK);
     OS_REQUIRE(tok.token != 0ull);
     OS_REQUIRE(XUserUnregisterForChangeEvent(tok, false));
+
+    // 5c-bis. GDK peripheral semantics: XUserFindForDevice resolves Xbox gamepad to default user,
+    //         while OpenScarlett keyboard (family=4) & mouse (family=3) peripherals return XGR_E_NOT_FOUND
+    //         unless explicitly associated.
+    {
+        XUserAppLocalDeviceId gp_id{};
+        gp_id.value[0] = 0x4Fu; gp_id.value[1] = 0x53u; gp_id.value[2] = 0u; gp_id.value[3] = 1u;
+        XUserHandle found_gp = nullptr;
+        OS_REQUIRE(XUserFindForDevice(&gp_id, &found_gp) == XGR_S_OK && found_gp != nullptr);
+        XUserCloseHandle(found_gp);
+
+        XUserAppLocalDeviceId kb_id{};
+        kb_id.value[0] = 0x4Fu; kb_id.value[1] = 0x53u; kb_id.value[2] = 1u; kb_id.value[3] = 4u;
+        XUserHandle found_kb = nullptr;
+        OS_REQUIRE(XUserFindForDevice(&kb_id, &found_kb) == XGR_E_NOT_FOUND && found_kb == nullptr);
+
+        XUserAppLocalDeviceId ms_id{};
+        ms_id.value[0] = 0x4Fu; ms_id.value[1] = 0x53u; ms_id.value[2] = 2u; ms_id.value[3] = 3u;
+        XUserHandle found_ms = nullptr;
+        OS_REQUIRE(XUserFindForDevice(&ms_id, &found_ms) == XGR_E_NOT_FOUND && found_ms == nullptr);
+    }
 
     // 5d. XStoreCanAcquireLicense* offline semantics (owned vs configured addon vs unowned vs invalid)
     XStoreContextHandle sctx = nullptr;

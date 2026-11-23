@@ -72,7 +72,10 @@ private:
         std::unordered_map<uint64_t, std::vector<std::unique_ptr<AtomicEntry>>> buckets;
     };
 
+    std::atomic<uint64_t> generation_{1ull};
     std::array<Shard, kShardCount> shards_;
+    mutable std::shared_mutex retired_mutex_;
+    std::vector<std::unique_ptr<AtomicEntry>> retired_entries_;
 };
 
 }  // namespace openscarlett

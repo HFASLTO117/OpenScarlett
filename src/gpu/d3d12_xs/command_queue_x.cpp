@@ -30,6 +30,8 @@ struct WindowCallbackState {
     std::atomic<bool> is_fullscreen{false};
     std::atomic<bool> in_fullscreen_toggle{false};
     std::atomic<uint64_t> alt_enter_toggle_count{0ull};
+    std::atomic<bool> raw_mouse_registered{false};
+    std::atomic<bool> cursor_clipped{false};
 
     std::mutex fullscreen_mutex;
     LONG_PTR saved_style = 0;
@@ -42,6 +44,102 @@ struct WindowCallbackState {
 namespace {
 
 constexpr const char* kModule = "d3d12_xs.dll";
+
+constexpr uint32_t kGiWinEventTargetHwnd = 1u;
+constexpr uint32_t kGiWinEventFocus = 2u;
+constexpr uint32_t kGiWinEventDeviceChange = 3u;
+constexpr uint32_t kGiWinEventMouseWheel = 4u;
+
+using PfnGiBroadcastRawInput = int32_t(__stdcall*)(void*);
+using PfnGiBroadcastWindowEvent = int32_t(__stdcall*)(void*, uint32_t, int32_t, int32_t);
+
+struct GameInputBridgeCache {
+    std::atomic<HMODULE> mod{nullptr};
+    std::atomic<PfnGiBroadcastRawInput> raw_fn{nullptr};
+    std::atomic<PfnGiBroadcastWindowEvent> win_fn{nullptr};
+};
+
+GameInputBridgeCache& GetGameInputBridge() noexcept {
+    static GameInputBridgeCache cache;
+    return cache;
+}
+
+void EnsureGameInputBridgeResolved() noexcept {
+    auto& c = GetGameInputBridge();
+    if (c.mod.load(std::memory_order_acquire) != nullptr) {
+        return;
+    }
+    HMODULE m = GetModuleHandleW(L"GameInput.dll");
+    if (!m) {
+        return;
+    }
+    auto rfn = reinterpret_cast<PfnGiBroadcastRawInput>(
+        reinterpret_cast<void*>(GetProcAddress(m, "OpenScarlettGameInputBroadcastRawInput")));
+    auto wfn = reinterpret_cast<PfnGiBroadcastWindowEvent>(
+        reinterpret_cast<void*>(GetProcAddress(m, "OpenScarlettGameInputBroadcastWindowEvent")));
+    if (rfn) {
+        c.raw_fn.store(rfn, std::memory_order_release);
+    }
+    if (wfn) {
+        c.win_fn.store(wfn, std::memory_order_release);
+    }
+    c.mod.store(m, std::memory_order_release);
+}
+
+void BroadcastRawInputToGameInput(void* h_raw_input) noexcept {
+    EnsureGameInputBridgeResolved();
+    if (auto fn = GetGameInputBridge().raw_fn.load(std::memory_order_acquire)) {
+        (void)fn(h_raw_input);
+    }
+}
+
+void BroadcastWindowEventToGameInput(
+    HWND hwnd, uint32_t event_kind, int32_t p1 = 0, int32_t p2 = 0) noexcept {
+    EnsureGameInputBridgeResolved();
+    if (auto fn = GetGameInputBridge().win_fn.load(std::memory_order_acquire)) {
+        (void)fn(reinterpret_cast<void*>(hwnd), event_kind, p1, p2);
+    }
+}
+
+void TryRegisterRawMouseForWindow(HWND hwnd, WindowCallbackState& state) noexcept {
+    if (!hwnd || IsWindow(hwnd) == FALSE || IsWindowVisible(hwnd) == FALSE) {
+        return;
+    }
+    if (state.raw_mouse_registered.load(std::memory_order_acquire)) {
+        return;
+    }
+    RAWINPUTDEVICE rid{};
+    rid.usUsagePage = 0x01u;  // HID_USAGE_PAGE_GENERIC
+    rid.usUsage = 0x02u;      // HID_USAGE_GENERIC_MOUSE
+    rid.dwFlags = 0u;
+    rid.hwndTarget = hwnd;
+    if (RegisterRawInputDevices(&rid, 1u, static_cast<UINT>(sizeof(rid))) != FALSE) {
+        state.raw_mouse_registered.store(true, std::memory_order_release);
+    }
+}
+
+uint32_t QueryWindowMonitorRefreshHz(HWND hwnd) noexcept {
+    HMONITOR mon = hwnd ? MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) : nullptr;
+    if (mon) {
+        MONITORINFOEXW mi{};
+        mi.cbSize = sizeof(mi);
+        if (GetMonitorInfoW(mon, &mi) != FALSE) {
+            DEVMODEW dm{};
+            dm.dmSize = sizeof(dm);
+            if (EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) != FALSE &&
+                dm.dmDisplayFrequency >= 24u && dm.dmDisplayFrequency <= 500u) {
+                return static_cast<uint32_t>(dm.dmDisplayFrequency);
+            }
+        }
+    }
+    DEVMODEW dm{};
+    dm.dmSize = sizeof(dm);
+    if (EnumDisplaySettingsW(nullptr, ENUM_CURRENT_SETTINGS, &dm) != FALSE &&
+        dm.dmDisplayFrequency >= 24u && dm.dmDisplayFrequency <= 500u) {
+        return static_cast<uint32_t>(dm.dmDisplayFrequency);
+    }
+    return 60u;
+}
 
 inline void RecordQueue(const char* method, int32_t slot, HRESULT hr = S_OK) {
     openscarlett::CallOutcome outcome = openscarlett::CallOutcome::Ok;
@@ -244,9 +342,47 @@ LRESULT CALLBACK SubclassWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 break;
             }
             case WM_ACTIVATEAPP: {
-                state->is_active.store(wParam != FALSE, std::memory_order_release);
+                const bool active = (wParam != FALSE);
+                state->is_active.store(active, std::memory_order_release);
+                if (!active && state->cursor_clipped.exchange(false, std::memory_order_acq_rel)) {
+                    ClipCursor(nullptr);
+                }
+                BroadcastWindowEventToGameInput(hwnd, kGiWinEventFocus, active ? 1 : 0, 0);
                 break;
             }
+            case WM_SETFOCUS: {
+                state->is_active.store(true, std::memory_order_release);
+                BroadcastWindowEventToGameInput(hwnd, kGiWinEventFocus, 1, 0);
+                break;
+            }
+            case WM_KILLFOCUS: {
+                state->is_active.store(false, std::memory_order_release);
+                if (state->cursor_clipped.exchange(false, std::memory_order_acq_rel)) {
+                    ClipCursor(nullptr);
+                }
+                BroadcastWindowEventToGameInput(hwnd, kGiWinEventFocus, 0, 0);
+                break;
+            }
+            case WM_INPUT: {
+                BroadcastRawInputToGameInput(reinterpret_cast<void*>(lParam));
+                break;
+            }
+            case WM_DEVICECHANGE: {
+                BroadcastWindowEventToGameInput(hwnd, kGiWinEventDeviceChange, static_cast<int32_t>(wParam), 0);
+                break;
+            }
+            case WM_MOUSEWHEEL: {
+                BroadcastWindowEventToGameInput(
+                    hwnd, kGiWinEventMouseWheel, 0, static_cast<int32_t>(GET_WHEEL_DELTA_WPARAM(wParam)));
+                break;
+            }
+#if defined(WM_MOUSEHWHEEL)
+            case WM_MOUSEHWHEEL: {
+                BroadcastWindowEventToGameInput(
+                    hwnd, kGiWinEventMouseWheel, static_cast<int32_t>(GET_WHEEL_DELTA_WPARAM(wParam)), 0);
+                break;
+            }
+#endif
             case WM_SYSKEYDOWN: {
                 const bool alt_down = (lParam & (static_cast<LPARAM>(1) << 29)) != 0;
                 const bool is_repeat = (lParam & (static_cast<LPARAM>(1) << 30)) != 0;
@@ -283,6 +419,9 @@ LRESULT CALLBACK SubclassWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 break;
             }
             case WM_DESTROY: {
+                if (state->cursor_clipped.exchange(false, std::memory_order_acq_rel)) {
+                    ClipCursor(nullptr);
+                }
                 state->close_requested.store(true, std::memory_order_release);
                 if (state->post_quit_on_close.load(std::memory_order_acquire)) {
                     if (!state->quit_posted.exchange(true, std::memory_order_acq_rel)) {
@@ -292,6 +431,9 @@ LRESULT CALLBACK SubclassWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 break;
             }
             case WM_NCDESTROY: {
+                if (state->cursor_clipped.exchange(false, std::memory_order_acq_rel)) {
+                    ClipCursor(nullptr);
+                }
                 LRESULT res = (orig_proc && orig_proc != &SubclassWndProc)
                                   ? CallWindowProcW(orig_proc, hwnd, msg, wParam, lParam)
                                   : DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -2158,6 +2300,8 @@ void CommandQueueX::AttachWindowSubclassLocked(HWND hwnd) {
     }
     reg.map[hwnd].orig_proc = reinterpret_cast<WNDPROC>(prev);
     subclassed_hwnd_ = hwnd;
+    TryRegisterRawMouseForWindow(hwnd, *window_state_);
+    BroadcastWindowEventToGameInput(hwnd, kGiWinEventTargetHwnd, 0, 0);
 }
 
 void CommandQueueX::DetachWindowSubclassLocked() {
@@ -2270,7 +2414,10 @@ HRESULT CommandQueueX::EnsurePresentHelperObjectsLocked() {
     if (!pacing_timer_) {
         pacing_timer_ = CreateWaitableTimerExW(
             nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-        if (!pacing_timer_) {
+        if (pacing_timer_) {
+            pacing_timer_high_res_ = true;
+        } else {
+            pacing_timer_high_res_ = false;
             pacing_timer_ = CreateWaitableTimerW(nullptr, TRUE, nullptr);
         }
     }
@@ -2468,7 +2615,9 @@ HRESULT CommandQueueX::EnsureSwapChainLocked(
         force_sdr ? DXGI_FORMAT_R8G8B8A8_UNORM : NormalizeSwapChainFormat(requested_fmt);
     const uint32_t req_max_latency =
         device_x_ ? std::clamp(device_x_->MaxFrameLatency(), 1u, 3u) : 2u;
-    const uint32_t req_buffer_count = std::clamp(req_max_latency + 1u, 2u, 3u);
+    // Always triple-buffer FLIP_DISCARD swapchains (3 backbuffers) to absorb scene-shift
+    // frame-time spikes smoothly without single-frame pipeline bubbles.
+    const uint32_t req_buffer_count = 3u;
 
     if (swapchain_ && swapchain_hwnd_ == hwnd) {
         if (!force_resize &&
@@ -2635,8 +2784,9 @@ void CommandQueueX::PaceFrameLocked(uint32_t frame_interval_us) {
     int64_t cur_qpc = now_qpc;
     if (cur_qpc < target_qpc) {
         const int64_t rem_us = ((target_qpc - cur_qpc) * 1000000LL) / qpc_freq_;
-        if (rem_us > 2000LL) {
-            const int64_t sleep_us = rem_us - 1500LL;
+        const int64_t spin_margin_us = pacing_timer_high_res_ ? 400LL : 1500LL;
+        if (rem_us > spin_margin_us + 250LL) {
+            const int64_t sleep_us = rem_us - spin_margin_us;
             if (pacing_timer_) {
                 LARGE_INTEGER due{};
                 due.QuadPart = -(sleep_us * 10LL);
@@ -2663,12 +2813,9 @@ void CommandQueueX::PaceFrameLocked(uint32_t frame_interval_us) {
         static_cast<double>(cur_qpc - last_present_qpc_) * 1000.0 / static_cast<double>(qpc_freq_);
     last_present_qpc_ = cur_qpc;
 
-    // Preserve phase when on time; resync cleanly if a frame overran by more than one interval.
-    if (cur_qpc <= target_qpc + interval_ticks) {
-        last_paced_qpc_ = target_qpc;
-    } else {
-        last_paced_qpc_ = cur_qpc;
-    }
+    // Resync cleanly whenever a heavy frame overran target_qpc so we never rush the next
+    // frame into a bursty double-present judder spike.
+    last_paced_qpc_ = (cur_qpc > target_qpc) ? cur_qpc : target_qpc;
 }
 
 HRESULT CommandQueueX::WaitForInternalFenceWithTimingLocked(
@@ -3253,10 +3400,68 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
         ((use_swapchain && !window_minimized) || fcap_override) &&
         !immediate_flag && frame_interval_us > 0u;
 
-    if (should_pace) {
+    // Ensure Raw Input mouse & 3D hidden-cursor confinement stay synced on active retail windows.
+    if (do_swapchain_present && target_hwnd && window_state_) {
+        if (!window_state_->raw_mouse_registered.load(std::memory_order_acquire)) {
+            TryRegisterRawMouseForWindow(target_hwnd, *window_state_);
+            BroadcastWindowEventToGameInput(target_hwnd, kGiWinEventTargetHwnd, 0, 0);
+        }
+        if (async_swapchain_fast_path) {
+            const bool focused =
+                window_state_->is_active.load(std::memory_order_acquire) &&
+                (GetForegroundWindow() == target_hwnd);
+            CURSORINFO ci{};
+            ci.cbSize = sizeof(ci);
+            const bool cursor_hidden =
+                (GetCursorInfo(&ci) != FALSE) && ((ci.flags & CURSOR_SHOWING) == 0u);
+            if (focused && cursor_hidden) {
+                RECT cr{};
+                if (GetClientRect(target_hwnd, &cr) != FALSE && cr.right > cr.left && cr.bottom > cr.top) {
+                    POINT tl{cr.left, cr.top};
+                    POINT br{cr.right, cr.bottom};
+                    ClientToScreen(target_hwnd, &tl);
+                    ClientToScreen(target_hwnd, &br);
+                    RECT sr{tl.x, tl.y, br.x, br.y};
+                    if (ClipCursor(&sr) != FALSE) {
+                        window_state_->cursor_clipped.store(true, std::memory_order_release);
+                    }
+                }
+            } else if (window_state_->cursor_clipped.exchange(false, std::memory_order_acq_rel)) {
+                ClipCursor(nullptr);
+            }
+        }
+    }
+
+    // Use native hardware DXGI VSync (SyncInterval=1) on interactive retail swapchains when
+    // requested frame_interval_us matches the monitor's refresh cadence: eliminates DWM phase-beat
+    // judder, drops dwm.exe compositor CPU dramatically, and removes software spin-wait overhead.
+    bool use_hw_vsync_present = false;
+    if (should_pace && async_swapchain_fast_path && do_swapchain_present && swapchain_ &&
+        !fcap_override && !swapchain_occluded_) {
+        static const bool s_force_sw_pacing = []() {
+            char b[16]{};
+            const DWORD n = GetEnvironmentVariableA("OPENSCARLETT_FORCE_SOFTWARE_PACING", b, sizeof(b));
+            return (n > 0u && n < sizeof(b) && (b[0] == '1' || b[0] == 't' || b[0] == 'T'));
+        }();
+        if (!s_force_sw_pacing) {
+            if (cached_monitor_hwnd_ != target_hwnd || cached_monitor_refresh_hz_ == 0u) {
+                cached_monitor_refresh_hz_ = QueryWindowMonitorRefreshHz(target_hwnd);
+                cached_monitor_hwnd_ = target_hwnd;
+            }
+            const uint32_t mon_interval_us =
+                (cached_monitor_refresh_hz_ > 0u) ? (1000000u / cached_monitor_refresh_hz_) : 16667u;
+            const uint32_t lo_us = (mon_interval_us * 88u) / 100u;
+            const uint32_t hi_us = (mon_interval_us * 112u) / 100u;
+            if (frame_interval_us >= lo_us && frame_interval_us <= hi_us) {
+                use_hw_vsync_present = true;
+            }
+        }
+    }
+
+    if (should_pace && !use_hw_vsync_present) {
         PaceFrameLocked(frame_interval_us);
         ++paced_frame_count_;
-    } else {
+    } else if (!use_hw_vsync_present) {
         const int64_t now_qpc = QueryQpcNow();
         if (last_present_qpc_ != 0 && qpc_freq_ > 0) {
             last_frame_ms_ = static_cast<double>(now_qpc - last_present_qpc_) * 1000.0 /
@@ -3362,16 +3567,26 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
                    static_cast<double>(qpc_freq_))
                 : 0.0;
     } else if (do_swapchain_present && swapchain_) {
+        const UINT sync_interval = use_hw_vsync_present ? 1u : 0u;
         const UINT present_flags =
-            ((swapchain_flags_ & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0)
+            (!use_hw_vsync_present && ((swapchain_flags_ & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0))
                 ? DXGI_PRESENT_ALLOW_TEARING
                 : 0u;
         present_submit_qpc = QueryQpcNow();
-        hr = swapchain_->Present(0u, present_flags);
-        if (FAILED(hr) && present_flags != 0u) {
+        hr = swapchain_->Present(sync_interval, present_flags);
+        if (FAILED(hr) && (present_flags != 0u || sync_interval != 0u)) {
             hr = swapchain_->Present(0u, 0u);
         }
         present_complete_qpc = QueryQpcNow();
+        if (use_hw_vsync_present) {
+            if (last_present_qpc_ != 0 && qpc_freq_ > 0) {
+                last_frame_ms_ = static_cast<double>(present_complete_qpc - last_present_qpc_) * 1000.0 /
+                                 static_cast<double>(qpc_freq_);
+            }
+            last_present_qpc_ = present_complete_qpc;
+            last_paced_qpc_ = 0;
+            ++paced_frame_count_;
+        }
         dxgi_present_us =
             (qpc_freq_ > 0)
                 ? (static_cast<double>(present_complete_qpc - present_submit_qpc) * 1000000.0 /
