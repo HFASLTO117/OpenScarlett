@@ -1069,14 +1069,11 @@ void TestGxdkExtensionsAndMesh3DLive(GpuFixture& fx, const char* tag) {
     rb->Unmap(0u, nullptr);
 
     // 3) DispatchMesh(2, 3, 2) LIVE 3D Mesh Shader on MeshShaderTier>=1 GPUs (y > 1, z > 1),
-    //    and graceful 3D group tracking on non-MeshShader Win10 inbox WARP.
+    //    and graceful 3D group tracking on non-MeshShader GPUs (e.g. Pascal MX250) or Win10 inbox WARP.
     D3D12_FEATURE_DATA_D3D12_OPTIONS7 opts7{};
     const bool hw_mesh =
         SUCCEEDED(fx.device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &opts7, sizeof(opts7))) &&
         opts7.MeshShaderTier >= D3D12_MESH_SHADER_TIER_1;
-    if (std::strcmp(tag, "HW_GPU") == 0) {
-        OS_REQUIRE(hw_mesh);
-    }
 
     if (hw_mesh) {
     const char* ms_hlsl =
@@ -1245,7 +1242,8 @@ void TestGxdkExtensionsAndMesh3DLive(GpuFixture& fx, const char* tag) {
     OS_REQUIRE(stats.last_mesh_y == 3u);
     OS_REQUIRE(stats.last_mesh_z == 2u);
     OS_REQUIRE(stats.total_mesh_groups >= 12u);
-    std::printf("[%s] PASS GXDK Extensions + DispatchMesh(2,3,2)=12 groups LIVE\n", tag);
+    std::printf("[%s] PASS GXDK Extensions + DispatchMesh(2,3,2)=12 groups (%s)\n",
+                tag, hw_mesh ? "LIVE MS+PS" : "MeshTier=0 fallback tracking");
 }
 
 // =============================================================================
