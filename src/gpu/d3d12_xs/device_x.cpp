@@ -5205,7 +5205,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePipelineState(
                 std::memcpy(&sd_probe,
                             raw_stream + pos + offsetof(StreamSubobjLayout<DXGI_SAMPLE_DESC>, value),
                             sizeof(sd_probe));
-                if (sd_probe.Count == 0u || (sd_probe.Count > 1u && sd_probe.Quality > 0u)) {
+                if (sd_probe.Count == 0u || sd_probe.Count > 1u) {
                     needs_stream_rebuild = true;
                 }
             }
@@ -9585,12 +9585,34 @@ bool DeviceX::ClampMsaaSampleDescForFormat(
         }
         return false;
     }
-    if (sample_desc.Quality == 0u || !host_dev_) {
+    if (!host_dev_) {
         return false;
     }
 
-    const DXGI_FORMAT probe_fmt =
-        (format == DXGI_FORMAT_UNKNOWN) ? DXGI_FORMAT_R8G8B8A8_UNORM : MapTypelessFormatForSrv(format);
+    DXGI_FORMAT probe_fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+    switch (format) {
+        case DXGI_FORMAT_UNKNOWN:
+            probe_fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+            break;
+        case DXGI_FORMAT_D24_UNORM_S8_UINT:
+        case DXGI_FORMAT_R24G8_TYPELESS:
+            probe_fmt = DXGI_FORMAT_D24_UNORM_S8_UINT;
+            break;
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+        case DXGI_FORMAT_R32G8X24_TYPELESS:
+            probe_fmt = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+            break;
+        case DXGI_FORMAT_D32_FLOAT:
+            probe_fmt = DXGI_FORMAT_D32_FLOAT;
+            break;
+        case DXGI_FORMAT_D16_UNORM:
+            probe_fmt = DXGI_FORMAT_D16_UNORM;
+            break;
+        default:
+            probe_fmt = MapTypelessFormatForSrv(format);
+            break;
+    }
+
     D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS msaa{};
     msaa.Format = probe_fmt;
     msaa.SampleCount = sample_desc.Count;
@@ -9598,8 +9620,39 @@ bool DeviceX::ClampMsaaSampleDescForFormat(
     const HRESULT hr = host_dev_->CheckFeatureSupport(
         D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &msaa, sizeof(msaa));
     if (FAILED(hr) || msaa.NumQualityLevels == 0u) {
-        sample_desc.Quality = 0u;
+        // Requested sample count (e.g. 16x MSAA on an 8x-max desktop GPU) is unsupported
+        // for this format; step down to the highest supported MSAA count (8 -> 4 -> 2 -> 1)
+        // so both resources and PSOs stay valid and mutually consistent.
+        uint32_t fallback_count = 1u;
+        uint32_t fallback_levels = 0u;
+        constexpr uint32_t kFallbackCounts[] = {8u, 4u, 2u};
+        for (uint32_t cand : kFallbackCounts) {
+            if (cand >= sample_desc.Count) {
+                continue;
+            }
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS probe{};
+            probe.Format = probe_fmt;
+            probe.SampleCount = cand;
+            probe.Flags = D3D12_MULTISAMPLE_QUALITY_LEVELS_FLAG_NONE;
+            if (SUCCEEDED(host_dev_->CheckFeatureSupport(
+                    D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &probe, sizeof(probe))) &&
+                probe.NumQualityLevels > 0u) {
+                fallback_count = cand;
+                fallback_levels = probe.NumQualityLevels;
+                break;
+            }
+        }
+        sample_desc.Count = fallback_count;
+        msaa.SampleCount = fallback_count;
+        msaa.NumQualityLevels = fallback_levels;
         changed = true;
+    }
+
+    if (sample_desc.Count <= 1u || msaa.NumQualityLevels == 0u) {
+        if (sample_desc.Quality != 0u) {
+            sample_desc.Quality = 0u;
+            changed = true;
+        }
     } else if (sample_desc.Quality == DXGI_STANDARD_MULTISAMPLE_QUALITY_PATTERN ||
                sample_desc.Quality == DXGI_CENTER_MULTISAMPLE_QUALITY_PATTERN) {
         const bool standard_count_ok =

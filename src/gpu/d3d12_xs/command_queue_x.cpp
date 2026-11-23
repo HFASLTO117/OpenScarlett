@@ -398,10 +398,23 @@ LRESULT CALLBACK SubclassWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
                 state->resize_pending.store(true, std::memory_order_release);
                 break;
             }
+            case WM_ACTIVATE: {
+                const bool active = (LOWORD(wParam) != WA_INACTIVE);
+                state->is_active.store(active, std::memory_order_release);
+                if (active) {
+                    TryRegisterRawMouseForWindow(hwnd, *state);
+                } else if (state->cursor_clipped.exchange(false, std::memory_order_acq_rel)) {
+                    ClipCursor(nullptr);
+                }
+                BroadcastWindowEventToGameInput(hwnd, kGiWinEventFocus, active ? 1 : 0, 0);
+                break;
+            }
             case WM_ACTIVATEAPP: {
                 const bool active = (wParam != FALSE);
                 state->is_active.store(active, std::memory_order_release);
-                if (!active && state->cursor_clipped.exchange(false, std::memory_order_acq_rel)) {
+                if (active) {
+                    TryRegisterRawMouseForWindow(hwnd, *state);
+                } else if (state->cursor_clipped.exchange(false, std::memory_order_acq_rel)) {
                     ClipCursor(nullptr);
                 }
                 BroadcastWindowEventToGameInput(hwnd, kGiWinEventFocus, active ? 1 : 0, 0);
@@ -409,6 +422,7 @@ LRESULT CALLBACK SubclassWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPar
             }
             case WM_SETFOCUS: {
                 state->is_active.store(true, std::memory_order_release);
+                TryRegisterRawMouseForWindow(hwnd, *state);
                 BroadcastWindowEventToGameInput(hwnd, kGiWinEventFocus, 1, 0);
                 break;
             }

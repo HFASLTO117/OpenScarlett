@@ -813,13 +813,20 @@ void TestGameInputS12() {
                    nullptr, GameInputWinEventFocus, 1, 0) == GAMEINPUT_S_OK);
     OS_REQUIRE(OpenScarlettGameInputBroadcastWindowEvent(
                    nullptr, GameInputWinEventDeviceChange, 0, 0) == GAMEINPUT_S_OK);
-    // Verify GDK v1 GameInputEnableBackgroundInput (0x40) policy + live physical/fallback poll
-    // works cleanly when host C:\Windows\System32\GameInput.dll is co-resident with our shim.
+    // Verify GDK v1 GameInputEnableBackgroundInput (0x40) policy, overflow-free QPC microsecond
+    // timestamps (must never wrap to huge sign-extended values on >10.67-day uptime Windows hosts!),
+    // and live XInput-first polling without eagerly loading host System32\GameInputRedist.dll.
     gi_ev->SetFocusPolicy(0x00000040u);
     {
+        const uint64_t ts0 = gi_ev->GetCurrentTimestamp();
+        OS_REQUIRE(ts0 > 0ull);
+        OS_REQUIRE(ts0 < (1ull << 62));  // Guard against signed int64_t QPC * 1000000 overflow wrap
+
         IGameInputReading* live_gp_r = nullptr;
         OS_REQUIRE(gi_ev->GetCurrentReading(GameInputKindGamepad, nullptr, &live_gp_r) == GAMEINPUT_S_OK &&
                    live_gp_r != nullptr);
+        const uint64_t rts0 = live_gp_r->GetTimestamp();
+        OS_REQUIRE(rts0 >= ts0 && rts0 < (1ull << 62));
         GameInputGamepadState live_gp{};
         OS_REQUIRE(live_gp_r->GetGamepadState(&live_gp));
         OS_REQUIRE(std::isfinite(live_gp.leftThumbstickX) && std::isfinite(live_gp.leftThumbstickY));
@@ -827,6 +834,17 @@ void TestGameInputS12() {
         OS_REQUIRE(live_gp.leftTrigger >= 0.0f && live_gp.leftTrigger <= 1.0f);
         OS_REQUIRE(live_gp.rightTrigger >= 0.0f && live_gp.rightTrigger <= 1.0f);
         live_gp_r->Release();
+
+        ::Sleep(2);
+        IGameInputReading* live_gp_r2 = nullptr;
+        OS_REQUIRE(gi_ev->GetCurrentReading(GameInputKindGamepad, nullptr, &live_gp_r2) == GAMEINPUT_S_OK &&
+                   live_gp_r2 != nullptr);
+        const uint64_t rts1 = live_gp_r2->GetTimestamp();
+        OS_REQUIRE(rts1 > rts0 && rts1 < (1ull << 62));
+        live_gp_r2->Release();
+
+        // Without OPENSCARLETT_ENABLE_NATIVE_GAMEINPUT=1, GameInputRedist.dll must NOT be loaded.
+        OS_REQUIRE(::GetModuleHandleW(L"GameInputRedist.dll") == nullptr);
     }
     gi_ev->Release();
 

@@ -5105,13 +5105,24 @@ bool IsValidGameSaveContainerName(const char* name) noexcept {
     size_t seg_start = 0u;
     for (size_t i = 0u; i < len; ++i) {
         const unsigned char c = static_cast<unsigned char>(name[i]);
-        const bool ok_char =
-            (c >= 'A' && c <= 'Z') ||
-            (c >= 'a' && c <= 'z') ||
-            (c >= '0' && c <= '9') ||
-            c == '_' || c == '-' || c == '.' || c == '/';
-        if (!ok_char) {
+        // Allow printable ASCII container characters (including Base64 '=', '+', '~' used by
+        // retail Xbox titles such as Minecraft Bedrock world containers like "ZAQEa-bIAAA=")
+        // while rejecting whitespace, control chars, and Windows/URI-reserved path characters.
+        if (c < 0x21u || c > 0x7Eu) {
             return false;
+        }
+        switch (c) {
+            case '\\':
+            case ':':
+            case '*':
+            case '?':
+            case '"':
+            case '<':
+            case '>':
+            case '|':
+                return false;
+            default:
+                break;
         }
         if (i > 0u && name[i] == '/' && name[i - 1u] == '/') {
             return false;

@@ -717,19 +717,44 @@ void TestGameSaveContainerNameValidation(const fs::path& work_root) {
     OS_REQUIRE(XGameSaveInitializeProvider(nullptr, "00000000-0000-0000-0000-000000001234", false, &prov) == XGR_S_OK);
     OS_REQUIRE(prov != nullptr);
 
-    // Valid container names
+    // Valid container names (including Base64 retail Xbox world IDs like Minecraft's "ZAQEa-bIAAA=")
     const std::string max256(256u, 'a');
     const char* valid_names[] = {
         "slot1",
         "Save_Slot-01.dat",
         "Profile/SubFolder/slot_2.bin",
         "A",
+        "ZAQEa-bIAAA=",
+        "World+01/Meta==~1",
         max256.c_str(),
     };
     for (const char* vn : valid_names) {
         XGameSaveContainerHandle ch = nullptr;
         OS_REQUIRE(XGameSaveCreateContainer(prov, vn, &ch) == XGR_S_OK && ch != nullptr);
         XGameSaveCloseContainer(ch);
+    }
+
+    // Round-trip blob write -> read -> delete on Base64 Minecraft world container "ZAQEa-bIAAA="
+    {
+        XGameSaveContainerHandle wc = nullptr;
+        OS_REQUIRE(XGameSaveCreateContainer(prov, "ZAQEa-bIAAA=", &wc) == XGR_S_OK && wc != nullptr);
+        XGameSaveUpdateHandle upd = nullptr;
+        OS_REQUIRE(XGameSaveCreateUpdate(wc, "My World", &upd) == XGR_S_OK && upd != nullptr);
+        const uint8_t payload[] = {0x4D, 0x43, 0x57, 0x52, 0x4C, 0x44};
+        OS_REQUIRE(XGameSaveSubmitBlobWrite(upd, "level.dat", payload, sizeof(payload)) == XGR_S_OK);
+        OS_REQUIRE(XGameSaveSubmitUpdate(upd) == XGR_S_OK);
+        XGameSaveCloseUpdate(upd);
+
+        const char* names[1] = {"level.dat"};
+        uint32_t cnt = 1u;
+        uint8_t buf[256]{};
+        OS_REQUIRE(XGameSaveReadBlobData(
+                       wc, names, &cnt, sizeof(buf), reinterpret_cast<XGameSaveBlob*>(buf)) == XGR_S_OK);
+        const auto* blob = reinterpret_cast<const XGameSaveBlob*>(buf);
+        OS_REQUIRE(cnt == 1u && blob->info.size == sizeof(payload));
+        OS_REQUIRE(std::memcmp(blob->data, payload, sizeof(payload)) == 0);
+        XGameSaveCloseContainer(wc);
+        OS_REQUIRE(XGameSaveDeleteContainer(prov, "ZAQEa-bIAAA=") == XGR_S_OK);
     }
 
     // Invalid container names MUST return XGR_E_GS_INVALID_CONTAINER_NAME (0x80830001)

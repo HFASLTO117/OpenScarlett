@@ -438,6 +438,23 @@ void TestD3D12XAndXboxExtensionHardening(
                           msaa_res2 != nullptr,
                       "4x MSAA texture with CENTER pattern clamped & created");
             if (msaa_res2) msaa_res2->Release();
+
+            // Oversized MSAA sample count (e.g. 16x AA on 8x-max desktop GPU) with Quality=0
+            // must step down cleanly to the highest supported sample count instead of failing.
+            msaa_desc.SampleDesc.Count = 16u;
+            msaa_desc.SampleDesc.Quality = 0u;
+            ID3D12Resource* msaa_res16 = nullptr;
+            S15_CHECK(SUCCEEDED(dev->CreateCommittedResource(
+                          &def_hp, D3D12_HEAP_FLAG_NONE, &msaa_desc, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                          nullptr, IID_PPV_ARGS(&msaa_res16))) &&
+                          msaa_res16 != nullptr,
+                      "16x MSAA texture with Quality=0 clamped to host max sample count & created");
+            if (msaa_res16) {
+                const D3D12_RESOURCE_DESC actual16 = msaa_res16->GetDesc();
+                S15_CHECK(actual16.SampleDesc.Count >= 4u && actual16.SampleDesc.Count <= 16u,
+                          "16x MSAA fallback sample count in [4, 16]");
+                msaa_res16->Release();
+            }
         }
     }
 
