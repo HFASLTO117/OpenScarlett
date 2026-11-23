@@ -6,6 +6,7 @@
 #include "openscarlett/core/telemetry.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -45,6 +46,15 @@ inline void RecordOk(const char* sym, int32_t slot = -1) {
         kModName, sym, openscarlett::CallOutcome::Ok, 0, slot);
 }
 
+template <uint32_t kInitialBurst = 16u, uint32_t kLogEveryN = 256u>
+inline bool ShouldTraceCall(std::atomic<uint64_t>& counter) noexcept {
+    if (!openscarlett::audio::IsRetailTraceEnabled()) {
+        return false;
+    }
+    const uint64_t n = counter.fetch_add(1ull, std::memory_order_relaxed);
+    return (n < kInitialBurst) || ((n % kLogEveryN) == 0ull);
+}
+
 bool GuidEquals(const AcpHalGuid* a, const AcpHalGuid& b) {
     return a && std::memcmp(a, &b, sizeof(AcpHalGuid)) == 0;
 }
@@ -70,114 +80,38 @@ struct AcpShapeAllocation {
 // Real retail Xbox Series X|S ACP_SHAPE_CONTEXTS (0x60 bytes, verified against fmod.dll).
 struct XboxAcpShapeContexts {
     uint32_t numSrcContexts;      // +0x00 (32 bytes each -> srcContexts)
-    uint32_t numEqCompContexts;   // +0x04 (32 bytes each -> eqCompContexts)
+    uint32_t numEqCompContexts;   // +0x04 (160 bytes each -> eqCompContexts)
     uint32_t numFiltVolContexts;  // +0x08 (32 bytes each -> filtVolContexts)
     uint32_t numDmaContexts;      // +0x0C (16 bytes each -> dmaContexts)
     uint32_t numXmaContexts;      // +0x10 (64 bytes each -> xmaContexts)
-    uint32_t numPcmContexts;      // +0x14 (64 bytes each -> pcmContexts)
+    uint32_t numPcmContexts;      // +0x14 (32 bytes each -> pcmContexts)
     void* srcContexts;            // +0x18
     void* eqCompContexts;         // +0x20
     void* filtVolContexts;        // +0x28
     void* dmaContexts;            // +0x30
     void* xmaContexts;            // +0x38
     void* pcmContexts;            // +0x40
-    uint64_t reserved[3];         // +0x48..0x5F
+    uint32_t apuAddresses[6];     // +0x48..+0x5C (srcApu, eqCompApu, filtVolApu, dmaApu, xmaApu, pcmApu)
 };
 static_assert(sizeof(XboxAcpShapeContexts) == 0x60, "XboxAcpShapeContexts must be 96 bytes");
 
+#pragma pack(push, 4)
 struct XboxAcpMessage {
-    uint32_t type = 0;       // +0x00 (0x10 = CommandCompleted, 0x80 = Disconnected)
-    uint32_t error = 0;      // +0x04 (0 = OK)
-    uint64_t reserved = 0;   // +0x08
-    uint64_t commandId = 0;  // +0x10
-    uint32_t extra = 0;      // +0x18
+    uint32_t kind = 0;               // +0x00 (0x10 = CommandCompleted, 0x80 = Disconnected)
+    uint32_t reserved = 0;           // +0x04 (0 = OK)
+    uint64_t audioClockSamples = 0;  // +0x08
+    uint64_t commandId = 0;          // +0x10
+    uint32_t extra = 0;              // +0x18
 };
-static_assert(sizeof(XboxAcpMessage) == 0x20 || sizeof(XboxAcpMessage) == 0x1C, "XboxAcpMessage size");
-
-// Real retail Xbox Series X|S IAcpHal vtable (does NOT inherit IUnknown;
-// verified against Xbox fmod.dll:
-//   slot 0 (+0x00): Connect(cmdQueueLen, msgQueueLen)
-//   slot 1 (+0x08): Disconnect()
-//   slot 2 (+0x10): SubmitCommand(cmdType, cmdId, flags, pData, dataFlags)
-//   slot 3 (+0x18): PopMessage(ACP_MESSAGE* outMsg) -> bool
-//   slot 4 (+0x20): RegisterEvent / GetQueueSpace
-//   slot 5 (+0x28): Release()
-class XboxRetailAcpHalImpl {
-public:
-    virtual int32_t OPENSCARLETT_ACPHAL_CALL Connect(
-        uint32_t commandQueueLength, uint32_t messageQueueLength) {
-        (void)commandQueueLength;
-        (void)messageQueueLength;
-        SrwLockGuard lk(mutex_);
-        connected_ = true;
-        messages_.clear();
-        return RecordHr("IAcpHal::Connect", ACPHAL_S_OK, 0);
-    }
-
-    virtual int32_t OPENSCARLETT_ACPHAL_CALL Disconnect() {
-        SrwLockGuard lk(mutex_);
-        connected_ = false;
-        XboxAcpMessage msg{};
-        msg.type = 0x80u;  // ACP_MESSAGE_TYPE_DISCONNECTED
-        msg.error = 0u;
-        messages_.push_back(msg);
-        return RecordHr("IAcpHal::Disconnect", ACPHAL_S_OK, 1);
-    }
-
-    virtual int32_t OPENSCARLETT_ACPHAL_CALL SubmitCommand(
-        uint32_t commandType,
-        uint64_t commandId,
-        uint32_t waitFlags,
-        const void* pCommandData,
-        uint32_t extraFlags) {
-        (void)commandType;
-        (void)waitFlags;
-        (void)pCommandData;
-        (void)extraFlags;
-        if (commandId != 0ull) {
-            SrwLockGuard lk(mutex_);
-            XboxAcpMessage msg{};
-            msg.type = 0x10u;  // ACP_MESSAGE_TYPE_COMMAND_COMPLETED
-            msg.error = 0u;
-            msg.commandId = commandId;
-            messages_.push_back(msg);
-        }
-        return RecordHr("IAcpHal::SubmitCommand", ACPHAL_S_OK, 2);
-    }
-
-    virtual bool OPENSCARLETT_ACPHAL_CALL PopMessage(void* pMessage) {
-        SrwLockGuard lk(mutex_);
-        if (messages_.empty()) {
-            return false;
-        }
-        const XboxAcpMessage msg = messages_.front();
-        messages_.pop_front();
-        if (pMessage) {
-            std::memcpy(pMessage, &msg, 0x1Cu);
-        }
-        return true;
-    }
-
-    virtual uint32_t OPENSCARLETT_ACPHAL_CALL GetCommandQueueSpace() {
-        return 0x800u;
-    }
-
-    virtual uint32_t OPENSCARLETT_ACPHAL_CALL Release() {
-        RecordOk("IAcpHal::Release", 5);
-        delete this;
-        return 0u;
-    }
-
-private:
-    SrwLock mutex_;
-    bool connected_ = false;
-    std::deque<XboxAcpMessage> messages_;
-};
+#pragma pack(pop)
+static_assert(sizeof(XboxAcpMessage) == 0x1Cu, "XboxAcpMessage must be 28 bytes");
 
 std::atomic<bool> g_xbox_retail_acphal_mode{false};
 SrwLock g_shape_alloc_mutex;
 std::unordered_set<void*> g_synthetic_shape_allocs;
 std::vector<void*> g_xbox_shape_buffers;
+void* g_retail_xma_contexts_va = nullptr;
+uint32_t g_retail_xma_context_count = 0u;
 
 class AcpHalImpl final : public IAcpHal {
 public:
@@ -597,10 +531,17 @@ public:
         }
         const uint32_t apu_span = static_cast<uint32_t>(span64);
         const bool retail_mode = g_xbox_retail_acphal_mode.load(std::memory_order_acquire);
-        // Real Xbox GDK apu.h defines APU_ALLOC_CACHED = 1, APU_ALLOC_NONCACHED = 0;
-        // our synthetic ABI header defines APU_ALLOC_NONCACHED = 1.
-        const bool is_non_cached =
-            retail_mode ? ((flags & 1u) == 0u) : ((flags & APU_ALLOC_NONCACHED) != 0u);
+        // Real Xbox GDK apu.h uses flags == 1 (cached), flags == 2 (non-cached), flags == 0 (cached);
+        // synthetic ABI tests use APU_ALLOC_CACHED (0) and APU_ALLOC_NONCACHED (1).
+        // flags == 2 ALWAYS routes to non_cached_ even before g_xbox_retail_acphal_mode is set.
+        bool is_non_cached = false;
+        if ((flags & 2u) != 0u) {
+            is_non_cached = true;
+        } else if (retail_mode) {
+            is_non_cached = false;
+        } else {
+            is_non_cached = ((flags & APU_ALLOC_NONCACHED) != 0u);
+        }
 
         SrwLockGuard lk(mutex_);
         if (!initialized_) {
@@ -725,7 +666,9 @@ public:
             return ACPHAL_S_OK;
         }
 
-        const bool is_non_cached = (flags & APU_ALLOC_NONCACHED) != 0u;
+        const bool retail_mode = g_xbox_retail_acphal_mode.load(std::memory_order_acquire);
+        const bool is_non_cached =
+            ((flags & 2u) != 0u) || (!retail_mode && ((flags & APU_ALLOC_NONCACHED) != 0u));
         const ApuHeapPool& pool = is_non_cached ? non_cached_ : cached_;
         const uint64_t used = static_cast<uint64_t>(pool.bytes_allocated) + pool.bytes_lost;
         const uint32_t free_bytes =
@@ -957,11 +900,539 @@ static bool IsWritableAcpPtr(void* ptr, size_t bytes) {
 #endif
 }
 
+static bool IsReadableAcpPtr(const void* ptr, size_t bytes) {
+    if (!ptr || reinterpret_cast<uintptr_t>(ptr) < 0x10000ull) {
+        return false;
+    }
+    const uintptr_t start = reinterpret_cast<uintptr_t>(ptr);
+    if (start + bytes < start) {
+        return false;
+    }
+#if defined(_WIN32)
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (::VirtualQuery(ptr, &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT) {
+        return false;
+    }
+    if ((mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0u) {
+        return false;
+    }
+    const DWORD prot = mbi.Protect & 0xFFu;
+    const bool readable = (prot == PAGE_READONLY || prot == PAGE_READWRITE ||
+                           prot == PAGE_WRITECOPY || prot == PAGE_EXECUTE_READ ||
+                           prot == PAGE_EXECUTE_READWRITE || prot == PAGE_EXECUTE_WRITECOPY);
+    if (!readable) return false;
+    const uintptr_t region_end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+    return start + bytes <= region_end;
+#else
+    return true;
+#endif
+}
+
+// Full 12-slot retail Xbox Series X|S IAcpHal vtable (does NOT inherit IUnknown).
+class XboxRetailAcpHalImpl {
+public:
+    virtual int32_t OPENSCARLETT_ACPHAL_CALL Connect(
+        uint32_t commandQueueLength, uint32_t messageQueueLength) {
+        static std::atomic<uint64_t> trace_cnt{0u};
+        if (ShouldTraceCall(trace_cnt)) {
+            openscarlett::audio::TraceRetailAudio(
+                "AcpHal", OPENSCARLETT_CALLER_ADDR(),
+                "IAcpHal::Connect(cmdLen=0x%X, msgLen=0x%X)",
+                commandQueueLength, messageQueueLength);
+        }
+        SrwLockGuard lk(mutex_);
+        connected_ = true;
+        messages_.clear();
+        audio_clock_samples_ = 0ull;
+        xma_enabled_mask_.fill(0ull);
+        return RecordHr("IAcpHal::Connect", ACPHAL_S_OK, 0);
+    }
+
+    virtual int32_t OPENSCARLETT_ACPHAL_CALL Disconnect() {
+        static std::atomic<uint64_t> trace_cnt{0u};
+        if (ShouldTraceCall(trace_cnt)) {
+            openscarlett::audio::TraceRetailAudio(
+                "AcpHal", OPENSCARLETT_CALLER_ADDR(), "IAcpHal::Disconnect()");
+        }
+        SrwLockGuard lk(mutex_);
+        connected_ = false;
+        XboxAcpMessage msg{};
+        msg.kind = 0x80u;  // ACP_MESSAGE_TYPE_DISCONNECTED
+        msg.reserved = 0u;
+        msg.audioClockSamples = audio_clock_samples_;
+        messages_.push_back(msg);
+        return RecordHr("IAcpHal::Disconnect", ACPHAL_S_OK, 1);
+    }
+
+    virtual int32_t OPENSCARLETT_ACPHAL_CALL SubmitCommand(
+        uint32_t commandType,
+        uint64_t commandId,
+        uint32_t frameIndex,
+        const void* pCommandData,
+        uint32_t fenceApuAddr) {
+        static std::atomic<uint64_t> trace_cnt{0u};
+        if (ShouldTraceCall(trace_cnt)) {
+            openscarlett::audio::TraceRetailAudio(
+                "AcpHal", OPENSCARLETT_CALLER_ADDR(),
+                "IAcpHal::SubmitCommand(type=0x%X, id=0x%llX, frame=%u, fence=0x%X)",
+                commandType, static_cast<unsigned long long>(commandId),
+                frameIndex, fenceApuAddr);
+        }
+        (void)frameIndex;
+
+        if (fenceApuAddr != 0u) {
+            void* fenceVa = ApuHeapManager::Instance().MapApuAddress(fenceApuAddr);
+            if (fenceVa && IsWritableAcpPtr(fenceVa, sizeof(uint32_t))) {
+                if ((reinterpret_cast<uintptr_t>(fenceVa) & 3u) == 0u) {
+                    std::atomic_ref<uint32_t>(*static_cast<uint32_t*>(fenceVa))
+                        .store(1u, std::memory_order_release);
+                } else {
+                    std::atomic_thread_fence(std::memory_order_release);
+                    const uint32_t one = 1u;
+                    std::memcpy(fenceVa, &one, sizeof(uint32_t));
+                }
+            }
+        }
+
+        SrwLockGuard lk(mutex_);
+        switch (commandType) {
+            case 1u:     // CMD_FLOWGRAPH
+            case 0x10u:  // CMD_DMA_CONSUMED
+                break;
+
+            case 2u: {   // CMD_CONFIG
+                uint32_t cfg_val = 0u;
+                if (pCommandData && IsReadableAcpPtr(pCommandData, sizeof(uint32_t))) {
+                    std::memcpy(&cfg_val, pCommandData, sizeof(uint32_t));
+                }
+                last_config_ = cfg_val;
+                break;
+            }
+
+            case 5u: {   // CMD_XMA_ENABLE_ONE
+                if (pCommandData && IsReadableAcpPtr(pCommandData, sizeof(uint32_t))) {
+                    uint32_t xmaIdx = 0u;
+                    std::memcpy(&xmaIdx, pCommandData, sizeof(uint32_t));
+                    if (xmaIdx < kMaxRetailXmaContexts) {
+                        SetXmaMaskBit(xmaIdx, true);
+                        ProcessRetailXmaContextLocked(xmaIdx);
+                    }
+                }
+                break;
+            }
+
+            case 6u: {   // CMD_XMA_ENABLE_MASK
+                if (pCommandData && IsReadableAcpPtr(pCommandData, 16u * sizeof(uint32_t))) {
+                    uint32_t words[16] = {};
+                    std::memcpy(words, pCommandData, sizeof(words));
+                    for (uint32_t w = 0u; w < 16u; ++w) {
+                        uint32_t bits = words[w];
+                        while (bits != 0u) {
+                            unsigned long bit = 0u;
+#if defined(_WIN32)
+                            _BitScanForward(&bit, bits);
+#else
+                            bit = static_cast<unsigned long>(__builtin_ctz(bits));
+#endif
+                            const uint32_t xmaIdx = w * 32u + static_cast<uint32_t>(bit);
+                            SetXmaMaskBit(xmaIdx, true);
+                            ProcessRetailXmaContextLocked(xmaIdx);
+                            bits &= (bits - 1u);
+                        }
+                    }
+                }
+                break;
+            }
+
+            case 7u: {   // CMD_XMA_DISABLE_ONE
+                if (pCommandData && IsReadableAcpPtr(pCommandData, sizeof(uint32_t))) {
+                    uint32_t xmaIdx = 0u;
+                    std::memcpy(&xmaIdx, pCommandData, sizeof(uint32_t));
+                    if (xmaIdx < kMaxRetailXmaContexts) {
+                        SetXmaMaskBit(xmaIdx, false);
+                    }
+                }
+                break;
+            }
+
+            case 8u: {   // CMD_XMA_DISABLE_MASK
+                if (pCommandData && IsReadableAcpPtr(pCommandData, 16u * sizeof(uint32_t))) {
+                    uint32_t words[16] = {};
+                    std::memcpy(words, pCommandData, sizeof(words));
+                    for (uint32_t w = 0u; w < 16u; ++w) {
+                        uint32_t bits = words[w];
+                        while (bits != 0u) {
+                            unsigned long bit = 0u;
+#if defined(_WIN32)
+                            _BitScanForward(&bit, bits);
+#else
+                            bit = static_cast<unsigned long>(__builtin_ctz(bits));
+#endif
+                            const uint32_t xmaIdx = w * 32u + static_cast<uint32_t>(bit);
+                            SetXmaMaskBit(xmaIdx, false);
+                            bits &= (bits - 1u);
+                        }
+                    }
+                }
+                break;
+            }
+
+            case 0xEu:   // CMD_XMA_UPDATE
+            case 0x12u:  // CMD_XMA_OUT_CONSUMED
+            case 0x13u:  // CMD_XMA_SET_INPUT
+            {
+                if (pCommandData && IsReadableAcpPtr(pCommandData, sizeof(uint32_t))) {
+                    uint32_t xmaIdx = 0u;
+                    std::memcpy(&xmaIdx, pCommandData, sizeof(uint32_t));
+                    if (xmaIdx < kMaxRetailXmaContexts) {
+                        ProcessRetailXmaContextLocked(xmaIdx);
+                    }
+                }
+                break;
+            }
+
+            default:
+                openscarlett::audio::LogUnimplAudio(
+                    "AcpHal", OPENSCARLETT_CALLER_ADDR(),
+                    "SubmitCommand type=0x%X id=0x%llX",
+                    commandType, static_cast<unsigned long long>(commandId));
+                break;
+        }
+
+        audio_clock_samples_ += 128ull;
+        if (commandId != 0ull) {
+            XboxAcpMessage msg{};
+            msg.kind = 0x10u;  // ACP_MESSAGE_TYPE_COMMAND_COMPLETED
+            msg.reserved = 0u;
+            msg.audioClockSamples = audio_clock_samples_;
+            msg.commandId = commandId;
+            msg.extra = 0u;
+            messages_.push_back(msg);
+        }
+        return RecordHr("IAcpHal::SubmitCommand", ACPHAL_S_OK, 2);
+    }
+
+    virtual bool OPENSCARLETT_ACPHAL_CALL PopMessage(void* pMessage) {
+        static std::atomic<uint64_t> trace_cnt{0u};
+        if (ShouldTraceCall(trace_cnt)) {
+            openscarlett::audio::TraceRetailAudio(
+                "AcpHal", OPENSCARLETT_CALLER_ADDR(), "IAcpHal::PopMessage()");
+        }
+        SrwLockGuard lk(mutex_);
+        if (messages_.empty()) {
+            return false;
+        }
+        const XboxAcpMessage msg = messages_.front();
+        messages_.pop_front();
+        if (pMessage && IsWritableAcpPtr(pMessage, sizeof(XboxAcpMessage))) {
+            std::memcpy(pMessage, &msg, sizeof(XboxAcpMessage));
+        }
+        return true;
+    }
+
+    virtual uint32_t OPENSCARLETT_ACPHAL_CALL GetNumMessages() {
+        static std::atomic<uint64_t> trace_cnt{0u};
+        if (ShouldTraceCall(trace_cnt)) {
+            openscarlett::audio::TraceRetailAudio(
+                "AcpHal", OPENSCARLETT_CALLER_ADDR(), "IAcpHal::GetNumMessages()");
+        }
+        SrwLockGuard lk(mutex_);
+        return static_cast<uint32_t>(messages_.size());
+    }
+
+    virtual uint32_t OPENSCARLETT_ACPHAL_CALL Release() {
+        static std::atomic<uint64_t> trace_cnt{0u};
+        if (ShouldTraceCall(trace_cnt)) {
+            openscarlett::audio::TraceRetailAudio(
+                "AcpHal", OPENSCARLETT_CALLER_ADDR(), "IAcpHal::Release()");
+        }
+        RecordOk("IAcpHal::Release", 5);
+        delete this;
+        return 0u;
+    }
+
+    virtual int32_t OPENSCARLETT_ACPHAL_CALL UnsupportedSlot6() {
+        static std::atomic<uint64_t> trace_cnt{0u};
+        if (ShouldTraceCall(trace_cnt)) {
+            openscarlett::audio::TraceRetailAudio(
+                "AcpHal", OPENSCARLETT_CALLER_ADDR(), "IAcpHal::UnsupportedSlot6()");
+        }
+        openscarlett::audio::LogUnimplAudio(
+            "AcpHal", OPENSCARLETT_CALLER_ADDR(), "IAcpHal::Slot6 unimplemented");
+        return static_cast<int32_t>(0x8AC80F0Eu);
+    }
+
+    virtual int32_t OPENSCARLETT_ACPHAL_CALL UnsupportedSlot7() {
+        static std::atomic<uint64_t> trace_cnt{0u};
+        if (ShouldTraceCall(trace_cnt)) {
+            openscarlett::audio::TraceRetailAudio(
+                "AcpHal", OPENSCARLETT_CALLER_ADDR(), "IAcpHal::UnsupportedSlot7()");
+        }
+        openscarlett::audio::LogUnimplAudio(
+            "AcpHal", OPENSCARLETT_CALLER_ADDR(), "IAcpHal::Slot7 unimplemented");
+        return static_cast<int32_t>(0x8AC80F0Eu);
+    }
+
+    virtual int32_t OPENSCARLETT_ACPHAL_CALL UnsupportedSlot8() {
+        static std::atomic<uint64_t> trace_cnt{0u};
+        if (ShouldTraceCall(trace_cnt)) {
+            openscarlett::audio::TraceRetailAudio(
+                "AcpHal", OPENSCARLETT_CALLER_ADDR(), "IAcpHal::UnsupportedSlot8()");
+        }
+        openscarlett::audio::LogUnimplAudio(
+            "AcpHal", OPENSCARLETT_CALLER_ADDR(), "IAcpHal::Slot8 unimplemented");
+        return static_cast<int32_t>(0x8AC80F0Eu);
+    }
+
+    virtual int32_t OPENSCARLETT_ACPHAL_CALL UnsupportedSlot9() {
+        static std::atomic<uint64_t> trace_cnt{0u};
+        if (ShouldTraceCall(trace_cnt)) {
+            openscarlett::audio::TraceRetailAudio(
+                "AcpHal", OPENSCARLETT_CALLER_ADDR(), "IAcpHal::UnsupportedSlot9()");
+        }
+        openscarlett::audio::LogUnimplAudio(
+            "AcpHal", OPENSCARLETT_CALLER_ADDR(), "IAcpHal::Slot9 unimplemented");
+        return static_cast<int32_t>(0x8AC80F0Eu);
+    }
+
+    virtual int32_t OPENSCARLETT_ACPHAL_CALL MapDriverRegion(uint64_t* outVa) {
+        static std::atomic<uint64_t> trace_cnt{0u};
+        if (ShouldTraceCall(trace_cnt)) {
+            openscarlett::audio::TraceRetailAudio(
+                "AcpHal", OPENSCARLETT_CALLER_ADDR(), "IAcpHal::MapDriverRegion()");
+        }
+        if (outVa && IsWritableAcpPtr(outVa, sizeof(uint64_t))) {
+            *outVa = 0ull;
+        }
+        openscarlett::audio::LogUnimplAudio(
+            "AcpHal", OPENSCARLETT_CALLER_ADDR(), "IAcpHal::MapDriverRegion unimplemented");
+        return static_cast<int32_t>(0x80070032u);
+    }
+
+    virtual uint32_t OPENSCARLETT_ACPHAL_CALL Destroy(uint32_t flags) {
+        static std::atomic<uint64_t> trace_cnt{0u};
+        if (ShouldTraceCall(trace_cnt)) {
+            openscarlett::audio::TraceRetailAudio(
+                "AcpHal", OPENSCARLETT_CALLER_ADDR(), "IAcpHal::Destroy(flags=0x%X)", flags);
+        }
+        (void)flags;
+        RecordOk("IAcpHal::Destroy", 11);
+        delete this;
+        return 0u;
+    }
+
+private:
+    static constexpr uint32_t kMaxRetailXmaContexts = 512u;
+
+    struct RetailXmaCtxState {
+        std::unique_ptr<openscarlett::Xma2Decoder> decoder;
+        uint32_t sample_rate = 0u;
+        uint16_t channels = 0u;
+        std::deque<int16_t> pending_pcm;
+    };
+
+    void SetXmaMaskBit(uint32_t idx, bool enable) noexcept {
+        const uint32_t word = idx >> 6u;
+        const uint64_t bit = 1ull << (idx & 63u);
+        if (enable) {
+            xma_enabled_mask_[word] |= bit;
+        } else {
+            xma_enabled_mask_[word] &= ~bit;
+        }
+    }
+
+    bool IsXmaMaskEnabled(uint32_t idx) const noexcept {
+        const uint32_t word = idx >> 6u;
+        const uint64_t bit = 1ull << (idx & 63u);
+        return (xma_enabled_mask_[word] & bit) != 0ull;
+    }
+
+    void ProcessRetailXmaContextLocked(uint32_t xmaIdx) {
+        if (xmaIdx >= kMaxRetailXmaContexts) {
+            return;
+        }
+        SrwLockGuard shape_lk(g_shape_alloc_mutex);
+        if (!g_retail_xma_contexts_va || xmaIdx >= g_retail_xma_context_count) {
+            return;
+        }
+        uint8_t* ctx = static_cast<uint8_t*>(g_retail_xma_contexts_va) +
+                       static_cast<size_t>(xmaIdx) * 64u;
+        if (!IsWritableAcpPtr(ctx, 64u)) {
+            return;
+        }
+
+        uint32_t dw0 = 0u;
+        uint32_t dw1 = 0u;
+        uint32_t dw4 = 0u;
+        uint32_t dw9 = 0u;
+        uint32_t buf0Apu = 0u;
+        uint32_t buf1Apu = 0u;
+        uint32_t outRingApu = 0u;
+        std::memcpy(&dw0, ctx + 0x00, 4u);
+        std::memcpy(&dw1, ctx + 0x04, 4u);
+        std::memcpy(&dw4, ctx + 0x10, 4u);
+        std::memcpy(&buf0Apu, ctx + 0x14, 4u);
+        std::memcpy(&buf1Apu, ctx + 0x18, 4u);
+        std::memcpy(&outRingApu, ctx + 0x1C, 4u);
+        std::memcpy(&dw9, ctx + 0x24, 4u);
+
+        const uint32_t buf0Pkts = dw0 & 0xFFFu;
+        bool buf0Valid = ((dw0 >> 20u) & 1u) != 0u;
+        bool buf1Valid = ((dw0 >> 21u) & 1u) != 0u;
+        const uint32_t rawOutBlocks = (dw0 >> 22u) & 0x1Fu;
+        const uint32_t outRingBlocks = (rawOutBlocks == 0u) ? 32u : rawOutBlocks;
+        uint32_t writeIdx = ((dw0 >> 27u) & 0x1Fu) % outRingBlocks;
+
+        const uint32_t buf1Pkts = dw1 & 0xFFFu;
+        const uint32_t rateCode = (dw1 >> 27u) & 3u;
+        const uint32_t chMinus1 = (dw1 >> 29u) & 1u;
+        const bool ctxEnabled = ((dw1 >> 31u) & 1u) != 0u;
+        uint32_t curBuf = (dw4 >> 31u) & 1u;
+        const uint32_t readIdx = (dw9 & 0x1Fu) % outRingBlocks;
+
+        if (!ctxEnabled && !IsXmaMaskEnabled(xmaIdx)) {
+            return;
+        }
+        if (outRingApu == 0u || outRingBlocks <= 1u) {
+            return;
+        }
+        const uint32_t outRingBytes = outRingBlocks * 256u;
+        void* outRingVa = ApuHeapManager::Instance().MapApuAddress(outRingApu);
+        if (!outRingVa ||
+            ApuHeapManager::Instance().ValidateApuAddressRange(outRingApu, outRingBytes) != ACPHAL_S_OK ||
+            !IsWritableAcpPtr(outRingVa, outRingBytes)) {
+            return;
+        }
+
+        uint32_t freeBlocks = (readIdx <= writeIdx)
+                                  ? (outRingBlocks - 1u - (writeIdx - readIdx))
+                                  : (readIdx - writeIdx - 1u);
+        auto& state = xma_states_[xmaIdx];
+
+        auto writePendingToRing = [&]() {
+            while (freeBlocks > 0u && !state.pending_pcm.empty()) {
+                int16_t block[128] = {};
+                const size_t n = std::min<size_t>(128u, state.pending_pcm.size());
+                for (size_t i = 0u; i < n; ++i) {
+                    block[i] = state.pending_pcm.front();
+                    state.pending_pcm.pop_front();
+                }
+                uint8_t* dst = static_cast<uint8_t*>(outRingVa) +
+                               static_cast<size_t>(writeIdx) * 256u;
+                std::memcpy(dst, block, 256u);
+                writeIdx = (writeIdx + 1u) % outRingBlocks;
+                --freeBlocks;
+            }
+        };
+
+        writePendingToRing();
+
+        static constexpr uint32_t kRates[4] = {24000u, 32000u, 44100u, 48000u};
+        const uint32_t targetRate = kRates[rateCode];
+        const uint16_t targetCh = static_cast<uint16_t>(chMinus1 + 1u);
+
+        while (freeBlocks > 0u && state.pending_pcm.empty()) {
+            uint32_t activeBuf = 0u;
+            if (curBuf == 0u) {
+                if (buf0Valid) {
+                    activeBuf = 0u;
+                } else if (buf1Valid) {
+                    activeBuf = 1u;
+                } else {
+                    break;
+                }
+            } else {
+                if (buf1Valid) {
+                    activeBuf = 1u;
+                } else if (buf0Valid) {
+                    activeBuf = 0u;
+                } else {
+                    break;
+                }
+            }
+
+            const uint32_t inApu = (activeBuf == 0u) ? buf0Apu : buf1Apu;
+            const uint32_t inPkts = (activeBuf == 0u) ? buf0Pkts : buf1Pkts;
+            if (inApu == 0u || inPkts == 0u) {
+                break;
+            }
+            const uint64_t inBytes64 =
+                static_cast<uint64_t>(inPkts) * openscarlett::kXma2PacketSize;
+            if (inBytes64 > 0xFFFFFFFFull) {
+                break;
+            }
+            const uint32_t inBytes = static_cast<uint32_t>(inBytes64);
+            void* inVa = ApuHeapManager::Instance().MapApuAddress(inApu);
+            if (!inVa ||
+                ApuHeapManager::Instance().ValidateApuAddressRange(inApu, inBytes) != ACPHAL_S_OK ||
+                !IsReadableAcpPtr(inVa, inBytes)) {
+                break;
+            }
+
+            if (!state.decoder || state.sample_rate != targetRate || state.channels != targetCh) {
+                state.decoder = std::make_unique<openscarlett::Xma2Decoder>();
+                openscarlett::Xma2Config cfg{};
+                cfg.sample_rate = targetRate;
+                cfg.channels = targetCh;
+                cfg.block_size = openscarlett::kXma2DefaultBlockSize;
+                cfg.subframes_per_frame = 4u;
+                cfg.quant_bits = 12u;
+                if (!state.decoder->Initialize(cfg).ok()) {
+                    state.decoder.reset();
+                    break;
+                }
+                state.sample_rate = targetRate;
+                state.channels = targetCh;
+            }
+
+            std::vector<int16_t> pcm;
+            const auto st = state.decoder->DecodePacketsInt16(
+                static_cast<const uint8_t*>(inVa), inBytes, pcm);
+            if (st.ok() && !pcm.empty()) {
+                state.pending_pcm.insert(state.pending_pcm.end(), pcm.begin(), pcm.end());
+            }
+
+            // Mark buffer consumed and advance curBuf.
+            if (activeBuf == 0u) {
+                buf0Valid = false;
+                dw0 &= ~(1u << 20u);
+            } else {
+                buf1Valid = false;
+                dw0 &= ~(1u << 21u);
+            }
+            curBuf = activeBuf ^ 1u;
+            dw4 = (dw4 & ~(1u << 31u)) | (curBuf << 31u);
+
+            writePendingToRing();
+        }
+
+        dw0 = (dw0 & ~(0x1Fu << 27u)) | ((writeIdx & 0x1Fu) << 27u);
+        std::memcpy(ctx + 0x00, &dw0, sizeof(uint32_t));
+        std::memcpy(ctx + 0x10, &dw4, sizeof(uint32_t));
+    }
+
+    SrwLock mutex_;
+    bool connected_ = false;
+    uint32_t last_config_ = 0u;
+    uint64_t audio_clock_samples_ = 0ull;
+    std::array<uint64_t, 8> xma_enabled_mask_{};
+    std::unordered_map<uint32_t, RetailXmaCtxState> xma_states_;
+    std::deque<XboxAcpMessage> messages_;
+};
+
 }  // namespace
 
 extern "C" {
 
 int32_t OPENSCARLETT_ACPHAL_CALL AcpHalCreate(IAcpHal** ppAcpHal) {
+    static std::atomic<uint64_t> trace_cnt{0u};
+    if (ShouldTraceCall(trace_cnt)) {
+        openscarlett::audio::TraceRetailAudio(
+            "AcpHal", OPENSCARLETT_CALLER_ADDR(),
+            "AcpHalCreate(ppAcpHal=%p, retail=%d)",
+            static_cast<const void*>(ppAcpHal),
+            g_xbox_retail_acphal_mode.load(std::memory_order_acquire) ? 1 : 0);
+    }
     if (!ppAcpHal) {
         return RecordHr("AcpHalCreate", ACPHAL_E_POINTER);
     }
@@ -985,6 +1456,13 @@ int32_t OPENSCARLETT_ACPHAL_CALL AcpHalCreate(IAcpHal** ppAcpHal) {
 int32_t OPENSCARLETT_ACPHAL_CALL AcpHalAllocateShapeContexts(
     const AcpHalShapeContexts* pRequested,
     AcpHalShapeContexts* pAllocated) {
+    static std::atomic<uint64_t> trace_cnt{0u};
+    if (ShouldTraceCall(trace_cnt)) {
+        openscarlett::audio::TraceRetailAudio(
+            "AcpHal", OPENSCARLETT_CALLER_ADDR(),
+            "AcpHalAllocateShapeContexts(pReq=%p, pAlloc=%p)",
+            static_cast<const void*>(pRequested), static_cast<void*>(pAllocated));
+    }
     if (!pRequested) {
         return RecordHr("AcpHalAllocateShapeContexts", ACPHAL_E_INVALIDARG);
     }
@@ -1012,12 +1490,12 @@ int32_t OPENSCARLETT_ACPHAL_CALL AcpHalAllocateShapeContexts(
             void** out_slot;
         };
         StageSpec stages[6] = {
-            {xbox_ctx->numSrcContexts,     32u, &xbox_ctx->srcContexts},
-            {xbox_ctx->numEqCompContexts,  32u, &xbox_ctx->eqCompContexts},
-            {xbox_ctx->numFiltVolContexts, 32u, &xbox_ctx->filtVolContexts},
-            {xbox_ctx->numDmaContexts,     16u, &xbox_ctx->dmaContexts},
-            {xbox_ctx->numXmaContexts,     64u, &xbox_ctx->xmaContexts},
-            {xbox_ctx->numPcmContexts,     64u, &xbox_ctx->pcmContexts},
+            {xbox_ctx->numSrcContexts,     32u,  &xbox_ctx->srcContexts},
+            {xbox_ctx->numEqCompContexts,  160u, &xbox_ctx->eqCompContexts},
+            {xbox_ctx->numFiltVolContexts, 32u,  &xbox_ctx->filtVolContexts},
+            {xbox_ctx->numDmaContexts,     16u,  &xbox_ctx->dmaContexts},
+            {xbox_ctx->numXmaContexts,     64u,  &xbox_ctx->xmaContexts},
+            {xbox_ctx->numPcmContexts,     32u,  &xbox_ctx->pcmContexts},
         };
 
         uint32_t stage_bytes[6] = {};
@@ -1032,6 +1510,7 @@ int32_t OPENSCARLETT_ACPHAL_CALL AcpHalAllocateShapeContexts(
 
         SrwLockGuard lk(g_shape_alloc_mutex);
         void* allocated_ptrs[6] = {};
+        APU_ADDRESS allocated_pas[6] = {};
         int32_t fail_hr = ACPHAL_S_OK;
         constexpr uint32_t kXboxRetailApuAllocCached = 1u;
         for (size_t i = 0u; i < 6u; ++i) {
@@ -1054,15 +1533,24 @@ int32_t OPENSCARLETT_ACPHAL_CALL AcpHalAllocateShapeContexts(
                 return RecordHr("AcpHalAllocateShapeContexts", fail_hr);
             }
             allocated_ptrs[i] = va;
+            allocated_pas[i] = pa;
         }
 
-        // All 6 stages succeeded — publish pointers and track for AcpHalReleaseShapeContexts.
+        // All 6 stages succeeded — publish pointers/APU addresses and track for release.
         for (size_t i = 0u; i < 6u; ++i) {
-            *stages[i].out_slot = allocated_ptrs[i];
-            if (allocated_ptrs[i]) {
-                g_xbox_shape_buffers.push_back(allocated_ptrs[i]);
+            if (stage_bytes[i] == 0u || !allocated_ptrs[i]) {
+                continue;
             }
+            if (IsWritableAcpPtr(stages[i].out_slot, sizeof(void*))) {
+                *stages[i].out_slot = allocated_ptrs[i];
+            }
+            if (IsWritableAcpPtr(&xbox_ctx->apuAddresses[i], sizeof(uint32_t))) {
+                xbox_ctx->apuAddresses[i] = allocated_pas[i];
+            }
+            g_xbox_shape_buffers.push_back(allocated_ptrs[i]);
         }
+        g_retail_xma_contexts_va = allocated_ptrs[4];
+        g_retail_xma_context_count = allocated_ptrs[4] ? xbox_ctx->numXmaContexts : 0u;
         return RecordHr("AcpHalAllocateShapeContexts", ACPHAL_S_OK);
     }
 
@@ -1131,6 +1619,12 @@ int32_t OPENSCARLETT_ACPHAL_CALL AcpHalAllocateShapeContexts(
 }
 
 int32_t OPENSCARLETT_ACPHAL_CALL AcpHalReleaseShapeContexts(AcpHalShapeContexts* pAllocated) {
+    static std::atomic<uint64_t> trace_cnt{0u};
+    if (ShouldTraceCall(trace_cnt)) {
+        openscarlett::audio::TraceRetailAudio(
+            "AcpHal", OPENSCARLETT_CALLER_ADDR(),
+            "AcpHalReleaseShapeContexts(pAlloc=%p)", static_cast<void*>(pAllocated));
+    }
     {
         SrwLockGuard lk(g_shape_alloc_mutex);
         if (IsWritableAcpPtr(pAllocated, sizeof(AcpHalShapeContexts)) &&
@@ -1153,6 +1647,8 @@ int32_t OPENSCARLETT_ACPHAL_CALL AcpHalReleaseShapeContexts(AcpHalShapeContexts*
                 }
             }
             g_xbox_shape_buffers.clear();
+            g_retail_xma_contexts_va = nullptr;
+            g_retail_xma_context_count = 0u;
             return RecordHr("AcpHalReleaseShapeContexts", ACPHAL_S_OK);
         }
     }
@@ -1175,6 +1671,12 @@ int32_t OPENSCARLETT_ACPHAL_CALL AcpHalReleaseShapeContexts(AcpHalShapeContexts*
 int32_t OPENSCARLETT_ACPHAL_CALL ApuValidateAddressRange(
     APU_ADDRESS apuAddress,
     uint32_t sizeInBytes) {
+    static std::atomic<uint64_t> trace_cnt{0u};
+    if (ShouldTraceCall(trace_cnt)) {
+        openscarlett::audio::TraceRetailAudio(
+            "AcpHal", OPENSCARLETT_CALLER_ADDR(),
+            "ApuValidateAddressRange(apu=0x%X, size=0x%X)", apuAddress, sizeInBytes);
+    }
     return RecordHr(
         "ApuValidateAddressRange",
         ApuHeapManager::Instance().ValidateApuAddressRange(apuAddress, sizeInBytes));
@@ -1183,6 +1685,12 @@ int32_t OPENSCARLETT_ACPHAL_CALL ApuValidateAddressRange(
 int32_t OPENSCARLETT_ACPHAL_CALL ApuCheckAddressRangeDisjoint(
     APU_ADDRESS apuAddress,
     uint32_t sizeInBytes) {
+    static std::atomic<uint64_t> trace_cnt{0u};
+    if (ShouldTraceCall(trace_cnt)) {
+        openscarlett::audio::TraceRetailAudio(
+            "AcpHal", OPENSCARLETT_CALLER_ADDR(),
+            "ApuCheckAddressRangeDisjoint(apu=0x%X, size=0x%X)", apuAddress, sizeInBytes);
+    }
     return RecordHr(
         "ApuCheckAddressRangeDisjoint",
         ApuHeapManager::Instance().CheckApuRangeDisjoint(apuAddress, sizeInBytes));
@@ -1191,6 +1699,13 @@ int32_t OPENSCARLETT_ACPHAL_CALL ApuCheckAddressRangeDisjoint(
 int32_t OPENSCARLETT_ACPHAL_CALL ApuCreateHeap(
     uint32_t cachedSizeInBytes,
     uint32_t nonCachedSizeInBytes) {
+    static std::atomic<uint64_t> trace_cnt{0u};
+    if (ShouldTraceCall(trace_cnt)) {
+        openscarlett::audio::TraceRetailAudio(
+            "AcpHal", OPENSCARLETT_CALLER_ADDR(),
+            "ApuCreateHeap(cached=0x%X, nonCached=0x%X)",
+            cachedSizeInBytes, nonCachedSizeInBytes);
+    }
     const int32_t hr = ApuHeapManager::Instance().CreateHeap(cachedSizeInBytes, nonCachedSizeInBytes);
     if (hr < 0) {
         std::fprintf(stderr, "[OpenScarlett][AcpHal] ApuCreateHeap(cached=0x%X, nonCached=0x%X) -> 0x%08X\n",
@@ -1206,6 +1721,13 @@ int32_t OPENSCARLETT_ACPHAL_CALL ApuAlloc(
     uint32_t sizeInBytes,
     uint32_t alignmentInBytes,
     uint32_t flags) {
+    static std::atomic<uint64_t> trace_cnt{0u};
+    if (ShouldTraceCall(trace_cnt)) {
+        openscarlett::audio::TraceRetailAudio(
+            "AcpHal", OPENSCARLETT_CALLER_ADDR(),
+            "ApuAlloc(size=0x%X, align=0x%X, flags=0x%X)",
+            sizeInBytes, alignmentInBytes, flags);
+    }
     return RecordHr(
         "ApuAlloc",
         ApuHeapManager::Instance().Alloc(
@@ -1213,18 +1735,36 @@ int32_t OPENSCARLETT_ACPHAL_CALL ApuAlloc(
 }
 
 int32_t OPENSCARLETT_ACPHAL_CALL ApuFree(void* virtualAddress) {
+    static std::atomic<uint64_t> trace_cnt{0u};
+    if (ShouldTraceCall(trace_cnt)) {
+        openscarlett::audio::TraceRetailAudio(
+            "AcpHal", OPENSCARLETT_CALLER_ADDR(),
+            "ApuFree(va=%p)", virtualAddress);
+    }
     return RecordHr("ApuFree", ApuHeapManager::Instance().Free(virtualAddress));
 }
 
 int32_t OPENSCARLETT_ACPHAL_CALL ApuHeapGetState(
     APU_HEAP_STATE* state,
     uint32_t flags) {
+    static std::atomic<uint64_t> trace_cnt{0u};
+    if (ShouldTraceCall(trace_cnt)) {
+        openscarlett::audio::TraceRetailAudio(
+            "AcpHal", OPENSCARLETT_CALLER_ADDR(),
+            "ApuHeapGetState(flags=0x%X)", flags);
+    }
     return RecordHr("ApuHeapGetState", ApuHeapManager::Instance().GetState(state, flags));
 }
 
 int32_t OPENSCARLETT_ACPHAL_CALL ApuIsVirtualAddressValid(
     const void* virtualAddress,
     uint32_t sizeInBytes) {
+    static std::atomic<uint64_t> trace_cnt{0u};
+    if (ShouldTraceCall(trace_cnt)) {
+        openscarlett::audio::TraceRetailAudio(
+            "AcpHal", OPENSCARLETT_CALLER_ADDR(),
+            "ApuIsVirtualAddressValid(va=%p, size=0x%X)", virtualAddress, sizeInBytes);
+    }
     const int32_t valid =
         ApuHeapManager::Instance().IsVirtualAddressValid(virtualAddress, sizeInBytes);
     RecordOk("ApuIsVirtualAddressValid");
@@ -1232,12 +1772,24 @@ int32_t OPENSCARLETT_ACPHAL_CALL ApuIsVirtualAddressValid(
 }
 
 APU_ADDRESS OPENSCARLETT_ACPHAL_CALL ApuMapVirtualAddress(const void* virtualAddress) {
+    static std::atomic<uint64_t> trace_cnt{0u};
+    if (ShouldTraceCall(trace_cnt)) {
+        openscarlett::audio::TraceRetailAudio(
+            "AcpHal", OPENSCARLETT_CALLER_ADDR(),
+            "ApuMapVirtualAddress(va=%p)", virtualAddress);
+    }
     const APU_ADDRESS addr = ApuHeapManager::Instance().MapVirtualAddress(virtualAddress);
     RecordOk("ApuMapVirtualAddress");
     return addr;
 }
 
 void* OPENSCARLETT_ACPHAL_CALL ApuMapApuAddress(APU_ADDRESS apuAddress) {
+    static std::atomic<uint64_t> trace_cnt{0u};
+    if (ShouldTraceCall(trace_cnt)) {
+        openscarlett::audio::TraceRetailAudio(
+            "AcpHal", OPENSCARLETT_CALLER_ADDR(),
+            "ApuMapApuAddress(apu=0x%X)", apuAddress);
+    }
     void* va = ApuHeapManager::Instance().MapApuAddress(apuAddress);
     RecordOk("ApuMapApuAddress");
     return va;
