@@ -488,7 +488,7 @@ size_t GetSubobjectStrideBytes(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type) noexcep
             return sizeof(StreamSubobjLayout<D3D12_DEPTH_STENCIL_DESC1>);
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING:
             return sizeof(StreamSubobjLayout<D3D12_VIEW_INSTANCING_DESC>);
-#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+#if defined(__ID3D12Device10_INTERFACE_DEFINED__) && !defined(__MINGW32__)
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2:
             return sizeof(StreamSubobjLayout<D3D12_DEPTH_STENCIL_DESC2>);
 #endif
@@ -4327,7 +4327,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePipelineState(
             needs_stream_rebuild = true;
             pso_remapped_ext_tags_.fetch_add(1ull, std::memory_order_relaxed);
             if (raw_tag == 25u) {
-#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+#if defined(__ID3D12Device10_INTERFACE_DEFINED__) && !defined(__MINGW32__)
                 const size_t ds2_stride = sizeof(StreamSubobjLayout<D3D12_DEPTH_STENCIL_DESC2>);
                 if (pos + ds2_stride <= total_bytes) {
                     ent.desktop_type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1;
@@ -4565,7 +4565,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePipelineState(
             if (ent.drop_subobject) continue;
 
             if (ent.convert_ds2_to_ds1) {
-#ifdef __ID3D12Device10_INTERFACE_DEFINED__
+#if defined(__ID3D12Device10_INTERFACE_DEFINED__) && !defined(__MINGW32__)
                 StreamSubobjLayout<D3D12_DEPTH_STENCIL_DESC2> ds2{};
                 std::memcpy(&ds2, raw_stream + ent.src_offset, sizeof(ds2));
                 StreamSubobjLayout<D3D12_DEPTH_STENCIL_DESC1> ds1{};
