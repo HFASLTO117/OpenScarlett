@@ -119,6 +119,7 @@ foreach(_audio_test
     test_dstorage_audio_diag_parity
     test_media_video_gameinput
     test_s16_media_storage_audio
+    test_retail_audio_engine
 )
     _openscarlett_add_test_lock(${_audio_test} audio)
 endforeach()

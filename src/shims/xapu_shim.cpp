@@ -1164,9 +1164,25 @@ OPENSCARLETT_XAPU_API int32_t OPENSCARLETT_XAPU_CALL XApuConnect(
     void* caller_addr = OPENSCARLETT_CALLER_ADDR();
     const int32_t hr = RecordHr("XApuConnect", XApuRegistry::Instance().Connect(arg1, arg2, arg3));
     if (ShouldTraceRetailCall(g_trace_connect)) {
-        openscarlett::audio::TraceRetailAudio(
-            "xapu", caller_addr, "XApuConnect(arg1=%p, arg2=%p, arg3=%p) -> 0x%08X",
-            arg1, arg2, arg3, static_cast<uint32_t>(hr));
+        if (IsReadablePointer(arg1, sizeof(XApuConnectInput)) &&
+            IsWritablePointer(arg2, sizeof(XApuConnectOutput)) &&
+            IsWritablePointer(arg3, sizeof(XAPU_CONNECTION_HANDLE))) {
+            XApuConnectInput in{};
+            std::memcpy(&in, arg1, sizeof(in));
+            XApuConnectOutput out{};
+            std::memcpy(&out, arg2, sizeof(out));
+            openscarlett::audio::TraceRetailAudio(
+                "xapu", caller_addr,
+                "XApuConnect(proc=%u, streams=%u, depth=%u, shm=0x%X, maxF=%u, opt=0x%X) -> 0x%08X (base=%p, out1=0x%llX)",
+                in.processType, in.streamCount, in.commandQueueDepth,
+                in.sharedMemoryBytes, in.maxFrameCountPerOutput, in.options,
+                static_cast<uint32_t>(hr), out.baseAddress,
+                static_cast<unsigned long long>(out.sizeOrReadyEvent));
+        } else {
+            openscarlett::audio::TraceRetailAudio(
+                "xapu", caller_addr, "XApuConnect(arg1=%p, arg2=%p, arg3=%p) -> 0x%08X",
+                arg1, arg2, arg3, static_cast<uint32_t>(hr));
+        }
     }
     return hr;
 }

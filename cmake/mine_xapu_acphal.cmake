@@ -29,6 +29,11 @@ endif()
 openscarlett_add_test(test_mine_xapu_acphal tests/test_mine_xapu_acphal.cpp)
 add_dependencies(test_mine_xapu_acphal xapu AcpHal)
 
+# 2b. Retail audio engine suite (xapu.dll, chad.dll, AcpHal.dll, XAudio2_9.dll)
+openscarlett_add_test(test_retail_audio_engine tests/test_retail_audio_engine.cpp)
+target_link_libraries(test_retail_audio_engine PRIVATE XAudio2_9)
+add_dependencies(test_retail_audio_engine xapu chad AcpHal XAudio2_9)
+
 # 3. Clean-room regression test suite for Minecraft Preview perf & hardening
 openscarlett_add_test(test_minecraft_perf_hardening tests/test_minecraft_perf_hardening.cpp)
 add_dependencies(test_minecraft_perf_hardening openscarlett_hook XAudio2_9 AcpHal xapu dstorage_xs d3d12_xs)
