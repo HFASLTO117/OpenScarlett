@@ -1737,12 +1737,16 @@ void CommandQueueX::ExecuteVulkanRecordedBatch(const VulkanRecordedBatch& batch)
                                         mdesc.push_constants.size());
                         }
                         openscarlett::VulkanMeshDrawResult mres{};
-                        if (vk->ExecuteMeshShaderDraw(mdesc, mres).ok()) {
+                        const openscarlett::Status mst = vk->ExecuteMeshShaderDraw(mdesc, mres);
+                        if (mst.ok()) {
                             ++spirv_mesh_cnt;
                             if (mres.executed_on_mesh_shader_hw) ++icd_execs_cnt;
                             if (op.rtv_resource) {
                                 device_x_->StoreVulkanRenderTargetFramebuffer(op.rtv_resource, mres.framebuffer);
                             }
+                        } else {
+                            std::fprintf(stderr, "[OpenScarlett][d3d12_xs] Vulkan DispatchMesh failed: %s\n",
+                                         mst.message.c_str());
                         }
                     }
                 }

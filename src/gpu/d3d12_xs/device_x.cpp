@@ -689,6 +689,52 @@ D3D12_HEAP_FLAGS SanitizeXboxHeapFlags(D3D12_HEAP_FLAGS flags) noexcept {
     return static_cast<D3D12_HEAP_FLAGS>(static_cast<uint32_t>(flags) & ~kMaskOut);
 }
 
+// Sanitize zero-initialized D3D12_DEPTH_STENCIL_DESC enum fields (valid D3D12_COMPARISON_FUNC
+// and D3D12_STENCIL_OP values are 1..8). Strict IHVs such as Intel Arc Battlemage can reject
+// or fault on PSOs containing invalid 0 enum values even when DepthEnable/StencilEnable are FALSE.
+bool SanitizeDepthStencilOp(D3D12_DEPTH_STENCILOP_DESC& op) noexcept {
+    bool changed = false;
+    if (static_cast<uint32_t>(op.StencilFailOp) == 0u) {
+        op.StencilFailOp = D3D12_STENCIL_OP_KEEP;
+        changed = true;
+    }
+    if (static_cast<uint32_t>(op.StencilDepthFailOp) == 0u) {
+        op.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+        changed = true;
+    }
+    if (static_cast<uint32_t>(op.StencilPassOp) == 0u) {
+        op.StencilPassOp = D3D12_STENCIL_OP_KEEP;
+        changed = true;
+    }
+    if (static_cast<uint32_t>(op.StencilFunc) == 0u) {
+        op.StencilFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        changed = true;
+    }
+    return changed;
+}
+
+bool SanitizeDepthStencilDesc(D3D12_DEPTH_STENCIL_DESC& ds) noexcept {
+    bool changed = false;
+    if (static_cast<uint32_t>(ds.DepthFunc) == 0u) {
+        ds.DepthFunc = ds.DepthEnable ? D3D12_COMPARISON_FUNC_LESS_EQUAL : D3D12_COMPARISON_FUNC_ALWAYS;
+        changed = true;
+    }
+    if (SanitizeDepthStencilOp(ds.FrontFace)) changed = true;
+    if (SanitizeDepthStencilOp(ds.BackFace)) changed = true;
+    return changed;
+}
+
+bool SanitizeDepthStencilDesc1(D3D12_DEPTH_STENCIL_DESC1& ds) noexcept {
+    bool changed = false;
+    if (static_cast<uint32_t>(ds.DepthFunc) == 0u) {
+        ds.DepthFunc = ds.DepthEnable ? D3D12_COMPARISON_FUNC_LESS_EQUAL : D3D12_COMPARISON_FUNC_ALWAYS;
+        changed = true;
+    }
+    if (SanitizeDepthStencilOp(ds.FrontFace)) changed = true;
+    if (SanitizeDepthStencilOp(ds.BackFace)) changed = true;
+    return changed;
+}
+
 XG_TILE_MODE ExtractXboxGfx10TileMode(D3D12_TEXTURE_LAYOUT layout) noexcept {
     const uint32_t raw = static_cast<uint32_t>(layout);
     if (raw >= D3D12XBOX_TEXTURE_LAYOUT_GFX10_BASE) {
@@ -2868,6 +2914,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateGraphicsPipelineState(
             lifted_desc.pRootSignature = SynthesizeHostRootSignatureFromXboxDesc(fallback_rs_desc);
         }
     }
+    (void)SanitizeDepthStencilDesc(lifted_desc.DepthStencilState);
 
     if (!ppPipelineState) {
         const HRESULT hr = host_dev_->CreateGraphicsPipelineState(&lifted_desc, riid, nullptr);
@@ -4391,6 +4438,22 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePipelineState(
                 std::memcpy(&stream_prim_topo,
                             raw_stream + pos + offsetof(StreamSubobjLayout<D3D12_PRIMITIVE_TOPOLOGY_TYPE>, value),
                             sizeof(stream_prim_topo));
+            } else if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL) {
+                D3D12_DEPTH_STENCIL_DESC ds_probe{};
+                std::memcpy(&ds_probe,
+                            raw_stream + pos + offsetof(StreamSubobjLayout<D3D12_DEPTH_STENCIL_DESC>, value),
+                            sizeof(ds_probe));
+                if (SanitizeDepthStencilDesc(ds_probe)) {
+                    needs_stream_rebuild = true;
+                }
+            } else if (sub_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1) {
+                D3D12_DEPTH_STENCIL_DESC1 ds1_probe{};
+                std::memcpy(&ds1_probe,
+                            raw_stream + pos + offsetof(StreamSubobjLayout<D3D12_DEPTH_STENCIL_DESC1>, value),
+                            sizeof(ds1_probe));
+                if (SanitizeDepthStencilDesc1(ds1_probe)) {
+                    needs_stream_rebuild = true;
+                }
             } else if (IsShaderSubobjectType(sub_type)) {
                 D3D12_SHADER_BYTECODE bc{};
                 std::memcpy(&bc, raw_stream + pos + kBytecodeOffset, sizeof(bc));
@@ -4645,6 +4708,20 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePipelineState(
                 }
             } else if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY) {
                 rebuilt_topo_pos = dst_pos;
+            } else if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL) {
+                D3D12_DEPTH_STENCIL_DESC ds_val{};
+                const size_t ds_off = offsetof(StreamSubobjLayout<D3D12_DEPTH_STENCIL_DESC>, value);
+                std::memcpy(&ds_val, rebuilt_bytes.data() + dst_pos + ds_off, sizeof(ds_val));
+                if (SanitizeDepthStencilDesc(ds_val)) {
+                    std::memcpy(rebuilt_bytes.data() + dst_pos + ds_off, &ds_val, sizeof(ds_val));
+                }
+            } else if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1) {
+                D3D12_DEPTH_STENCIL_DESC1 ds1_val{};
+                const size_t ds1_off = offsetof(StreamSubobjLayout<D3D12_DEPTH_STENCIL_DESC1>, value);
+                std::memcpy(&ds1_val, rebuilt_bytes.data() + dst_pos + ds1_off, sizeof(ds1_val));
+                if (SanitizeDepthStencilDesc1(ds1_val)) {
+                    std::memcpy(rebuilt_bytes.data() + dst_pos + ds1_off, &ds1_val, sizeof(ds1_val));
+                }
             } else if (has_xbox_shader && IsShaderSubobjectType(ent.desktop_type)) {
                 D3D12_SHADER_BYTECODE bc{};
                 std::memcpy(&bc, rebuilt_bytes.data() + dst_pos + kBytecodeOffset, sizeof(bc));
@@ -8046,8 +8123,16 @@ uint64_t DeviceX::EffectiveResidencyBudgetBytesLocked() const noexcept {
     if (residency_budget_override_bytes_ > 0ull) {
         return residency_budget_override_bytes_;
     }
-    if (dxgi_mem_info_.queried_dxgi_adapter3 && dxgi_mem_info_.local_budget_bytes > 0ull) {
-        return std::min<uint64_t>(dxgi_mem_info_.local_budget_bytes, console_profile_.target_console_vram_bytes);
+    if (dxgi_mem_info_.queried_dxgi_adapter3 &&
+        (dxgi_mem_info_.local_budget_bytes > 0ull || dxgi_mem_info_.non_local_budget_bytes > 0ull)) {
+        // Integrated UMA GPUs (e.g. Intel Arc B390 reporting 128 MB dedicated VRAM) expose
+        // their full unified pool via non-local or combined DXGI segments.
+        constexpr uint64_t kUmaLocalThreshold = 512ull * 1024ull * 1024ull;
+        uint64_t host_budget = dxgi_mem_info_.local_budget_bytes;
+        if (host_budget < kUmaLocalThreshold && dxgi_mem_info_.non_local_budget_bytes > host_budget) {
+            host_budget = dxgi_mem_info_.non_local_budget_bytes;
+        }
+        return std::min<uint64_t>(host_budget, console_profile_.target_console_vram_bytes);
     }
     if (adapter_info_.dedicated_video_memory_bytes > 0ull) {
         const uint64_t safe_host = (adapter_info_.dedicated_video_memory_bytes * 85ull) / 100ull;

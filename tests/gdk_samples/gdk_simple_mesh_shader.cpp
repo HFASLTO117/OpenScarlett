@@ -67,6 +67,7 @@ struct MeshShaderPsoStream {
     PsoStreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, D3D12_BLEND_DESC> blend;
     PsoStreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, D3D12_RASTERIZER_DESC> rasterizer;
     PsoStreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, D3D12_DEPTH_STENCIL_DESC> depth_stencil;
+    PsoStreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE> topology;
     PsoStreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, UINT> sample_mask;
     PsoStreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, DXGI_SAMPLE_DESC> sample_desc;
     PsoStreamSubobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY> rt_formats;
@@ -253,7 +254,15 @@ int main() {
     stream.rasterizer.inner.DepthClipEnable = TRUE;
 
     stream.depth_stencil.inner.DepthEnable = FALSE;
+    stream.depth_stencil.inner.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+    stream.depth_stencil.inner.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
     stream.depth_stencil.inner.StencilEnable = FALSE;
+    stream.depth_stencil.inner.StencilReadMask = D3D12_DEFAULT_STENCIL_READ_MASK;
+    stream.depth_stencil.inner.StencilWriteMask = D3D12_DEFAULT_STENCIL_WRITE_MASK;
+    stream.depth_stencil.inner.FrontFace = {
+        D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_FUNC_ALWAYS};
+    stream.depth_stencil.inner.BackFace = stream.depth_stencil.inner.FrontFace;
+    stream.topology.inner = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     stream.sample_mask.inner = UINT_MAX;
     stream.sample_desc.inner = {1, 0};
     stream.rt_formats.inner.NumRenderTargets = 1;
@@ -359,7 +368,6 @@ int main() {
 
     cmd->SetGraphicsRootSignature(root_sig.Get());
     cmd->SetPipelineState(mesh_pso.Get());
-    cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
     // Real hardware Mesh Shader dispatch (ID3D12GraphicsCommandListX::DispatchMesh slot 79!)
     cmd->DispatchMesh(1, 1, 1);
@@ -392,6 +400,9 @@ int main() {
 
     hr = queue->PresentX(1, &plane, &pres_params);
     if (FAILED(hr)) {
+        const HRESULT reason = device->GetDeviceRemovedReason();
+        std::fprintf(stderr, "[gdk_simple_mesh_shader] DeviceRemovedReason=0x%08lX\n",
+                     static_cast<unsigned long>(reason));
         return Fail("PresentX(1)", hr);
     }
     ::QueryPerformanceCounter(&qpc_end);
