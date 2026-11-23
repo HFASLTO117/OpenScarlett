@@ -48,6 +48,8 @@ EXPORTS
     OpenScarlettD3D12SetBackendMode
     OpenScarlettD3D12GetActiveBackend
     OpenScarlettD3D12GetVulkanRoutingStats
+    DXGIXSetVLineNotification
+    DXGIXSetFrameNotification
     IID_ID3D12Device = OS_IID_ID3D12Device DATA
     IID_ID3D12Device1 = OS_IID_ID3D12Device1 DATA
     IID_ID3D12Device2 = OS_IID_ID3D12Device2 DATA

@@ -87,12 +87,19 @@ void* OPENSCARLETT_KERNELX_CALL XMemShim_XMemAllocAligned(
 }
 
 void OPENSCARLETT_KERNELX_CALL XMemShim_XMemFree(void* pAddress, uint64_t dwAllocAttributes) {
+    if (!pAddress) {
+#if defined(_WIN32)
+        SetLastError(0u);
+#endif
+        RecordOutcome("XMemFree", true);
+        return;
+    }
 #if defined(_WIN32)
     SetLastError(0u);
 #endif
     ::XMemFree(pAddress, dwAllocAttributes);
 #if defined(_WIN32)
-    const bool ok = (pAddress == nullptr) || (GetLastError() == 0u);
+    const bool ok = (GetLastError() == 0u);
 #else
     const bool ok = true;
 #endif
@@ -100,12 +107,19 @@ void OPENSCARLETT_KERNELX_CALL XMemShim_XMemFree(void* pAddress, uint64_t dwAllo
 }
 
 void OPENSCARLETT_KERNELX_CALL XMemShim_XMemFreeDefault(void* pAddress, uint64_t dwAllocAttributes) {
+    if (!pAddress) {
+#if defined(_WIN32)
+        SetLastError(0u);
+#endif
+        RecordOutcome("XMemFreeDefault", true);
+        return;
+    }
 #if defined(_WIN32)
     SetLastError(0u);
 #endif
     ::XMemFreeDefault(pAddress, dwAllocAttributes);
 #if defined(_WIN32)
-    const bool ok = (pAddress == nullptr) || (GetLastError() == 0u);
+    const bool ok = (GetLastError() == 0u);
 #else
     const bool ok = true;
 #endif
