@@ -3744,13 +3744,21 @@ struct VulkanBackend::Impl {
         subpass.pColorAttachments = &color_ref;
         subpass.pDepthStencilAttachment = enable_depth ? &depth_ref : nullptr;
 
-        VkSubpassDependency dep{};
-        dep.srcSubpass = 0u;
-        dep.dstSubpass = kVkSubpassExternal;
-        dep.srcStageMask = kVkPipelineStageColorAttachmentOutputBit;
-        dep.dstStageMask = kVkPipelineStageTransferBit;
-        dep.srcAccessMask = kVkAccessColorAttachmentWriteBit;
-        dep.dstAccessMask = kVkAccessTransferReadBit;
+        VkSubpassDependency deps[2]{};
+        // Incoming dependency: synchronize UNDEFINED -> COLOR_ATTACHMENT_OPTIMAL before LOAD_OP_CLEAR
+        deps[0].srcSubpass = kVkSubpassExternal;
+        deps[0].dstSubpass = 0u;
+        deps[0].srcStageMask = kVkPipelineStageTopOfPipeBit | kVkPipelineStageColorAttachmentOutputBit;
+        deps[0].dstStageMask = kVkPipelineStageColorAttachmentOutputBit;
+        deps[0].srcAccessMask = 0u;
+        deps[0].dstAccessMask = kVkAccessColorAttachmentWriteBit;
+        // Outgoing dependency: synchronize color writes before transfer readback copy
+        deps[1].srcSubpass = 0u;
+        deps[1].dstSubpass = kVkSubpassExternal;
+        deps[1].srcStageMask = kVkPipelineStageColorAttachmentOutputBit;
+        deps[1].dstStageMask = kVkPipelineStageTransferBit;
+        deps[1].srcAccessMask = kVkAccessColorAttachmentWriteBit;
+        deps[1].dstAccessMask = kVkAccessTransferReadBit;
 
         VkRenderPassCreateInfo rp_ci{};
         rp_ci.sType = kVkStypeRenderPassCreateInfo;
@@ -3758,8 +3766,8 @@ struct VulkanBackend::Impl {
         rp_ci.pAttachments = attachments.data();
         rp_ci.subpassCount = 1;
         rp_ci.pSubpasses = &subpass;
-        rp_ci.dependencyCount = 1;
-        rp_ci.pDependencies = &dep;
+        rp_ci.dependencyCount = 2;
+        rp_ci.pDependencies = deps;
         if (vkCreateRenderPass(device, &rp_ci, nullptr, &render_pass) != kVkSuccess) {
             cleanup();
             return Status::Error(StatusCode::DeviceError, "vkCreateRenderPass failed");
@@ -6057,6 +6065,7 @@ Status VulkanBackend::ExecuteMeshShaderDraw(const VulkanMeshDrawDesc& desc,
         &out_result.custom_border_samplers_used,
         &out_result.custom_border_fallback_samplers_used);
     if (!st.ok()) {
+        std::cerr << "[OpenScarlett][vulkan] ExecuteMeshShaderDraw ICD error: " << st.message << "\n";
         if (pc_exceeded && desc.allow_fallback_emulation) {
             return run_sw_mesh();
         }

@@ -8,6 +8,7 @@ out/
 .vs/
 .vscode/
 .cache/
+.sccache/
 __pycache__/
 *.pyc
 *.ppm

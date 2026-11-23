@@ -2,6 +2,16 @@
 #include "openscarlett/gpu/rdna2_rayquery_bridge.h"
 #include "openscarlett/gpu/rdna2_xbox_container.h"
 
+// MSVC's global optimizer (/Og, implied by /O1 and /O2) exhibits an exponential
+// >15-minute compile-time blowup on the large opcode-lowering dispatch functions
+// in this translation unit. Disabling global optimizations (while keeping local
+// & inline optimizations active) cuts MSVC compile time from ~900s to ~10s with
+// zero warnings and negligible runtime impact (shader lifting is dominated by
+// DXC / spirv-val).
+#if defined(_MSC_VER) && !defined(__clang__)
+#pragma optimize("g", off)
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <cstdio>

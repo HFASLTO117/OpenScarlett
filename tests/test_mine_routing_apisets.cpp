@@ -13,8 +13,12 @@ namespace fs = std::filesystem;
 namespace {
 
 fs::path ResolveScratchDir() {
-    fs::path root = fs::path(OPENSCARLETT_BINARY_DIR) / "test_scratch_mine_routing";
     std::error_code ec;
+    fs::path base = fs::temp_directory_path(ec);
+    if (ec || base.empty()) {
+        base = fs::current_path(ec);
+    }
+    fs::path root = base / "openscarlett_test_mine_routing";
     fs::create_directories(root, ec);
     return root.make_preferred();
 }
