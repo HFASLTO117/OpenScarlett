@@ -1960,6 +1960,7 @@ void ExecMimgCpu(const MemImgDecodedInst& di, MemImgExecState& state) {
             const bool has_bias = (mode == 5u || mode == 6u);
             const bool has_lod = (mode == 4u);
             const bool has_grad = (mode == 2u || mode == 3u);
+            const bool has_cl = (mode == 1u || mode == 3u || mode == 6u);
 
             uint32_t aidx = vaddr;
             int32_t off_u = 0, off_v = 0;
@@ -1998,6 +1999,9 @@ void ExecMimgCpu(const MemImgDecodedInst& di, MemImgExecState& state) {
             float lod = state.sampler.lod_bias + bias;
             if (has_lod) {
                 lod = BitsToFloat(v[(aidx + coord_cnt) & 63u]);
+            } else if (has_cl) {
+                const float min_lod = BitsToFloat(v[(aidx + coord_cnt) & 63u]);
+                lod = std::max(lod, min_lod);
             } else if (mode == 7u) {
                 lod = 0.0f;  // _lz
             }
@@ -2241,7 +2245,7 @@ void ExecDsCpu(const MemImgDecodedInst& di, MemImgExecState& state) {
                         case 0x09: cur = old & d0; break;
                         case 0x0A: cur = old | d0; break;
                         case 0x0B: cur = old ^ d0; break;
-                        case 0x0C: cur = (old & ~d0) | d1; break;
+                        case 0x0C: cur = (old & ~d0) | (d1 & d0); break;
                         case 0x0D: cur = d0; break;  // ds_wrxchg_rtn_b32
                         case 0x10: if (old == d0) cur = d1; break;
                         case 0x11: if (BitsToFloat(old) == BitsToFloat(d0)) cur = d1; break;
@@ -2299,7 +2303,7 @@ void ExecDsCpu(const MemImgDecodedInst& di, MemImgExecState& state) {
                             case 0x09: cur = old & d0; break;
                             case 0x0A: cur = old | d0; break;
                             case 0x0B: cur = old ^ d0; break;
-                            case 0x0C: cur = (old & ~d0) | d1; break;
+                            case 0x0C: cur = (old & ~d0) | (d1 & d0); break;
                             case 0x0D: cur = d0; break;
                             case 0x10: if (old == d0) cur = d1; break;
                             case 0x11: if (BitsToDouble(old) == BitsToDouble(d0)) cur = d1; break;
@@ -3041,6 +3045,12 @@ Status EmitMemImgHlsl(
 
     if (u.uses_bvh) {
         os << "uint4 _os_bvh_intersect(uint node_ptr, float tmax, float3 orig, float3 dir) {\n"
+              "    uint _bvh_raw = 0u;\n"
+              "    _uav0.GetDimensions(_bvh_raw);\n"
+              "    uint _bvh_bytes = (_bvh_raw > 0u) ? _bvh_raw : 65536u;\n"
+              "    if (_bvh_bytes < 48u || node_ptr > ((_bvh_bytes - 48u) / 48u)) {\n"
+              "        return uint4(asuint(tmax), 0u, 0u, 0u);\n"
+              "    }\n"
               "    uint base = node_ptr * 48u;\n"
               "    float3 p0 = float3(asfloat(_uav0.Load(base+0u)), asfloat(_uav0.Load(base+4u)), asfloat(_uav0.Load(base+8u)));\n"
               "    float3 p1 = float3(asfloat(_uav0.Load(base+12u)), asfloat(_uav0.Load(base+16u)), asfloat(_uav0.Load(base+20u)));\n"
@@ -3424,8 +3434,10 @@ Status EmitMemImgHlsl(
                 const bool has_bias = (mode == 5u || mode == 6u);
                 const bool has_lod = (mode == 4u);
                 const bool has_grad = (mode == 2u || mode == 3u);
+                const bool has_cl = (mode == 1u || mode == 3u || mode == 6u);
                 uint32_t ai = va;
                 if (has_off) ++ai;
+                const uint32_t bias_r = ai;
                 if (has_bias) ++ai;
                 const uint32_t dref_r = ai;
                 if (is_cmp) ++ai;
@@ -3447,6 +3459,13 @@ Status EmitMemImgHlsl(
                     ccnt = 2u;
                 }
                 const std::string lod_expr = has_lod ? ("asfloat(v[" + std::to_string((ai + ccnt) & 63u) + "])") : "0.0";
+                const std::string min_lod_expr = "asfloat(v[" + std::to_string((ai + ccnt) & 63u) + "])";
+                const std::string bias_expr = "asfloat(v[" + std::to_string(bias_r & 63u) + "])";
+                const char* off_arg = (dim == kMimgDim1D || dim == kMimgDim1DArray) ? ", int(0)"
+                                    : (dim == kMimgDim3D ? ", int3(0, 0, 0)"
+                                    : (dim == kMimgDimCube ? "" : ", int2(0, 0)"));
+                const char* zero_grad = (dim == kMimgDim1D || dim == kMimgDim1DArray) ? "0.0"
+                                      : ((dim == kMimgDim3D || dim == kMimgDimCube) ? "float3(0.0, 0.0, 0.0)" : "float2(0.0, 0.0)");
 
                 if (e->is_gather && (dim == kMimgDim2D || dim == kMimgDimCube || dim == kMimgDim2DArray)) {
                     if (is_cmp) {
@@ -3463,9 +3482,29 @@ Status EmitMemImgHlsl(
                        << "] = asuint(_g.w); }\n";
                 } else {
                     if (is_cmp) {
-                        os << "    { float _c = " << tname << ".SampleCmpLevelZero(_samp_cmp, " << coord_expr
-                           << ", asfloat(v[" << (dref_r & 63u) << "]));\n"
-                           << "      float4 _tx = float4(_c, _c, _c, _c);\n";
+                        if (has_cl && container.stage == ShaderStage::Pixel &&
+                            dim != kMimgDim3D && dim != kMimgDim1DArray) {
+                            os << "    { float _c = (asfloat(v[" << (dref_r & 63u) << "]) <= " << tname << ".Sample(_samp0, " << coord_expr
+                               << off_arg << ", " << min_lod_expr << ").x) ? 1.0f : 0.0f;\n"
+                               << "      float4 _tx = float4(_c, _c, _c, _c);\n";
+                        } else {
+                            os << "    { float _c = " << tname << ".SampleCmpLevelZero(_samp_cmp, " << coord_expr
+                               << ", asfloat(v[" << (dref_r & 63u) << "]));\n"
+                               << "      float4 _tx = float4(_c, _c, _c, _c);\n";
+                        }
+                    } else if (has_cl) {
+                        if (container.stage == ShaderStage::Pixel && !has_grad) {
+                            if (has_bias) {
+                                os << "    { float4 _tx = " << tname << ".SampleBias(_samp0, " << coord_expr
+                                   << ", " << bias_expr << off_arg << ", " << min_lod_expr << ");\n";
+                            } else {
+                                os << "    { float4 _tx = " << tname << ".Sample(_samp0, " << coord_expr
+                                   << off_arg << ", " << min_lod_expr << ");\n";
+                            }
+                        } else {
+                            os << "    { float4 _tx = " << tname << ".SampleGrad(_samp0, " << coord_expr
+                               << ", " << zero_grad << ", " << zero_grad << off_arg << ", " << min_lod_expr << ");\n";
+                        }
                     } else {
                         os << "    { float4 _tx = " << tname << ".SampleLevel(_samp0, " << coord_expr << ", " << lod_expr << ");\n";
                     }
@@ -3489,7 +3528,8 @@ Status EmitMemImgHlsl(
             const std::string base_a = "(v[" + std::to_string(vaddr) + "] + " + std::to_string(off16) + "u)";
 
             if (op == 0x14u) {
-                // ds_nop
+                // ds_nop barrier alignment (Leonida #4596/#4620): preserve pending LDS visibility
+                os << "    GroupMemoryBarrier();\n";
             } else if (op >= 0x18u && op <= 0x1Du) {
                 os << "    GroupMemoryBarrierWithGroupSync();\n";
             } else if (op == 0x35u) {
@@ -3598,7 +3638,33 @@ Status EmitMemImgHlsl(
                    << "      v[" << ((vdst + 2u) & 63u) << "] = _lds[(_a1 >> 2u) & 4095u];\n"
                    << "      v[" << ((vdst + 3u) & 63u) << "] = _lds[((_a1 + 4u) >> 2u) & 4095u]; }\n";
             } else if (e->is_atomic) {
-                if (op == 0x40u || op == 0x60u) {
+                if (op == 0x2Eu || op == 0x2Fu) {
+                    // ds_wrxchg2_rtn_b32 / ds_wrxchg2st64_rtn_b32 (dual-offset atomic exchange)
+                    const uint32_t sc = (op == 0x2Fu) ? 256u : 4u;
+                    os << "    { uint _i0 = ((v[" << static_cast<uint32_t>(vaddr) << "] + "
+                       << (static_cast<uint32_t>(inst.ds_offset0) * sc) << "u) >> 2u) & 4095u;\n"
+                       << "      uint _i1 = ((v[" << static_cast<uint32_t>(vaddr) << "] + "
+                       << (static_cast<uint32_t>(inst.ds_offset1) * sc) << "u) >> 2u) & 4095u;\n"
+                       << "      uint _o0 = 0u; uint _o1 = 0u;\n"
+                       << "      InterlockedExchange(_lds[_i0], v[" << static_cast<uint32_t>(d0) << "], _o0);\n"
+                       << "      InterlockedExchange(_lds[_i1], v[" << static_cast<uint32_t>(d1) << "], _o1);\n"
+                       << "      v[" << static_cast<uint32_t>(vdst) << "] = _o0;\n"
+                       << "      v[" << ((vdst + 1u) & 63u) << "] = _o1; }\n";
+                } else if (op == 0x0Cu || op == 0x2Cu) {
+                    // ds_mskor_b32 / ds_mskor_rtn_b32: atomic (old & ~mask) | (data & mask)
+                    os << "    { uint _idx = ((" << base_a << ") >> 2u) & 4095u;\n"
+                       << "      uint _msk = v[" << static_cast<uint32_t>(d0) << "];\n"
+                       << "      uint _dat = v[" << static_cast<uint32_t>(d1) << "] & _msk;\n"
+                       << "      uint _cur = _lds[_idx]; uint _prev = 0u;\n"
+                       << "      [allow_uav_condition] for (uint _it = 0u; _it < 64u; ++_it) {\n"
+                       << "        uint _nxt = (_cur & ~_msk) | _dat;\n"
+                       << "        InterlockedCompareExchange(_lds[_idx], _cur, _nxt, _prev);\n"
+                       << "        if (_prev == _cur) break;\n"
+                       << "        _cur = _prev;\n"
+                       << "      }\n";
+                    if (e->has_rtn) os << "      v[" << static_cast<uint32_t>(vdst) << "] = _prev;\n";
+                    os << "    }\n";
+                } else if (op == 0x40u || op == 0x60u) {
                     EmitHlslAtomicOp(os, "_lds", base_a, 0x52u, d0, vdst, e->has_rtn, true);
                 } else {
                     const uint16_t base_op = (op == 0x55u) ? 0x15u
@@ -3653,6 +3719,7 @@ Status EmitMemImgHlsl(
                         case 0x20: os << "    { uint _sa = " << aexpr << "; uint _b = (_scratch[(_sa >> 2u) & 63u] >> ((_sa & 3u) * 8u)) & 0xFFu; v[" << static_cast<uint32_t>(vdst) << "] = (v[" << static_cast<uint32_t>(vdst) << "] & 0xFFFF0000u) | _b; }\n"; break;
                         case 0x21: os << "    { uint _sa = " << aexpr << "; uint _b = (_scratch[(_sa >> 2u) & 63u] >> ((_sa & 3u) * 8u)) & 0xFFu; v[" << static_cast<uint32_t>(vdst) << "] = (v[" << static_cast<uint32_t>(vdst) << "] & 0xFFFFu) | (_b << 16u); }\n"; break;
                         case 0x22: os << "    { uint _sa = " << aexpr << "; uint _b = (_scratch[(_sa >> 2u) & 63u] >> ((_sa & 3u) * 8u)) & 0xFFu; uint _s = asuint(((int)(_b << 24u)) >> 24) & 0xFFFFu; v[" << static_cast<uint32_t>(vdst) << "] = (v[" << static_cast<uint32_t>(vdst) << "] & 0xFFFF0000u) | _s; }\n"; break;
+                        case 0x23: os << "    { uint _sa = " << aexpr << "; uint _b = (_scratch[(_sa >> 2u) & 63u] >> ((_sa & 3u) * 8u)) & 0xFFu; uint _s = asuint(((int)(_b << 24u)) >> 24) & 0xFFFFu; v[" << static_cast<uint32_t>(vdst) << "] = (v[" << static_cast<uint32_t>(vdst) << "] & 0xFFFFu) | (_s << 16u); }\n"; break;
                         case 0x24: os << "    { uint _sa = " << aexpr << "; uint _h = (_scratch[(_sa >> 2u) & 63u] >> ((_sa & 2u) * 8u)) & 0xFFFFu; v[" << static_cast<uint32_t>(vdst) << "] = (v[" << static_cast<uint32_t>(vdst) << "] & 0xFFFF0000u) | _h; }\n"; break;
                         case 0x25: os << "    { uint _sa = " << aexpr << "; uint _h = (_scratch[(_sa >> 2u) & 63u] >> ((_sa & 2u) * 8u)) & 0xFFFFu; v[" << static_cast<uint32_t>(vdst) << "] = (v[" << static_cast<uint32_t>(vdst) << "] & 0xFFFFu) | (_h << 16u); }\n"; break;
                         default: {
@@ -3712,19 +3779,25 @@ Status EmitMemImgHlsl(
             }
         } else if (inst.encoding == Rdna2Encoding::EXP) {
             const uint8_t tgt = inst.exp_target;
+            const uint8_t en = inst.exp_en;
             const uint8_t s0 = static_cast<uint8_t>(inst.src[0].reg_index & 63u);
             const uint8_t s1 = static_cast<uint8_t>(inst.src[1].reg_index & 63u);
             const uint8_t s2 = static_cast<uint8_t>(inst.src[2].reg_index & 63u);
             const uint8_t s3 = static_cast<uint8_t>(inst.src[3].reg_index & 63u);
-            std::string vec_expr;
+            const char* def_w = (tgt == 12u) ? "1.0" : "0.0";
+            std::string ch[4];
             if (inst.exp_compr) {
-                vec_expr = "float4(f16tof32(v[" + std::to_string(s0) + "] & 0xFFFFu), f16tof32(v[" +
-                           std::to_string(s0) + "] >> 16u), f16tof32(v[" + std::to_string(s1) +
-                           "] & 0xFFFFu), f16tof32(v[" + std::to_string(s1) + "] >> 16u))";
+                ch[0] = (en & 1u) ? ("f16tof32(v[" + std::to_string(s0) + "] & 0xFFFFu)") : "0.0";
+                ch[1] = (en & 2u) ? ("f16tof32(v[" + std::to_string(s0) + "] >> 16u)") : "0.0";
+                ch[2] = (en & 4u) ? ("f16tof32(v[" + std::to_string(s1) + "] & 0xFFFFu)") : "0.0";
+                ch[3] = (en & 8u) ? ("f16tof32(v[" + std::to_string(s1) + "] >> 16u)") : def_w;
             } else {
-                vec_expr = "float4(asfloat(v[" + std::to_string(s0) + "]), asfloat(v[" + std::to_string(s1) +
-                           "]), asfloat(v[" + std::to_string(s2) + "]), asfloat(v[" + std::to_string(s3) + "]))";
+                ch[0] = (en & 1u) ? ("asfloat(v[" + std::to_string(s0) + "])") : "0.0";
+                ch[1] = (en & 2u) ? ("asfloat(v[" + std::to_string(s1) + "])") : "0.0";
+                ch[2] = (en & 4u) ? ("asfloat(v[" + std::to_string(s2) + "])") : "0.0";
+                ch[3] = (en & 8u) ? ("asfloat(v[" + std::to_string(s3) + "])") : def_w;
             }
+            const std::string vec_expr = "float4(" + ch[0] + ", " + ch[1] + ", " + ch[2] + ", " + ch[3] + ")";
             if (container.stage == ShaderStage::Vertex) {
                 if (tgt == 12u) os << "    _out.pos = " << vec_expr << ";\n";
                 else if (tgt == 13u && u.uses_exp_pos1 && (inst.exp_en & 4u) != 0u)
@@ -3790,7 +3863,9 @@ enum SpvOp : uint16_t {
     OpCompositeConstruct = 80,
     OpCompositeExtract = 81,
     OpSampledImage = 86,
+    OpImageSampleImplicitLod = 87,
     OpImageSampleExplicitLod = 88,
+    OpImageSampleDrefImplicitLod = 89,
     OpImageSampleDrefExplicitLod = 90,
     OpImageFetch = 95,
     OpImageGather = 96,
@@ -3846,10 +3921,12 @@ enum SpvOp : uint16_t {
     OpAtomicXor = 242,
     OpPhi = 245,
     OpLoopMerge = 246,
+    OpSelectionMerge = 247,
     OpLabel = 248,
     OpBranch = 249,
     OpBranchConditional = 250,
     OpReturn = 253,
+    OpArrayLength = 68,
 };
 
 class SpirvMemImgEmitter {
@@ -3866,17 +3943,26 @@ public:
 
         // Scan for extra capabilities
         bool need_img_query = false;
+        bool need_min_lod = false;
         bool need_sampled_1d = usage_.uses_tex_dim[kMimgDim1D] || usage_.uses_tex_dim[kMimgDim1DArray];
         for (const auto& di : insts_) {
-            if (di.entry && di.base.encoding == Rdna2Encoding::MIMG &&
-                (di.entry->raw_opcode == 0x0Eu || di.entry->raw_opcode == 0x60u)) {
-                need_img_query = true;
+            if (di.entry && di.base.encoding == Rdna2Encoding::MIMG) {
+                if (di.entry->raw_opcode == 0x0Eu || di.entry->raw_opcode == 0x60u) {
+                    need_img_query = true;
+                }
+                if (di.entry->is_sample && !di.entry->is_gather) {
+                    const uint8_t mode = static_cast<uint8_t>(di.entry->raw_opcode & 0x07u);
+                    if (mode == 1u || mode == 3u || mode == 6u) {
+                        need_min_lod = true;
+                    }
+                }
             }
         }
 
         EmitInst(sec_caps_, OpCapability, {1u});  // Shader
         if (need_img_query) EmitInst(sec_caps_, OpCapability, {50u});  // ImageQuery
         if (need_sampled_1d) EmitInst(sec_caps_, OpCapability, {43u});  // Sampled1D
+        if (need_min_lod) EmitInst(sec_caps_, OpCapability, {42u});  // MinLod
 
         glsl_ext_ = AllocId();
         {
@@ -4659,6 +4745,18 @@ private:
                         break;
                     case 0x20: StoreVgpr(vd, EmitBinary(OpBitwiseOr, t_u32_, EmitBinary(OpBitwiseAnd, t_u32_, LoadVgpr(vd), ConstU32(0xFFFF0000u)), LoadSsboByte(ssbo, baddr))); break;
                     case 0x21: StoreVgpr(vd, EmitBinary(OpBitwiseOr, t_u32_, EmitBinary(OpBitwiseAnd, t_u32_, LoadVgpr(vd), ConstU32(0xFFFFu)), EmitBinary(OpShiftLeftLogical, t_u32_, LoadSsboByte(ssbo, baddr), ConstU32(16u)))); break;
+                    case 0x22: {
+                        const uint32_t sb = BitcastU32(EmitBinary(OpShiftRightArithmetic, t_i32_, BitcastI32(EmitBinary(OpShiftLeftLogical, t_u32_, LoadSsboByte(ssbo, baddr), ConstU32(24u))), ConstI32(24)));
+                        const uint32_t d16 = EmitBinary(OpBitwiseAnd, t_u32_, sb, ConstU32(0xFFFFu));
+                        StoreVgpr(vd, EmitBinary(OpBitwiseOr, t_u32_, EmitBinary(OpBitwiseAnd, t_u32_, LoadVgpr(vd), ConstU32(0xFFFF0000u)), d16));
+                        break;
+                    }
+                    case 0x23: {
+                        const uint32_t sb = BitcastU32(EmitBinary(OpShiftRightArithmetic, t_i32_, BitcastI32(EmitBinary(OpShiftLeftLogical, t_u32_, LoadSsboByte(ssbo, baddr), ConstU32(24u))), ConstI32(24)));
+                        const uint32_t d16 = EmitBinary(OpBitwiseAnd, t_u32_, sb, ConstU32(0xFFFFu));
+                        StoreVgpr(vd, EmitBinary(OpBitwiseOr, t_u32_, EmitBinary(OpBitwiseAnd, t_u32_, LoadVgpr(vd), ConstU32(0xFFFFu)), EmitBinary(OpShiftLeftLogical, t_u32_, d16, ConstU32(16u))));
+                        break;
+                    }
                     case 0x24: StoreVgpr(vd, EmitBinary(OpBitwiseOr, t_u32_, EmitBinary(OpBitwiseAnd, t_u32_, LoadVgpr(vd), ConstU32(0xFFFF0000u)), LoadSsboU16(ssbo, baddr))); break;
                     case 0x25: StoreVgpr(vd, EmitBinary(OpBitwiseOr, t_u32_, EmitBinary(OpBitwiseAnd, t_u32_, LoadVgpr(vd), ConstU32(0xFFFFu)), EmitBinary(OpShiftLeftLogical, t_u32_, LoadSsboU16(ssbo, baddr), ConstU32(16u)))); break;
                     default: break;
@@ -4671,9 +4769,29 @@ private:
             const uint8_t va = static_cast<uint8_t>(((e->is_store || e->is_atomic) ? inst.src[1].reg_index : inst.src[0].reg_index) & 63u);
 
             if (e->is_bvh) {
-                // Branchless Möller-Trumbore triangle intersection reading 12 dwords from uav0[node_ptr * 12]
+                // Word-bounded BVH reads against OpArrayLength (Leonida #3803): truncated/OOB offsets return empty miss
                 const uint32_t sh = (op == 0xE7u) ? 1u : 0u;
-                const uint32_t base_dw = EmitBinary(OpIMul, t_u32_, LoadVgpr(va), ConstU32(12u));
+                const uint32_t node_ptr = LoadVgpr(va);
+                const uint32_t tmax_u = LoadVgpr(va + 1u + sh);
+                const uint32_t tmax = BitcastF32(tmax_u);
+                // Seed safe miss output before bounds-checked traversal
+                StoreVgpr(vd + 0u, tmax_u);
+                StoreVgpr(vd + 1u, c_u0_);
+                StoreVgpr(vd + 2u, c_u0_);
+                StoreVgpr(vd + 3u, c_u0_);
+                const uint32_t bvh_words = AllocId();
+                EmitInst(sec_fn_, OpArrayLength, {t_u32_, bvh_words, var_uav0_, 0u});
+                const uint32_t has_node = EmitBinary(OpUGreaterThanEqual, t_bool_, bvh_words, ConstU32(12u));
+                const uint32_t base_dw = EmitBinary(OpIMul, t_u32_, node_ptr, ConstU32(12u));
+                const uint32_t end_dw = EmitBinary(OpIAdd, t_u32_, base_dw, ConstU32(12u));
+                const uint32_t no_wrap = EmitBinary(OpUGreaterThanEqual, t_bool_, end_dw, base_dw);
+                const uint32_t ptr_ok = EmitBinary(OpULessThanEqual, t_bool_, end_dw, bvh_words);
+                const uint32_t in_bvh = EmitBinary(OpLogicalAnd, t_bool_, has_node, EmitBinary(OpLogicalAnd, t_bool_, no_wrap, ptr_ok));
+                const uint32_t lbl_in = AllocId();
+                const uint32_t lbl_out = AllocId();
+                EmitInst(sec_fn_, OpSelectionMerge, {lbl_out, 0u});
+                EmitInst(sec_fn_, OpBranchConditional, {in_bvh, lbl_in, lbl_out});
+                EmitInst(sec_fn_, OpLabel, {lbl_in});
                 auto load_bvh_f = [&](uint32_t k) -> uint32_t {
                     const uint32_t w = AllocId();
                     EmitInst(sec_fn_, OpLoad, {t_u32_, w, SsboPtrAtDword(var_uav0_, EmitBinary(OpIAdd, t_u32_, base_dw, ConstU32(k)))});
@@ -4689,7 +4807,6 @@ private:
                 const uint32_t p2 = make_v3(load_bvh_f(6u), load_bvh_f(7u), load_bvh_f(8u));
                 const uint32_t prim = AllocId();
                 EmitInst(sec_fn_, OpLoad, {t_u32_, prim, SsboPtrAtDword(var_uav0_, EmitBinary(OpIAdd, t_u32_, base_dw, ConstU32(9u)))});
-                const uint32_t tmax = BitcastF32(LoadVgpr(va + 1u + sh));
                 const uint32_t orig = make_v3(BitcastF32(LoadVgpr(va + 2u + sh)), BitcastF32(LoadVgpr(va + 3u + sh)), BitcastF32(LoadVgpr(va + 4u + sh)));
                 const uint32_t dir = make_v3(BitcastF32(LoadVgpr(va + 5u + sh)), BitcastF32(LoadVgpr(va + 6u + sh)), BitcastF32(LoadVgpr(va + 7u + sh)));
                 const uint32_t e1 = EmitBinary(OpFSub, t_vec3_, p1, p0);
@@ -4722,6 +4839,8 @@ private:
                 StoreVgpr(vd + 1u, BitcastU32(out_u));
                 StoreVgpr(vd + 2u, BitcastU32(out_v));
                 StoreVgpr(vd + 3u, out_id);
+                EmitInst(sec_fn_, OpBranch, {lbl_out});
+                EmitInst(sec_fn_, OpLabel, {lbl_out});
             } else if (op == 0x0Eu) {
                 const uint32_t img = AllocId(); EmitInst(sec_fn_, OpLoad, {t_tex_[dim], img, var_tex_[dim]});
                 const uint32_t lod_i = BitcastI32(LoadVgpr(va));
@@ -4811,8 +4930,10 @@ private:
                 const bool has_bias = (mode == 5u || mode == 6u);
                 const bool has_lod = (mode == 4u);
                 const bool has_grad = (mode == 2u || mode == 3u);
+                const bool has_cl = (mode == 1u || mode == 3u || mode == 6u);
                 uint32_t ai = va;
                 if (has_off) ++ai;
+                const uint32_t bias_r = ai;
                 if (has_bias) ++ai;
                 const uint32_t dref_r = ai;
                 if (is_cmp) ++ai;
@@ -4834,6 +4955,18 @@ private:
                     ccnt = 2u;
                 }
                 const uint32_t lod_f = has_lod ? BitcastF32(LoadVgpr(ai + ccnt)) : c_f0_;
+                const uint32_t min_lod_f = has_cl ? BitcastF32(LoadVgpr(ai + ccnt)) : c_f0_;
+                auto make_zero_grad = [&]() -> uint32_t {
+                    if (dim == kMimgDim1D || dim == kMimgDim1DArray) return c_f0_;
+                    if (dim == kMimgDim3D || dim == kMimgDimCube) {
+                        const uint32_t z3 = AllocId();
+                        EmitInst(sec_fn_, OpCompositeConstruct, {t_vec3_, z3, c_f0_, c_f0_, c_f0_});
+                        return z3;
+                    }
+                    const uint32_t z2 = AllocId();
+                    EmitInst(sec_fn_, OpCompositeConstruct, {t_vec2_, z2, c_f0_, c_f0_});
+                    return z2;
+                };
 
                 if (e->is_gather && (dim == kMimgDim2D || dim == kMimgDimCube || dim == kMimgDim2DArray)) {
                     const uint32_t g = AllocId();
@@ -4850,14 +4983,36 @@ private:
                     }
                 } else if (is_cmp) {
                     const uint32_t cf = AllocId();
-                    EmitInst(sec_fn_, OpImageSampleDrefExplicitLod, {t_f32_, cf, si, coord, BitcastF32(LoadVgpr(dref_r)), 2u, lod_f});
+                    if (has_cl && is_ps && !has_grad) {
+                        if (has_bias) {
+                            EmitInst(sec_fn_, OpImageSampleDrefImplicitLod, {t_f32_, cf, si, coord, BitcastF32(LoadVgpr(dref_r)), 0x81u /*Bias|MinLod*/, BitcastF32(LoadVgpr(bias_r)), min_lod_f});
+                        } else {
+                            EmitInst(sec_fn_, OpImageSampleDrefImplicitLod, {t_f32_, cf, si, coord, BitcastF32(LoadVgpr(dref_r)), 0x80u /*MinLod*/, min_lod_f});
+                        }
+                    } else if (has_cl) {
+                        const uint32_t zg = make_zero_grad();
+                        EmitInst(sec_fn_, OpImageSampleDrefExplicitLod, {t_f32_, cf, si, coord, BitcastF32(LoadVgpr(dref_r)), 0x84u /*Grad|MinLod*/, zg, zg, min_lod_f});
+                    } else {
+                        EmitInst(sec_fn_, OpImageSampleDrefExplicitLod, {t_f32_, cf, si, coord, BitcastF32(LoadVgpr(dref_r)), 2u, lod_f});
+                    }
                     uint32_t dst_off = 0;
                     for (uint32_t c = 0; c < 4u; ++c) {
                         if ((dmask & (1u << c)) != 0u) StoreVgpr(vd + dst_off++, BitcastU32(cf));
                     }
                 } else {
                     const uint32_t tx = AllocId();
-                    EmitInst(sec_fn_, OpImageSampleExplicitLod, {t_vec4_, tx, si, coord, 2u, lod_f});
+                    if (has_cl && is_ps && !has_grad) {
+                        if (has_bias) {
+                            EmitInst(sec_fn_, OpImageSampleImplicitLod, {t_vec4_, tx, si, coord, 0x81u /*Bias|MinLod*/, BitcastF32(LoadVgpr(bias_r)), min_lod_f});
+                        } else {
+                            EmitInst(sec_fn_, OpImageSampleImplicitLod, {t_vec4_, tx, si, coord, 0x80u /*MinLod*/, min_lod_f});
+                        }
+                    } else if (has_cl) {
+                        const uint32_t zg = make_zero_grad();
+                        EmitInst(sec_fn_, OpImageSampleExplicitLod, {t_vec4_, tx, si, coord, 0x84u /*Grad|MinLod*/, zg, zg, min_lod_f});
+                    } else {
+                        EmitInst(sec_fn_, OpImageSampleExplicitLod, {t_vec4_, tx, si, coord, 2u, lod_f});
+                    }
                     uint32_t dst_off = 0;
                     for (uint32_t c = 0; c < 4u; ++c) {
                         if ((dmask & (1u << c)) != 0u) {
@@ -4888,7 +5043,8 @@ private:
             };
 
             if (op == 0x14u) {
-                // ds_nop
+                // ds_nop barrier alignment (Leonida #4596/#4620): workgroup memory visibility fence
+                EmitInst(sec_fn_, OpMemoryBarrier, {c_u2_, ConstU32(0x108u)});
             } else if (op >= 0x18u && op <= 0x1Du) {
                 EmitWorkgroupBarrier();
             } else if (op == 0x35u) {
@@ -5018,7 +5174,46 @@ private:
                     : EmitBinary(OpBitwiseOr, t_u32_, EmitBinary(OpBitwiseAnd, t_u32_, old_v, ConstU32(0xFFFF0000u)), d16);
                 StoreVgpr(vdst, merged);
             } else if (e->is_atomic) {
-                if (op == 0x40u || op == 0x60u) {
+                if (op == 0x2Eu || op == 0x2Fu) {
+                    const uint32_t sc = (op == 0x2Fu) ? 256u : 4u;
+                    const uint32_t p0 = lds_ptr(EmitBinary(OpIAdd, t_u32_, LoadVgpr(vaddr), ConstU32(static_cast<uint32_t>(inst.ds_offset0) * sc)));
+                    const uint32_t p1 = lds_ptr(EmitBinary(OpIAdd, t_u32_, LoadVgpr(vaddr), ConstU32(static_cast<uint32_t>(inst.ds_offset1) * sc)));
+                    const uint32_t o0 = AllocId();
+                    EmitInst(sec_fn_, OpAtomicExchange, {t_u32_, o0, p0, c_u2_, c_u0_, LoadVgpr(d0)});
+                    const uint32_t o1 = AllocId();
+                    EmitInst(sec_fn_, OpAtomicExchange, {t_u32_, o1, p1, c_u2_, c_u0_, LoadVgpr(d1)});
+                    StoreVgpr(vdst, o0);
+                    StoreVgpr(vdst + 1u, o1);
+                } else if (op == 0x0Cu || op == 0x2Cu) {
+                    const uint32_t p = lds_ptr(base_a);
+                    const uint32_t msk = LoadVgpr(d0);
+                    const uint32_t nmsk = AllocId(); EmitInst(sec_fn_, OpNot, {t_u32_, nmsk, msk});
+                    const uint32_t dat = EmitBinary(OpBitwiseAnd, t_u32_, LoadVgpr(d1), msk);
+                    const uint32_t init_cur = AllocId(); EmitInst(sec_fn_, OpLoad, {t_u32_, init_cur, p});
+                    const uint32_t lbl_pre = AllocId();
+                    const uint32_t lbl_hdr = AllocId();
+                    const uint32_t lbl_body = AllocId();
+                    const uint32_t lbl_cont = AllocId();
+                    const uint32_t lbl_merge = AllocId();
+                    EmitInst(sec_fn_, OpBranch, {lbl_pre});
+                    EmitInst(sec_fn_, OpLabel, {lbl_pre});
+                    EmitInst(sec_fn_, OpBranch, {lbl_hdr});
+                    EmitInst(sec_fn_, OpLabel, {lbl_hdr});
+                    const uint32_t cur_phi = AllocId();
+                    const uint32_t prev_val = AllocId();
+                    EmitInst(sec_fn_, OpPhi, {t_u32_, cur_phi, init_cur, lbl_pre, prev_val, lbl_cont});
+                    EmitInst(sec_fn_, OpLoopMerge, {lbl_merge, lbl_cont, 0u});
+                    EmitInst(sec_fn_, OpBranch, {lbl_body});
+                    EmitInst(sec_fn_, OpLabel, {lbl_body});
+                    const uint32_t nxt = EmitBinary(OpBitwiseOr, t_u32_, EmitBinary(OpBitwiseAnd, t_u32_, cur_phi, nmsk), dat);
+                    EmitInst(sec_fn_, OpAtomicCompareExchange, {t_u32_, prev_val, p, c_u2_, c_u0_, c_u0_, nxt, cur_phi});
+                    const uint32_t eq = EmitBinary(OpIEqual, t_bool_, prev_val, cur_phi);
+                    EmitInst(sec_fn_, OpBranchConditional, {eq, lbl_merge, lbl_cont});
+                    EmitInst(sec_fn_, OpLabel, {lbl_cont});
+                    EmitInst(sec_fn_, OpBranch, {lbl_hdr});
+                    EmitInst(sec_fn_, OpLabel, {lbl_merge});
+                    if (e->has_rtn) StoreVgpr(vdst, prev_val);
+                } else if (op == 0x40u || op == 0x60u) {
                     const uint32_t p_lo = lds_ptr(base_a);
                     const uint32_t p_hi = lds_ptr(EmitBinary(OpIAdd, t_u32_, base_a, c_u4_));
                     const auto prev64 = EmitSpvAtomicAdd64(p_lo, p_hi, c_u2_, LoadVgpr(d0), LoadVgpr(d0 + 1u));
@@ -5075,18 +5270,19 @@ private:
                     return sp;
                 };
                 if (e->is_load) {
-                    if (op == 0x08u || op == 0x09u || op == 0x20u || op == 0x21u || op == 0x22u) {
+                    if (op == 0x08u || op == 0x09u || op == 0x20u || op == 0x21u || op == 0x22u || op == 0x23u) {
                         const uint32_t w = AllocId(); EmitInst(sec_fn_, OpLoad, {t_u32_, w, scratch_ptr(dw0)});
                         const uint32_t sh = EmitBinary(OpShiftLeftLogical, t_u32_, EmitBinary(OpBitwiseAnd, t_u32_, baddr, c_u3_), c_u3_);
                         uint32_t b = EmitBinary(OpBitwiseAnd, t_u32_, EmitBinary(OpShiftRightLogical, t_u32_, w, sh), ConstU32(0xFFu));
-                        if (op == 0x09u || op == 0x22u) {
+                        if (op == 0x09u || op == 0x22u || op == 0x23u) {
                             b = BitcastU32(EmitBinary(OpShiftRightArithmetic, t_i32_, BitcastI32(EmitBinary(OpShiftLeftLogical, t_u32_, b, ConstU32(24u))), ConstI32(24)));
                         }
                         if (op == 0x20u || op == 0x22u) {
                             const uint32_t lo = EmitBinary(OpBitwiseAnd, t_u32_, b, ConstU32(0xFFFFu));
                             StoreVgpr(vdst, EmitBinary(OpBitwiseOr, t_u32_, EmitBinary(OpBitwiseAnd, t_u32_, LoadVgpr(vdst), ConstU32(0xFFFF0000u)), lo));
-                        } else if (op == 0x21u) {
-                            StoreVgpr(vdst, EmitBinary(OpBitwiseOr, t_u32_, EmitBinary(OpBitwiseAnd, t_u32_, LoadVgpr(vdst), ConstU32(0xFFFFu)), EmitBinary(OpShiftLeftLogical, t_u32_, b, ConstU32(16u))));
+                        } else if (op == 0x21u || op == 0x23u) {
+                            const uint32_t hi = EmitBinary(OpBitwiseAnd, t_u32_, b, ConstU32(0xFFFFu));
+                            StoreVgpr(vdst, EmitBinary(OpBitwiseOr, t_u32_, EmitBinary(OpBitwiseAnd, t_u32_, LoadVgpr(vdst), ConstU32(0xFFFFu)), EmitBinary(OpShiftLeftLogical, t_u32_, hi, ConstU32(16u))));
                         } else {
                             StoreVgpr(vdst, b);
                         }
@@ -5170,21 +5366,28 @@ private:
             }
         } else if (inst.encoding == Rdna2Encoding::EXP) {
             const uint8_t tgt = inst.exp_target;
-            uint32_t vec4_val = 0;
+            const uint8_t en = inst.exp_en;
+            const uint32_t def_w = (tgt == 12u) ? c_f1_ : c_f0_;
+            uint32_t f0 = c_f0_, f1 = c_f0_, f2 = c_f0_, f3 = def_w;
             if (inst.exp_compr) {
-                const uint32_t u01 = AllocId(); EmitInst(sec_fn_, OpExtInst, {t_vec2_, u01, glsl_ext_, 62u, LoadVgpr(inst.src[0].reg_index)});
-                const uint32_t u23 = AllocId(); EmitInst(sec_fn_, OpExtInst, {t_vec2_, u23, glsl_ext_, 62u, LoadVgpr(inst.src[1].reg_index)});
-                const uint32_t f0 = AllocId(); EmitInst(sec_fn_, OpCompositeExtract, {t_f32_, f0, u01, 0u});
-                const uint32_t f1 = AllocId(); EmitInst(sec_fn_, OpCompositeExtract, {t_f32_, f1, u01, 1u});
-                const uint32_t f2 = AllocId(); EmitInst(sec_fn_, OpCompositeExtract, {t_f32_, f2, u23, 0u});
-                const uint32_t f3 = AllocId(); EmitInst(sec_fn_, OpCompositeExtract, {t_f32_, f3, u23, 1u});
-                vec4_val = AllocId(); EmitInst(sec_fn_, OpCompositeConstruct, {t_vec4_, vec4_val, f0, f1, f2, f3});
+                if ((en & 0x3u) != 0u) {
+                    const uint32_t u01 = AllocId(); EmitInst(sec_fn_, OpExtInst, {t_vec2_, u01, glsl_ext_, 62u, LoadVgpr(inst.src[0].reg_index)});
+                    if ((en & 1u) != 0u) { f0 = AllocId(); EmitInst(sec_fn_, OpCompositeExtract, {t_f32_, f0, u01, 0u}); }
+                    if ((en & 2u) != 0u) { f1 = AllocId(); EmitInst(sec_fn_, OpCompositeExtract, {t_f32_, f1, u01, 1u}); }
+                }
+                if ((en & 0xCu) != 0u) {
+                    const uint32_t u23 = AllocId(); EmitInst(sec_fn_, OpExtInst, {t_vec2_, u23, glsl_ext_, 62u, LoadVgpr(inst.src[1].reg_index)});
+                    if ((en & 4u) != 0u) { f2 = AllocId(); EmitInst(sec_fn_, OpCompositeExtract, {t_f32_, f2, u23, 0u}); }
+                    if ((en & 8u) != 0u) { f3 = AllocId(); EmitInst(sec_fn_, OpCompositeExtract, {t_f32_, f3, u23, 1u}); }
+                }
             } else {
-                vec4_val = AllocId();
-                EmitInst(sec_fn_, OpCompositeConstruct, {t_vec4_, vec4_val,
-                         BitcastF32(LoadVgpr(inst.src[0].reg_index)), BitcastF32(LoadVgpr(inst.src[1].reg_index)),
-                         BitcastF32(LoadVgpr(inst.src[2].reg_index)), BitcastF32(LoadVgpr(inst.src[3].reg_index))});
+                if ((en & 1u) != 0u) f0 = BitcastF32(LoadVgpr(inst.src[0].reg_index));
+                if ((en & 2u) != 0u) f1 = BitcastF32(LoadVgpr(inst.src[1].reg_index));
+                if ((en & 4u) != 0u) f2 = BitcastF32(LoadVgpr(inst.src[2].reg_index));
+                if ((en & 8u) != 0u) f3 = BitcastF32(LoadVgpr(inst.src[3].reg_index));
             }
+            const uint32_t vec4_val = AllocId();
+            EmitInst(sec_fn_, OpCompositeConstruct, {t_vec4_, vec4_val, f0, f1, f2, f3});
             if (is_vs) {
                 if (tgt == 12u && out_pos_) EmitInst(sec_fn_, OpStore, {out_pos_, vec4_val});
                 else if (tgt >= 32u && tgt < 40u && out_param_[tgt - 32u]) EmitInst(sec_fn_, OpStore, {out_param_[tgt - 32u], vec4_val});

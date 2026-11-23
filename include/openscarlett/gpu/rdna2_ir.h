@@ -29,12 +29,16 @@ enum class IrOp : uint16_t {
     StageInput,     // Vertex/Pixel input lane (e.g. PS interpolated PARAM0 channel 0..3)
     LoadRootConst,  // Read 32-bit scalar constant from b0[imm_u32]
     LoadUav,        // Load 32-bit word from uav[imm_u32] at byte offset operands[0]
+    SmemSpanCheck,  // Single hoisted span bounds-check for multi-dword s_buffer_load -> Bool
+    LoadUavSpanElem,// Load dword k of a span checked by operands[1] (imm_u32 = flags_slot | (elem_idx << 16))
     StoreUav,       // Store operands[1] to uav[imm_u32] at byte offset operands[0]
+    StoreUavSubDword,// Sub-dword (byte/short) atomic RMW store to uav (imm_u32 = slot | (is_short<<8) | (from_hi16<<9))
 
     // Texture / Image ops (MIMG)
     ImageSample,        // operands: [u_f32, v_f32, lod_or_dref_f32], imm_u32 = channel (0..3) | (is_cmp << 7) -> f32
     ImageSampleDynamic, // operands: [u_f32, v_f32, lod_or_dref_f32, desc_idx_u32], imm_u32 = ch | (is_cmp << 7) | (array_len << 8)
     ImageSampleImplicit,// operands: [u_f32, v_f32], imm_u32 = channel (0..3) -> f32 (PS helper-lane quad derivatives)
+    ImageSampleMinLod,  // operands: mode-specific + trailing min_lod_f32, imm_u32 = ch | (mode << 4) -> f32
     ImageLoad,          // operands: [x_u32, y_u32], imm_u32 = channel (0..3) -> f32
     ImageLoadMip,       // operands: [x_u32, y_u32, z_or_face_u32, mip_u32], imm_u32 = ch | (dim << 4) -> f32
     ImageStore,         // operands: [x_u32, y_u32, r_f32, g_f32, b_f32, a_f32] -> void
@@ -45,6 +49,9 @@ enum class IrOp : uint16_t {
     LdsLoad,            // operands: [byte_addr_u32] -> u32
     LdsStore,           // operands: [byte_addr_u32, val_u32] -> void
     LdsAtomicAdd,       // operands: [byte_addr_u32, val_u32] -> prev_u32
+    LdsAtomicMskOr,     // operands: [byte_addr_u32, mask_u32, data_u32] -> prev_u32 (atomic (old&~mask)|(data&mask))
+    LdsAtomicExchange,  // operands: [byte_addr_u32, data_u32] -> prev_u32
+    LdsMemoryBarrier,   // ds_nop barrier alignment (Workgroup memory fence without thread sync stall)
 
     // Thread-private scratch memory ops (FLAT flat_seg == 1)
     ScratchLoad,        // operands: [byte_addr_u32] -> u32
@@ -54,6 +61,7 @@ enum class IrOp : uint16_t {
     WaveLaneId,             // [] -> lane_id u32 (0..wave_size-1)
     WaveReadFirstLane,      // [val] -> u32
     WaveReadLaneAt,         // [val, lane_idx_u32] -> u32
+    WaveDpp8,               // [val_u32], imm_u32 = dpp8_sel24 | (fi << 24) -> u32 (quad-local 8-lane permutation)
     WaveBallotLo,           // [pred_bool] -> u32 (lanes 0..31)
     WaveBallotHi,           // [pred_bool] -> u32 (lanes 32..63)
     WaveActiveCountBits64,  // [ballot_lo_u32, ballot_hi_u32] -> u32
@@ -97,6 +105,11 @@ enum class IrOp : uint16_t {
     BitNot,
     BitReverse32,   // operands: [src_u32] -> u32 (S_BREV_B32)
     BitCount32,     // operands: [src_u32] -> u32 (strictly low 32-bit popcount for S_BCNT1_I32_B32)
+    FlbitU32,       // operands: [src_u32] -> u32 (S_FLBIT_I32_B32)
+    FlbitI32,       // operands: [src_i32] -> u32 (S_FLBIT_I32 leading sign-bit count)
+    FlbitU64,       // operands: [lo_u32, hi_u32] -> u32 (S_FLBIT_I32_B64)
+    FlbitI64,       // operands: [lo_u32, hi_u32] -> u32 (S_FLBIT_I32_I64)
+    Mad64Mul32,     // operands: [s0, s1, s2_lo, s2_hi], imm_u32 = part(0=lo,1=hi,2=carry_bool) | (is_signed<<4)
     AbsDiffI32,     // operands: [a_i32, b_i32] -> u32 (S_ABSDIFF_I32)
     Shl,
     Shr,
@@ -123,10 +136,13 @@ enum class IrOp : uint16_t {
     F2I,
     U2F,
     F2U,
+    CvtPkNormI16F16,  // operands: [src0_u32, src1_u32], imm_u32 = op_sel|(neg<<8)|(abs<<12) -> u32 packed 2x snorm16
+    CvtPkNormU16F16,  // operands: [src0_u32, src1_u32], imm_u32 = op_sel|(neg<<8)|(abs<<12) -> u32 packed 2x unorm16
     CvtPkNormI16F32,  // operands: [src0_f32, src1_f32] -> u32 packed 2x snorm16
     CvtPkNormU16F32,  // operands: [src0_f32, src1_f32] -> u32 packed 2x unorm16
     CvtNormI16F16,    // operands: [src0_u32], imm_u32 = op_sel|(neg<<8)|(abs<<12) -> u32 lo16 snorm16
     CvtNormU16F16,    // operands: [src0_u32], imm_u32 = op_sel|(neg<<8)|(abs<<12) -> u32 lo16 unorm16
+    UnpackF16,        // operands: [src0_u32], imm_u32 = 0 (lo16) | 1 (hi16) -> f32 (compressed EXP unpack)
 
     // Comparisons (produce IrType::Bool)
     CmpEq,

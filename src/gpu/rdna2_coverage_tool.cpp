@@ -27,6 +27,7 @@
 #include "openscarlett/gpu/rdna2_interpreter.h"
 #include "openscarlett/gpu/rdna2_ir.h"
 #include "openscarlett/gpu/rdna2_lifter.h"
+#include "openscarlett/gpu/rdna2_stages_ext.h"
 #include "openscarlett/gpu/rdna2_xbox_container.h"
 #include "openscarlett/gpu/vulkan_backend.h"
 
@@ -3341,9 +3342,13 @@ struct D3D12BenchContext {
         return true;
     }
 
-    bool RunGraphicsDrawQuad(const std::vector<uint8_t>& vs_dxil,
-                             const std::vector<uint8_t>& ps_dxil,
-                             std::vector<float>& out_rgba32f_4x4) {
+    bool ExecuteGraphicsDrawInternal(const D3D12_GRAPHICS_PIPELINE_STATE_DESC& base_gps,
+                                     D3D_PRIMITIVE_TOPOLOGY topology,
+                                     uint32_t vertex_count,
+                                     std::vector<float>& out_rgba32f_4x4) {
+        if (!device || warp_hung || device->GetDeviceRemovedReason() != S_OK) {
+            return false;
+        }
         constexpr uint32_t kW = 4u;
         constexpr uint32_t kH = 4u;
         constexpr uint32_t kPitch = 256u;
@@ -3362,16 +3367,13 @@ struct D3D12BenchContext {
             return false;
         }
 
-        D3D12_GRAPHICS_PIPELINE_STATE_DESC gps{};
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC gps = base_gps;
         gps.pRootSignature = root_sig.Get();
-        gps.VS = {vs_dxil.data(), vs_dxil.size()};
-        gps.PS = {ps_dxil.data(), ps_dxil.size()};
         gps.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
         gps.SampleMask = 0xFFFFFFFFu;
         gps.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
         gps.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
         gps.RasterizerState.DepthClipEnable = TRUE;
-        gps.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         gps.NumRenderTargets = 1u;
         gps.RTVFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
         gps.SampleDesc.Count = 1u;
@@ -3405,8 +3407,8 @@ struct D3D12BenchContext {
         cmd_list->RSSetScissorRects(1, &sc);
         cmd_list->OMSetRenderTargets(1, &rtv_h, FALSE, nullptr);
         cmd_list->SetGraphicsRootSignature(root_sig.Get());
-        cmd_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-        cmd_list->DrawInstanced(3u, 1u, 0u, 0u);
+        cmd_list->IASetPrimitiveTopology(topology);
+        cmd_list->DrawInstanced(vertex_count, 1u, 0u, 0u);
 
         D3D12_RESOURCE_BARRIER to_copy{};
         to_copy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -3445,6 +3447,42 @@ struct D3D12BenchContext {
         }
         rb->Unmap(0, nullptr);
         return true;
+    }
+
+    bool RunGraphicsDrawQuad(const std::vector<uint8_t>& vs_dxil,
+                             const std::vector<uint8_t>& ps_dxil,
+                             std::vector<float>& out_rgba32f_4x4) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC gps{};
+        gps.VS = {vs_dxil.data(), vs_dxil.size()};
+        gps.PS = {ps_dxil.data(), ps_dxil.size()};
+        gps.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        return ExecuteGraphicsDrawInternal(gps, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, 3u, out_rgba32f_4x4);
+    }
+
+    bool RunTessellationDrawQuad(const std::vector<uint8_t>& vs_dxil,
+                                 const std::vector<uint8_t>& hs_dxil,
+                                 const std::vector<uint8_t>& ds_dxil,
+                                 const std::vector<uint8_t>& ps_dxil,
+                                 std::vector<float>& out_rgba32f_4x4) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC gps{};
+        gps.VS = {vs_dxil.data(), vs_dxil.size()};
+        gps.HS = {hs_dxil.data(), hs_dxil.size()};
+        gps.DS = {ds_dxil.data(), ds_dxil.size()};
+        gps.PS = {ps_dxil.data(), ps_dxil.size()};
+        gps.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH;
+        return ExecuteGraphicsDrawInternal(gps, D3D_PRIMITIVE_TOPOLOGY_3_CONTROL_POINT_PATCHLIST, 3u, out_rgba32f_4x4);
+    }
+
+    bool RunGeometryDrawQuad(const std::vector<uint8_t>& vs_dxil,
+                             const std::vector<uint8_t>& gs_dxil,
+                             const std::vector<uint8_t>& ps_dxil,
+                             std::vector<float>& out_rgba32f_4x4) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC gps{};
+        gps.VS = {vs_dxil.data(), vs_dxil.size()};
+        gps.GS = {gs_dxil.data(), gs_dxil.size()};
+        gps.PS = {ps_dxil.data(), ps_dxil.size()};
+        gps.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        return ExecuteGraphicsDrawInternal(gps, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST, 3u, out_rgba32f_4x4);
     }
 
     bool RunMeshDrawQuad(const std::vector<uint8_t>& as_dxil,
@@ -7076,10 +7114,133 @@ void BuildExtendedMemGpuKernels(std::vector<PreparedExtKernel>& kernels, std::st
 }
 #endif
 
+struct PreparedExtStageLifts {
+    bool hs_ready = false;
+    bool ds_ready = false;
+    bool gs_ready = false;
+    Rdna2ExtendedStageLiftResult hs_lift{};
+    Rdna2ExtendedStageLiftResult ds_lift{};
+    Rdna2ExtendedStageLiftResult gs_lift{};
+    std::string tess_vs_hlsl;
+    std::string gs_vs_hlsl;
+    std::string color_ps_hlsl;
+    std::array<float, 4> tess_expected_rgba{0.25f, 0.50f, 0.75f, 1.0f};
+    std::array<float, 4> gs_expected_rgba{0.125f, 0.625f, 0.875f, 1.0f};
+};
+
+PreparedExtStageLifts BuildExtendedStageLifts() {
+    PreparedExtStageLifts ext{};
+    Rdna2ExtendedLiftOptions eopts{};
+    eopts.emit_hlsl = true;
+    eopts.emit_spirv = true;
+    eopts.compile_dxil_with_dxc = false;
+    eopts.resign_dxil = true;
+    eopts.validate_spirv_external = false;
+
+    // 1. Real RDNA2 Hull Shader (HS) — triangle patch tessellation
+    {
+        Rdna2Assembler hs_a;
+        hs_a.EmitVop2(Rdna2Opcode::V_ADD_F32, 0, Rdna2Operand::InlineFloat(0.5f), 0);
+        hs_a.EmitVop2(Rdna2Opcode::V_MUL_F32, 1, Rdna2Operand::InlineFloat(1.0f), 1);
+        hs_a.EmitSopp(Rdna2Opcode::S_ENDPGM);
+        Xs2ShaderContainer hs_xs2{};
+        hs_xs2.stage = ShaderStage::Hull;
+        hs_xs2.code_words = hs_a.Words();
+        Rdna2HullStageContract hs_c{};
+        hs_c.domain = TessDomain::Tri;
+        hs_c.partitioning = TessPartitioning::FractionalOdd;
+        hs_c.output_topology = TessOutputTopology::TriangleCw;
+        hs_c.input_control_points = 3u;
+        hs_c.output_control_points = 3u;
+        hs_c.default_outer_tess = 2.0f;
+        hs_c.default_inner_tess = 2.0f;
+        if (LiftRdna2HullShader(hs_xs2, hs_c, ext.hs_lift, eopts).ok() &&
+            !ext.hs_lift.hlsl_source.empty() && !ext.hs_lift.spirv_words.empty()) {
+            ext.hs_ready = true;
+        }
+    }
+
+    // 2. Real RDNA2 Domain Shader (DS) — barycentric patch evaluation
+    {
+        Rdna2Assembler ds_a;
+        ds_a.EmitVop2(Rdna2Opcode::V_MUL_F32, 0, Rdna2Operand::InlineFloat(1.0f), 0);
+        ds_a.EmitVop3(Rdna2Opcode::V_FMA_F32, 1, Rdna2Operand::Vgpr(0), Rdna2Operand::InlineFloat(1.0f), Rdna2Operand::Vgpr(1));
+        ds_a.EmitSopp(Rdna2Opcode::S_ENDPGM);
+        Xs2ShaderContainer ds_xs2{};
+        ds_xs2.stage = ShaderStage::Domain;
+        ds_xs2.code_words = ds_a.Words();
+        Rdna2DomainStageContract ds_c{};
+        ds_c.domain = TessDomain::Tri;
+        ds_c.partitioning = TessPartitioning::FractionalOdd;
+        ds_c.output_topology = TessOutputTopology::TriangleCw;
+        ds_c.input_control_points = 3u;
+        if (LiftRdna2DomainShader(ds_xs2, ds_c, ext.ds_lift, eopts).ok() &&
+            !ext.ds_lift.hlsl_source.empty() && !ext.ds_lift.spirv_words.empty()) {
+            ext.ds_ready = true;
+        }
+    }
+
+    // 3. Real RDNA2 Geometry Shader (GS) — S_SENDMSG GS_EMIT x3 + GS_CUT triangle emission
+    {
+        Rdna2Assembler gs_a;
+        gs_a.EmitVop2(Rdna2Opcode::V_ADD_F32, 0, Rdna2Operand::InlineFloat(0.5f), 0);
+        const int16_t emit_msg = PackRdna2GsSendMsg(kRdna2SendMsgIdGs, kRdna2GsOpEmit, 0u);
+        const int16_t cut_msg = PackRdna2GsSendMsg(kRdna2SendMsgIdGsDone, kRdna2GsOpCut, 0u);
+        gs_a.EmitSopp(Rdna2Opcode::S_SENDMSG, emit_msg);
+        gs_a.EmitSopp(Rdna2Opcode::S_SENDMSG, emit_msg);
+        gs_a.EmitSopp(Rdna2Opcode::S_SENDMSG, emit_msg);
+        gs_a.EmitSopp(Rdna2Opcode::S_SENDMSG, cut_msg);
+        gs_a.EmitSopp(Rdna2Opcode::S_ENDPGM);
+        Xs2ShaderContainer gs_xs2{};
+        gs_xs2.stage = ShaderStage::Geometry;
+        gs_xs2.code_words = gs_a.Words();
+        Rdna2GeometryStageContract gs_c{};
+        gs_c.input_primitive = GsInputPrimitive::Triangle;
+        gs_c.output_primitive = GsOutputPrimitive::TriangleStream;
+        gs_c.max_vertex_count = 3u;
+        gs_c.instance_count = 1u;
+        gs_c.detect_sendmsg_emit_cut = true;
+        if (LiftRdna2GeometryShader(gs_xs2, gs_c, ext.gs_lift, eopts).ok() &&
+            !ext.gs_lift.hlsl_source.empty() && !ext.gs_lift.spirv_words.empty() &&
+            ext.gs_lift.gs_emit_count == 3u && ext.gs_lift.gs_cut_count >= 1u) {
+            ext.gs_ready = true;
+        }
+    }
+
+    // Oversized fullscreen triangle covers [-1, 1]^2 even after lifted HS/GS pos bias (+0.0625)
+    ext.tess_vs_hlsl =
+        "struct VsOut { float4 pos : POSITION; float4 col : COLOR0; };\n"
+        "VsOut main(uint vid : SV_VertexID) {\n"
+        "    VsOut o;\n"
+        "    float2 p = (vid == 0u) ? float2(-2.0f, -2.0f)\n"
+        "             : ((vid == 1u) ? float2(4.0f, -2.0f) : float2(-2.0f, 4.0f));\n"
+        "    o.pos = float4(p, 0.0f, 1.0f);\n"
+        "    o.col = float4(0.25f, 0.50f, 0.75f, 1.0f);\n"
+        "    return o;\n"
+        "}\n";
+    ext.gs_vs_hlsl =
+        "struct VsOut { float4 pos : SV_Position; float4 col : COLOR0; };\n"
+        "VsOut main(uint vid : SV_VertexID) {\n"
+        "    VsOut o;\n"
+        "    float2 p = (vid == 0u) ? float2(-2.0f, -2.0f)\n"
+        "             : ((vid == 1u) ? float2(4.0f, -2.0f) : float2(-2.0f, 4.0f));\n"
+        "    o.pos = float4(p, 0.0f, 1.0f);\n"
+        "    o.col = float4(0.125f, 0.625f, 0.875f, 1.0f);\n"
+        "    return o;\n"
+        "}\n";
+    ext.color_ps_hlsl =
+        "struct PsIn { float4 pos : SV_Position; float4 col : COLOR0; };\n"
+        "float4 main(PsIn i) : SV_Target0 {\n"
+        "    return i.col;\n"
+        "}\n";
+    return ext;
+}
+
 void RunExtendedGpuOpcodeVerification(
     AuditState& audit,
     Rdna2CoverageReport& out_report,
     const std::string& dxc_path,
+    const PreparedExtStageLifts& ext_stages,
     VulkanBackend* vk_opt,
 #if defined(_WIN32)
     D3D12BenchContext* d3d_hw_opt,
@@ -7250,7 +7411,18 @@ void RunExtendedGpuOpcodeVerification(
         Rdna2LiftResult ms_lift{};
         std::vector<uint8_t> as_dxil_sm65;
         std::vector<uint8_t> ms_dxil_sm65;
+
+        bool tess_ready = false;
+        bool gs_ready = false;
+        std::vector<uint8_t> tess_vs_dxil_hw, tess_vs_dxil_warp;
+        std::vector<uint8_t> hs_dxil_hw, hs_dxil_warp;
+        std::vector<uint8_t> ds_dxil_hw, ds_dxil_warp;
+        std::vector<uint8_t> gs_vs_dxil_hw, gs_vs_dxil_warp;
+        std::vector<uint8_t> gs_dxil_hw, gs_dxil_warp;
+        std::vector<uint8_t> color_ps_dxil_hw, color_ps_dxil_warp;
     } gfx{};
+    gfx.tess_ready = ext_stages.hs_ready && ext_stages.ds_ready;
+    gfx.gs_ready = ext_stages.gs_ready;
 
     if (out_report.has_dxc_tool && (d3d_hw_opt || d3d_warp_opt)) {
         // Fullscreen triangle VS: vid 0->(-1,-1), 1->(3,-1), 2->(-1,3); Param0 = (0.25, 0.5, 0.75, 1.0)
@@ -7404,8 +7576,8 @@ void RunExtendedGpuOpcodeVerification(
         const std::string hw_cs = d3d_hw_opt ? ("cs" + hw_suf) : "";
         const std::string warp_cs = d3d_warp_opt ? ("cs" + warp_suf) : "";
 
-        // Compile compute kernels + up to 5 graphics shaders in one parallel pool (in-process dxcompiler.dll!)
-        const size_t total_compile_jobs = kernels.size() + 5u;
+        // Compile compute kernels + up to 11 graphics/tess/GS/mesh shaders in one parallel pool (in-process dxcompiler.dll!)
+        const size_t total_compile_jobs = kernels.size() + 11u;
         std::atomic<size_t> next_job{0u};
         const size_t n_threads = std::min<size_t>(
             total_compile_jobs, std::min<size_t>(12u, std::max<size_t>(2u, std::thread::hardware_concurrency())));
@@ -7475,6 +7647,18 @@ void RunExtendedGpuOpcodeVerification(
                             if (CompileHlslFast(gfx.ms_lift.hlsl_source, "ms_6_5", "main", gfx.ms_dxil_sm65, diag, dxc_path).ok()) {
                                 (void)ResignDxilContainer(gfx.ms_dxil_sm65);
                             }
+                        } else if (gj == 5u && gfx.tess_ready) {
+                            compile_stage_pair(ext_stages.tess_vs_hlsl, "vs", gfx.tess_vs_dxil_hw, gfx.tess_vs_dxil_warp);
+                        } else if (gj == 6u && gfx.tess_ready) {
+                            compile_stage_pair(ext_stages.hs_lift.hlsl_source, "hs", gfx.hs_dxil_hw, gfx.hs_dxil_warp);
+                        } else if (gj == 7u && gfx.tess_ready) {
+                            compile_stage_pair(ext_stages.ds_lift.hlsl_source, "ds", gfx.ds_dxil_hw, gfx.ds_dxil_warp);
+                        } else if (gj == 8u && gfx.gs_ready) {
+                            compile_stage_pair(ext_stages.gs_vs_hlsl, "vs", gfx.gs_vs_dxil_hw, gfx.gs_vs_dxil_warp);
+                        } else if (gj == 9u && gfx.gs_ready) {
+                            compile_stage_pair(ext_stages.gs_lift.hlsl_source, "gs", gfx.gs_dxil_hw, gfx.gs_dxil_warp);
+                        } else if (gj == 10u && (gfx.tess_ready || gfx.gs_ready)) {
+                            compile_stage_pair(ext_stages.color_ps_hlsl, "ps", gfx.color_ps_dxil_hw, gfx.color_ps_dxil_warp);
                         }
                     }
                 }
@@ -7654,6 +7838,8 @@ void RunExtendedGpuOpcodeVerification(
             bool base_ran = false, base_ok = false;
             bool ord_ran = false, ord_ok = false;
             bool mesh_ran = false, mesh_ok = false;
+            bool tess_ran = false, tess_ok = false;
+            bool gs_ran = false, gs_ok = false;
             std::string err;
         };
         GfxBackendOutcome hw_gfx{}, warp_gfx{};
@@ -7694,6 +7880,39 @@ void RunExtendedGpuOpcodeVerification(
                 } else {
                     std::fprintf(stderr, "[EXT-GPU-FAIL] %s (as_ms_ps_draw): mesh draw parity mismatch\n", tag);
                     if (out.err.empty()) out.err = std::string(tag) + " mesh draw parity mismatch";
+                }
+            }
+
+            if (gfx.tess_ready) {
+                const auto& tvs_dxil = is_hw ? gfx.tess_vs_dxil_hw : gfx.tess_vs_dxil_warp;
+                const auto& hs_dxil = is_hw ? gfx.hs_dxil_hw : gfx.hs_dxil_warp;
+                const auto& ds_dxil = is_hw ? gfx.ds_dxil_hw : gfx.ds_dxil_warp;
+                const auto& cps_dxil = is_hw ? gfx.color_ps_dxil_hw : gfx.color_ps_dxil_warp;
+                out.tess_ran = true;
+                std::vector<float> fb_tess;
+                if (!tvs_dxil.empty() && !hs_dxil.empty() && !ds_dxil.empty() && !cps_dxil.empty() &&
+                    ctx->RunTessellationDrawQuad(tvs_dxil, hs_dxil, ds_dxil, cps_dxil, fb_tess) &&
+                    verify_fb_rgba(fb_tess, ext_stages.tess_expected_rgba)) {
+                    out.tess_ok = true;
+                } else {
+                    std::fprintf(stderr, "[EXT-GPU-FAIL] %s (vs_hs_ds_ps_draw): tessellation draw parity mismatch\n", tag);
+                    if (out.err.empty()) out.err = std::string(tag) + " tessellation HS+DS draw parity mismatch";
+                }
+            }
+
+            if (gfx.gs_ready) {
+                const auto& gvs_dxil = is_hw ? gfx.gs_vs_dxil_hw : gfx.gs_vs_dxil_warp;
+                const auto& gs_dxil = is_hw ? gfx.gs_dxil_hw : gfx.gs_dxil_warp;
+                const auto& cps_dxil = is_hw ? gfx.color_ps_dxil_hw : gfx.color_ps_dxil_warp;
+                out.gs_ran = true;
+                std::vector<float> fb_gs;
+                if (!gvs_dxil.empty() && !gs_dxil.empty() && !cps_dxil.empty() &&
+                    ctx->RunGeometryDrawQuad(gvs_dxil, gs_dxil, cps_dxil, fb_gs) &&
+                    verify_fb_rgba(fb_gs, ext_stages.gs_expected_rgba)) {
+                    out.gs_ok = true;
+                } else {
+                    std::fprintf(stderr, "[EXT-GPU-FAIL] %s (vs_gs_ps_draw): geometry draw parity mismatch\n", tag);
+                    if (out.err.empty()) out.err = std::string(tag) + " geometry GS draw parity mismatch";
                 }
             }
         };
@@ -7750,6 +7969,47 @@ void RunExtendedGpuOpcodeVerification(
             ++out_report.workloads[4u].gpu_passed;
             audit.MarkGpuOpcodes(gfx.as_lift.instructions);
             audit.MarkGpuOpcodes(gfx.ms_lift.instructions);
+        }
+
+        // Aggregate Tessellation (HS + DS)
+        const bool hs_dxil_ok = (!gfx.hs_dxil_hw.empty() && VerifyDxbcContainerHash(gfx.hs_dxil_hw.data(), gfx.hs_dxil_hw.size())) ||
+                                (!gfx.hs_dxil_warp.empty() && VerifyDxbcContainerHash(gfx.hs_dxil_warp.data(), gfx.hs_dxil_warp.size()));
+        const bool ds_dxil_ok = (!gfx.ds_dxil_hw.empty() && VerifyDxbcContainerHash(gfx.ds_dxil_hw.data(), gfx.ds_dxil_hw.size())) ||
+                                (!gfx.ds_dxil_warp.empty() && VerifyDxbcContainerHash(gfx.ds_dxil_warp.data(), gfx.ds_dxil_warp.size()));
+        if (out_report.extended_stages.size() >= 3u) {
+            if (hs_dxil_ok) out_report.extended_stages[0u].dxil_passed = 1u;
+            if (ds_dxil_ok) out_report.extended_stages[1u].dxil_passed = 1u;
+        }
+        if (hw_gfx.tess_ok) ++out_report.corpus_gpu_hw_executed;
+        if (warp_gfx.tess_ok) ++out_report.corpus_gpu_warp_executed;
+        if ((hw_gfx.tess_ran || warp_gfx.tess_ran) &&
+            (!hw_gfx.tess_ran || hw_gfx.tess_ok) &&
+            (!warp_gfx.tess_ran || warp_gfx.tess_ok)) {
+            ++out_report.corpus_gpu_executed;
+            if (out_report.extended_stages.size() >= 3u) {
+                ++out_report.extended_stages[0u].gpu_passed;
+                ++out_report.extended_stages[1u].gpu_passed;
+            }
+            audit.MarkGpuOpcodes(ext_stages.hs_lift.instructions);
+            audit.MarkGpuOpcodes(ext_stages.ds_lift.instructions);
+        }
+
+        // Aggregate Geometry (GS)
+        const bool gs_dxil_ok = (!gfx.gs_dxil_hw.empty() && VerifyDxbcContainerHash(gfx.gs_dxil_hw.data(), gfx.gs_dxil_hw.size())) ||
+                                (!gfx.gs_dxil_warp.empty() && VerifyDxbcContainerHash(gfx.gs_dxil_warp.data(), gfx.gs_dxil_warp.size()));
+        if (out_report.extended_stages.size() >= 3u && gs_dxil_ok) {
+            out_report.extended_stages[2u].dxil_passed = 1u;
+        }
+        if (hw_gfx.gs_ok) ++out_report.corpus_gpu_hw_executed;
+        if (warp_gfx.gs_ok) ++out_report.corpus_gpu_warp_executed;
+        if ((hw_gfx.gs_ran || warp_gfx.gs_ran) &&
+            (!hw_gfx.gs_ran || hw_gfx.gs_ok) &&
+            (!warp_gfx.gs_ran || warp_gfx.gs_ok)) {
+            ++out_report.corpus_gpu_executed;
+            if (out_report.extended_stages.size() >= 3u) {
+                ++out_report.extended_stages[2u].gpu_passed;
+            }
+            audit.MarkGpuOpcodes(ext_stages.gs_lift.instructions);
         }
     }
 #endif
@@ -7819,6 +8079,20 @@ Status RunRdna2CoverageBenchmark(const Rdna2BenchOptions& opts, Rdna2CoverageRep
     out_report.stages.resize(static_cast<size_t>(StageSlot::Count));
     for (size_t s = 0; s < kStageNames.size(); ++s) {
         out_report.stages[s].stage = kStageNames[s];
+    }
+    const PreparedExtStageLifts ext_stages = BuildExtendedStageLifts();
+    out_report.extended_stages.resize(3u);
+    out_report.extended_stages[0u].stage = "HS";
+    out_report.extended_stages[1u].stage = "DS";
+    out_report.extended_stages[2u].stage = "GS";
+    const std::array<bool, 3> ext_ready_flags = {ext_stages.hs_ready, ext_stages.ds_ready, ext_stages.gs_ready};
+    for (size_t es = 0u; es < 3u; ++es) {
+        out_report.extended_stages[es].total = 1u;
+        if (ext_ready_flags[es]) {
+            out_report.extended_stages[es].passed = 1u;
+            out_report.extended_stages[es].disasm_passed = 1u;
+            out_report.extended_stages[es].spirv_passed = 1u;
+        }
     }
     out_report.workloads.resize(kWorkloads.size());
     for (size_t w = 0; w < kWorkloads.size(); ++w) {
@@ -8282,10 +8556,12 @@ Status RunRdna2CoverageBenchmark(const Rdna2BenchOptions& opts, Rdna2CoverageRep
         }
 
         // Extended multi-kernel real-GPU opcode verification across ALL 20 GFX10.3 families
+        // plus ALL 7 graphics/compute pipeline stages (CS / VS / PS / MS / AS / HS+DS / GS)
         RunExtendedGpuOpcodeVerification(
             audit,
             out_report,
             dxc_path,
+            ext_stages,
             out_report.has_vulkan_hw ? &vk : nullptr,
 #if defined(_WIN32)
             out_report.has_d3d12_hw ? &d3d_hw : nullptr,
@@ -8389,8 +8665,12 @@ std::string SerializeRdna2CoverageJson(const Rdna2CoverageReport& r) {
     os << "  },\n";
 
     os << "  \"stages\": {\n";
-    for (size_t i = 0; i < r.stages.size(); ++i) {
-        const auto& s = r.stages[i];
+    std::vector<const Rdna2StageCoverage*> all_stages;
+    all_stages.reserve(r.stages.size() + r.extended_stages.size());
+    for (const auto& s : r.stages) all_stages.push_back(&s);
+    for (const auto& s : r.extended_stages) all_stages.push_back(&s);
+    for (size_t i = 0; i < all_stages.size(); ++i) {
+        const auto& s = *all_stages[i];
         os << "    \"" << EscapeJson(s.stage) << "\": {"
            << "\"total\": " << s.total
            << ", \"passed\": " << s.passed
@@ -8399,7 +8679,7 @@ std::string SerializeRdna2CoverageJson(const Rdna2CoverageReport& r) {
            << ", \"dxil_passed\": " << s.dxil_passed
            << ", \"cpu_ref_passed\": " << s.cpu_ref_passed
            << ", \"gpu_passed\": " << s.gpu_passed
-           << "}" << ((i + 1u < r.stages.size()) ? "," : "") << "\n";
+           << "}" << ((i + 1u < all_stages.size()) ? "," : "") << "\n";
     }
     os << "  },\n";
 
@@ -8540,6 +8820,14 @@ int RunRdna2BenchCli(int argc, char** argv) {
             report.corpus_gpu_warp_executed,
             report.corpus_vulkan_executed,
             report.elapsed_seconds);
+        std::printf("Stages (GPU) :");
+        for (const auto& stg : report.stages) {
+            std::printf(" %s=%u", stg.stage.c_str(), stg.gpu_passed);
+        }
+        for (const auto& stg : report.extended_stages) {
+            std::printf(" %s=%u", stg.stage.c_str(), stg.gpu_passed);
+        }
+        std::printf("\n");
         if (!opts.json_output_path.empty()) {
             std::printf("JSON Report  : %s\n", opts.json_output_path.c_str());
         }

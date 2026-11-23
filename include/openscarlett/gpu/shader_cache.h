@@ -51,6 +51,33 @@ struct ShaderCacheStats {
     uint64_t sync_compiles_failed = 0;
     uint64_t total_compile_failures = 0;
     uint64_t standins_served = 0;
+    // Extended Sprint 16 async PSO + persistent disk cache telemetry (appended for ABI compatibility)
+    uint64_t total_compile_time_us = 0;
+    uint64_t avg_compile_time_us = 0;
+    uint64_t disk_bytes_read = 0;
+    uint64_t disk_bytes_written = 0;
+    uint64_t active_worker_threads = 0;
+    uint64_t peak_queue_depth = 0;
+    uint64_t hot_swaps_ready = 0;
+    uint64_t disk_entries_pruned = 0;
+    uint64_t async_dedup_hits = 0;
+    uint64_t async_priority_promotions = 0;
+};
+
+enum class ShaderCachePriority : uint8_t {
+    Prewarm = 0,
+    Normal = 1,
+    Urgent = 2,
+};
+
+struct ShaderCacheDiskEntryInfo {
+    std::string key_hex;
+    std::string path;
+    ShaderStage stage = ShaderStage::Unknown;
+    std::string target_profile;
+    uint64_t size_bytes = 0;
+    uint64_t last_write_epoch_sec = 0;
+    bool valid_crc32 = false;
 };
 
 struct CachedShaderResult {
@@ -64,11 +91,17 @@ struct CachedShaderResult {
     std::string diagnostics;
 };
 
+using AsyncCompileCompletionCallback = std::function<void(
+    const ShaderCacheKey& key,
+    const CachedShaderResult& result,
+    const Status& status)>;
+
 struct ShaderCacheLiftRequest {
     uint32_t highest_shader_model = 0x65u;  // D3D_SHADER_MODEL (e.g. 0x65=SM6.5, 0x62=SM6.2)
     bool mesh_has_payload = true;           // Relevant for ShaderStage::Mesh (true iff AS is bound)
     bool prefer_dxil_standin = false;       // True for multi-stage graphics/mesh PSOs to match DXIL
     std::string dxc_path;                   // Optional explicit dxc.exe path (empty = portable lookup)
+    ShaderCachePriority priority = ShaderCachePriority::Normal;
 };
 
 // Deterministic 128-bit content hash over (input_blob, target_profile, shader_model_flags, format_version).
@@ -102,6 +135,30 @@ public:
     void EnableAsyncPsoCompilation(bool enable);
     void ResetAsyncPsoCompilationOverride();
     bool IsAsyncPsoCompilationEnabled() const;
+
+    // Configures background worker pool size (0 = auto: min(4, max(2, hw_threads / 2)); clamped to [1, 8]).
+    void SetAsyncWorkerCount(uint32_t worker_count);
+    uint32_t GetAsyncWorkerCount() const noexcept;
+
+    // Registers an optional completion callback invoked outside internal locks when an async
+    // compilation finishes, allowing callers to hot-swap stand-in PSOs with zero hitch.
+    void SetAsyncCompletionCallback(AsyncCompileCompletionCallback callback);
+
+    // Enqueues an asynchronous background prewarm compile at the requested priority without
+    // compiling a stand-in or blocking the caller. Returns Ok immediately on cache hit or enqueue.
+    Status PrewarmXboxShaderAsync(
+        const void* blob,
+        size_t blob_size,
+        const ShaderCacheLiftRequest& request,
+        ShaderCacheKey* out_key = nullptr,
+        ShaderCachePriority priority = ShaderCachePriority::Prewarm);
+
+    // Enumerates on-disk `.ossc` cache entries with IEEE 802.3 CRC32 verification (non-destructive).
+    std::vector<ShaderCacheDiskEntryInfo> EnumerateDiskCacheEntries() const;
+
+    // Prunes corrupt entries first, then oldest-modified `.ossc` files until total bytes <= max_bytes
+    // (when max_bytes > 0) and entry count <= max_entries (when max_entries > 0). Returns count removed.
+    size_t PruneDiskCache(uint64_t max_bytes, size_t max_entries = 0);
 
     // Clears in-memory cache entries (preserving on-disk cache files).
     void ClearMemoryCache();
@@ -148,6 +205,9 @@ private:
         ShaderStage stage = ShaderStage::Unknown;
         std::string target_profile;
         ShaderCacheLiftRequest request{};
+        ShaderCachePriority priority = ShaderCachePriority::Normal;
+        uint64_t sequence = 0;
+        bool had_standin = false;
     };
 
     bool TryLoadFromDisk(const ShaderCacheKey& key, MemoryEntry& out_entry);
@@ -176,6 +236,7 @@ private:
     std::unordered_map<std::string, std::vector<uint8_t>> standin_cache_;
 
     std::atomic<int> async_override_{-1};  // -1 = env var, 0 = off, 1 = on
+    std::atomic<uint32_t> configured_worker_count_{0};  // 0 = auto
     std::atomic<uint64_t> mem_hits_{0};
     std::atomic<uint64_t> disk_hits_{0};
     std::atomic<uint64_t> misses_{0};
@@ -186,12 +247,25 @@ private:
     std::atomic<uint64_t> sync_succeeded_{0};
     std::atomic<uint64_t> sync_failed_{0};
     std::atomic<uint64_t> standins_served_{0};
+    std::atomic<uint64_t> total_compile_time_us_{0};
+    std::atomic<uint64_t> compile_count_{0};
+    std::atomic<uint64_t> disk_bytes_read_{0};
+    std::atomic<uint64_t> disk_bytes_written_{0};
+    std::atomic<uint64_t> active_worker_threads_{0};
+    std::atomic<uint64_t> peak_queue_depth_{0};
+    std::atomic<uint64_t> hot_swaps_ready_{0};
+    std::atomic<uint64_t> disk_entries_pruned_{0};
+    std::atomic<uint64_t> async_dedup_hits_{0};
+    std::atomic<uint64_t> async_priority_promotions_{0};
     std::string last_compile_error_;
 
     mutable std::mutex async_mutex_;
     std::condition_variable async_cv_;
-    std::deque<AsyncJob> job_queue_;
+    std::vector<AsyncJob> job_queue_;
     std::unordered_set<ShaderCacheKey, ShaderCacheKeyHash> inflight_keys_;
+    std::unordered_set<ShaderCacheKey, ShaderCacheKeyHash> standin_pending_keys_;
+    AsyncCompileCompletionCallback completion_callback_;
+    uint64_t next_job_seq_ = 1;
     std::vector<std::thread> workers_;
     uint32_t active_workers_ = 0;
     uint32_t active_jobs_ = 0;

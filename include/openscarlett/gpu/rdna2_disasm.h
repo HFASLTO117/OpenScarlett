@@ -305,6 +305,10 @@ enum class Rdna2Opcode : uint16_t {
     S_BREV_B32,
     S_BCNT1_I32_B32,
     S_BCNT1_I32_B64,
+    S_FLBIT_I32_B32,
+    S_FLBIT_I32_B64,
+    S_FLBIT_I32,
+    S_FLBIT_I32_I64,
     S_SETPC_B64,
     S_SWAPPC_B64,
     S_GETPC_B64,
@@ -322,6 +326,8 @@ enum class Rdna2Opcode : uint16_t {
     S_CMP_GE_U32,
     S_CMP_LT_U32,
     S_CMP_LE_U32,
+    S_CMP_EQ_U64,
+    S_CMP_LG_U64,
 
     // SOPK
     S_MOVK_I32,
@@ -460,6 +466,19 @@ enum class Rdna2Opcode : uint16_t {
     V_CMPX_GE_F16,
     V_CMPX_NEQ_F16,
     V_CMPX_NLT_F16,
+    // 64-bit integer compares (CS / VS / PS)
+    V_CMP_LT_I64,
+    V_CMP_EQ_I64,
+    V_CMP_LE_I64,
+    V_CMP_GT_I64,
+    V_CMP_LG_I64,
+    V_CMP_GE_I64,
+    V_CMP_LT_U64,
+    V_CMP_EQ_U64,
+    V_CMP_LE_U64,
+    V_CMP_GT_U64,
+    V_CMP_LG_U64,
+    V_CMP_GE_U64,
 
     // VOP3 (native 3-operand / wave / bitfield / 16-bit ops)
     V_FMA_F32,
@@ -472,6 +491,8 @@ enum class Rdna2Opcode : uint16_t {
     V_ALIGNBYTE_B32,
     V_DIV_FMAS_F32,
     V_MUL_LO_U32,
+    V_MAD_U64_U32,
+    V_MAD_I64_I32,
     V_ADD_NC_U16,
     V_SUB_NC_U16,
     V_MIN_U16,
@@ -479,12 +500,15 @@ enum class Rdna2Opcode : uint16_t {
     V_MIN_I16,
     V_MAX_I16,
     V_MUL_LO_U16,
+    V_ASHRREV_I16,
     V_LSHLREV_B16,
     V_LSHRREV_B16,
     V_MAD_U16,
     V_MBCNT_LO_U32_B32,
     V_MBCNT_HI_U32_B32,
     V_READLANE_B32,
+    V_CVT_PKNORM_I16_F16,
+    V_CVT_PKNORM_U16_F16,
     V_CVT_PKNORM_I16_F32,
     V_CVT_PKNORM_U16_F32,
     V_ADD3_U32,
@@ -506,6 +530,10 @@ enum class Rdna2Opcode : uint16_t {
     // SMEM
     S_LOAD_DWORD,
     S_BUFFER_LOAD_DWORD,
+    S_BUFFER_LOAD_DWORDX2,
+    S_BUFFER_LOAD_DWORDX4,
+    S_BUFFER_LOAD_DWORDX8,
+    S_BUFFER_LOAD_DWORDX16,
 
     // MUBUF
     BUFFER_LOAD_FORMAT_X,
@@ -517,7 +545,15 @@ enum class Rdna2Opcode : uint16_t {
     BUFFER_LOAD_FORMAT_D16_XYZ,
     BUFFER_LOAD_FORMAT_D16_XYZW,
     BUFFER_LOAD_DWORD,
+    BUFFER_STORE_BYTE_D16_HI,
+    BUFFER_STORE_SHORT_D16_HI,
     BUFFER_STORE_DWORD,
+    BUFFER_LOAD_UBYTE_D16,
+    BUFFER_LOAD_UBYTE_D16_HI,
+    BUFFER_LOAD_SBYTE_D16,
+    BUFFER_LOAD_SBYTE_D16_HI,
+    BUFFER_LOAD_SHORT_D16,
+    BUFFER_LOAD_SHORT_D16_HI,
 
     // MTBUF (typed format-converting buffer loads, including D16)
     TBUFFER_LOAD_FORMAT_X,
@@ -535,14 +571,25 @@ enum class Rdna2Opcode : uint16_t {
     IMAGE_STORE,
     IMAGE_ATOMIC_CMPSWAP,
     IMAGE_SAMPLE,
+    IMAGE_SAMPLE_CL,
+    IMAGE_SAMPLE_D_CL,
     IMAGE_SAMPLE_LZ,
+    IMAGE_SAMPLE_B_CL,
+    IMAGE_SAMPLE_C_CL,
+    IMAGE_SAMPLE_C_D_CL,
+    IMAGE_SAMPLE_C_B_CL,
     IMAGE_SAMPLE_C_LZ,
     IMAGE_BVH_INTERSECT_RAY,
 
     // DS (LDS / Shared Memory & Swizzle)
     DS_ADD_U32,
+    DS_MSKOR_B32,
     DS_WRITE_B32,
+    DS_NOP,
     DS_ADD_RTN_U32,
+    DS_MSKOR_RTN_B32,
+    DS_WRXCHG2_RTN_B32,
+    DS_WRXCHG2ST64_RTN_B32,
     DS_SWIZZLE_B32,
     DS_READ_B32,
     DS_READ_U8_D16,
@@ -551,6 +598,10 @@ enum class Rdna2Opcode : uint16_t {
     DS_READ_I8_D16_HI,
     DS_READ_U16_D16,
     DS_READ_U16_D16_HI,
+    DS_WRITE_B96,
+    DS_WRITE_B128,
+    DS_READ_B96,
+    DS_READ_B128,
 
     // FLAT / GLOBAL / SCRATCH
     GLOBAL_LOAD_DWORD,
@@ -707,6 +758,14 @@ struct Rdna2Instruction {
     uint8_t vintrp_attr = 0;   // 6-bit parameter attribute slot (0..31)
     uint8_t vintrp_chan = 0;   // 2-bit attribute channel (0..3)
 
+    // DPP8 / DPP8FI (0xE9 / 0xEA) 8-lane quad-local permutation metadata
+    bool has_dpp8 = false;
+    bool dpp8_fi = false;
+    uint32_t dpp8_word = 0;    // 8 x 3-bit lane selectors [23:0]
+
+    // VOP3 SDST carry-out register for 64-bit integer MAD (v_mad_u64_u32 / v_mad_i64_i32)
+    Rdna2Operand sdst{};
+
     std::string mnemonic;
     std::string disasm;
 };
@@ -764,6 +823,17 @@ public:
     void EmitVop2Literal(Rdna2Opcode op, uint8_t vdst, const Rdna2Operand& src0, uint8_t vsrc1, uint32_t literal_k);
     // VOP1 (automatically emits 64-bit word when src0 is a 32-bit literal)
     void EmitVop1(Rdna2Opcode op, uint8_t vdst, const Rdna2Operand& src0);
+    // VOP1 / VOP2 with GFX10.3 DPP8 (0xE9) or DPP8FI (0xEA) arbitrary 8-lane selector word
+    void EmitVop1Dpp8(Rdna2Opcode op, uint8_t vdst, uint8_t vsrc0, uint32_t dpp8_sel24, bool fi = false);
+    void EmitVop2Dpp8(Rdna2Opcode op, uint8_t vdst, uint8_t vsrc0, uint8_t vsrc1, uint32_t dpp8_sel24, bool fi = false);
+    // VOP3B (64-bit VOP3 with explicit sdst carry-out, e.g., V_MAD_U64_U32 / V_MAD_I64_I32)
+    void EmitVop3b(
+        Rdna2Opcode op,
+        uint8_t vdst,
+        uint8_t sdst,
+        const Rdna2Operand& src0,
+        const Rdna2Operand& src1,
+        const Rdna2Operand& src2);
     // VOPC (automatically emits 64-bit word when src0 is a 32-bit literal)
     void EmitVopc(Rdna2Opcode op, const Rdna2Operand& src0, uint8_t vsrc1);
     // VOP3 (64-bit, or 96-bit if one source is a 32-bit literal)
