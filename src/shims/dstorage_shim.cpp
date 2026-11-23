@@ -28,13 +28,19 @@
 #  include <d3d12.h>
 #  include <windows.h>
 
-#  if defined(_MSC_VER)
-#    define OS_UUIDOF(T) __uuidof(T)
-#  elif defined(__CRT_UUID_DECL)
-#    define OS_UUIDOF(T) __mingw_uuidof<T>()
-#  else
-#    define OS_UUIDOF(T) IID_##T
-#  endif
+// Inline explicit D3D12 COM IIDs (portable across MSVC, Clang-CL, and MinGW-w64; zero __uuidof).
+static constexpr GUID kOsDStorageIidId3d12Device = {
+    0x189819F1u, 0x1DB6u, 0x4B57u, {0xBE, 0x54u, 0x18, 0x21, 0x33, 0x9B, 0x85, 0xF7}};
+static constexpr GUID kOsDStorageIidId3d12Resource = {
+    0x696442BEu, 0xA72Eu, 0x4059u, {0xBC, 0x79u, 0x5B, 0x5C, 0x98, 0x04, 0x0F, 0xAD}};
+static constexpr GUID kOsDStorageIidId3d12CommandQueue = {
+    0x0EC870A6u, 0x5D7Eu, 0x4C22u, {0x8C, 0xFCu, 0x5B, 0xAA, 0xE0, 0x76, 0x16, 0xED}};
+static constexpr GUID kOsDStorageIidId3d12CommandAllocator = {
+    0x6102DEE4u, 0xAF59u, 0x4B09u, {0xB9, 0x99u, 0xB4, 0x4D, 0x73, 0xF0, 0x9B, 0x24}};
+static constexpr GUID kOsDStorageIidId3d12GraphicsCommandList = {
+    0x5B160D0Fu, 0xAC1Bu, 0x4185u, {0x8B, 0xA8u, 0xB3, 0xAE, 0x42, 0xA5, 0xA4, 0x55}};
+static constexpr GUID kOsDStorageIidId3d12Fence = {
+    0x0A753DCFu, 0xC4D8u, 0x4B91u, {0xAD, 0xF6u, 0xBE, 0x5A, 0x60, 0xD9, 0x5A, 0x76}};
 #endif
 
 namespace {
@@ -806,24 +812,43 @@ public:
     }
 
     bool AttachFile(HANDLE hfile) {
-        std::lock_guard<std::mutex> lk(mutex_);
-        if (active_files_ == 0u) {
-            iocp_ = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0u, 0u);
-            if (!iocp_) return false;
-            constexpr size_t kIocpThreads = 2u;
-            threads_.reserve(kIocpThreads);
-            for (size_t i = 0u; i < kIocpThreads; ++i) {
-                threads_.emplace_back(&DStorageIocpEngine::CompletionLoop, this, iocp_);
-            }
-        }
-        if (!CreateIoCompletionPort(hfile, iocp_, kFileIoKey, 0u)) {
+        std::vector<std::thread> to_join;
+        HANDLE to_close = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
             if (active_files_ == 0u) {
-                ShutdownLocked();
+                iocp_ = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0u, 0u);
+                if (!iocp_) return false;
+                constexpr size_t kIocpThreads = 2u;
+                threads_.reserve(kIocpThreads);
+                for (size_t i = 0u; i < kIocpThreads; ++i) {
+                    threads_.emplace_back(&DStorageIocpEngine::CompletionLoop, this, iocp_);
+                }
             }
-            return false;
+            if (!CreateIoCompletionPort(hfile, iocp_, kFileIoKey, 0u)) {
+                if (active_files_ == 0u && iocp_) {
+                    for (size_t i = 0u; i < threads_.size(); ++i) {
+                        PostQueuedCompletionStatus(iocp_, 0u, kShutdownKey, nullptr);
+                    }
+                    to_join.swap(threads_);
+                    to_close = iocp_;
+                    iocp_ = nullptr;
+                }
+            } else {
+                ++active_files_;
+                return true;
+            }
         }
-        ++active_files_;
-        return true;
+        for (auto& t : to_join) {
+            if (t.joinable()) {
+                if (t.get_id() != std::this_thread::get_id()) t.join();
+                else t.detach();
+            }
+        }
+        if (to_close) {
+            CloseHandle(to_close);
+        }
+        return false;
     }
 
     void DetachFile() {
@@ -857,19 +882,6 @@ public:
 private:
     static constexpr ULONG_PTR kFileIoKey = 0x5CA0F11Eu;
     static constexpr ULONG_PTR kShutdownKey = 0x5CA0DEADu;
-
-    void ShutdownLocked() {
-        if (!iocp_) return;
-        for (size_t i = 0u; i < threads_.size(); ++i) {
-            PostQueuedCompletionStatus(iocp_, 0u, kShutdownKey, nullptr);
-        }
-        for (auto& t : threads_) {
-            if (t.joinable()) t.detach();
-        }
-        threads_.clear();
-        CloseHandle(iocp_);
-        iocp_ = nullptr;
-    }
 
     void CompletionLoop(HANDLE port) {
         for (;;) {
@@ -914,17 +926,21 @@ public:
     explicit DStorageFileImpl(
 #if defined(_WIN32)
         HANDLE hfile,
-        bool iocp_attached = false
+        bool iocp_attached = false,
+        const wchar_t* path = nullptr
 #else
         void* hfile,
-        bool iocp_attached = false
+        bool iocp_attached = false,
+        const wchar_t* path = nullptr
 #endif
         )
-        : file_handle_(hfile), iocp_attached_(iocp_attached) {}
+        : file_handle_(hfile), iocp_attached_(iocp_attached), file_path_(path ? path : L"") {}
 
     ~DStorageFileImpl() {
         CloseInternal();
     }
+
+    const std::wstring& FilePath() const noexcept { return file_path_; }
 
     int32_t OPENSCARLETT_DSTORAGE_CALL QueryInterface(
         const DStorageGuid* riid, void** ppvObject) override {
@@ -962,6 +978,9 @@ public:
         if (!info) {
             return RecordHr("IDStorageFileX::GetFileInformation", OS_DSTORAGE_E_INVALIDARG, 4);
         }
+        if (closing_.load(std::memory_order_acquire)) {
+            return RecordHr("IDStorageFileX::GetFileInformation", OS_DSTORAGE_E_IO_ERROR, 4);
+        }
         std::shared_lock<std::shared_mutex> lk(handle_rw_mutex_);
 #if defined(_WIN32)
         if (file_handle_ == INVALID_HANDLE_VALUE || !file_handle_) {
@@ -984,17 +1003,21 @@ public:
         uint32_t size,
         std::vector<uint8_t>& out,
         const std::atomic<bool>* cancel_flag = nullptr) {
+        if (size == 0u || offset + static_cast<uint64_t>(size) < offset) {
+            return OS_DSTORAGE_E_INVALIDARG;
+        }
+        if (closing_.load(std::memory_order_acquire)) {
+            return OS_DSTORAGE_E_IO_ERROR;
+        }
         // Shared lock allows N parallel positioned OVERLAPPED reads on the SAME file handle!
         std::shared_lock<std::shared_mutex> lk(handle_rw_mutex_);
 #if defined(_WIN32)
-        if (file_handle_ == INVALID_HANDLE_VALUE || !file_handle_) {
+        if (closing_.load(std::memory_order_acquire) ||
+            file_handle_ == INVALID_HANDLE_VALUE || !file_handle_) {
             return OS_DSTORAGE_E_IO_ERROR;
         }
         if (cancel_flag && cancel_flag->load(std::memory_order_acquire)) {
             return OS_DSTORAGE_E_CANCELLED;
-        }
-        if (offset + static_cast<uint64_t>(size) < offset) {
-            return OS_DSTORAGE_E_INVALIDARG;
         }
         LARGE_INTEGER file_sz{};
         if (!GetFileSizeEx(file_handle_, &file_sz) ||
@@ -1015,6 +1038,10 @@ public:
 
         uint32_t total_read = 0u;
         while (total_read < size) {
+            if (closing_.load(std::memory_order_acquire)) {
+                out.clear();
+                return OS_DSTORAGE_E_IO_ERROR;
+            }
             if (cancel_flag && cancel_flag->load(std::memory_order_acquire)) {
                 out.clear();
                 return OS_DSTORAGE_E_CANCELLED;
@@ -1040,14 +1067,17 @@ public:
             if (iocp_attached_) {
                 std::unique_lock<std::mutex> olk(op.mutex);
                 while (!op.completed) {
-                    if (cancel_flag && cancel_flag->load(std::memory_order_acquire)) {
+                    if (closing_.load(std::memory_order_acquire) ||
+                        (cancel_flag && cancel_flag->load(std::memory_order_acquire))) {
                         CancelIoEx(file_handle_, &op.ov);
                     }
                     op.cv.wait_for(olk, std::chrono::milliseconds(5), [&]() { return op.completed; });
                 }
                 if (op.error_code == ERROR_OPERATION_ABORTED) {
                     out.clear();
-                    return OS_DSTORAGE_E_CANCELLED;
+                    return closing_.load(std::memory_order_acquire)
+                               ? OS_DSTORAGE_E_IO_ERROR
+                               : OS_DSTORAGE_E_CANCELLED;
                 }
                 if (op.error_code != ERROR_SUCCESS || op.bytes_transferred == 0u) {
                     out.clear();
@@ -1086,6 +1116,16 @@ public:
 
 private:
     void CloseInternal() {
+        closing_.store(true, std::memory_order_release);
+#if defined(_WIN32)
+        // Cancel any blocked overlapped reads before waiting for exclusive handle lock.
+        {
+            std::shared_lock<std::shared_mutex> slk(handle_rw_mutex_);
+            if (file_handle_ != INVALID_HANDLE_VALUE && file_handle_ != nullptr) {
+                CancelIoEx(file_handle_, nullptr);
+            }
+        }
+#endif
         bool detach_iocp = false;
         {
             std::unique_lock<std::shared_mutex> lk(handle_rw_mutex_);
@@ -1108,6 +1148,7 @@ private:
     }
 
     std::atomic<uint32_t> ref_count_{1};
+    std::atomic<bool> closing_{false};
     mutable std::shared_mutex handle_rw_mutex_;
 #if defined(_WIN32)
     HANDLE file_handle_ = INVALID_HANDLE_VALUE;
@@ -1115,6 +1156,7 @@ private:
     void* file_handle_ = nullptr;
 #endif
     bool iocp_attached_ = false;
+    std::wstring file_path_;
 };
 
 // ===========================================================================
@@ -1124,6 +1166,10 @@ class DStorageStatusArrayImpl final : public IDStorageStatusArrayX {
 public:
     explicit DStorageStatusArrayImpl(uint32_t capacity)
         : complete_(capacity, true), results_(capacity, OS_DSTORAGE_S_OK) {}
+
+    uint32_t Capacity() const noexcept {
+        return static_cast<uint32_t>(complete_.size());
+    }
 
     int32_t OPENSCARLETT_DSTORAGE_CALL QueryInterface(
         const DStorageGuid* riid, void** ppvObject) override {
@@ -1275,7 +1321,7 @@ struct DStorageGpuUploadContext {
 
         if (FAILED(device->CreateCommittedResource(
                 &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ,
-                nullptr, OS_UUIDOF(ID3D12Resource), reinterpret_cast<void**>(&slot.buffer))) ||
+                nullptr, kOsDStorageIidId3d12Resource, reinterpret_cast<void**>(&slot.buffer))) ||
             !slot.buffer) {
             slot.buffer = nullptr;
             return nullptr;
@@ -1295,7 +1341,7 @@ struct DStorageGpuUploadContext {
 
         D3D12_COMMAND_QUEUE_DESC qd{};
         qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-        if (FAILED(dev->CreateCommandQueue(&qd, OS_UUIDOF(ID3D12CommandQueue),
+        if (FAILED(dev->CreateCommandQueue(&qd, kOsDStorageIidId3d12CommandQueue,
                                            reinterpret_cast<void**>(&cmd_queue))) ||
             !cmd_queue) {
             Reset();
@@ -1303,7 +1349,7 @@ struct DStorageGpuUploadContext {
         }
         if (FAILED(dev->CreateCommandAllocator(
                 D3D12_COMMAND_LIST_TYPE_DIRECT,
-                OS_UUIDOF(ID3D12CommandAllocator),
+                kOsDStorageIidId3d12CommandAllocator,
                 reinterpret_cast<void**>(&cmd_alloc))) ||
             !cmd_alloc) {
             Reset();
@@ -1314,7 +1360,7 @@ struct DStorageGpuUploadContext {
                 D3D12_COMMAND_LIST_TYPE_DIRECT,
                 cmd_alloc,
                 nullptr,
-                OS_UUIDOF(ID3D12GraphicsCommandList),
+                kOsDStorageIidId3d12GraphicsCommandList,
                 reinterpret_cast<void**>(&cmd_list))) ||
             !cmd_list) {
             Reset();
@@ -1322,7 +1368,7 @@ struct DStorageGpuUploadContext {
         }
         cmd_list->Close();
 
-        if (FAILED(dev->CreateFence(0ull, D3D12_FENCE_FLAG_NONE, OS_UUIDOF(ID3D12Fence),
+        if (FAILED(dev->CreateFence(0ull, D3D12_FENCE_FLAG_NONE, kOsDStorageIidId3d12Fence,
                                     reinterpret_cast<void**>(&fence))) ||
             !fence) {
             Reset();
@@ -1360,14 +1406,14 @@ struct DStorageGpuUploadContext {
 #endif
 
 // Forward declaration for priority scheduler.
-class DStorageQueueImpl;
+class DStorageQueueCore;
 
 // ===========================================================================
 // Multi-Threaded Cross-Queue Priority Scheduler (REALTIME > HIGH > NORMAL > LOW)
 // Dispatches concurrent IOCP file reads & parallel decompression across worker
 // threads while strictly preserving per-queue Status/Event/Signal barriers and
-// priority preemption. Ref-counted worker lifecycle guarantees zero hangs in
-// DLL_PROCESS_DETACH.
+// priority preemption. Holds shared_ptr<DStorageQueueCore> and uses monotonic
+// generation-scoped worker teardown to prevent all Close/Release/restart races.
 // ===========================================================================
 class DStoragePriorityScheduler {
 public:
@@ -1384,70 +1430,54 @@ public:
         }
     }
 
-    void RegisterQueue(DStorageQueueImpl* q, DSTORAGE_PRIORITY priority);
-    void UnregisterQueue(DStorageQueueImpl* q);
+    void RegisterQueue(const std::shared_ptr<DStorageQueueCore>& q, DSTORAGE_PRIORITY priority);
+    void UnregisterQueue(const DStorageQueueCore* q);
     void NotifyWorkAvailable();
 
 private:
     struct Slot {
-        DStorageQueueImpl* queue = nullptr;
+        std::shared_ptr<DStorageQueueCore> queue;
         size_t bucket = 2u;
         uint32_t active_workers = 0u;
         bool removing = false;
     };
 
-    void RunLoop();
+    void RunLoop(uint64_t my_generation);
 
     std::mutex mutex_;
     std::condition_variable work_cv_;
     std::condition_variable idle_cv_;
     std::vector<Slot> slots_;
     std::array<size_t, 4> rr_cursor_{0u, 0u, 0u, 0u};
-    bool stop_ = false;
+    uint64_t generation_ = 0ull;
     bool worker_running_ = false;
     std::vector<std::thread> workers_;
 };
 
 // ===========================================================================
-// IDStorageQueueX / X1 / X2 Implementation (Multi-Threaded IOCP + Real Xbox
-// Zlib/BCPack/Swizzle/PhysicalPages + GDeflate/Custom + XgGpuUntiler Ring)
+// Ref-Counted Queue Core (shared between IDStorageQueueX2 wrapper & workers;
+// eliminates all Close() / Release() / worker teardown races, xcl #81)
 // ===========================================================================
-class DStorageQueueImpl final : public IDStorageQueueX2 {
+class DStorageQueueCore final : public std::enable_shared_from_this<DStorageQueueCore> {
 public:
     struct InFlightRequestState {
         uint64_t tag = 0ull;
         std::atomic<bool> canceled{false};
     };
 
-    explicit DStorageQueueImpl(
+    static std::shared_ptr<DStorageQueueCore> Create(
         const DSTORAGE_QUEUE_DESC& desc,
         std::shared_ptr<std::atomic<uint32_t>> staging_size_ref = nullptr,
-        uint32_t queue_options = DSTORAGE_QUEUE_OPTIONS_NONE)
-        : desc_(desc),
-          queue_options_(queue_options),
-          auto_submit_disabled_((queue_options & DSTORAGE_QUEUE_OPTIONS_DISABLE_AUTO_SUBMIT) != 0u),
-          staging_size_ref_(staging_size_ref
-                                ? std::move(staging_size_ref)
-                                : std::make_shared<std::atomic<uint32_t>>(
-                                      DSTORAGE_DEFAULT_STAGING_BUFFER_SIZE)) {
-        if (desc_.Capacity < DSTORAGE_MIN_QUEUE_CAPACITY) {
-            desc_.Capacity = DSTORAGE_MIN_QUEUE_CAPACITY;
-        } else if (desc_.Capacity > DSTORAGE_MAX_QUEUE_CAPACITY) {
-            desc_.Capacity = DSTORAGE_MAX_QUEUE_CAPACITY;
+        uint32_t queue_options = DSTORAGE_QUEUE_OPTIONS_NONE) {
+        auto core = std::shared_ptr<DStorageQueueCore>(
+            new (std::nothrow) DStorageQueueCore(desc, std::move(staging_size_ref), queue_options));
+        if (core) {
+            DStoragePriorityScheduler::Global().RegisterQueue(core, core->desc_.Priority);
         }
-        auto_submit_threshold_ =
-            std::max<uint16_t>(1u, static_cast<uint16_t>(desc_.Capacity / 2u));
-        if (desc_.Name) {
-            name_storage_ = desc_.Name;
-            desc_.Name = name_storage_.c_str();
-        }
-#if defined(_WIN32)
-        error_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-#endif
-        DStoragePriorityScheduler::Global().RegisterQueue(this, desc_.Priority);
+        return core;
     }
 
-    ~DStorageQueueImpl() {
+    ~DStorageQueueCore() {
         CloseInternal();
 #if defined(_WIN32)
         if (error_event_) {
@@ -1457,48 +1487,13 @@ public:
 #endif
     }
 
-    int32_t OPENSCARLETT_DSTORAGE_CALL QueryInterface(
-        const DStorageGuid* riid, void** ppvObject) override {
-        if (!ppvObject) return RecordHr("IDStorageQueueX::QueryInterface", OS_DSTORAGE_E_POINTER, 0);
-        *ppvObject = nullptr;
-        if (!riid) return RecordHr("IDStorageQueueX::QueryInterface", OS_DSTORAGE_E_INVALIDARG, 0);
-        if (GuidEquals(riid, IID_OS_DStorage_IUnknown) ||
-            GuidEquals(riid, IID_IDStorageQueueX)) {
-            AddRef();
-            *ppvObject = static_cast<IDStorageQueueX*>(this);
-            return RecordHr("IDStorageQueueX::QueryInterface", OS_DSTORAGE_S_OK, 0);
-        }
-        if (GuidEquals(riid, IID_IDStorageQueueX1)) {
-            AddRef();
-            *ppvObject = static_cast<IDStorageQueueX1*>(this);
-            return RecordHr("IDStorageQueueX::QueryInterface", OS_DSTORAGE_S_OK, 0);
-        }
-        if (GuidEquals(riid, IID_IDStorageQueueX2)) {
-            AddRef();
-            *ppvObject = static_cast<IDStorageQueueX2*>(this);
-            return RecordHr("IDStorageQueueX::QueryInterface", OS_DSTORAGE_S_OK, 0);
-        }
-        return RecordHr("IDStorageQueueX::QueryInterface", OS_DSTORAGE_E_NOINTERFACE, 0);
-    }
-
-    uint32_t OPENSCARLETT_DSTORAGE_CALL AddRef() override {
-        RecordOk("IDStorageQueueX::AddRef", 1);
-        return ref_count_.fetch_add(1, std::memory_order_relaxed) + 1;
-    }
-
-    uint32_t OPENSCARLETT_DSTORAGE_CALL Release() override {
-        RecordOk("IDStorageQueueX::Release", 2);
-        const uint32_t rem = ref_count_.fetch_sub(1, std::memory_order_acq_rel) - 1;
-        if (rem == 0) {
-            delete this;
-        }
-        return rem;
-    }
-
     // Title entry point: `request` is the Xbox dstorage_xs.h DSTORAGE_REQUEST (0x48 bytes).
-    void OPENSCARLETT_DSTORAGE_CALL EnqueueRequest(const DSTORAGE_REQUEST* request) override {
+    void EnqueueRequest(const DSTORAGE_REQUEST* request) {
         RecordOk("IDStorageQueueX::EnqueueRequest", 3);
-        if (!request) return;
+        if (!request) {
+            RecordCommandFailure(OS_DSTORAGE_E_POINTER, DSTORAGE_COMMAND_TYPE_REQUEST);
+            return;
+        }
         QueueItem item{};
         item.kind = QueueItem::Kind::Request;
         item.is_xbox_request = true;
@@ -1524,7 +1519,8 @@ public:
 
     // Decodes a title's 0x48-byte Xbox DSTORAGE_REQUEST into the internal descriptor while
     // preserving exact Xbox option bits (ZlibDecompress, BcpackMode, SwizzleMode,
-    // DestinationIsPhysicalPages, SourceIsPhysicalPages) and strictly validating reserved bits.
+    // DestinationIsPhysicalPages, SourceIsPhysicalPages) and strictly validating reserved bits,
+    // pointers, sizes, and 64-bit file offset overflow.
     static int32_t DecodeXboxRequest(const DSTORAGE_REQUEST& x, OpenScarlettDStorageRequestDesc& out) {
         out = OpenScarlettDStorageRequestDesc{};
         const uint64_t opts = x.Options.AsUINT64;
@@ -1575,6 +1571,25 @@ public:
                 return OS_DSTORAGE_E_INVALIDARG;
             }
         }
+        // Strict pointer, zero-size, and offset-overflow validation.
+        if (!x.Destination) {
+            return OS_DSTORAGE_E_POINTER;
+        }
+        if (x.DestinationSize == 0u || x.SourceSize == 0u) {
+            return OS_DSTORAGE_E_INVALIDARG;
+        }
+        if (from_memory) {
+            if (!x.Source) {
+                return OS_DSTORAGE_E_POINTER;
+            }
+        } else {
+            if (!x.File) {
+                return OS_DSTORAGE_E_POINTER;
+            }
+            if (x.FileOffset + static_cast<uint64_t>(x.SourceSize) < x.FileOffset) {
+                return OS_DSTORAGE_E_INVALIDARG;
+            }
+        }
         // Uncompressed requests require SourceSize == DestinationSize.
         if (!use_zlib && bcpack_mode == 0u && x.SourceSize != x.DestinationSize) {
             return OS_DSTORAGE_E_INVALIDARG;
@@ -1584,6 +1599,34 @@ public:
     }
 
 private:
+    explicit DStorageQueueCore(
+        const DSTORAGE_QUEUE_DESC& desc,
+        std::shared_ptr<std::atomic<uint32_t>> staging_size_ref,
+        uint32_t queue_options)
+        : desc_(desc),
+          queue_options_(queue_options),
+          auto_submit_disabled_((queue_options & DSTORAGE_QUEUE_OPTIONS_DISABLE_AUTO_SUBMIT) != 0u),
+          staging_size_ref_(staging_size_ref
+                                ? std::move(staging_size_ref)
+                                : std::make_shared<std::atomic<uint32_t>>(
+                                      DSTORAGE_DEFAULT_STAGING_BUFFER_SIZE)) {
+        if (desc_.Capacity < DSTORAGE_MIN_QUEUE_CAPACITY) {
+            desc_.Capacity = DSTORAGE_MIN_QUEUE_CAPACITY;
+        } else if (desc_.Capacity > DSTORAGE_MAX_QUEUE_CAPACITY) {
+            desc_.Capacity = DSTORAGE_MAX_QUEUE_CAPACITY;
+        }
+        auto_submit_threshold_ =
+            std::max<uint16_t>(1u, static_cast<uint16_t>(desc_.Capacity / 2u));
+        if (desc_.Name) {
+            name_storage_ = desc_.Name;
+            desc_.Name = name_storage_.c_str();
+        }
+        ResetErrorRecordLocked();
+#if defined(_WIN32)
+        error_event_ = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+#endif
+    }
+
     struct QueueItem;
     void EnqueueRequestItem(QueueItem& item) {
         if (item.request.Options.SourceType == DSTORAGE_REQUEST_SOURCE_FILE &&
@@ -1615,11 +1658,17 @@ private:
     }
 
 public:
-    void OPENSCARLETT_DSTORAGE_CALL EnqueueStatus(
-        IDStorageStatusArrayX* statusArray, uint32_t index) override {
+    void EnqueueStatus(IDStorageStatusArrayX* statusArray, uint32_t index) {
         RecordOk("IDStorageQueueX::EnqueueStatus", 4);
-        if (!statusArray) return;
+        if (!statusArray) {
+            RecordCommandFailure(OS_DSTORAGE_E_POINTER, DSTORAGE_COMMAND_TYPE_STATUS);
+            return;
+        }
         auto* impl = static_cast<DStorageStatusArrayImpl*>(statusArray);
+        if (index >= impl->Capacity()) {
+            RecordCommandFailure(OS_DSTORAGE_E_INVALIDARG, DSTORAGE_COMMAND_TYPE_STATUS, statusArray, index);
+            return;
+        }
         impl->MarkPending(index);
         impl->AddRef();
 
@@ -1643,9 +1692,47 @@ public:
         }
     }
 
-    void OPENSCARLETT_DSTORAGE_CALL EnqueueSetEvent(void* handle) override {
+    void EnqueueSetEvent(void* handle) {
         RecordOk("IDStorageQueueX::EnqueueSetEvent", 5);
-        if (!handle) return;
+        if (!handle) {
+            RecordCommandFailure(OS_DSTORAGE_E_POINTER, DSTORAGE_COMMAND_TYPE_EVENT);
+            return;
+        }
+#if defined(_WIN32)
+        if (handle == INVALID_HANDLE_VALUE) {
+            RecordCommandFailure(OS_DSTORAGE_E_INVALIDARG, DSTORAGE_COMMAND_TYPE_EVENT);
+            return;
+        }
+        HANDLE dup = nullptr;
+        if (!DuplicateHandle(
+                GetCurrentProcess(),
+                static_cast<HANDLE>(handle),
+                GetCurrentProcess(),
+                &dup,
+                0u,
+                FALSE,
+                DUPLICATE_SAME_ACCESS) ||
+            !dup) {
+            RecordCommandFailure(OS_DSTORAGE_E_INVALIDARG, DSTORAGE_COMMAND_TYPE_EVENT);
+            return;
+        }
+        QueueItem item{};
+        item.kind = QueueItem::Kind::Event;
+        item.event_handle = dup;
+        bool close_dup = false;
+        {
+            std::unique_lock<std::mutex> lk(mutex_);
+            WaitForSlotLocked(lk);
+            if (!closed_) {
+                staged_.push_back(item);
+            } else {
+                close_dup = true;
+            }
+        }
+        if (close_dup) {
+            CloseHandle(dup);
+        }
+#else
         QueueItem item{};
         item.kind = QueueItem::Kind::Event;
         item.event_handle = handle;
@@ -1654,9 +1741,10 @@ public:
         if (!closed_) {
             staged_.push_back(item);
         }
+#endif
     }
 
-    void OPENSCARLETT_DSTORAGE_CALL Submit() override {
+    void Submit() {
         RecordOk("IDStorageQueueX::Submit", 6);
         bool flushed = false;
         {
@@ -1669,8 +1757,7 @@ public:
         }
     }
 
-    void OPENSCARLETT_DSTORAGE_CALL CancelRequestsWithTag(
-        uint64_t mask, uint64_t value) override {
+    void CancelRequestsWithTag(uint64_t mask, uint64_t value) {
         RecordOk("IDStorageQueueX::CancelRequestsWithTag", 7);
         std::lock_guard<std::mutex> lk(mutex_);
         auto cancel_in = [&](std::deque<QueueItem>& q, uint64_t& counter) {
@@ -1708,12 +1795,12 @@ public:
         out.LastIntermediateSize = last_intermediate_size_.load(std::memory_order_acquire);
     }
 
-    void OPENSCARLETT_DSTORAGE_CALL Close() override {
+    void Close() {
         RecordOk("IDStorageQueueX::Close", 8);
         CloseInternal();
     }
 
-    void* OPENSCARLETT_DSTORAGE_CALL GetErrorEvent() override {
+    void* GetErrorEvent() {
         RecordOk("IDStorageQueueX::GetErrorEvent", 9);
 #if defined(_WIN32)
         return error_event_;
@@ -1722,12 +1809,12 @@ public:
 #endif
     }
 
-    void OPENSCARLETT_DSTORAGE_CALL RetrieveErrorRecord(DSTORAGE_ERROR_RECORD* record) override {
+    void RetrieveErrorRecord(DSTORAGE_ERROR_RECORD* record) {
         RecordOk("IDStorageQueueX::RetrieveErrorRecord", 10);
         if (!record) return;
         std::lock_guard<std::mutex> lk(error_mutex_);
         *record = error_record_;
-        std::memset(&error_record_, 0, sizeof(error_record_));
+        ResetErrorRecordLocked();
 #if defined(_WIN32)
         if (error_event_) {
             ResetEvent(error_event_);
@@ -1735,7 +1822,7 @@ public:
 #endif
     }
 
-    void OPENSCARLETT_DSTORAGE_CALL Query(DSTORAGE_QUEUE_INFO* info) override {
+    void Query(DSTORAGE_QUEUE_INFO* info) {
         RecordOk("IDStorageQueueX::Query", 11);
         if (!info) return;
         std::lock_guard<std::mutex> lk(mutex_);
@@ -1753,22 +1840,46 @@ public:
     }
 
     // IDStorageQueueX1 (slot 12)
-    void OPENSCARLETT_DSTORAGE_CALL EnqueueSignal(void* fence, uint64_t value) override {
+    void EnqueueSignal(void* fence, uint64_t value) {
         RecordOk("IDStorageQueueX1::EnqueueSignal", 12);
-        if (!fence) return;
+        if (!fence) {
+            RecordCommandFailure(
+                OS_DSTORAGE_E_POINTER, DSTORAGE_COMMAND_TYPE_SIGNAL, nullptr, 0u, nullptr, value);
+            return;
+        }
+#if defined(_WIN32)
+        if (!ValidateReadableRange(fence, sizeof(void*))) {
+            RecordCommandFailure(
+                OS_DSTORAGE_E_INVALIDARG, DSTORAGE_COMMAND_TYPE_SIGNAL, nullptr, 0u, fence, value);
+            return;
+        }
+        static_cast<ID3D12Fence*>(fence)->AddRef();
+#endif
         QueueItem item{};
         item.kind = QueueItem::Kind::Signal;
         item.signal_fence = fence;
         item.signal_value = value;
-        std::unique_lock<std::mutex> lk(mutex_);
-        WaitForSlotLocked(lk);
-        if (!closed_) {
-            staged_.push_back(item);
+        bool release_fence = false;
+        {
+            std::unique_lock<std::mutex> lk(mutex_);
+            WaitForSlotLocked(lk);
+            if (!closed_) {
+                staged_.push_back(item);
+            } else {
+                release_fence = true;
+            }
         }
+#if defined(_WIN32)
+        if (release_fence) {
+            static_cast<ID3D12Fence*>(fence)->Release();
+        }
+#else
+        (void)release_fence;
+#endif
     }
 
     // IDStorageQueueX2 (slots 13..15)
-    void OPENSCARLETT_DSTORAGE_CALL Query1(DSTORAGE_QUEUE_INFO1* info) override {
+    void Query1(DSTORAGE_QUEUE_INFO1* info) {
         RecordOk("IDStorageQueueX2::Query1", 13);
         if (!info) return;
         std::lock_guard<std::mutex> lk(mutex_);
@@ -1795,7 +1906,7 @@ public:
             completed_canceled_count_.load(std::memory_order_acquire);
     }
 
-    int32_t OPENSCARLETT_DSTORAGE_CALL SetAutoSubmitDisabled(bool disabled) override {
+    int32_t SetAutoSubmitDisabled(bool disabled) {
         std::lock_guard<std::mutex> lk(mutex_);
         auto_submit_disabled_ = disabled;
         if (disabled) {
@@ -1806,7 +1917,7 @@ public:
         return RecordHr("IDStorageQueueX2::SetAutoSubmitDisabled", OS_DSTORAGE_S_OK, 14);
     }
 
-    bool OPENSCARLETT_DSTORAGE_CALL GetAutoSubmitDisabled() override {
+    bool GetAutoSubmitDisabled() {
         RecordOk("IDStorageQueueX2::GetAutoSubmitDisabled", 15);
         std::lock_guard<std::mutex> lk(mutex_);
         return auto_submit_disabled_;
@@ -1940,7 +2051,9 @@ public:
             case QueueItem::Kind::Event: {
 #if defined(_WIN32)
                 if (item.event_handle) {
-                    SetEvent(static_cast<HANDLE>(item.event_handle));
+                    HANDLE h = static_cast<HANDLE>(item.event_handle);
+                    SetEvent(h);
+                    CloseHandle(h);
                 }
 #endif
                 break;
@@ -1949,7 +2062,9 @@ public:
             case QueueItem::Kind::Signal: {
 #if defined(_WIN32)
                 if (item.signal_fence) {
-                    static_cast<ID3D12Fence*>(item.signal_fence)->Signal(item.signal_value);
+                    auto* f = static_cast<ID3D12Fence*>(item.signal_fence);
+                    f->Signal(item.signal_value);
+                    f->Release();
                 }
 #endif
                 break;
@@ -2032,7 +2147,11 @@ private:
         out_ptr = nullptr;
         out_size = 0u;
         if (req.Options.SourceType == DSTORAGE_REQUEST_SOURCE_FILE) {
-            if (!req.Source.File.Source || req.Source.File.Size == 0u) {
+            if (!req.Source.File.Source) {
+                return OS_DSTORAGE_E_POINTER;
+            }
+            if (req.Source.File.Size == 0u ||
+                req.Source.File.Offset + static_cast<uint64_t>(req.Source.File.Size) < req.Source.File.Offset) {
                 return OS_DSTORAGE_E_INVALIDARG;
             }
             if (check_staging_for_src &&
@@ -2049,9 +2168,17 @@ private:
             return OS_DSTORAGE_S_OK;
         }
         if (req.Options.SourceType == DSTORAGE_REQUEST_SOURCE_MEMORY) {
-            if (!req.Source.Memory.Source || req.Source.Memory.Size == 0u) {
+            if (!req.Source.Memory.Source) {
+                return OS_DSTORAGE_E_POINTER;
+            }
+            if (req.Source.Memory.Size == 0u) {
                 return OS_DSTORAGE_E_INVALIDARG;
             }
+#if defined(_WIN32)
+            if (!ValidateReadableRange(req.Source.Memory.Source, req.Source.Memory.Size)) {
+                return OS_DSTORAGE_E_INVALIDARG;
+            }
+#endif
             if (check_staging_for_src &&
                 req.Options.CompressionFormat != DSTORAGE_COMPRESSION_FORMAT_NONE &&
                 req.Source.Memory.Size > staging_limit) {
@@ -2426,7 +2553,7 @@ private:
         ID3D12Device* dev = static_cast<ID3D12Device*>(device_);
         ID3D12Device* queried_dev = nullptr;
         if (!dev) {
-            if (FAILED(dst_res->GetDevice(OS_UUIDOF(ID3D12Device),
+            if (FAILED(dst_res->GetDevice(kOsDStorageIidId3d12Device,
                                           reinterpret_cast<void**>(&queried_dev))) ||
                 !queried_dev) {
                 return OS_DSTORAGE_E_FAIL;
@@ -2521,7 +2648,7 @@ private:
             local_desc.d3d12_device ? local_desc.d3d12_device : device_);
         ID3D12Device* queried_dev = nullptr;
         if (!dev) {
-            if (FAILED(dst_tex->GetDevice(OS_UUIDOF(ID3D12Device),
+            if (FAILED(dst_tex->GetDevice(kOsDStorageIidId3d12Device,
                                           reinterpret_cast<void**>(&queried_dev))) ||
                 !queried_dev) {
                 return OS_DSTORAGE_E_FAIL;
@@ -2767,8 +2894,13 @@ private:
 #endif
         }
 
-        if (req.Options.DestinationType != DSTORAGE_REQUEST_DESTINATION_MEMORY ||
-            !req.Destination.Memory.Buffer || req.Destination.Memory.Size == 0) {
+        if (req.Options.DestinationType != DSTORAGE_REQUEST_DESTINATION_MEMORY) {
+            return OS_DSTORAGE_E_INVALIDARG;
+        }
+        if (!req.Destination.Memory.Buffer) {
+            return OS_DSTORAGE_E_POINTER;
+        }
+        if (req.Destination.Memory.Size == 0) {
             return OS_DSTORAGE_E_INVALIDARG;
         }
 
@@ -3014,10 +3146,54 @@ private:
         }
     }
 
+    void ResetErrorRecordLocked() noexcept {
+        std::memset(&error_record_, 0, sizeof(error_record_));
+        error_record_.FailureCount = 0u;
+        error_record_.FirstFailure.HResult = OS_DSTORAGE_S_OK;
+        error_record_.FirstFailure.CommandType = DSTORAGE_COMMAND_TYPE_NONE;
+    }
+
+    void RecordCommandFailure(
+        int32_t hr,
+        DSTORAGE_COMMAND_TYPE cmd_type,
+        IDStorageStatusArrayX* status_arr = nullptr,
+        uint32_t status_index = 0u,
+        void* signal_fence = nullptr,
+        uint64_t signal_value = 0ull) {
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            if (batch_hr_ >= 0) {
+                batch_hr_ = hr;
+            }
+        }
+        completed_failed_count_.fetch_add(1u, std::memory_order_relaxed);
+        std::lock_guard<std::mutex> elk(error_mutex_);
+        if (error_record_.FailureCount == 0u) {
+            ResetErrorRecordLocked();
+            auto& ff = error_record_.FirstFailure;
+            ff.HResult = hr;
+            ff.CommandType = cmd_type;
+            if (cmd_type == DSTORAGE_COMMAND_TYPE_STATUS) {
+                ff.Status.StatusArray = status_arr;
+                ff.Status.Index = status_index;
+            } else if (cmd_type == DSTORAGE_COMMAND_TYPE_SIGNAL) {
+                ff.Signal.Fence = signal_fence;
+                ff.Signal.Value = signal_value;
+            }
+        }
+        ++error_record_.FailureCount;
+#if defined(_WIN32)
+        if (error_event_) {
+            SetEvent(error_event_);
+        }
+#endif
+    }
+
     void RecordFailure(int32_t hr, const QueueItem& item) {
         const OpenScarlettDStorageRequestDesc& req = item.request;
         std::lock_guard<std::mutex> lk(error_mutex_);
         if (error_record_.FailureCount == 0) {
+            ResetErrorRecordLocked();
             auto& ff = error_record_.FirstFailure;
             ff.HResult = hr;
             ff.CommandType = DSTORAGE_COMMAND_TYPE_REQUEST;
@@ -3032,6 +3208,15 @@ private:
             if (req.Options.SourceType == DSTORAGE_REQUEST_SOURCE_FILE) {
                 r.FileOffset = req.Source.File.Offset;
                 r.SourceSize = req.Source.File.Size;
+                if (req.Source.File.Source) {
+                    const auto* fimpl = static_cast<const DStorageFileImpl*>(req.Source.File.Source);
+                    const std::wstring& fp = fimpl->FilePath();
+                    size_t i = 0u;
+                    for (; i + 1u < DSTORAGE_ERROR_RECORD_MAX_PATH && i < fp.size(); ++i) {
+                        r.Filename[i] = static_cast<char16_t>(fp[i]);
+                    }
+                    r.Filename[i] = u'\0';
+                }
             } else {
                 r.Source = const_cast<void*>(req.Source.Memory.Source);
                 r.SourceSize = req.Source.Memory.Size;
@@ -3053,11 +3238,17 @@ private:
 #endif
     }
 
+public:
     void CloseInternal() {
         std::deque<QueueItem> leftover_staged;
         {
             std::unique_lock<std::mutex> lk(mutex_);
-            if (closed_) return;
+            if (closed_) {
+                // Wait for the concurrent Close() call to finish draining & unregistering
+                // so Release() / ~DStorageQueueImpl() never races active teardown!
+                close_cv_.wait(lk, [&]() { return close_complete_; });
+                return;
+            }
             closed_ = true;
             leftover_staged.swap(staged_);
             staged_request_count_ = 0u;
@@ -3071,6 +3262,14 @@ private:
             } else if (item.kind == QueueItem::Kind::Status && item.status_array) {
                 item.status_array->MarkComplete(item.status_index, OS_DSTORAGE_E_FAIL);
                 item.status_array->Release();
+            } else if (item.kind == QueueItem::Kind::Event && item.event_handle) {
+#if defined(_WIN32)
+                CloseHandle(static_cast<HANDLE>(item.event_handle));
+#endif
+            } else if (item.kind == QueueItem::Kind::Signal && item.signal_fence) {
+#if defined(_WIN32)
+                static_cast<ID3D12Fence*>(item.signal_fence)->Release();
+#endif
             }
         }
 
@@ -3090,9 +3289,14 @@ private:
             gpu_ctx_.Reset();
         }
 #endif
+        {
+            std::lock_guard<std::mutex> lk(mutex_);
+            close_complete_ = true;
+        }
+        close_cv_.notify_all();
     }
 
-    std::atomic<uint32_t> ref_count_{1};
+private:
     DSTORAGE_QUEUE_DESC desc_{};
     uint32_t queue_options_ = DSTORAGE_QUEUE_OPTIONS_NONE;
     bool auto_submit_disabled_ = false;
@@ -3105,7 +3309,9 @@ private:
     std::mutex mutex_;
     std::condition_variable space_cv_;
     std::condition_variable drain_cv_;
+    std::condition_variable close_cv_;
     bool closed_ = false;
+    bool close_complete_ = false;
     uint32_t staged_request_count_ = 0u;
     std::atomic<size_t> active_count_{0u};
     size_t in_flight_requests_ = 0u;
@@ -3136,47 +3342,171 @@ private:
 };
 
 // ===========================================================================
+// IDStorageQueueX / X1 / X2 COM Wrapper (owns shared_ptr<DStorageQueueCore>)
+// ===========================================================================
+class DStorageQueueImpl final : public IDStorageQueueX2 {
+public:
+    explicit DStorageQueueImpl(std::shared_ptr<DStorageQueueCore> core)
+        : core_(std::move(core)) {}
+
+    ~DStorageQueueImpl() {
+        if (core_) {
+            core_->CloseInternal();
+        }
+    }
+
+    int32_t OPENSCARLETT_DSTORAGE_CALL QueryInterface(
+        const DStorageGuid* riid, void** ppvObject) override {
+        if (!ppvObject) return RecordHr("IDStorageQueueX::QueryInterface", OS_DSTORAGE_E_POINTER, 0);
+        *ppvObject = nullptr;
+        if (!riid) return RecordHr("IDStorageQueueX::QueryInterface", OS_DSTORAGE_E_INVALIDARG, 0);
+        if (GuidEquals(riid, IID_OS_DStorage_IUnknown) ||
+            GuidEquals(riid, IID_IDStorageQueueX)) {
+            AddRef();
+            *ppvObject = static_cast<IDStorageQueueX*>(this);
+            return RecordHr("IDStorageQueueX::QueryInterface", OS_DSTORAGE_S_OK, 0);
+        }
+        if (GuidEquals(riid, IID_IDStorageQueueX1)) {
+            AddRef();
+            *ppvObject = static_cast<IDStorageQueueX1*>(this);
+            return RecordHr("IDStorageQueueX::QueryInterface", OS_DSTORAGE_S_OK, 0);
+        }
+        if (GuidEquals(riid, IID_IDStorageQueueX2)) {
+            AddRef();
+            *ppvObject = static_cast<IDStorageQueueX2*>(this);
+            return RecordHr("IDStorageQueueX::QueryInterface", OS_DSTORAGE_S_OK, 0);
+        }
+        return RecordHr("IDStorageQueueX::QueryInterface", OS_DSTORAGE_E_NOINTERFACE, 0);
+    }
+
+    uint32_t OPENSCARLETT_DSTORAGE_CALL AddRef() override {
+        RecordOk("IDStorageQueueX::AddRef", 1);
+        return ref_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+    }
+
+    uint32_t OPENSCARLETT_DSTORAGE_CALL Release() override {
+        RecordOk("IDStorageQueueX::Release", 2);
+        const uint32_t rem = ref_count_.fetch_sub(1, std::memory_order_acq_rel) - 1;
+        if (rem == 0) {
+            delete this;
+        }
+        return rem;
+    }
+
+    void OPENSCARLETT_DSTORAGE_CALL EnqueueRequest(const DSTORAGE_REQUEST* request) override {
+        core_->EnqueueRequest(request);
+    }
+
+    void EnqueueRequestDesc(const OpenScarlettDStorageRequestDesc& request) {
+        core_->EnqueueRequestDesc(request);
+    }
+
+    void SetDevice(void* device) { core_->SetDevice(device); }
+    void SetTitleVaMirror(void* mirror) { core_->SetTitleVaMirror(mirror); }
+
+    void OPENSCARLETT_DSTORAGE_CALL EnqueueStatus(
+        IDStorageStatusArrayX* statusArray, uint32_t index) override {
+        core_->EnqueueStatus(statusArray, index);
+    }
+
+    void OPENSCARLETT_DSTORAGE_CALL EnqueueSetEvent(void* handle) override {
+        core_->EnqueueSetEvent(handle);
+    }
+
+    void OPENSCARLETT_DSTORAGE_CALL Submit() override {
+        core_->Submit();
+    }
+
+    void OPENSCARLETT_DSTORAGE_CALL CancelRequestsWithTag(
+        uint64_t mask, uint64_t value) override {
+        core_->CancelRequestsWithTag(mask, value);
+    }
+
+    void GetQueueStats(DSTORAGE_QUEUE_STATS& out) {
+        core_->GetQueueStats(out);
+    }
+
+    void OPENSCARLETT_DSTORAGE_CALL Close() override {
+        core_->Close();
+    }
+
+    void* OPENSCARLETT_DSTORAGE_CALL GetErrorEvent() override {
+        return core_->GetErrorEvent();
+    }
+
+    void OPENSCARLETT_DSTORAGE_CALL RetrieveErrorRecord(DSTORAGE_ERROR_RECORD* record) override {
+        core_->RetrieveErrorRecord(record);
+    }
+
+    void OPENSCARLETT_DSTORAGE_CALL Query(DSTORAGE_QUEUE_INFO* info) override {
+        core_->Query(info);
+    }
+
+    void OPENSCARLETT_DSTORAGE_CALL EnqueueSignal(void* fence, uint64_t value) override {
+        core_->EnqueueSignal(fence, value);
+    }
+
+    void OPENSCARLETT_DSTORAGE_CALL Query1(DSTORAGE_QUEUE_INFO1* info) override {
+        core_->Query1(info);
+    }
+
+    int32_t OPENSCARLETT_DSTORAGE_CALL SetAutoSubmitDisabled(bool disabled) override {
+        return core_->SetAutoSubmitDisabled(disabled);
+    }
+
+    bool OPENSCARLETT_DSTORAGE_CALL GetAutoSubmitDisabled() override {
+        return core_->GetAutoSubmitDisabled();
+    }
+
+private:
+    std::atomic<uint32_t> ref_count_{1};
+    std::shared_ptr<DStorageQueueCore> core_;
+};
+
+// ===========================================================================
 // Multi-Threaded DStoragePriorityScheduler Method Definitions
 // ===========================================================================
-void DStoragePriorityScheduler::RegisterQueue(DStorageQueueImpl* q, DSTORAGE_PRIORITY priority) {
+void DStoragePriorityScheduler::RegisterQueue(
+    const std::shared_ptr<DStorageQueueCore>& q,
+    DSTORAGE_PRIORITY priority) {
     std::lock_guard<std::mutex> lk(mutex_);
     slots_.push_back(Slot{q, PriorityToBucket(priority), 0u, false});
     if (!worker_running_) {
-        stop_ = false;
         worker_running_ = true;
+        const uint64_t my_gen = ++generation_;
         const unsigned hw = std::thread::hardware_concurrency();
         const size_t num_workers = std::clamp<size_t>(hw ? hw : 4u, 2u, 4u);
         workers_.reserve(num_workers);
         for (size_t i = 0u; i < num_workers; ++i) {
-            workers_.emplace_back(&DStoragePriorityScheduler::RunLoop, this);
+            workers_.emplace_back(&DStoragePriorityScheduler::RunLoop, this, my_gen);
         }
     }
     work_cv_.notify_all();
 }
 
-void DStoragePriorityScheduler::UnregisterQueue(DStorageQueueImpl* q) {
+void DStoragePriorityScheduler::UnregisterQueue(const DStorageQueueCore* q) {
     std::vector<std::thread> to_join;
     {
         std::unique_lock<std::mutex> lk(mutex_);
         for (auto& s : slots_) {
-            if (s.queue == q) {
+            if (s.queue.get() == q) {
                 s.removing = true;
                 break;
             }
         }
         idle_cv_.wait(lk, [&]() {
             for (const auto& s : slots_) {
-                if (s.queue == q) return s.active_workers == 0u;
+                if (s.queue.get() == q) return s.active_workers == 0u;
             }
             return true;
         });
         slots_.erase(
             std::remove_if(slots_.begin(), slots_.end(),
-                           [q](const Slot& s) { return s.queue == q; }),
+                           [q](const Slot& s) { return s.queue.get() == q; }),
             slots_.end());
 
         if (slots_.empty() && worker_running_) {
-            stop_ = true;
+            ++generation_;
             worker_running_ = false;
             work_cv_.notify_all();
             to_join.swap(workers_);
@@ -3200,12 +3530,12 @@ void DStoragePriorityScheduler::NotifyWorkAvailable() {
     work_cv_.notify_all();
 }
 
-void DStoragePriorityScheduler::RunLoop() {
+void DStoragePriorityScheduler::RunLoop(uint64_t my_generation) {
     for (;;) {
-        DStorageQueueImpl* chosen = nullptr;
+        std::shared_ptr<DStorageQueueCore> chosen;
         {
             std::unique_lock<std::mutex> lk(mutex_);
-            auto pick_next = [&]() -> DStorageQueueImpl* {
+            auto pick_next = [&]() -> std::shared_ptr<DStorageQueueCore> {
                 // Strictly scan REALTIME(0) > HIGH(1) > NORMAL(2) > LOW(3).
                 // Higher-priority queues get full multi-worker concurrency; if any higher-priority
                 // bucket has pending work (even waiting on its own final barrier), lower buckets
@@ -3218,7 +3548,7 @@ void DStoragePriorityScheduler::RunLoop() {
                     for (size_t off = 0u; off < n; ++off) {
                         const size_t idx = (start + off) % n;
                         Slot& s = slots_[idx];
-                        if (s.bucket != b || s.removing) continue;
+                        if (s.bucket != b || s.removing || !s.queue) continue;
                         if (s.queue->HasPendingActiveOrInFlight()) {
                             bucket_busy = true;
                         }
@@ -3241,12 +3571,12 @@ void DStoragePriorityScheduler::RunLoop() {
             };
 
             work_cv_.wait(lk, [&]() {
-                if (stop_) return true;
+                if (generation_ != my_generation) return true;
                 chosen = pick_next();
                 return chosen != nullptr;
             });
 
-            if (stop_ && !chosen) {
+            if (generation_ != my_generation && !chosen) {
                 return;
             }
         }
@@ -3257,7 +3587,7 @@ void DStoragePriorityScheduler::RunLoop() {
             {
                 std::lock_guard<std::mutex> lk(mutex_);
                 for (auto& s : slots_) {
-                    if (s.queue == chosen) {
+                    if (s.queue.get() == chosen.get()) {
                         if (s.active_workers > 0u) --s.active_workers;
                         if (s.active_workers == 0u) {
                             notify_next = true;
@@ -3269,6 +3599,7 @@ void DStoragePriorityScheduler::RunLoop() {
                     }
                 }
             }
+            chosen.reset();
             if (notify_next) {
                 work_cv_.notify_all();
             }
@@ -3336,7 +3667,11 @@ public:
             desc->SourceType != DSTORAGE_REQUEST_SOURCE_MEMORY) {
             return RecordHr("IDStorageFactoryX::CreateQueue", OS_DSTORAGE_E_INVALIDARG, 3);
         }
-        auto* q = new (std::nothrow) DStorageQueueImpl(*desc, staging_size_, DSTORAGE_QUEUE_OPTIONS_NONE);
+        auto core = DStorageQueueCore::Create(*desc, staging_size_, DSTORAGE_QUEUE_OPTIONS_NONE);
+        if (!core) {
+            return RecordHr("IDStorageFactoryX::CreateQueue", OS_DSTORAGE_E_OUTOFMEMORY, 3);
+        }
+        auto* q = new (std::nothrow) DStorageQueueImpl(std::move(core));
         if (!q) {
             return RecordHr("IDStorageFactoryX::CreateQueue", OS_DSTORAGE_E_OUTOFMEMORY, 3);
         }
@@ -3367,7 +3702,7 @@ public:
             return RecordHr("IDStorageFactoryX::OpenFile", OS_DSTORAGE_E_FILE_NOT_FOUND, 4);
         }
         const bool attached = DStorageIocpEngine::Global().AttachFile(h);
-        auto* f = new (std::nothrow) DStorageFileImpl(h, attached);
+        auto* f = new (std::nothrow) DStorageFileImpl(h, attached, path);
         if (!f) {
             CloseHandle(h);
             if (attached) DStorageIocpEngine::Global().DetachFile();
@@ -3464,7 +3799,11 @@ public:
         base_desc.Capacity = desc->Capacity;
         base_desc.Priority = desc->Priority;
         base_desc.Name = desc->Name;
-        auto* q = new (std::nothrow) DStorageQueueImpl(base_desc, staging_size_, desc->Options);
+        auto core = DStorageQueueCore::Create(base_desc, staging_size_, desc->Options);
+        if (!core) {
+            return RecordHr("IDStorageFactoryX2::CreateQueue1", OS_DSTORAGE_E_OUTOFMEMORY, 10);
+        }
+        auto* q = new (std::nothrow) DStorageQueueImpl(std::move(core));
         if (!q) {
             return RecordHr("IDStorageFactoryX2::CreateQueue1", OS_DSTORAGE_E_OUTOFMEMORY, 10);
         }

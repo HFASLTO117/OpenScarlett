@@ -5,6 +5,21 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <mutex>
+
+#if defined(_WIN32)
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  ifndef NOMINMAX
+#    define NOMINMAX
+#  endif
+#  include <d3d12.h>
+#  include <d3dcompiler.h>
+#  include <dxgi1_6.h>
+#  include <windows.h>
+#  include "openscarlett/gpu/d3d12_adapter.h"
+#endif
 
 namespace openscarlett {
 
@@ -547,6 +562,730 @@ void Bink2YCbCr709ToRgb(uint8_t y, uint8_t cb, uint8_t cr, uint8_t& r, uint8_t& 
     r = ClampU8(yf + 1.574800f * crf);
     g = ClampU8(yf - 0.187324f * cbf - 0.468124f * crf);
     b = ClampU8(yf + 1.855600f * cbf);
+}
+
+void Bink2RgbToYCbCr601(uint8_t r, uint8_t g, uint8_t b, uint8_t& y, uint8_t& cb, uint8_t& cr) noexcept {
+    const float rf = static_cast<float>(r);
+    const float gf = static_cast<float>(g);
+    const float bf = static_cast<float>(b);
+    const float yf = 0.299000f * rf + 0.587000f * gf + 0.114000f * bf;
+    const float cbf = 128.0f - 0.168736f * rf - 0.331264f * gf + 0.500000f * bf;
+    const float crf = 128.0f + 0.500000f * rf - 0.418688f * gf - 0.081312f * bf;
+    y = ClampU8(yf);
+    cb = ClampU8(cbf);
+    cr = ClampU8(crf);
+}
+
+void Bink2YCbCr601ToRgb(uint8_t y, uint8_t cb, uint8_t cr, uint8_t& r, uint8_t& g, uint8_t& b) noexcept {
+    const float yf = static_cast<float>(y);
+    const float cbf = static_cast<float>(cb) - 128.0f;
+    const float crf = static_cast<float>(cr) - 128.0f;
+    r = ClampU8(yf + 1.402000f * crf);
+    g = ClampU8(yf - 0.344136f * cbf - 0.714136f * crf);
+    b = ClampU8(yf + 1.772000f * cbf);
+}
+
+Status Bink2ConvertYuv420pToRgbaCpu(
+    uint32_t width,
+    uint32_t height,
+    const uint8_t* plane_y,
+    uint32_t pitch_y,
+    const uint8_t* plane_u,
+    uint32_t pitch_u,
+    const uint8_t* plane_v,
+    uint32_t pitch_v,
+    const uint8_t* plane_a,
+    uint32_t pitch_a,
+    Bink2ColorMatrix matrix,
+    Bink2PixelFormat pixel_format,
+    std::vector<uint8_t>& out_rgba) {
+    out_rgba.clear();
+    if (width == 0u || height == 0u || width > 7680u || height > 4320u ||
+        !plane_y || !plane_u || !plane_v) {
+        return Status::Error(StatusCode::InvalidArgument, "Bink2 YUV->RGBA invalid arguments");
+    }
+    const uint32_t cw = (width + 1u) / 2u;
+    const uint32_t py = (pitch_y != 0u) ? pitch_y : width;
+    const uint32_t pu = (pitch_u != 0u) ? pitch_u : cw;
+    const uint32_t pv = (pitch_v != 0u) ? pitch_v : cw;
+    const uint32_t pa = (pitch_a != 0u) ? pitch_a : width;
+    if (py < width || pu < cw || pv < cw || (plane_a && pa < width)) {
+        return Status::Error(StatusCode::InvalidArgument, "Bink2 YUV->RGBA pitch smaller than plane width");
+    }
+
+    out_rgba.resize(static_cast<size_t>(width) * height * 4u);
+    const bool is_bgra = (pixel_format == Bink2PixelFormat::Bgra8);
+    const bool is_601 = (matrix == Bink2ColorMatrix::Bt601);
+
+    for (uint32_t y = 0u; y < height; ++y) {
+        const uint8_t* row_y = plane_y + static_cast<size_t>(y) * py;
+        const uint8_t* row_u = plane_u + static_cast<size_t>(y >> 1u) * pu;
+        const uint8_t* row_v = plane_v + static_cast<size_t>(y >> 1u) * pv;
+        const uint8_t* row_a = plane_a ? (plane_a + static_cast<size_t>(y) * pa) : nullptr;
+        uint8_t* dst = out_rgba.data() + static_cast<size_t>(y) * width * 4u;
+        for (uint32_t x = 0u; x < width; ++x) {
+            const uint8_t yv = row_y[x];
+            const uint8_t uv = row_u[x >> 1u];
+            const uint8_t vv = row_v[x >> 1u];
+            const uint8_t av = row_a ? row_a[x] : 255u;
+            uint8_t r = 0u, g = 0u, b = 0u;
+            if (is_601) {
+                Bink2YCbCr601ToRgb(yv, uv, vv, r, g, b);
+            } else {
+                Bink2YCbCr709ToRgb(yv, uv, vv, r, g, b);
+            }
+            const size_t o = static_cast<size_t>(x) * 4u;
+            if (is_bgra) {
+                dst[o + 0u] = b;
+                dst[o + 1u] = g;
+                dst[o + 2u] = r;
+                dst[o + 3u] = av;
+            } else {
+                dst[o + 0u] = r;
+                dst[o + 1u] = g;
+                dst[o + 2u] = b;
+                dst[o + 3u] = av;
+            }
+        }
+    }
+    return Status::Ok();
+}
+
+// ---------------------------------------------------------------------------
+// Live D3D12 Compute-Shader Planar YUV420p(+A) -> RGBA8/BGRA8 Converter
+// Portable across MSVC, Clang-CL, MinGW-w64 (explicit inline GUIDs, zero __uuidof).
+// ---------------------------------------------------------------------------
+namespace {
+
+#if defined(_WIN32)
+constexpr GUID kBinkIidId3d12RootSignature = {
+    0xC54A6B66u, 0x72DFu, 0x4EE8u, {0x8B, 0xE5u, 0xA9, 0x46, 0xA1, 0x42, 0x92, 0x14}};
+constexpr GUID kBinkIidId3d12PipelineState = {
+    0x765A30F3u, 0xF624u, 0x4C6Fu, {0xA8, 0x28u, 0xAC, 0xE9, 0x48, 0x62, 0x24, 0x45}};
+constexpr GUID kBinkIidId3d12CommandQueue = {
+    0x0EC870A6u, 0x5D7Eu, 0x4C22u, {0x8C, 0xFCu, 0x5B, 0xAA, 0xE0, 0x76, 0x16, 0xED}};
+constexpr GUID kBinkIidId3d12CommandAllocator = {
+    0x6102DEE4u, 0xAF59u, 0x4B09u, {0xB9, 0x99u, 0xB4, 0x4D, 0x73, 0xF0, 0x9B, 0x24}};
+constexpr GUID kBinkIidId3d12GraphicsCommandList = {
+    0x5B160D0Fu, 0xAC1Bu, 0x4185u, {0x8B, 0xA8u, 0xB3, 0xAE, 0x42, 0xA5, 0xA4, 0x55}};
+constexpr GUID kBinkIidId3d12Fence = {
+    0x0A753DCFu, 0xC4D8u, 0x4B91u, {0xAD, 0xF6u, 0xBE, 0x5A, 0x60, 0xD9, 0x5A, 0x76}};
+constexpr GUID kBinkIidId3d12Resource = {
+    0x696442BEu, 0xA72Eu, 0x4059u, {0xBC, 0x79u, 0x5B, 0x5C, 0x98, 0x04, 0x0F, 0xAD}};
+
+constexpr const char* kBinkYuvToRgbaHlsl = R"(
+cbuffer BinkYuvParams : register(b0) {
+    uint width;
+    uint height;
+    uint pitchY;
+    uint pitchU;
+    uint pitchV;
+    uint pitchA;
+    uint offsetY;
+    uint offsetU;
+    uint offsetV;
+    uint offsetA;
+    uint matrixMode;
+    uint pixelFormat;
+    uint hasAlpha;
+    uint pad0;
+    uint pad1;
+    uint pad2;
+};
+
+ByteAddressBuffer SrcPlanes : register(t0);
+RWByteAddressBuffer DstRgba : register(u0);
+
+uint LoadU8(uint byteOff) {
+    uint word = SrcPlanes.Load(byteOff & ~3u);
+    return (word >> ((byteOff & 3u) * 8u)) & 0xFFu;
+}
+
+uint ClampRoundU8(float v) {
+    return (uint)clamp(floor(v + 0.5), 0.0, 255.0);
+}
+
+[numthreads(8, 8, 1)]
+void BinkYuv420ToRgbaCS(uint3 tid : SV_DispatchThreadID) {
+    if (tid.x >= width || tid.y >= height) {
+        return;
+    }
+    uint x = tid.x;
+    uint y = tid.y;
+    uint cx = x >> 1u;
+    uint cy = y >> 1u;
+
+    float yf  = (float)LoadU8(offsetY + y * pitchY + x);
+    float cbf = (float)LoadU8(offsetU + cy * pitchU + cx) - 128.0;
+    float crf = (float)LoadU8(offsetV + cy * pitchV + cx) - 128.0;
+    uint av   = 255u;
+    [branch] if (hasAlpha != 0u) {
+        av = LoadU8(offsetA + y * pitchA + x);
+    }
+
+    float rf, gf, bf;
+    if (matrixMode != 0u) {
+        // Full-range ITU-R BT.601
+        rf = yf + 1.402000 * crf;
+        gf = yf - 0.344136 * cbf - 0.714136 * crf;
+        bf = yf + 1.772000 * cbf;
+    } else {
+        // Full-range ITU-R BT.709
+        rf = yf + 1.574800 * crf;
+        gf = yf - 0.187324 * cbf - 0.468124 * crf;
+        bf = yf + 1.855600 * cbf;
+    }
+
+    uint r = ClampRoundU8(rf);
+    uint g = ClampRoundU8(gf);
+    uint b = ClampRoundU8(bf);
+
+    uint packed = (pixelFormat != 0u)
+        ? (b | (g << 8u) | (r << 16u) | (av << 24u))
+        : (r | (g << 8u) | (b << 16u) | (av << 24u));
+    DstRgba.Store((y * width + x) * 4u, packed);
+}
+)";
+
+struct BinkYuvCbData {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t pitchY = 0;
+    uint32_t pitchU = 0;
+    uint32_t pitchV = 0;
+    uint32_t pitchA = 0;
+    uint32_t offsetY = 0;
+    uint32_t offsetU = 0;
+    uint32_t offsetV = 0;
+    uint32_t offsetA = 0;
+    uint32_t matrixMode = 0;
+    uint32_t pixelFormat = 0;
+    uint32_t hasAlpha = 0;
+    uint32_t pad0 = 0;
+    uint32_t pad1 = 0;
+    uint32_t pad2 = 0;
+};
+static_assert(sizeof(BinkYuvCbData) == 64u, "BinkYuvCbData must be 64 bytes (16 uint32 constants)");
+
+using PfnD3D12SerializeRootSignature = HRESULT(WINAPI*)(
+    const D3D12_ROOT_SIGNATURE_DESC*, D3D_ROOT_SIGNATURE_VERSION, ID3DBlob**, ID3DBlob**);
+#endif
+
+}  // namespace
+
+struct Bink2GpuColorConverter::Impl {
+    mutable std::mutex mutex;
+    bool initialized = false;
+    bool using_gpu = false;
+    bool is_warp = false;
+    uint64_t gpu_conversions = 0;
+    uint64_t cpu_fallback_conversions = 0;
+    std::string adapter_description;
+
+#if defined(_WIN32)
+    ID3D12Device* device = nullptr;
+    IDXGIAdapter1* adapter = nullptr;
+    ID3D12CommandQueue* cmd_queue = nullptr;
+    ID3D12CommandAllocator* cmd_alloc = nullptr;
+    ID3D12GraphicsCommandList* cmd_list = nullptr;
+    ID3D12RootSignature* root_sig = nullptr;
+    ID3D12PipelineState* pso = nullptr;
+    ID3D12Fence* fence = nullptr;
+    HANDLE fence_event = nullptr;
+    uint64_t fence_val = 0ull;
+
+    ID3D12Resource* cb_upload_buf = nullptr;
+    ID3D12Resource* src_upload_buf = nullptr;
+    ID3D12Resource* src_gpu_buf = nullptr;
+    uint64_t src_cap = 0ull;
+    ID3D12Resource* dst_uav_buf = nullptr;
+    uint64_t dst_uav_cap = 0ull;
+    ID3D12Resource* readback_buf = nullptr;
+    uint64_t readback_cap = 0ull;
+
+    void ReleaseBuffers() {
+        if (cb_upload_buf) { cb_upload_buf->Release(); cb_upload_buf = nullptr; }
+        if (src_upload_buf) { src_upload_buf->Release(); src_upload_buf = nullptr; }
+        if (src_gpu_buf) { src_gpu_buf->Release(); src_gpu_buf = nullptr; }
+        if (dst_uav_buf) { dst_uav_buf->Release(); dst_uav_buf = nullptr; }
+        if (readback_buf) { readback_buf->Release(); readback_buf = nullptr; }
+        src_cap = 0ull;
+        dst_uav_cap = 0ull;
+        readback_cap = 0ull;
+    }
+
+    void ReleaseAll() {
+        ReleaseBuffers();
+        if (pso) { pso->Release(); pso = nullptr; }
+        if (root_sig) { root_sig->Release(); root_sig = nullptr; }
+        if (cmd_list) { cmd_list->Release(); cmd_list = nullptr; }
+        if (cmd_alloc) { cmd_alloc->Release(); cmd_alloc = nullptr; }
+        if (cmd_queue) { cmd_queue->Release(); cmd_queue = nullptr; }
+        if (fence) { fence->Release(); fence = nullptr; }
+        if (fence_event) { CloseHandle(fence_event); fence_event = nullptr; }
+        if (device) { device->Release(); device = nullptr; }
+        if (adapter) { adapter->Release(); adapter = nullptr; }
+        fence_val = 0ull;
+        using_gpu = false;
+        is_warp = false;
+        initialized = false;
+    }
+
+    bool CreateBuffer(
+        D3D12_HEAP_TYPE heap_type,
+        uint64_t size_bytes,
+        D3D12_RESOURCE_FLAGS flags,
+        D3D12_RESOURCE_STATES init_state,
+        ID3D12Resource** out_res) {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = heap_type;
+        hp.CreationNodeMask = 1u;
+        hp.VisibleNodeMask = 1u;
+
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = size_bytes;
+        rd.Height = 1u;
+        rd.DepthOrArraySize = 1u;
+        rd.MipLevels = 1u;
+        rd.Format = DXGI_FORMAT_UNKNOWN;
+        rd.SampleDesc.Count = 1u;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        rd.Flags = flags;
+
+        return SUCCEEDED(device->CreateCommittedResource(
+            &hp, D3D12_HEAP_FLAG_NONE, &rd, init_state, nullptr,
+            kBinkIidId3d12Resource, reinterpret_cast<void**>(out_res))) && (*out_res != nullptr);
+    }
+
+    bool EnsureBuffers(uint64_t src_bytes, uint64_t dst_bytes) {
+        const uint64_t aligned_src = (std::max<uint64_t>(src_bytes, 256ull) + 255ull) & ~255ull;
+        const uint64_t aligned_dst = (std::max<uint64_t>(dst_bytes, 256ull) + 255ull) & ~255ull;
+        if (!cb_upload_buf) {
+            if (!CreateBuffer(D3D12_HEAP_TYPE_UPLOAD, 256ull, D3D12_RESOURCE_FLAG_NONE,
+                              D3D12_RESOURCE_STATE_GENERIC_READ, &cb_upload_buf)) {
+                return false;
+            }
+        }
+        if (!src_upload_buf || !src_gpu_buf || src_cap < aligned_src) {
+            if (src_upload_buf) { src_upload_buf->Release(); src_upload_buf = nullptr; }
+            if (src_gpu_buf) { src_gpu_buf->Release(); src_gpu_buf = nullptr; }
+            if (!CreateBuffer(D3D12_HEAP_TYPE_UPLOAD, aligned_src, D3D12_RESOURCE_FLAG_NONE,
+                              D3D12_RESOURCE_STATE_GENERIC_READ, &src_upload_buf)) {
+                return false;
+            }
+            if (!CreateBuffer(D3D12_HEAP_TYPE_DEFAULT, aligned_src, D3D12_RESOURCE_FLAG_NONE,
+                              D3D12_RESOURCE_STATE_COMMON, &src_gpu_buf)) {
+                return false;
+            }
+            src_cap = aligned_src;
+        }
+        if (!dst_uav_buf || dst_uav_cap < aligned_dst) {
+            if (dst_uav_buf) { dst_uav_buf->Release(); dst_uav_buf = nullptr; }
+            if (!CreateBuffer(D3D12_HEAP_TYPE_DEFAULT, aligned_dst, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                              D3D12_RESOURCE_STATE_COMMON, &dst_uav_buf)) {
+                return false;
+            }
+            dst_uav_cap = aligned_dst;
+        }
+        if (!readback_buf || readback_cap < aligned_dst) {
+            if (readback_buf) { readback_buf->Release(); readback_buf = nullptr; }
+            if (!CreateBuffer(D3D12_HEAP_TYPE_READBACK, aligned_dst, D3D12_RESOURCE_FLAG_NONE,
+                              D3D12_RESOURCE_STATE_COPY_DEST, &readback_buf)) {
+                return false;
+            }
+            readback_cap = aligned_dst;
+        }
+        return true;
+    }
+#else
+    void ReleaseAll() {
+        using_gpu = false;
+        is_warp = false;
+        initialized = false;
+    }
+#endif
+};
+
+Bink2GpuColorConverter::Bink2GpuColorConverter() : impl_(new Impl()) {}
+Bink2GpuColorConverter::~Bink2GpuColorConverter() {
+    Shutdown();
+    delete impl_;
+    impl_ = nullptr;
+}
+
+void Bink2GpuColorConverter::Shutdown() {
+    if (!impl_) return;
+    std::lock_guard<std::mutex> lk(impl_->mutex);
+    impl_->ReleaseAll();
+}
+
+bool Bink2GpuColorConverter::IsGpuReady() const noexcept {
+    if (!impl_) return false;
+    std::lock_guard<std::mutex> lk(impl_->mutex);
+    return impl_->initialized && impl_->using_gpu;
+}
+
+Bink2GpuConverterStats Bink2GpuColorConverter::Stats() const {
+    Bink2GpuConverterStats st{};
+    if (!impl_) return st;
+    std::lock_guard<std::mutex> lk(impl_->mutex);
+    st.initialized = impl_->initialized;
+    st.using_gpu = impl_->using_gpu;
+    st.is_warp = impl_->is_warp;
+    st.gpu_conversions = impl_->gpu_conversions;
+    st.cpu_fallback_conversions = impl_->cpu_fallback_conversions;
+    st.adapter_description = impl_->adapter_description;
+    return st;
+}
+
+Status Bink2GpuColorConverter::Initialize(bool prefer_warp, bool allow_cpu_fallback) {
+    if (!impl_) return Status::Error(StatusCode::DeviceError, "Null Bink2GpuColorConverter");
+    std::lock_guard<std::mutex> lk(impl_->mutex);
+    impl_->ReleaseAll();
+
+#if defined(_WIN32)
+    D3D12AdapterSelectionOptions opts{};
+    opts.prefer_warp = prefer_warp;
+    opts.allow_warp_fallback = !prefer_warp;
+    D3D12AdapterInfo info{};
+    const Status dev_st = SelectD3D12AdapterAndCreateDevice(
+        opts, &impl_->device, &impl_->adapter, &info);
+    if (!dev_st.ok() || !impl_->device) {
+        if (allow_cpu_fallback) {
+            impl_->initialized = true;
+            impl_->using_gpu = false;
+            impl_->adapter_description = "CPU Fallback";
+            return Status::Ok();
+        }
+        return dev_st;
+    }
+
+    auto fail_or_fallback = [&](const char* msg) -> Status {
+        impl_->ReleaseAll();
+        if (allow_cpu_fallback) {
+            impl_->initialized = true;
+            impl_->using_gpu = false;
+            impl_->adapter_description = "CPU Fallback";
+            return Status::Ok();
+        }
+        return Status::Error(StatusCode::DeviceError, msg);
+    };
+
+    // Compile HLSL cs_5_1 compute shader (fallback to cs_5_0 if needed).
+    ID3DBlob* cs_blob = nullptr;
+    ID3DBlob* err_blob = nullptr;
+    HRESULT chr = D3DCompile(
+        kBinkYuvToRgbaHlsl,
+        std::strlen(kBinkYuvToRgbaHlsl),
+        "BinkYuv420ToRgba.hlsl",
+        nullptr,
+        nullptr,
+        "BinkYuv420ToRgbaCS",
+        "cs_5_1",
+        D3DCOMPILE_OPTIMIZATION_LEVEL3,
+        0u,
+        &cs_blob,
+        &err_blob);
+    if (err_blob) { err_blob->Release(); err_blob = nullptr; }
+    if (FAILED(chr) || !cs_blob) {
+        if (cs_blob) { cs_blob->Release(); cs_blob = nullptr; }
+        chr = D3DCompile(
+            kBinkYuvToRgbaHlsl,
+            std::strlen(kBinkYuvToRgbaHlsl),
+            "BinkYuv420ToRgba.hlsl",
+            nullptr,
+            nullptr,
+            "BinkYuv420ToRgbaCS",
+            "cs_5_0",
+            D3DCOMPILE_OPTIMIZATION_LEVEL3,
+            0u,
+            &cs_blob,
+            &err_blob);
+        if (err_blob) { err_blob->Release(); err_blob = nullptr; }
+    }
+    if (FAILED(chr) || !cs_blob) {
+        if (cs_blob) cs_blob->Release();
+        return fail_or_fallback("Failed to compile Bink2 YUV->RGBA compute shader");
+    }
+
+    // Root signature: param 0 = root CBV (b0), param 1 = root SRV (t0), param 2 = root UAV (u0).
+    D3D12_ROOT_PARAMETER params[3]{};
+    params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+    params[0].Descriptor.ShaderRegister = 0u;
+    params[0].Descriptor.RegisterSpace = 0u;
+    params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+    params[1].Descriptor.ShaderRegister = 0u;
+    params[1].Descriptor.RegisterSpace = 0u;
+    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    params[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+    params[2].Descriptor.ShaderRegister = 0u;
+    params[2].Descriptor.RegisterSpace = 0u;
+    params[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+
+    D3D12_ROOT_SIGNATURE_DESC rs_desc{};
+    rs_desc.NumParameters = 3u;
+    rs_desc.pParameters = params;
+    rs_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+    auto fn_serialize = reinterpret_cast<PfnD3D12SerializeRootSignature>(
+        ResolveHostD3D12Proc("D3D12SerializeRootSignature"));
+    ID3DBlob* rs_blob = nullptr;
+    ID3DBlob* rs_err = nullptr;
+    const HRESULT rshr = fn_serialize
+        ? fn_serialize(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1, &rs_blob, &rs_err)
+        : E_FAIL;
+    if (rs_err) rs_err->Release();
+    if (FAILED(rshr) || !rs_blob) {
+        cs_blob->Release();
+        if (rs_blob) rs_blob->Release();
+        return fail_or_fallback("Failed to serialize Bink2 compute root signature");
+    }
+
+    const HRESULT crs_hr = impl_->device->CreateRootSignature(
+        0u, rs_blob->GetBufferPointer(), rs_blob->GetBufferSize(),
+        kBinkIidId3d12RootSignature, reinterpret_cast<void**>(&impl_->root_sig));
+    rs_blob->Release();
+    if (FAILED(crs_hr) || !impl_->root_sig) {
+        cs_blob->Release();
+        return fail_or_fallback("Failed to create Bink2 compute root signature");
+    }
+
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc{};
+    pso_desc.pRootSignature = impl_->root_sig;
+    pso_desc.CS = {cs_blob->GetBufferPointer(), cs_blob->GetBufferSize()};
+    const HRESULT pso_hr = impl_->device->CreateComputePipelineState(
+        &pso_desc, kBinkIidId3d12PipelineState, reinterpret_cast<void**>(&impl_->pso));
+    cs_blob->Release();
+    if (FAILED(pso_hr) || !impl_->pso) {
+        return fail_or_fallback("Failed to create Bink2 compute PSO");
+    }
+
+    D3D12_COMMAND_QUEUE_DESC qd{};
+    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+    if (FAILED(impl_->device->CreateCommandQueue(
+            &qd, kBinkIidId3d12CommandQueue, reinterpret_cast<void**>(&impl_->cmd_queue))) ||
+        !impl_->cmd_queue) {
+        return fail_or_fallback("Failed to create Bink2 compute command queue");
+    }
+    if (FAILED(impl_->device->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_DIRECT, kBinkIidId3d12CommandAllocator,
+            reinterpret_cast<void**>(&impl_->cmd_alloc))) ||
+        !impl_->cmd_alloc) {
+        return fail_or_fallback("Failed to create Bink2 compute command allocator");
+    }
+    if (FAILED(impl_->device->CreateCommandList(
+            0u, D3D12_COMMAND_LIST_TYPE_DIRECT, impl_->cmd_alloc, impl_->pso,
+            kBinkIidId3d12GraphicsCommandList, reinterpret_cast<void**>(&impl_->cmd_list))) ||
+        !impl_->cmd_list) {
+        return fail_or_fallback("Failed to create Bink2 compute command list");
+    }
+    impl_->cmd_list->Close();
+
+    if (FAILED(impl_->device->CreateFence(
+            0ull, D3D12_FENCE_FLAG_NONE, kBinkIidId3d12Fence,
+            reinterpret_cast<void**>(&impl_->fence))) ||
+        !impl_->fence) {
+        return fail_or_fallback("Failed to create Bink2 compute fence");
+    }
+    impl_->fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (!impl_->fence_event) {
+        return fail_or_fallback("Failed to create Bink2 fence event");
+    }
+
+    impl_->initialized = true;
+    impl_->using_gpu = true;
+    impl_->is_warp = info.is_warp;
+    impl_->adapter_description = info.description;
+    return Status::Ok();
+#else
+    (void)prefer_warp;
+    if (allow_cpu_fallback) {
+        impl_->initialized = true;
+        impl_->using_gpu = false;
+        impl_->adapter_description = "CPU Fallback";
+        return Status::Ok();
+    }
+    return Status::Error(StatusCode::UnsupportedFormat, "D3D12 unavailable on non-Windows host");
+#endif
+}
+
+Status Bink2GpuColorConverter::ConvertYuv420pToRgba(
+    uint32_t width,
+    uint32_t height,
+    const uint8_t* plane_y,
+    uint32_t pitch_y,
+    const uint8_t* plane_u,
+    uint32_t pitch_u,
+    const uint8_t* plane_v,
+    uint32_t pitch_v,
+    const uint8_t* plane_a,
+    uint32_t pitch_a,
+    Bink2ColorMatrix matrix,
+    Bink2PixelFormat pixel_format,
+    std::vector<uint8_t>& out_rgba,
+    bool* out_used_gpu) {
+    if (out_used_gpu) *out_used_gpu = false;
+    if (!impl_) return Status::Error(StatusCode::DeviceError, "Null Bink2GpuColorConverter");
+    if (width == 0u || height == 0u || width > 7680u || height > 4320u ||
+        !plane_y || !plane_u || !plane_v) {
+        return Status::Error(StatusCode::InvalidArgument, "Bink2 GPU YUV->RGBA invalid arguments");
+    }
+    const uint32_t cw = (width + 1u) / 2u;
+    const uint32_t ch = (height + 1u) / 2u;
+    const uint32_t py = (pitch_y != 0u) ? pitch_y : width;
+    const uint32_t pu = (pitch_u != 0u) ? pitch_u : cw;
+    const uint32_t pv = (pitch_v != 0u) ? pitch_v : cw;
+    const uint32_t pa = (pitch_a != 0u) ? pitch_a : width;
+    if (py < width || pu < cw || pv < cw || (plane_a && pa < width)) {
+        return Status::Error(StatusCode::InvalidArgument, "Bink2 GPU YUV->RGBA pitch smaller than plane width");
+    }
+
+    std::lock_guard<std::mutex> lk(impl_->mutex);
+#if defined(_WIN32)
+    if (impl_->initialized && impl_->using_gpu && impl_->device && impl_->pso) {
+        auto align4 = [](uint64_t v) noexcept -> uint64_t { return (v + 3ull) & ~3ull; };
+        const uint64_t sz_y = static_cast<uint64_t>(py) * height;
+        const uint64_t sz_u = static_cast<uint64_t>(pu) * ch;
+        const uint64_t sz_v = static_cast<uint64_t>(pv) * ch;
+        const uint64_t sz_a = plane_a ? (static_cast<uint64_t>(pa) * height) : 0ull;
+
+        const uint64_t off_y = 0ull;
+        const uint64_t off_u = align4(off_y + sz_y);
+        const uint64_t off_v = align4(off_u + sz_u);
+        const uint64_t off_a = align4(off_v + sz_v);
+        const uint64_t total_src = align4(off_a + sz_a) + 4ull;
+        const uint64_t total_dst = static_cast<uint64_t>(width) * height * 4ull;
+
+        if (total_src <= 0xFFFFFFFFull && impl_->EnsureBuffers(total_src, total_dst)) {
+            void* mapped_src = nullptr;
+            const D3D12_RANGE empty_range{0, 0};
+            if (SUCCEEDED(impl_->src_upload_buf->Map(0u, &empty_range, &mapped_src)) && mapped_src) {
+                auto* dst_p = static_cast<uint8_t*>(mapped_src);
+                std::memcpy(dst_p + off_y, plane_y, static_cast<size_t>(sz_y));
+                std::memcpy(dst_p + off_u, plane_u, static_cast<size_t>(sz_u));
+                std::memcpy(dst_p + off_v, plane_v, static_cast<size_t>(sz_v));
+                if (plane_a && sz_a > 0ull) {
+                    std::memcpy(dst_p + off_a, plane_a, static_cast<size_t>(sz_a));
+                }
+                impl_->src_upload_buf->Unmap(0u, nullptr);
+
+                BinkYuvCbData cb{};
+                cb.width = width;
+                cb.height = height;
+                cb.pitchY = py;
+                cb.pitchU = pu;
+                cb.pitchV = pv;
+                cb.pitchA = plane_a ? pa : 0u;
+                cb.offsetY = static_cast<uint32_t>(off_y);
+                cb.offsetU = static_cast<uint32_t>(off_u);
+                cb.offsetV = static_cast<uint32_t>(off_v);
+                cb.offsetA = plane_a ? static_cast<uint32_t>(off_a) : 0u;
+                cb.matrixMode = (matrix == Bink2ColorMatrix::Bt601) ? 1u : 0u;
+                cb.pixelFormat = (pixel_format == Bink2PixelFormat::Bgra8) ? 1u : 0u;
+                cb.hasAlpha = plane_a ? 1u : 0u;
+
+                void* mapped_cb = nullptr;
+                bool cb_ok = false;
+                if (SUCCEEDED(impl_->cb_upload_buf->Map(0u, &empty_range, &mapped_cb)) && mapped_cb) {
+                    std::memset(mapped_cb, 0, 256u);
+                    std::memcpy(mapped_cb, &cb, sizeof(cb));
+                    impl_->cb_upload_buf->Unmap(0u, nullptr);
+                    cb_ok = true;
+                }
+
+                const uint64_t aligned_src = (std::max<uint64_t>(total_src, 256ull) + 255ull) & ~255ull;
+                if (cb_ok &&
+                    SUCCEEDED(impl_->cmd_alloc->Reset()) &&
+                    SUCCEEDED(impl_->cmd_list->Reset(impl_->cmd_alloc, nullptr))) {
+                    // Stage source planes to DEFAULT heap buffer (COMMON promotes to COPY_DEST).
+                    impl_->cmd_list->CopyBufferRegion(
+                        impl_->src_gpu_buf, 0ull, impl_->src_upload_buf, 0ull, aligned_src);
+
+                    D3D12_RESOURCE_BARRIER pre[2]{};
+                    pre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    pre[0].Transition = {
+                        impl_->src_gpu_buf,
+                        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+                    pre[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    pre[1].Transition = {
+                        impl_->dst_uav_buf,
+                        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        D3D12_RESOURCE_STATE_COMMON,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+                    impl_->cmd_list->ResourceBarrier(2u, pre);
+
+                    impl_->cmd_list->SetComputeRootSignature(impl_->root_sig);
+                    impl_->cmd_list->SetPipelineState(impl_->pso);
+                    impl_->cmd_list->SetComputeRootConstantBufferView(
+                        0u, impl_->cb_upload_buf->GetGPUVirtualAddress());
+                    impl_->cmd_list->SetComputeRootShaderResourceView(
+                        1u, impl_->src_gpu_buf->GetGPUVirtualAddress());
+                    impl_->cmd_list->SetComputeRootUnorderedAccessView(
+                        2u, impl_->dst_uav_buf->GetGPUVirtualAddress());
+
+                    const uint32_t gx = (width + 7u) / 8u;
+                    const uint32_t gy = (height + 7u) / 8u;
+                    impl_->cmd_list->Dispatch(gx, gy, 1u);
+
+                    D3D12_RESOURCE_BARRIER post[2]{};
+                    post[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                    post[0].UAV.pResource = impl_->dst_uav_buf;
+                    post[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    post[1].Transition = {
+                        impl_->dst_uav_buf,
+                        D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        D3D12_RESOURCE_STATE_COPY_SOURCE};
+                    impl_->cmd_list->ResourceBarrier(2u, post);
+
+                    impl_->cmd_list->CopyBufferRegion(
+                        impl_->readback_buf, 0ull, impl_->dst_uav_buf, 0ull, total_dst);
+
+                    // Note: src_gpu_buf (NON_PIXEL_SHADER_RESOURCE) and dst_uav_buf (COPY_SOURCE)
+                    // are read-only states on DEFAULT buffers and decay back to COMMON after Execute.
+                    if (SUCCEEDED(impl_->cmd_list->Close())) {
+                        ID3D12CommandList* lists[] = {impl_->cmd_list};
+                        impl_->cmd_queue->ExecuteCommandLists(1u, lists);
+                        const uint64_t wait_v = ++impl_->fence_val;
+                        if (SUCCEEDED(impl_->cmd_queue->Signal(impl_->fence, wait_v))) {
+                            bool wait_ok = true;
+                            if (impl_->fence->GetCompletedValue() < wait_v) {
+                                wait_ok = SUCCEEDED(impl_->fence->SetEventOnCompletion(wait_v, impl_->fence_event)) &&
+                                          (WaitForSingleObject(impl_->fence_event, 30000u) == WAIT_OBJECT_0);
+                            }
+                            if (wait_ok && SUCCEEDED(impl_->device->GetDeviceRemovedReason())) {
+                                void* rb_ptr = nullptr;
+                                const D3D12_RANGE rb_range{0, static_cast<SIZE_T>(total_dst)};
+                                if (SUCCEEDED(impl_->readback_buf->Map(0u, &rb_range, &rb_ptr)) && rb_ptr) {
+                                    out_rgba.resize(static_cast<size_t>(total_dst));
+                                    std::memcpy(out_rgba.data(), rb_ptr, static_cast<size_t>(total_dst));
+                                    impl_->readback_buf->Unmap(0u, &empty_range);
+                                    ++impl_->gpu_conversions;
+                                    if (out_used_gpu) *out_used_gpu = true;
+                                    return Status::Ok();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+#endif
+
+    const Status cpu_st = Bink2ConvertYuv420pToRgbaCpu(
+        width, height, plane_y, py, plane_u, pu, plane_v, pv, plane_a, pa,
+        matrix, pixel_format, out_rgba);
+    if (cpu_st.ok()) {
+        ++impl_->cpu_fallback_conversions;
+    }
+    return cpu_st;
 }
 
 Status Bink2EncodeTestStream(

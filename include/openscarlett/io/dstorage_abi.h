@@ -109,6 +109,7 @@ enum DSTORAGE_COMMAND_TYPE : int32_t {
     DSTORAGE_COMMAND_TYPE_REQUEST = 0,
     DSTORAGE_COMMAND_TYPE_STATUS = 1,
     DSTORAGE_COMMAND_TYPE_SIGNAL = 2,
+    DSTORAGE_COMMAND_TYPE_EVENT = 3,
 };
 
 // OpenScarlett host extension (PC DirectStorage concepts). Xbox dstorage_xs.h has no destination
