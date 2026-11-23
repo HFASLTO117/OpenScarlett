@@ -1,5 +1,7 @@
 #define OPENSCARLETT_BUILDING_ACPHAL 1
 #include "openscarlett/audio/acphal_abi.h"
+#include "openscarlett/audio/audio_sync.h"
+#include "openscarlett/audio/audio_trace.h"
 #include "openscarlett/audio/xma2_decoder.h"
 #include "openscarlett/core/telemetry.h"
 
@@ -10,7 +12,6 @@
 #include <deque>
 #include <map>
 #include <memory>
-#include <mutex>
 #include <new>
 #include <unordered_map>
 #include <unordered_set>
@@ -22,6 +23,9 @@
 #endif
 
 namespace {
+
+using openscarlett::audio::SrwLock;
+using openscarlett::audio::SrwLockGuard;
 
 constexpr const char* kModName = "AcpHal.dll";
 constexpr uint32_t kMaxAcpContexts = 256u;
@@ -104,14 +108,14 @@ public:
         uint32_t commandQueueLength, uint32_t messageQueueLength) {
         (void)commandQueueLength;
         (void)messageQueueLength;
-        std::lock_guard<std::mutex> lk(mutex_);
+        SrwLockGuard lk(mutex_);
         connected_ = true;
         messages_.clear();
         return RecordHr("IAcpHal::Connect", ACPHAL_S_OK, 0);
     }
 
     virtual int32_t OPENSCARLETT_ACPHAL_CALL Disconnect() {
-        std::lock_guard<std::mutex> lk(mutex_);
+        SrwLockGuard lk(mutex_);
         connected_ = false;
         XboxAcpMessage msg{};
         msg.type = 0x80u;  // ACP_MESSAGE_TYPE_DISCONNECTED
@@ -131,7 +135,7 @@ public:
         (void)pCommandData;
         (void)extraFlags;
         if (commandId != 0ull) {
-            std::lock_guard<std::mutex> lk(mutex_);
+            SrwLockGuard lk(mutex_);
             XboxAcpMessage msg{};
             msg.type = 0x10u;  // ACP_MESSAGE_TYPE_COMMAND_COMPLETED
             msg.error = 0u;
@@ -142,7 +146,7 @@ public:
     }
 
     virtual bool OPENSCARLETT_ACPHAL_CALL PopMessage(void* pMessage) {
-        std::lock_guard<std::mutex> lk(mutex_);
+        SrwLockGuard lk(mutex_);
         if (messages_.empty()) {
             return false;
         }
@@ -165,13 +169,13 @@ public:
     }
 
 private:
-    std::mutex mutex_;
+    SrwLock mutex_;
     bool connected_ = false;
     std::deque<XboxAcpMessage> messages_;
 };
 
 std::atomic<bool> g_xbox_retail_acphal_mode{false};
-std::mutex g_shape_alloc_mutex;
+SrwLock g_shape_alloc_mutex;
 std::unordered_set<void*> g_synthetic_shape_allocs;
 std::vector<void*> g_xbox_shape_buffers;
 
@@ -209,7 +213,7 @@ public:
         if (contextIndex >= kMaxAcpContexts || !desc) {
             return RecordHr("IAcpHal::ConfigureXmaContext", ACPHAL_E_INVALIDARG, 3);
         }
-        std::lock_guard<std::mutex> lk(mutex_);
+        SrwLockGuard lk(mutex_);
         auto& dec = decoders_[contextIndex];
         if (!dec) {
             dec = std::make_unique<openscarlett::Xma2Decoder>();
@@ -241,7 +245,7 @@ public:
     }
 
     int32_t OPENSCARLETT_ACPHAL_CALL WaitIdle() override {
-        std::lock_guard<std::mutex> lk(mutex_);
+        SrwLockGuard lk(mutex_);
         return RecordHr("IAcpHal::WaitIdle", ACPHAL_S_OK, 6);
     }
 
@@ -250,7 +254,7 @@ public:
         if (contextIndex >= kMaxAcpContexts || !packetCount) {
             return RecordHr("IAcpHal::GetDecodedPacketCount", ACPHAL_E_INVALIDARG, 7);
         }
-        std::lock_guard<std::mutex> lk(mutex_);
+        SrwLockGuard lk(mutex_);
         auto it = decoders_.find(contextIndex);
         *packetCount = (it != decoders_.end() && it->second)
                            ? it->second->Stats().packets_parsed
@@ -260,7 +264,7 @@ public:
 
 private:
     int32_t ExecuteCommand(const AcpHalCommand& cmd) {
-        std::lock_guard<std::mutex> lk(mutex_);
+        SrwLockGuard lk(mutex_);
         switch (cmd.type) {
             case AcpHalCommand_Nop:
             case AcpHalCommand_Flush:
@@ -336,7 +340,7 @@ private:
     }
 
     std::atomic<uint32_t> ref_count_{1};
-    std::mutex mutex_;
+    SrwLock mutex_;
     std::unordered_map<uint32_t, std::unique_ptr<openscarlett::Xma2Decoder>> decoders_;
 };
 
@@ -534,7 +538,7 @@ public:
     }
 
     ~ApuHeapManager() {
-        std::lock_guard<std::mutex> lk(mutex_);
+        SrwLockGuard lk(mutex_);
         for (const auto& kv : by_va_) {
             AlignedFreeHost(kv.second.virtual_address);
         }
@@ -548,7 +552,7 @@ public:
             non_cached_bytes > kNonCachedApuSpaceSize) {
             return ACPHAL_E_INVALIDARG;
         }
-        std::lock_guard<std::mutex> lk(mutex_);
+        SrwLockGuard lk(mutex_);
         const uint64_t cached_used =
             static_cast<uint64_t>(cached_.bytes_allocated) + cached_.bytes_lost;
         const uint64_t non_cached_used =
@@ -598,7 +602,7 @@ public:
         const bool is_non_cached =
             retail_mode ? ((flags & 1u) == 0u) : ((flags & APU_ALLOC_NONCACHED) != 0u);
 
-        std::lock_guard<std::mutex> lk(mutex_);
+        SrwLockGuard lk(mutex_);
         if (!initialized_) {
             cached_.capacity = kDefaultApuCachedHeapBytes;
             non_cached_.capacity = kDefaultApuNonCachedHeapBytes;
@@ -612,8 +616,10 @@ public:
         if (span64 > pool_ptr->capacity || cur_used > pool_ptr->capacity ||
             span64 > pool_ptr->capacity - cur_used) {
             if (retail_mode) {
-                // Retail fallback: if the requested pool is smaller than the allocation,
-                // try the complementary pool (or expand capacity within APU address space).
+                // Retail fallback: real Xbox GDK defines APU_ALLOC_CACHED = 1 (vs 0 in synthetic
+                // ABI). If the requested pool cannot satisfy the allocation, fall back to the
+                // complementary pool when it has sufficient capacity — while strictly honoring
+                // explicit ApuCreateHeap total capacity so OOM & atomic SHAPE rollback still work.
                 ApuHeapPool* alt = use_non_cached ? &cached_ : &non_cached_;
                 const uint64_t alt_used = static_cast<uint64_t>(alt->bytes_allocated) + alt->bytes_lost;
                 if (span64 <= alt->capacity && alt_used <= alt->capacity &&
@@ -621,13 +627,7 @@ public:
                     use_non_cached = !use_non_cached;
                     pool_ptr = alt;
                 } else {
-                    const uint64_t needed = cur_used + span64;
-                    const uint32_t max_cap = use_non_cached ? kNonCachedApuSpaceSize : kCachedApuSpaceSize;
-                    if (needed <= max_cap) {
-                        pool_ptr->capacity = static_cast<uint32_t>(needed);
-                    } else {
-                        return ACPHAL_E_OUTOFMEMORY;
-                    }
+                    return ACPHAL_E_OUTOFMEMORY;
                 }
             } else {
                 return ACPHAL_E_OUTOFMEMORY;
@@ -691,7 +691,7 @@ public:
 
         void* to_free = nullptr;
         {
-            std::lock_guard<std::mutex> lk(mutex_);
+            SrwLockGuard lk(mutex_);
             const uintptr_t va_key = reinterpret_cast<uintptr_t>(virtual_address);
             auto it = by_va_.find(va_key);
             if (it == by_va_.end()) {
@@ -720,7 +720,7 @@ public:
         }
         std::memset(state, 0, sizeof(*state));
 
-        std::lock_guard<std::mutex> lk(mutex_);
+        SrwLockGuard lk(mutex_);
         if (!initialized_) {
             return ACPHAL_S_OK;
         }
@@ -747,7 +747,7 @@ public:
         if (va + static_cast<uintptr_t>(size_in_bytes) < va) {
             return 0;
         }
-        std::lock_guard<std::mutex> lk(mutex_);
+        SrwLockGuard lk(mutex_);
         auto it = by_va_.upper_bound(va);
         if (it == by_va_.begin()) {
             return 0;
@@ -777,7 +777,7 @@ public:
             return APU_INVALID_ADDRESS;
         }
         const uintptr_t va = reinterpret_cast<uintptr_t>(virtual_address);
-        std::lock_guard<std::mutex> lk(mutex_);
+        SrwLockGuard lk(mutex_);
         auto it = by_va_.upper_bound(va);
         if (it == by_va_.begin()) {
             return APU_INVALID_ADDRESS;
@@ -803,7 +803,7 @@ public:
         if (apu_address == APU_INVALID_ADDRESS) {
             return nullptr;
         }
-        std::lock_guard<std::mutex> lk(mutex_);
+        SrwLockGuard lk(mutex_);
         auto it = by_apu_.upper_bound(apu_address);
         if (it == by_apu_.begin()) {
             return nullptr;
@@ -837,7 +837,7 @@ public:
         if (req_end < req_start || req_end > 0x100000000ull) {
             return ACPHAL_E_INVALIDARG;
         }
-        std::lock_guard<std::mutex> lk(mutex_);
+        SrwLockGuard lk(mutex_);
         auto it = by_apu_.upper_bound(apu_address);
         if (it == by_apu_.begin()) {
             return ACPHAL_E_INVALIDARG;
@@ -868,7 +868,7 @@ public:
         if (req_end < req_start || req_end > 0x100000000ull) {
             return ACPHAL_E_INVALIDARG;
         }
-        std::lock_guard<std::mutex> lk(mutex_);
+        SrwLockGuard lk(mutex_);
         if (!cached_.IsRangeWithinSpace(req_start, size_in_bytes) &&
             !non_cached_.IsRangeWithinSpace(req_start, size_in_bytes)) {
             return ACPHAL_E_INVALIDARG;
@@ -922,7 +922,7 @@ private:
         return false;
     }
 
-    std::mutex mutex_;
+    SrwLock mutex_;
     bool initialized_ = false;
     ApuHeapPool cached_{};
     ApuHeapPool non_cached_{};
@@ -1030,17 +1030,18 @@ int32_t OPENSCARLETT_ACPHAL_CALL AcpHalAllocateShapeContexts(
             stage_bytes[i] = static_cast<uint32_t>(total64);
         }
 
-        std::lock_guard<std::mutex> lk(g_shape_alloc_mutex);
+        SrwLockGuard lk(g_shape_alloc_mutex);
         void* allocated_ptrs[6] = {};
         int32_t fail_hr = ACPHAL_S_OK;
+        constexpr uint32_t kXboxRetailApuAllocCached = 1u;
         for (size_t i = 0u; i < 6u; ++i) {
             if (stage_bytes[i] == 0u) {
                 continue;
             }
             void* va = nullptr;
             APU_ADDRESS pa = APU_INVALID_ADDRESS;
-            const int32_t hr =
-                ApuHeapManager::Instance().Alloc(&va, &pa, stage_bytes[i], 64u, APU_ALLOC_CACHED);
+            const int32_t hr = ApuHeapManager::Instance().Alloc(
+                &va, &pa, stage_bytes[i], 64u, kXboxRetailApuAllocCached);
             if (hr != ACPHAL_S_OK || !va) {
                 fail_hr = (hr < 0) ? hr : ACPHAL_E_OUTOFMEMORY;
                 // Atomic rollback of stages 0..(i-1) without clobbering caller slots.
@@ -1123,7 +1124,7 @@ int32_t OPENSCARLETT_ACPHAL_CALL AcpHalAllocateShapeContexts(
     pAllocated->numDmaContexts = alloc->num_dma;
     pAllocated->internalAllocation = alloc;
     {
-        std::lock_guard<std::mutex> lk(g_shape_alloc_mutex);
+        SrwLockGuard lk(g_shape_alloc_mutex);
         g_synthetic_shape_allocs.insert(alloc);
     }
     return RecordHr("AcpHalAllocateShapeContexts", ACPHAL_S_OK);
@@ -1131,7 +1132,7 @@ int32_t OPENSCARLETT_ACPHAL_CALL AcpHalAllocateShapeContexts(
 
 int32_t OPENSCARLETT_ACPHAL_CALL AcpHalReleaseShapeContexts(AcpHalShapeContexts* pAllocated) {
     {
-        std::lock_guard<std::mutex> lk(g_shape_alloc_mutex);
+        SrwLockGuard lk(g_shape_alloc_mutex);
         if (IsWritableAcpPtr(pAllocated, sizeof(AcpHalShapeContexts)) &&
             pAllocated->internalAllocation != nullptr &&
             g_synthetic_shape_allocs.erase(pAllocated->internalAllocation) > 0) {

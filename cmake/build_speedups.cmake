@@ -116,6 +116,7 @@ endforeach()
 # 4. Serialize tests touching live host WASAPI audio endpoints.
 foreach(_audio_test
     test_audio_opus_wasapi
+    test_dstorage_audio_diag_parity
     test_media_video_gameinput
     test_s16_media_storage_audio
 )
