@@ -977,7 +977,6 @@ void PipelineStateXProxy::EnsureLiftedOnBind() {
     lift_attempted_.store(true, std::memory_order_release);
     if (!pending_xdat_ || !device_x_) return;
     device_x_->LiftPendingXdatGraphicsPso(this);
-    pending_xdat_.reset();
 }
 
 HRESULT STDMETHODCALLTYPE PipelineStateXProxy::QueryInterface(REFIID riid, void** ppvObject) {
@@ -1189,7 +1188,10 @@ HRESULT STDMETHODCALLTYPE FenceXProxy::GetDevice(REFIID riid, void** ppvDevice) 
 }
 
 UINT64 STDMETHODCALLTYPE FenceXProxy::GetCompletedValue() {
-    return host_fence_ ? host_fence_->GetCompletedValue() : UINT64_MAX;
+    if (!host_fence_) return UINT64_MAX;
+    const UINT64 v = host_fence_->GetCompletedValue();
+    AdvanceCpuFenceWord(v);
+    return v;
 }
 
 HRESULT STDMETHODCALLTYPE FenceXProxy::SetEventOnCompletion(UINT64 Value, HANDLE hEvent) {
@@ -1197,7 +1199,12 @@ HRESULT STDMETHODCALLTYPE FenceXProxy::SetEventOnCompletion(UINT64 Value, HANDLE
 }
 
 HRESULT STDMETHODCALLTYPE FenceXProxy::Signal(UINT64 Value) {
-    return host_fence_ ? host_fence_->Signal(Value) : E_FAIL;
+    if (!host_fence_) return E_FAIL;
+    const HRESULT hr = host_fence_->Signal(Value);
+    if (SUCCEEDED(hr)) {
+        AdvanceCpuFenceWord(Value);
+    }
+    return hr;
 }
 
 D3D12_FENCE_FLAGS STDMETHODCALLTYPE FenceXProxy::GetCreationFlags() {

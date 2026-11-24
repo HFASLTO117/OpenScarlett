@@ -304,6 +304,8 @@ private:
         D3D12XBOX_COLOR_SPACE req_color_space);
     HRESULT EnsureReadbackBufferLocked(uint64_t required_bytes);
     HRESULT EnsureToneMapUploadBufferLocked(uint64_t required_bytes);
+    HRESULT EnsureCompositeObjectsLocked(uint32_t width, uint32_t height, DXGI_FORMAT rt_format);
+    void ReleaseCompositeObjectsLocked();
     HRESULT WaitForInternalFenceLocked();
     void AttachWindowSubclassLocked(HWND hwnd);
     void DetachWindowSubclassLocked();
@@ -345,6 +347,17 @@ private:
     uint64_t readback_buf_capacity_ = 0;
     ID3D12Resource* tonemap_upload_buf_ = nullptr;
     uint64_t tonemap_upload_capacity_ = 0;
+
+    ID3D12RootSignature* composite_rs_ = nullptr;
+    ID3D12PipelineState* composite_pso_ = nullptr;
+    DXGI_FORMAT composite_pso_rt_format_ = DXGI_FORMAT_UNKNOWN;
+    ID3D12DescriptorHeap* composite_rtv_heap_ = nullptr;
+    ID3D12DescriptorHeap* composite_srv_heap_ = nullptr;
+    ID3D12Resource* composite_rt_ = nullptr;
+    uint32_t composite_rt_width_ = 0u;
+    uint32_t composite_rt_height_ = 0u;
+    DXGI_FORMAT composite_rt_format_ = DXGI_FORMAT_UNKNOWN;
+    bool composite_compile_failed_ = false;
 
     IDXGISwapChain3* swapchain_ = nullptr;
     IDXGISwapChain4* swapchain4_ = nullptr;
@@ -415,6 +428,11 @@ private:
     uint64_t retire_fence_val_ = 0ull;
     std::vector<std::pair<uint64_t, std::vector<ID3D12Resource*>>> pending_retirements_;
     void PumpPendingRetirementsLocked() noexcept;
+
+    // Non-blocking GPU-ordered Write32BitValueX / Write64BitValueX fence completion
+    std::mutex deferred_write_mutex_;
+    ID3D12Fence* deferred_write_fence_ = nullptr;
+    uint64_t deferred_write_fence_val_ = 0ull;
 };
 
 }  // namespace openscarlett::d3d12_xs

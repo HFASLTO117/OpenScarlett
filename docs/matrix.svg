@@ -117,7 +117,7 @@
     <rect x="368" y="468" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="368" y="468" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="378" y="482">kernelx</text>
-    <text class="tiny" x="378" y="493">92 exports · high</text>
+    <text class="tiny" x="378" y="493">100 exports · high</text>
     <rect x="539" y="468" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="539" y="468" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="549" y="482">XCurl</text>
@@ -133,7 +133,7 @@
     <rect x="197" y="506" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="197" y="506" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="207" y="520">xmem</text>
-    <text class="tiny" x="207" y="531">24 exports · high</text>
+    <text class="tiny" x="207" y="531">25 exports · high</text>
     <rect x="368" y="506" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="368" y="506" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="378" y="520">XAudio2_9</text>
@@ -193,11 +193,11 @@
     <rect x="197" y="620" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="197" y="620" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="207" y="634">xapu</text>
-    <text class="tiny" x="207" y="645">5 exports · high</text>
+    <text class="tiny" x="207" y="645">6 exports · high</text>
     <rect x="368" y="620" width="163" height="30" rx="6" fill="#12261e" stroke="#30363d" stroke-width="1"/>
     <rect x="368" y="620" width="3.5" height="30" rx="2" fill="#2ea043"/>
     <text class="mono" x="378" y="634">chad</text>
-    <text class="tiny" x="378" y="645">5 exports · high</text>
+    <text class="tiny" x="378" y="645">7 exports · high</text>
     <rect x="539" y="620" width="163" height="30" rx="6" fill="#261e10" stroke="#30363d" stroke-width="1"/>
     <rect x="539" y="620" width="3.5" height="30" rx="2" fill="#d29922"/>
     <text class="mono" x="549" y="634">pixevt</text>

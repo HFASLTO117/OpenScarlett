@@ -356,6 +356,9 @@ private:
 // ---------------------------------------------------------------------------
 struct PendingXdatGfxDesc {
     bool is_compute = false;
+    bool from_slot57 = false;
+    uint32_t vs_cbv_slot_mask = 0u;
+    uint32_t ps_cbv_slot_mask = 0u;
     std::vector<uint8_t> vs_blob;
     std::vector<uint8_t> ps_blob;
     std::vector<uint8_t> hs_blob;
@@ -507,32 +510,32 @@ public:
     // Slot 12 (+0x60): GetCompletedValuePtrX() -> returns pointer to 64-bit fence value word
     // (verified live at RVA 0x4FB0AEC..0x4FB0B30: caller dereferences [rax] and compares vs target).
     virtual const volatile uint64_t* STDMETHODCALLTYPE GetCompletedValuePtrX() {
-        SyncCpuFenceWord();
+        cpu_fence_ptr_queried_.store(true, std::memory_order_release);
+        if (host_fence_) {
+            AdvanceCpuFenceWord(host_fence_->GetCompletedValue());
+        }
         return &cpu_fence_word_;
+    }
+    bool IsCpuFencePtrQueried() const noexcept {
+        return cpu_fence_ptr_queried_.load(std::memory_order_acquire);
+    }
+    void AdvanceCpuFenceWord(uint64_t completed_val) noexcept {
+        if (completed_val == UINT64_MAX) return;
+        LONG64 cur = *reinterpret_cast<const volatile LONG64*>(&cpu_fence_word_);
+        while (static_cast<uint64_t>(cur) < completed_val) {
+            const LONG64 prev = ::InterlockedCompareExchange64(
+                reinterpret_cast<volatile LONG64*>(&cpu_fence_word_),
+                static_cast<LONG64>(completed_val),
+                cur);
+            if (prev == cur) break;
+            cur = prev;
+        }
     }
     void NotifyGpuSignal(uint64_t value) noexcept {
         uint64_t cur = pending_gpu_signal_.load(std::memory_order_acquire);
         while (value > cur && !pending_gpu_signal_.compare_exchange_weak(cur, value, std::memory_order_acq_rel)) {}
-        SyncCpuFenceWord();
-    }
-    void SyncCpuFenceWord() noexcept {
-        uint64_t v = host_fence_ ? host_fence_->GetCompletedValue() : 0ull;
-        const uint64_t pend = pending_gpu_signal_.load(std::memory_order_acquire);
-        if (host_fence_ && v != UINT64_MAX && pend > v) {
-            HANDLE ev = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
-            if (ev) {
-                if (SUCCEEDED(host_fence_->SetEventOnCompletion(pend, ev))) {
-                    ::WaitForSingleObject(ev, 50u);
-                }
-                ::CloseHandle(ev);
-            }
-            v = host_fence_->GetCompletedValue();
-            if (v < pend) {
-                v = pend;
-            }
-        }
-        if (v > cpu_fence_word_) {
-            cpu_fence_word_ = v;
+        if (host_fence_) {
+            AdvanceCpuFenceWord(host_fence_->GetCompletedValue());
         }
     }
     virtual HRESULT STDMETHODCALLTYPE XboxFenceSlot13() { return S_OK; }
@@ -557,6 +560,7 @@ private:
     D3D12_FENCE_FLAGS creation_flags_ = D3D12_FENCE_FLAG_NONE;
     volatile uint64_t cpu_fence_word_ = 0ull;
     std::atomic<uint64_t> pending_gpu_signal_{0ull};
+    std::atomic<bool> cpu_fence_ptr_queried_{false};
 };
 
 // ---------------------------------------------------------------------------

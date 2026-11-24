@@ -1600,7 +1600,10 @@ Status BuildRdna2Ir(
             else out_module.uses_uav1 = true;
             return static_cast<uint32_t>(slot);
         }
-        const uint32_t slot = (srsrc == 0u) ? 0u : 1u;
+        const uint32_t slot =
+            (pb_cfg.enabled && !is_write && (pb_cfg.in0_is_cbv || pb_cfg.in0_is_srv))
+                ? 0u
+                : ((srsrc == 0u) ? 0u : 1u);
         if (pb_cfg.enabled && is_write && (pb_cfg.in0_is_cbv || pb_cfg.in0_is_srv)) {
             out_module.used_psv0_uav_buf_mask |= (1u << slot);
         }
@@ -4335,10 +4338,91 @@ Status BuildRdna2Ir(
                 case Rdna2Opcode::TBUFFER_LOAD_FORMAT_D16_XY:
                 case Rdna2Opcode::TBUFFER_LOAD_FORMAT_D16_XYZ:
                 case Rdna2Opcode::TBUFFER_LOAD_FORMAT_D16_XYZW: {
-                    const uint32_t uav_slot = resolve_uav_buf_slot(inst.srsrc, false);
-
-                    bool idx_is_d16 = false;
-                    const uint32_t idx_comps = FormatLoadComponentCount(inst.opcode, idx_is_d16);
+                    bool is_d16 = false;
+                    const uint32_t comps = FormatLoadComponentCount(inst.opcode, is_d16);
+                    const uint32_t fmt_srsrc_reg = static_cast<uint32_t>(inst.srsrc) * 4u;
+                    const bool fmt_is_s2_desc =
+                        !inst.idxen &&
+                        out_module.stage_contract.psv0_bindings.enabled &&
+                        fmt_srsrc_reg < 106u &&
+                        state.sgpr_desc_slot[fmt_srsrc_reg] >= 0 &&
+                        static_cast<uint32_t>(state.sgpr_desc_slot[fmt_srsrc_reg]) < 16u;
+                    if (out_module.stage == ShaderStage::Vertex &&
+                        !out_module.stage_contract.vs_ia_inputs.empty() &&
+                        inst.idxen && !inst.offen && inst.mem_offset >= 0) {
+                        const uint32_t moff = static_cast<uint32_t>(inst.mem_offset);
+                        auto resolve_ia_comp = [&](uint32_t byte_pos, int& out_ai, uint32_t& out_comp, IrType& out_t) -> bool {
+                            for (size_t ai = 0u; ai < out_module.stage_contract.vs_ia_inputs.size(); ++ai) {
+                                const auto& ib = out_module.stage_contract.vs_ia_inputs[ai];
+                                const uint32_t esz = std::max<uint32_t>(1u, ib.elem_byte_size);
+                                if (ib.has_byte_offset &&
+                                    byte_pos >= ib.byte_offset && byte_pos < ib.byte_offset + esz) {
+                                    out_ai = static_cast<int>(ai);
+                                    const uint32_t csz = std::max<uint32_t>(1u, ib.comp_byte_size);
+                                    out_comp = (byte_pos - ib.byte_offset) / csz;
+                                    out_t = (ib.component_type == 1u)
+                                                ? IrType::U32
+                                                : (ib.component_type == 2u ? IrType::I32 : IrType::F32);
+                                    return true;
+                                }
+                            }
+                            return false;
+                        };
+                        int first_ai = -1;
+                        uint32_t first_comp = 0u;
+                        IrType first_t = IrType::F32;
+                        if (resolve_ia_comp(moff, first_ai, first_comp, first_t)) {
+                            const auto& ib0 = out_module.stage_contract.vs_ia_inputs[static_cast<size_t>(first_ai)];
+                            const uint32_t step_bytes = std::max<uint32_t>(1u, ib0.comp_byte_size);
+                            const uint8_t dst_base = static_cast<uint8_t>(inst.dst.reg_index);
+                            auto emit_ia_scalar = [&](uint32_t c_idx, IrType& elem_t) -> IrValueId {
+                                int ai = first_ai;
+                                uint32_t comp = first_comp + c_idx;
+                                elem_t = first_t;
+                                if (!resolve_ia_comp(moff + c_idx * step_bytes, ai, comp, elem_t)) {
+                                    ai = first_ai;
+                                    comp = std::min<uint32_t>(3u, first_comp + c_idx);
+                                    elem_t = first_t;
+                                }
+                                const uint32_t imm =
+                                    (static_cast<uint32_t>(ai & 0x3Fu) << 2u) | (comp & 3u);
+                                return emit_in_bb(IrOp::StageInput, elem_t, {}, imm);
+                            };
+                            if (is_d16) {
+                                const uint32_t reg_count = (comps + 1u) / 2u;
+                                for (uint32_t r = 0u; r < reg_count && dst_base + r < 256u; ++r) {
+                                    IrType t0 = IrType::F32;
+                                    IrValueId v0 = emit_ia_scalar(r * 2u, t0);
+                                    IrType t1 = t0;
+                                    IrValueId v1 = (r * 2u + 1u < comps)
+                                                       ? emit_ia_scalar(r * 2u + 1u, t1)
+                                                       : emit_in_bb(t0 == IrType::F32 ? IrOp::ConstF32 : IrOp::ConstU32,
+                                                                    t0, {}, 0u, 0.0f);
+                                    IrValueId packed = kInvalidIrValue;
+                                    if (t0 == IrType::F32) {
+                                        packed = emit_in_bb(IrOp::PackF16, IrType::U32, {v0, v1});
+                                    } else {
+                                        IrValueId mask16 = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, 0xFFFFu);
+                                        IrValueId sh16 = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, 16u);
+                                        IrValueId lo = emit_in_bb(IrOp::BitAnd, IrType::U32, {v0, mask16});
+                                        IrValueId hi = emit_in_bb(IrOp::Shl, IrType::U32,
+                                                                  {emit_in_bb(IrOp::BitAnd, IrType::U32, {v1, mask16}), sh16});
+                                        packed = emit_in_bb(IrOp::BitOr, IrType::U32, {lo, hi});
+                                    }
+                                    write_dst(Rdna2Operand::Vgpr(static_cast<uint8_t>(dst_base + r)), packed);
+                                }
+                            } else {
+                                for (uint32_t c = 0u; c < comps && dst_base + c < 256u; ++c) {
+                                    IrType tc = IrType::F32;
+                                    IrValueId vc = emit_ia_scalar(c, tc);
+                                    write_dst(Rdna2Operand::Vgpr(static_cast<uint8_t>(dst_base + c)), vc);
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    bool idx_is_d16 = is_d16;
+                    const uint32_t idx_comps = comps;
                     IrValueId addr = kInvalidIrValue;
                     if (inst.offen) {
                         addr = eval_operand(inst.src[1], false);
@@ -4371,13 +4455,41 @@ Status BuildRdna2Ir(
                         addr = emit_in_bb(IrOp::IAdd, IrType::U32, {addr, soff_v});
                     }
 
-                    bool is_d16 = false;
-                    const uint32_t comps = FormatLoadComponentCount(inst.opcode, is_d16);
                     const uint8_t fmt_code = (inst.encoding == Rdna2Encoding::MTBUF && inst.mtbuf_format != 0u)
                                                  ? inst.mtbuf_format
                                                  : static_cast<uint8_t>(Rdna2MtbufFormat::R32G32B32A32_FLOAT);
                     const auto fmt = static_cast<Rdna2MtbufFormat>(fmt_code);
                     const uint8_t dst_base = static_cast<uint8_t>(inst.dst.reg_index);
+
+                    uint32_t fmt_s2_flags = 0u;
+                    if (fmt_is_s2_desc && !is_d16 &&
+                        (inst.encoding == Rdna2Encoding::MUBUF ||
+                         GetRdna2MtbufFormatInfo(fmt_code).component_bytes == 4u)) {
+                        const uint32_t dslot = static_cast<uint32_t>(state.sgpr_desc_slot[fmt_srsrc_reg]);
+                        const bool is_cbv_slot =
+                            (out_module.stage_contract.psv0_bindings.space2_cbv_slot_mask & (1u << dslot)) != 0u;
+                        if (is_cbv_slot) {
+                            out_module.used_space2_cbv_slots |= (1u << dslot);
+                            fmt_s2_flags = kIrLoadCbHeapFlag | (((dslot + 1u) & 0x1Fu) << 24);
+                        } else {
+                            out_module.used_space2_srv_slots |= (1u << dslot);
+                            fmt_s2_flags = (((dslot + 1u) & 0x1Fu) << 24);
+                        }
+                    }
+                    if (fmt_s2_flags != 0u) {
+                        for (uint32_t c = 0u; c < comps && dst_base + c < 256u; ++c) {
+                            IrValueId ak =
+                                (c == 0u)
+                                    ? addr
+                                    : emit_in_bb(IrOp::IAdd, IrType::U32,
+                                                 {addr, emit_in_bb(IrOp::ConstU32, IrType::U32, {}, c * 4u, 0.0f)});
+                            IrValueId raw_v = emit_in_bb(IrOp::LoadUav, IrType::U32, {ak}, fmt_s2_flags);
+                            write_dst(Rdna2Operand::Vgpr(static_cast<uint8_t>(dst_base + c)), raw_v);
+                        }
+                        break;
+                    }
+
+                    const uint32_t uav_slot = resolve_uav_buf_slot(inst.srsrc, false);
 
                     if (is_d16) {
                         // D16 packs 2 converted 16-bit components per VGPR
@@ -4409,8 +4521,67 @@ Status BuildRdna2Ir(
                         (inst.encoding == Rdna2Encoding::MUBUF &&
                          inst.raw_opcode >= 0x30u && inst.raw_opcode <= 0x4Du);
                     const bool is_write_op =
-                        is_mubuf_atomic || (inst.opcode == Rdna2Opcode::BUFFER_STORE_DWORD);
-                    const uint32_t uav_slot = resolve_uav_buf_slot(inst.srsrc, is_write_op);
+                        is_mubuf_atomic || (inst.opcode == Rdna2Opcode::BUFFER_STORE_DWORD &&
+                                            !(inst.encoding == Rdna2Encoding::MUBUF &&
+                                              inst.raw_opcode >= 0x0Cu && inst.raw_opcode <= 0x0Fu));
+                    const uint32_t mubuf_load_count =
+                        (inst.encoding == Rdna2Encoding::MUBUF && inst.raw_opcode == 0x0Du) ? 2u :
+                        (inst.encoding == Rdna2Encoding::MUBUF && inst.raw_opcode == 0x0Eu) ? 4u :
+                        (inst.encoding == Rdna2Encoding::MUBUF && inst.raw_opcode == 0x0Fu) ? 3u : 1u;
+                     const uint32_t srsrc_reg = static_cast<uint32_t>(inst.srsrc) * 4u;
+                    const bool mubuf_is_s2_desc =
+                        !is_write_op && !inst.idxen &&
+                        out_module.stage_contract.psv0_bindings.enabled &&
+                        srsrc_reg < 106u && state.sgpr_desc_slot[srsrc_reg] >= 0 &&
+                        static_cast<uint32_t>(state.sgpr_desc_slot[srsrc_reg]) < 16u;
+                    if (!is_write_op &&
+                        out_module.stage == ShaderStage::Vertex &&
+                        !out_module.stage_contract.vs_ia_inputs.empty() &&
+                        inst.idxen && !inst.offen && inst.mem_offset >= 0) {
+                        const uint32_t moff = static_cast<uint32_t>(inst.mem_offset);
+                        int matched_ai = -1;
+                        uint32_t base_comp = 0u;
+                        for (size_t ai = 0u; ai < out_module.stage_contract.vs_ia_inputs.size(); ++ai) {
+                            const auto& ib = out_module.stage_contract.vs_ia_inputs[ai];
+                            const uint32_t esz = std::max<uint32_t>(1u, ib.elem_byte_size);
+                            if (ib.has_byte_offset &&
+                                moff >= ib.byte_offset && moff < ib.byte_offset + esz) {
+                                matched_ai = static_cast<int>(ai);
+                                const uint32_t csz = std::max<uint32_t>(1u, ib.comp_byte_size);
+                                base_comp = (moff - ib.byte_offset) / csz;
+                                break;
+                            }
+                        }
+                        if (matched_ai >= 0) {
+                            const auto& ib = out_module.stage_contract.vs_ia_inputs[static_cast<size_t>(matched_ai)];
+                            const IrType res_t = (ib.component_type == 1u)
+                                                     ? IrType::U32
+                                                     : (ib.component_type == 2u ? IrType::I32 : IrType::F32);
+                            const uint8_t dst_base = static_cast<uint8_t>(inst.dst.reg_index);
+                            for (uint32_t c = 0u; c < mubuf_load_count && c < 4u && dst_base + c < 256u; ++c) {
+                                const uint32_t imm =
+                                    (static_cast<uint32_t>(matched_ai & 0x3Fu) << 2u) |
+                                    ((base_comp + c) & 3u);
+                                write_dst(Rdna2Operand::Vgpr(static_cast<uint8_t>(dst_base + c)),
+                                          emit_in_bb(IrOp::StageInput, res_t, {}, imm));
+                            }
+                            break;
+                        }
+                    }
+                    uint32_t mubuf_s2_flags = 0u;
+                    if (mubuf_is_s2_desc) {
+                        const uint32_t dslot = static_cast<uint32_t>(state.sgpr_desc_slot[srsrc_reg]);
+                        const bool is_cbv_slot =
+                            (out_module.stage_contract.psv0_bindings.space2_cbv_slot_mask & (1u << dslot)) != 0u;
+                        if (is_cbv_slot) {
+                            out_module.used_space2_cbv_slots |= (1u << dslot);
+                            mubuf_s2_flags = kIrLoadCbHeapFlag | (((dslot + 1u) & 0x1Fu) << 24);
+                        } else {
+                            out_module.used_space2_srv_slots |= (1u << dslot);
+                            mubuf_s2_flags = (((dslot + 1u) & 0x1Fu) << 24);
+                        }
+                    }
+                    const uint32_t uav_slot = (mubuf_s2_flags != 0u) ? 0u : resolve_uav_buf_slot(inst.srsrc, is_write_op);
                     IrValueId addr = kInvalidIrValue;
                     if (inst.offen) {
                         addr = eval_operand(inst.src[1], false);
@@ -4448,8 +4619,17 @@ Status BuildRdna2Ir(
                         if (inst.glc && inst.dst.kind == Rdna2OperandKind::Vgpr) {
                             write_dst(inst.dst, prev);
                         }
-                    } else if (inst.opcode == Rdna2Opcode::BUFFER_LOAD_DWORD) {
-                        write_dst(inst.dst, emit_in_bb(IrOp::LoadUav, IrType::U32, {addr}, uav_slot));
+                    } else if (inst.opcode == Rdna2Opcode::BUFFER_LOAD_DWORD || !is_write_op) {
+                        const uint8_t dst_base = static_cast<uint8_t>(inst.dst.reg_index);
+                        const uint32_t load_imm = (mubuf_s2_flags != 0u) ? mubuf_s2_flags : uav_slot;
+                        for (uint32_t k = 0u; k < mubuf_load_count && dst_base + k < 256u; ++k) {
+                            IrValueId ak = (k == 0u)
+                                               ? addr
+                                               : emit_in_bb(IrOp::IAdd, IrType::U32,
+                                                            {addr, emit_in_bb(IrOp::ConstU32, IrType::U32, {}, k * 4u, 0.0f)});
+                            write_dst(Rdna2Operand::Vgpr(static_cast<uint8_t>(dst_base + k)),
+                                      emit_in_bb(IrOp::LoadUav, IrType::U32, {ak}, load_imm));
+                        }
                     } else if (inst.encoding == Rdna2Encoding::MUBUF &&
                                inst.raw_opcode >= 0x1Du && inst.raw_opcode <= 0x1Fu) {
                         // GFX10.3 buffer_store_dwordx2 (0x1D), dwordx3 (0x1E), dwordx4 (0x1F)

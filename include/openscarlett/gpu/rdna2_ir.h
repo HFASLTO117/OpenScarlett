@@ -262,6 +262,10 @@ struct VsIaInputBinding {
     uint8_t mask = 0xFu;
     uint8_t component_type = 3u;  // 1=uint, 2=sint, 3=float
     uint8_t dst_vgpr_base = 0u;
+    uint8_t elem_byte_size = 16u;
+    uint8_t comp_byte_size = 4u;
+    uint32_t byte_offset = 0u;
+    bool has_byte_offset = false;
 };
 
 struct Psv0HlslResourceEntry {
@@ -307,6 +311,7 @@ struct Psv0HlslBindingOverrides {
     uint32_t rwimg_u32_res_kind = 2u;
     bool cs_fssm_abi = false;
     uint32_t cs_user_sgpr_count = 0u;
+    uint32_t space2_cbv_slot_mask = 0u;
     std::vector<Psv0HlslResourceEntry> uav_buffers;
     std::vector<Psv0HlslResourceEntry> uav_textures;
     std::vector<Psv0HlslResourceEntry> srv_textures;
@@ -320,6 +325,7 @@ struct StageContractTable {
     std::vector<FssmPixelInputEntry> pixel_inputs;
     Rdna2TextureFormat texture_srv_format = Rdna2TextureFormat::Float4;
     std::vector<VsIaInputBinding> vs_ia_inputs;
+    uint32_t min_param_outputs = 0u;
     Psv0HlslBindingOverrides psv0_bindings{};
 };
 

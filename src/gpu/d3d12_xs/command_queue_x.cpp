@@ -13,6 +13,7 @@
 #include "proxies_x.h"
 #include "openscarlett/core/telemetry.h"
 #include "openscarlett/gpu/d3d12_adapter.h"
+#include "openscarlett/gpu/rdna2_lifter.h"
 
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
@@ -1500,6 +1501,13 @@ CommandQueueX::~CommandQueueX() {
     }
     fence_dispatcher_.reset();
     {
+        std::lock_guard<std::mutex> dwlk(deferred_write_mutex_);
+        if (deferred_write_fence_) {
+            deferred_write_fence_->Release();
+            deferred_write_fence_ = nullptr;
+        }
+    }
+    {
         std::lock_guard<std::mutex> lock(present_mutex_);
         ReleasePresentObjectsLocked();
     }
@@ -1688,9 +1696,25 @@ void STDMETHODCALLTYPE CommandQueueX::CopyTileMappings(
     RecordQueue("ID3D12CommandQueueX::CopyTileMappings", 9, S_OK);
 }
 
+namespace {
+std::atomic<uint32_t> g_prof_exec_cnt{0u};
+std::atomic<int64_t> g_prof_exec_qpc{0};
+std::atomic<int64_t> g_prof_sync_qpc{0};
+std::atomic<uint32_t> g_prof_w32_cnt{0u};
+std::atomic<int64_t> g_prof_w32_qpc{0};
+}  // namespace
+
 void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
     UINT NumCommandLists,
     ID3D12CommandList* const* ppCommandLists) {
+    const int64_t exec_t0_qpc = QueryQpcNow();
+    struct ExecProfGuard {
+        int64_t t0;
+        ~ExecProfGuard() {
+            g_prof_exec_cnt.fetch_add(1u, std::memory_order_relaxed);
+            g_prof_exec_qpc.fetch_add(QueryQpcNow() - t0, std::memory_order_relaxed);
+        }
+    } exec_prof_guard{exec_t0_qpc};
     // Auto-sync all dirty/modified unified-memory textures, unified heap buffers, & TitleVAMirror
     // pages BEFORE submitting host command lists so GPU shaders never sample stale CPU memory.
     if (device_x_ && host_queue_) {
@@ -1705,7 +1729,9 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
                 std::fflush(stderr);
             }
         }
+        const int64_t sync_t0 = QueryQpcNow();
         (void)device_x_->SyncAllUnifiedResourcesBeforeSubmit(host_queue_, queue_type_);
+        g_prof_sync_qpc.fetch_add(QueryQpcNow() - sync_t0, std::memory_order_relaxed);
         if (SUCCEEDED(pre_rem) && device_x_->IsRetailScarlettAbi() && device_x_->HostDevice()) {
             const HRESULT mid_rem = device_x_->HostDevice()->GetDeviceRemovedReason();
             if (FAILED(mid_rem)) {
@@ -1745,6 +1771,9 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
     for (UINT i = 0; i < NumCommandLists; ++i) {
         if (CommandListX* clx = CommandListX::TryFromCommandList(ppCommandLists[i])) {
             if (clx->LastCloseFailed()) {
+                // Still honor CPU fence/marker writes & retirements so CPU wait loops never stall.
+                clx->ExtractDeferredCpuOps(deferred_writes, deferred_waits);
+                clx->ExtractTransientResources(batch_transients);
                 continue;  // Never pass an unclosed/invalid command list to host D3D12 queue
             }
             clx->ExtractPendingMirrorWritebacks(pending_writeback_vas);
@@ -1798,23 +1827,25 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
         PumpPendingRetirementsLocked();
     }
     if (device_x_ && CommandListX::IsDiagTraceEnabled() && device_x_->HostDevice()) {
-        // Flush this submission immediately so GetDeviceRemovedReason pinpoints the exact offending list.
+        static const bool s_sync_diag_drain = EnvFlagTrueA("OPENSCARLETT_SYNC_DIAG_DRAIN");
         static std::mutex s_diag_mu;
         static std::atomic<bool> s_dumped{false};
         if (!s_dumped.load(std::memory_order_acquire)) {
-            ID3D12Fence* tmp_fence = nullptr;
-            if (SUCCEEDED(device_x_->HostDevice()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&tmp_fence))) && tmp_fence) {
-                if (SUCCEEDED(host_queue_->Signal(tmp_fence, 1))) {
-                    HANDLE ev = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
-                    if (ev) {
-                        if (tmp_fence->GetCompletedValue() < 1) {
-                            tmp_fence->SetEventOnCompletion(1, ev);
-                            ::WaitForSingleObject(ev, 5000);
+            if (s_sync_diag_drain) {
+                ID3D12Fence* tmp_fence = nullptr;
+                if (SUCCEEDED(device_x_->HostDevice()->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&tmp_fence))) && tmp_fence) {
+                    if (SUCCEEDED(host_queue_->Signal(tmp_fence, 1))) {
+                        HANDLE ev = ::CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                        if (ev) {
+                            if (tmp_fence->GetCompletedValue() < 1) {
+                                tmp_fence->SetEventOnCompletion(1, ev);
+                                ::WaitForSingleObject(ev, 5000);
+                            }
+                            ::CloseHandle(ev);
                         }
-                        ::CloseHandle(ev);
                     }
+                    tmp_fence->Release();
                 }
-                tmp_fence->Release();
             }
             const HRESULT rem_hr = device_x_->HostDevice()->GetDeviceRemovedReason();
             static const bool dump_dbg_iq = []() {
@@ -2019,32 +2050,105 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
     }
 
     if (!deferred_writes.empty()) {
-        {
-            std::lock_guard<std::mutex> lock(present_mutex_);
-            if (SUCCEEDED(EnsurePresentHelperObjectsLocked())) {
-                WaitForInternalFenceLocked();
+        static const bool s_sync_dw = EnvFlagTrueA("OPENSCARLETT_SYNC_DEFERRED_WRITES");
+        const int64_t qpc_freq = qpc_freq_;
+        auto commit_writes = [qpc_freq](const std::vector<DeferredCpuWrite32>& writes) {
+            for (const auto& wr : writes) {
+                if (wr.is_64bit) {
+                    if (IsWritableCpuVa(wr.address, sizeof(uint64_t))) {
+                        uint64_t v = wr.value;
+                        if (wr.is_timestamp) {
+                            const int64_t now = QueryQpcNow();
+                            v = (qpc_freq > 0)
+                                    ? static_cast<uint64_t>((static_cast<double>(now) * 99750000.0) /
+                                                            static_cast<double>(qpc_freq))
+                                    : static_cast<uint64_t>(now);
+                        }
+                        ::InterlockedExchange64(
+                            reinterpret_cast<volatile LONG64*>(static_cast<uintptr_t>(wr.address)),
+                            static_cast<LONG64>(v));
+                    }
+                } else if (IsWritableCpuVa(wr.address, sizeof(uint32_t))) {
+                    ::InterlockedExchange(
+                        reinterpret_cast<volatile LONG*>(static_cast<uintptr_t>(wr.address)),
+                        static_cast<LONG>(static_cast<uint32_t>(wr.value)));
+                }
+            }
+        };
+
+        bool dispatched_async = false;
+        if (!s_sync_dw && fence_dispatcher_ && host_queue_ && device_x_ &&
+            device_x_->IsRetailScarlettAbi() && device_x_->HostDevice()) {
+            ID3D12Fence* dw_fence = nullptr;
+            uint64_t dw_val = 0ull;
+            {
+                std::lock_guard<std::mutex> dwlk(deferred_write_mutex_);
+                if (!deferred_write_fence_) {
+                    (void)device_x_->HostDevice()->CreateFence(
+                        0ull, D3D12_FENCE_FLAG_NONE, OS_D3D12_IID(ID3D12Fence),
+                        reinterpret_cast<void**>(&deferred_write_fence_));
+                }
+                if (deferred_write_fence_) {
+                    dw_val = ++deferred_write_fence_val_;
+                    if (SUCCEEDED(host_queue_->Signal(deferred_write_fence_, dw_val))) {
+                        dw_fence = deferred_write_fence_;
+                    }
+                }
+            }
+            if (dw_fence) {
+                struct AsyncWriteBatch {
+                    std::vector<DeferredCpuWrite32> writes;
+                    int64_t qpc_freq = 0;
+                };
+                auto* batch = new (std::nothrow) AsyncWriteBatch{std::move(deferred_writes), qpc_freq};
+                if (batch) {
+                    const HRESULT rhr = fence_dispatcher_->RegisterCallback(
+                        dw_fence,
+                        dw_val,
+                        [](ID3D12Fence*, UINT64, HRESULT, void* user_ctx) {
+                            std::unique_ptr<AsyncWriteBatch> owned(static_cast<AsyncWriteBatch*>(user_ctx));
+                            if (!owned) return;
+                            for (const auto& wr : owned->writes) {
+                                if (wr.is_64bit) {
+                                    if (IsWritableCpuVa(wr.address, sizeof(uint64_t))) {
+                                        uint64_t v = wr.value;
+                                        if (wr.is_timestamp) {
+                                            const int64_t now = QueryQpcNow();
+                                            v = (owned->qpc_freq > 0)
+                                                    ? static_cast<uint64_t>((static_cast<double>(now) * 99750000.0) /
+                                                                            static_cast<double>(owned->qpc_freq))
+                                                    : static_cast<uint64_t>(now);
+                                        }
+                                        ::InterlockedExchange64(
+                                            reinterpret_cast<volatile LONG64*>(static_cast<uintptr_t>(wr.address)),
+                                            static_cast<LONG64>(v));
+                                    }
+                                } else if (IsWritableCpuVa(wr.address, sizeof(uint32_t))) {
+                                    ::InterlockedExchange(
+                                        reinterpret_cast<volatile LONG*>(static_cast<uintptr_t>(wr.address)),
+                                        static_cast<LONG>(static_cast<uint32_t>(wr.value)));
+                                }
+                            }
+                        },
+                        batch,
+                        nullptr);
+                    if (SUCCEEDED(rhr)) {
+                        dispatched_async = true;
+                    } else {
+                        deferred_writes = std::move(batch->writes);
+                        delete batch;
+                    }
+                }
             }
         }
-        for (const auto& wr : deferred_writes) {
-            if (wr.is_64bit) {
-                if (IsWritableCpuVa(wr.address, sizeof(uint64_t))) {
-                    uint64_t v = wr.value;
-                    if (wr.is_timestamp) {
-                        const int64_t now = QueryQpcNow();
-                        v = (qpc_freq_ > 0)
-                                ? static_cast<uint64_t>((static_cast<double>(now) * 99750000.0) /
-                                                        static_cast<double>(qpc_freq_))
-                                : static_cast<uint64_t>(now);
-                    }
-                    ::InterlockedExchange64(
-                        reinterpret_cast<volatile LONG64*>(static_cast<uintptr_t>(wr.address)),
-                        static_cast<LONG64>(v));
+        if (!dispatched_async) {
+            {
+                std::lock_guard<std::mutex> lock(present_mutex_);
+                if (SUCCEEDED(EnsurePresentHelperObjectsLocked())) {
+                    WaitForInternalFenceLocked();
                 }
-            } else if (IsWritableCpuVa(wr.address, sizeof(uint32_t))) {
-                ::InterlockedExchange(
-                    reinterpret_cast<volatile LONG*>(static_cast<uintptr_t>(wr.address)),
-                    static_cast<LONG>(static_cast<uint32_t>(wr.value)));
             }
+            commit_writes(deferred_writes);
         }
     }
 
@@ -2582,12 +2686,27 @@ void STDMETHODCALLTYPE CommandQueueX::EndEvent() {
 }
 
 HRESULT STDMETHODCALLTYPE CommandQueueX::Signal(ID3D12Fence* pFence, UINT64 Value) {
-    const HRESULT hr = host_queue_->Signal(UnwrapFence(pFence), Value);
+    ID3D12Fence* host_fence = UnwrapFence(pFence);
+    const HRESULT hr = host_queue_->Signal(host_fence, Value);
     if (SUCCEEDED(hr) && pFence && IsKnownProxyPointer(pFence)) {
         IOpenScarlettProxyInspect* insp = nullptr;
         if (SUCCEEDED(pFence->QueryInterface(IID_IOpenScarlettProxyInspect, reinterpret_cast<void**>(&insp))) && insp) {
             if (insp->GetProxyKind() == D3D12XProxyKind::Fence) {
-                static_cast<FenceXProxy*>(pFence)->NotifyGpuSignal(Value);
+                auto* fp = static_cast<FenceXProxy*>(pFence);
+                fp->NotifyGpuSignal(Value);
+                if (fp->IsCpuFencePtrQueried() && fence_dispatcher_ && host_fence &&
+                    host_fence->GetCompletedValue() < Value) {
+                    (void)fence_dispatcher_->RegisterCallback(
+                        pFence,
+                        Value,
+                        [](ID3D12Fence* uf, UINT64 target_val, HRESULT status, void*) {
+                            if (SUCCEEDED(status) && uf) {
+                                static_cast<FenceXProxy*>(uf)->AdvanceCpuFenceWord(target_val);
+                            }
+                        },
+                        nullptr,
+                        nullptr);
+                }
             }
             insp->Release();
         }
@@ -3295,9 +3414,232 @@ HRESULT CommandQueueX::WaitForInternalFenceLocked() {
     return WaitForInternalFenceWithTimingLocked(nullptr, nullptr, nullptr);
 }
 
+void CommandQueueX::ReleaseCompositeObjectsLocked() {
+    if (composite_rt_) { composite_rt_->Release(); composite_rt_ = nullptr; }
+    if (composite_srv_heap_) { composite_srv_heap_->Release(); composite_srv_heap_ = nullptr; }
+    if (composite_rtv_heap_) { composite_rtv_heap_->Release(); composite_rtv_heap_ = nullptr; }
+    if (composite_pso_) { composite_pso_->Release(); composite_pso_ = nullptr; }
+    if (composite_rs_) { composite_rs_->Release(); composite_rs_ = nullptr; }
+    composite_pso_rt_format_ = DXGI_FORMAT_UNKNOWN;
+    composite_rt_width_ = 0u;
+    composite_rt_height_ = 0u;
+    composite_rt_format_ = DXGI_FORMAT_UNKNOWN;
+}
+
+HRESULT CommandQueueX::EnsureCompositeObjectsLocked(
+    uint32_t width, uint32_t height, DXGI_FORMAT rt_format) {
+    if (composite_compile_failed_ || !device_x_ || !device_x_->HostDevice() ||
+        queue_type_ != D3D12_COMMAND_LIST_TYPE_DIRECT || width == 0u || height == 0u) {
+        return E_FAIL;
+    }
+    ID3D12Device* dev = device_x_->HostDevice();
+
+    if (!composite_rs_) {
+        D3D12_DESCRIPTOR_RANGE srv_range{};
+        srv_range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+        srv_range.NumDescriptors = 2u;
+        srv_range.BaseShaderRegister = 0u;
+        srv_range.RegisterSpace = 0u;
+        srv_range.OffsetInDescriptorsFromTableStart = 0u;
+
+        D3D12_ROOT_PARAMETER params[2]{};
+        params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        params[0].DescriptorTable.NumDescriptorRanges = 1u;
+        params[0].DescriptorTable.pDescriptorRanges = &srv_range;
+        params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        params[1].Constants.ShaderRegister = 0u;
+        params[1].Constants.RegisterSpace = 0u;
+        params[1].Constants.Num32BitValues = 12u;
+        params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        D3D12_STATIC_SAMPLER_DESC samp{};
+        samp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+        samp.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        samp.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        samp.MaxAnisotropy = 1u;
+        samp.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        samp.MaxLOD = D3D12_FLOAT32_MAX;
+        samp.ShaderRegister = 0u;
+        samp.RegisterSpace = 0u;
+        samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+        D3D12_ROOT_SIGNATURE_DESC rs_desc{};
+        rs_desc.NumParameters = 2u;
+        rs_desc.pParameters = params;
+        rs_desc.NumStaticSamplers = 1u;
+        rs_desc.pStaticSamplers = &samp;
+        rs_desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+
+        using PfnSerialize = HRESULT(WINAPI*)(
+            const D3D12_ROOT_SIGNATURE_DESC*, D3D_ROOT_SIGNATURE_VERSION, ID3DBlob**, ID3DBlob**);
+        auto ser_fn = reinterpret_cast<PfnSerialize>(
+            openscarlett::ResolveHostD3D12Proc("D3D12SerializeRootSignature"));
+        if (!ser_fn) {
+            composite_compile_failed_ = true;
+            return E_FAIL;
+        }
+        ID3DBlob* rs_blob = nullptr;
+        HRESULT hr = ser_fn(&rs_desc, D3D_ROOT_SIGNATURE_VERSION_1, &rs_blob, nullptr);
+        if (FAILED(hr) || !rs_blob) {
+            composite_compile_failed_ = true;
+            return FAILED(hr) ? hr : E_FAIL;
+        }
+        hr = dev->CreateRootSignature(
+            0u, rs_blob->GetBufferPointer(), rs_blob->GetBufferSize(), IID_PPV_ARGS(&composite_rs_));
+        rs_blob->Release();
+        if (FAILED(hr) || !composite_rs_) {
+            composite_compile_failed_ = true;
+            return FAILED(hr) ? hr : E_FAIL;
+        }
+    }
+
+    if (!composite_pso_ || composite_pso_rt_format_ != rt_format) {
+        static std::mutex s_dxil_mu;
+        static std::vector<uint8_t> s_vs_dxil;
+        static std::vector<uint8_t> s_ps_dxil;
+        static bool s_compiled = false;
+        static bool s_failed = false;
+        {
+            std::lock_guard<std::mutex> lk(s_dxil_mu);
+            if (!s_compiled && !s_failed) {
+                static constexpr const char* kCompHlsl = R"(
+Texture2D<float4> Plane0Tex : register(t0);
+Texture2D<float4> Plane1Tex : register(t1);
+SamplerState LinearClamp : register(s0);
+cbuffer CompParams : register(b0) {
+    float4 DstUvRect;
+    float4 SrcUvRect;
+    uint4 Flags;
+};
+struct VSOut {
+    float4 pos : SV_Position;
+    float2 uv  : TEXCOORD0;
+};
+VSOut VSMain(uint vid : SV_VertexID) {
+    VSOut o;
+    float2 uv = float2((vid << 1) & 2, vid & 2);
+    o.uv = uv;
+    o.pos = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0.0, 1.0);
+    return o;
+}
+float4 PSMain(VSOut i) : SV_Target0 {
+    float4 base = Plane0Tex.SampleLevel(LinearClamp, i.uv, 0.0);
+    if (Flags.x != 0u) {
+        float2 rel = (i.uv - DstUvRect.xy) * DstUvRect.zw;
+        if (all(rel >= 0.0) && all(rel <= 1.0)) {
+            float2 uv1 = SrcUvRect.xy + rel * SrcUvRect.zw;
+            float4 over = Plane1Tex.SampleLevel(LinearClamp, uv1, 0.0);
+            float a = saturate(over.a);
+            float max_c = max(over.r, max(over.g, over.b));
+            float3 over_premul = (a > 0.0 && max_c > a + (1.0 / 255.0)) ? (over.rgb * a) : over.rgb;
+            base.rgb = over_premul + base.rgb * (1.0 - a);
+            base.a = saturate(a + base.a * (1.0 - a));
+        } else {
+            base.a = 1.0;
+        }
+    } else {
+        base.a = 1.0;
+    }
+    return base;
+}
+)";
+                std::string diag;
+                const auto vst = openscarlett::CompileHlslWithDxc(
+                    kCompHlsl, "vs_6_0", "VSMain", s_vs_dxil, diag);
+                const auto pst = vst.ok()
+                                     ? openscarlett::CompileHlslWithDxc(
+                                           kCompHlsl, "ps_6_0", "PSMain", s_ps_dxil, diag)
+                                     : vst;
+                if (vst.ok() && pst.ok() && !s_vs_dxil.empty() && !s_ps_dxil.empty()) {
+                    s_compiled = true;
+                } else {
+                    s_failed = true;
+                }
+            }
+        }
+        if (!s_compiled) {
+            composite_compile_failed_ = true;
+            return E_FAIL;
+        }
+        if (composite_pso_) {
+            WaitForInternalFenceLocked();
+            composite_pso_->Release();
+            composite_pso_ = nullptr;
+        }
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pso_desc{};
+        pso_desc.pRootSignature = composite_rs_;
+        pso_desc.VS = {s_vs_dxil.data(), s_vs_dxil.size()};
+        pso_desc.PS = {s_ps_dxil.data(), s_ps_dxil.size()};
+        pso_desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        pso_desc.SampleMask = UINT_MAX;
+        pso_desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pso_desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pso_desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pso_desc.NumRenderTargets = 1u;
+        pso_desc.RTVFormats[0] = rt_format;
+        pso_desc.SampleDesc.Count = 1u;
+        const HRESULT phr = dev->CreateGraphicsPipelineState(&pso_desc, IID_PPV_ARGS(&composite_pso_));
+        if (FAILED(phr) || !composite_pso_) {
+            composite_compile_failed_ = true;
+            return FAILED(phr) ? phr : E_FAIL;
+        }
+        composite_pso_rt_format_ = rt_format;
+    }
+
+    if (!composite_rtv_heap_) {
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        hd.NumDescriptors = 1u;
+        const HRESULT hr = dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&composite_rtv_heap_));
+        if (FAILED(hr)) return hr;
+    }
+    if (!composite_srv_heap_) {
+        D3D12_DESCRIPTOR_HEAP_DESC hd{};
+        hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+        hd.NumDescriptors = (kPresentRingSlots + 1u) * 2u;
+        hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+        const HRESULT hr = dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&composite_srv_heap_));
+        if (FAILED(hr)) return hr;
+    }
+
+    if (!composite_rt_ || composite_rt_width_ != width || composite_rt_height_ != height ||
+        composite_rt_format_ != rt_format) {
+        if (composite_rt_) {
+            WaitForInternalFenceLocked();
+            composite_rt_->Release();
+            composite_rt_ = nullptr;
+        }
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rd.Width = width;
+        rd.Height = height;
+        rd.DepthOrArraySize = 1u;
+        rd.MipLevels = 1u;
+        rd.Format = rt_format;
+        rd.SampleDesc.Count = 1u;
+        rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        const HRESULT hr = dev->CreateCommittedResource(
+            &hp, D3D12_HEAP_FLAG_NONE, &rd,
+            D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr, IID_PPV_ARGS(&composite_rt_));
+        if (FAILED(hr) || !composite_rt_) return FAILED(hr) ? hr : E_FAIL;
+        dev->CreateRenderTargetView(
+            composite_rt_, nullptr, composite_rtv_heap_->GetCPUDescriptorHandleForHeapStart());
+        composite_rt_width_ = width;
+        composite_rt_height_ = height;
+        composite_rt_format_ = rt_format;
+    }
+    return S_OK;
+}
+
 void CommandQueueX::ReleasePresentObjectsLocked() {
     DetachWindowSubclassLocked();
     ReleaseSwapChainLocked();
+    ReleaseCompositeObjectsLocked();
     if (tonemap_upload_buf_) { tonemap_upload_buf_->Release(); tonemap_upload_buf_ = nullptr; }
     if (readback_buf_) { readback_buf_->Release(); readback_buf_ = nullptr; }
     for (uint32_t i = 0u; i < kPresentRingSlots; ++i) {
@@ -3397,6 +3739,108 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
         caller_state = static_cast<D3D12_RESOURCE_STATES>(static_cast<UINT>(caller_state) & kTexAllowed);
     }
 
+    // Detect optional Xbox Plane 1 hardware UI/video overlay (used by RAGE9 / Series S|X multi-plane titles).
+    // Retail Scarlett D3D12XBOX_PRESENT_PLANE_PARAMETERS stores:
+    //   +0x18: const D3D12_RECT* pSourceRect (pixel coordinates)
+    //   +0x20: const D3D12XBOX_RECT_NORMALIZED* pDestRectNormalized (float [0..1] left, top, right, bottom)
+    ID3D12Resource* overlay_tex = nullptr;
+    D3D12_RESOURCE_DESC overlay_desc{};
+    D3D12_RESOURCE_STATES overlay_caller_state = D3D12_RESOURCE_STATE_COMMON;
+    D3D12_RECT overlay_src_rect{};
+    float overlay_dst_norm[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+    bool has_overlay_dst_norm = false;
+    if (PlaneCount >= 2u &&
+        pPlaneParameters[1].ResourceCount > 0u &&
+        pPlaneParameters[1].ppResources &&
+        pPlaneParameters[1].ppResources[0]) {
+        ID3D12Resource* cand = UnwrapResource(pPlaneParameters[1].ppResources[0]);
+        if (cand && cand != src_tex) {
+            const D3D12_RESOURCE_DESC cd = cand->GetDesc();
+            if (cd.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+                cd.Width > 0u && cd.Height > 0u) {
+                overlay_tex = cand;
+                overlay_desc = cd;
+                if (device_x_ && device_x_->IsRetailScarlettAbi()) {
+                    const auto* raw_bytes = reinterpret_cast<const uint8_t*>(&pPlaneParameters[1]);
+                    const D3D12_RECT* psr = nullptr;
+                    const float* pdr_f = nullptr;
+                    std::memcpy(&psr, raw_bytes + 0x18u, sizeof(psr));
+                    std::memcpy(&pdr_f, raw_bytes + 0x20u, sizeof(pdr_f));
+                    auto is_valid_16b = [](const void* p) noexcept -> bool {
+                        if (!p || reinterpret_cast<uintptr_t>(p) < 0x10000u) return false;
+                        MEMORY_BASIC_INFORMATION mbi{};
+                        return ::VirtualQuery(p, &mbi, sizeof(mbi)) == sizeof(mbi) &&
+                               mbi.State == MEM_COMMIT &&
+                               (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0u &&
+                               reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize >=
+                                   reinterpret_cast<uintptr_t>(p) + 16u;
+                    };
+                    if (is_valid_16b(psr)) {
+                        std::memcpy(&overlay_src_rect, psr, sizeof(D3D12_RECT));
+                    }
+                    if (is_valid_16b(pdr_f)) {
+                        float tmp[4]{};
+                        std::memcpy(tmp, pdr_f, sizeof(tmp));
+                        if (tmp[2] > tmp[0] && tmp[3] > tmp[1] &&
+                            tmp[0] >= -4.0f && tmp[2] <= 4.0f &&
+                            tmp[1] >= -4.0f && tmp[3] <= 4.0f) {
+                            std::memcpy(overlay_dst_norm, tmp, sizeof(tmp));
+                            has_overlay_dst_norm = true;
+                        }
+                    }
+                } else {
+                    overlay_src_rect = pPlaneParameters[1].SourceRect;
+                    const auto& dr = pPlaneParameters[1].DestRect;
+                    if (dr.right > dr.left && dr.bottom > dr.top) {
+                        const float ref_w = (static_cast<uint32_t>(dr.right) > width)
+                                                ? static_cast<float>(dr.right)
+                                                : static_cast<float>(width);
+                        const float ref_h = (static_cast<uint32_t>(dr.bottom) > height)
+                                                ? static_cast<float>(dr.bottom)
+                                                : static_cast<float>(height);
+                        overlay_dst_norm[0] = static_cast<float>(dr.left) / ref_w;
+                        overlay_dst_norm[1] = static_cast<float>(dr.top) / ref_h;
+                        overlay_dst_norm[2] = static_cast<float>(dr.right) / ref_w;
+                        overlay_dst_norm[3] = static_cast<float>(dr.bottom) / ref_h;
+                        has_overlay_dst_norm = true;
+                    }
+                }
+                overlay_caller_state =
+                    (device_x_ && device_x_->IsRetailScarlettAbi())
+                        ? device_x_->GetRetailResourceState(cand, D3D12_RESOURCE_STATE_COMMON)
+                        : pPlaneParameters[1].ResourceState;
+                if (device_x_ && device_x_->IsRetailScarlettAbi()) {
+                    constexpr UINT kTexAllowed =
+                        static_cast<UINT>(D3D12_RESOURCE_STATE_RENDER_TARGET) |
+                        static_cast<UINT>(D3D12_RESOURCE_STATE_UNORDERED_ACCESS) |
+                        static_cast<UINT>(D3D12_RESOURCE_STATE_DEPTH_WRITE) |
+                        static_cast<UINT>(D3D12_RESOURCE_STATE_DEPTH_READ) |
+                        static_cast<UINT>(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) |
+                        static_cast<UINT>(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) |
+                        static_cast<UINT>(D3D12_RESOURCE_STATE_COPY_DEST) |
+                        static_cast<UINT>(D3D12_RESOURCE_STATE_COPY_SOURCE) |
+                        static_cast<UINT>(D3D12_RESOURCE_STATE_RESOLVE_DEST) |
+                        static_cast<UINT>(D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+                    overlay_caller_state = static_cast<D3D12_RESOURCE_STATES>(
+                        static_cast<UINT>(overlay_caller_state) & kTexAllowed);
+                }
+                static std::atomic<uint32_t> s_mp_logs{0u};
+                if (s_mp_logs.fetch_add(1u, std::memory_order_relaxed) < 5u) {
+                    std::fprintf(
+                        stderr,
+                        "[OpenScarlett][d3d12_xs] PresentX Multi-Plane: P0=%ux%u(fmt=%d st=0x%X) + "
+                        "P1=%llux%u(fmt=%d st=0x%X src=[%ld,%ld..%ld,%ld] dst=[%.3f,%.3f..%.3f,%.3f])\n",
+                        width, height, static_cast<int>(src_desc.Format), static_cast<unsigned>(caller_state),
+                        static_cast<unsigned long long>(overlay_desc.Width), overlay_desc.Height,
+                        static_cast<int>(overlay_desc.Format), static_cast<unsigned>(overlay_caller_state),
+                        overlay_src_rect.left, overlay_src_rect.top, overlay_src_rect.right, overlay_src_rect.bottom,
+                        overlay_dst_norm[0], overlay_dst_norm[1], overlay_dst_norm[2], overlay_dst_norm[3]);
+                    std::fflush(stderr);
+                }
+            }
+        }
+    }
+
     // Ensure window subclass is active and pump pending Win32 messages WITHOUT holding present_mutex_.
     const bool force_headless = EnvFlagTrueA("OPENSCARLETT_PRESENTX_HEADLESS");
     HWND pump_hwnd = nullptr;
@@ -3476,12 +3920,52 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
     HWND target_hwnd = ResolveTargetOutputWindowLocked(pPresentParameters, force_headless);
     const bool use_swapchain = (target_hwnd != nullptr && IsWindow(target_hwnd) != FALSE);
 
+    const bool vk_routing_active =
+        device_x_ && device_x_->IsVulkanRoutingActive() &&
+        device_x_->GetVulkanBackend() && device_x_->GetVulkanBackend()->IsInitialized();
+    openscarlett::FrameBufferRgba8 vk_direct_rt_fb{};
+    const bool has_vk_direct_rt_fb =
+        vk_routing_active && device_x_->TryGetVulkanRenderTargetFramebuffer(src_tex, vk_direct_rt_fb);
+
+    uint32_t out_width = width;
+    uint32_t out_height = height;
+    if (device_x_ && device_x_->IsRetailScarlettAbi()) {
+        static const std::pair<uint32_t, uint32_t> s_disp_res = []() -> std::pair<uint32_t, uint32_t> {
+            const std::string s = ReadEnvStringA("OPENSCARLETT_DISPLAY_RES");
+            if (!s.empty()) {
+                char* end1 = nullptr;
+                const unsigned long rw = std::strtoul(s.c_str(), &end1, 10);
+                if (end1 && (*end1 == 'x' || *end1 == 'X')) {
+                    char* end2 = nullptr;
+                    const unsigned long rh = std::strtoul(end1 + 1, &end2, 10);
+                    if (rw >= 64ul && rw <= 7680ul && rh >= 64ul && rh <= 4320ul) {
+                        return {static_cast<uint32_t>(rw), static_cast<uint32_t>(rh)};
+                    }
+                }
+            }
+            return {0u, 0u};
+        }();
+        if (s_disp_res.first > 0u && s_disp_res.second > 0u) {
+            out_width = s_disp_res.first;
+            out_height = s_disp_res.second;
+        }
+    }
+
+    const DXGI_FORMAT comp_rt_fmt = NormalizeSwapChainFormat(src_desc.Format);
+    const bool need_gpu_scale = (out_width != width || out_height != height);
+    const bool use_gpu_plane_composite =
+        ((overlay_tex != nullptr) || need_gpu_scale) && !vk_routing_active &&
+        SUCCEEDED(EnsureCompositeObjectsLocked(out_width, out_height, comp_rt_fmt));
+    if (!use_gpu_plane_composite) {
+        out_width = width;
+        out_height = height;
+    }
+
     bool window_minimized = false;
-    // Size the DXGI flip-model swapchain (DXGI_SCALING_STRETCH) to match the presented
-    // Xbox source plane (width x height) so CopyTextureRegion fills 100% of the backbuffer
-    // and DWM hardware-scales edge-to-edge in windowed/borderless-fullscreen with zero black bars.
-    const uint32_t target_bb_width = width;
-    const uint32_t target_bb_height = height;
+    // Size the DXGI flip-model swapchain (DXGI_SCALING_STRETCH) to match the output plane
+    // (out_width x out_height) so CopyTextureRegion fills 100% of the backbuffer.
+    const uint32_t target_bb_width = out_width;
+    const uint32_t target_bb_height = out_height;
     if (use_swapchain) {
         AttachWindowSubclassLocked(target_hwnd);
         RECT cr{};
@@ -3495,13 +3979,6 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
             window_state_ ? window_state_->is_minimized.load(std::memory_order_acquire) : false;
         window_minimized = iconic || cb_min || (cw == 0u || ch == 0u);
     }
-
-    const bool vk_routing_active =
-        device_x_ && device_x_->IsVulkanRoutingActive() &&
-        device_x_->GetVulkanBackend() && device_x_->GetVulkanBackend()->IsInitialized();
-    openscarlett::FrameBufferRgba8 vk_direct_rt_fb{};
-    const bool has_vk_direct_rt_fb =
-        vk_routing_active && device_x_->TryGetVulkanRenderTargetFramebuffer(src_tex, vk_direct_rt_fb);
 
     bool do_swapchain_present = !vk_routing_active && use_swapchain && !window_minimized;
     if (do_swapchain_present) {
@@ -3526,7 +4003,7 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
                 return hr;
             }
         } else if (frame_latency_waitable_object_) {
-            const DWORD wait_ms = swapchain_occluded_ ? 50u : 1000u;
+            const DWORD wait_ms = swapchain_occluded_ ? 16u : 50u;
             const DWORD wr = WaitForSingleObjectEx(frame_latency_waitable_object_, wait_ms, TRUE);
             if (wr == WAIT_OBJECT_0) {
                 ++latency_waits_;
@@ -3546,9 +4023,14 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
          swapchain_format_ == DXGI_FORMAT_B8G8R8A8_UNORM);
     const bool skip_intermediate_readback =
         (exit_after_frames > 0ull && !want_capture_this_frame && !need_tonemap_bb_upload && !vk_routing_active);
+    const bool want_sync_readback =
+        (!device_x_ || !device_x_->IsRetailScarlettAbi()) && readback_capture_enabled_;
     const bool need_readback =
         !has_vk_direct_rt_fb && !skip_intermediate_readback &&
-        (vk_routing_active || (!use_swapchain) || readback_capture_enabled_ || need_tonemap_bb_upload || want_capture_this_frame);
+        (vk_routing_active || (!use_swapchain) || want_sync_readback || need_tonemap_bb_upload || want_capture_this_frame);
+
+    const D3D12_RESOURCE_DESC active_copy_desc =
+        (use_gpu_plane_composite && composite_rt_) ? composite_rt_->GetDesc() : src_desc;
 
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
     UINT num_rows = 0;
@@ -3556,7 +4038,7 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
     UINT64 total_bytes = 0;
     if (need_readback) {
         device_x_->HostDevice()->GetCopyableFootprints(
-            &src_desc, 0, 1, 0, &footprint, &num_rows, &row_size_bytes, &total_bytes);
+            &active_copy_desc, 0, 1, 0, &footprint, &num_rows, &row_size_bytes, &total_bytes);
         hr = EnsureReadbackBufferLocked(total_bytes);
         if (FAILED(hr)) {
             RecordQueue("ID3D12CommandQueueX::PresentX", 19, hr);
@@ -3599,8 +4081,152 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
             return hr;
         }
 
-        // Transition plane 0 to COPY_SOURCE if needed.
-        if (caller_state != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+        ID3D12Resource* copy_src_tex = src_tex;
+        if (use_gpu_plane_composite && composite_rt_ && composite_pso_ && composite_rs_ &&
+            composite_rtv_heap_ && composite_srv_heap_) {
+            auto to_srv_fmt = [](DXGI_FORMAT f) noexcept -> DXGI_FORMAT {
+                switch (f) {
+                    case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
+                    case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
+                    case DXGI_FORMAT_B8G8R8X8_TYPELESS: return DXGI_FORMAT_B8G8R8X8_UNORM;
+                    case DXGI_FORMAT_R10G10B10A2_TYPELESS: return DXGI_FORMAT_R10G10B10A2_UNORM;
+                    case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+                    default: return f;
+                }
+            };
+            const uint32_t srv_pair_idx = async_swapchain_fast_path ? active_ring_slot : kPresentRingSlots;
+            const UINT srv_inc = device_x_->HostDevice()->GetDescriptorHandleIncrementSize(
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+            D3D12_CPU_DESCRIPTOR_HANDLE srv_cpu = composite_srv_heap_->GetCPUDescriptorHandleForHeapStart();
+            srv_cpu.ptr += static_cast<SIZE_T>(srv_pair_idx * 2u) * srv_inc;
+            D3D12_GPU_DESCRIPTOR_HANDLE srv_gpu = composite_srv_heap_->GetGPUDescriptorHandleForHeapStart();
+            srv_gpu.ptr += static_cast<UINT64>(srv_pair_idx * 2u) * srv_inc;
+
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv0{};
+            srv0.Format = to_srv_fmt(src_desc.Format);
+            srv0.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv0.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv0.Texture2D.MipLevels = 1u;
+            device_x_->HostDevice()->CreateShaderResourceView(src_tex, &srv0, srv_cpu);
+
+            D3D12_CPU_DESCRIPTOR_HANDLE srv1_cpu = srv_cpu;
+            srv1_cpu.ptr += srv_inc;
+            D3D12_SHADER_RESOURCE_VIEW_DESC srv1{};
+            srv1.Format = to_srv_fmt(overlay_tex ? overlay_desc.Format : src_desc.Format);
+            srv1.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            srv1.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            srv1.Texture2D.MipLevels = 1u;
+            device_x_->HostDevice()->CreateShaderResourceView(
+                overlay_tex ? overlay_tex : src_tex, &srv1, srv1_cpu);
+
+            D3D12_RESOURCE_BARRIER pre_barriers[3]{};
+            UINT num_pre = 0u;
+            if (caller_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) {
+                auto& b = pre_barriers[num_pre++];
+                b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b.Transition.pResource = src_tex;
+                b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                b.Transition.StateBefore = caller_state;
+                b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            }
+            if (overlay_tex && overlay_caller_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) {
+                auto& b = pre_barriers[num_pre++];
+                b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b.Transition.pResource = overlay_tex;
+                b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                b.Transition.StateBefore = overlay_caller_state;
+                b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            }
+            {
+                auto& b = pre_barriers[num_pre++];
+                b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b.Transition.pResource = composite_rt_;
+                b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            }
+            active_cmd->ResourceBarrier(num_pre, pre_barriers);
+
+            float comp_consts[12]{};
+            // DstUvRect: (minU, minV, invWidthU, invHeightV)
+            comp_consts[0] = 0.0f;
+            comp_consts[1] = 0.0f;
+            comp_consts[2] = 1.0f;
+            comp_consts[3] = 1.0f;
+            if (overlay_tex) {
+                if (has_overlay_dst_norm) {
+                    const float du = overlay_dst_norm[2] - overlay_dst_norm[0];
+                    const float dv = overlay_dst_norm[3] - overlay_dst_norm[1];
+                    if (du > 0.0f && dv > 0.0f) {
+                        comp_consts[0] = overlay_dst_norm[0];
+                        comp_consts[1] = overlay_dst_norm[1];
+                        comp_consts[2] = 1.0f / du;
+                        comp_consts[3] = 1.0f / dv;
+                    }
+                }
+                // SrcUvRect: (u0, v0, du, dv)
+                comp_consts[4] = 0.0f;
+                comp_consts[5] = 0.0f;
+                comp_consts[6] = 1.0f;
+                comp_consts[7] = 1.0f;
+                const auto& sr = overlay_src_rect;
+                if (sr.right > sr.left && sr.bottom > sr.top &&
+                    static_cast<uint64_t>(sr.right) <= overlay_desc.Width &&
+                    static_cast<uint32_t>(sr.bottom) <= overlay_desc.Height) {
+                    comp_consts[4] = static_cast<float>(sr.left) / static_cast<float>(overlay_desc.Width);
+                    comp_consts[5] = static_cast<float>(sr.top) / static_cast<float>(overlay_desc.Height);
+                    comp_consts[6] = static_cast<float>(sr.right - sr.left) / static_cast<float>(overlay_desc.Width);
+                    comp_consts[7] = static_cast<float>(sr.bottom - sr.top) / static_cast<float>(overlay_desc.Height);
+                }
+            }
+            const uint32_t has_overlay_flag = (overlay_tex != nullptr) ? 1u : 0u;
+            std::memcpy(&comp_consts[8], &has_overlay_flag, sizeof(uint32_t));
+
+            const D3D12_CPU_DESCRIPTOR_HANDLE rtv_h = composite_rtv_heap_->GetCPUDescriptorHandleForHeapStart();
+            D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(out_width), static_cast<float>(out_height), 0.0f, 1.0f};
+            D3D12_RECT sc{0, 0, static_cast<LONG>(out_width), static_cast<LONG>(out_height)};
+            ID3D12DescriptorHeap* heaps[] = {composite_srv_heap_};
+            active_cmd->SetPipelineState(composite_pso_);
+            active_cmd->SetGraphicsRootSignature(composite_rs_);
+            active_cmd->SetDescriptorHeaps(1u, heaps);
+            active_cmd->SetGraphicsRootDescriptorTable(0u, srv_gpu);
+            active_cmd->SetGraphicsRoot32BitConstants(1u, 12u, comp_consts, 0u);
+            active_cmd->RSSetViewports(1u, &vp);
+            active_cmd->RSSetScissorRects(1u, &sc);
+            active_cmd->OMSetRenderTargets(1u, &rtv_h, FALSE, nullptr);
+            active_cmd->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+            active_cmd->DrawInstanced(3u, 1u, 0u, 0u);
+
+            D3D12_RESOURCE_BARRIER post_barriers[3]{};
+            UINT num_post = 0u;
+            {
+                auto& b = post_barriers[num_post++];
+                b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b.Transition.pResource = composite_rt_;
+                b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+            }
+            if (caller_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) {
+                auto& b = post_barriers[num_post++];
+                b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b.Transition.pResource = src_tex;
+                b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                b.Transition.StateAfter = caller_state;
+            }
+            if (overlay_tex && overlay_caller_state != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) {
+                auto& b = post_barriers[num_post++];
+                b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b.Transition.pResource = overlay_tex;
+                b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                b.Transition.StateAfter = overlay_caller_state;
+            }
+            active_cmd->ResourceBarrier(num_post, post_barriers);
+            copy_src_tex = composite_rt_;
+        } else if (caller_state != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+            // Transition plane 0 to COPY_SOURCE if needed.
             D3D12_RESOURCE_BARRIER to_copy{};
             to_copy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             to_copy.Transition.pResource = src_tex;
@@ -3611,7 +4237,7 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
         }
 
         D3D12_TEXTURE_COPY_LOCATION src_loc{};
-        src_loc.pResource = src_tex;
+        src_loc.pResource = copy_src_tex;
         src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         src_loc.SubresourceIndex = 0;
 
@@ -3622,8 +4248,8 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
             if (SUCCEEDED(hr) && backbuffer) {
                 const D3D12_RESOURCE_DESC bb_desc = backbuffer->GetDesc();
                 const uint32_t copy_w =
-                    std::min<uint32_t>(width, static_cast<uint32_t>(bb_desc.Width));
-                const uint32_t copy_h = std::min<uint32_t>(height, bb_desc.Height);
+                    std::min<uint32_t>(out_width, static_cast<uint32_t>(bb_desc.Width));
+                const uint32_t copy_h = std::min<uint32_t>(out_height, bb_desc.Height);
 
                 D3D12_RESOURCE_BARRIER bb_to_dst{};
                 bb_to_dst.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -3668,8 +4294,8 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
             active_cmd->CopyTextureRegion(&rb_dst, 0, 0, 0, &src_loc, nullptr);
         }
 
-        // Restore plane 0 back to caller_state.
-        if (caller_state != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+        // Restore plane 0 back to caller_state (when not already restored by composite pass).
+        if (copy_src_tex == src_tex && caller_state != D3D12_RESOURCE_STATE_COPY_SOURCE) {
             D3D12_RESOURCE_BARRIER back_barrier{};
             back_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
             back_barrier.Transition.pResource = src_tex;
@@ -3719,14 +4345,14 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
 
         const auto* rb_bytes = static_cast<const uint8_t*>(mapped);
         const size_t packed_row_bytes = static_cast<size_t>(row_size_bytes);
-        const size_t total_packed = packed_row_bytes * height;
+        const size_t total_packed = packed_row_bytes * out_height;
         last_present_raw_pixels_.resize(total_packed);
-        last_present_raw_format_ = src_desc.Format;
+        last_present_raw_format_ = active_copy_desc.Format;
 
-        const size_t rgba8_row_bytes = static_cast<size_t>(width) * 4u;
-        last_present_pixels_.resize(rgba8_row_bytes * height);
+        const size_t rgba8_row_bytes = static_cast<size_t>(out_width) * 4u;
+        last_present_pixels_.resize(rgba8_row_bytes * out_height);
 
-        for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t y = 0; y < out_height; ++y) {
             const uint8_t* src_row =
                 rb_bytes + static_cast<size_t>(y) * footprint.Footprint.RowPitch;
             std::memcpy(
@@ -3736,13 +4362,13 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
             uint8_t* dst_rgba8_row =
                 last_present_pixels_.data() + static_cast<size_t>(y) * rgba8_row_bytes;
             ConvertPackedRowToSdrRgba8(
-                src_desc.Format,
+                active_copy_desc.Format,
                 effective_cs,
                 present_config_.ToneMapMode,
                 present_config_.PaperWhiteNits,
                 src_row,
                 dst_rgba8_row,
-                width);
+                out_width);
         }
 
         D3D12_RANGE write_none{0, 0};
@@ -3773,8 +4399,8 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
         hr = swapchain_->GetBuffer(bb_idx, IID_PPV_ARGS(&backbuffer));
         if (SUCCEEDED(hr) && backbuffer) {
             const D3D12_RESOURCE_DESC bb_desc = backbuffer->GetDesc();
-            const uint32_t copy_w = std::min<uint32_t>(width, static_cast<uint32_t>(bb_desc.Width));
-            const uint32_t copy_h = std::min<uint32_t>(height, bb_desc.Height);
+            const uint32_t copy_w = std::min<uint32_t>(out_width, static_cast<uint32_t>(bb_desc.Width));
+            const uint32_t copy_h = std::min<uint32_t>(out_height, bb_desc.Height);
 
             D3D12_PLACED_SUBRESOURCE_FOOTPRINT bb_fp{};
             UINT bb_rows = 0u;
@@ -3793,7 +4419,7 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
                     const bool bb_is_bgra = (bb_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM);
                     for (uint32_t y = 0; y < copy_h; ++y) {
                         const uint8_t* src_r =
-                            last_present_pixels_.data() + static_cast<size_t>(y) * width * 4u;
+                            last_present_pixels_.data() + static_cast<size_t>(y) * out_width * 4u;
                         uint8_t* dst_r = up_bytes + static_cast<size_t>(y) * bb_fp.Footprint.RowPitch;
                         if (bb_is_bgra) {
                             for (uint32_t x = 0; x < copy_w; ++x) {
@@ -4075,10 +4701,37 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
         }
     }
 
-    last_present_width_ = has_vk_direct_rt_fb ? vk_direct_rt_fb.width : width;
-    last_present_height_ = has_vk_direct_rt_fb ? vk_direct_rt_fb.height : height;
+    last_present_width_ = has_vk_direct_rt_fb ? vk_direct_rt_fb.width : out_width;
+    last_present_height_ = has_vk_direct_rt_fb ? vk_direct_rt_fb.height : out_height;
     ++present_count_;
     ++non_blank_present_count_;
+    if (device_x_ && device_x_->IsRetailScarlettAbi() && (present_count_ <= 8u || (present_count_ % 20u) == 0u)) {
+        const uint32_t ec = g_prof_exec_cnt.exchange(0u, std::memory_order_relaxed);
+        const int64_t eq = g_prof_exec_qpc.exchange(0, std::memory_order_relaxed);
+        const int64_t sq = g_prof_sync_qpc.exchange(0, std::memory_order_relaxed);
+        const uint32_t wc = g_prof_w32_cnt.exchange(0u, std::memory_order_relaxed);
+        const int64_t wq = g_prof_w32_qpc.exchange(0, std::memory_order_relaxed);
+        static const bool s_trace_prof = []() {
+            char v[16]{};
+            return ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_RETAIL", v, sizeof(v)) > 0 && v[0] == '1';
+        }();
+        if (s_trace_prof && present_count_ <= 240u) {
+            const double to_ms = (qpc_freq_ > 0) ? (1000.0 / static_cast<double>(qpc_freq_)) : 0.0;
+            std::fprintf(stderr,
+                         "[OpenScarlett][PROF] f=%llu exec=%u(%.2fms, sync=%.2fms) w32=%u(%.2fms) fint=%uus\n",
+                         static_cast<unsigned long long>(present_count_), ec,
+                         static_cast<double>(eq) * to_ms, static_cast<double>(sq) * to_ms,
+                         wc, static_cast<double>(wq) * to_ms,
+                         device_x_->FrameIntervalMicroseconds());
+            std::fflush(stderr);
+        }
+    } else if (device_x_ && device_x_->IsRetailScarlettAbi()) {
+        g_prof_exec_cnt.store(0u, std::memory_order_relaxed);
+        g_prof_exec_qpc.store(0, std::memory_order_relaxed);
+        g_prof_sync_qpc.store(0, std::memory_order_relaxed);
+        g_prof_w32_cnt.store(0u, std::memory_order_relaxed);
+        g_prof_w32_qpc.store(0, std::memory_order_relaxed);
+    }
     if (device_x_) {
         device_x_->GetQueryAccumulator().BeginFrame(present_count_);
         device_x_->OnPresentFrameComplete(present_count_);
@@ -4144,6 +4797,10 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
                     out_fb.width = out_w;
                     out_fb.height = out_h;
                     out_fb.pixels = last_present_pixels_;
+                }
+                // Match Xbox HDMI / DXGI_ALPHA_MODE_IGNORE opaque scanout on Plane 0 diagnostic PNGs.
+                for (size_t a_off = 3u; a_off < out_fb.pixels.size(); a_off += 4u) {
+                    out_fb.pixels[a_off] = 255u;
                 }
                 char png_name[MAX_PATH]{};
                 std::snprintf(png_name, sizeof(png_name), "%s\\sec_%04u_%llums.png",
@@ -4378,6 +5035,13 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::Wait32BitValueX(
     uint32_t Value,
     uint32_t Mask,
     D3D12XBOX_WAIT_VALUE_OP Operation) {
+    struct W32ProfGuard {
+        int64_t t0;
+        ~W32ProfGuard() {
+            g_prof_w32_cnt.fetch_add(1u, std::memory_order_relaxed);
+            g_prof_w32_qpc.fetch_add(QueryQpcNow() - t0, std::memory_order_relaxed);
+        }
+    } w32_prof{QueryQpcNow()};
     if (Address == 0ull) {
         RecordQueue("ID3D12CommandQueueX::Wait32BitValueX", 23, E_INVALIDARG);
         return E_INVALIDARG;
@@ -4391,6 +5055,9 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::Wait32BitValueX(
         const int64_t start_qpc = QueryQpcNow();
         const int64_t timeout_ticks = (qpc_freq_ > 0) ? (qpc_freq_ * 2LL) : 0LL;
         for (;;) {
+            if (fence_dispatcher_) {
+                (void)fence_dispatcher_->PumpReadyCallbacks();
+            }
             {
                 std::lock_guard<std::mutex> lock(present_mutex_);
                 PumpMirrorReadbackCompletionLocked();
@@ -4413,6 +5080,9 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::Wait32BitValueX(
         const int64_t start_qpc = QueryQpcNow();
         const int64_t timeout_ticks = (qpc_freq_ > 0) ? (qpc_freq_ * 2LL) : 0LL;  // 2s bounded wait
         for (;;) {
+            if (fence_dispatcher_) {
+                (void)fence_dispatcher_->PumpReadyCallbacks();
+            }
             const uint32_t cur = *ptr;
             if (EvaluateWaitOp<uint32_t>(cur, Value, Mask, Operation)) {
                 RecordQueue("ID3D12CommandQueueX::Wait32BitValueX", 23, S_OK);
@@ -4456,6 +5126,9 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::Wait64BitValueX(
         const int64_t start_qpc = QueryQpcNow();
         const int64_t timeout_ticks = (qpc_freq_ > 0) ? (qpc_freq_ * 2LL) : 0LL;
         for (;;) {
+            if (fence_dispatcher_) {
+                (void)fence_dispatcher_->PumpReadyCallbacks();
+            }
             {
                 std::lock_guard<std::mutex> lock(present_mutex_);
                 PumpMirrorReadbackCompletionLocked();
@@ -4478,6 +5151,9 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::Wait64BitValueX(
         const int64_t start_qpc = QueryQpcNow();
         const int64_t timeout_ticks = (qpc_freq_ > 0) ? (qpc_freq_ * 2LL) : 0LL;  // 2s bounded wait
         for (;;) {
+            if (fence_dispatcher_) {
+                (void)fence_dispatcher_->PumpReadyCallbacks();
+            }
             const uint64_t cur = *ptr;
             if (EvaluateWaitOp<uint64_t>(cur, Value, Mask, Operation)) {
                 RecordQueue("ID3D12CommandQueueX::Wait64BitValueX", 24, S_OK);

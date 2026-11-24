@@ -5667,12 +5667,38 @@ bool IsReadableCodePageProtect(DWORD prot) noexcept {
            base == PAGE_WRITECOPY;
 }
 
+bool IsAddressInMainExecutableImage(uintptr_t addr, size_t len = 1u) noexcept {
+    struct ExeBounds {
+        uintptr_t start = 0u;
+        uintptr_t end = 0u;
+    };
+    static const ExeBounds s_bounds = []() noexcept -> ExeBounds {
+        ExeBounds b{};
+        HMODULE exe = g_real_GetModuleHandleW ? g_real_GetModuleHandleW(nullptr) : ::GetModuleHandleW(nullptr);
+        if (!exe) return b;
+        const auto* base = reinterpret_cast<const uint8_t*>(exe);
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+        if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0 || dos->e_lfanew > 4096) return b;
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+        if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.SizeOfImage == 0u) return b;
+        b.start = reinterpret_cast<uintptr_t>(base);
+        b.end = b.start + static_cast<uintptr_t>(nt->OptionalHeader.SizeOfImage);
+        return b;
+    }();
+    return s_bounds.start != 0u && addr >= s_bounds.start &&
+           len <= (s_bounds.end - s_bounds.start) && (addr + len) <= s_bounds.end;
+}
+
 size_t ReadInsnBytesSafe64(const uint8_t* rip_ptr, uint8_t (&out)[kMaxX64InsnBytes]) noexcept {
     std::memset(out, 0, sizeof(out));
     if (!rip_ptr) {
         return 0u;
     }
     uintptr_t cursor = reinterpret_cast<uintptr_t>(rip_ptr);
+    if (IsAddressInMainExecutableImage(cursor, kMaxX64InsnBytes)) {
+        std::memcpy(out, rip_ptr, kMaxX64InsnBytes);
+        return kMaxX64InsnBytes;
+    }
     size_t copied = 0u;
     while (copied < kMaxX64InsnBytes) {
         MEMORY_BASIC_INFORMATION mbi{};
@@ -6044,7 +6070,34 @@ LONG CALLBACK Zen2IllegalInstructionVeh(PEXCEPTION_POINTERS ep) {
                     if (ext == 0xFAu) {
                         HotPatchToNopsThreadSafe(p, insn_len);
                     } else {
-                        ::SwitchToThread();
+                        thread_local uintptr_t s_last_mwaitx_rip = 0u;
+                        thread_local uint32_t s_mwaitx_streak = 0u;
+                        if (reinterpret_cast<uintptr_t>(p) == s_last_mwaitx_rip) {
+                            ++s_mwaitx_streak;
+                        } else {
+                            s_last_mwaitx_rip = reinterpret_cast<uintptr_t>(p);
+                            s_mwaitx_streak = 1u;
+                        }
+                        if (s_mwaitx_streak <= 2u) {
+                            ::SwitchToThread();
+                        } else {
+                            using PfnNtDelayExecution = LONG(NTAPI*)(BOOLEAN, PLARGE_INTEGER);
+                            static const PfnNtDelayExecution s_nt_delay = []() noexcept -> PfnNtDelayExecution {
+                                HMODULE ntdll = g_real_GetModuleHandleW
+                                                    ? g_real_GetModuleHandleW(L"ntdll.dll")
+                                                    : ::GetModuleHandleW(L"ntdll.dll");
+                                if (!ntdll) return nullptr;
+                                PfnGetProcAddress gpa = g_real_GetProcAddress ? g_real_GetProcAddress : &::GetProcAddress;
+                                return reinterpret_cast<PfnNtDelayExecution>(gpa(ntdll, "NtDelayExecution"));
+                            }();
+                            if (s_nt_delay) {
+                                LARGE_INTEGER rel{};
+                                rel.QuadPart = -2500LL;  // 250 us relative micro-sleep (matching Zen 2 MWAITX idle)
+                                (void)s_nt_delay(FALSE, &rel);
+                            } else {
+                                ::Sleep(1u);
+                            }
+                        }
                     }
                     ctx->Rip += insn_len;
                     return EXCEPTION_CONTINUE_EXECUTION;

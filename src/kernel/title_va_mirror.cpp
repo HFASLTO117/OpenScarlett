@@ -222,11 +222,25 @@ Status TitleVAMirror::RegisterRegion(const TitleVaMappingDesc& desc,
         const UINT reset_rc = ResetWriteWatch(
             entry.cpu_backing_ptr, static_cast<SIZE_T>(entry.alloc_size_bytes));
         entry.write_watch_enabled = (reset_rc == 0u);
-        if (!entry.write_watch_enabled && entry.size_bytes > (16ull * 1024ull * 1024ull)) {
+        if (!entry.write_watch_enabled && entry.size_bytes > (256ull * 1024ull)) {
             const size_t num_chunks =
                 static_cast<size_t>((entry.size_bytes + kPageSize64KB - 1ull) / kPageSize64KB);
             entry.fallback_chunk_hashes.assign(num_chunks, 0ull);
             entry.touched_chunk_bits.assign((num_chunks + 63u) / 64u, 0ull);
+            const auto* base = static_cast<const uint8_t*>(entry.cpu_backing_ptr);
+            for (size_t c = 0u; c < num_chunks; ++c) {
+                const uint64_t off = static_cast<uint64_t>(c) * kPageSize64KB;
+                const uint64_t len = std::min<uint64_t>(kPageSize64KB, entry.size_bytes - off);
+                const auto* words = reinterpret_cast<const uint64_t*>(base + off);
+                const size_t nwords = static_cast<size_t>(len >> 3u);
+                uint64_t acc = 0ull;
+                for (size_t wi = 0u; wi < nwords; ++wi) {
+                    if (words[wi] != 0ull) { acc = 1ull; break; }
+                }
+                if (acc != 0ull) {
+                    entry.touched_chunk_bits[c >> 6u] |= (1ull << (c & 63u));
+                }
+            }
             entry.use_touched_chunk_hints = true;
             entry.fallback_hashes_initialized = true;
         }
@@ -415,7 +429,7 @@ Status TitleVAMirror::QueryDirtyLocked(RegionEntry& entry,
                 // so untouched zero pages are never redundantly uploaded over PCIe.
                 constexpr uint64_t kZeroChunkHash = 0ull;
                 entry.fallback_chunk_hashes.assign(num_chunks, kZeroChunkHash);
-                entry.use_touched_chunk_hints = (entry.size_bytes > (16ull * 1024ull * 1024ull));
+                entry.use_touched_chunk_hints = (entry.size_bytes > (256ull * 1024ull));
                 if (entry.use_touched_chunk_hints) {
                     entry.touched_chunk_bits.assign((num_chunks + 63u) / 64u, 0ull);
                 }

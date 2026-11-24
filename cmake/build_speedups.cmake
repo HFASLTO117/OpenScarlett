@@ -89,6 +89,7 @@ endif()
 foreach(_win_test
     test_gdkx_untouched_samples
     test_presentx_windowing
+    test_s12_d3d12_aaa_wiring
     test_scarlett_game_live
     test_launcher_updater
     test_gdk_3d_scene_dual_api

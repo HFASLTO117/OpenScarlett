@@ -246,6 +246,20 @@ public:
     void SetRetailScarlettAbi(bool enabled) noexcept { retail_scarlett_abi_ = enabled; }
     bool IsRetailScarlettAbi() const noexcept { return retail_scarlett_abi_; }
     void LiftPendingXdatGraphicsPso(class PipelineStateXProxy* proxy);
+    HRESULT CreateDerivedGraphicsPipelineStateX(
+        ID3D12PipelineState* pSourcePso,
+        UINT numOverrides,
+        const void* pOverrides,
+        REFIID riid,
+        void** ppPipelineState);
+    HRESULT DeserializeGraphicsPipelineStateX(
+        const void* pDesc,
+        REFIID riid,
+        void** ppPipelineState);
+    HRESULT DeserializeComputePipelineStateX(
+        const void* pDesc,
+        REFIID riid,
+        void** ppPipelineState);
     void CreatePlacedShaderResourceViewX(
         const D3D12_RESOURCE_DESC* pResourceDesc,
         const void* pViewDesc,
@@ -287,6 +301,11 @@ public:
         auto it = valid_rtv_handles_.find(ptr);
         return (it != valid_rtv_handles_.end()) ? it->second : nullptr;
     }
+    ID3D12Resource* LookupRetailDsvResource(SIZE_T ptr) const noexcept {
+        std::lock_guard<std::mutex> lk(valid_view_mutex_);
+        auto it = valid_dsv_handles_.find(ptr);
+        return (it != valid_dsv_handles_.end()) ? it->second : nullptr;
+    }
     bool IsValidRetailRtvHandle(SIZE_T ptr) const noexcept {
         std::lock_guard<std::mutex> lk(valid_view_mutex_);
         return valid_rtv_handles_.find(ptr) != valid_rtv_handles_.end();
@@ -295,6 +314,13 @@ public:
         std::lock_guard<std::mutex> lk(valid_view_mutex_);
         return valid_dsv_handles_.find(ptr) != valid_dsv_handles_.end();
     }
+    bool IsReadOnlyRetailDsvHandle(SIZE_T ptr) const noexcept {
+        std::lock_guard<std::mutex> lk(valid_view_mutex_);
+        return readonly_dsv_handles_.find(ptr) != readonly_dsv_handles_.end();
+    }
+    bool IsSamplerRootTableParam(void* host_rs, UINT root_param_index) const noexcept;
+    bool IsValidRootDescriptorTableParam(
+        void* host_rs, UINT root_param_index, bool* out_is_sampler = nullptr) const noexcept;
     ~DeviceX();
 
     DeviceX(const DeviceX&) = delete;
@@ -1010,7 +1036,8 @@ public:
     void RegisterGuestBackedDescHeap(
         ID3D12DescriptorHeap* host_heap,
         uint64_t host_gpu_start, uint64_t host_cpu_start, uint32_t host_num_descs,
-        uint32_t inc_size, uint64_t guest_cpu_start, uint64_t guest_byte_size);
+        uint32_t inc_size, uint64_t guest_cpu_start, uint64_t guest_byte_size,
+        D3D12_DESCRIPTOR_HEAP_TYPE heap_type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     D3D12_GPU_DESCRIPTOR_HANDLE MaterializeGuestDescriptorTable(
         D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle,
         ID3D12RootSignature* bound_host_rs,
@@ -1037,6 +1064,12 @@ private:
         ID3D12Resource* host_res,
         const D3D12_RESOURCE_DESC& desc,
         uint64_t guest_va = 0ull);
+    void TrackPlacedTextureVa(
+        ID3D12Resource* host_res,
+        uint64_t guest_va);
+    ID3D12Resource* ResolvePlacedTextureByGpuVa(
+        uint64_t guest_va,
+        const D3D12_RESOURCE_DESC* expected_desc) const;
     HRESULT EnsureFeedbackCodecPipelinesLocked();
     void TrackTransientGpuResource(ID3D12Resource* res);
     void ReleaseAaaRuntimeObjects();
@@ -1219,6 +1252,7 @@ private:
     uint64_t unified_fence_val_ = 0ull;
     ID3D12CommandQueue* unified_sync_direct_queue_ = nullptr;
     std::atomic<uint64_t> committed_non_rt_vram_bytes_{0ull};
+    std::atomic<uint64_t> committed_rt_ds_vram_bytes_{0ull};
 
     // Direct d3d12_xs -> Vulkan 1.4 routing state (active when OPENSCARLETT_BACKEND=vulkan)
     bool vulkan_routing_active_ = false;
@@ -1228,7 +1262,8 @@ private:
     std::unordered_map<SIZE_T, ID3D12Resource*> vk_rtv_map_;
     mutable std::mutex valid_view_mutex_;
     std::unordered_map<SIZE_T, ID3D12Resource*> valid_rtv_handles_;
-    std::unordered_set<SIZE_T> valid_dsv_handles_;
+    std::unordered_map<SIZE_T, ID3D12Resource*> valid_dsv_handles_;
+    std::unordered_set<SIZE_T> readonly_dsv_handles_;
     std::unordered_map<SIZE_T, ID3D12Resource*> vk_dsv_map_;
     std::unordered_map<ID3D12Resource*, VulkanTrackedResource> vk_resources_;
     std::unordered_map<ID3D12Resource*, openscarlett::FrameBufferRgba8> vk_rt_framebuffers_;
@@ -1451,10 +1486,16 @@ private:
     std::array<TransientRingSlice, 8u> transient_ring_cache_{};
     uint32_t transient_ring_cache_next_ = 0u;
 
-    // 64 MiB VA-bucketed aliasing heaps for CreatePlacedResourceX textures so Xbox transient
+    // VA-bucketed aliasing heaps for CreatePlacedResourceX textures so Xbox transient
     // render-graph resources placed at overlapping physical VAs share host VRAM (zero bloat).
     std::mutex placed_alias_mutex_;
     std::unordered_map<uint64_t, ID3D12Heap*> placed_alias_heaps_;
+
+    // Guest VA -> placed ID3D12Resource* map for CreatePlacedShaderResourceViewX (Slot 70)
+    // so retail single-plane 4K UI / render-target SRVs resolve to live GPU textures.
+    mutable std::mutex placed_tex_va_mutex_;
+    std::unordered_map<ID3D12Resource*, uint64_t> placed_tex_res_to_va_;
+    std::unordered_map<uint64_t, std::vector<ID3D12Resource*>> placed_tex_by_va_;
 
     // Guest-backed Scarlett shader-visible descriptor heap mirror (for oversized >1M console heaps).
     // Retail titles memcpy 32-byte descriptors from CPU staging heaps directly into guest_cpu_start
@@ -1489,6 +1530,7 @@ private:
         uint64_t guest_byte_size = 0ull;
         uint32_t ring_cursor = 0u;
         bool ring_wrapped = false;
+        D3D12_DESCRIPTOR_HEAP_TYPE heap_type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
     };
     bool EnsureShadowDescHeapLocked() noexcept;
     uint32_t AllocShadowSlotLocked(bool prefer_static_partition) noexcept;
@@ -1498,12 +1540,26 @@ private:
     void SnapshotCreatedDescriptorToShadow(
         D3D12_CPU_DESCRIPTOR_HANDLE created_cpu_handle, uint64_t guest_writeback_addr = 0ull,
         bool prefer_static_partition = false);
+    bool TryCopyGuestBackedDescriptorsSimple(
+        UINT num_descs,
+        D3D12_CPU_DESCRIPTOR_HANDLE dst_start,
+        D3D12_CPU_DESCRIPTOR_HANDLE src_start,
+        D3D12_DESCRIPTOR_HEAP_TYPE heap_type);
+    D3D12_CPU_DESCRIPTOR_HANDLE TranslateGuestSamplerCpuHandle(
+        D3D12_CPU_DESCRIPTOR_HANDLE handle,
+        ID3D12DescriptorHeap** out_shadow_src = nullptr,
+        D3D12_CPU_DESCRIPTOR_HANDLE* out_shadow_slot = nullptr) noexcept;
+    bool HostFormatSupportsTypedUav(DXGI_FORMAT fmt) const noexcept;
     void RecordRootSigTableSizes(void* host_rs, const D3D12_VERSIONED_ROOT_SIGNATURE_DESC& desc);
 
     std::atomic<bool> has_guest_backed_desc_heaps_{false};
     mutable std::mutex guest_dh_mutex_;
     std::vector<GuestBackedDescHeap> guest_backed_desc_heaps_;
     ID3D12DescriptorHeap* shadow_cbv_srv_uav_heap_ = nullptr;
+    ID3D12DescriptorHeap* shadow_sampler_heap_ = nullptr;
+    D3D12_CPU_DESCRIPTOR_HANDLE shadow_sampler_cpu_start_{0u};
+    uint32_t shadow_sampler_inc_ = 32u;
+    uint32_t shadow_sampler_cap_ = 0u;
     D3D12_CPU_DESCRIPTOR_HANDLE shadow_cbv_srv_uav_cpu_start_{0u};
     D3D12_CPU_DESCRIPTOR_HANDLE shadow_null_srv_cpu_{0u};
     uint32_t shadow_cbv_srv_uav_inc_ = 32u;

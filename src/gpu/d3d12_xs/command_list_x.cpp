@@ -636,6 +636,13 @@ HRESULT STDMETHODCALLTYPE CommandListX::Close() {
     if (FAILED(hr) && device_x_ && device_x_->IsRetailScarlettAbi() && device_x_->HostDevice()) {
         std::fprintf(stderr, "[OpenScarlett][d3d12_xs] CommandListX::Close FAILED hr=0x%08lX type=%d\n",
                      static_cast<unsigned long>(hr), static_cast<int>(list_type_));
+        const auto ops = CopyDiagOps();
+        if (!ops.empty()) {
+            const size_t start_op = (ops.size() > 64u) ? (ops.size() - 64u) : 0u;
+            for (size_t k = start_op; k < ops.size(); ++k) {
+                std::fprintf(stderr, "  [DiagOp #%zu] %s\n", k, ops[k].c_str());
+            }
+        }
         ID3D12InfoQueue* iq = nullptr;
         if (SUCCEEDED(device_x_->HostDevice()->QueryInterface(
                 OS_D3D12_IID(ID3D12InfoQueue), reinterpret_cast<void**>(&iq))) && iq) {
@@ -805,7 +812,56 @@ HRESULT STDMETHODCALLTYPE CommandListX::Reset(
             use_alloc = retail_private_allocs_[slot];
         }
     }
-    const HRESULT hr = host_list_->Reset(use_alloc, last_pso_is_standin_ ? nullptr : host_pso);
+    HRESULT hr = host_list_->Reset(use_alloc, last_pso_is_standin_ ? nullptr : host_pso);
+    if (FAILED(hr) && device_x_ && device_x_->IsRetailScarlettAbi() && device_x_->HostDevice() && use_alloc) {
+        // Recover cleanly if a prior Close() returned E_INVALIDARG and left host_list_ open/poisoned.
+        ID3D12GraphicsCommandList* fresh_list = nullptr;
+        if (SUCCEEDED(device_x_->HostDevice()->CreateCommandList(
+                0u, list_type_, use_alloc, last_pso_is_standin_ ? nullptr : host_pso,
+                OS_D3D12_IID(ID3D12GraphicsCommandList), reinterpret_cast<void**>(&fresh_list))) &&
+            fresh_list) {
+            if (host_list_) host_list_->Release();
+            host_list_ = fresh_list;
+            if (host_list1_) { host_list1_->Release(); host_list1_ = nullptr; }
+            if (host_list2_) { host_list2_->Release(); host_list2_ = nullptr; }
+            if (host_list3_) { host_list3_->Release(); host_list3_ = nullptr; }
+            if (host_list4_) { host_list4_->Release(); host_list4_ = nullptr; }
+            if (host_list5_) { host_list5_->Release(); host_list5_ = nullptr; }
+            if (host_list6_) { host_list6_->Release(); host_list6_ = nullptr; }
+#ifdef __ID3D12GraphicsCommandList7_INTERFACE_DEFINED__
+            if (host_list7_) { host_list7_->Release(); host_list7_ = nullptr; }
+            (void)host_list_->QueryInterface(OS_D3D12_IID(ID3D12GraphicsCommandList7), reinterpret_cast<void**>(&host_list7_));
+#endif
+#ifdef __ID3D12GraphicsCommandList8_INTERFACE_DEFINED__
+            if (host_list8_) { host_list8_->Release(); host_list8_ = nullptr; }
+            (void)host_list_->QueryInterface(OS_D3D12_IID(ID3D12GraphicsCommandList8), reinterpret_cast<void**>(&host_list8_));
+#endif
+#ifdef __ID3D12GraphicsCommandList9_INTERFACE_DEFINED__
+            if (host_list9_) { host_list9_->Release(); host_list9_ = nullptr; }
+            (void)host_list_->QueryInterface(OS_D3D12_IID(ID3D12GraphicsCommandList9), reinterpret_cast<void**>(&host_list9_));
+#endif
+#ifdef __ID3D12GraphicsCommandList10_INTERFACE_DEFINED__
+            if (host_list10_) { host_list10_->Release(); host_list10_ = nullptr; }
+            (void)host_list_->QueryInterface(OS_D3D12_IID(ID3D12GraphicsCommandList10), reinterpret_cast<void**>(&host_list10_));
+#endif
+            (void)host_list_->QueryInterface(OS_D3D12_IID(ID3D12GraphicsCommandList1), reinterpret_cast<void**>(&host_list1_));
+            (void)host_list_->QueryInterface(OS_D3D12_IID(ID3D12GraphicsCommandList2), reinterpret_cast<void**>(&host_list2_));
+            (void)host_list_->QueryInterface(OS_D3D12_IID(ID3D12GraphicsCommandList3), reinterpret_cast<void**>(&host_list3_));
+            (void)host_list_->QueryInterface(OS_D3D12_IID(ID3D12GraphicsCommandList4), reinterpret_cast<void**>(&host_list4_));
+            (void)host_list_->QueryInterface(OS_D3D12_IID(ID3D12GraphicsCommandList5), reinterpret_cast<void**>(&host_list5_));
+            (void)host_list_->QueryInterface(OS_D3D12_IID(ID3D12GraphicsCommandList6), reinterpret_cast<void**>(&host_list6_));
+            {
+                auto& reg = GetCommandListRegistry();
+                std::unique_lock<std::shared_mutex> rlock(reg.mutex);
+                for (const auto& kv : reg.wrapper_map) {
+                    if (kv.second == this) {
+                        reg.map[kv.first] = host_list_;
+                    }
+                }
+            }
+            hr = S_OK;
+        }
+    }
     if (IsDiagTraceEnabled()) {
         static std::atomic<uint32_t> s_rst_log{0u};
         if (s_rst_log.fetch_add(1u, std::memory_order_relaxed) < 12u) {
@@ -1562,6 +1618,11 @@ void STDMETHODCALLTYPE CommandListX::CopyResource(
     if (IsDiagTraceEnabled()) {
         AppendDiagOp("CopyResource");
     }
+    if (!host_dst || !host_src) {
+        if (device_x_) device_x_->RecordZeroCountNoop();
+        RecordList("ID3D12GraphicsCommandListX::CopyResource[NullResNoop]", 17, S_OK);
+        return;
+    }
     if (TryBridgePlacedTiledCopyResource(host_dst, host_src)) {
         RecordList("ID3D12GraphicsCommandListX::CopyResource[PlacedTiled]", 17, S_OK);
         RecordList("ID3D12GraphicsCommandListX::CopyResource", 17, S_OK);
@@ -1579,6 +1640,11 @@ void STDMETHODCALLTYPE CommandListX::CopyTiles(
     D3D12_TILE_COPY_FLAGS Flags) {
     ID3D12Resource* host_tiled = UnwrapResource(pTiledResource);
     ID3D12Resource* host_buf = UnwrapResource(pBuffer);
+    if (!host_tiled || !host_buf) {
+        if (device_x_) device_x_->RecordZeroCountNoop();
+        RecordList("ID3D12GraphicsCommandListX::CopyTiles[NullResNoop]", 18, S_OK);
+        return;
+    }
     if (TryBridgePlacedTiledCopyTiles(
             host_tiled, pTileRegionStartCoordinate, pTileRegionSize,
             host_buf, BufferStartOffsetInBytes, Flags)) {
@@ -1597,6 +1663,11 @@ void STDMETHODCALLTYPE CommandListX::ResolveSubresource(
     ID3D12Resource* pSrcResource, UINT SrcSubresource, DXGI_FORMAT Format) {
     ID3D12Resource* host_dst = UnwrapResource(pDstResource);
     ID3D12Resource* host_src = UnwrapResource(pSrcResource);
+    if (!host_dst || !host_src) {
+        if (device_x_) device_x_->RecordZeroCountNoop();
+        RecordList("ID3D12GraphicsCommandListX::ResolveSubresource[NullResNoop]", 19, S_OK);
+        return;
+    }
     if (host_dst && host_src && host_list1_) {
         const D3D12_RESOURCE_DESC dd = host_dst->GetDesc();
         const D3D12_RESOURCE_DESC sd = host_src->GetDesc();
@@ -1647,6 +1718,12 @@ void STDMETHODCALLTYPE CommandListX::IASetPrimitiveTopology(
             }
             clean_topo = D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
         }
+    }
+    if (IsDiagTraceEnabled()) {
+        char buf[64];
+        std::snprintf(buf, sizeof(buf), "IASetPrimitiveTopology(raw=%u->%d)",
+                      raw_t, static_cast<int>(clean_topo));
+        AppendDiagOp(buf);
     }
     host_list_->IASetPrimitiveTopology(clean_topo);
     RecordList("ID3D12GraphicsCommandListX::IASetPrimitiveTopology", 20, S_OK);
@@ -1735,7 +1812,7 @@ void STDMETHODCALLTYPE CommandListX::SetPipelineState(ID3D12PipelineState* pPipe
                       static_cast<void*>(host_pso), last_pso_is_standin_ ? 1 : 0);
         AppendDiagOp(buf);
     }
-    if (!skip_host && !last_pso_is_standin_) {
+    if (!skip_host && !last_pso_is_standin_ && host_pso != nullptr) {
         host_list_->SetPipelineState(host_pso);
     }
     RecordList("ID3D12GraphicsCommandListX::SetPipelineState", 25, S_OK);
@@ -1850,6 +1927,63 @@ void STDMETHODCALLTYPE CommandListX::ResourceBarrier(
                             break;
                         }
                     }
+                    // Desktop D3D12 forbids Xbox-exclusive high state bits and read+write mixed states
+                    // (e.g. UNORDERED_ACCESS | NON_PIXEL_SHADER_RESOURCE) which poison Close() with 0x80070057.
+                    if (device_x_ && device_x_->IsRetailScarlettAbi()) {
+                        const D3D12_RESOURCE_FLAGS rflags = b.Transition.pResource->GetDesc().Flags;
+                        auto sanitize_retail_state = [is_buffer, rflags](D3D12_RESOURCE_STATES st) noexcept -> D3D12_RESOURCE_STATES {
+                            constexpr UINT kValidDesktopMask =
+                                static_cast<UINT>(D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER) |
+                                static_cast<UINT>(D3D12_RESOURCE_STATE_INDEX_BUFFER) |
+                                static_cast<UINT>(D3D12_RESOURCE_STATE_RENDER_TARGET) |
+                                static_cast<UINT>(D3D12_RESOURCE_STATE_UNORDERED_ACCESS) |
+                                static_cast<UINT>(D3D12_RESOURCE_STATE_DEPTH_WRITE) |
+                                static_cast<UINT>(D3D12_RESOURCE_STATE_DEPTH_READ) |
+                                static_cast<UINT>(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) |
+                                static_cast<UINT>(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) |
+                                static_cast<UINT>(D3D12_RESOURCE_STATE_STREAM_OUT) |
+                                static_cast<UINT>(D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT) |
+                                static_cast<UINT>(D3D12_RESOURCE_STATE_COPY_DEST) |
+                                static_cast<UINT>(D3D12_RESOURCE_STATE_COPY_SOURCE) |
+                                static_cast<UINT>(D3D12_RESOURCE_STATE_RESOLVE_DEST) |
+                                static_cast<UINT>(D3D12_RESOURCE_STATE_RESOLVE_SOURCE) |
+                                static_cast<UINT>(D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE);
+                            UINT u = static_cast<UINT>(st) & kValidDesktopMask;
+                            if (!is_buffer) {
+                                constexpr UINT kBufOnly =
+                                    static_cast<UINT>(D3D12_RESOURCE_STATE_VERTEX_AND_CONSTANT_BUFFER) |
+                                    static_cast<UINT>(D3D12_RESOURCE_STATE_INDEX_BUFFER) |
+                                    static_cast<UINT>(D3D12_RESOURCE_STATE_STREAM_OUT) |
+                                    static_cast<UINT>(D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT);
+                                u &= ~kBufOnly;
+                            }
+                            if ((rflags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0) {
+                                u &= ~static_cast<UINT>(D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                            }
+                            if ((rflags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) == 0) {
+                                u &= ~static_cast<UINT>(D3D12_RESOURCE_STATE_RENDER_TARGET);
+                            }
+                            if ((rflags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) == 0) {
+                                u &= ~static_cast<UINT>(D3D12_RESOURCE_STATE_DEPTH_WRITE | D3D12_RESOURCE_STATE_DEPTH_READ);
+                            }
+                            if ((rflags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) != 0) {
+                                u &= ~static_cast<UINT>(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                            }
+                            if ((u & D3D12_RESOURCE_STATE_RENDER_TARGET) != 0u) return D3D12_RESOURCE_STATE_RENDER_TARGET;
+                            if ((u & D3D12_RESOURCE_STATE_UNORDERED_ACCESS) != 0u) return D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                            if ((u & D3D12_RESOURCE_STATE_DEPTH_WRITE) != 0u) return D3D12_RESOURCE_STATE_DEPTH_WRITE;
+                            if ((u & D3D12_RESOURCE_STATE_COPY_DEST) != 0u) return D3D12_RESOURCE_STATE_COPY_DEST;
+                            if ((u & D3D12_RESOURCE_STATE_RESOLVE_DEST) != 0u) return D3D12_RESOURCE_STATE_RESOLVE_DEST;
+                            if ((u & D3D12_RESOURCE_STATE_STREAM_OUT) != 0u) return D3D12_RESOURCE_STATE_STREAM_OUT;
+                            return static_cast<D3D12_RESOURCE_STATES>(u);
+                        };
+                        b.Transition.StateBefore = sanitize_retail_state(b.Transition.StateBefore);
+                        b.Transition.StateAfter = sanitize_retail_state(b.Transition.StateAfter);
+                        if (b.Transition.StateBefore == b.Transition.StateAfter) {
+                            emit = false;
+                            break;
+                        }
+                    }
                     // Desktop D3D12 forbids buffer-only state bits on texture resources
                     // (Xbox titles sometimes pass GENERIC_READ or VB/IB bits on textures).
                     if (!is_buffer) {
@@ -1916,6 +2050,13 @@ void STDMETHODCALLTYPE CommandListX::ResourceBarrier(
                 b.UAV.pResource = UnwrapResource(pBarriers[i].UAV.pResource);
                 if (b.UAV.pResource != nullptr) {
                     RecordMirroredResourceGpuWrite(b.UAV.pResource);
+                    if (device_x_ && device_x_->IsRetailScarlettAbi() &&
+                        (b.UAV.pResource->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0) {
+                        // Desktop D3D12 marks the command list E_INVALIDARG (Close -> 0x80070057) if a
+                        // per-resource UAV barrier references a resource created without ALLOW_UNORDERED_ACCESS.
+                        b.UAV.pResource = nullptr;
+                        ++global_uav_barriers;
+                    }
                 } else {
                     // Console global UAV barrier (UAV.pResource == nullptr, xcl #68):
                     // valid on DIRECT/COMPUTE lists in D3D12 and maps conservatively to a full
@@ -2070,10 +2211,19 @@ D3D12_RESOURCE_STATES BarrierLayoutToLegacyState(
     D3D12_BARRIER_ACCESS fallback_access) noexcept {
     switch (layout) {
         case D3D12_BARRIER_LAYOUT_UNDEFINED:
+            return D3D12_RESOURCE_STATE_COMMON;
         case D3D12_BARRIER_LAYOUT_COMMON:
         case D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COMMON:
-        case D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COMMON:
+        case D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COMMON: {
+            if (fallback_access != D3D12_BARRIER_ACCESS_COMMON &&
+                fallback_access != D3D12_BARRIER_ACCESS_NO_ACCESS) {
+                const D3D12_RESOURCE_STATES acc_st = BarrierAccessToLegacyState(fallback_access);
+                if (acc_st != D3D12_RESOURCE_STATE_COMMON) {
+                    return acc_st;
+                }
+            }
             return D3D12_RESOURCE_STATE_COMMON;
+        }
         case D3D12_BARRIER_LAYOUT_GENERIC_READ:
         case D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_GENERIC_READ:
         case D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_GENERIC_READ:
@@ -2136,6 +2286,31 @@ bool IsEnhancedReadAccess(D3D12_BARRIER_ACCESS access) noexcept {
     return (static_cast<uint32_t>(access) & kReadMask) != 0u;
 }
 
+bool HostSupportsEnhancedBarriers(ID3D12Device* host_dev) noexcept {
+    if (!host_dev) return false;
+#if defined(D3D12_SDK_VERSION) && (D3D12_SDK_VERSION >= 608)
+    static std::mutex s_eb_mu;
+    static std::unordered_map<ID3D12Device*, bool> s_eb_cache;
+    {
+        std::lock_guard<std::mutex> lk(s_eb_mu);
+        auto it = s_eb_cache.find(host_dev);
+        if (it != s_eb_cache.end()) return it->second;
+    }
+    D3D12_FEATURE_DATA_D3D12_OPTIONS12 opt12{};
+    const bool supported =
+        SUCCEEDED(host_dev->CheckFeatureSupport(
+            D3D12_FEATURE_D3D12_OPTIONS12, &opt12, sizeof(opt12))) &&
+        (opt12.EnhancedBarriersSupported != FALSE);
+    {
+        std::lock_guard<std::mutex> lk(s_eb_mu);
+        s_eb_cache[host_dev] = supported;
+    }
+    return supported;
+#else
+    return false;
+#endif
+}
+
 }  // namespace
 
 void CommandListX::ExecuteEnhancedBarriers(
@@ -2147,8 +2322,13 @@ void CommandListX::ExecuteEnhancedBarriers(
         AppendDiagOp(buf);
     }
     eb_barrier_calls_.fetch_add(1ull, std::memory_order_relaxed);
+    const bool is_retail = (device_x_ && device_x_->IsRetailScarlettAbi());
+    const bool use_native_eb =
+        (!is_retail) && (host_list7_ != nullptr) && device_x_ &&
+        HostSupportsEnhancedBarriers(device_x_->HostDevice());
+
     if (!barrier_groups || num_barrier_groups == 0u) {
-        if (host_list7_) {
+        if (use_native_eb) {
             host_list7_->Barrier(num_barrier_groups, barrier_groups);
             eb_native_calls_.fetch_add(1ull, std::memory_order_relaxed);
         }
@@ -2209,6 +2389,8 @@ void CommandListX::ExecuteEnhancedBarriers(
                     if (host_res) {
                         const D3D12_RESOURCE_STATES before_st = BarrierAccessToLegacyState(bb.AccessBefore);
                         const D3D12_RESOURCE_STATES after_st = BarrierAccessToLegacyState(bb.AccessAfter);
+                        const D3D12_RESOURCE_STATES eff_before =
+                            is_retail ? device_x_->GetRetailResourceState(host_res, before_st) : before_st;
                         if (track_unified) {
                             {
                                 std::lock_guard<std::mutex> lk(aaa_rec_mutex_);
@@ -2233,19 +2415,19 @@ void CommandListX::ExecuteEnhancedBarriers(
                         if (IsEnhancedWriteAccess(bb.AccessBefore) || IsEnhancedWriteAccess(bb.AccessAfter)) {
                             RecordMirroredResourceGpuWrite(host_res);
                         }
-                        if ((bb.AccessBefore & D3D12_BARRIER_ACCESS_UNORDERED_ACCESS) != 0 ||
-                            (bb.AccessAfter & D3D12_BARRIER_ACCESS_UNORDERED_ACCESS) != 0) {
-                            D3D12_RESOURCE_BARRIER lb{};
-                            lb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-                            lb.UAV.pResource = host_res;
-                            legacy_barriers.push_back(lb);
-                        } else if (before_st != after_st) {
+                        if (bb.AccessAfter != D3D12_BARRIER_ACCESS_NO_ACCESS && eff_before != after_st) {
                             D3D12_RESOURCE_BARRIER lb{};
                             lb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
                             lb.Transition.pResource = host_res;
                             lb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                            lb.Transition.StateBefore = before_st;
+                            lb.Transition.StateBefore = eff_before;
                             lb.Transition.StateAfter = after_st;
+                            legacy_barriers.push_back(lb);
+                        } else if ((bb.AccessBefore & D3D12_BARRIER_ACCESS_UNORDERED_ACCESS) != 0 ||
+                                   (bb.AccessAfter & D3D12_BARRIER_ACCESS_UNORDERED_ACCESS) != 0) {
+                            D3D12_RESOURCE_BARRIER lb{};
+                            lb.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                            lb.UAV.pResource = host_res;
                             legacy_barriers.push_back(lb);
                         }
                     }
@@ -2272,6 +2454,8 @@ void CommandListX::ExecuteEnhancedBarriers(
                             BarrierLayoutToLegacyState(tb.LayoutBefore, tb.AccessBefore);
                         const D3D12_RESOURCE_STATES after_st =
                             BarrierLayoutToLegacyState(tb.LayoutAfter, tb.AccessAfter);
+                        const D3D12_RESOURCE_STATES eff_before =
+                            is_retail ? device_x_->GetRetailResourceState(host_res, before_st) : before_st;
                         if (track_unified) {
                             {
                                 std::lock_guard<std::mutex> lk(aaa_rec_mutex_);
@@ -2290,7 +2474,7 @@ void CommandListX::ExecuteEnhancedBarriers(
                             after_st == D3D12_RESOURCE_STATE_RENDER_TARGET) {
                             RecordMirroredResourceGpuWrite(host_res);
                         }
-                        if (before_st != after_st) {
+                        if (tb.LayoutAfter != D3D12_BARRIER_LAYOUT_UNDEFINED && eff_before != after_st) {
                             D3D12_RESOURCE_BARRIER lb{};
                             lb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
                             lb.Transition.pResource = host_res;
@@ -2298,7 +2482,7 @@ void CommandListX::ExecuteEnhancedBarriers(
                                 (tb.Subresources.NumMipLevels == 0u)
                                     ? tb.Subresources.IndexOrFirstMipLevel
                                     : D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                            lb.Transition.StateBefore = before_st;
+                            lb.Transition.StateBefore = eff_before;
                             lb.Transition.StateAfter = after_st;
                             legacy_barriers.push_back(lb);
                         } else if ((tb.AccessBefore & D3D12_BARRIER_ACCESS_UNORDERED_ACCESS) != 0 ||
@@ -2325,6 +2509,15 @@ void CommandListX::ExecuteEnhancedBarriers(
         eb_unified_tex_notifs_.fetch_add(unified_notifs, std::memory_order_relaxed);
     }
 
+    if (is_retail) {
+        if (!legacy_barriers.empty()) {
+            this->ResourceBarrier(static_cast<UINT>(legacy_barriers.size()), legacy_barriers.data());
+        }
+        eb_legacy_fallbacks_.fetch_add(1ull, std::memory_order_relaxed);
+        RecordList("ID3D12GraphicsCommandListX::Barrier", 80, S_OK);
+        return;
+    }
+
     std::vector<D3D12_RESOURCE_BARRIER> extra_tiled_barriers;
     if (!legacy_barriers.empty()) {
         TrackPlacedTiledResourceBarriers(
@@ -2340,11 +2533,11 @@ void CommandListX::ExecuteEnhancedBarriers(
         vk_batch_.has_host_commands = true;
     }
 
-    if (host_list7_) {
+    if (use_native_eb) {
         host_list7_->Barrier(num_barrier_groups, unwrapped_groups.data());
         eb_native_calls_.fetch_add(1ull, std::memory_order_relaxed);
     } else if (host_list_) {
-        // Legacy fallback for Windows 10 22H2 inbox D3D12 without Agility SDK D3D12Core.dll.
+        // Legacy fallback for Windows 10 22H2 inbox D3D12 without EnhancedBarriersSupported.
         if (!extra_tiled_barriers.empty()) {
             host_list_->ResourceBarrier(
                 static_cast<UINT>(extra_tiled_barriers.size()), extra_tiled_barriers.data());
@@ -2445,9 +2638,12 @@ void STDMETHODCALLTYPE CommandListX::SetComputeRootSignature(
         char buf[96];
         std::snprintf(buf, sizeof(buf), "SetComputeRootSig(%p empty=%d)",
                       static_cast<void*>(host_rs), last_cmp_rs_is_empty_ ? 1 : 0);
-        AppendDiagOp(buf);
+        std::string rs_info = device_x_ ? device_x_->DescribeDiagRootSig(host_rs) : std::string{};
+        AppendDiagOp(rs_info.empty() ? std::string(buf) : (std::string(buf) + " " + rs_info));
     }
-    host_list_->SetComputeRootSignature(host_rs);
+    if (host_rs) {
+        host_list_->SetComputeRootSignature(host_rs);
+    }
     RecordList("ID3D12GraphicsCommandListX::SetComputeRootSignature", 29, S_OK);
 }
 
@@ -2472,27 +2668,53 @@ void STDMETHODCALLTYPE CommandListX::SetGraphicsRootSignature(
         std::string rs_info = device_x_ ? device_x_->DescribeDiagRootSig(host_rs) : std::string{};
         AppendDiagOp(rs_info.empty() ? std::string(buf) : (std::string(buf) + " " + rs_info));
     }
-    host_list_->SetGraphicsRootSignature(host_rs);
+    if (host_rs) {
+        host_list_->SetGraphicsRootSignature(host_rs);
+    }
     RecordList("ID3D12GraphicsCommandListX::SetGraphicsRootSignature", 30, S_OK);
 }
 
 void STDMETHODCALLTYPE CommandListX::SetComputeRootDescriptorTable(
     UINT RootParameterIndex, D3D12_GPU_DESCRIPTOR_HANDLE BaseDescriptor) {
+    bool is_sampler_param = false;
+    const bool is_table_param =
+        !device_x_ || device_x_->IsValidRootDescriptorTableParam(
+                          last_host_compute_rs_, RootParameterIndex, &is_sampler_param);
     if (device_x_) {
         BaseDescriptor = device_x_->TranslateGpuDescriptorHandle(BaseDescriptor);
-        BaseDescriptor = device_x_->MaterializeGuestDescriptorTable(
-            BaseDescriptor, last_host_compute_rs_, RootParameterIndex);
+        if (is_table_param && !is_sampler_param) {
+            BaseDescriptor = device_x_->MaterializeGuestDescriptorTable(
+                BaseDescriptor, last_host_compute_rs_, RootParameterIndex);
+        }
         const uint32_t sgpr_slot = (RootParameterIndex * 2u) % 14u;
         (void)device_x_->GetDescriptorBridge().SetRootSgprTablePtr(sgpr_slot, BaseDescriptor.ptr);
         device_x_->RecordBridgeTableBind();
     }
+    bool valid_for_host = is_table_param && (BaseDescriptor.ptr != 0ull);
+    if (device_x_ && device_x_->IsRetailScarlettAbi()) {
+        ID3D12DescriptorHeap* req_heap =
+            is_sampler_param ? bound_sampler_heap_ : bound_cbv_srv_uav_heap_;
+        if (!req_heap) {
+            valid_for_host = false;
+        } else {
+            const D3D12_DESCRIPTOR_HEAP_DESC hd = req_heap->GetDesc();
+            const uint64_t h_start = req_heap->GetGPUDescriptorHandleForHeapStart().ptr;
+            const uint32_t inc = device_x_->GetDescriptorHandleIncrementSize(hd.Type);
+            const uint64_t h_end = h_start + static_cast<uint64_t>(hd.NumDescriptors) * inc;
+            if (BaseDescriptor.ptr < h_start || BaseDescriptor.ptr >= h_end) {
+                BaseDescriptor.ptr = h_start;
+            }
+            valid_for_host = (BaseDescriptor.ptr != 0ull);
+        }
+    }
     if (IsDiagTraceEnabled()) {
-        char buf[96];
-        std::snprintf(buf, sizeof(buf), "SetCmpRootDescTable(rp=%u gpu=0x%llX)",
-                      RootParameterIndex, static_cast<unsigned long long>(BaseDescriptor.ptr));
+        char buf[112];
+        std::snprintf(buf, sizeof(buf), "SetCmpRootDescTable(rp=%u samp=%d gpu=0x%llX)",
+                      RootParameterIndex, is_sampler_param ? 1 : 0,
+                      static_cast<unsigned long long>(BaseDescriptor.ptr));
         AppendDiagOp(buf);
     }
-    if (!last_cmp_rs_is_empty_ && !last_pso_is_standin_) {
+    if (valid_for_host && !last_cmp_rs_is_empty_ && !last_pso_is_standin_) {
         host_list_->SetComputeRootDescriptorTable(RootParameterIndex, BaseDescriptor);
     }
     RecordList("ID3D12GraphicsCommandListX::SetComputeRootDescriptorTable", 31, S_OK);
@@ -2501,27 +2723,53 @@ void STDMETHODCALLTYPE CommandListX::SetComputeRootDescriptorTable(
 void STDMETHODCALLTYPE CommandListX::SetGraphicsRootDescriptorTable(
     UINT RootParameterIndex, D3D12_GPU_DESCRIPTOR_HANDLE BaseDescriptor) {
     const D3D12_GPU_DESCRIPTOR_HANDLE orig_gpu = BaseDescriptor;
+    bool is_sampler_param = false;
+    const bool is_table_param =
+        !device_x_ || device_x_->IsValidRootDescriptorTableParam(
+                          last_host_graphics_rs_, RootParameterIndex, &is_sampler_param);
     uint32_t mat_hits = 0u;
     uint32_t mat_slots = 0u;
     if (device_x_) {
         BaseDescriptor = device_x_->TranslateGpuDescriptorHandle(BaseDescriptor);
-        BaseDescriptor = device_x_->MaterializeGuestDescriptorTable(
-            BaseDescriptor, last_host_graphics_rs_, RootParameterIndex, &mat_hits, &mat_slots);
+        if (is_table_param && !is_sampler_param) {
+            BaseDescriptor = device_x_->MaterializeGuestDescriptorTable(
+                BaseDescriptor, last_host_graphics_rs_, RootParameterIndex, &mat_hits, &mat_slots);
+        }
         const uint32_t sgpr_slot = (RootParameterIndex * 2u) % 14u;
         (void)device_x_->GetDescriptorBridge().SetRootSgprTablePtr(sgpr_slot, BaseDescriptor.ptr);
         device_x_->RecordBridgeTableBind();
     }
+    bool valid_for_host = is_table_param && (BaseDescriptor.ptr != 0ull);
+    if (device_x_ && device_x_->IsRetailScarlettAbi()) {
+        ID3D12DescriptorHeap* req_heap =
+            is_sampler_param ? bound_sampler_heap_ : bound_cbv_srv_uav_heap_;
+        if (!req_heap) {
+            valid_for_host = false;
+        } else {
+            const D3D12_DESCRIPTOR_HEAP_DESC hd = req_heap->GetDesc();
+            const uint64_t h_start = req_heap->GetGPUDescriptorHandleForHeapStart().ptr;
+            const uint32_t inc = device_x_->GetDescriptorHandleIncrementSize(hd.Type);
+            const uint64_t h_end = h_start + static_cast<uint64_t>(hd.NumDescriptors) * inc;
+            if (BaseDescriptor.ptr < h_start || BaseDescriptor.ptr >= h_end) {
+                BaseDescriptor.ptr = h_start;
+            }
+            valid_for_host = (BaseDescriptor.ptr != 0ull);
+        }
+    }
     if (IsDiagTraceEnabled()) {
-        std::string extra = device_x_ ? device_x_->DescribeDiagDescriptorTable(orig_gpu, 4u) : std::string{};
+        std::string extra = (!is_sampler_param && device_x_)
+                                ? device_x_->DescribeDiagDescriptorTable(orig_gpu, 4u)
+                                : std::string{};
         char buf[160];
-        std::snprintf(buf, sizeof(buf), "SetGfxRootDescTable(rp=%u gpu=0x%llX->0x%llX mat=%u/%u skip=%d)",
-                      RootParameterIndex, static_cast<unsigned long long>(orig_gpu.ptr),
+        std::snprintf(buf, sizeof(buf), "SetGfxRootDescTable(rp=%u samp=%d gpu=0x%llX->0x%llX mat=%u/%u skip=%d)",
+                      RootParameterIndex, is_sampler_param ? 1 : 0,
+                      static_cast<unsigned long long>(orig_gpu.ptr),
                       static_cast<unsigned long long>(BaseDescriptor.ptr),
                       mat_hits, mat_slots,
                       last_gfx_rs_is_empty_ ? 1 : 0);
         AppendDiagOp(extra.empty() ? std::string(buf) : (std::string(buf) + " " + extra));
     }
-    if (!last_gfx_rs_is_empty_ && !last_pso_is_standin_) {
+    if (valid_for_host && !last_gfx_rs_is_empty_ && !last_pso_is_standin_) {
         host_list_->SetGraphicsRootDescriptorTable(RootParameterIndex, BaseDescriptor);
     }
     RecordList("ID3D12GraphicsCommandListX::SetGraphicsRootDescriptorTable", 32, S_OK);
@@ -2543,7 +2791,7 @@ void STDMETHODCALLTYPE CommandListX::SetComputeRoot32BitConstant(
         }
         vk_cmp_root_constants_[DestOffsetIn32BitValues] = SrcData;
     }
-    if (!last_cmp_rs_is_empty_) {
+    if (!last_cmp_rs_is_empty_ && !last_pso_is_standin_) {
         host_list_->SetComputeRoot32BitConstant(RootParameterIndex, SrcData, DestOffsetIn32BitValues);
     }
     RecordList("ID3D12GraphicsCommandListX::SetComputeRoot32BitConstant", 33, S_OK);
@@ -2597,7 +2845,7 @@ void STDMETHODCALLTYPE CommandListX::SetComputeRoot32BitConstants(
         std::memcpy(vk_cmp_root_constants_.data() + DestOffsetIn32BitValues,
                     pSrcData, static_cast<size_t>(Num32BitValuesToSet) * sizeof(uint32_t));
     }
-    if (!last_cmp_rs_is_empty_) {
+    if (!last_cmp_rs_is_empty_ && !last_pso_is_standin_) {
         host_list_->SetComputeRoot32BitConstants(
             RootParameterIndex, Num32BitValuesToSet, pSrcData, DestOffsetIn32BitValues);
     }
@@ -3016,6 +3264,32 @@ void STDMETHODCALLTYPE CommandListX::OMSetRenderTargets(
             (pDepthStencilDescriptor && device_x_->IsValidRetailDsvHandle(pDepthStencilDescriptor->ptr))
                 ? pDepthStencilDescriptor
                 : nullptr;
+        ID3D12Resource* dsv_res =
+            clean_dsv ? device_x_->LookupRetailDsvResource(clean_dsv->ptr) : nullptr;
+        if (clean_dsv && dsv_res && clean_n > 0u) {
+            const D3D12_RESOURCE_DESC dd = dsv_res->GetDesc();
+            for (UINT k = 0u; k < clean_n; ++k) {
+                ID3D12Resource* rk = device_x_->LookupRetailRtvResource(clean_rtvs[k].ptr);
+                if (!rk) continue;
+                const D3D12_RESOURCE_DESC rd = rk->GetDesc();
+                if (dd.Width < rd.Width || dd.Height < rd.Height ||
+                    dd.SampleDesc.Count != rd.SampleDesc.Count) {
+                    static std::atomic<uint32_t> s_dsv_drop{0u};
+                    if (s_dsv_drop.fetch_add(1u, std::memory_order_relaxed) < 5u) {
+                        std::fprintf(
+                            stderr,
+                            "[OpenScarlett][d3d12_xs] OMSetRenderTargets: dropped mismatched stale DSV "
+                            "(%llux%u samp=%u) for RTV%u (%llux%u samp=%u)\n",
+                            static_cast<unsigned long long>(dd.Width), dd.Height, dd.SampleDesc.Count,
+                            k, static_cast<unsigned long long>(rd.Width), rd.Height, rd.SampleDesc.Count);
+                        std::fflush(stderr);
+                    }
+                    clean_dsv = nullptr;
+                    dsv_res = nullptr;
+                    break;
+                }
+            }
+        }
         ID3D12Resource* prev_rtv0 = last_bound_rtv0_res_;
         ID3D12Resource* next_rtv0 =
             (clean_n > 0u) ? device_x_->LookupRetailRtvResource(clean_rtvs[0].ptr) : nullptr;
@@ -3048,14 +3322,36 @@ void STDMETHODCALLTYPE CommandListX::OMSetRenderTargets(
                 host_list_->ResourceBarrier(1u, &tb);
             }
         }
+        if (dsv_res) {
+            const D3D12_RESOURCE_STATES target_dsv_st =
+                (clean_dsv && device_x_->IsReadOnlyRetailDsvHandle(clean_dsv->ptr))
+                    ? D3D12_RESOURCE_STATE_DEPTH_READ
+                    : D3D12_RESOURCE_STATE_DEPTH_WRITE;
+            const D3D12_RESOURCE_STATES before = device_x_->TransitionRetailResourceState(
+                dsv_res, target_dsv_st, D3D12_RESOURCE_STATE_COMMON);
+            if (before != target_dsv_st) {
+                D3D12_RESOURCE_BARRIER tb{};
+                tb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                tb.Transition.pResource = dsv_res;
+                tb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                tb.Transition.StateBefore = before;
+                tb.Transition.StateAfter = target_dsv_st;
+                host_list_->ResourceBarrier(1u, &tb);
+            }
+        }
         last_bound_rtv0_res_ = next_rtv0;
         if (IsDiagTraceEnabled()) {
-            char buf[144];
-            std::snprintf(buf, sizeof(buf), "OMSetRenderTargets(n=%u->%u rtv0=0x%llX dsv=%d->%d dsv_h=0x%llX)",
+            char buf[220];
+            const D3D12_RESOURCE_DESC dd_diag = dsv_res ? dsv_res->GetDesc() : D3D12_RESOURCE_DESC{};
+            std::snprintf(buf, sizeof(buf),
+                          "OMSetRenderTargets(n=%u->%u rtv0=0x%llX dsv=%d->%d dsv_h=0x%llX dsv=%p[%llux%u D=%u fmt=%d])",
                           NumRenderTargetDescriptors, clean_n,
                           clean_n > 0u ? static_cast<unsigned long long>(clean_rtvs[0].ptr) : 0ull,
                           pDepthStencilDescriptor ? 1 : 0, clean_dsv ? 1 : 0,
-                          clean_dsv ? static_cast<unsigned long long>(clean_dsv->ptr) : 0ull);
+                          clean_dsv ? static_cast<unsigned long long>(clean_dsv->ptr) : 0ull,
+                          static_cast<void*>(dsv_res),
+                          static_cast<unsigned long long>(dd_diag.Width), dd_diag.Height,
+                          dd_diag.DepthOrArraySize, static_cast<int>(dd_diag.Format));
             std::string rtv_info = (clean_n > 0u && device_x_) ? device_x_->DescribeDiagRtv(clean_rtvs[0].ptr) : std::string{};
             AppendDiagOp(rtv_info.empty() ? std::string(buf) : (std::string(buf) + " [" + rtv_info + "]"));
         }
@@ -3094,6 +3390,21 @@ void STDMETHODCALLTYPE CommandListX::ClearDepthStencilView(
         AppendDiagOp(invalid_dsv ? "ClearDepthStencilView[SKIP_INVALID]" : "ClearDepthStencilView");
     }
     if (!invalid_dsv) {
+        if (device_x_ && device_x_->IsRetailScarlettAbi()) {
+            if (ID3D12Resource* dsv_res = device_x_->LookupRetailDsvResource(DepthStencilView.ptr)) {
+                const D3D12_RESOURCE_STATES before = device_x_->TransitionRetailResourceState(
+                    dsv_res, D3D12_RESOURCE_STATE_DEPTH_WRITE, D3D12_RESOURCE_STATE_COMMON);
+                if (before != D3D12_RESOURCE_STATE_DEPTH_WRITE) {
+                    D3D12_RESOURCE_BARRIER b{};
+                    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    b.Transition.pResource = dsv_res;
+                    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                    b.Transition.StateBefore = before;
+                    b.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
+                    host_list_->ResourceBarrier(1u, &b);
+                }
+            }
+        }
         host_list_->ClearDepthStencilView(
             DepthStencilView, ClearFlags, Depth, Stencil, NumRects, pRects);
     }
@@ -3173,7 +3484,7 @@ void STDMETHODCALLTYPE CommandListX::ClearUnorderedAccessViewUint(
             }
         }
     }
-    if (host_res && (host_res->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0) {
+    if (!host_res || (host_res->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0) {
         RecordList("ID3D12GraphicsCommandListX::ClearUnorderedAccessViewUint[NoUavFlagSkip]", 49, S_OK);
         return;
     }
@@ -3195,7 +3506,7 @@ void STDMETHODCALLTYPE CommandListX::ClearUnorderedAccessViewFloat(
     D3D12_CPU_DESCRIPTOR_HANDLE ViewCPUHandle, ID3D12Resource* pResource,
     const FLOAT Values[4], UINT NumRects, const D3D12_RECT* pRects) {
     ID3D12Resource* host_res = UnwrapResource(pResource);
-    if (host_res && (host_res->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0) {
+    if (!host_res || (host_res->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0) {
         RecordList("ID3D12GraphicsCommandListX::ClearUnorderedAccessViewFloat[NoUavFlagSkip]", 50, S_OK);
         return;
     }
@@ -3214,10 +3525,24 @@ void STDMETHODCALLTYPE CommandListX::ClearUnorderedAccessViewFloat(
 
 void STDMETHODCALLTYPE CommandListX::DiscardResource(
     ID3D12Resource* pResource, const D3D12_DISCARD_REGION* pRegion) {
+    ID3D12Resource* host_res = UnwrapResource(pResource);
     if (IsDiagTraceEnabled()) {
         AppendDiagOp("DiscardResource");
     }
-    host_list_->DiscardResource(UnwrapResource(pResource), pRegion);
+    if (!host_res) {
+        RecordList("ID3D12GraphicsCommandListX::DiscardResource[NullResNoop]", 51, S_OK);
+        return;
+    }
+    if (device_x_ && device_x_->IsRetailScarlettAbi()) {
+        // Desktop D3D12 DiscardResource faults or marks E_INVALIDARG unless resource has ALLOW_RENDER_TARGET
+        // or ALLOW_DEPTH_STENCIL (unlike Xbox UMA render-graph aliasing). DiscardResource is a hint only.
+        const D3D12_RESOURCE_FLAGS flg = host_res->GetDesc().Flags;
+        if ((flg & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) == 0) {
+            RecordList("ID3D12GraphicsCommandListX::DiscardResource[HintNoop]", 51, S_OK);
+            return;
+        }
+    }
+    host_list_->DiscardResource(host_res, pRegion);
     RecordList("ID3D12GraphicsCommandListX::DiscardResource", 51, S_OK);
 }
 
@@ -3835,6 +4160,11 @@ void STDMETHODCALLTYPE CommandListX::ResolveSubresourceRegion(
         }
     }
 
+    if (!host_dst || !host_src) {
+        if (device_x_) device_x_->RecordZeroCountNoop();
+        RecordList("ID3D12GraphicsCommandListX::ResolveSubresourceRegion[NullResNoop]", 64, S_OK);
+        return;
+    }
     if (host_list1_) {
         host_list1_->ResolveSubresourceRegion(
             host_dst, DstSubresource, DstX, DstY,
@@ -4085,7 +4415,47 @@ void STDMETHODCALLTYPE CommandListX::DispatchRays(const D3D12_DISPATCH_RAYS_DESC
 void STDMETHODCALLTYPE CommandListX::RSSetShadingRate(
     D3D12_SHADING_RATE baseShadingRate,
     const D3D12_SHADING_RATE_COMBINER* combiners) {
-    if (host_list5_) {
+    if (IsDiagTraceEnabled()) {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "RSSetShadingRate(rate=0x%X comb=%p)",
+                      static_cast<unsigned>(baseShadingRate), static_cast<const void*>(combiners));
+        AppendDiagOp(buf);
+    }
+    auto is_valid_rate = [](D3D12_SHADING_RATE r) noexcept -> bool {
+        switch (r) {
+            case D3D12_SHADING_RATE_1X1:
+            case D3D12_SHADING_RATE_1X2:
+            case D3D12_SHADING_RATE_2X1:
+            case D3D12_SHADING_RATE_2X2:
+            case D3D12_SHADING_RATE_2X4:
+            case D3D12_SHADING_RATE_4X2:
+            case D3D12_SHADING_RATE_4X4:
+                return true;
+            default:
+                return false;
+        }
+    };
+    bool vrs_ok = (host_list5_ != nullptr) && is_valid_rate(baseShadingRate);
+    if (vrs_ok && combiners) {
+        if (static_cast<uint32_t>(combiners[0]) > static_cast<uint32_t>(D3D12_SHADING_RATE_COMBINER_MAX) ||
+            static_cast<uint32_t>(combiners[1]) > static_cast<uint32_t>(D3D12_SHADING_RATE_COMBINER_MAX)) {
+            vrs_ok = false;
+        }
+    }
+    if (vrs_ok && device_x_ && device_x_->HostDevice()) {
+        D3D12_FEATURE_DATA_D3D12_OPTIONS6 o6{};
+        if (FAILED(device_x_->HostDevice()->CheckFeatureSupport(
+                D3D12_FEATURE_D3D12_OPTIONS6, &o6, sizeof(o6))) ||
+            o6.VariableShadingRateTier == D3D12_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED) {
+            vrs_ok = false;
+        } else if (o6.AdditionalShadingRatesSupported == FALSE &&
+                   (baseShadingRate == D3D12_SHADING_RATE_2X4 ||
+                    baseShadingRate == D3D12_SHADING_RATE_4X2 ||
+                    baseShadingRate == D3D12_SHADING_RATE_4X4)) {
+            vrs_ok = false;
+        }
+    }
+    if (vrs_ok) {
         host_list5_->RSSetShadingRate(baseShadingRate, combiners);
         RecordList("ID3D12GraphicsCommandListX::RSSetShadingRate", 77, S_OK);
     } else {
@@ -4261,18 +4631,36 @@ void STDMETHODCALLTYPE CommandListX::Write32BitValueX(
     uint32_t Value,
     uint32_t Flags) {
     if (device_x_) device_x_->RecordCmdListWrite32();
+    if (IsDiagTraceEnabled()) {
+        char buf[112];
+        std::snprintf(buf, sizeof(buf), "Write32BitValueX(addr=0x%llX val=0x%X flg=0x%X)",
+                      static_cast<unsigned long long>(Address), Value, Flags);
+        AppendDiagOp(buf);
+    }
     if (Address == 0ull) {
         RecordList("ID3D12GraphicsCommandListX::Write32BitValueX", 86, E_INVALIDARG);
         return;
     }
 
+    const bool is_retail = device_x_ && device_x_->IsRetailScarlettAbi();
     uint64_t buf_off = 0ull;
     ID3D12Resource* host_buf =
-        device_x_ ? device_x_->ResolveBufferResourceByGpuVa(Address, &buf_off) : nullptr;
+        (!is_retail && device_x_) ? device_x_->ResolveBufferResourceByGpuVa(Address, &buf_off) : nullptr;
     const D3D12_GPU_VIRTUAL_ADDRESS translated =
-        device_x_ ? device_x_->TranslateGuestGpuVa(Address) : Address;
+        (!is_retail && device_x_) ? device_x_->TranslateGuestGpuVa(Address) : Address;
 
-    if (host_buf != nullptr && host_list2_ != nullptr) {
+    bool can_wbi = (!is_retail) && (host_buf != nullptr) && (host_list2_ != nullptr) &&
+                   ((translated & 3ull) == 0ull);
+    if (can_wbi) {
+        D3D12_HEAP_PROPERTIES hp{};
+        if (FAILED(host_buf->GetHeapProperties(&hp, nullptr)) ||
+            hp.Type == D3D12_HEAP_TYPE_UPLOAD ||
+            hp.Type == D3D12_HEAP_TYPE_READBACK) {
+            can_wbi = false;
+        }
+    }
+
+    if (can_wbi) {
         D3D12_WRITEBUFFERIMMEDIATE_PARAMETER param{};
         param.Dest = translated;
         param.Value = Value;
@@ -4296,6 +4684,13 @@ void CommandListX::Write64BitValueX(
     D3D12_GPU_VIRTUAL_ADDRESS Address,
     uint64_t Value,
     uint32_t Flags) {
+    if (IsDiagTraceEnabled()) {
+        char buf[112];
+        std::snprintf(buf, sizeof(buf), "Write64BitValueX(addr=0x%llX val=0x%llX flg=0x%X)",
+                      static_cast<unsigned long long>(Address),
+                      static_cast<unsigned long long>(Value), Flags);
+        AppendDiagOp(buf);
+    }
     if (Address == 0ull) {
         RecordList("ID3D12GraphicsCommandListX::Write64BitValueX", 86, E_INVALIDARG);
         return;
@@ -4340,6 +4735,12 @@ void STDMETHODCALLTYPE CommandListX::FlushGpuCacheRange(
     SIZE_T SizeInBytes) {
     (void)SizeInBytes;
     if (device_x_) device_x_->RecordCmdListFlushCache();
+    if (IsDiagTraceEnabled()) {
+        char buf[96];
+        std::snprintf(buf, sizeof(buf), "FlushGpuCacheRange(flg=0x%X addr=0x%llX)",
+                      Flags, static_cast<unsigned long long>(BaseAddress));
+        AppendDiagOp(buf);
+    }
     ID3D12Resource* host_buf = nullptr;
     if (device_x_ && BaseAddress != 0ull) {
         uint64_t off = 0ull;

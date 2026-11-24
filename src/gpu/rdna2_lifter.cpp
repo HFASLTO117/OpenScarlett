@@ -396,6 +396,9 @@ uint32_t ModuleParamOutputCount(const Rdna2IrModule& ir) noexcept {
     if (count > 0u && ir.output_interp_modes.size() > count) {
         count = std::min<uint32_t>(4u, static_cast<uint32_t>(ir.output_interp_modes.size()));
     }
+    if (ir.stage_contract.min_param_outputs > count) {
+        count = ir.stage_contract.min_param_outputs;
+    }
     return std::min<uint32_t>(4u, count);
 }
 
@@ -580,17 +583,19 @@ std::string MakeUniqueTempPath(const char* prefix, const char* ext) {
     std::error_code ec;
     std::filesystem::path temp_dir;
 #if defined(_WIN32)
-    char env_buf[1024]{};
-    DWORD env_len = GetEnvironmentVariableA("TEMP", env_buf, static_cast<DWORD>(sizeof(env_buf)));
-    if (env_len == 0 || env_len >= sizeof(env_buf)) {
-        env_len = GetEnvironmentVariableA("TMP", env_buf, static_cast<DWORD>(sizeof(env_buf)));
-    }
-    if (env_len > 0 && env_len < sizeof(env_buf)) {
-        temp_dir = std::filesystem::path(env_buf) / "openscarlett_lifter";
-    } else if (std::filesystem::exists("E:\\OpenScarlett", ec)) {
+    if (std::filesystem::exists("E:\\OpenScarlett", ec)) {
         temp_dir = std::filesystem::path(kLifterTempDir);
     } else {
-        temp_dir = std::filesystem::temp_directory_path(ec) / "openscarlett_lifter";
+        char env_buf[1024]{};
+        DWORD env_len = GetEnvironmentVariableA("TEMP", env_buf, static_cast<DWORD>(sizeof(env_buf)));
+        if (env_len == 0 || env_len >= sizeof(env_buf)) {
+            env_len = GetEnvironmentVariableA("TMP", env_buf, static_cast<DWORD>(sizeof(env_buf)));
+        }
+        if (env_len > 0 && env_len < sizeof(env_buf)) {
+            temp_dir = std::filesystem::path(env_buf) / "openscarlett_lifter";
+        } else {
+            temp_dir = std::filesystem::temp_directory_path(ec) / "openscarlett_lifter";
+        }
     }
 #else
     temp_dir = std::filesystem::temp_directory_path(ec) / "openscarlett_lifter";
@@ -951,7 +956,8 @@ public:
         // Distinct CB heap register space (space1) for CB loads with non-zero base SGPR offset
         // so they never collide with mixed-heap V# slot 0 (u0, space0) or root constants (b0, space0).
         const bool has_dual_srv0 = pb.enabled && pb.in0_is_cbv && pb.has_srv0;
-        bool needs_in0_decl = uses_uav0;
+        bool needs_in0_decl =
+            uses_uav0 || (uses_buf_load_fmt && !use_psv0_uav_bufs_ && (!pb.enabled || in0_is_cbv || in0_is_srv));
         bool needs_srv0_decl = false;
         {
             std::vector<uint32_t> cb_heap_regs;
@@ -997,7 +1003,13 @@ public:
         if (needs_srv0_decl) {
             hdr << "ByteAddressBuffer _srv0 : register(t" << pb.srv0_reg << ", space" << pb.srv0_space << ");\n";
         }
-        if (needs_in0_decl) {
+        const bool in0_cbv_aliased_to_s2 =
+            needs_in0_decl && in0_is_cbv && pb.in0_space == 2u && pb.in0_reg < 16u &&
+            ((ir_.used_space2_cbv_slots & (1u << pb.in0_reg)) != 0u);
+        const bool in0_srv_aliased_to_s2 =
+            needs_in0_decl && !in0_is_cbv && in0_is_srv && pb.in0_space == 2u && pb.in0_reg < 16u &&
+            (((ir_.used_space2_srv_slots | ir_.used_space2_tex_slots) & (1u << pb.in0_reg)) != 0u);
+        if (needs_in0_decl && !in0_cbv_aliased_to_s2 && !in0_srv_aliased_to_s2) {
             if (in0_is_cbv) {
                 hdr << "cbuffer _in0_cb : register(b" << pb.in0_reg << ", space" << pb.in0_space << ") {\n"
                     << "    uint4 _in0_cb_d[4096];\n"
@@ -1052,6 +1064,16 @@ public:
                 hdr << "Texture2D<" << tex_elem << "> _tex_s" << s2 << " : register(t" << s2 << ", space2);\n";
             }
         }
+        if (in0_cbv_aliased_to_s2) {
+            hdr << "uint _os_in0_cb_load(uint off) { return _os_cb_s" << pb.in0_reg << "_load(off); }\n";
+        } else if (in0_srv_aliased_to_s2) {
+            if (((ir_.used_space2_srv_slots & (1u << pb.in0_reg)) != 0u) &&
+                ((ir_.used_space2_tex_slots & (1u << pb.in0_reg)) == 0u)) {
+                hdr << "#define _in0 _srv_s" << pb.in0_reg << "\n";
+            } else {
+                hdr << "ByteAddressBuffer _in0 : register(t" << pb.in0_reg << ", space98);\n";
+            }
+        }
         uint32_t next_t = 0u;
         bool tex0_is_2d_float4 = false;
         if (use_psv0_srv_texs_) {
@@ -1102,16 +1124,33 @@ public:
         }
         uint32_t next_rw_u = uses_dual_uav ? 2u : 1u;
         if (ir_.uses_texture_uav) {
+            uint32_t rw_kind = (pb.enabled && pb.has_rwtex0 && pb.rwtex0_res_kind != 0u)
+                                   ? pb.rwtex0_res_kind
+                                   : 0u;
+            if (rw_kind == 0u) {
+                for (const auto& bb_rw : ir_.blocks) {
+                    for (const auto& in_rw : bb_rw.instructions) {
+                        if (in_rw.op == IrOp::ImageStore) {
+                            rw_kind = ResKindFromMimgDim(in_rw.imm_u32 & 7u);
+                            break;
+                        }
+                    }
+                    if (rw_kind != 0u) break;
+                }
+                if (rw_kind == 0u) rw_kind = 2u;
+            }
             if (pb.enabled && pb.has_rwtex0) {
-                hdr << HlslRwTexType(pb.rwtex0_res_kind ? pb.rwtex0_res_kind : 2u, "float4")
+                hdr << HlslRwTexType(rw_kind, "float4")
                     << " _rwtex0 : register(u" << pb.rwtex0_reg << ", space" << pb.rwtex0_space << ");\n";
             } else {
-                hdr << "RWTexture2D<float4> _rwtex0 : register(u" << next_rw_u++ << ");\n";
+                hdr << HlslRwTexType(rw_kind, "float4") << " _rwtex0 : register(u" << next_rw_u++ << ");\n";
             }
         }
         if (ir_.uses_texture_u32_uav) {
+            const uint32_t u32_dim_kind =
+                (ir_.texture_u32_uav_dim == 2u) ? 4u : ((ir_.texture_u32_uav_dim == 3u) ? 7u : 2u);
             if (pb.enabled && pb.has_rwimg_u32) {
-                hdr << HlslRwTexType(pb.rwimg_u32_res_kind ? pb.rwimg_u32_res_kind : 2u, "uint")
+                hdr << HlslRwTexType(pb.rwimg_u32_res_kind ? pb.rwimg_u32_res_kind : u32_dim_kind, "uint")
                     << " _rwimg_u32 : register(u" << pb.rwimg_u32_reg << ", space" << pb.rwimg_u32_space << ");\n";
             } else if (ir_.texture_u32_uav_dim == 2u) {
                 hdr << "RWTexture3D<uint> _rwimg_u32 : register(u" << next_rw_u++ << ");\n";
@@ -1264,7 +1303,7 @@ public:
                            "    return (w0 >> bit_off) | ((bit_off != 0u) ? (w1 << hi_sh) : 0u);\n"
                            "}\n";
                 }
-            } else if (uses_uav0 || in0_is_cbv || in0_is_srv) {
+            } else if (uses_uav0 || in0_is_cbv || in0_is_srv || needs_in0_decl) {
                 if (in0_is_cbv) {
                     hdr << "uint _os_load_unaligned_u0(uint byte_addr) {\n"
                            "    uint aligned = byte_addr & ~3u;\n"
@@ -1284,6 +1323,10 @@ public:
                            "    return (w0 >> bit_off) | ((bit_off != 0u) ? (w1 << hi_sh) : 0u);\n"
                            "}\n";
                 }
+            } else {
+                hdr << "uint _os_load_unaligned_u0(uint byte_addr) {\n"
+                       "    return (byte_addr == 0xFFFFFFFFu) ? 0u : 0u;\n"
+                       "}\n";
             }
             if (uses_dual_uav) {
                 hdr << "uint _os_load_unaligned_u1(uint byte_addr) {\n"
@@ -8815,8 +8858,9 @@ Status CompileHlslWithDxc(
         ofs.write(hlsl.data(), static_cast<std::streamsize>(hlsl.size()));
     }
 
+    const char* opt_flag = (hlsl.size() > 65536u) ? " -O1" : "";
     const std::string cmd = "\"" + resolved_dxc + "\" -T " + target + " -E " + entry_point +
-                            " -Fo \"" + dxil_path + "\" \"" + hlsl_path + "\"";
+                            opt_flag + " -Fo \"" + dxil_path + "\" \"" + hlsl_path + "\"";
     uint32_t exit_code = 1;
     Status run_st = RunExternalProcess(cmd, exit_code, out_diagnostics);
 
@@ -8912,6 +8956,7 @@ Status LiftRdna2Xs2Shader(
         (!eff_opts.stage_contract.vertex_fetches.empty() ||
          !eff_opts.stage_contract.pixel_inputs.empty() ||
          !eff_opts.stage_contract.vs_ia_inputs.empty() ||
+         eff_opts.stage_contract.min_param_outputs > 0u ||
          eff_opts.stage_contract.psv0_bindings.enabled ||
          eff_opts.stage_contract.texture_srv_format != Rdna2TextureFormat::Float4)
             ? &eff_opts.stage_contract
