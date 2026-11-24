@@ -1,4 +1,5 @@
 #include "openscarlett/gpu/rdna2_disasm.h"
+#include "openscarlett/gpu/rdna2_xbox_container.h"
 
 #include <cmath>
 #include <cstdio>
@@ -72,6 +73,7 @@ Rdna2Opcode DecodeSop2Opcode(uint16_t raw) {
         case 0x10: return Rdna2Opcode::S_OR_B32;
         case 0x12: return Rdna2Opcode::S_XOR_B32;
         case 0x14: return Rdna2Opcode::S_ANDN2_B32;
+        case 0x16: return Rdna2Opcode::S_OR_B32;       // GFX10.3 s_orn2_b32
         case 0x1E: return Rdna2Opcode::S_LSHL_B32;
         case 0x20: return Rdna2Opcode::S_LSHR_B32;
         case 0x22: return Rdna2Opcode::S_ASHR_I32;
@@ -79,6 +81,10 @@ Rdna2Opcode DecodeSop2Opcode(uint16_t raw) {
         case 0x27: return Rdna2Opcode::S_BFE_U32;
         case 0x28: return Rdna2Opcode::S_BFE_I32;
         case 0x2C: return Rdna2Opcode::S_MUL_I32;
+        case 0x2E: return Rdna2Opcode::S_ADD_U32;      // GFX10.3 s_lshl1_add_u32
+        case 0x2F: return Rdna2Opcode::S_ADD_U32;      // GFX10.3 s_lshl2_add_u32
+        case 0x30: return Rdna2Opcode::S_ADD_U32;      // GFX10.3 s_lshl3_add_u32
+        case 0x31: return Rdna2Opcode::S_ADD_U32;      // GFX10.3 s_lshl4_add_u32
         default:   return Rdna2Opcode::Unknown;
     }
 }
@@ -119,6 +125,8 @@ Rdna2Opcode DecodeSop1Opcode(uint16_t raw) {
         case 0x08: return Rdna2Opcode::S_BCNT1_I32_B32;
         case 0x09: return Rdna2Opcode::S_BCNT1_I32_B64;
         case 0x0A: return Rdna2Opcode::S_MOV_B32;      // GFX10.3 s_wqm_b32 (exec quad mode)
+        case 0x0B: return Rdna2Opcode::S_MOV_B32;      // GFX10.3 s_wqm_b64
+        case 0x0C: return Rdna2Opcode::S_MOV_B32;      // GFX10.3 s_quadmask_b32
         case 0x0D: return Rdna2Opcode::S_BREV_B32;
         case 0x15: return Rdna2Opcode::S_FLBIT_I32_B32;
         case 0x16: return Rdna2Opcode::S_FLBIT_I32_B64;
@@ -129,6 +137,8 @@ Rdna2Opcode DecodeSop1Opcode(uint16_t raw) {
         case 0x1F: return Rdna2Opcode::S_GETPC_B64;
         case 0x20: return Rdna2Opcode::S_SETPC_B64;    // GFX10.3 hardware s_setpc_b64
         case 0x21: return Rdna2Opcode::S_SWAPPC_B64;   // GFX10.3 hardware s_swappc_b64 (VS fetch call)
+        case 0x2C: return Rdna2Opcode::S_MOV_B32;      // GFX10.3 s_sendmsg_rtn_b32
+        case 0x2D: return Rdna2Opcode::S_MOV_B32;      // GFX10.3 s_sendmsg_rtn_b64
         default:   return Rdna2Opcode::Unknown;
     }
 }
@@ -197,6 +207,9 @@ Rdna2Opcode DecodeSopkOpcode(uint16_t raw) {
         case 0x01: return Rdna2Opcode::S_VERSION;
         case 0x0F: return Rdna2Opcode::S_ADDK_I32;
         case 0x10: return Rdna2Opcode::S_MULK_I32;
+        case 0x12: return Rdna2Opcode::S_MOVK_I32;     // GFX10.3 s_getreg_b32
+        case 0x13: return Rdna2Opcode::S_VERSION;      // GFX10.3 s_setreg_b32
+        case 0x14: return Rdna2Opcode::S_VERSION;      // GFX10.3 s_setreg_imm32_b32 (2 dwords)
         case 0x17: return Rdna2Opcode::S_WAITCNT_VSCNT;
         case 0x18: return Rdna2Opcode::S_WAITCNT_VMCNT;
         case 0x19: return Rdna2Opcode::S_WAITCNT_EXPCNT;
@@ -276,12 +289,17 @@ uint16_t EncodeSoppOpcode(Rdna2Opcode op) {
 
 Rdna2Opcode DecodeVop2Opcode(uint16_t raw) {
     switch (raw) {
+        case 0x00: return Rdna2Opcode::V_CNDMASK_B32;  // GFX9/Xbox & GFX10 VOP2 op=0x00 v_cndmask_b32_e32
         case 0x01: return Rdna2Opcode::V_CNDMASK_B32;
+        case 0x02: return Rdna2Opcode::V_DOT2_F32_F16; // GFX10.3 v_dot2c_f32_f16_e32
         case 0x03: return Rdna2Opcode::V_ADD_F32;
         case 0x04: return Rdna2Opcode::V_SUB_F32;
         case 0x05: return Rdna2Opcode::V_SUBREV_F32;
+        case 0x06: return Rdna2Opcode::V_FMAC_F32;     // GFX10.3 v_fmac_legacy_f32
         case 0x07: return Rdna2Opcode::V_MUL_F32;  // GFX10.3 v_mul_legacy_f32
         case 0x08: return Rdna2Opcode::V_MUL_F32;
+        case 0x09: return Rdna2Opcode::V_MUL_LO_U32;   // GFX10.3 v_mul_i32_i24
+        case 0x0B: return Rdna2Opcode::V_MUL_LO_U32;   // GFX10.3 v_mul_u32_u24
         case 0x0F: return Rdna2Opcode::V_MIN_F32;
         case 0x10: return Rdna2Opcode::V_MAX_F32;
         case 0x11: return Rdna2Opcode::V_MIN_I32;
@@ -296,10 +314,15 @@ Rdna2Opcode DecodeVop2Opcode(uint16_t raw) {
         case 0x1C: return Rdna2Opcode::V_OR_B32;
         case 0x1D: return Rdna2Opcode::V_XOR_B32;
         case 0x1F: return Rdna2Opcode::V_MAC_F32;
+        case 0x20: return Rdna2Opcode::V_MADMK_F32;    // GFX10.3 native v_madmk_f32
         case 0x21: return Rdna2Opcode::V_MADMK_F32;
         case 0x22: return Rdna2Opcode::V_MADAK_F32;
         case 0x25: return Rdna2Opcode::V_ADD_NC_U32;
         case 0x26: return Rdna2Opcode::V_SUB_NC_U32;
+        case 0x27: return Rdna2Opcode::V_SUB_NC_U32;   // GFX10.3 v_subrev_nc_u32
+        case 0x28: return Rdna2Opcode::V_ADD_NC_U32;   // GFX10.3 v_add_co_ci_u32_e32
+        case 0x29: return Rdna2Opcode::V_SUB_NC_U32;   // GFX10.3 v_sub_co_ci_u32_e32
+        case 0x2A: return Rdna2Opcode::V_SUB_NC_U32;   // GFX10.3 v_subrev_co_ci_u32_e32
         case 0x2B: return Rdna2Opcode::V_FMAC_F32;
         case 0x2C: return Rdna2Opcode::V_MADMK_F32;  // GFX10.3 v_fmamk_f32 (mandatory 32-bit literal K)
         case 0x2D: return Rdna2Opcode::V_MADAK_F32;  // GFX10.3 v_fmaak_f32 (mandatory 32-bit literal K)
@@ -442,11 +465,15 @@ Rdna2Opcode DecodeVopcOpcode(uint16_t raw) {
         case 0x36: return Rdna2Opcode::V_CMPX_GE_F32;
         case 0x81: return Rdna2Opcode::V_CMP_LT_I32;
         case 0x82: return Rdna2Opcode::V_CMP_EQ_I32;
+        case 0x83: return Rdna2Opcode::V_CMP_GE_I32;   // GFX10.3 v_cmp_le_i32
         case 0x84: return Rdna2Opcode::V_CMP_GT_I32;
+        case 0x85: return Rdna2Opcode::V_CMP_EQ_I32;   // GFX10.3 v_cmp_lg_i32 (ne)
         case 0x86: return Rdna2Opcode::V_CMP_GE_I32;
         case 0x91: return Rdna2Opcode::V_CMPX_LT_I32;
         case 0x92: return Rdna2Opcode::V_CMPX_EQ_I32;
+        case 0x93: return Rdna2Opcode::V_CMPX_GE_I32;  // GFX10.3 v_cmpx_le_i32
         case 0x94: return Rdna2Opcode::V_CMPX_GT_I32;
+        case 0x95: return Rdna2Opcode::V_CMPX_EQ_I32;  // GFX10.3 v_cmpx_lg_i32 (ne)
         case 0x96: return Rdna2Opcode::V_CMPX_GE_I32;
         // 64-bit signed integer compares
         case 0xA1: return Rdna2Opcode::V_CMP_LT_I64;
@@ -457,7 +484,9 @@ Rdna2Opcode DecodeVopcOpcode(uint16_t raw) {
         case 0xA6: return Rdna2Opcode::V_CMP_GE_I64;
         case 0xC1: return Rdna2Opcode::V_CMP_LT_U32;
         case 0xC2: return Rdna2Opcode::V_CMP_EQ_U32;
+        case 0xC3: return Rdna2Opcode::V_CMP_GE_U32;   // GFX10.3 v_cmp_le_u32
         case 0xC4: return Rdna2Opcode::V_CMP_GT_U32;
+        case 0xC5: return Rdna2Opcode::V_CMP_EQ_U32;   // GFX10.3 v_cmp_lg_u32 (ne)
         case 0xC6: return Rdna2Opcode::V_CMP_GE_U32;
         // GFX10 split F16 compare range (lower half 0xC8..0xCF; upper half 0xD8..0xDF)
         case 0xC9: return Rdna2Opcode::V_CMP_LT_F16;
@@ -468,7 +497,9 @@ Rdna2Opcode DecodeVopcOpcode(uint16_t raw) {
         case 0xCE: return Rdna2Opcode::V_CMP_GE_F16;
         case 0xD1: return Rdna2Opcode::V_CMPX_LT_U32;
         case 0xD2: return Rdna2Opcode::V_CMPX_EQ_U32;
+        case 0xD3: return Rdna2Opcode::V_CMPX_GE_U32;  // GFX10.3 v_cmpx_le_u32
         case 0xD4: return Rdna2Opcode::V_CMPX_GT_U32;
+        case 0xD5: return Rdna2Opcode::V_CMPX_EQ_U32;  // GFX10.3 v_cmpx_lg_u32 (ne)
         case 0xD6: return Rdna2Opcode::V_CMPX_GE_U32;
         case 0xD8: return Rdna2Opcode::V_CMP_U_F16;
         case 0xD9: return Rdna2Opcode::V_CMP_NGE_F16;
@@ -579,8 +610,15 @@ uint16_t EncodeVopcOpcode(Rdna2Opcode op) {
 Rdna2Opcode DecodeVop3Opcode(uint16_t raw, uint8_t& out_src_count) {
     // Native 3-operand / wave / bitfield VOP3 opcodes (GFX10.3)
     switch (raw) {
+        case 0x100: out_src_count = 3; return Rdna2Opcode::V_CNDMASK_B32;   // GFX10 v_cndmask_b32_e64 (op=0x100)
         case 0x101: out_src_count = 3; return Rdna2Opcode::V_CNDMASK_B32;
+        case 0x128: out_src_count = 3; return Rdna2Opcode::V_ADD_NC_U32;    // GFX10.3 v_add_co_ci_u32_e64
+        case 0x129: out_src_count = 3; return Rdna2Opcode::V_SUB_NC_U32;    // GFX10.3 v_sub_co_ci_u32_e64
+        case 0x12A: out_src_count = 3; return Rdna2Opcode::V_SUB_NC_U32;    // GFX10.3 v_subrev_co_ci_u32_e64
+        case 0x140: out_src_count = 3; return Rdna2Opcode::V_MAD_F32;       // GFX10.3 v_mad_legacy_f32
         case 0x141: out_src_count = 3; return Rdna2Opcode::V_MAD_F32;
+        case 0x142: out_src_count = 3; return Rdna2Opcode::V_ADD3_U32;      // GFX10.3 v_mad_i32_i24
+        case 0x143: out_src_count = 3; return Rdna2Opcode::V_ADD3_U32;      // GFX10.3 v_mad_u32_u24
         case 0x148: out_src_count = 3; return Rdna2Opcode::V_BFE_U32;
         case 0x149: out_src_count = 3; return Rdna2Opcode::V_BFE_I32;
         case 0x14A: out_src_count = 3; return Rdna2Opcode::V_BFI_B32;
@@ -600,6 +638,7 @@ Rdna2Opcode DecodeVop3Opcode(uint16_t raw, uint8_t& out_src_count) {
         case 0x169: out_src_count = 2; return Rdna2Opcode::V_MUL_LO_U32;
         case 0x16C: out_src_count = 3; return Rdna2Opcode::V_MAD_U64_U32;
         case 0x16D: out_src_count = 3; return Rdna2Opcode::V_MAD_I64_I32;
+        case 0x179: out_src_count = 3; return Rdna2Opcode::V_FMA_F32;       // GFX10.3 v_fma_legacy_f32
         case 0x303: out_src_count = 2; return Rdna2Opcode::V_ADD_NC_U16;
         case 0x304: out_src_count = 2; return Rdna2Opcode::V_SUB_NC_U16;
         case 0x305: out_src_count = 2; return Rdna2Opcode::V_MBCNT_LO_U32_B32;
@@ -608,6 +647,9 @@ Rdna2Opcode DecodeVop3Opcode(uint16_t raw, uint8_t& out_src_count) {
         case 0x30A: out_src_count = 2; return Rdna2Opcode::V_MAX_U16;
         case 0x30B: out_src_count = 2; return Rdna2Opcode::V_MIN_I16;
         case 0x30C: out_src_count = 2; return Rdna2Opcode::V_MAX_I16;
+        case 0x30D: out_src_count = 2; return Rdna2Opcode::V_ADD_NC_U32;    // GFX10.3 v_add_co_u32_e64
+        case 0x30E: out_src_count = 2; return Rdna2Opcode::V_SUB_NC_U32;    // GFX10.3 v_sub_co_u32_e64
+        case 0x30F: out_src_count = 2; return Rdna2Opcode::V_SUB_NC_U32;    // GFX10.3 v_subrev_co_u32_e64
         case 0x312: out_src_count = 2; return Rdna2Opcode::V_MUL_LO_U16;
         case 0x313: out_src_count = 2; return Rdna2Opcode::V_ASHRREV_I16;
         case 0x314: out_src_count = 2; return Rdna2Opcode::V_LSHLREV_B16;
@@ -621,8 +663,13 @@ Rdna2Opcode DecodeVop3Opcode(uint16_t raw, uint8_t& out_src_count) {
         case 0x368: out_src_count = 2; return Rdna2Opcode::V_CVT_PKNORM_I16_F32;
         case 0x369: out_src_count = 2; return Rdna2Opcode::V_CVT_PKNORM_U16_F32;
         case 0x36D: out_src_count = 3; return Rdna2Opcode::V_ADD3_U32;
+        case 0x36E: out_src_count = 3; return Rdna2Opcode::V_LSHL_OR_B32;   // GFX10.3 v_and_or_b32
         case 0x36F: out_src_count = 3; return Rdna2Opcode::V_LSHL_OR_B32;
+        case 0x370: out_src_count = 3; return Rdna2Opcode::V_LSHL_OR_B32;   // GFX10.3 v_or3_b32
+        case 0x371: out_src_count = 3; return Rdna2Opcode::V_ADD3_U32;      // GFX10.3 v_xad_u32
+        case 0x372: out_src_count = 3; return Rdna2Opcode::V_LSHL_ADD_U32;  // GFX10.3 v_lshl_add_u32
         case 0x373: out_src_count = 3; return Rdna2Opcode::V_DOT2_F32_F16;
+        case 0x374: out_src_count = 3; return Rdna2Opcode::V_LSHL_ADD_U32;  // GFX10.3 v_add_lshl_u32
         case 0x377: out_src_count = 3; return Rdna2Opcode::V_PERMLANE16_B32;
         case 0x378: out_src_count = 3; return Rdna2Opcode::V_PERMLANEX16_B32;
         default: break;
@@ -776,15 +823,38 @@ Rdna2Opcode DecodeMubufOpcode(uint16_t raw) {
         case 0x0E: return Rdna2Opcode::BUFFER_LOAD_FORMAT_XYZW;  // GFX10.3 buffer_load_dwordx4 (4 dwords)
         case 0x0F: return Rdna2Opcode::BUFFER_LOAD_FORMAT_XYZ;   // GFX10.3 buffer_load_dwordx3 (3 dwords)
         case 0x14: return Rdna2Opcode::BUFFER_LOAD_DWORD;
+        case 0x18: return Rdna2Opcode::BUFFER_STORE_BYTE_D16_HI;   // GFX10.3 buffer_store_byte (low 8 bits)
         case 0x19: return Rdna2Opcode::BUFFER_STORE_BYTE_D16_HI;
+        case 0x1A: return Rdna2Opcode::BUFFER_STORE_SHORT_D16_HI;  // GFX10.3 buffer_store_short (low 16 bits)
         case 0x1B: return Rdna2Opcode::BUFFER_STORE_SHORT_D16_HI;
         case 0x1C: return Rdna2Opcode::BUFFER_STORE_DWORD;
+        case 0x1D: return Rdna2Opcode::BUFFER_STORE_DWORD;         // GFX10.3 buffer_store_dwordx2
+        case 0x1E: return Rdna2Opcode::BUFFER_STORE_DWORD;         // GFX10.3 buffer_store_dwordx3
+        case 0x1F: return Rdna2Opcode::BUFFER_STORE_DWORD;         // GFX10.3 buffer_store_dwordx4
         case 0x20: return Rdna2Opcode::BUFFER_LOAD_UBYTE_D16;
         case 0x21: return Rdna2Opcode::BUFFER_LOAD_UBYTE_D16_HI;
         case 0x22: return Rdna2Opcode::BUFFER_LOAD_SBYTE_D16;
         case 0x23: return Rdna2Opcode::BUFFER_LOAD_SBYTE_D16_HI;
         case 0x24: return Rdna2Opcode::BUFFER_LOAD_SHORT_D16;
         case 0x25: return Rdna2Opcode::BUFFER_LOAD_SHORT_D16_HI;
+        // GFX10.3 MUBUF buffer_atomic_* (0x30..0x3D, 0x3F, 0x40, 0x4D; distinguished by raw_opcode)
+        case 0x30:
+        case 0x31:
+        case 0x32:
+        case 0x33:
+        case 0x34:
+        case 0x35:
+        case 0x36:
+        case 0x37:
+        case 0x38:
+        case 0x39:
+        case 0x3A:
+        case 0x3B:
+        case 0x3C:
+        case 0x3D:
+        case 0x3F:
+        case 0x40:
+        case 0x4D: return Rdna2Opcode::BUFFER_LOAD_DWORD;
         default:   return Rdna2Opcode::Unknown;
     }
 }
@@ -901,17 +971,58 @@ Rdna2Opcode DecodeMimgOpcode(uint16_t raw) {
         case 0x00: return Rdna2Opcode::IMAGE_LOAD;
         case 0x01: return Rdna2Opcode::IMAGE_LOAD_MIP;
         case 0x08: return Rdna2Opcode::IMAGE_STORE;
+        case 0x0E: return Rdna2Opcode::IMAGE_LOAD_MIP;  // GFX10.3 image_get_resinfo (raw_opcode == 0x0E)
         case 0x11: return Rdna2Opcode::IMAGE_ATOMIC_CMPSWAP;
-        case 0x20: return Rdna2Opcode::IMAGE_SAMPLE;
-        case 0x21: return Rdna2Opcode::IMAGE_SAMPLE_CL;
-        case 0x23: return Rdna2Opcode::IMAGE_SAMPLE_D_CL;
+        // GFX10.3 image_sample* & image_sample*_o (0x20..0x27, 0x30..0x37)
+        case 0x20:
+        case 0x24:  // image_sample_l
+        case 0x30:  // image_sample_o
+        case 0x34:  // image_sample_l_o
+            return Rdna2Opcode::IMAGE_SAMPLE;
+        case 0x21:
+        case 0x31:  // image_sample_cl_o
+            return Rdna2Opcode::IMAGE_SAMPLE_CL;
+        case 0x22:  // image_sample_d
+        case 0x23:
+        case 0x32:  // image_sample_d_o
+        case 0x33:  // image_sample_d_cl_o
+            return Rdna2Opcode::IMAGE_SAMPLE_D_CL;
         case 0x25:
-        case 0x27: return Rdna2Opcode::IMAGE_SAMPLE_LZ;
-        case 0x26: return Rdna2Opcode::IMAGE_SAMPLE_B_CL;
-        case 0x29: return Rdna2Opcode::IMAGE_SAMPLE_C_CL;
-        case 0x2B: return Rdna2Opcode::IMAGE_SAMPLE_C_D_CL;
-        case 0x2E: return Rdna2Opcode::IMAGE_SAMPLE_C_B_CL;
-        case 0x2F: return Rdna2Opcode::IMAGE_SAMPLE_C_LZ;
+        case 0x27:
+        case 0x35:  // image_sample_b_o
+        case 0x37:  // image_sample_lz_o
+            return Rdna2Opcode::IMAGE_SAMPLE_LZ;
+        case 0x26:
+        case 0x36:  // image_sample_b_cl_o
+            return Rdna2Opcode::IMAGE_SAMPLE_B_CL;
+        // GFX10.3 image_sample_c* & image_sample_c*_o (0x28..0x2F, 0x38..0x3F)
+        case 0x28:  // image_sample_c
+        case 0x2C:  // image_sample_c_l
+        case 0x2F:
+        case 0x38:  // image_sample_c_o
+        case 0x3C:  // image_sample_c_l_o
+        case 0x3F:  // image_sample_c_lz_o
+            return Rdna2Opcode::IMAGE_SAMPLE_C_LZ;
+        case 0x29:
+        case 0x39:  // image_sample_c_cl_o
+            return Rdna2Opcode::IMAGE_SAMPLE_C_CL;
+        case 0x2A:  // image_sample_c_d
+        case 0x2B:
+        case 0x3A:  // image_sample_c_d_o
+        case 0x3B:  // image_sample_c_d_cl_o
+            return Rdna2Opcode::IMAGE_SAMPLE_C_D_CL;
+        case 0x2D:  // image_sample_c_b
+        case 0x2E:
+        case 0x3D:  // image_sample_c_b_o
+        case 0x3E:  // image_sample_c_b_cl_o
+            return Rdna2Opcode::IMAGE_SAMPLE_C_B_CL;
+        // GFX10.3 image_gather4* (0x40..0x47, 0x50..0x57 non-cmp; 0x48..0x4F, 0x58..0x5F cmp)
+        case 0x40: case 0x41: case 0x44: case 0x45: case 0x46: case 0x47:
+        case 0x50: case 0x51: case 0x54: case 0x55: case 0x56: case 0x57:
+            return Rdna2Opcode::IMAGE_SAMPLE;
+        case 0x48: case 0x49: case 0x4C: case 0x4D: case 0x4E: case 0x4F:
+        case 0x58: case 0x59: case 0x5C: case 0x5D: case 0x5E: case 0x5F:
+            return Rdna2Opcode::IMAGE_SAMPLE_C_LZ;
         case 0xE6: return Rdna2Opcode::IMAGE_BVH_INTERSECT_RAY;
         default:   return Rdna2Opcode::Unknown;
     }
@@ -1357,8 +1468,20 @@ std::vector<uint8_t> BuildPsv0Chunk(const XboxPsv0Info& psv) {
     AppendLe32(out, psv.num_threads_x);
     AppendLe32(out, psv.num_threads_y);
     AppendLe32(out, psv.num_threads_z);
-    // Resource binding count = 0
-    AppendLe32(out, 0u);
+    // Resource binding count + optional 24-byte PSVResourceBindInfo1 table
+    const uint32_t res_count = static_cast<uint32_t>(psv.resource_bindings.size());
+    AppendLe32(out, res_count);
+    if (res_count > 0u) {
+        AppendLe32(out, 24u);
+        for (const auto& rb : psv.resource_bindings) {
+            AppendLe32(out, rb.res_type);
+            AppendLe32(out, rb.space);
+            AppendLe32(out, rb.lower_bound);
+            AppendLe32(out, rb.upper_bound);
+            AppendLe32(out, rb.res_kind);
+            AppendLe32(out, rb.res_flags);
+        }
+    }
     return out;
 }
 
@@ -1564,6 +1687,13 @@ bool IsXboxShaderBytecode(const void* data, size_t size) noexcept {
         if (std::memcmp(bytes + off, "XBOX", 4) == 0 || std::memcmp(bytes + off, "XS2M", 4) == 0) {
             return true;
         }
+        if (std::memcmp(bytes + off, "DXIL", 4) == 0) {
+            const uint32_t csz = ReadLe32(bytes + off + 4u);
+            if (csz >= 48u && static_cast<uint64_t>(off) + 8ull + 48ull <= total_size &&
+                std::memcmp(bytes + off + 8u + 24u, "XDAT", 4) == 0) {
+                return true;
+            }
+        }
     }
     return false;
 }
@@ -1632,6 +1762,12 @@ Status ParseXboxShaderContainer(const void* data, size_t size, XboxDxbcContainer
             out_container.has_dxil_or_shdr = true;
             if (out_container.host_shader_chunk_fourcc.empty()) {
                 out_container.host_shader_chunk_fourcc = chunk.fourcc;
+            }
+            if (std::memcmp(chunk.fourcc, "DXIL", 4) == 0 && !out_container.has_xs2 &&
+                chunk.data.size() >= 48u && std::memcmp(chunk.data.data() + 24u, "XDAT", 4) == 0) {
+                if (ExtractXdatDxilChunkToXs2(chunk.data, out_container.xs2)) {
+                    out_container.has_xs2 = true;
+                }
             }
         } else if (std::memcmp(chunk.fourcc, "ISG1", 4) == 0) {
             if (!ParseDxbcSignatureChunk(chunk.data.data(), chunk.data.size(), true, out_container.input_signature)) {
@@ -2979,6 +3115,10 @@ Status DisassembleRdna2(
             inst.encoding = Rdna2Encoding::SOPK;
             const uint16_t raw_op = static_cast<uint16_t>((w0 >> 23) & 0x1Fu);
             const uint8_t sdst = static_cast<uint8_t>((w0 >> 16) & 0x7Fu);
+            if (raw_op == 0x14u) {
+                uint32_t imm32 = 0;
+                if (auto st = consume_word(imm32); !st.ok()) return st;
+            }
             inst.raw_opcode = raw_op;
             inst.opcode = DecodeSopkOpcode(raw_op);
             if (inst.opcode != Rdna2Opcode::S_VERSION) {
@@ -3010,6 +3150,7 @@ Status DisassembleRdna2(
             const uint16_t src0 = static_cast<uint16_t>(w0 & 0x1FFu);
             uint32_t lit = 0;
             uint32_t dpp8_raw = 0;
+            bool has_sdwa_dpp16 = false;
             if (src0 == 255u) {
                 if (auto st = consume_word(lit); !st.ok()) return st;
             } else if (src0 == 0xE9u || src0 == 0xEAu) {
@@ -3017,6 +3158,9 @@ Status DisassembleRdna2(
                 inst.has_dpp8 = true;
                 inst.dpp8_fi = (src0 == 0xEAu);
                 inst.dpp8_word = (dpp8_raw >> 8) & 0xFFFFFFu;
+            } else if (src0 == 0xF9u || src0 == 0xFAu) {
+                if (auto st = consume_word(dpp8_raw); !st.ok()) return st;
+                has_sdwa_dpp16 = true;
             }
             inst.raw_opcode = raw_op;
             inst.opcode = DecodeVop1Opcode(raw_op);
@@ -3026,8 +3170,9 @@ Status DisassembleRdna2(
                 } else {
                     inst.dst = Rdna2Operand::Vgpr(vdst);
                 }
-                inst.src[0] = inst.has_dpp8 ? Rdna2Operand::Vgpr(static_cast<uint8_t>(dpp8_raw & 0xFFu))
-                                            : DecodeRdna2SourceOperand(src0, lit);
+                inst.src[0] = (inst.has_dpp8 || has_sdwa_dpp16)
+                                  ? Rdna2Operand::Vgpr(static_cast<uint8_t>(dpp8_raw & 0xFFu))
+                                  : DecodeRdna2SourceOperand(src0, lit);
                 inst.src_count = 1;
             }
         } else if ((w0 >> 25) == 0x3Eu) {
@@ -3038,6 +3183,7 @@ Status DisassembleRdna2(
             const uint16_t src0 = static_cast<uint16_t>(w0 & 0x1FFu);
             uint32_t lit = 0;
             uint32_t dpp8_raw = 0;
+            bool has_sdwa_dpp16 = false;
             if (src0 == 255u) {
                 if (auto st = consume_word(lit); !st.ok()) return st;
             } else if (src0 == 0xE9u || src0 == 0xEAu) {
@@ -3045,12 +3191,16 @@ Status DisassembleRdna2(
                 inst.has_dpp8 = true;
                 inst.dpp8_fi = (src0 == 0xEAu);
                 inst.dpp8_word = (dpp8_raw >> 8) & 0xFFFFFFu;
+            } else if (src0 == 0xF9u || src0 == 0xFAu) {
+                if (auto st = consume_word(dpp8_raw); !st.ok()) return st;
+                has_sdwa_dpp16 = true;
             }
             inst.raw_opcode = raw_op;
             inst.opcode = DecodeVopcOpcode(raw_op);
             inst.dst = IsVcmpxOpcode(inst.opcode) ? Rdna2Operand::ExecLo() : Rdna2Operand::VccLo();
-            inst.src[0] = inst.has_dpp8 ? Rdna2Operand::Vgpr(static_cast<uint8_t>(dpp8_raw & 0xFFu))
-                                        : DecodeRdna2SourceOperand(src0, lit);
+            inst.src[0] = (inst.has_dpp8 || has_sdwa_dpp16)
+                              ? Rdna2Operand::Vgpr(static_cast<uint8_t>(dpp8_raw & 0xFFu))
+                              : DecodeRdna2SourceOperand(src0, lit);
             inst.src[1] = Rdna2Operand::Vgpr(vsrc1);
             inst.src_count = 2;
         } else if ((w0 >> 31) == 0x0u) {
@@ -3064,6 +3214,7 @@ Status DisassembleRdna2(
             inst.opcode = DecodeVop2Opcode(raw_op);
             uint32_t lit = 0;
             uint32_t dpp8_raw = 0;
+            bool has_sdwa_dpp16 = false;
             const bool mandatory_lit = Vop2OpcodeHasMandatoryLiteral(inst.opcode);
             if (src0 == 0xE9u || src0 == 0xEAu) {
                 if (auto st = consume_word(dpp8_raw); !st.ok()) return st;
@@ -3073,10 +3224,16 @@ Status DisassembleRdna2(
                 if (mandatory_lit) {
                     if (auto st = consume_word(lit); !st.ok()) return st;
                 }
+            } else if (src0 == 0xF9u || src0 == 0xFAu) {
+                if (auto st = consume_word(dpp8_raw); !st.ok()) return st;
+                has_sdwa_dpp16 = true;
+                if (mandatory_lit) {
+                    if (auto st = consume_word(lit); !st.ok()) return st;
+                }
             } else if (src0 == 255u || mandatory_lit) {
                 if (auto st = consume_word(lit); !st.ok()) return st;
             }
-            const Rdna2Operand decoded_src0 = inst.has_dpp8
+            const Rdna2Operand decoded_src0 = (inst.has_dpp8 || has_sdwa_dpp16)
                                                   ? Rdna2Operand::Vgpr(static_cast<uint8_t>(dpp8_raw & 0xFFu))
                                                   : DecodeRdna2SourceOperand(src0, lit);
             inst.dst = Rdna2Operand::Vgpr(vdst);
@@ -3098,6 +3255,9 @@ Status DisassembleRdna2(
                 inst.src_count = 2;
                 if (inst.opcode == Rdna2Opcode::V_CNDMASK_B32) {
                     inst.src[2] = Rdna2Operand::VccLo();
+                    inst.src_count = 3;
+                } else if (inst.opcode == Rdna2Opcode::V_DOT2_F32_F16) {
+                    inst.src[2] = Rdna2Operand::Vgpr(vdst);
                     inst.src_count = 3;
                 }
             }
@@ -3187,7 +3347,12 @@ Status DisassembleRdna2(
             } else {
                 inst.dst = Rdna2Operand::Vgpr(vdst);
             }
-            if (inst.opcode == Rdna2Opcode::V_MAD_U64_U32 || inst.opcode == Rdna2Opcode::V_MAD_I64_I32) {
+            const bool is_vop3b =
+                (inst.opcode == Rdna2Opcode::V_MAD_U64_U32 ||
+                 inst.opcode == Rdna2Opcode::V_MAD_I64_I32 ||
+                 raw_op == 0x128u || raw_op == 0x129u || raw_op == 0x12Au ||
+                 raw_op == 0x30Du || raw_op == 0x30Eu || raw_op == 0x30Fu);
+            if (is_vop3b) {
                 // VOP3B format: bits [14:8] encode SDST carry-out (not abs/op_sel)
                 const uint8_t vop3b_sdst = static_cast<uint8_t>((w0 >> 8) & 0x7Fu);
                 inst.sdst = decode_scalar_dst(vop3b_sdst);
@@ -3348,10 +3513,15 @@ Status DisassembleRdna2(
             const uint8_t vaddr = static_cast<uint8_t>(w1 & 0xFFu);
             inst.raw_opcode = raw_op;
             inst.opcode = DecodeMubufOpcode(raw_op);
-            if (inst.opcode != Rdna2Opcode::BUFFER_STORE_DWORD &&
-                inst.opcode != Rdna2Opcode::BUFFER_STORE_BYTE_D16_HI &&
-                inst.opcode != Rdna2Opcode::BUFFER_STORE_SHORT_D16_HI &&
-                inst.opcode != Rdna2Opcode::Unknown) {
+            const bool is_mubuf_atomic = (raw_op >= 0x30u && raw_op <= 0x4Du);
+            if (is_mubuf_atomic) {
+                if (inst.glc) {
+                    inst.dst = Rdna2Operand::Vgpr(vdata);
+                }
+            } else if (inst.opcode != Rdna2Opcode::BUFFER_STORE_DWORD &&
+                       inst.opcode != Rdna2Opcode::BUFFER_STORE_BYTE_D16_HI &&
+                       inst.opcode != Rdna2Opcode::BUFFER_STORE_SHORT_D16_HI &&
+                       inst.opcode != Rdna2Opcode::Unknown) {
                 inst.dst = Rdna2Operand::Vgpr(vdata);
             }
             inst.src[0] = Rdna2Operand::Vgpr(vdata);

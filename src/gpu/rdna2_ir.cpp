@@ -1040,6 +1040,8 @@ const char* IrOpName(IrOp op) noexcept {
         case IrOp::ConstU32:      return "const.u32";
         case IrOp::ConstF32:      return "const.f32";
         case IrOp::ThreadIdX:     return "thread_id.x";
+        case IrOp::GroupId:       return "group_id";
+        case IrOp::GroupThreadId: return "group_thread_id";
         case IrOp::StageInput:    return "stage_input";
         case IrOp::LoadRootConst: return "load_root_const";
         case IrOp::LoadUav:       return "load_uav";
@@ -1047,10 +1049,13 @@ const char* IrOpName(IrOp op) noexcept {
         case IrOp::LoadUavSpanElem: return "load_uav_span_elem";
         case IrOp::StoreUav:      return "store_uav";
         case IrOp::StoreUavSubDword: return "store_uav_subdword";
+        case IrOp::UavAtomic:     return "uav_atomic";
         case IrOp::ImageSample:   return "image_sample";
         case IrOp::ImageSampleDynamic: return "image_sample_dynamic";
         case IrOp::ImageSampleImplicit: return "image_sample_implicit";
         case IrOp::ImageSampleMinLod: return "image_sample_minlod";
+        case IrOp::ImageGather4:  return "image_gather4";
+        case IrOp::ImageGetResInfo: return "image_get_resinfo";
         case IrOp::ImageLoad:     return "image_load";
         case IrOp::ImageLoadMip:  return "image_load_mip";
         case IrOp::ImageStore:    return "image_store";
@@ -1183,6 +1188,7 @@ bool IrOpHasSideEffects(IrOp op) noexcept {
     switch (op) {
         case IrOp::StoreUav:
         case IrOp::StoreUavSubDword:
+        case IrOp::UavAtomic:
         case IrOp::ImageStore:
         case IrOp::ImageAtomicCmpSwap:
         case IrOp::LdsStore:
@@ -1530,6 +1536,8 @@ Status BuildRdna2Ir(
     };
 
     IrValueId tid_x_val = kInvalidIrValue;
+    IrValueId group_id_vals[3] = {kInvalidIrValue, kInvalidIrValue, kInvalidIrValue};
+    IrValueId group_tid_vals[4] = {kInvalidIrValue, kInvalidIrValue, kInvalidIrValue, kInvalidIrValue};
     IrValueId mesh_gtid_val = kInvalidIrValue;
     IrValueId merged_wave_info_val = kInvalidIrValue;
     IrValueId zero_u32_val = kInvalidIrValue;
@@ -1538,6 +1546,107 @@ Status BuildRdna2Ir(
     IrValueId false_bool_val = kInvalidIrValue;
     std::array<IrValueId, 16> ps_inputs{};
     std::unordered_map<uint32_t, IrValueId> root_const_vals;
+
+    // Detect unpacked vs packed (GFX10.3 10-bit X/Y/Z in v0) SV_GroupThreadID for FSSM Compute shaders:
+    // On GFX10.3 Wave32/Wave64, dxc_xs packs (z<<20)|(y<<10)|x into v0 unless v1/v2 are read uninitialized.
+    const auto& pb_cfg = out_module.stage_contract.psv0_bindings;
+    const bool cs_fssm_mode = pb_cfg.cs_fssm_abi && (out_module.stage == ShaderStage::Compute);
+    bool cs_unpacked_tid = false;
+    if (cs_fssm_mode && (out_module.threadgroup_y > 1u || out_module.threadgroup_z > 1u) && !leaders.empty()) {
+        bool v1_written = false;
+        bool v2_written = false;
+        const size_t bb0_end = (leaders.size() > 1u) ? leaders[1] : instructions.size();
+        for (size_t ii = leaders[0]; ii < bb0_end; ++ii) {
+            const auto& ins = instructions[ii];
+            for (uint8_t s = 0u; s < ins.src_count && s < 4u; ++s) {
+                if (ins.src[s].kind == Rdna2OperandKind::Vgpr) {
+                    if (ins.src[s].reg_index == 1u && !v1_written && out_module.threadgroup_y > 1u) {
+                        cs_unpacked_tid = true;
+                    }
+                    if (ins.src[s].reg_index == 2u && !v2_written && out_module.threadgroup_z > 1u) {
+                        cs_unpacked_tid = true;
+                    }
+                }
+            }
+            if (ins.dst.kind == Rdna2OperandKind::Vgpr) {
+                if (ins.dst.reg_index == 1u) v1_written = true;
+                if (ins.dst.reg_index == 2u) v2_written = true;
+            }
+        }
+    }
+
+    std::vector<uint8_t> seen_uav_srsrcs;
+    auto resolve_uav_buf_slot = [&](uint8_t srsrc, bool is_write) -> uint32_t {
+        out_module.uses_uav = true;
+        if (pb_cfg.enabled && !pb_cfg.uav_buffers.empty()) {
+            size_t slot = 0u;
+            bool found = false;
+            for (size_t k = 0u; k < seen_uav_srsrcs.size(); ++k) {
+                if (seen_uav_srsrcs[k] == srsrc) {
+                    slot = k;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                slot = seen_uav_srsrcs.size();
+                seen_uav_srsrcs.push_back(srsrc);
+            }
+            slot = std::min<size_t>(slot, pb_cfg.uav_buffers.size() - 1u);
+            if (slot < 32u) {
+                out_module.used_psv0_uav_buf_mask |= (1u << static_cast<uint32_t>(slot));
+            }
+            if (slot == 0u) out_module.uses_uav0 = true;
+            else out_module.uses_uav1 = true;
+            return static_cast<uint32_t>(slot);
+        }
+        const uint32_t slot = (srsrc == 0u) ? 0u : 1u;
+        if (pb_cfg.enabled && is_write && (pb_cfg.in0_is_cbv || pb_cfg.in0_is_srv)) {
+            out_module.used_psv0_uav_buf_mask |= (1u << slot);
+        }
+        if (slot == 0u) out_module.uses_uav0 = true;
+        else out_module.uses_uav1 = true;
+        return slot;
+    };
+
+    std::vector<uint8_t> seen_srv_tex_srsrcs;
+    auto resolve_srv_tex_flags = [&](uint8_t srsrc, uint8_t mimg_dim) -> uint32_t {
+        if (!pb_cfg.enabled || pb_cfg.srv_textures.empty()) return 0u;
+        auto dim_matches_kind = [](uint8_t dim, uint32_t kind) noexcept -> bool {
+            if (dim == 0u) return kind == 1u;
+            if (dim == 2u) return kind == 4u;
+            if (dim == 3u) return kind == 5u || kind == 9u;
+            if (dim == 4u) return kind == 6u;
+            if (dim == 5u || dim == 7u) return kind == 7u || kind == 8u;
+            return kind == 2u || kind == 3u;
+        };
+        size_t ord = 0u;
+        bool found = false;
+        for (size_t k = 0u; k < seen_srv_tex_srsrcs.size(); ++k) {
+            if (seen_srv_tex_srsrcs[k] == srsrc) {
+                ord = k;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            ord = seen_srv_tex_srsrcs.size();
+            seen_srv_tex_srsrcs.push_back(srsrc);
+        }
+        size_t chosen = std::min<size_t>(ord, pb_cfg.srv_textures.size() - 1u);
+        if (!dim_matches_kind(mimg_dim, pb_cfg.srv_textures[chosen].res_kind)) {
+            for (size_t k = 0u; k < pb_cfg.srv_textures.size(); ++k) {
+                if (dim_matches_kind(mimg_dim, pb_cfg.srv_textures[k].res_kind)) {
+                    chosen = k;
+                    break;
+                }
+            }
+        }
+        if (chosen < 32u) {
+            out_module.used_psv0_srv_tex_mask |= (1u << static_cast<uint32_t>(chosen));
+        }
+        return (static_cast<uint32_t>(chosen + 1u) & 0x1Fu) << 8;
+    };
 
     auto get_zero_u32 = [&]() -> IrValueId {
         if (zero_u32_val == kInvalidIrValue) {
@@ -1572,6 +1681,24 @@ Status BuildRdna2Ir(
             tid_x_val = register_preamble(IrOp::ThreadIdX, IrType::U32, 0u, 0.0f);
         }
         return tid_x_val;
+    };
+
+    auto get_group_id = [&](uint32_t comp) -> IrValueId {
+        const uint32_t c = comp & 3u;
+        if (c < 3u && group_id_vals[c] == kInvalidIrValue) {
+            out_module.uses_group_id = true;
+            group_id_vals[c] = register_preamble(IrOp::GroupId, IrType::U32, c, 0.0f);
+        }
+        return (c < 3u) ? group_id_vals[c] : get_zero_u32();
+    };
+
+    auto get_group_tid = [&](uint32_t mode) -> IrValueId {
+        const uint32_t m = mode & 3u;
+        if (group_tid_vals[m] == kInvalidIrValue) {
+            out_module.uses_group_thread_id = true;
+            group_tid_vals[m] = register_preamble(IrOp::GroupThreadId, IrType::U32, m, 0.0f);
+        }
+        return group_tid_vals[m];
     };
 
     auto get_mesh_global_tid = [&]() -> IrValueId {
@@ -1666,6 +1793,12 @@ Status BuildRdna2Ir(
                  ins.opcode == Rdna2Opcode::IMAGE_SAMPLE_C_B_CL || ins.opcode == Rdna2Opcode::IMAGE_SAMPLE_LZ ||
                  ins.opcode == Rdna2Opcode::IMAGE_SAMPLE_C_LZ ||
                  ins.opcode == Rdna2Opcode::IMAGE_BVH_INTERSECT_RAY ||
+                 ins.opcode == Rdna2Opcode::BUFFER_LOAD_FORMAT_XY ||
+                 ins.opcode == Rdna2Opcode::BUFFER_LOAD_FORMAT_XYZ ||
+                 ins.opcode == Rdna2Opcode::BUFFER_LOAD_FORMAT_XYZW ||
+                 ins.opcode == Rdna2Opcode::TBUFFER_LOAD_FORMAT_XY ||
+                 ins.opcode == Rdna2Opcode::TBUFFER_LOAD_FORMAT_XYZ ||
+                 ins.opcode == Rdna2Opcode::TBUFFER_LOAD_FORMAT_XYZW ||
                  ins.opcode == Rdna2Opcode::DS_READ_B96 || ins.opcode == Rdna2Opcode::DS_READ_B128) &&
                 ins.dst.kind == Rdna2OperandKind::Vgpr) {
                 for (uint32_t k = 0u; k < 4u && ins.dst.reg_index + k < 256u; ++k) {
@@ -1843,6 +1976,13 @@ Status BuildRdna2Ir(
                     if (v == kInvalidIrValue) {
                         if (kind == PendingRegKind::Exec) {
                             v = get_true_bool();
+                        } else if (kind == PendingRegKind::Vgpr && cs_fssm_mode &&
+                                   (reg_idx == 0u || (cs_unpacked_tid && reg_idx <= 2u))) {
+                            v = get_group_tid(cs_unpacked_tid ? reg_idx : 3u);
+                        } else if (kind == PendingRegKind::Sgpr && cs_fssm_mode &&
+                                   reg_idx >= pb_cfg.cs_user_sgpr_count &&
+                                   reg_idx < pb_cfg.cs_user_sgpr_count + 3u) {
+                            v = get_group_id(reg_idx - pb_cfg.cs_user_sgpr_count);
                         } else if (kind == PendingRegKind::Vgpr && reg_idx == 0u &&
                                    (out_module.stage == ShaderStage::Compute || out_module.stage == ShaderStage::Vertex ||
                                     out_module.stage == ShaderStage::Geometry || out_module.stage == ShaderStage::Mesh ||
@@ -1908,10 +2048,19 @@ Status BuildRdna2Ir(
                 state.vgpr[idx] = get_mesh_global_tid();
                 return state.vgpr[idx];
             }
-            if ((out_module.stage == ShaderStage::Compute || out_module.stage == ShaderStage::Vertex ||
-                 out_module.stage == ShaderStage::Geometry ||
-                 out_module.stage == ShaderStage::Mesh || out_module.stage == ShaderStage::Amplification) &&
-                idx == 0u) {
+            if (cs_fssm_mode) {
+                if (idx == 0u) {
+                    state.vgpr[0u] = get_group_tid(cs_unpacked_tid ? 0u : 3u);
+                    return state.vgpr[0u];
+                }
+                if (cs_unpacked_tid && (idx == 1u || idx == 2u)) {
+                    state.vgpr[idx] = get_group_tid(idx);
+                    return state.vgpr[idx];
+                }
+            } else if ((out_module.stage == ShaderStage::Compute || out_module.stage == ShaderStage::Vertex ||
+                        out_module.stage == ShaderStage::Geometry ||
+                        out_module.stage == ShaderStage::Mesh || out_module.stage == ShaderStage::Amplification) &&
+                       idx == 0u) {
                 state.vgpr[idx] = get_tid_x();
                 return state.vgpr[idx];
             }
@@ -1925,6 +2074,17 @@ Status BuildRdna2Ir(
                 // GFX10.3 merged_wave_info in s3
                 state.sgpr[idx] = get_merged_wave_info();
                 return state.sgpr[idx];
+            }
+            if (cs_fssm_mode) {
+                if (idx >= pb_cfg.cs_user_sgpr_count && idx < pb_cfg.cs_user_sgpr_count + 3u) {
+                    state.sgpr[idx] = get_group_id(static_cast<uint32_t>(idx) - pb_cfg.cs_user_sgpr_count);
+                    return state.sgpr[idx];
+                }
+                if (idx < std::min<uint32_t>(16u, pb_cfg.cs_user_sgpr_count)) {
+                    state.sgpr[idx] = get_root_const(idx);
+                    return state.sgpr[idx];
+                }
+                return get_zero_u32();
             }
             if (idx < 16u) {
                 state.sgpr[idx] = get_root_const(idx);
@@ -2297,6 +2457,13 @@ Status BuildRdna2Ir(
                 case Rdna2Opcode::S_ADD_U32: {
                     IrValueId a = eval_operand(inst.src[0], false);
                     IrValueId bval = eval_operand(inst.src[1], false);
+                    if (inst.encoding == Rdna2Encoding::SOP2 &&
+                        inst.raw_opcode >= 0x2Eu && inst.raw_opcode <= 0x31u) {
+                        // GFX10.3 s_lshl1..4_add_u32: sdst = (ssrc0 << k) + ssrc1
+                        const uint32_t sh_amt = static_cast<uint32_t>(inst.raw_opcode - 0x2Du);
+                        IrValueId c_sh = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, sh_amt, 0.0f);
+                        a = emit_in_bb(IrOp::Shl, IrType::U32, {a, c_sh});
+                    }
                     IrValueId sum = emit_in_bb(IrOp::IAdd, IrType::U32, {a, bval});
                     write_dst(inst.dst, sum);
                     state.scc = emit_in_bb(IrOp::CmpLtU, IrType::Bool, {sum, a});
@@ -2380,7 +2547,19 @@ Status BuildRdna2Ir(
                     }
                     break;
                 case Rdna2Opcode::S_OR_B32:
-                    if (inst.dst.kind == Rdna2OperandKind::ExecLo || inst.dst.kind == Rdna2OperandKind::ExecHi ||
+                    if (inst.encoding == Rdna2Encoding::SOP2 && inst.raw_opcode == 0x16u) {
+                        // GFX10.3 s_orn2_b32: a | ~b
+                        if (inst.dst.kind == Rdna2OperandKind::ExecLo || inst.dst.kind == Rdna2OperandKind::ExecHi ||
+                            is_lane_pred_operand(inst.src[0]) || is_lane_pred_operand(inst.src[1])) {
+                            IrValueId nb = emit_in_bb(IrOp::LogicalNot, IrType::Bool, {eval_lane_pred(inst.src[1])});
+                            IrValueId r = emit_bool_or(eval_lane_pred(inst.src[0]), nb);
+                            write_dst(inst.dst, r);
+                            state.scc = r;
+                        } else {
+                            IrValueId nb = emit_in_bb(IrOp::BitNot, IrType::U32, {eval_operand(inst.src[1], false)});
+                            write_dst(inst.dst, emit_in_bb(IrOp::BitOr, IrType::U32, {eval_operand(inst.src[0], false), nb}));
+                        }
+                    } else if (inst.dst.kind == Rdna2OperandKind::ExecLo || inst.dst.kind == Rdna2OperandKind::ExecHi ||
                         is_lane_pred_operand(inst.src[0]) || is_lane_pred_operand(inst.src[1])) {
                         IrValueId r = emit_bool_or(eval_lane_pred(inst.src[0]), eval_lane_pred(inst.src[1]));
                         write_dst(inst.dst, r);
@@ -2916,7 +3095,19 @@ Status BuildRdna2Ir(
                     break;
                 }
                 case Rdna2Opcode::V_MUL_F32: {
-                    IrValueId r = emit_in_bb(IrOp::FMul, IrType::F32, {eval_src0(inst, true), eval_operand(inst.src[1], true)});
+                    IrValueId a = eval_src0(inst, true);
+                    IrValueId bval = eval_operand(inst.src[1], true);
+                    const bool is_legacy =
+                        (inst.encoding == Rdna2Encoding::VOP2 && inst.raw_opcode == 0x07u) ||
+                        (inst.encoding == Rdna2Encoding::VOP3 && inst.raw_opcode == 0x107u);
+                    IrValueId r = emit_in_bb(IrOp::FMul, IrType::F32, {a, bval});
+                    if (is_legacy) {
+                        IrValueId z = emit_in_bb(IrOp::ConstF32, IrType::F32, {}, 0u, 0.0f);
+                        IrValueId az = emit_in_bb(IrOp::CmpEq, IrType::Bool, {a, z});
+                        IrValueId bz = emit_in_bb(IrOp::CmpEq, IrType::Bool, {bval, z});
+                        IrValueId any_z = emit_bool_or(az, bz);
+                        r = emit_in_bb(IrOp::Select, IrType::F32, {any_z, z, r});
+                    }
                     write_dst(inst.dst, apply_clamp(r, inst.clamp));
                     break;
                 }
@@ -2963,7 +3154,18 @@ Status BuildRdna2Ir(
                     IrValueId a = eval_src0(inst, true);
                     IrValueId bval = eval_operand(inst.src[1], true);
                     IrValueId acc = read_vgpr(static_cast<uint8_t>(inst.dst.reg_index), true);
+                    const bool is_legacy =
+                        (inst.encoding == Rdna2Encoding::VOP2 && inst.raw_opcode == 0x06u) ||
+                        (inst.encoding == Rdna2Encoding::VOP3 && inst.raw_opcode == 0x106u);
                     IrValueId r = emit_in_bb(IrOp::FFma, IrType::F32, {a, bval, acc});
+                    if (is_legacy) {
+                        IrValueId z = emit_in_bb(IrOp::ConstF32, IrType::F32, {}, 0u, 0.0f);
+                        IrValueId az = emit_in_bb(IrOp::CmpEq, IrType::Bool, {a, z});
+                        IrValueId bz = emit_in_bb(IrOp::CmpEq, IrType::Bool, {bval, z});
+                        IrValueId any_z = emit_bool_or(az, bz);
+                        IrValueId z_plus_acc = emit_in_bb(IrOp::FAdd, IrType::F32, {z, acc});
+                        r = emit_in_bb(IrOp::Select, IrType::F32, {any_z, z_plus_acc, r});
+                    }
                     write_dst(inst.dst, apply_clamp(r, inst.clamp));
                     break;
                 }
@@ -3012,12 +3214,73 @@ Status BuildRdna2Ir(
                     write_dst(inst.dst, emit_in_bb(IrOp::Shr, IrType::I32, {val, shift}));
                     break;
                 }
-                case Rdna2Opcode::V_ADD_NC_U32:
-                    write_dst(inst.dst, emit_in_bb(IrOp::IAdd, IrType::U32, {eval_src0(inst, false), eval_operand(inst.src[1], false)}));
+                case Rdna2Opcode::V_ADD_NC_U32: {
+                    IrValueId s0 = eval_src0(inst, false);
+                    IrValueId s1 = eval_operand(inst.src[1], false);
+                    const bool is_co_ci =
+                        (inst.encoding == Rdna2Encoding::VOP2 && inst.raw_opcode == 0x28u) ||
+                        (inst.encoding == Rdna2Encoding::VOP3 && inst.raw_opcode == 0x128u);
+                    const bool is_co =
+                        is_co_ci || (inst.encoding == Rdna2Encoding::VOP3 && inst.raw_opcode == 0x30Du);
+                    IrValueId sum = emit_in_bb(IrOp::IAdd, IrType::U32, {s0, s1});
+                    IrValueId carry = emit_in_bb(IrOp::CmpLtU, IrType::Bool, {sum, s0});
+                    if (is_co_ci) {
+                        IrValueId cin_b = (inst.encoding == Rdna2Encoding::VOP3 && inst.src_count >= 3u)
+                                              ? ensure_bool(eval_operand(inst.src[2], false))
+                                              : ensure_bool(state.vcc);
+                        IrValueId c1 = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, 1u, 0.0f);
+                        IrValueId cin_u = emit_in_bb(IrOp::Select, IrType::U32, {cin_b, c1, get_zero_u32()});
+                        IrValueId sum2 = emit_in_bb(IrOp::IAdd, IrType::U32, {sum, cin_u});
+                        IrValueId c2 = emit_in_bb(IrOp::CmpLtU, IrType::Bool, {sum2, sum});
+                        carry = emit_bool_or(carry, c2);
+                        sum = sum2;
+                    }
+                    write_dst(inst.dst, sum);
+                    if (is_co) {
+                        const Rdna2Operand cdst =
+                            (inst.encoding == Rdna2Encoding::VOP3 && inst.sdst.kind != Rdna2OperandKind::None)
+                                ? inst.sdst
+                                : Rdna2Operand::VccLo();
+                        write_dst(cdst, carry);
+                    }
                     break;
-                case Rdna2Opcode::V_SUB_NC_U32:
-                    write_dst(inst.dst, emit_in_bb(IrOp::ISub, IrType::U32, {eval_src0(inst, false), eval_operand(inst.src[1], false)}));
+                }
+                case Rdna2Opcode::V_SUB_NC_U32: {
+                    IrValueId s0 = eval_src0(inst, false);
+                    IrValueId s1 = eval_operand(inst.src[1], false);
+                    const bool is_subrev =
+                        (inst.encoding == Rdna2Encoding::VOP2 && (inst.raw_opcode == 0x27u || inst.raw_opcode == 0x2Au)) ||
+                        (inst.encoding == Rdna2Encoding::VOP3 && (inst.raw_opcode == 0x127u || inst.raw_opcode == 0x12Au || inst.raw_opcode == 0x30Fu));
+                    const bool is_co_ci =
+                        (inst.encoding == Rdna2Encoding::VOP2 && (inst.raw_opcode == 0x29u || inst.raw_opcode == 0x2Au)) ||
+                        (inst.encoding == Rdna2Encoding::VOP3 && (inst.raw_opcode == 0x129u || inst.raw_opcode == 0x12Au));
+                    const bool is_co =
+                        is_co_ci || (inst.encoding == Rdna2Encoding::VOP3 && (inst.raw_opcode == 0x30Eu || inst.raw_opcode == 0x30Fu));
+                    IrValueId lhs = is_subrev ? s1 : s0;
+                    IrValueId rhs = is_subrev ? s0 : s1;
+                    IrValueId diff = emit_in_bb(IrOp::ISub, IrType::U32, {lhs, rhs});
+                    IrValueId borrow = emit_in_bb(IrOp::CmpLtU, IrType::Bool, {lhs, rhs});
+                    if (is_co_ci) {
+                        IrValueId bin_b = (inst.encoding == Rdna2Encoding::VOP3 && inst.src_count >= 3u)
+                                              ? ensure_bool(eval_operand(inst.src[2], false))
+                                              : ensure_bool(state.vcc);
+                        IrValueId c1 = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, 1u, 0.0f);
+                        IrValueId bin_u = emit_in_bb(IrOp::Select, IrType::U32, {bin_b, c1, get_zero_u32()});
+                        IrValueId diff2 = emit_in_bb(IrOp::ISub, IrType::U32, {diff, bin_u});
+                        IrValueId b2 = emit_in_bb(IrOp::CmpLtU, IrType::Bool, {diff, bin_u});
+                        borrow = emit_bool_or(borrow, b2);
+                        diff = diff2;
+                    }
+                    write_dst(inst.dst, diff);
+                    if (is_co) {
+                        const Rdna2Operand cdst =
+                            (inst.encoding == Rdna2Encoding::VOP3 && inst.sdst.kind != Rdna2OperandKind::None)
+                                ? inst.sdst
+                                : Rdna2Operand::VccLo();
+                        write_dst(cdst, borrow);
+                    }
                     break;
+                }
                 case Rdna2Opcode::V_CNDMASK_B32: {
                     // AMD ISA: D = cond ? src1 : src0
                     // Handle Wave64 vote invalidation (Leonida #4596): if VCC or an SGPR pair was
@@ -3369,33 +3632,47 @@ Status BuildRdna2Ir(
                                 cmp_val = emit_in_bb(IrOp::CmpLt, IrType::Bool, {eval_src0(inst, false), eval_operand(inst.src[1], false)});
                                 break;
                             case Rdna2Opcode::V_CMP_EQ_I32:
-                            case Rdna2Opcode::V_CMPX_EQ_I32:
-                                cmp_val = emit_in_bb(IrOp::CmpEq, IrType::Bool, {eval_src0(inst, false), eval_operand(inst.src[1], false)});
+                            case Rdna2Opcode::V_CMPX_EQ_I32: {
+                                const bool is_ne = (inst.raw_opcode == 0x85u || inst.raw_opcode == 0x95u);
+                                cmp_val = emit_in_bb(is_ne ? IrOp::CmpNe : IrOp::CmpEq, IrType::Bool,
+                                                     {eval_src0(inst, false), eval_operand(inst.src[1], false)});
                                 break;
+                            }
                             case Rdna2Opcode::V_CMP_GT_I32:
                             case Rdna2Opcode::V_CMPX_GT_I32:
                                 cmp_val = emit_in_bb(IrOp::CmpGt, IrType::Bool, {eval_src0(inst, false), eval_operand(inst.src[1], false)});
                                 break;
                             case Rdna2Opcode::V_CMP_GE_I32:
-                            case Rdna2Opcode::V_CMPX_GE_I32:
-                                cmp_val = emit_in_bb(IrOp::CmpGe, IrType::Bool, {eval_src0(inst, false), eval_operand(inst.src[1], false)});
+                            case Rdna2Opcode::V_CMPX_GE_I32: {
+                                const bool is_le = (inst.raw_opcode == 0x83u || inst.raw_opcode == 0x93u);
+                                IrValueId a = eval_src0(inst, false);
+                                IrValueId bval = eval_operand(inst.src[1], false);
+                                cmp_val = emit_in_bb(IrOp::CmpGe, IrType::Bool, is_le ? std::vector<IrValueId>{bval, a} : std::vector<IrValueId>{a, bval});
                                 break;
+                            }
                             case Rdna2Opcode::V_CMP_LT_U32:
                             case Rdna2Opcode::V_CMPX_LT_U32:
                                 cmp_val = emit_in_bb(IrOp::CmpLtU, IrType::Bool, {eval_src0(inst, false), eval_operand(inst.src[1], false)});
                                 break;
                             case Rdna2Opcode::V_CMP_EQ_U32:
-                            case Rdna2Opcode::V_CMPX_EQ_U32:
-                                cmp_val = emit_in_bb(IrOp::CmpEqU, IrType::Bool, {eval_src0(inst, false), eval_operand(inst.src[1], false)});
+                            case Rdna2Opcode::V_CMPX_EQ_U32: {
+                                const bool is_ne = (inst.raw_opcode == 0xC5u || inst.raw_opcode == 0xD5u);
+                                cmp_val = emit_in_bb(is_ne ? IrOp::CmpNe : IrOp::CmpEqU, IrType::Bool,
+                                                     {eval_src0(inst, false), eval_operand(inst.src[1], false)});
                                 break;
+                            }
                             case Rdna2Opcode::V_CMP_GT_U32:
                             case Rdna2Opcode::V_CMPX_GT_U32:
                                 cmp_val = emit_in_bb(IrOp::CmpGtU, IrType::Bool, {eval_src0(inst, false), eval_operand(inst.src[1], false)});
                                 break;
                             case Rdna2Opcode::V_CMP_GE_U32:
-                            case Rdna2Opcode::V_CMPX_GE_U32:
-                                cmp_val = emit_in_bb(IrOp::CmpGeU, IrType::Bool, {eval_src0(inst, false), eval_operand(inst.src[1], false)});
+                            case Rdna2Opcode::V_CMPX_GE_U32: {
+                                const bool is_le = (inst.raw_opcode == 0xC3u || inst.raw_opcode == 0xD3u);
+                                IrValueId a = eval_src0(inst, false);
+                                IrValueId bval = eval_operand(inst.src[1], false);
+                                cmp_val = emit_in_bb(IrOp::CmpGeU, IrType::Bool, is_le ? std::vector<IrValueId>{bval, a} : std::vector<IrValueId>{a, bval});
                                 break;
+                            }
                             default:
                                 break;
                         }
@@ -3415,11 +3692,19 @@ Status BuildRdna2Ir(
 
                 // ----- VOP3 (native 3-op & 16-bit VOP3) -----
                 case Rdna2Opcode::V_FMA_F32: {
-                    IrValueId r = emit_in_bb(IrOp::FFma, IrType::F32, {
-                        eval_operand(inst.src[0], true),
-                        eval_operand(inst.src[1], true),
-                        eval_operand(inst.src[2], true),
-                    });
+                    IrValueId a = eval_operand(inst.src[0], true);
+                    IrValueId bval = eval_operand(inst.src[1], true);
+                    IrValueId cval = eval_operand(inst.src[2], true);
+                    IrValueId r = emit_in_bb(IrOp::FFma, IrType::F32, {a, bval, cval});
+                    if (inst.encoding == Rdna2Encoding::VOP3 && inst.raw_opcode == 0x179u) {
+                        // GFX10.3 v_fma_legacy_f32: 0.0 * anything + c == +0.0 + c
+                        IrValueId z = emit_in_bb(IrOp::ConstF32, IrType::F32, {}, 0u, 0.0f);
+                        IrValueId az = emit_in_bb(IrOp::CmpEq, IrType::Bool, {a, z});
+                        IrValueId bz = emit_in_bb(IrOp::CmpEq, IrType::Bool, {bval, z});
+                        IrValueId any_z = emit_bool_or(az, bz);
+                        IrValueId z_plus_c = emit_in_bb(IrOp::FAdd, IrType::F32, {z, cval});
+                        r = emit_in_bb(IrOp::Select, IrType::F32, {any_z, z_plus_c, r});
+                    }
                     write_dst(inst.dst, apply_clamp(r, inst.clamp));
                     break;
                 }
@@ -3427,16 +3712,32 @@ Status BuildRdna2Ir(
                     IrValueId x0 = eval_operand(inst.src[0], false);
                     IrValueId x1 = eval_operand(inst.src[1], false);
                     IrValueId x2 = eval_operand(inst.src[2], false);
-                    IrValueId sh = emit_in_bb(IrOp::Shl, IrType::U32, {x0, x1});
-                    write_dst(inst.dst, emit_in_bb(IrOp::IAdd, IrType::U32, {sh, x2}));
+                    if (inst.encoding == Rdna2Encoding::VOP3 && inst.raw_opcode == 0x374u) {
+                        // GFX10.3 v_add_lshl_u32: (s0 + s1) << s2
+                        IrValueId sum = emit_in_bb(IrOp::IAdd, IrType::U32, {x0, x1});
+                        write_dst(inst.dst, emit_in_bb(IrOp::Shl, IrType::U32, {sum, x2}));
+                    } else {
+                        IrValueId sh = emit_in_bb(IrOp::Shl, IrType::U32, {x0, x1});
+                        write_dst(inst.dst, emit_in_bb(IrOp::IAdd, IrType::U32, {sh, x2}));
+                    }
                     break;
                 }
                 case Rdna2Opcode::V_LSHL_OR_B32: {
                     IrValueId x0 = eval_operand(inst.src[0], false);
                     IrValueId x1 = eval_operand(inst.src[1], false);
                     IrValueId x2 = eval_operand(inst.src[2], false);
-                    IrValueId sh = emit_in_bb(IrOp::Shl, IrType::U32, {x0, x1});
-                    write_dst(inst.dst, emit_in_bb(IrOp::BitOr, IrType::U32, {sh, x2}));
+                    if (inst.encoding == Rdna2Encoding::VOP3 && inst.raw_opcode == 0x36Eu) {
+                        // GFX10.3 v_and_or_b32: (s0 & s1) | s2
+                        IrValueId a = emit_in_bb(IrOp::BitAnd, IrType::U32, {x0, x1});
+                        write_dst(inst.dst, emit_in_bb(IrOp::BitOr, IrType::U32, {a, x2}));
+                    } else if (inst.encoding == Rdna2Encoding::VOP3 && inst.raw_opcode == 0x370u) {
+                        // GFX10.3 v_or3_b32: s0 | s1 | s2
+                        IrValueId o = emit_in_bb(IrOp::BitOr, IrType::U32, {x0, x1});
+                        write_dst(inst.dst, emit_in_bb(IrOp::BitOr, IrType::U32, {o, x2}));
+                    } else {
+                        IrValueId sh = emit_in_bb(IrOp::Shl, IrType::U32, {x0, x1});
+                        write_dst(inst.dst, emit_in_bb(IrOp::BitOr, IrType::U32, {sh, x2}));
+                    }
                     break;
                 }
                 case Rdna2Opcode::V_MIN3_F32: {
@@ -3496,11 +3797,19 @@ Status BuildRdna2Ir(
                     break;
                 }
                 case Rdna2Opcode::V_MAD_F32: {
-                    IrValueId r = emit_in_bb(IrOp::FMad, IrType::F32, {
-                        eval_operand(inst.src[0], true),
-                        eval_operand(inst.src[1], true),
-                        eval_operand(inst.src[2], true),
-                    });
+                    IrValueId a = eval_operand(inst.src[0], true);
+                    IrValueId bval = eval_operand(inst.src[1], true);
+                    IrValueId cval = eval_operand(inst.src[2], true);
+                    IrValueId r = emit_in_bb(IrOp::FMad, IrType::F32, {a, bval, cval});
+                    if (inst.encoding == Rdna2Encoding::VOP3 && inst.raw_opcode == 0x140u) {
+                        // GFX10.3 v_mad_legacy_f32: 0.0 * anything + c == +0.0 + c
+                        IrValueId z = emit_in_bb(IrOp::ConstF32, IrType::F32, {}, 0u, 0.0f);
+                        IrValueId az = emit_in_bb(IrOp::CmpEq, IrType::Bool, {a, z});
+                        IrValueId bz = emit_in_bb(IrOp::CmpEq, IrType::Bool, {bval, z});
+                        IrValueId any_z = emit_bool_or(az, bz);
+                        IrValueId z_plus_c = emit_in_bb(IrOp::FAdd, IrType::F32, {z, cval});
+                        r = emit_in_bb(IrOp::Select, IrType::F32, {any_z, z_plus_c, r});
+                    }
                     write_dst(inst.dst, apply_clamp(r, inst.clamp));
                     break;
                 }
@@ -3653,12 +3962,26 @@ Status BuildRdna2Ir(
                     }, imm));
                     break;
                 }
-                case Rdna2Opcode::V_MUL_LO_U32:
-                    write_dst(inst.dst, emit_in_bb(IrOp::IMul, IrType::U32, {
-                        eval_operand(inst.src[0], false),
-                        eval_operand(inst.src[1], false),
-                    }));
+                case Rdna2Opcode::V_MUL_LO_U32: {
+                    IrValueId a = eval_src0(inst, false);
+                    IrValueId bval = eval_operand(inst.src[1], false);
+                    if ((inst.encoding == Rdna2Encoding::VOP2 && inst.raw_opcode == 0x09u) ||
+                        (inst.encoding == Rdna2Encoding::VOP3 && inst.raw_opcode == 0x109u)) {
+                        // GFX10.3 v_mul_i32_i24
+                        IrValueId c0 = get_zero_u32();
+                        IrValueId c24 = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, 24u, 0.0f);
+                        a = emit_in_bb(IrOp::BfeI32, IrType::I32, {a, c0, c24});
+                        bval = emit_in_bb(IrOp::BfeI32, IrType::I32, {bval, c0, c24});
+                    } else if ((inst.encoding == Rdna2Encoding::VOP2 && inst.raw_opcode == 0x0Bu) ||
+                               (inst.encoding == Rdna2Encoding::VOP3 && inst.raw_opcode == 0x10Bu)) {
+                        // GFX10.3 v_mul_u32_u24
+                        IrValueId m24 = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, 0x00FFFFFFu, 0.0f);
+                        a = emit_in_bb(IrOp::BitAnd, IrType::U32, {a, m24});
+                        bval = emit_in_bb(IrOp::BitAnd, IrType::U32, {bval, m24});
+                    }
+                    write_dst(inst.dst, emit_in_bb(IrOp::IMul, IrType::U32, {a, bval}));
                     break;
+                }
                 case Rdna2Opcode::V_MBCNT_LO_U32_B32: {
                     out_module.uses_wave64_emulation = true;
                     IrValueId mask = kInvalidIrValue;
@@ -3714,8 +4037,32 @@ Status BuildRdna2Ir(
                     break;
                 }
                 case Rdna2Opcode::V_ADD3_U32: {
-                    IrValueId ab = emit_in_bb(IrOp::IAdd, IrType::U32, {eval_operand(inst.src[0], false), eval_operand(inst.src[1], false)});
-                    write_dst(inst.dst, emit_in_bb(IrOp::IAdd, IrType::U32, {ab, eval_operand(inst.src[2], false)}));
+                    IrValueId x0 = eval_operand(inst.src[0], false);
+                    IrValueId x1 = eval_operand(inst.src[1], false);
+                    IrValueId x2 = eval_operand(inst.src[2], false);
+                    if (inst.encoding == Rdna2Encoding::VOP3 && inst.raw_opcode == 0x142u) {
+                        // GFX10.3 v_mad_i32_i24
+                        IrValueId c0 = get_zero_u32();
+                        IrValueId c24 = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, 24u, 0.0f);
+                        IrValueId s0 = emit_in_bb(IrOp::BfeI32, IrType::I32, {x0, c0, c24});
+                        IrValueId s1 = emit_in_bb(IrOp::BfeI32, IrType::I32, {x1, c0, c24});
+                        IrValueId prod = emit_in_bb(IrOp::IMul, IrType::U32, {s0, s1});
+                        write_dst(inst.dst, emit_in_bb(IrOp::IAdd, IrType::U32, {prod, x2}));
+                    } else if (inst.encoding == Rdna2Encoding::VOP3 && inst.raw_opcode == 0x143u) {
+                        // GFX10.3 v_mad_u32_u24
+                        IrValueId m24 = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, 0x00FFFFFFu, 0.0f);
+                        IrValueId u0 = emit_in_bb(IrOp::BitAnd, IrType::U32, {x0, m24});
+                        IrValueId u1 = emit_in_bb(IrOp::BitAnd, IrType::U32, {x1, m24});
+                        IrValueId prod = emit_in_bb(IrOp::IMul, IrType::U32, {u0, u1});
+                        write_dst(inst.dst, emit_in_bb(IrOp::IAdd, IrType::U32, {prod, x2}));
+                    } else if (inst.encoding == Rdna2Encoding::VOP3 && inst.raw_opcode == 0x371u) {
+                        // GFX10.3 v_xad_u32: (s0 ^ s1) + s2
+                        IrValueId xr = emit_in_bb(IrOp::BitXor, IrType::U32, {x0, x1});
+                        write_dst(inst.dst, emit_in_bb(IrOp::IAdd, IrType::U32, {xr, x2}));
+                    } else {
+                        IrValueId ab = emit_in_bb(IrOp::IAdd, IrType::U32, {x0, x1});
+                        write_dst(inst.dst, emit_in_bb(IrOp::IAdd, IrType::U32, {ab, x2}));
+                    }
                     break;
                 }
                 case Rdna2Opcode::V_DOT2_F32_F16: {
@@ -3988,10 +4335,7 @@ Status BuildRdna2Ir(
                 case Rdna2Opcode::TBUFFER_LOAD_FORMAT_D16_XY:
                 case Rdna2Opcode::TBUFFER_LOAD_FORMAT_D16_XYZ:
                 case Rdna2Opcode::TBUFFER_LOAD_FORMAT_D16_XYZW: {
-                    const uint32_t uav_slot = (inst.srsrc == 0u) ? 0u : 1u;
-                    out_module.uses_uav = true;
-                    if (uav_slot == 0u) out_module.uses_uav0 = true;
-                    else out_module.uses_uav1 = true;
+                    const uint32_t uav_slot = resolve_uav_buf_slot(inst.srsrc, false);
 
                     bool idx_is_d16 = false;
                     const uint32_t idx_comps = FormatLoadComponentCount(inst.opcode, idx_is_d16);
@@ -4061,13 +4405,12 @@ Status BuildRdna2Ir(
                 }
                 case Rdna2Opcode::BUFFER_LOAD_DWORD:
                 case Rdna2Opcode::BUFFER_STORE_DWORD: {
-                    const uint32_t uav_slot = (inst.srsrc == 0u) ? 0u : 1u;
-                    out_module.uses_uav = true;
-                    if (uav_slot == 0u) {
-                        out_module.uses_uav0 = true;
-                    } else {
-                        out_module.uses_uav1 = true;
-                    }
+                    const bool is_mubuf_atomic =
+                        (inst.encoding == Rdna2Encoding::MUBUF &&
+                         inst.raw_opcode >= 0x30u && inst.raw_opcode <= 0x4Du);
+                    const bool is_write_op =
+                        is_mubuf_atomic || (inst.opcode == Rdna2Opcode::BUFFER_STORE_DWORD);
+                    const uint32_t uav_slot = resolve_uav_buf_slot(inst.srsrc, is_write_op);
                     IrValueId addr = kInvalidIrValue;
                     if (inst.offen) {
                         addr = eval_operand(inst.src[1], false);
@@ -4087,8 +4430,40 @@ Status BuildRdna2Ir(
                         IrValueId soff_v = eval_operand(sop, false);
                         addr = emit_in_bb(IrOp::IAdd, IrType::U32, {addr, soff_v});
                     }
-                    if (inst.opcode == Rdna2Opcode::BUFFER_LOAD_DWORD) {
+                    if (is_mubuf_atomic) {
+                        const uint8_t vdata_base = static_cast<uint8_t>(inst.src[0].reg_index);
+                        IrValueId data = read_vgpr(vdata_base, false);
+                        IrValueId cmp_val = (inst.raw_opcode == 0x31u && vdata_base + 1u < 256u)
+                                                ? read_vgpr(static_cast<uint8_t>(vdata_base + 1u), false)
+                                                : get_zero_u32();
+                        const uint32_t imm = (uav_slot & 0xFFu) |
+                                             (static_cast<uint32_t>(inst.raw_opcode & 0xFFu) << 8) |
+                                             (inst.glc ? (1u << 16) : 0u);
+                        IrValueId prev = emit_in_bb(
+                            IrOp::UavAtomic,
+                            inst.glc ? IrType::U32 : IrType::Void,
+                            {addr, data, cmp_val},
+                            imm);
+                        attach_exec_pred();
+                        if (inst.glc && inst.dst.kind == Rdna2OperandKind::Vgpr) {
+                            write_dst(inst.dst, prev);
+                        }
+                    } else if (inst.opcode == Rdna2Opcode::BUFFER_LOAD_DWORD) {
                         write_dst(inst.dst, emit_in_bb(IrOp::LoadUav, IrType::U32, {addr}, uav_slot));
+                    } else if (inst.encoding == Rdna2Encoding::MUBUF &&
+                               inst.raw_opcode >= 0x1Du && inst.raw_opcode <= 0x1Fu) {
+                        // GFX10.3 buffer_store_dwordx2 (0x1D), dwordx3 (0x1E), dwordx4 (0x1F)
+                        const uint32_t count = static_cast<uint32_t>(inst.raw_opcode - 0x1Bu);
+                        const uint8_t vdata_base = static_cast<uint8_t>(inst.src[0].reg_index);
+                        for (uint32_t k = 0u; k < count && vdata_base + k < 256u; ++k) {
+                            IrValueId ak = (k == 0u)
+                                               ? addr
+                                               : emit_in_bb(IrOp::IAdd, IrType::U32,
+                                                            {addr, emit_in_bb(IrOp::ConstU32, IrType::U32, {}, k * 4u, 0.0f)});
+                            IrValueId dk = read_vgpr(static_cast<uint8_t>(vdata_base + k), false);
+                            emit_in_bb(IrOp::StoreUav, IrType::Void, {ak, dk}, uav_slot);
+                            attach_exec_pred();
+                        }
                     } else {
                         IrValueId data = eval_operand(inst.src[0], false);
                         emit_in_bb(IrOp::StoreUav, IrType::Void, {addr, data}, uav_slot);
@@ -4104,11 +4479,10 @@ Status BuildRdna2Ir(
                 case Rdna2Opcode::BUFFER_LOAD_SHORT_D16_HI:
                 case Rdna2Opcode::BUFFER_STORE_BYTE_D16_HI:
                 case Rdna2Opcode::BUFFER_STORE_SHORT_D16_HI: {
-                    // MUBUF D16 byte/short loads & d16_hi stores (xbox-emulator #235)
-                    const uint32_t uav_slot = (inst.srsrc == 0u) ? 0u : 1u;
-                    out_module.uses_uav = true;
-                    if (uav_slot == 0u) out_module.uses_uav0 = true;
-                    else out_module.uses_uav1 = true;
+                    // MUBUF D16 byte/short loads & byte/short/d16_hi stores (xbox-emulator #235)
+                    const bool is_sub_store = (inst.opcode == Rdna2Opcode::BUFFER_STORE_BYTE_D16_HI ||
+                                               inst.opcode == Rdna2Opcode::BUFFER_STORE_SHORT_D16_HI);
+                    const uint32_t uav_slot = resolve_uav_buf_slot(inst.srsrc, is_sub_store);
 
                     IrValueId addr = kInvalidIrValue;
                     if (inst.offen) {
@@ -4130,14 +4504,17 @@ Status BuildRdna2Ir(
                         addr = emit_in_bb(IrOp::IAdd, IrType::U32, {addr, soff_v});
                     }
 
-                    if (inst.opcode == Rdna2Opcode::BUFFER_STORE_BYTE_D16_HI ||
-                        inst.opcode == Rdna2Opcode::BUFFER_STORE_SHORT_D16_HI) {
+                    if (is_sub_store) {
                         IrValueId data = eval_operand(inst.src[0], false);
-                        IrValueId c16 = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, 16u, 0.0f);
-                        IrValueId hi16 = emit_in_bb(IrOp::Shr, IrType::U32, {data, c16});
+                        const bool is_lo_bits = (inst.raw_opcode == 0x18u || inst.raw_opcode == 0x1Au);
+                        IrValueId src_sub = data;
+                        if (!is_lo_bits) {
+                            IrValueId c16 = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, 16u, 0.0f);
+                            src_sub = emit_in_bb(IrOp::Shr, IrType::U32, {data, c16});
+                        }
                         const uint32_t width_bytes = (inst.opcode == Rdna2Opcode::BUFFER_STORE_SHORT_D16_HI) ? 2u : 1u;
-                        emit_in_bb(IrOp::StoreUavSubDword, IrType::Void, {addr, hi16},
-                                   (uav_slot & 0xFu) | (width_bytes << 8));
+                        emit_in_bb(IrOp::StoreUavSubDword, IrType::Void, {addr, src_sub},
+                                   (uav_slot & 0xFFu) | (width_bytes << 8));
                         attach_exec_pred();
                     } else {
                         const bool is_hi = (inst.opcode == Rdna2Opcode::BUFFER_LOAD_UBYTE_D16_HI ||
@@ -4189,8 +4566,27 @@ Status BuildRdna2Ir(
                     out_module.uses_texture_load = true;
                     const uint8_t vaddr_base = static_cast<uint8_t>(inst.src[0].reg_index);
                     const uint8_t vdata_base = static_cast<uint8_t>(inst.dst.reg_index);
-                    IrValueId x = read_vgpr(vaddr_base, false);
-                    IrValueId y = read_vgpr(static_cast<uint8_t>(vaddr_base + 1u), false);
+                    auto rd_va_u = [&](uint32_t k) -> IrValueId {
+                        const uint8_t r = (k == 0u)
+                                              ? vaddr_base
+                                              : ((inst.mimg_nsa_dwords > 0u && (k - 1u) < static_cast<uint32_t>(inst.mimg_nsa_dwords) * 4u)
+                                                     ? inst.mimg_nsa_vaddr[k - 1u]
+                                                     : static_cast<uint8_t>(vaddr_base + k));
+                        return read_vgpr(r, false);
+                    };
+                    const uint8_t dim = inst.mimg_dim;
+                    IrValueId x = rd_va_u(0u);
+                    IrValueId y = (dim == 0u) ? get_zero_u32() : rd_va_u(1u);
+                    IrValueId z = (dim == 2u || dim == 3u || dim == 5u || dim == 7u) ? rd_va_u(2u) : get_zero_u32();
+                    uint32_t tex_flags = 0u;
+                    const uint32_t srsrc_sgpr = static_cast<uint32_t>(inst.srsrc) * 4u;
+                    if (pb_cfg.enabled && srsrc_sgpr < 106u && state.sgpr_desc_slot[srsrc_sgpr] >= 0) {
+                        const uint32_t slot = static_cast<uint32_t>(state.sgpr_desc_slot[srsrc_sgpr]);
+                        out_module.used_space2_tex_slots |= (1u << slot);
+                        tex_flags = ((slot + 1u) & 0x1Fu) << 24;
+                    } else {
+                        tex_flags = resolve_srv_tex_flags(inst.srsrc, dim);
+                    }
                     const uint8_t dmask = inst.mimg_dmask ? inst.mimg_dmask : 0xFu;
                     const IrType load_ty = (out_module.texture_srv_format == Rdna2TextureFormat::Uint4)
                                                ? IrType::U32
@@ -4198,32 +4594,68 @@ Status BuildRdna2Ir(
                     uint8_t out_reg = vdata_base;
                     for (uint32_t ch = 0; ch < 4u; ++ch) {
                         if ((dmask & (1u << ch)) != 0u) {
-                            state.vgpr[out_reg++] = emit_in_bb(IrOp::ImageLoad, load_ty, {x, y}, ch);
+                            const uint32_t imm = (ch & 3u) | (static_cast<uint32_t>(dim & 7u) << 4) | tex_flags;
+                            state.vgpr[out_reg++] = emit_in_bb(IrOp::ImageLoad, load_ty, {x, y, z}, imm);
                         }
                     }
                     break;
                 }
                 case Rdna2Opcode::IMAGE_LOAD_MIP: {
                     const uint8_t dim = inst.mimg_dim;
-                    if (dim == 2u) {
+                    const uint8_t vaddr_base = static_cast<uint8_t>(inst.src[0].reg_index);
+                    const uint8_t vdata_base = static_cast<uint8_t>(inst.dst.reg_index);
+                    auto rd_va_u = [&](uint32_t k) -> IrValueId {
+                        const uint8_t r = (k == 0u)
+                                              ? vaddr_base
+                                              : ((inst.mimg_nsa_dwords > 0u && (k - 1u) < static_cast<uint32_t>(inst.mimg_nsa_dwords) * 4u)
+                                                     ? inst.mimg_nsa_vaddr[k - 1u]
+                                                     : static_cast<uint8_t>(vaddr_base + k));
+                        return read_vgpr(r, false);
+                    };
+                    uint32_t tex_flags = 0u;
+                    const uint32_t srsrc_sgpr = static_cast<uint32_t>(inst.srsrc) * 4u;
+                    if (pb_cfg.enabled && srsrc_sgpr < 106u && state.sgpr_desc_slot[srsrc_sgpr] >= 0) {
+                        const uint32_t slot = static_cast<uint32_t>(state.sgpr_desc_slot[srsrc_sgpr]);
+                        out_module.used_space2_tex_slots |= (1u << slot);
+                        tex_flags = ((slot + 1u) & 0x1Fu) << 24;
+                    } else {
+                        tex_flags = resolve_srv_tex_flags(inst.srsrc, dim);
+                    }
+                    if (inst.raw_opcode == 0x0Eu) {
+                        // GFX10.3 image_get_resinfo: vaddr[0] = mip -> width, height, depth/slices, mip_levels
+                        out_module.uses_texture_srv = true;
+                        IrValueId mip = rd_va_u(0u);
+                        const uint8_t dmask = inst.mimg_dmask ? inst.mimg_dmask : 0xFu;
+                        uint8_t out_reg = vdata_base;
+                        for (uint32_t ch = 0u; ch < 4u; ++ch) {
+                            if ((dmask & (1u << ch)) != 0u) {
+                                const uint32_t imm = (ch & 3u) | (static_cast<uint32_t>(dim & 7u) << 4) | tex_flags;
+                                state.vgpr[out_reg++] = emit_in_bb(IrOp::ImageGetResInfo, IrType::U32, {mip}, imm);
+                            }
+                        }
+                        break;
+                    }
+                    if (!pb_cfg.enabled && dim == 2u) {
                         out_module.uses_texture3d_srv = true;
-                    } else if (dim == 3u) {
+                    } else if (!pb_cfg.enabled && dim == 3u) {
                         out_module.uses_texture_cube_srv = true;
                     } else {
                         out_module.uses_texture_srv = true;
                         out_module.uses_texture2d_mip_srv = true;
                     }
-                    const uint8_t vaddr_base = static_cast<uint8_t>(inst.src[0].reg_index);
-                    const uint8_t vdata_base = static_cast<uint8_t>(inst.dst.reg_index);
-                    IrValueId x = read_vgpr(vaddr_base, false);
-                    IrValueId y = read_vgpr(static_cast<uint8_t>(vaddr_base + 1u), false);
+                    IrValueId x = rd_va_u(0u);
+                    IrValueId y = get_zero_u32();
                     IrValueId z = get_zero_u32();
                     IrValueId mip = get_zero_u32();
-                    if (dim == 2u || dim == 3u) {
-                        z = read_vgpr(static_cast<uint8_t>(vaddr_base + 2u), false);
-                        mip = read_vgpr(static_cast<uint8_t>(vaddr_base + 3u), false);
+                    if (dim == 0u) {
+                        mip = rd_va_u(1u);
+                    } else if (dim == 2u || dim == 3u || dim == 5u || dim == 7u) {
+                        y = rd_va_u(1u);
+                        z = rd_va_u(2u);
+                        mip = rd_va_u(3u);
                     } else {
-                        mip = read_vgpr(static_cast<uint8_t>(vaddr_base + 2u), false);
+                        y = rd_va_u(1u);
+                        mip = rd_va_u(2u);
                     }
                     const uint8_t dmask = inst.mimg_dmask ? inst.mimg_dmask : 0xFu;
                     const IrType load_ty = (dim != 2u && dim != 3u &&
@@ -4233,7 +4665,7 @@ Status BuildRdna2Ir(
                     uint8_t out_reg = vdata_base;
                     for (uint32_t ch = 0; ch < 4u; ++ch) {
                         if ((dmask & (1u << ch)) != 0u) {
-                            const uint32_t imm = (ch & 3u) | (static_cast<uint32_t>(dim & 7u) << 4);
+                            const uint32_t imm = (ch & 3u) | (static_cast<uint32_t>(dim & 7u) << 4) | tex_flags;
                             state.vgpr[out_reg++] = emit_in_bb(IrOp::ImageLoadMip, load_ty, {x, y, z, mip}, imm);
                         }
                     }
@@ -4288,51 +4720,116 @@ Status BuildRdna2Ir(
                     out_module.uses_texture_sample = true;
                     const uint8_t vaddr_base = static_cast<uint8_t>(inst.src[0].reg_index);
                     const uint8_t vdata_base = static_cast<uint8_t>(inst.dst.reg_index);
-                    const uint8_t dmask = inst.mimg_dmask ? inst.mimg_dmask : 0xFu;
-                    uint32_t tex_s2_flags = 0u;
+                    const uint8_t dim = inst.mimg_dim;
+                    const uint32_t coord_cnt =
+                        (dim == 0u) ? 1u : ((dim == 2u || dim == 3u || dim == 5u || dim == 7u) ? 3u : 2u);
+                    auto rd_va = [&](uint32_t k, bool as_flt, uint8_t& out_reg_idx) -> IrValueId {
+                        out_reg_idx = (k == 0u)
+                                          ? vaddr_base
+                                          : ((inst.mimg_nsa_dwords > 0u &&
+                                              (k - 1u) < static_cast<uint32_t>(inst.mimg_nsa_dwords) * 4u)
+                                                 ? inst.mimg_nsa_vaddr[k - 1u]
+                                                 : static_cast<uint8_t>(vaddr_base + k));
+                        return read_vgpr(out_reg_idx, as_flt);
+                    };
+                    uint32_t tex_flags = 0u;
                     const uint32_t srsrc_sgpr = static_cast<uint32_t>(inst.srsrc) * 4u;
-                    if (out_module.stage_contract.psv0_bindings.enabled &&
-                        srsrc_sgpr < 106u && state.sgpr_desc_slot[srsrc_sgpr] >= 0) {
+                    if (pb_cfg.enabled && srsrc_sgpr < 106u && state.sgpr_desc_slot[srsrc_sgpr] >= 0) {
                         const uint32_t slot = static_cast<uint32_t>(state.sgpr_desc_slot[srsrc_sgpr]);
                         out_module.used_space2_tex_slots |= (1u << slot);
-                        tex_s2_flags = ((slot + 1u) & 0x1Fu) << 24;
+                        tex_flags = ((slot + 1u) & 0x1Fu) << 24;
+                    } else {
+                        tex_flags = resolve_srv_tex_flags(inst.srsrc, dim);
                     }
+
+                    // GFX10.3 image_gather4* (0x40..0x5F)
+                    if (inst.raw_opcode >= 0x40u && inst.raw_opcode <= 0x5Fu) {
+                        const bool has_off = (inst.raw_opcode >= 0x50u);
+                        const uint16_t low_nib = static_cast<uint16_t>(inst.raw_opcode & 0xFu);
+                        const bool is_cmp = (low_nib >= 8u);
+                        const uint16_t sub = static_cast<uint16_t>(low_nib & 7u);
+                        const bool has_bias = (sub == 5u || sub == 6u);
+                        if (is_cmp) out_module.uses_comparison_sample = true;
+                        uint32_t ai = 0u;
+                        uint8_t dummy_r = 0u;
+                        if (has_off) (void)rd_va(ai++, false, dummy_r);
+                        if (has_bias) (void)rd_va(ai++, true, dummy_r);
+                        IrValueId dref = is_cmp ? rd_va(ai++, true, dummy_r) : get_zero_f32();
+                        IrValueId u = rd_va(ai++, true, dummy_r);
+                        IrValueId v = (coord_cnt >= 2u) ? rd_va(ai++, true, dummy_r) : get_zero_f32();
+                        IrValueId w = (coord_cnt >= 3u) ? rd_va(ai++, true, dummy_r) : get_zero_f32();
+                        uint32_t gather_ch = 0u;
+                        if ((inst.mimg_dmask & 0x2u) != 0u) gather_ch = 1u;
+                        else if ((inst.mimg_dmask & 0x4u) != 0u) gather_ch = 2u;
+                        else if ((inst.mimg_dmask & 0x8u) != 0u) gather_ch = 3u;
+                        for (uint32_t oc = 0u; oc < 4u && (vdata_base + oc) < 256u; ++oc) {
+                            const uint32_t imm = (oc & 3u) |
+                                                 ((gather_ch & 3u) << 2) |
+                                                 (static_cast<uint32_t>(dim & 7u) << 4) |
+                                                 (is_cmp ? 0x80u : 0u) |
+                                                 tex_flags;
+                            state.vgpr[vdata_base + oc] =
+                                emit_in_bb(IrOp::ImageGather4, IrType::F32, {u, v, w, dref}, imm);
+                        }
+                        break;
+                    }
+
+                    const uint8_t dmask = inst.mimg_dmask ? inst.mimg_dmask : 0xFu;
+                    const uint32_t dim_bits = static_cast<uint32_t>(dim & 7u) << 4;
+                    const bool has_off = (inst.raw_opcode >= 0x30u && inst.raw_opcode <= 0x3Fu);
+                    // Note: synthetic Rdna2Assembler encodes IMAGE_SAMPLE_LZ as 0x25; in retail XDAT, 0x25 is image_sample_b.
+                    const bool has_bias = pb_cfg.enabled && ((inst.raw_opcode & 0x7u) == 0x5u);
+                    const bool has_explicit_lod = ((inst.raw_opcode & 0x7u) == 0x4u);
+                    uint32_t ai = 0u;
+                    uint8_t reg_idx = 0u;
+                    if (has_off) (void)rd_va(ai++, false, reg_idx);
+                    IrValueId bias_val = has_bias ? rd_va(ai++, true, reg_idx) : get_zero_f32();
                     uint8_t out_reg = vdata_base;
                     if (inst.opcode == Rdna2Opcode::IMAGE_SAMPLE_C_LZ) {
-                        // RDNA2 ISA: image_sample_c_lz takes vaddr[0]=dref, vaddr[1]=u, vaddr[2]=v
                         out_module.uses_comparison_sample = true;
-                        const uint8_t reg_u = (inst.mimg_nsa_dwords > 0u) ? inst.mimg_nsa_vaddr[0] : static_cast<uint8_t>(vaddr_base + 1u);
-                        const uint8_t reg_v = (inst.mimg_nsa_dwords > 0u) ? inst.mimg_nsa_vaddr[1] : static_cast<uint8_t>(vaddr_base + 2u);
-                        IrValueId dref = read_vgpr(vaddr_base, true);
-                        IrValueId u = read_vgpr(reg_u, true);
-                        IrValueId v = read_vgpr(reg_v, true);
+                        IrValueId dref = rd_va(ai++, true, reg_idx);
+                        IrValueId u = rd_va(ai++, true, reg_idx);
+                        IrValueId v = (coord_cnt >= 2u) ? rd_va(ai++, true, reg_idx) : get_zero_f32();
+                        IrValueId w = (coord_cnt >= 3u) ? rd_va(ai++, true, reg_idx) : get_zero_f32();
                         for (uint32_t ch = 0; ch < 4u; ++ch) {
                             if ((dmask & (1u << ch)) != 0u) {
-                                state.vgpr[out_reg++] = emit_in_bb(IrOp::ImageSample, IrType::F32, {u, v, dref}, ch | 0x80u | tex_s2_flags);
+                                state.vgpr[out_reg++] = emit_in_bb(
+                                    IrOp::ImageSample, IrType::F32, {u, v, dref, w},
+                                    ch | dim_bits | 0x80u | tex_flags);
                             }
                         }
                     } else {
-                        const uint8_t reg_v = (inst.mimg_nsa_dwords > 0u) ? inst.mimg_nsa_vaddr[0] : static_cast<uint8_t>(vaddr_base + 1u);
-                        const uint8_t reg_lod = (inst.mimg_nsa_dwords > 0u) ? inst.mimg_nsa_vaddr[1] : static_cast<uint8_t>(vaddr_base + 2u);
-                        IrValueId u = read_vgpr(vaddr_base, true);
-                        IrValueId v = read_vgpr(reg_v, true);
-                        if (out_module.stage == ShaderStage::Pixel && inst.opcode == Rdna2Opcode::IMAGE_SAMPLE) {
-                            // Pixel shader implicit-LOD sample: use helper-lane-aware affine quad derivatives
+                        IrValueId u = rd_va(ai++, true, reg_idx);
+                        IrValueId v = (coord_cnt >= 2u) ? rd_va(ai++, true, reg_idx) : get_zero_f32();
+                        IrValueId w = (coord_cnt >= 3u) ? rd_va(ai++, true, reg_idx) : get_zero_f32();
+                        if (out_module.stage == ShaderStage::Pixel &&
+                            inst.opcode == Rdna2Opcode::IMAGE_SAMPLE && !has_explicit_lod) {
                             out_module.uses_pixel_quad_derivatives = true;
                             for (uint32_t ch = 0; ch < 4u; ++ch) {
                                 if ((dmask & (1u << ch)) != 0u) {
-                                    state.vgpr[out_reg++] = emit_in_bb(IrOp::ImageSampleImplicit, IrType::F32, {u, v}, ch | tex_s2_flags);
+                                    state.vgpr[out_reg++] = emit_in_bb(
+                                        IrOp::ImageSampleImplicit, IrType::F32, {u, v, w},
+                                        ch | dim_bits | tex_flags);
                                 }
                             }
                         } else {
-                            IrValueId lod = get_zero_f32();
-                            if (inst.opcode == Rdna2Opcode::IMAGE_SAMPLE &&
-                                reg_lod < 256u && state.vgpr[reg_lod] != kInvalidIrValue) {
-                                lod = state.vgpr[reg_lod];
+                            IrValueId lod = has_bias ? bias_val : get_zero_f32();
+                            if (has_explicit_lod) {
+                                lod = rd_va(ai++, true, reg_idx);
+                            } else if (inst.opcode == Rdna2Opcode::IMAGE_SAMPLE) {
+                                const uint8_t cand_lod_r =
+                                    (inst.mimg_nsa_dwords > 0u && ai - 1u < static_cast<uint32_t>(inst.mimg_nsa_dwords) * 4u)
+                                        ? inst.mimg_nsa_vaddr[ai - 1u]
+                                        : static_cast<uint8_t>(vaddr_base + ai);
+                                if (state.vgpr[cand_lod_r] != kInvalidIrValue) {
+                                    lod = state.vgpr[cand_lod_r];
+                                }
                             }
                             for (uint32_t ch = 0; ch < 4u; ++ch) {
                                 if ((dmask & (1u << ch)) != 0u) {
-                                    state.vgpr[out_reg++] = emit_in_bb(IrOp::ImageSample, IrType::F32, {u, v, lod}, ch | tex_s2_flags);
+                                    state.vgpr[out_reg++] = emit_in_bb(
+                                        IrOp::ImageSample, IrType::F32, {u, v, lod, w},
+                                        ch | dim_bits | tex_flags);
                                 }
                             }
                         }
@@ -4345,13 +4842,34 @@ Status BuildRdna2Ir(
                 case Rdna2Opcode::IMAGE_SAMPLE_C_CL:
                 case Rdna2Opcode::IMAGE_SAMPLE_C_D_CL:
                 case Rdna2Opcode::IMAGE_SAMPLE_C_B_CL: {
-                    // MIMG MinLod-clamped sampling (Xbox2Windows 747b21a)
-                    // imm_u32: bits [1:0] = channel, bits [6:4] = variant:
-                    //   0=CL, 1=D_CL, 2=B_CL, 3=C_CL, 4=C_D_CL, 5=C_B_CL
+                    // MIMG derivative / bias / MinLod-clamped sampling (Xbox2Windows 747b21a)
                     out_module.uses_texture_srv = true;
                     out_module.uses_texture_sample = true;
                     const uint8_t vaddr_base = static_cast<uint8_t>(inst.src[0].reg_index);
                     const uint8_t vdata_base = static_cast<uint8_t>(inst.dst.reg_index);
+                    const uint8_t dim = inst.mimg_dim;
+                    const uint32_t coord_cnt =
+                        (dim == 0u) ? 1u : ((dim == 2u || dim == 3u || dim == 5u || dim == 7u) ? 3u : 2u);
+                    const uint32_t grad_cnt =
+                        (dim == 0u || dim == 4u) ? 1u : ((dim == 2u || dim == 3u) ? 3u : 2u);
+                    auto rd_va = [&](uint32_t k, bool as_flt) -> IrValueId {
+                        const uint8_t r = (k == 0u)
+                                              ? vaddr_base
+                                              : ((inst.mimg_nsa_dwords > 0u &&
+                                                  (k - 1u) < static_cast<uint32_t>(inst.mimg_nsa_dwords) * 4u)
+                                                     ? inst.mimg_nsa_vaddr[k - 1u]
+                                                     : static_cast<uint8_t>(vaddr_base + k));
+                        return read_vgpr(r, as_flt);
+                    };
+                    uint32_t tex_flags = 0u;
+                    const uint32_t srsrc_sgpr = static_cast<uint32_t>(inst.srsrc) * 4u;
+                    if (pb_cfg.enabled && srsrc_sgpr < 106u && state.sgpr_desc_slot[srsrc_sgpr] >= 0) {
+                        const uint32_t slot = static_cast<uint32_t>(state.sgpr_desc_slot[srsrc_sgpr]);
+                        out_module.used_space2_tex_slots |= (1u << slot);
+                        tex_flags = ((slot + 1u) & 0x1Fu) << 24;
+                    } else {
+                        tex_flags = resolve_srv_tex_flags(inst.srsrc, dim);
+                    }
                     const uint8_t dmask = inst.mimg_dmask ? inst.mimg_dmask : 0xFu;
                     const bool is_cmp = (inst.opcode == Rdna2Opcode::IMAGE_SAMPLE_C_CL ||
                                          inst.opcode == Rdna2Opcode::IMAGE_SAMPLE_C_D_CL ||
@@ -4360,6 +4878,9 @@ Status BuildRdna2Ir(
                                            inst.opcode == Rdna2Opcode::IMAGE_SAMPLE_C_B_CL);
                     const bool has_grad = (inst.opcode == Rdna2Opcode::IMAGE_SAMPLE_D_CL ||
                                            inst.opcode == Rdna2Opcode::IMAGE_SAMPLE_C_D_CL);
+                    const bool has_off = (inst.raw_opcode >= 0x30u && inst.raw_opcode <= 0x3Fu);
+                    const uint16_t sub_op = static_cast<uint16_t>(inst.raw_opcode & 0x7u);
+                    const bool has_min_lod = (sub_op == 1u || sub_op == 3u || sub_op == 6u);
                     if (is_cmp) {
                         out_module.uses_comparison_sample = true;
                     }
@@ -4370,23 +4891,27 @@ Status BuildRdna2Ir(
                     else if (inst.opcode == Rdna2Opcode::IMAGE_SAMPLE_C_D_CL) variant = 4u;
                     else if (inst.opcode == Rdna2Opcode::IMAGE_SAMPLE_C_B_CL) variant = 5u;
 
-                    // AMD GFX10.3 MIMG vaddr layout: [bias], [dref], [dh_x,dh_y,dv_x,dv_y], [u,v], [min_lod]
-                    uint8_t ai = vaddr_base;
-                    IrValueId bias = has_bias ? read_vgpr(ai++, true) : get_zero_f32();
-                    IrValueId dref = is_cmp ? read_vgpr(ai++, true) : get_zero_f32();
-                    IrValueId ddx_u = has_grad ? read_vgpr(ai++, true) : get_zero_f32();
-                    IrValueId ddx_v = has_grad ? read_vgpr(ai++, true) : get_zero_f32();
-                    IrValueId ddy_u = has_grad ? read_vgpr(ai++, true) : get_zero_f32();
-                    IrValueId ddy_v = has_grad ? read_vgpr(ai++, true) : get_zero_f32();
-                    IrValueId u = read_vgpr(ai++, true);
-                    IrValueId v = read_vgpr(ai++, true);
-                    IrValueId min_lod = read_vgpr(ai++, true);
+                    uint32_t ai = 0u;
+                    if (has_off) (void)rd_va(ai++, false);
+                    IrValueId bias = has_bias ? rd_va(ai++, true) : get_zero_f32();
+                    IrValueId dref = is_cmp ? rd_va(ai++, true) : get_zero_f32();
+                    IrValueId ddx_u = has_grad ? rd_va(ai++, true) : get_zero_f32();
+                    IrValueId ddx_v = (has_grad && grad_cnt >= 2u) ? rd_va(ai++, true) : get_zero_f32();
+                    if (has_grad && grad_cnt >= 3u) (void)rd_va(ai++, true);
+                    IrValueId ddy_u = has_grad ? rd_va(ai++, true) : get_zero_f32();
+                    IrValueId ddy_v = (has_grad && grad_cnt >= 2u) ? rd_va(ai++, true) : get_zero_f32();
+                    if (has_grad && grad_cnt >= 3u) (void)rd_va(ai++, true);
+                    IrValueId u = rd_va(ai++, true);
+                    IrValueId v = (coord_cnt >= 2u) ? rd_va(ai++, true) : get_zero_f32();
+                    IrValueId w = (coord_cnt >= 3u) ? rd_va(ai++, true) : get_zero_f32();
+                    IrValueId min_lod = has_min_lod ? rd_va(ai++, true) : get_zero_f32();
 
-                    std::vector<IrValueId> ops = {u, v, min_lod, dref, bias, ddx_u, ddx_v, ddy_u, ddy_v};
+                    std::vector<IrValueId> ops = {u, v, min_lod, dref, bias, ddx_u, ddx_v, ddy_u, ddy_v, w};
                     uint8_t out_reg = vdata_base;
                     for (uint32_t ch = 0u; ch < 4u; ++ch) {
                         if ((dmask & (1u << ch)) != 0u) {
-                            const uint32_t imm = (ch & 3u) | (variant << 4);
+                            const uint32_t imm = (ch & 3u) | (variant << 4) |
+                                                 (static_cast<uint32_t>(dim & 7u) << 16) | tex_flags;
                             state.vgpr[out_reg++] = emit_in_bb(IrOp::ImageSampleMinLod, IrType::F32, ops, imm);
                         }
                     }
@@ -4394,10 +4919,24 @@ Status BuildRdna2Ir(
                 }
                 case Rdna2Opcode::IMAGE_STORE: {
                     out_module.uses_texture_uav = true;
+                    if (pb_cfg.enabled && !pb_cfg.uav_textures.empty()) {
+                        out_module.used_psv0_uav_tex_mask |= 1u;
+                    }
                     const uint8_t vdata_base = static_cast<uint8_t>(inst.src[0].reg_index);
                     const uint8_t vaddr_base = static_cast<uint8_t>(inst.src[1].reg_index);
-                    IrValueId x = read_vgpr(vaddr_base, false);
-                    IrValueId y = read_vgpr(static_cast<uint8_t>(vaddr_base + 1u), false);
+                    const uint8_t dim = inst.mimg_dim;
+                    auto rd_va_u = [&](uint32_t k) -> IrValueId {
+                        const uint8_t r = (k == 0u)
+                                              ? vaddr_base
+                                              : ((inst.mimg_nsa_dwords > 0u &&
+                                                  (k - 1u) < static_cast<uint32_t>(inst.mimg_nsa_dwords) * 4u)
+                                                     ? inst.mimg_nsa_vaddr[k - 1u]
+                                                     : static_cast<uint8_t>(vaddr_base + k));
+                        return read_vgpr(r, false);
+                    };
+                    IrValueId x = rd_va_u(0u);
+                    IrValueId y = (dim == 0u) ? get_zero_u32() : rd_va_u(1u);
+                    IrValueId z = (dim == 2u || dim == 3u || dim == 5u || dim == 7u) ? rd_va_u(2u) : get_zero_u32();
                     const uint8_t dmask = inst.mimg_dmask ? inst.mimg_dmask : 0xFu;
                     IrValueId rgba[4]{};
                     uint8_t in_reg = vdata_base;
@@ -4410,7 +4949,9 @@ Status BuildRdna2Ir(
                             rgba[ch] = get_zero_f32();
                         }
                     }
-                    emit_in_bb(IrOp::ImageStore, IrType::Void, {x, y, rgba[0], rgba[1], rgba[2], rgba[3]});
+                    emit_in_bb(IrOp::ImageStore, IrType::Void,
+                               {x, y, rgba[0], rgba[1], rgba[2], rgba[3], z},
+                               static_cast<uint32_t>(dim & 7u));
                     break;
                 }
 
@@ -5129,13 +5670,15 @@ Status OptimizeRdna2Ir(Rdna2IrModule& module, Rdna2IrOptStats* out_stats) {
             for (auto& inst : bb.instructions) {
                 if (inst.id == kInvalidIrValue || IrOpHasSideEffects(inst.op)) continue;
                 if (inst.op == IrOp::ConstU32 || inst.op == IrOp::ConstF32 ||
-                    inst.op == IrOp::ThreadIdX || inst.op == IrOp::MeshGlobalThreadId ||
+                    inst.op == IrOp::ThreadIdX || inst.op == IrOp::GroupId ||
+                    inst.op == IrOp::GroupThreadId || inst.op == IrOp::MeshGlobalThreadId ||
                     inst.op == IrOp::MergedWaveInfo || inst.op == IrOp::StageInput ||
                     inst.op == IrOp::LoadRootConst || inst.op == IrOp::LoadUav ||
                     inst.op == IrOp::SmemSpanCheck || inst.op == IrOp::LoadUavSpanElem ||
-                    inst.op == IrOp::BufferLoadFormat ||
+                    inst.op == IrOp::UavAtomic || inst.op == IrOp::BufferLoadFormat ||
                     inst.op == IrOp::ImageSample || inst.op == IrOp::ImageSampleDynamic ||
                     inst.op == IrOp::ImageSampleImplicit || inst.op == IrOp::ImageSampleMinLod ||
+                    inst.op == IrOp::ImageGather4 || inst.op == IrOp::ImageGetResInfo ||
                     inst.op == IrOp::ImageLoad ||
                     inst.op == IrOp::ImageLoadMip || inst.op == IrOp::ImageAtomicCmpSwap ||
                     inst.op == IrOp::BvhIntersectRay ||
@@ -6131,7 +6674,8 @@ std::string DumpRdna2Ir(const Rdna2IrModule& module) {
                 os << " " << inst.imm_u32;
             } else if (inst.op == IrOp::ConstF32) {
                 os << " " << inst.imm_f32;
-            } else if (inst.op == IrOp::LoadRootConst || inst.op == IrOp::StageInput) {
+            } else if (inst.op == IrOp::LoadRootConst || inst.op == IrOp::StageInput ||
+                       inst.op == IrOp::GroupId || inst.op == IrOp::GroupThreadId) {
                 os << " " << inst.imm_u32;
             } else if (inst.op == IrOp::Phi) {
                 for (size_t i = 0; i < inst.phi_incoming.size(); ++i) {
