@@ -91,6 +91,12 @@ enum class IrOp : uint16_t {
     FFloor,
     FCeil,
     FFract,
+    FTrunc,
+    FRndne,
+    FExp2,
+    FLog2,
+    FSinCycles,
+    FCosCycles,
     FDot2,          // V_DOT2_F32_F16(a_packed, b_packed, c_f32)
 
     // Integer / bitwise arithmetic

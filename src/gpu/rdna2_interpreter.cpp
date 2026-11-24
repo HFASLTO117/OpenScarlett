@@ -1770,6 +1770,42 @@ Status ExecuteRdna2Cpu(
                                             : (inst.clamp ? 0u : 0x7FC00000u);
                                     }
                                     break;
+                                case Rdna2Opcode::V_TRUNC_F32:
+                                    for (uint32_t l = 0; l < wv.lane_count; ++l) {
+                                        if (!lane_active(l)) continue;
+                                        wv.vgpr[l][inst.dst.reg_index] = FloatToBits(clamp_f32(std::trunc(read_op_f32(inst.src[0], l))));
+                                    }
+                                    break;
+                                case Rdna2Opcode::V_RNDNE_F32:
+                                    for (uint32_t l = 0; l < wv.lane_count; ++l) {
+                                        if (!lane_active(l)) continue;
+                                        wv.vgpr[l][inst.dst.reg_index] = FloatToBits(clamp_f32(std::nearbyint(read_op_f32(inst.src[0], l))));
+                                    }
+                                    break;
+                                case Rdna2Opcode::V_EXP_F32:
+                                    for (uint32_t l = 0; l < wv.lane_count; ++l) {
+                                        if (!lane_active(l)) continue;
+                                        wv.vgpr[l][inst.dst.reg_index] = FloatToBits(clamp_f32(std::exp2(read_op_f32(inst.src[0], l))));
+                                    }
+                                    break;
+                                case Rdna2Opcode::V_LOG_F32:
+                                    for (uint32_t l = 0; l < wv.lane_count; ++l) {
+                                        if (!lane_active(l)) continue;
+                                        wv.vgpr[l][inst.dst.reg_index] = FloatToBits(clamp_f32(std::log2(read_op_f32(inst.src[0], l))));
+                                    }
+                                    break;
+                                case Rdna2Opcode::V_SIN_F32:
+                                    for (uint32_t l = 0; l < wv.lane_count; ++l) {
+                                        if (!lane_active(l)) continue;
+                                        wv.vgpr[l][inst.dst.reg_index] = FloatToBits(clamp_f32(std::sin(read_op_f32(inst.src[0], l) * 6.283185307179586f)));
+                                    }
+                                    break;
+                                case Rdna2Opcode::V_COS_F32:
+                                    for (uint32_t l = 0; l < wv.lane_count; ++l) {
+                                        if (!lane_active(l)) continue;
+                                        wv.vgpr[l][inst.dst.reg_index] = FloatToBits(clamp_f32(std::cos(read_op_f32(inst.src[0], l) * 6.283185307179586f)));
+                                    }
+                                    break;
                                 case Rdna2Opcode::V_SWAP_B32:
                                     for (uint32_t l = 0; l < wv.lane_count; ++l) {
                                         if (!lane_active(l)) continue;

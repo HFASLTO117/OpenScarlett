@@ -1626,6 +1626,12 @@ bool AssembleSingleCoreOpcode(Rdna2Opcode op, std::vector<uint32_t>& out_words) 
         case Rdna2Opcode::V_FLOOR_F32:
         case Rdna2Opcode::V_CEIL_F32:
         case Rdna2Opcode::V_FRACT_F32:
+        case Rdna2Opcode::V_TRUNC_F32:
+        case Rdna2Opcode::V_RNDNE_F32:
+        case Rdna2Opcode::V_EXP_F32:
+        case Rdna2Opcode::V_LOG_F32:
+        case Rdna2Opcode::V_SIN_F32:
+        case Rdna2Opcode::V_COS_F32:
         case Rdna2Opcode::V_CVT_NORM_I16_F16:
         case Rdna2Opcode::V_CVT_NORM_U16_F16:
             a.EmitVop1(op, 3, Rdna2Operand::Vgpr(1));

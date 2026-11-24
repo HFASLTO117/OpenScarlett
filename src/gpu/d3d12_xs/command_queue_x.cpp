@@ -3962,13 +3962,17 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
                 device_x_->HostDevice()->GetCopyableFootprints(&ud, 0u, 1u, 0ull, &ufp, &urows, &ursz, &utot);
                 if (utot <= readback_buf_->GetDesc().Width &&
                     SUCCEEDED(present_alloc_->Reset()) && SUCCEEDED(present_cmd_->Reset(present_alloc_, nullptr))) {
+                    const D3D12_RESOURCE_STATES ui_before = device_x_->GetRetailResourceState(
+                        ui_rtv, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
                     D3D12_RESOURCE_BARRIER b0{};
                     b0.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
                     b0.Transition.pResource = ui_rtv;
                     b0.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-                    b0.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                    b0.Transition.StateBefore = ui_before;
                     b0.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-                    present_cmd_->ResourceBarrier(1u, &b0);
+                    if (ui_before != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+                        present_cmd_->ResourceBarrier(1u, &b0);
+                    }
                     D3D12_TEXTURE_COPY_LOCATION ul_src{};
                     ul_src.pResource = ui_rtv;
                     ul_src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -3977,8 +3981,10 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
                     ul_dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
                     ul_dst.PlacedFootprint = ufp;
                     present_cmd_->CopyTextureRegion(&ul_dst, 0u, 0u, 0u, &ul_src, nullptr);
-                    std::swap(b0.Transition.StateBefore, b0.Transition.StateAfter);
-                    present_cmd_->ResourceBarrier(1u, &b0);
+                    if (ui_before != D3D12_RESOURCE_STATE_COPY_SOURCE) {
+                        std::swap(b0.Transition.StateBefore, b0.Transition.StateAfter);
+                        present_cmd_->ResourceBarrier(1u, &b0);
+                    }
                     if (SUCCEEDED(present_cmd_->Close())) {
                         ID3D12CommandList* ul_lists[] = {present_cmd_};
                         host_queue_->ExecuteCommandLists(1u, ul_lists);

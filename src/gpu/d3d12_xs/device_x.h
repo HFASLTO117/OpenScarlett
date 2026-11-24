@@ -993,7 +993,9 @@ public:
     }
 
     void NotifyDescriptorHeapDestroyed(ID3D12DescriptorHeap* host_heap) noexcept;
+    void NotifyRootSignatureDestroyed(ID3D12RootSignature* host_rs) noexcept;
     void RegisterGuestBackedDescHeap(
+        ID3D12DescriptorHeap* host_heap,
         uint64_t host_gpu_start, uint64_t host_cpu_start, uint32_t host_num_descs,
         uint32_t inc_size, uint64_t guest_cpu_start, uint64_t guest_byte_size);
     D3D12_GPU_DESCRIPTOR_HANDLE MaterializeGuestDescriptorTable(
@@ -1426,7 +1428,7 @@ private:
     std::mutex placed_alias_mutex_;
     std::unordered_map<uint64_t, ID3D12Heap*> placed_alias_heaps_;
 
-    // Guest-backed Scarlett shader-visible descriptor heap mirror (e.g. GTA VI 1,245,184-slot heap).
+    // Guest-backed Scarlett shader-visible descriptor heap mirror (for oversized >1M console heaps).
     // Retail titles memcpy 32-byte descriptors from CPU staging heaps directly into guest_cpu_start
     // instead of calling ID3D12Device::CopyDescriptors; we shadow created staging descriptors and
     // materialize each bound descriptor table into the real host shader-visible heap via
@@ -1450,6 +1452,7 @@ private:
         }
     };
     struct GuestBackedDescHeap {
+        ID3D12DescriptorHeap* host_heap = nullptr;
         uint64_t host_gpu_start = 0ull;
         uint64_t host_cpu_start = 0ull;
         uint32_t host_num_descs = 0u;
@@ -1457,13 +1460,16 @@ private:
         uint64_t guest_cpu_start = 0ull;
         uint64_t guest_byte_size = 0ull;
         uint32_t ring_cursor = 0u;
+        bool ring_wrapped = false;
     };
     bool EnsureShadowDescHeapLocked() noexcept;
+    uint32_t AllocShadowSlotLocked(bool prefer_static_partition) noexcept;
     bool RedirectGuestDescDestIfNeeded(
-        D3D12_CPU_DESCRIPTOR_HANDLE& dst, uint64_t& out_guest_writeback_addr);
+        D3D12_CPU_DESCRIPTOR_HANDLE& dst, uint64_t& out_guest_writeback_addr,
+        bool prefer_static_partition = false);
     void SnapshotCreatedDescriptorToShadow(
         D3D12_CPU_DESCRIPTOR_HANDLE created_cpu_handle, uint64_t guest_writeback_addr = 0ull,
-        ID3D12Resource* opt_res = nullptr);
+        bool prefer_static_partition = false);
     void RecordRootSigTableSizes(void* host_rs, const D3D12_VERSIONED_ROOT_SIGNATURE_DESC& desc);
 
     std::atomic<bool> has_guest_backed_desc_heaps_{false};
@@ -1471,11 +1477,14 @@ private:
     std::vector<GuestBackedDescHeap> guest_backed_desc_heaps_;
     ID3D12DescriptorHeap* shadow_cbv_srv_uav_heap_ = nullptr;
     D3D12_CPU_DESCRIPTOR_HANDLE shadow_cbv_srv_uav_cpu_start_{0u};
+    D3D12_CPU_DESCRIPTOR_HANDLE shadow_null_srv_cpu_{0u};
     uint32_t shadow_cbv_srv_uav_inc_ = 32u;
     uint32_t shadow_cbv_srv_uav_cap_ = 0u;
-    uint32_t shadow_cbv_srv_uav_cursor_ = 0u;
+    uint32_t shadow_static_cursor_ = 1u;   // slot 0 reserved for shadow_null_srv_cpu_
+    uint32_t shadow_dynamic_cursor_ = 0u;
+    std::vector<Desc32Key> shadow_slot_keys_;
+    std::vector<uint8_t> shadow_slot_valid_;
     std::unordered_map<Desc32Key, uint64_t, Desc32KeyHash> desc32_to_shadow_cpu_;
-    std::unordered_map<Desc32Key, ID3D12Resource*, Desc32KeyHash> desc32_to_res_;
     std::unordered_map<void*, std::vector<uint32_t>> rs_table_slot_counts_;
 
     // Diagnostic-only (OPENSCARLETT_TRACE_D3D12_LOG) descriptor & root signature inspector.

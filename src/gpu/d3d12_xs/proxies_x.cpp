@@ -1032,6 +1032,9 @@ RootSignatureXProxy::RootSignatureXProxy(DeviceX* parent_device, ID3D12RootSigna
 
 RootSignatureXProxy::~RootSignatureXProxy() {
     UnregisterProxy(static_cast<const ID3D12RootSignature*>(this));
+    if (device_x_ && host_rs_) {
+        device_x_->NotifyRootSignatureDestroyed(host_rs_);
+    }
     if (host_rs_) host_rs_->Release();
     if (device_x_) device_x_->Release();
 }

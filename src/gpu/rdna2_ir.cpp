@@ -1088,6 +1088,12 @@ const char* IrOpName(IrOp op) noexcept {
         case IrOp::FFloor:        return "ffloor";
         case IrOp::FCeil:         return "fceil";
         case IrOp::FFract:        return "ffract";
+        case IrOp::FTrunc:        return "ftrunc";
+        case IrOp::FRndne:        return "frndne";
+        case IrOp::FExp2:         return "fexp2";
+        case IrOp::FLog2:         return "flog2";
+        case IrOp::FSinCycles:    return "fsin_cycles";
+        case IrOp::FCosCycles:    return "fcos_cycles";
         case IrOp::FDot2:         return "fdot2";
         case IrOp::IAdd:          return "iadd";
         case IrOp::ISub:          return "isub";
@@ -3092,6 +3098,24 @@ Status BuildRdna2Ir(
                     break;
                 case Rdna2Opcode::V_FRACT_F32:
                     write_dst(inst.dst, apply_clamp(emit_in_bb(IrOp::FFract, IrType::F32, {eval_src0(inst, true)}), inst.clamp));
+                    break;
+                case Rdna2Opcode::V_TRUNC_F32:
+                    write_dst(inst.dst, apply_clamp(emit_in_bb(IrOp::FTrunc, IrType::F32, {eval_src0(inst, true)}), inst.clamp));
+                    break;
+                case Rdna2Opcode::V_RNDNE_F32:
+                    write_dst(inst.dst, apply_clamp(emit_in_bb(IrOp::FRndne, IrType::F32, {eval_src0(inst, true)}), inst.clamp));
+                    break;
+                case Rdna2Opcode::V_EXP_F32:
+                    write_dst(inst.dst, apply_clamp(emit_in_bb(IrOp::FExp2, IrType::F32, {eval_src0(inst, true)}), inst.clamp));
+                    break;
+                case Rdna2Opcode::V_LOG_F32:
+                    write_dst(inst.dst, apply_clamp(emit_in_bb(IrOp::FLog2, IrType::F32, {eval_src0(inst, true)}), inst.clamp));
+                    break;
+                case Rdna2Opcode::V_SIN_F32:
+                    write_dst(inst.dst, apply_clamp(emit_in_bb(IrOp::FSinCycles, IrType::F32, {eval_src0(inst, true)}), inst.clamp));
+                    break;
+                case Rdna2Opcode::V_COS_F32:
+                    write_dst(inst.dst, apply_clamp(emit_in_bb(IrOp::FCosCycles, IrType::F32, {eval_src0(inst, true)}), inst.clamp));
                     break;
                 case Rdna2Opcode::V_CVT_NORM_I16_F16:
                 case Rdna2Opcode::V_CVT_NORM_U16_F16: {
@@ -5133,6 +5157,24 @@ Status OptimizeRdna2Ir(Rdna2IrModule& module, Rdna2IrOptStats* out_stats) {
                         if (get_const_f32(inst.operands[0], fa)) {
                             fold_to_f32(std::isfinite(fa) ? QuietNanF32(fa - ExactFloorF32(fa)) : BitsToFloat(0x7FC00000u));
                         }
+                        break;
+                    case IrOp::FTrunc:
+                        if (get_const_f32(inst.operands[0], fa)) fold_to_f32(QuietNanF32(std::trunc(fa)));
+                        break;
+                    case IrOp::FRndne:
+                        if (get_const_f32(inst.operands[0], fa)) fold_to_f32(QuietNanF32(std::nearbyint(fa)));
+                        break;
+                    case IrOp::FExp2:
+                        if (get_const_f32(inst.operands[0], fa)) fold_to_f32(QuietNanF32(std::exp2(fa)));
+                        break;
+                    case IrOp::FLog2:
+                        if (get_const_f32(inst.operands[0], fa) && fa > 0.0f) fold_to_f32(QuietNanF32(std::log2(fa)));
+                        break;
+                    case IrOp::FSinCycles:
+                        if (get_const_f32(inst.operands[0], fa)) fold_to_f32(QuietNanF32(std::sin(fa * 6.283185307179586f)));
+                        break;
+                    case IrOp::FCosCycles:
+                        if (get_const_f32(inst.operands[0], fa)) fold_to_f32(QuietNanF32(std::cos(fa * 6.283185307179586f)));
                         break;
                     case IrOp::IAdd:
                         if (get_const_u32(inst.operands[0], ua) && get_const_u32(inst.operands[1], ub)) fold_to_u32(ua + ub, inst.type);

@@ -457,11 +457,10 @@ public:
             return XAPU_E_INVALIDARG;
         }
 
-        // Retail Scarlett ABI (verified against GTA VI at +0x4EAA854):
-        // calls XApuGetResultCount(handle, 0) with RDX=0 and reads the
-        // pending result count directly from EAX (0 = empty). Returning
-        // E_INVALIDARG (0x80070057) caused the caller to loop 2.14B times
-        // while holding its global audio mutex!
+        // Retail Scarlett GRDK 2504/2510 ABI: callers pass XApuGetResultCount(handle, 0)
+        // with a null out-pointer and read the pending result count directly from EAX (0 = empty).
+        // Returning E_INVALIDARG (0x80070057) caused callers to spin on dequeue while holding
+        // their audio lock.
         if (state->xbox_retail_mode &&
             (!out_result_count || !IsWritablePointer(out_result_count, sizeof(uint32_t)))) {
             std::lock_guard<std::mutex> lk(state->queue_mutex);

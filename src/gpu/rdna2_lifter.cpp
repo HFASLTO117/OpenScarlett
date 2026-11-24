@@ -234,10 +234,15 @@ uint32_t ModuleDynamicSampledArraySize(const Rdna2IrModule& ir) noexcept {
 
 enum GlslStd450Op : uint32_t {
     GlslRoundEven = 2,
+    GlslTrunc = 3,
     GlslFAbs = 4,
     GlslFloor = 8,
     GlslCeil = 9,
     GlslFract = 10,
+    GlslSin = 13,
+    GlslCos = 14,
+    GlslExp2 = 29,
+    GlslLog2 = 30,
     GlslSqrt = 31,
     GlslInverseSqrt = 32,
     GlslFMin = 37,
@@ -820,8 +825,13 @@ public:
         }
 
         const bool uses_stage_in = ModuleUsesStageInput(ir_);
-        const bool uses_dual_uav = ir_.uses_uav1;
-        const bool uses_uav0 = ir_.uses_uav0 || (ir_.uses_uav && !ir_.uses_uav1);
+        const bool psv0_in0_srv = ir_.stage_contract.psv0_bindings.enabled &&
+                                  ir_.stage_contract.psv0_bindings.in0_is_srv &&
+                                  !ir_.stage_contract.psv0_bindings.in0_is_cbv;
+        const bool uses_uav_writes = ModuleUsesOp(ir_, IrOp::StoreUav) ||
+                                     ModuleUsesOp(ir_, IrOp::StoreUavSubDword);
+        const bool uses_dual_uav = ir_.uses_uav1 && !(psv0_in0_srv && !uses_uav_writes);
+        const bool uses_uav0 = ir_.uses_uav0 || (ir_.uses_uav && !uses_dual_uav);
         const bool uses_fma = ModuleUsesOp(ir_, IrOp::FFma) || ModuleUsesOp(ir_, IrOp::FFma16) || ModuleUsesOp(ir_, IrOp::FmaMix);
         const bool uses_mad = ModuleUsesOp(ir_, IrOp::FMad);
         const bool uses_alignbyte = ModuleUsesOp(ir_, IrOp::AlignByte);
@@ -1122,7 +1132,7 @@ public:
         }
         if (uses_buf_load_fmt) {
             hdr << "// UB-free sub-dword merge & MTBUF D16 format-conversion helpers (shifts strictly < 32)\n";
-            if (uses_uav0 || in0_is_cbv) {
+            if (uses_uav0 || in0_is_cbv || in0_is_srv) {
                 if (in0_is_cbv) {
                     hdr << "uint _os_load_unaligned_u0(uint byte_addr) {\n"
                            "    uint aligned = byte_addr & ~3u;\n"
@@ -2071,13 +2081,13 @@ private:
                     } else if (in0_cbv) {
                         os << ind << "_v" << inst.id << " = _os_in0_cb_load(" << AsU32(inst.operands[0]) << ");\n";
                     } else if ((inst.imm_u32 & kIrLoadSmemBoundsCheckFlag) != 0u) {
-                        const char* buf = ((inst.imm_u32 & 0xFFu) == 1u && ir_.uses_uav1) ? "_out0" : "_in0";
+                        const char* buf = (!use_in0_srv && (inst.imm_u32 & 0xFFu) == 1u && ir_.uses_uav1) ? "_out0" : "_in0";
                         os << ind << "{ uint _sb_off = " << AsU32(inst.operands[0]) << "; uint _sb_len = 0u; "
                            << buf << ".GetDimensions(_sb_len); "
                            << "bool _sb_ok = (_sb_off < 0x80000000u) && ((_sb_len > 0u) ? ((_sb_off < _sb_len) && ((_sb_off + 4u) <= _sb_len)) : (_sb_off < 65536u)); "
                            << "_v" << inst.id << " = _sb_ok ? " << buf << ".Load(_sb_off) : 0u; }\n";
                     } else {
-                        const char* buf = (inst.imm_u32 == 1u && ir_.uses_uav1) ? "_out0" : "_in0";
+                        const char* buf = (!use_in0_srv && inst.imm_u32 == 1u && ir_.uses_uav1) ? "_out0" : "_in0";
                         os << ind << "_v" << inst.id << " = " << buf << ".Load(" << AsU32(inst.operands[0]) << ");\n";
                     }
                     break;
@@ -2151,7 +2161,15 @@ private:
                     const uint32_t comp_idx = (inst.imm_u32 >> 12) & 0xFu;
                     const bool is_d16 = ((inst.imm_u32 >> 16) & 1u) != 0u;
                     const bool has_hi = ((inst.imm_u32 >> 17) & 1u) != 0u;
-                    const char* loader = (uav_slot == 1u && ir_.uses_uav1) ? "_os_load_unaligned_u1" : "_os_load_unaligned_u0";
+                    const bool force_u0_srv =
+                        ir_.stage_contract.psv0_bindings.enabled &&
+                        ir_.stage_contract.psv0_bindings.in0_is_srv &&
+                        !ir_.stage_contract.psv0_bindings.in0_is_cbv &&
+                        !ModuleUsesOp(ir_, IrOp::StoreUav) &&
+                        !ModuleUsesOp(ir_, IrOp::StoreUavSubDword);
+                    const char* loader = (!force_u0_srv && uav_slot == 1u && ir_.uses_uav1)
+                                             ? "_os_load_unaligned_u1"
+                                             : "_os_load_unaligned_u0";
                     const Rdna2MtbufFormatInfo fmt_info = GetRdna2MtbufFormatInfo(static_cast<uint8_t>(fmt));
                     const uint32_t elem_bytes = fmt_info.component_bytes ? fmt_info.component_bytes : 4u;
                     const std::string base_addr = AsU32(inst.operands[0]);
@@ -2675,6 +2693,24 @@ private:
                     break;
                 case IrOp::FFract:
                     os << ind << "_v" << inst.id << " = _os_fract_f32(" << AsF32(inst.operands[0]) << ");\n";
+                    break;
+                case IrOp::FTrunc:
+                    os << ind << "_v" << inst.id << " = trunc(" << AsF32(inst.operands[0]) << ");\n";
+                    break;
+                case IrOp::FRndne:
+                    os << ind << "_v" << inst.id << " = round(" << AsF32(inst.operands[0]) << ");\n";
+                    break;
+                case IrOp::FExp2:
+                    os << ind << "_v" << inst.id << " = exp2(" << AsF32(inst.operands[0]) << ");\n";
+                    break;
+                case IrOp::FLog2:
+                    os << ind << "_v" << inst.id << " = log2(" << AsF32(inst.operands[0]) << ");\n";
+                    break;
+                case IrOp::FSinCycles:
+                    os << ind << "_v" << inst.id << " = sin((" << AsF32(inst.operands[0]) << ") * 6.28318530718f);\n";
+                    break;
+                case IrOp::FCosCycles:
+                    os << ind << "_v" << inst.id << " = cos((" << AsF32(inst.operands[0]) << ") * 6.28318530718f);\n";
                     break;
                 case IrOp::FDot2: {
                     const std::string a = AsU32(inst.operands[0]);
@@ -6522,6 +6558,30 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                     EmitSpvInst(sec_fn, SpvOpLogicalOr, {t_bool, non_fin, is_nan, is_inf});
                     EmitSpvInst(sec_fn, SpvOpExtInst, {t_f32, fr, glsl_ext_id, GlslFract, fx});
                     EmitSpvInst(sec_fn, SpvOpSelect, {t_f32, res, non_fin, get_const_f32(BitsToFloat(0x7FC00000u)), fr});
+                    break;
+                }
+                case IrOp::FTrunc:
+                    EmitSpvInst(sec_fn, SpvOpExtInst, {t_f32, res, glsl_ext_id, GlslTrunc, get_as_f32(inst.operands[0])});
+                    break;
+                case IrOp::FRndne:
+                    EmitSpvInst(sec_fn, SpvOpExtInst, {t_f32, res, glsl_ext_id, GlslRoundEven, get_as_f32(inst.operands[0])});
+                    break;
+                case IrOp::FExp2:
+                    EmitSpvInst(sec_fn, SpvOpExtInst, {t_f32, res, glsl_ext_id, GlslExp2, get_as_f32(inst.operands[0])});
+                    break;
+                case IrOp::FLog2:
+                    EmitSpvInst(sec_fn, SpvOpExtInst, {t_f32, res, glsl_ext_id, GlslLog2, get_as_f32(inst.operands[0])});
+                    break;
+                case IrOp::FSinCycles: {
+                    uint32_t rad = alloc_id();
+                    EmitSpvInst(sec_fn, SpvOpFMul, {t_f32, rad, get_as_f32(inst.operands[0]), get_const_f32(6.28318530718f)});
+                    EmitSpvInst(sec_fn, SpvOpExtInst, {t_f32, res, glsl_ext_id, GlslSin, rad});
+                    break;
+                }
+                case IrOp::FCosCycles: {
+                    uint32_t rad = alloc_id();
+                    EmitSpvInst(sec_fn, SpvOpFMul, {t_f32, rad, get_as_f32(inst.operands[0]), get_const_f32(6.28318530718f)});
+                    EmitSpvInst(sec_fn, SpvOpExtInst, {t_f32, res, glsl_ext_id, GlslCos, rad});
                     break;
                 }
                 case IrOp::FDot2: {

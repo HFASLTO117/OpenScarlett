@@ -1759,7 +1759,7 @@ public:
             if (res.SizeInBytes == UINT64_MAX && !clean_descs.empty()) {
                 static std::atomic<uint32_t> s_rai2_fb{0u};
                 const uint32_t n = s_rai2_fb.fetch_add(1u, std::memory_order_relaxed);
-                if (n < 16u && pResourceDescs) {
+                if (openscarlett::d3d12_xs::CommandListX::IsDiagTraceEnabled() && n < 16u && pResourceDescs) {
                     const auto& rd = pResourceDescs[0];
                     std::fprintf(stderr,
                         "[OpenScarlett][d3d12_xs] GetResourceAllocationInfo2 fallback #%u: dim=%u %llux%u D=%u mips=%u fmt=%u samp=%u/%u lay=0x%X flags=0x%X align=0x%llX\n",
@@ -2119,16 +2119,19 @@ public:
             }
             auto* retail_heap = new (std::nothrow) ScarlettRetailDescriptorHeapProxy(
                 inner_heap, guest_cpu_base, guest_byte_size);
-            if (auto* dh = openscarlett::d3d12_xs::TryGetDescriptorHeapProxy(inner_heap)) {
-                if (ID3D12DescriptorHeap* hh = dh->HostDescriptorHeap()) {
-                    const auto hd = hh->GetDesc();
-                    const UINT inc = inner_->GetDescriptorHandleIncrementSize(hd.Type);
-                    const uint64_t hcpu = hh->GetCPUDescriptorHandleForHeapStart().ptr;
-                    const uint64_t hgpu = (hd.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)
-                                              ? hh->GetGPUDescriptorHandleForHeapStart().ptr
-                                              : 0ull;
-                    inner_->RegisterGuestBackedDescHeap(
-                        hgpu, hcpu, hd.NumDescriptors, inc, guest_cpu_base, guest_byte_size);
+            if (retail_heap) {
+                if (auto* dh = openscarlett::d3d12_xs::TryGetDescriptorHeapProxy(inner_heap)) {
+                    if (ID3D12DescriptorHeap* hh = dh->HostDescriptorHeap()) {
+                        const auto hd = hh->GetDesc();
+                        if (hd.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
+                            (hd.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0) {
+                            const UINT inc = inner_->GetDescriptorHandleIncrementSize(hd.Type);
+                            const uint64_t hcpu = hh->GetCPUDescriptorHandleForHeapStart().ptr;
+                            const uint64_t hgpu = hh->GetGPUDescriptorHandleForHeapStart().ptr;
+                            inner_->RegisterGuestBackedDescHeap(
+                                hh, hgpu, hcpu, hd.NumDescriptors, inc, guest_cpu_base, guest_byte_size);
+                        }
+                    }
                 }
             }
             inner_heap->Release();

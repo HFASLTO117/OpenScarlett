@@ -611,6 +611,21 @@ D3D12_COMMAND_LIST_TYPE STDMETHODCALLTYPE CommandListX::GetType() {
 
 // ID3D12GraphicsCommandList (slots 9..59)
 HRESULT STDMETHODCALLTYPE CommandListX::Close() {
+    if (device_x_ && device_x_->IsRetailScarlettAbi() && last_bound_rtv0_res_ != nullptr) {
+        ID3D12Resource* rtv_res = last_bound_rtv0_res_;
+        last_bound_rtv0_res_ = nullptr;
+        const D3D12_RESOURCE_STATES before = device_x_->TransitionRetailResourceState(
+            rtv_res, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        if (before != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) {
+            D3D12_RESOURCE_BARRIER tb{};
+            tb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            tb.Transition.pResource = rtv_res;
+            tb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            tb.Transition.StateBefore = before;
+            tb.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            host_list_->ResourceBarrier(1u, &tb);
+        }
+    }
     const HRESULT hr = host_list_->Close();
     last_close_failed_.store(FAILED(hr), std::memory_order_release);
     if (IsDiagTraceEnabled()) {
@@ -852,19 +867,22 @@ void STDMETHODCALLTYPE CommandListX::ClearState(ID3D12PipelineState* pPipelineSt
 }
 
 namespace {
-bool SafeCopyBytes72(void* dst, const void* src) noexcept {
-    if (!dst || !src) return false;
+bool SafeCopyBytes(void* dst, const void* src, size_t len) noexcept {
+    if (!dst || !src || len == 0u) return false;
 #if defined(_MSC_VER)
     __try {
-        std::memcpy(dst, src, 72u);
+        std::memcpy(dst, src, len);
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
     }
 #else
-    std::memcpy(dst, src, 72u);
+    std::memcpy(dst, src, len);
     return true;
 #endif
+}
+bool SafeCopyBytes72(void* dst, const void* src) noexcept {
+    return SafeCopyBytes(dst, src, 72u);
 }
 }  // namespace
 
@@ -999,7 +1017,7 @@ void STDMETHODCALLTYPE CommandListX::DrawInstanced(
             host_list_->DrawInstanced(
                 VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
         }
-    } else if (last_pso_is_standin_ || pso_missing) {
+    } else if (IsDiagTraceEnabled() && (last_pso_is_standin_ || pso_missing)) {
         static std::atomic<uint64_t> s_skip_di{0ull};
         const uint64_t n = s_skip_di.fetch_add(1ull, std::memory_order_relaxed) + 1ull;
         if (n == 1ull || (n % 500ull) == 0ull) {
@@ -1078,7 +1096,7 @@ void STDMETHODCALLTYPE CommandListX::DrawIndexedInstanced(
         host_list_->DrawIndexedInstanced(
             IndexCountPerInstance, InstanceCount, StartIndexLocation,
             BaseVertexLocation, StartInstanceLocation);
-    } else if (last_pso_is_standin_ || pso_missing) {
+    } else if (IsDiagTraceEnabled() && (last_pso_is_standin_ || pso_missing)) {
         static std::atomic<uint64_t> s_skip_dii{0ull};
         const uint64_t n = s_skip_dii.fetch_add(1ull, std::memory_order_relaxed) + 1ull;
         if (n == 1ull || (n % 500ull) == 0ull) {
@@ -1928,6 +1946,19 @@ void STDMETHODCALLTYPE CommandListX::ResourceBarrier(
                               static_cast<unsigned>(b.Transition.StateAfter),
                               static_cast<unsigned>(b.Flags));
                 AppendDiagOp(buf);
+            }
+            if (device_x_ && device_x_->IsRetailScarlettAbi() &&
+                b.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION &&
+                b.Transition.pResource != nullptr) {
+                const D3D12_RESOURCE_STATES tracked =
+                    device_x_->GetRetailResourceState(b.Transition.pResource, b.Transition.StateBefore);
+                if (tracked != b.Transition.StateBefore) {
+                    b.Transition.StateBefore = tracked;
+                }
+                if (b.Transition.StateBefore == b.Transition.StateAfter) {
+                    continue;
+                }
+                device_x_->SetRetailResourceState(b.Transition.pResource, b.Transition.StateAfter);
             }
             unwrapped[out_count++] = b;
         }
@@ -2814,19 +2845,17 @@ void STDMETHODCALLTYPE CommandListX::IASetIndexBuffer(const D3D12_INDEX_BUFFER_V
     }();
     static std::atomic<uint32_t> s_sf_ib_log{0u};
     if (trace_sf && pView && s_sf_ib_log.fetch_add(1u, std::memory_order_relaxed) < 8u) {
-        const auto* ib16 = reinterpret_cast<const uint16_t*>(static_cast<uintptr_t>(pView->BufferLocation));
+        uint16_t ib16[6]{};
+        if (pView->BufferLocation >= 0x10000ull && pView->SizeInBytes >= sizeof(ib16)) {
+            (void)SafeCopyBytes(ib16, reinterpret_cast<const void*>(static_cast<uintptr_t>(pView->BufferLocation)), sizeof(ib16));
+        }
         std::fprintf(stderr,
                      "[OpenScarlett][SF-IB] raw=0x%llX -> host=0x%llX (mapped=%d) sz=%u fmt=%d idx0..5=[%u,%u,%u,%u,%u,%u]\n",
                      static_cast<unsigned long long>(pView->BufferLocation),
                      static_cast<unsigned long long>(translated_view.BufferLocation),
                      (translated_view.BufferLocation != pView->BufferLocation) ? 1 : 0,
                      pView->SizeInBytes, static_cast<int>(pView->Format),
-                     (pView->SizeInBytes >= 12u) ? ib16[0] : 0u,
-                     (pView->SizeInBytes >= 12u) ? ib16[1] : 0u,
-                     (pView->SizeInBytes >= 12u) ? ib16[2] : 0u,
-                     (pView->SizeInBytes >= 12u) ? ib16[3] : 0u,
-                     (pView->SizeInBytes >= 12u) ? ib16[4] : 0u,
-                     (pView->SizeInBytes >= 12u) ? ib16[5] : 0u);
+                     ib16[0], ib16[1], ib16[2], ib16[3], ib16[4], ib16[5]);
         std::fflush(stderr);
     }
     host_list_->IASetIndexBuffer(pass_view);
@@ -2894,15 +2923,17 @@ void STDMETHODCALLTYPE CommandListX::IASetVertexBuffers(
                      static_cast<unsigned long long>(translated[0].BufferLocation),
                      (translated[0].BufferLocation != pViews[0].BufferLocation) ? 1 : 0, sz);
         if (pViews[0].BufferLocation >= 0x10000ull && sz >= 48u) {
-            const auto* vb = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(pViews[0].BufferLocation));
-            for (uint32_t vi = 0u; vi < 3u; ++vi) {
-                uint32_t c0 = 0u, c1 = 0u;
-                float px = 0.f, py = 0.f;
-                std::memcpy(&c0, vb + vi * 16u + 0u, 4u);
-                std::memcpy(&c1, vb + vi * 16u + 4u, 4u);
-                std::memcpy(&px, vb + vi * 16u + 8u, 4u);
-                std::memcpy(&py, vb + vi * 16u + 12u, 4u);
-                std::fprintf(stderr, " v%u(c0=0x%08X c1=0x%08X pos=%.1f,%.1f)", vi, c0, c1, px, py);
+            uint8_t vb[48]{};
+            if (SafeCopyBytes(vb, reinterpret_cast<const void*>(static_cast<uintptr_t>(pViews[0].BufferLocation)), sizeof(vb))) {
+                for (uint32_t vi = 0u; vi < 3u; ++vi) {
+                    uint32_t c0 = 0u, c1 = 0u;
+                    float px = 0.f, py = 0.f;
+                    std::memcpy(&c0, vb + vi * 16u + 0u, 4u);
+                    std::memcpy(&c1, vb + vi * 16u + 4u, 4u);
+                    std::memcpy(&px, vb + vi * 16u + 8u, 4u);
+                    std::memcpy(&py, vb + vi * 16u + 12u, 4u);
+                    std::fprintf(stderr, " v%u(c0=0x%08X c1=0x%08X pos=%.1f,%.1f)", vi, c0, c1, px, py);
+                }
             }
         }
         std::fprintf(stderr, "\n");
