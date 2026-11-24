@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <dxgi1_4.h>
+#include <psapi.h>
 #include <shared_mutex>
 #include <unordered_map>
 
@@ -550,6 +552,9 @@ DXGI_FORMAT NormalizeSwapChainFormat(DXGI_FORMAT fmt) noexcept {
             return DXGI_FORMAT_R8G8B8A8_UNORM;
         case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
         case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+        case DXGI_FORMAT_B8G8R8X8_UNORM:
+        case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+        case DXGI_FORMAT_B8G8R8X8_TYPELESS:
             return DXGI_FORMAT_B8G8R8A8_UNORM;
         case DXGI_FORMAT_R10G10B10A2_TYPELESS:
         case DXGI_FORMAT_R10G10B10A2_UNORM:
@@ -1388,7 +1393,24 @@ HWND CommandQueueX::ResolveTargetOutputWindowLocked(
                     wc.lpszClassName = kClassName;
                     ::RegisterClassExW(&wc);
 
-                    RECT r{0, 0, 1280, 720};
+                    LONG win_w = 1280;
+                    LONG win_h = 720;
+                    {
+                        char rbuf[64]{};
+                        const DWORD rlen = ::GetEnvironmentVariableA("OPENSCARLETT_DISPLAY_RES", rbuf, sizeof(rbuf));
+                        if (rlen > 0u && rlen < sizeof(rbuf)) {
+                            char* sep = nullptr;
+                            const unsigned long ew = std::strtoul(rbuf, &sep, 10);
+                            if (sep && (*sep == 'x' || *sep == 'X')) {
+                                const unsigned long eh = std::strtoul(sep + 1, nullptr, 10);
+                                if (ew >= 320ul && eh >= 180ul && ew <= 3840ul && eh <= 2160ul) {
+                                    win_w = static_cast<LONG>(ew);
+                                    win_h = static_cast<LONG>(eh);
+                                }
+                            }
+                        }
+                    }
+                    RECT r{0, 0, win_w, win_h};
                     ::AdjustWindowRectEx(&r, WS_OVERLAPPEDWINDOW, FALSE, 0);
                     HWND hw = ::CreateWindowExW(
                         0, kClassName, L"OpenScarlett - Xbox Series X|S",
@@ -1672,7 +1694,29 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
     // Auto-sync all dirty/modified unified-memory textures, unified heap buffers, & TitleVAMirror
     // pages BEFORE submitting host command lists so GPU shaders never sample stale CPU memory.
     if (device_x_ && host_queue_) {
+        const HRESULT pre_rem = (device_x_->IsRetailScarlettAbi() && device_x_->HostDevice())
+                                    ? device_x_->HostDevice()->GetDeviceRemovedReason()
+                                    : S_OK;
+        if (FAILED(pre_rem)) {
+            static std::atomic<bool> s_pre_rem{false};
+            if (!s_pre_rem.exchange(true)) {
+                std::fprintf(stderr, "[OpenScarlett][EXEC-PRE-REMOVED] rem=0x%08lX n=%u qtype=%d\n",
+                             static_cast<unsigned long>(pre_rem), NumCommandLists, static_cast<int>(queue_type_));
+                std::fflush(stderr);
+            }
+        }
         (void)device_x_->SyncAllUnifiedResourcesBeforeSubmit(host_queue_, queue_type_);
+        if (SUCCEEDED(pre_rem) && device_x_->IsRetailScarlettAbi() && device_x_->HostDevice()) {
+            const HRESULT mid_rem = device_x_->HostDevice()->GetDeviceRemovedReason();
+            if (FAILED(mid_rem)) {
+                static std::atomic<bool> s_mid_rem{false};
+                if (!s_mid_rem.exchange(true)) {
+                    std::fprintf(stderr, "[OpenScarlett][EXEC-POST-SYNC-REMOVED] rem=0x%08lX n=%u qtype=%d\n",
+                                 static_cast<unsigned long>(mid_rem), NumCommandLists, static_cast<int>(queue_type_));
+                    std::fflush(stderr);
+                }
+            }
+        }
     }
 
     // Unwrap any CommandListX* wrappers back to native host ID3D12CommandList* pointers.
@@ -1825,8 +1869,35 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
             static std::atomic<uint32_t> s_dump_exec_count{0u};
             static std::atomic<uint32_t> s_dump_dii_count{0u};
             static std::atomic<uint32_t> s_dump_lift_count{0u};
+            static std::array<std::string, 6> s_recent_exec_ring;
+            static uint32_t s_recent_exec_pos = 0u;
             if (dump_all_ops) {
                 const uint32_t seq = s_dump_exec_count.fetch_add(1u, std::memory_order_relaxed);
+                {
+                    std::string snap;
+                    char hdr[128];
+                    std::snprintf(hdr, sizeof(hdr),
+                                  "\n=== RING EXEC #%u (n=%u, valid=%u, queue_type=%d, rem=0x%08X) ===\n",
+                                  seq, NumCommandLists, valid_list_count, static_cast<int>(queue_type_),
+                                  static_cast<unsigned>(rem_hr));
+                    snap += hdr;
+                    for (UINT i = 0; i < NumCommandLists; ++i) {
+                        if (CommandListX* clx = CommandListX::TryFromCommandList(ppCommandLists[i])) {
+                            const auto ops = clx->CopyDiagOps();
+                            char lh[64];
+                            std::snprintf(lh, sizeof(lh), "--- List[%u] (%zu ops) ---\n", i, ops.size());
+                            snap += lh;
+                            for (const auto& op : ops) {
+                                snap += "  ";
+                                snap += op;
+                                snap += '\n';
+                            }
+                        }
+                    }
+                    std::lock_guard<std::mutex> dlk(s_diag_mu);
+                    s_recent_exec_ring[s_recent_exec_pos % s_recent_exec_ring.size()] = std::move(snap);
+                    ++s_recent_exec_pos;
+                }
                 bool has_dii = false;
                 if (dump_after_exec == 0u && dump_after_lift == 0u && seq >= 25u &&
                     s_dump_dii_count.load(std::memory_order_relaxed) < 4u) {
@@ -1853,23 +1924,29 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
                     std::lock_guard<std::mutex> dlk(s_diag_mu);
                     FILE* f = nullptr;
                     if (::fopen_s(&f, CommandListX::DiagTraceLogPath(), "a") == 0 && f) {
-                        std::fprintf(f, "\n=== EXEC #%u (n=%u, valid=%u, queue_type=%d, rem=0x%08X) ===\n",
-                                     seq, NumCommandLists, valid_list_count, static_cast<int>(queue_type_),
-                                     static_cast<unsigned>(rem_hr));
-                        for (UINT i = 0; i < NumCommandLists; ++i) {
-                            if (CommandListX* clx = CommandListX::TryFromCommandList(ppCommandLists[i])) {
-                                const auto ops = clx->CopyDiagOps();
-                                std::fprintf(f, "--- List[%u] (%zu ops) ---\n", i, ops.size());
-                                for (const auto& op : ops) {
-                                    std::fprintf(f, "  %s\n", op.c_str());
-                                }
-                            }
-                        }
+                        const uint32_t idx = (s_recent_exec_pos - 1u) % static_cast<uint32_t>(s_recent_exec_ring.size());
+                        std::fwrite(s_recent_exec_ring[idx].data(), 1u, s_recent_exec_ring[idx].size(), f);
                         std::fclose(f);
                     }
                 }
             }
             if (FAILED(rem_hr) && !s_dumped.exchange(true)) {
+                if (dump_all_ops) {
+                    std::lock_guard<std::mutex> dlk(s_diag_mu);
+                    FILE* f = nullptr;
+                    if (::fopen_s(&f, CommandListX::DiagTraceLogPath(), "a") == 0 && f) {
+                        std::fprintf(f, "\n========== DEVICE REMOVED (rem=0x%08X) LAST 6 EXECS ==========\n",
+                                     static_cast<unsigned>(rem_hr));
+                        const uint32_t n = static_cast<uint32_t>(s_recent_exec_ring.size());
+                        for (uint32_t k = 0u; k < n; ++k) {
+                            const uint32_t idx = (s_recent_exec_pos + k) % n;
+                            if (!s_recent_exec_ring[idx].empty()) {
+                                std::fwrite(s_recent_exec_ring[idx].data(), 1u, s_recent_exec_ring[idx].size(), f);
+                            }
+                        }
+                        std::fclose(f);
+                    }
+                }
                 std::lock_guard<std::mutex> dlk(s_diag_mu);
                 FILE* f = nullptr;
                 if (::fopen_s(&f, CommandListX::DiagTraceLogPath(), "a") == 0 && f) {
@@ -3301,10 +3378,24 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
 
     const uint32_t width = static_cast<uint32_t>(src_desc.Width);
     const uint32_t height = src_desc.Height;
-    const D3D12_RESOURCE_STATES caller_state =
+    D3D12_RESOURCE_STATES caller_state =
         (device_x_ && device_x_->IsRetailScarlettAbi())
             ? device_x_->GetRetailResourceState(src_tex, pPlaneParameters[0].ResourceState)
             : pPlaneParameters[0].ResourceState;
+    if (device_x_ && device_x_->IsRetailScarlettAbi()) {
+        constexpr UINT kTexAllowed =
+            static_cast<UINT>(D3D12_RESOURCE_STATE_RENDER_TARGET) |
+            static_cast<UINT>(D3D12_RESOURCE_STATE_UNORDERED_ACCESS) |
+            static_cast<UINT>(D3D12_RESOURCE_STATE_DEPTH_WRITE) |
+            static_cast<UINT>(D3D12_RESOURCE_STATE_DEPTH_READ) |
+            static_cast<UINT>(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) |
+            static_cast<UINT>(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) |
+            static_cast<UINT>(D3D12_RESOURCE_STATE_COPY_DEST) |
+            static_cast<UINT>(D3D12_RESOURCE_STATE_COPY_SOURCE) |
+            static_cast<UINT>(D3D12_RESOURCE_STATE_RESOLVE_DEST) |
+            static_cast<UINT>(D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+        caller_state = static_cast<D3D12_RESOURCE_STATES>(static_cast<UINT>(caller_state) & kTexAllowed);
+    }
 
     // Ensure window subclass is active and pump pending Win32 messages WITHOUT holding present_mutex_.
     const bool force_headless = EnvFlagTrueA("OPENSCARLETT_PRESENTX_HEADLESS");
@@ -3359,13 +3450,28 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
     last_presented_color_space_ = effective_cs;
 
     const std::string capture_png_path = ReadEnvStringA("OPENSCARLETT_PRESENTX_CAPTURE_PNG");
+    const std::string capture_dir_path = ReadEnvStringA("OPENSCARLETT_CAPTURE_DIR");
+    const uint64_t capture_interval_ms = []() -> uint64_t {
+        const uint64_t v = ReadEnvUint64A("OPENSCARLETT_CAPTURE_INTERVAL_MS");
+        return (v > 0ull) ? v : 1000ull;
+    }();
+    static uint64_t s_cap_t0_ms = 0ull;
+    static uint64_t s_cap_last_ms = 0ull;
+    static uint64_t s_cap_last_frame = 0ull;
+    static uint32_t s_cap_seq = 0u;
+    const uint64_t now_cap_ms = GetTickCount64();
+    if (s_cap_t0_ms == 0ull) s_cap_t0_ms = now_cap_ms;
+    const bool want_periodic_capture =
+        !capture_dir_path.empty() &&
+        (s_cap_last_ms == 0ull || (now_cap_ms - s_cap_last_ms) >= capture_interval_ms);
     const uint64_t exit_after_frames = ReadEnvUint64A("OPENSCARLETT_PRESENTX_EXIT_AFTER_FRAMES");
     const uint64_t this_non_blank_frame = non_blank_present_count_ + 1ull;
     const bool want_capture_this_frame =
-        !capture_png_path.empty() &&
-        ((exit_after_frames > 0ull && this_non_blank_frame == exit_after_frames) ||
-         (exit_after_frames == 0ull &&
-          (this_non_blank_frame == 1ull || (this_non_blank_frame % 25ull) == 0ull)));
+        want_periodic_capture ||
+        (!capture_png_path.empty() &&
+         ((exit_after_frames > 0ull && this_non_blank_frame == exit_after_frames) ||
+          (exit_after_frames == 0ull &&
+           (this_non_blank_frame == 1ull || (this_non_blank_frame % 25ull) == 0ull))));
 
     HWND target_hwnd = ResolveTargetOutputWindowLocked(pPresentParameters, force_headless);
     const bool use_swapchain = (target_hwnd != nullptr && IsWindow(target_hwnd) != FALSE);
@@ -3585,6 +3691,21 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
 
         ID3D12CommandList* cmd_lists[] = {active_cmd};
         host_queue_->ExecuteCommandLists(1, cmd_lists);
+        if (device_x_ && device_x_->IsRetailScarlettAbi() && device_x_->HostDevice()) {
+            const HRESULT prem = device_x_->HostDevice()->GetDeviceRemovedReason();
+            if (FAILED(prem)) {
+                static std::atomic<bool> s_pr_rem{false};
+                if (!s_pr_rem.exchange(true)) {
+                    std::fprintf(stderr,
+                                 "[OpenScarlett][PRESENT-POST-REMOVED] rem=0x%08lX frame=%llu %ux%u fmt=%d st=0x%X\n",
+                                 static_cast<unsigned long>(prem),
+                                 static_cast<unsigned long long>(present_count_),
+                                 width, height, static_cast<int>(src_desc.Format),
+                                 static_cast<unsigned>(caller_state));
+                    std::fflush(stderr);
+                }
+            }
+        }
     }
 
     auto process_readback = [&]() -> HRESULT {
@@ -3960,23 +4081,137 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
     ++non_blank_present_count_;
     if (device_x_) {
         device_x_->GetQueryAccumulator().BeginFrame(present_count_);
+        device_x_->OnPresentFrameComplete(present_count_);
     }
 
     if (want_capture_this_frame && !last_present_pixels_.empty() &&
         last_present_width_ > 0u && last_present_height_ > 0u) {
-        openscarlett::FrameBufferRgba8 fb{};
-        try {
-            fb.width = last_present_width_;
-            fb.height = last_present_height_;
-            fb.pixels.swap(last_present_pixels_);
-            if (fb.WritePng(capture_png_path).ok()) {
-                capture_png_written_ = true;
+        if (!capture_png_path.empty()) {
+            openscarlett::FrameBufferRgba8 fb{};
+            try {
+                fb.width = last_present_width_;
+                fb.height = last_present_height_;
+                fb.pixels.swap(last_present_pixels_);
+                if (fb.WritePng(capture_png_path).ok()) {
+                    capture_png_written_ = true;
+                }
+            } catch (const std::bad_alloc&) {
+                // Skip diagnostic capture rather than crashing guest under tight host commit limits.
             }
-        } catch (const std::bad_alloc&) {
-            // Skip diagnostic capture rather than crashing guest under tight host commit limits.
+            if (last_present_pixels_.empty() && !fb.pixels.empty()) {
+                last_present_pixels_.swap(fb.pixels);
+            }
         }
-        if (last_present_pixels_.empty() && !fb.pixels.empty()) {
-            last_present_pixels_.swap(fb.pixels);
+        if (want_periodic_capture) {
+            const uint64_t dt_ms = (s_cap_last_ms > 0ull) ? std::max<uint64_t>(1ull, now_cap_ms - s_cap_last_ms) : 1000ull;
+            const uint64_t df = (s_cap_last_frame > 0ull && present_count_ >= s_cap_last_frame)
+                                    ? (present_count_ - s_cap_last_frame)
+                                    : 1ull;
+            const double fps_1s = static_cast<double>(df) * 1000.0 / static_cast<double>(dt_ms);
+            s_cap_last_ms = now_cap_ms;
+            s_cap_last_frame = present_count_;
+            const uint32_t seq = ++s_cap_seq;
+            const uint64_t elapsed_ms = now_cap_ms - s_cap_t0_ms;
+
+            // Downsample to max 1280x720 for lightweight 1-second PNG capture (< 3.6 MiB).
+            uint32_t out_w = last_present_width_;
+            uint32_t out_h = last_present_height_;
+            try {
+                openscarlett::FrameBufferRgba8 out_fb{};
+                if (out_w > 1280u || out_h > 720u) {
+                    const double scale = std::min(1280.0 / static_cast<double>(out_w),
+                                                  720.0 / static_cast<double>(out_h));
+                    out_w = std::max<uint32_t>(1u, static_cast<uint32_t>(std::lround(out_w * scale)));
+                    out_h = std::max<uint32_t>(1u, static_cast<uint32_t>(std::lround(out_h * scale)));
+                    out_fb.width = out_w;
+                    out_fb.height = out_h;
+                    out_fb.pixels.resize(static_cast<size_t>(out_w) * out_h * 4u);
+                    const uint8_t* src_px = last_present_pixels_.data();
+                    uint8_t* dst_px = out_fb.pixels.data();
+                    for (uint32_t y = 0u; y < out_h; ++y) {
+                        const uint32_t sy = static_cast<uint32_t>(
+                            (static_cast<uint64_t>(y) * last_present_height_) / out_h);
+                        const uint8_t* srow = src_px + static_cast<size_t>(sy) * last_present_width_ * 4u;
+                        uint8_t* drow = dst_px + static_cast<size_t>(y) * out_w * 4u;
+                        for (uint32_t x = 0u; x < out_w; ++x) {
+                            const uint32_t sx = static_cast<uint32_t>(
+                                (static_cast<uint64_t>(x) * last_present_width_) / out_w);
+                            std::memcpy(drow + static_cast<size_t>(x) * 4u,
+                                        srow + static_cast<size_t>(sx) * 4u, 4u);
+                        }
+                    }
+                } else {
+                    out_fb.width = out_w;
+                    out_fb.height = out_h;
+                    out_fb.pixels = last_present_pixels_;
+                }
+                char png_name[MAX_PATH]{};
+                std::snprintf(png_name, sizeof(png_name), "%s\\sec_%04u_%llums.png",
+                              capture_dir_path.c_str(), seq, static_cast<unsigned long long>(elapsed_ms));
+                (void)out_fb.WritePng(png_name);
+                const std::string latest_path = capture_dir_path + "\\latest.png";
+                (void)out_fb.WritePng(latest_path);
+            } catch (const std::bad_alloc&) {
+            }
+
+            // Capture live host RAM/commit, guest working set, and DXGI GPU VRAM/L0 usage.
+            PROCESS_MEMORY_COUNTERS_EX pmc{};
+            pmc.cb = sizeof(pmc);
+            (void)K32GetProcessMemoryInfo(GetCurrentProcess(),
+                                          reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc));
+            MEMORYSTATUSEX ms{};
+            ms.dwLength = sizeof(ms);
+            (void)GlobalMemoryStatusEx(&ms);
+            uint64_t vram_used_mb = 0ull, vram_budget_mb = 0ull, l0_used_mb = 0ull;
+            if (device_x_ && device_x_->HostDevice()) {
+                const LUID luid = device_x_->HostDevice()->GetAdapterLuid();
+                IDXGIFactory4* fac4 = nullptr;
+                if (SUCCEEDED(CreateDXGIFactory1(IID_PPV_ARGS(&fac4))) && fac4) {
+                    IDXGIAdapter3* ad3 = nullptr;
+                    if (SUCCEEDED(fac4->EnumAdapterByLuid(luid, IID_PPV_ARGS(&ad3))) && ad3) {
+                        DXGI_QUERY_VIDEO_MEMORY_INFO local_info{};
+                        DXGI_QUERY_VIDEO_MEMORY_INFO nonlocal_info{};
+                        if (SUCCEEDED(ad3->QueryVideoMemoryInfo(0u, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local_info))) {
+                            vram_used_mb = local_info.CurrentUsage >> 20u;
+                            vram_budget_mb = local_info.Budget >> 20u;
+                        }
+                        if (SUCCEEDED(ad3->QueryVideoMemoryInfo(0u, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &nonlocal_info))) {
+                            l0_used_mb = nonlocal_info.CurrentUsage >> 20u;
+                        }
+                        ad3->Release();
+                    }
+                    fac4->Release();
+                }
+            }
+            const uint32_t lifted = device_x_ ? device_x_->LazyLiftCount() : 0u;
+            const HRESULT rem_now = (device_x_ && device_x_->HostDevice())
+                                        ? device_x_->HostDevice()->GetDeviceRemovedReason()
+                                        : S_OK;
+            const std::string tel_path = capture_dir_path + "\\telemetry_1s.jsonl";
+            FILE* tf = nullptr;
+            if (::fopen_s(&tf, tel_path.c_str(), "a") == 0 && tf) {
+                std::fprintf(
+                    tf,
+                    "{\"sec\":%u,\"elapsed_ms\":%llu,\"frame\":%llu,\"fps\":%.2f,"
+                    "\"src\":\"%ux%u\",\"cap\":\"%ux%u\","
+                    "\"guest_ws_mb\":%llu,\"guest_commit_mb\":%llu,"
+                    "\"host_free_ram_mb\":%llu,\"host_free_commit_mb\":%llu,\"mem_load_pct\":%lu,"
+                    "\"gpu_vram_used_mb\":%llu,\"gpu_vram_budget_mb\":%llu,\"gpu_l0_used_mb\":%llu,"
+                    "\"lifted_psos\":%u,\"removed_hr\":\"0x%08lX\"}\n",
+                    seq, static_cast<unsigned long long>(elapsed_ms),
+                    static_cast<unsigned long long>(present_count_), fps_1s,
+                    last_present_width_, last_present_height_, out_w, out_h,
+                    static_cast<unsigned long long>(pmc.WorkingSetSize >> 20u),
+                    static_cast<unsigned long long>(pmc.PrivateUsage >> 20u),
+                    static_cast<unsigned long long>(ms.ullAvailPhys >> 20u),
+                    static_cast<unsigned long long>(ms.ullAvailPageFile >> 20u),
+                    static_cast<unsigned long>(ms.dwMemoryLoad),
+                    static_cast<unsigned long long>(vram_used_mb),
+                    static_cast<unsigned long long>(vram_budget_mb),
+                    static_cast<unsigned long long>(l0_used_mb),
+                    lifted, static_cast<unsigned long>(rem_now));
+                std::fclose(tf);
+            }
         }
         // Diagnostic: if Scaleform/UI rendered into an offscreen RTV before blitting to the
         // swapchain plane, read back that offscreen UI RTV as well to isolate UI draw vs blit.

@@ -520,6 +520,20 @@ OS_S7_API int32_t OS_S7_CALL MinUserXShutdown(void) {
 OS_S7_API int32_t OS_S7_CALL MinUserXGetSystemMetrics(int32_t nIndex) {
     RecordMod("MinUserXGetSystemMetrics", kHrOk);
 #if defined(_WIN32)
+    if (nIndex == 0 || nIndex == 1) {
+        char rbuf[64]{};
+        const DWORD rlen = ::GetEnvironmentVariableA("OPENSCARLETT_DISPLAY_RES", rbuf, sizeof(rbuf));
+        if (rlen > 0u && rlen < sizeof(rbuf)) {
+            char* sep = nullptr;
+            const unsigned long ew = std::strtoul(rbuf, &sep, 10);
+            if (sep && (*sep == 'x' || *sep == 'X')) {
+                const unsigned long eh = std::strtoul(sep + 1, nullptr, 10);
+                if (ew >= 320ul && eh >= 180ul && ew <= 7680ul && eh <= 4320ul) {
+                    return static_cast<int32_t>(nIndex == 0 ? ew : eh);
+                }
+            }
+        }
+    }
     const int val = ::GetSystemMetrics(nIndex);
     if (val != 0) {
         return static_cast<int32_t>(val);

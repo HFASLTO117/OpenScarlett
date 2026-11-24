@@ -328,7 +328,13 @@ ResourceXProxy::~ResourceXProxy() {
 #ifdef __ID3D12Resource1_INTERFACE_DEFINED__
     if (host_res1_) host_res1_->Release();
 #endif
-    if (host_res_) host_res_->Release();
+    if (host_res_) {
+        if (device_x_ && device_x_->IsRetailScarlettAbi()) {
+            device_x_->DeferHostResourceRelease(host_res_);
+        } else {
+            host_res_->Release();
+        }
+    }
     if (device_x_) device_x_->Release();
 }
 

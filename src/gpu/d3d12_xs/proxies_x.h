@@ -355,8 +355,13 @@ private:
 //    Supports both native host D3D12 PSOs and direct SPIR-V Vulkan PSOs (host_pso == nullptr).
 // ---------------------------------------------------------------------------
 struct PendingXdatGfxDesc {
+    bool is_compute = false;
     std::vector<uint8_t> vs_blob;
     std::vector<uint8_t> ps_blob;
+    std::vector<uint8_t> hs_blob;
+    std::vector<uint8_t> ds_blob;
+    std::vector<uint8_t> gs_blob;
+    std::vector<uint8_t> cs_blob;
     ID3D12RootSignature* host_rs = nullptr;
     std::vector<std::string> il_names;
     std::vector<D3D12_INPUT_ELEMENT_DESC> il_elems;

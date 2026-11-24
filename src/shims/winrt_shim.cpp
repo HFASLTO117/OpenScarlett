@@ -1258,7 +1258,21 @@ struct LifecycleGlobalState {
 };
 
 LifecycleGlobalState& GetLifecycleState() {
-    static LifecycleGlobalState* s = new LifecycleGlobalState();
+    static LifecycleGlobalState* s = []() {
+        auto* st = new LifecycleGlobalState();
+        if (const char* r = std::getenv("OPENSCARLETT_DISPLAY_RES")) {
+            char* sep = nullptr;
+            const unsigned long ew = std::strtoul(r, &sep, 10);
+            if (sep && (*sep == 'x' || *sep == 'X')) {
+                const unsigned long eh = std::strtoul(sep + 1, nullptr, 10);
+                if (ew >= 320ul && eh >= 180ul && ew <= 7680ul && eh <= 4320ul) {
+                    st->window_bounds.Width = static_cast<float>(ew);
+                    st->window_bounds.Height = static_cast<float>(eh);
+                }
+            }
+        }
+        return st;
+    }();
     return *s;
 }
 

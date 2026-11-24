@@ -1607,7 +1607,12 @@ public:
             "d3d12_xs.dll", "ScarlettRetailCmdList::BuildRaytracingAccelerationStructuresX",
             openscarlett::CallOutcome::Ok, S_OK, 131);
     }
-    virtual void STDMETHODCALLTYPE Slot132(uintptr_t a1, uintptr_t a2, uintptr_t a3) { RecordClUnimpl(132, a1, a2, a3, _ReturnAddress()); }
+    // Slot 132 (+0x420): SetCommandBufferRingSizeX(UINT RingSizeInBytes, UINT Flags, UINT Reserved)
+    virtual void STDMETHODCALLTYPE Slot132(uintptr_t /*a1*/, uintptr_t /*a2*/, uintptr_t /*a3*/) {
+        openscarlett::CallTelemetry::Global().Record(
+            "d3d12_xs.dll", "ScarlettRetailCmdList::SetCommandBufferRingSizeX_Slot132",
+            openscarlett::CallOutcome::Ok, S_OK, 132);
+    }
     virtual void STDMETHODCALLTYPE Slot133() { RecordClUnimpl(133); }
     virtual void STDMETHODCALLTYPE Slot134() { RecordClUnimpl(134); }
     virtual void STDMETHODCALLTYPE Slot135() { RecordClUnimpl(135); }
@@ -1630,8 +1635,16 @@ public:
     // Slot 146 (+0x490): ID3D12GraphicsCommandList7::Barrier (Enhanced Barriers)
     virtual void STDMETHODCALLTYPE Barrier(
         UINT32 NumBarrierGroups, const void* pBarrierGroups) {
+#ifdef __ID3D12GraphicsCommandList7_INTERFACE_DEFINED__
+        if (inner_) {
+            inner_->ExecuteEnhancedBarriers(
+                NumBarrierGroups, static_cast<const D3D12_BARRIER_GROUP*>(pBarrierGroups));
+            return;
+        }
+#else
         (void)NumBarrierGroups;
         (void)pBarrierGroups;
+#endif
         openscarlett::CallTelemetry::Global().Record(
             "d3d12_xs.dll", "ScarlettRetailCmdList::Barrier",
             openscarlett::CallOutcome::Ok, S_OK, 146);
@@ -2453,7 +2466,18 @@ public:
             std::memset(pOutConfig, 0, 16u);
             auto* words = static_cast<uint32_t*>(pOutConfig);
             words[0] = 0x10030000u;  // GFX10.3 / Scarlett
-            words[1] = 52u;          // Anaconda CU count
+            bool is_lockhart = false;
+            char cbuf[32]{};
+            DWORD clen = ::GetEnvironmentVariableA("OPENSCARLETT_CONSOLE_TYPE", cbuf, sizeof(cbuf));
+            if (clen == 0u || clen >= sizeof(cbuf)) {
+                clen = ::GetEnvironmentVariableA("OPENSCARLETT_CONSOLE_PROFILE", cbuf, sizeof(cbuf));
+            }
+            if (clen > 0u && clen < sizeof(cbuf)) {
+                std::string s(cbuf, clen);
+                for (char& ch : s) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                is_lockhart = (s == "lockhart" || s == "series_s" || s == "3" || s == "s" || s == "8gb");
+            }
+            words[1] = is_lockhart ? 20u : 52u;  // Lockhart (20 CU) vs Anaconda (52 CU)
         }
         openscarlett::CallTelemetry::Global().Record(
             "d3d12_xs.dll", "ScarlettRetailDevice::GetGpuHardwareConfigurationX",
@@ -3138,6 +3162,19 @@ HRESULT CreateWrappedDeviceInternal(
                 dbg->EnableDebugLayer();
                 dbg->Release();
                 std::fprintf(stderr, "[OpenScarlett][d3d12_xs] D3D12 Debug Layer ENABLED via OPENSCARLETT_ENABLE_D3D12_DEBUG=1\n");
+                std::fflush(stderr);
+            }
+        }
+        if (::GetEnvironmentVariableA("OPENSCARLETT_ENABLE_DRED", dbg_env, sizeof(dbg_env)) > 0 &&
+            dbg_env[0] == '1') {
+            auto fn_dbg = reinterpret_cast<PfnD3D12GetDebugInterface>(
+                openscarlett::ResolveHostD3D12Proc("D3D12GetDebugInterface"));
+            ID3D12DeviceRemovedExtendedDataSettings* dred = nullptr;
+            if (fn_dbg && SUCCEEDED(fn_dbg(IID_PPV_ARGS(&dred))) && dred) {
+                dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                dred->Release();
+                std::fprintf(stderr, "[OpenScarlett][d3d12_xs] D3D12 DRED (AutoBreadcrumbs + PageFault) ENABLED\n");
                 std::fflush(stderr);
             }
         }
@@ -4196,6 +4233,21 @@ OPENSCARLETT_D3D12_API HRESULT WINAPI D3D12XboxGetDisplayMode(
 
     pOutMode->Width = (cx > 0) ? static_cast<uint32_t>(cx) : 1920u;
     pOutMode->Height = (cy > 0) ? static_cast<uint32_t>(cy) : 1080u;
+    {
+        char rbuf[64]{};
+        const DWORD rlen = ::GetEnvironmentVariableA("OPENSCARLETT_DISPLAY_RES", rbuf, sizeof(rbuf));
+        if (rlen > 0u && rlen < sizeof(rbuf)) {
+            char* sep = nullptr;
+            const unsigned long ew = std::strtoul(rbuf, &sep, 10);
+            if (sep && (*sep == 'x' || *sep == 'X')) {
+                const unsigned long eh = std::strtoul(sep + 1, nullptr, 10);
+                if (ew >= 320ul && eh >= 180ul && ew <= 7680ul && eh <= 4320ul) {
+                    pOutMode->Width = static_cast<uint32_t>(ew);
+                    pOutMode->Height = static_cast<uint32_t>(eh);
+                }
+            }
+        }
+    }
     pOutMode->RefreshRateNumerator = hz;
     pOutMode->RefreshRateDenominator = 1u;
     pOutMode->Format = DXGI_FORMAT_R8G8B8A8_UNORM;

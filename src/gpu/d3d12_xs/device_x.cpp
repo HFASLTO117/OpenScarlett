@@ -381,8 +381,34 @@ DXGI_FORMAT MapTypelessFormatForSrv(DXGI_FORMAT fmt) noexcept {
             return DXGI_FORMAT_BC6H_UF16;
         case DXGI_FORMAT_BC7_TYPELESS:
             return DXGI_FORMAT_BC7_UNORM;
+        case DXGI_FORMAT_B8G8R8X8_TYPELESS:
+            return DXGI_FORMAT_B8G8R8X8_UNORM;
+        case DXGI_FORMAT_R32G32B32_TYPELESS:
+            return DXGI_FORMAT_R32G32B32_FLOAT;
         default:
             return fmt;
+    }
+}
+
+bool IsDepthOrPlanarFormatForCopy(DXGI_FORMAT fmt) noexcept {
+    switch (fmt) {
+        case DXGI_FORMAT_D16_UNORM:
+        case DXGI_FORMAT_D32_FLOAT:
+        case DXGI_FORMAT_D24_UNORM_S8_UINT:
+        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+        case DXGI_FORMAT_R24G8_TYPELESS:
+        case DXGI_FORMAT_R24_UNORM_X8_TYPELESS:
+        case DXGI_FORMAT_X24_TYPELESS_G8_UINT:
+        case DXGI_FORMAT_R32G8X24_TYPELESS:
+        case DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS:
+        case DXGI_FORMAT_X32_TYPELESS_G8X24_UINT:
+        case DXGI_FORMAT_NV12:
+        case DXGI_FORMAT_P010:
+        case DXGI_FORMAT_P016:
+        case DXGI_FORMAT_420_OPAQUE:
+            return true;
+        default:
+            return false;
     }
 }
 
@@ -1047,6 +1073,45 @@ bool IsKnownD3D12DeviceIid(REFIID riid) noexcept {
 
 // Synthetic virtual IDXGIOutput returned when the host adapter has no physical display outputs
 // (e.g. Optimus render-only dGPU, WARP, or headless CI runners).
+void QueryConfiguredDisplayMode(uint32_t& out_w, uint32_t& out_h) noexcept {
+    out_w = 1920u;
+    out_h = 1080u;
+    char cbuf[32]{};
+    DWORD clen = ::GetEnvironmentVariableA("OPENSCARLETT_CONSOLE_TYPE", cbuf, sizeof(cbuf));
+    if (clen == 0u || clen >= sizeof(cbuf)) {
+        clen = ::GetEnvironmentVariableA("OPENSCARLETT_CONSOLE_PROFILE", cbuf, sizeof(cbuf));
+    }
+    if (clen > 0u && clen < sizeof(cbuf)) {
+        std::string s(cbuf, clen);
+        for (char& ch : s) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        if (s == "lockhart" || s == "series_s" || s == "series-s" || s == "3" || s == "s" || s == "8gb") {
+            out_w = 1280u;
+            out_h = 720u;
+        }
+    }
+    char rbuf[64]{};
+    const DWORD rlen = ::GetEnvironmentVariableA("OPENSCARLETT_DISPLAY_RES", rbuf, sizeof(rbuf));
+    if (rlen > 0u && rlen < sizeof(rbuf)) {
+        char* sep = nullptr;
+        const unsigned long ew = std::strtoul(rbuf, &sep, 10);
+        if (sep && (*sep == 'x' || *sep == 'X')) {
+            const unsigned long eh = std::strtoul(sep + 1, nullptr, 10);
+            if (ew >= 320ul && eh >= 180ul && ew <= 7680ul && eh <= 4320ul) {
+                out_w = static_cast<uint32_t>(ew);
+                out_h = static_cast<uint32_t>(eh);
+            }
+        }
+    }
+}
+
+bool HasExplicitConsoleOrDisplayOverride() noexcept {
+    char buf[64]{};
+    if (::GetEnvironmentVariableA("OPENSCARLETT_DISPLAY_RES", buf, sizeof(buf)) > 0u) return true;
+    if (::GetEnvironmentVariableA("OPENSCARLETT_CONSOLE_TYPE", buf, sizeof(buf)) > 0u) return true;
+    if (::GetEnvironmentVariableA("OPENSCARLETT_CONSOLE_PROFILE", buf, sizeof(buf)) > 0u) return true;
+    return false;
+}
+
 class VirtualDxgiOutput final : public IDXGIOutput {
 public:
     explicit VirtualDxgiOutput(IDXGIAdapter* parent_adapter) : parent_adapter_(parent_adapter) {
@@ -1087,7 +1152,9 @@ public:
         std::memset(pDesc, 0, sizeof(*pDesc));
         const wchar_t kName[] = L"\\\\.\\DISPLAY1";
         std::memcpy(pDesc->DeviceName, kName, sizeof(kName));
-        pDesc->DesktopCoordinates = {0, 0, 1920, 1080};
+        uint32_t mw = 1920u, mh = 1080u;
+        QueryConfiguredDisplayMode(mw, mh);
+        pDesc->DesktopCoordinates = {0, 0, static_cast<LONG>(mw), static_cast<LONG>(mh)};
         pDesc->AttachedToDesktop = TRUE;
         pDesc->Rotation = DXGI_MODE_ROTATION_IDENTITY;
         pDesc->Monitor = nullptr;
@@ -1101,9 +1168,11 @@ public:
             return S_OK;
         }
         if (*pNumModes == 0u) return DXGI_ERROR_MORE_DATA;
+        uint32_t mw = 1920u, mh = 1080u;
+        QueryConfiguredDisplayMode(mw, mh);
         std::memset(pDesc, 0, sizeof(*pDesc));
-        pDesc[0].Width = 1920u;
-        pDesc[0].Height = 1080u;
+        pDesc[0].Width = mw;
+        pDesc[0].Height = mh;
         pDesc[0].RefreshRate = {60u, 1u};
         pDesc[0].Format = EnumFormat;
         *pNumModes = 1u;
@@ -1112,13 +1181,15 @@ public:
     HRESULT STDMETHODCALLTYPE FindClosestMatchingMode(
         const DXGI_MODE_DESC* pModeToMatch, DXGI_MODE_DESC* pClosestMatch, IUnknown*) override {
         if (!pClosestMatch) return E_INVALIDARG;
+        uint32_t mw = 1920u, mh = 1080u;
+        QueryConfiguredDisplayMode(mw, mh);
         if (pModeToMatch) {
             *pClosestMatch = *pModeToMatch;
         } else {
             std::memset(pClosestMatch, 0, sizeof(*pClosestMatch));
         }
-        if (pClosestMatch->Width == 0u) pClosestMatch->Width = 1920u;
-        if (pClosestMatch->Height == 0u) pClosestMatch->Height = 1080u;
+        if (pClosestMatch->Width == 0u || HasExplicitConsoleOrDisplayOverride()) pClosestMatch->Width = mw;
+        if (pClosestMatch->Height == 0u || HasExplicitConsoleOrDisplayOverride()) pClosestMatch->Height = mh;
         if (pClosestMatch->RefreshRate.Numerator == 0u) {
             pClosestMatch->RefreshRate = {60u, 1u};
         }
@@ -1158,9 +1229,11 @@ public:
             return S_OK;
         }
         if (*pNumModes == 0u) return DXGI_ERROR_MORE_DATA;
+        uint32_t mw = 1920u, mh = 1080u;
+        QueryConfiguredDisplayMode(mw, mh);
         std::memset(pDesc, 0, sizeof(*pDesc));
-        pDesc[0].Width = 1920u;
-        pDesc[0].Height = 1080u;
+        pDesc[0].Width = mw;
+        pDesc[0].Height = mh;
         pDesc[0].RefreshRate = {60u, 1u};
         pDesc[0].Format = (EnumFormat == DXGI_FORMAT_UNKNOWN) ? DXGI_FORMAT_R8G8B8A8_UNORM : EnumFormat;
         pDesc[0].ScanlineOrdering = DXGI_MODE_SCANLINE_ORDER_PROGRESSIVE;
@@ -1173,13 +1246,15 @@ public:
     virtual HRESULT STDMETHODCALLTYPE FindClosestMatchingMode1(
         const DXGI_MODE_DESC1* pModeToMatch, DXGI_MODE_DESC1* pClosestMatch, IUnknown*) {
         if (!pClosestMatch) return E_INVALIDARG;
+        uint32_t mw = 1920u, mh = 1080u;
+        QueryConfiguredDisplayMode(mw, mh);
         if (pModeToMatch) {
             *pClosestMatch = *pModeToMatch;
         } else {
             std::memset(pClosestMatch, 0, sizeof(*pClosestMatch));
         }
-        if (pClosestMatch->Width == 0u) pClosestMatch->Width = 1920u;
-        if (pClosestMatch->Height == 0u) pClosestMatch->Height = 1080u;
+        if (pClosestMatch->Width == 0u || HasExplicitConsoleOrDisplayOverride()) pClosestMatch->Width = mw;
+        if (pClosestMatch->Height == 0u || HasExplicitConsoleOrDisplayOverride()) pClosestMatch->Height = mh;
         if (pClosestMatch->RefreshRate.Numerator == 0u) pClosestMatch->RefreshRate = {60u, 1u};
         if (pClosestMatch->Format == DXGI_FORMAT_UNKNOWN) pClosestMatch->Format = DXGI_FORMAT_R8G8B8A8_UNORM;
         return S_OK;
@@ -1251,6 +1326,12 @@ public:
     HRESULT STDMETHODCALLTYPE EnumOutputs(UINT Output, IDXGIOutput** ppOutput) override {
         if (!ppOutput) return E_POINTER;
         *ppOutput = nullptr;
+        if (Output == 0u && HasExplicitConsoleOrDisplayOverride()) {
+            auto* vout = new (std::nothrow) VirtualDxgiOutput(this);
+            if (!vout) return E_OUTOFMEMORY;
+            *ppOutput = vout;
+            return S_OK;
+        }
         if (real_adapter_) {
             const HRESULT hr = real_adapter_->EnumOutputs(Output, ppOutput);
             if (SUCCEEDED(hr) && *ppOutput) {
@@ -2021,7 +2102,11 @@ void DeviceX::NotifyResourceDestroyed(ID3D12Resource* host_resource) noexcept {
             }
         }
         if (unified_res_release) {
-            unified_res_release->Release();
+            if (retail_scarlett_abi_) {
+                DeferHostResourceRelease(unified_res_release);
+            } else {
+                unified_res_release->Release();
+            }
         }
     }
     {
@@ -2038,6 +2123,30 @@ void DeviceX::NotifyResourceDestroyed(ID3D12Resource* host_resource) noexcept {
         std::lock_guard<std::mutex> lock(vk_state_mutex_);
         vk_resources_.erase(host_resource);
         vk_rt_framebuffers_.erase(host_resource);
+    }
+}
+
+void DeviceX::DeferHostResourceRelease(ID3D12Resource* host_resource) noexcept {
+    if (!host_resource) return;
+    constexpr uint64_t kRetireFrameDelay = 16ull;
+    const uint64_t retire = present_frame_count_.load(std::memory_order_acquire) + kRetireFrameDelay;
+    std::lock_guard<std::mutex> lk(deferred_release_mutex_);
+    deferred_release_queue_.push_back({host_resource, retire});
+}
+
+void DeviceX::OnPresentFrameComplete(uint64_t present_frame) noexcept {
+    present_frame_count_.store(present_frame, std::memory_order_release);
+    std::vector<ID3D12Resource*> ready;
+    {
+        std::lock_guard<std::mutex> lk(deferred_release_mutex_);
+        while (!deferred_release_queue_.empty() &&
+               deferred_release_queue_.front().retire_frame <= present_frame) {
+            ready.push_back(deferred_release_queue_.front().resource);
+            deferred_release_queue_.pop_front();
+        }
+    }
+    for (ID3D12Resource* r : ready) {
+        if (r) r->Release();
     }
 }
 
@@ -2449,6 +2558,20 @@ DeviceX::~DeviceX() {
         rs_table_slot_counts_.clear();
         guest_backed_desc_heaps_.clear();
         has_guest_backed_desc_heaps_.store(false, std::memory_order_relaxed);
+    }
+    {
+        std::vector<ID3D12Resource*> leftover;
+        {
+            std::lock_guard<std::mutex> dlk(deferred_release_mutex_);
+            leftover.reserve(deferred_release_queue_.size());
+            for (const auto& entry : deferred_release_queue_) {
+                if (entry.resource) leftover.push_back(entry.resource);
+            }
+            deferred_release_queue_.clear();
+        }
+        for (ID3D12Resource* r : leftover) {
+            r->Release();
+        }
     }
     {
         std::lock_guard<std::mutex> alk(placed_alias_mutex_);
@@ -3606,6 +3729,40 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateGraphicsPipelineState(
     }
     if (used_standin_pso || (retail_scarlett_abi_ && gfx_has_xdat)) {
         proxy->SetStandinPso(true);
+        if (retail_scarlett_abi_ && gfx_has_xdat && lifted_desc.pRootSignature) {
+            auto pd = std::make_unique<PendingXdatGfxDesc>();
+            pd->gpso = lifted_desc;
+            pd->host_rs = lifted_desc.pRootSignature;
+            pd->host_rs->AddRef();
+            auto copy_bc = [](const D3D12_SHADER_BYTECODE& s, std::vector<uint8_t>& dst) {
+                if (s.pShaderBytecode && s.BytecodeLength > 0u) {
+                    const auto* bp = static_cast<const uint8_t*>(s.pShaderBytecode);
+                    dst.assign(bp, bp + s.BytecodeLength);
+                }
+            };
+            copy_bc(lifted_desc.VS, pd->vs_blob);
+            copy_bc(lifted_desc.PS, pd->ps_blob);
+            copy_bc(lifted_desc.HS, pd->hs_blob);
+            copy_bc(lifted_desc.DS, pd->ds_blob);
+            copy_bc(lifted_desc.GS, pd->gs_blob);
+            if (lifted_desc.InputLayout.pInputElementDescs && lifted_desc.InputLayout.NumElements > 0u &&
+                lifted_desc.InputLayout.NumElements <= 32u) {
+                pd->il_names.reserve(lifted_desc.InputLayout.NumElements);
+                pd->il_elems.assign(
+                    lifted_desc.InputLayout.pInputElementDescs,
+                    lifted_desc.InputLayout.pInputElementDescs + lifted_desc.InputLayout.NumElements);
+                for (auto& e : pd->il_elems) {
+                    pd->il_names.emplace_back(e.SemanticName ? e.SemanticName : "");
+                    e.SemanticName = pd->il_names.back().c_str();
+                }
+                pd->gpso.InputLayout = {pd->il_elems.data(), static_cast<UINT>(pd->il_elems.size())};
+            } else {
+                pd->gpso.InputLayout = {nullptr, 0u};
+            }
+            if (!pd->vs_blob.empty()) {
+                proxy->SetPendingXdatGfxDesc(std::move(pd));
+            }
+        }
     }
     if (vulkan_routing_active_ && (lift_vs || lift_ps)) {
         VulkanPipelineInfo vk_pi{};
@@ -3746,6 +3903,15 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateComputePipelineState(
     }
     if (cs_is_xdat) {
         proxy->SetStandinPso(true);
+        if (lifted_desc.pRootSignature && lifted_desc.CS.pShaderBytecode && lifted_desc.CS.BytecodeLength > 0u) {
+            auto pd = std::make_unique<PendingXdatGfxDesc>();
+            pd->is_compute = true;
+            pd->host_rs = lifted_desc.pRootSignature;
+            pd->host_rs->AddRef();
+            const auto* bp = static_cast<const uint8_t*>(lifted_desc.CS.pShaderBytecode);
+            pd->cs_blob.assign(bp, bp + lifted_desc.CS.BytecodeLength);
+            proxy->SetPendingXdatGfxDesc(std::move(pd));
+        }
     }
     if (vulkan_routing_active_ && cs_is_xbox) {
         VulkanPipelineInfo vk_pi{};
@@ -4390,26 +4556,29 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateRootSignature(
                                     expanded_ranges_1_1.push_back(b7_alias);
                                     if (scaleform_t2_b0_pair && !other_param_uses_s1_ext) {
                                         // Retail UI/font pipelines sharing the {t2, b0} space1 root
-                                        // signature also bind CBV b1..b6 space1 (@0) and SRV t3..t15
-                                        // space1 (@1) in PSV0 metadata.
-                                        D3D12_DESCRIPTOR_RANGE1 cb_mid = b7_alias;
-                                        cb_mid.BaseShaderRegister = 1u;
-                                        cb_mid.NumDescriptors = 6u;
-                                        cb_mid.OffsetInDescriptorsFromTableStart = 0u;
-                                        D3D12_DESCRIPTOR_RANGE1 cb_hi = b7_alias;
-                                        cb_hi.BaseShaderRegister = 8u;
-                                        cb_hi.NumDescriptors = 24u;
-                                        cb_hi.OffsetInDescriptorsFromTableStart = 0u;
-                                        D3D12_DESCRIPTOR_RANGE1 srv_ext{};
-                                        srv_ext.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-                                        srv_ext.NumDescriptors = 13u;
-                                        srv_ext.BaseShaderRegister = 3u;
-                                        srv_ext.RegisterSpace = 1u;
-                                        srv_ext.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
-                                        srv_ext.OffsetInDescriptorsFromTableStart = 1u;
-                                        expanded_ranges_1_1.push_back(cb_mid);
-                                        expanded_ranges_1_1.push_back(cb_hi);
-                                        expanded_ranges_1_1.push_back(srv_ext);
+                                        // signature all place their active CBV at table offset @0
+                                        // under PSV0 registers b1..b15 (e.g. b1, b3, b10, b11).
+                                        // Emit each register individually at @0 so b3/b10/b11 read
+                                        // slot @0 rather than empty slots @2/@3, and alias t3..t15
+                                        // individually at @1 without inflating table size past 16.
+                                        for (UINT cb_reg = 1u; cb_reg <= 15u; ++cb_reg) {
+                                            if (cb_reg == 7u) continue;
+                                            D3D12_DESCRIPTOR_RANGE1 cb_r = b7_alias;
+                                            cb_r.BaseShaderRegister = cb_reg;
+                                            cb_r.NumDescriptors = 1u;
+                                            cb_r.OffsetInDescriptorsFromTableStart = 0u;
+                                            expanded_ranges_1_1.push_back(cb_r);
+                                        }
+                                        for (UINT srv_reg = 3u; srv_reg <= 15u; ++srv_reg) {
+                                            D3D12_DESCRIPTOR_RANGE1 srv_r{};
+                                            srv_r.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+                                            srv_r.NumDescriptors = 1u;
+                                            srv_r.BaseShaderRegister = srv_reg;
+                                            srv_r.RegisterSpace = 1u;
+                                            srv_r.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
+                                            srv_r.OffsetInDescriptorsFromTableStart = 1u;
+                                            expanded_ranges_1_1.push_back(srv_r);
+                                        }
                                     }
                                 }
                                 if (!has_s2) {
@@ -4424,6 +4593,12 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateRootSignature(
                                     s2_cbv.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
                                     expanded_ranges_1_1.push_back(s2_srv);
                                     expanded_ranges_1_1.push_back(s2_cbv);
+                                    if (params_1_1[static_cast<size_t>(target_pi)].ShaderVisibility ==
+                                        D3D12_SHADER_VISIBILITY_ALL) {
+                                        D3D12_DESCRIPTOR_RANGE1 s2_uav = s2_srv;
+                                        s2_uav.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+                                        expanded_ranges_1_1.push_back(s2_uav);
+                                    }
                                 }
                                 params_1_1[static_cast<size_t>(target_pi)].DescriptorTable.NumDescriptorRanges =
                                     static_cast<UINT>(expanded_ranges_1_1.size());
@@ -6260,6 +6435,48 @@ HRESULT STDMETHODCALLTYPE DeviceX::GetDeviceRemovedReason() {
                     }
                     iq->Release();
                 }
+                ID3D12DeviceRemovedExtendedData* dred = nullptr;
+                if (SUCCEEDED(host_dev_->QueryInterface(IID_PPV_ARGS(&dred))) && dred) {
+                    D3D12_DRED_PAGE_FAULT_OUTPUT pf{};
+                    if (SUCCEEDED(dred->GetPageFaultAllocationOutput(&pf))) {
+                        std::fprintf(stderr, "  [DRED-PF] PageFaultVA=0x%llX\n",
+                                     static_cast<unsigned long long>(pf.PageFaultVA));
+                        const D3D12_DRED_ALLOCATION_NODE* n = pf.pHeadExistingAllocationNode;
+                        for (int k = 0; n && k < 4; n = n->pNext, ++k) {
+                            std::fprintf(stderr, "    existing[%d] type=%d name=%s\n",
+                                         k, static_cast<int>(n->AllocationType),
+                                         n->ObjectNameA ? n->ObjectNameA : "(unnamed)");
+                        }
+                        n = pf.pHeadRecentFreedAllocationNode;
+                        for (int k = 0; n && k < 4; n = n->pNext, ++k) {
+                            std::fprintf(stderr, "    freed[%d] type=%d name=%s\n",
+                                         k, static_cast<int>(n->AllocationType),
+                                         n->ObjectNameA ? n->ObjectNameA : "(unnamed)");
+                        }
+                    }
+                    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT bc{};
+                    if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&bc))) {
+                        const D3D12_AUTO_BREADCRUMB_NODE* node = bc.pHeadAutoBreadcrumbNode;
+                        int ni = 0;
+                        while (node && ni < 8) {
+                            const UINT done = node->pLastBreadcrumbValue ? *node->pLastBreadcrumbValue : 0u;
+                            if (node->BreadcrumbCount > 0u && done < node->BreadcrumbCount) {
+                                std::fprintf(stderr, "  [DRED-BC #%d] completed=%u/%u ops:",
+                                             ni, done, node->BreadcrumbCount);
+                                const UINT s = (done > 3u) ? (done - 3u) : 0u;
+                                const UINT e = std::min<UINT>(node->BreadcrumbCount, done + 4u);
+                                for (UINT bi = s; bi < e; ++bi) {
+                                    std::fprintf(stderr, " %s%d", (bi == done) ? ">>>" : "",
+                                                 static_cast<int>(node->pCommandHistory[bi]));
+                                }
+                                std::fprintf(stderr, "\n");
+                            }
+                            node = node->pNext;
+                            ++ni;
+                        }
+                    }
+                    dred->Release();
+                }
                 std::fflush(stderr);
             }
             CommandQueueX::NotifyDeviceRemovedForDevice(this, host_hr);
@@ -6612,14 +6829,30 @@ HRESULT STDMETHODCALLTYPE DeviceX::SetResidencyPriority(
 void DeviceX::LiftPendingXdatGraphicsPso(PipelineStateXProxy* proxy) {
     if (!proxy || !host_dev_) return;
     PendingXdatGfxDesc* pd = proxy->PendingXdatDesc();
-    if (!pd || pd->vs_blob.empty() || !pd->host_rs) return;
+    if (!pd || !pd->host_rs) return;
+    if (pd->is_compute ? pd->cs_blob.empty() : pd->vs_blob.empty()) return;
+
+    static const bool s_disable_cs_lift = []() {
+        char v[16]{};
+        return ::GetEnvironmentVariableA("OPENSCARLETT_DISABLE_XDAT_CS_LIFT", v, sizeof(v)) > 0 && v[0] == '1';
+    }();
+    if (pd->is_compute && s_disable_cs_lift) {
+        return;
+    }
 
     static std::mutex s_xdat_cache_mu;
     static std::unordered_map<uint64_t, std::vector<uint8_t>> s_xdat_dxil_cache;
     static const std::string s_disk_cache_dir = []() {
         char dir[260]{};
         if (::GetEnvironmentVariableA("OPENSCARLETT_DXIL_CACHE_DIR", dir, sizeof(dir)) > 0) {
+            ::CreateDirectoryA(dir, nullptr);
             return std::string(dir);
+        }
+        const DWORD attr = ::GetFileAttributesA("E:\\OpenScarlett");
+        if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            ::CreateDirectoryA("E:\\OpenScarlett\\.tmp", nullptr);
+            ::CreateDirectoryA("E:\\OpenScarlett\\.tmp\\dxil_cache", nullptr);
+            return std::string("E:\\OpenScarlett\\.tmp\\dxil_cache");
         }
         return std::string{};
     }();
@@ -6645,7 +6878,7 @@ void DeviceX::LiftPendingXdatGraphicsPso(PipelineStateXProxy* proxy) {
         }
         if (!s_disk_cache_dir.empty()) {
             char cpath[320]{};
-            std::snprintf(cpath, sizeof(cpath), "%s\\v7_%016llx.dxil",
+            std::snprintf(cpath, sizeof(cpath), "%s\\v8_%016llx.dxil",
                           s_disk_cache_dir.c_str(), static_cast<unsigned long long>(h));
             FILE* cf = nullptr;
             if (::fopen_s(&cf, cpath, "rb") == 0 && cf) {
@@ -6676,7 +6909,7 @@ void DeviceX::LiftPendingXdatGraphicsPso(PipelineStateXProxy* proxy) {
             out_err = st.message;
         } else if (!s_disk_cache_dir.empty()) {
             char cpath[320]{};
-            std::snprintf(cpath, sizeof(cpath), "%s\\v7_%016llx.dxil",
+            std::snprintf(cpath, sizeof(cpath), "%s\\v8_%016llx.dxil",
                           s_disk_cache_dir.c_str(), static_cast<unsigned long long>(h));
             FILE* cf = nullptr;
             if (::fopen_s(&cf, cpath, "wb") == 0 && cf) {
@@ -6692,15 +6925,53 @@ void DeviceX::LiftPendingXdatGraphicsPso(PipelineStateXProxy* proxy) {
         return ok;
     };
 
-    std::vector<uint8_t> vs_dxil, ps_dxil;
-    std::string vs_err, ps_err;
-    const bool vs_ok = lift_stage(pd->vs_blob, vs_dxil, vs_err);
-    const bool ps_ok = lift_stage(pd->ps_blob, ps_dxil, ps_err);
-
     static std::atomic<uint32_t> s_bound_seq{0u};
     const uint32_t seq = s_bound_seq.fetch_add(1u, std::memory_order_relaxed);
+
+    if (pd->is_compute) {
+        std::vector<uint8_t> cs_dxil;
+        std::string cs_err;
+        const bool cs_ok = lift_stage(pd->cs_blob, cs_dxil, cs_err);
+        lazy_lift_count_.fetch_add(1u, std::memory_order_release);
+        if (!cs_ok || cs_dxil.empty()) {
+            if (seq < 32u) {
+                std::fprintf(stderr,
+                             "[OpenScarlett][d3d12_xs] LAZY-LIFT-CS #%u FAIL pso=%p cs(%zuB '%s')\n",
+                             seq, static_cast<void*>(proxy), pd->cs_blob.size(), cs_err.c_str());
+                std::fflush(stderr);
+            }
+            return;
+        }
+        D3D12_COMPUTE_PIPELINE_STATE_DESC cpso{};
+        cpso.pRootSignature = pd->host_rs;
+        cpso.CS = {cs_dxil.data(), cs_dxil.size()};
+        ID3D12PipelineState* lifted_cs_pso = nullptr;
+        const HRESULT chr = host_dev_->CreateComputePipelineState(
+            &cpso, OS_D3D12_IID(ID3D12PipelineState), reinterpret_cast<void**>(&lifted_cs_pso));
+        if (SUCCEEDED(chr) && lifted_cs_pso) {
+            proxy->AdoptLiftedHostPso(lifted_cs_pso);
+            lifted_cs_pso->Release();
+        }
+        if (seq < 32u) {
+            std::fprintf(stderr,
+                         "[OpenScarlett][d3d12_xs] LAZY-LIFT-CS #%u pso=%p rs=%p (raw=%zuB -> dxil=%zuB) -> hr=0x%08lX\n",
+                         seq, static_cast<void*>(proxy), static_cast<void*>(pd->host_rs),
+                         pd->cs_blob.size(), cs_dxil.size(), static_cast<unsigned long>(chr));
+            std::fflush(stderr);
+        }
+        return;
+    }
+
+    std::vector<uint8_t> vs_dxil, ps_dxil, hs_dxil, ds_dxil, gs_dxil;
+    std::string vs_err, ps_err, hs_err, ds_err, gs_err;
+    const bool vs_ok = lift_stage(pd->vs_blob, vs_dxil, vs_err);
+    const bool ps_ok = lift_stage(pd->ps_blob, ps_dxil, ps_err);
+    const bool hs_ok = lift_stage(pd->hs_blob, hs_dxil, hs_err);
+    const bool ds_ok = lift_stage(pd->ds_blob, ds_dxil, ds_err);
+    const bool gs_ok = lift_stage(pd->gs_blob, gs_dxil, gs_err);
+
     lazy_lift_count_.fetch_add(1u, std::memory_order_release);
-    if (!vs_ok || !ps_ok) {
+    if (!vs_ok || !ps_ok || !hs_ok || !ds_ok || !gs_ok) {
         if (seq < 24u) {
             std::fprintf(stderr,
                          "[OpenScarlett][d3d12_xs] LAZY-LIFT #%u FAIL pso=%p vs(%zuB ok=%d '%s') ps(%zuB ok=%d '%s')\n",
@@ -6717,6 +6988,12 @@ void DeviceX::LiftPendingXdatGraphicsPso(PipelineStateXProxy* proxy) {
     gpso.VS = {vs_dxil.data(), vs_dxil.size()};
     gpso.PS = ps_dxil.empty() ? D3D12_SHADER_BYTECODE{nullptr, 0u}
                               : D3D12_SHADER_BYTECODE{ps_dxil.data(), ps_dxil.size()};
+    gpso.HS = hs_dxil.empty() ? D3D12_SHADER_BYTECODE{nullptr, 0u}
+                              : D3D12_SHADER_BYTECODE{hs_dxil.data(), hs_dxil.size()};
+    gpso.DS = ds_dxil.empty() ? D3D12_SHADER_BYTECODE{nullptr, 0u}
+                              : D3D12_SHADER_BYTECODE{ds_dxil.data(), ds_dxil.size()};
+    gpso.GS = gs_dxil.empty() ? D3D12_SHADER_BYTECODE{nullptr, 0u}
+                              : D3D12_SHADER_BYTECODE{gs_dxil.data(), gs_dxil.size()};
     if (!pd->il_elems.empty()) {
         for (size_t i = 0u; i < pd->il_elems.size() && i < pd->il_names.size(); ++i) {
             pd->il_elems[i].SemanticName = pd->il_names[i].c_str();
@@ -7419,7 +7696,37 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePipelineState(
                 }
             }
         }
-        if (stream_has_xdat && !stream_has_xdat_cs) {
+        if (stream_has_xdat && stream_has_xdat_cs) {
+            auto pd = std::make_unique<PendingXdatGfxDesc>();
+            pd->is_compute = true;
+            bool has_ms_as = false;
+            for (const auto& ent : entries) {
+                if (ent.drop_subobject) continue;
+                if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS ||
+                    ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS) {
+                    has_ms_as = true;
+                } else if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE) {
+                    ID3D12RootSignature* rs = nullptr;
+                    std::memcpy(&rs, raw_stream + ent.src_offset + kRootSigOffset, sizeof(rs));
+                    ID3D12RootSignature* hrs = UnwrapRootSignature(rs);
+                    if (hrs) {
+                        hrs->AddRef();
+                        if (pd->host_rs) pd->host_rs->Release();
+                        pd->host_rs = hrs;
+                    }
+                } else if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS) {
+                    D3D12_SHADER_BYTECODE bc{};
+                    std::memcpy(&bc, raw_stream + ent.src_offset + kBytecodeOffset, sizeof(bc));
+                    if (bc.pShaderBytecode && bc.BytecodeLength > 0u) {
+                        const auto* bp = static_cast<const uint8_t*>(bc.pShaderBytecode);
+                        pd->cs_blob.assign(bp, bp + bc.BytecodeLength);
+                    }
+                }
+            }
+            if (!has_ms_as && !pd->cs_blob.empty() && pd->host_rs) {
+                pending_xdat = std::move(pd);
+            }
+        } else if (stream_has_xdat && !stream_has_xdat_cs) {
             auto pd = std::make_unique<PendingXdatGfxDesc>();
             pd->gpso.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
             pd->gpso.SampleMask = UINT_MAX;
@@ -7453,6 +7760,27 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePipelineState(
                     if (bc.pShaderBytecode && bc.BytecodeLength > 0u) {
                         const auto* bp = static_cast<const uint8_t*>(bc.pShaderBytecode);
                         pd->ps_blob.assign(bp, bp + bc.BytecodeLength);
+                    }
+                } else if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS) {
+                    D3D12_SHADER_BYTECODE bc{};
+                    std::memcpy(&bc, raw_stream + ent.src_offset + kBytecodeOffset, sizeof(bc));
+                    if (bc.pShaderBytecode && bc.BytecodeLength > 0u) {
+                        const auto* bp = static_cast<const uint8_t*>(bc.pShaderBytecode);
+                        pd->hs_blob.assign(bp, bp + bc.BytecodeLength);
+                    }
+                } else if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS) {
+                    D3D12_SHADER_BYTECODE bc{};
+                    std::memcpy(&bc, raw_stream + ent.src_offset + kBytecodeOffset, sizeof(bc));
+                    if (bc.pShaderBytecode && bc.BytecodeLength > 0u) {
+                        const auto* bp = static_cast<const uint8_t*>(bc.pShaderBytecode);
+                        pd->ds_blob.assign(bp, bp + bc.BytecodeLength);
+                    }
+                } else if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS) {
+                    D3D12_SHADER_BYTECODE bc{};
+                    std::memcpy(&bc, raw_stream + ent.src_offset + kBytecodeOffset, sizeof(bc));
+                    if (bc.pShaderBytecode && bc.BytecodeLength > 0u) {
+                        const auto* bp = static_cast<const uint8_t*>(bc.pShaderBytecode);
+                        pd->gs_blob.assign(bp, bp + bc.BytecodeLength);
                     }
                 } else if (ent.desktop_type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT) {
                     if (ent.src_offset + sizeof(StreamSubobjLayout<D3D12_INPUT_LAYOUT_DESC>) <= total_bytes) {
@@ -8309,6 +8637,10 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateLifetimeTracker(
 }
 
 void STDMETHODCALLTYPE DeviceX::RemoveDevice() {
+    if (retail_scarlett_abi_) {
+        std::fprintf(stderr, "[OpenScarlett][d3d12_xs] GUEST CALLED DeviceX::RemoveDevice()!\n");
+        std::fflush(stderr);
+    }
     HRESULT final_reason = DXGI_ERROR_DEVICE_REMOVED;
     device_removed_reason_.store(final_reason, std::memory_order_release);
     if (host_dev5_) {
@@ -9223,7 +9555,19 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResourceX(
     if ((FAILED(hr) || !host_res) && retail_scarlett_abi_ && VirtualAddress != 0ull) {
         const bool is_buf = (clean_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER);
         const bool is_msaa = (!is_buf && clean_desc.SampleDesc.Count > 1u);
-        const bool want_alias = !is_buf || (clean_desc.Width <= 65536ull);
+        const bool is_rt_ds =
+            !is_buf &&
+            (clean_desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                 D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) != 0;
+        // Isolate RT/DS render-graph targets into their own dedicated ALLOW_ONLY_RT_DS_TEXTURES
+        // aliasing heap (map_key = 0/1) so persistent SRV/UI/BC7 textures NEVER collide with or
+        // overwrite active render targets/depth buffers! Non-RT/DS textures commit to L1 VRAM
+        // first up to ~1.75 GiB, then place into a separate ALLOW_ONLY_NON_RT_DS_TEXTURES heap (map_key = 4).
+        constexpr uint64_t kMaxDedicatedSrvVramBytes = 1792ull * 1024ull * 1024ull;
+        const bool non_rt_over_budget =
+            (!is_buf && !is_rt_ds && !is_msaa) &&
+            (committed_non_rt_vram_bytes_.load(std::memory_order_relaxed) >= kMaxDedicatedSrvVramBytes);
+        const bool want_alias = is_rt_ds || is_msaa || non_rt_over_budget || (is_buf && clean_desc.Width <= 65536ull);
         if (want_alias) {
             const uint64_t pool_bytes = is_buf ? (64ull * 1024ull * 1024ull)
                                                : (is_msaa ? (64ull * 1024ull * 1024ull)
@@ -9238,11 +9582,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResourceX(
                 if (heap_off + ainfo.SizeInBytes > pool_bytes) {
                     heap_off = 0ull;
                 }
-                const bool is_rt_ds =
-                    !is_buf &&
-                    (clean_desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
-                                         D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) != 0;
-                const uint64_t map_key = is_buf ? 2ull : (is_msaa ? 1ull : 0ull);
+                const uint64_t map_key = is_buf ? 2ull : (is_msaa ? 1ull : (is_rt_ds ? 0ull : 4ull));
                 ID3D12Heap* alias_heap = nullptr;
                 {
                     std::lock_guard<std::mutex> alk(placed_alias_mutex_);
@@ -9257,15 +9597,12 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResourceX(
                         hd.Alignment = is_msaa ? D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT
                                                : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
                         hd.Flags = is_buf ? D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS
-                                          : D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES;
+                                          : ((is_rt_ds || is_msaa)
+                                                 ? D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES
+                                                 : D3D12_HEAP_FLAG_ALLOW_ONLY_NON_RT_DS_TEXTURES);
                         ID3D12Heap* new_heap = nullptr;
                         HRESULT hhr = host_dev_->CreateHeap(
                             &hd, OS_D3D12_IID(ID3D12Heap), reinterpret_cast<void**>(&new_heap));
-                        if ((FAILED(hhr) || !new_heap) && is_rt_ds) {
-                            hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
-                            hhr = host_dev_->CreateHeap(
-                                &hd, OS_D3D12_IID(ID3D12Heap), reinterpret_cast<void**>(&new_heap));
-                        }
                         if (SUCCEEDED(hhr) && new_heap) {
                             placed_alias_heaps_[map_key] = new_heap;
                             alias_heap = new_heap;
@@ -9291,6 +9628,13 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResourceX(
         hr = host_dev_->CreateCommittedResource(
             &default_heap_props, D3D12_HEAP_FLAG_NONE, &clean_desc, InitialState,
             clear_ptr, OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
+        if (SUCCEEDED(hr) && host_res && retail_scarlett_abi_ &&
+            clean_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+            (clean_desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                 D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) == 0) {
+            committed_non_rt_vram_bytes_.fetch_add(
+                EstimateResourceVramBytes(clean_desc), std::memory_order_relaxed);
+        }
     }
     if ((FAILED(hr) || !host_res) && hr == E_OUTOFMEMORY) {
         // 4-8 GiB desktop GPUs can exhaust dedicated L1 VRAM when retail Scarlett titles
@@ -9745,20 +10089,9 @@ void DeviceX::AutoRegisterUnifiedResource(
 }
 
 HRESULT DeviceX::EnsureUnifiedUploadObjectsLocked() {
-    if (unified_alloc_ && unified_cmd_ && unified_fence_ && unified_fence_event_) {
+    if (unified_fence_ && unified_fence_event_ &&
+        unified_upload_ring_[0].alloc && unified_upload_ring_[0].cmd) {
         return S_OK;
-    }
-    if (!unified_alloc_) {
-        HRESULT hr = host_dev_->CreateCommandAllocator(
-            D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&unified_alloc_));
-        if (FAILED(hr)) return hr;
-    }
-    if (!unified_cmd_) {
-        HRESULT hr = host_dev_->CreateCommandList(
-            0u, D3D12_COMMAND_LIST_TYPE_DIRECT, unified_alloc_, nullptr,
-            IID_PPV_ARGS(&unified_cmd_));
-        if (FAILED(hr)) return hr;
-        unified_cmd_->Close();
     }
     if (!unified_fence_) {
         HRESULT hr = host_dev_->CreateFence(
@@ -9769,40 +10102,88 @@ HRESULT DeviceX::EnsureUnifiedUploadObjectsLocked() {
         unified_fence_event_ = CreateEventA(nullptr, FALSE, FALSE, nullptr);
         if (!unified_fence_event_) return E_OUTOFMEMORY;
     }
+    for (uint32_t i = 0u; i < kUnifiedUploadRingSlots; ++i) {
+        auto& slot = unified_upload_ring_[i];
+        if (!slot.alloc) {
+            HRESULT hr = host_dev_->CreateCommandAllocator(
+                D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&slot.alloc));
+            if (FAILED(hr)) return hr;
+        }
+        if (!slot.cmd) {
+            HRESULT hr = host_dev_->CreateCommandList(
+                0u, D3D12_COMMAND_LIST_TYPE_DIRECT, slot.alloc, nullptr,
+                IID_PPV_ARGS(&slot.cmd));
+            if (FAILED(hr)) return hr;
+            slot.cmd->Close();
+        }
+    }
     return S_OK;
 }
 
-HRESULT DeviceX::EnsureUnifiedUploadBufferLocked(uint64_t required_bytes) {
-    if (required_bytes == 0ull) return S_OK;
-    if (unified_upload_buf_ && unified_upload_capacity_ >= required_bytes) {
-        return S_OK;
-    }
-    if (unified_upload_buf_) {
-        unified_upload_buf_->Release();
-        unified_upload_buf_ = nullptr;
-        unified_upload_capacity_ = 0ull;
+HRESULT DeviceX::AcquireUnifiedUploadRingSlotLocked(
+    uint64_t required_bytes,
+    uint32_t& out_slot_index) {
+    HRESULT hr = EnsureUnifiedUploadObjectsLocked();
+    if (FAILED(hr)) return hr;
+
+    const uint32_t slot_idx = unified_upload_ring_cursor_ % kUnifiedUploadRingSlots;
+    unified_upload_ring_cursor_ = (unified_upload_ring_cursor_ + 1u) % kUnifiedUploadRingSlots;
+    auto& slot = unified_upload_ring_[slot_idx];
+
+    if (slot.fence_val > 0ull && unified_fence_->GetCompletedValue() < slot.fence_val) {
+        hr = unified_fence_->SetEventOnCompletion(slot.fence_val, unified_fence_event_);
+        if (SUCCEEDED(hr)) {
+            const DWORD wr = WaitForSingleObject(unified_fence_event_, 15000u);
+            if (wr != WAIT_OBJECT_0) {
+                return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+            }
+        }
     }
 
-    const uint64_t alloc_bytes = AlignUp64(std::max<uint64_t>(required_bytes, 65536ull), 4096ull);
-    D3D12_HEAP_PROPERTIES up_heap{};
-    up_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
-    D3D12_RESOURCE_DESC up_desc{};
-    up_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-    up_desc.Width = alloc_bytes;
-    up_desc.Height = 1u;
-    up_desc.DepthOrArraySize = 1u;
-    up_desc.MipLevels = 1u;
-    up_desc.Format = DXGI_FORMAT_UNKNOWN;
-    up_desc.SampleDesc.Count = 1u;
-    up_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (required_bytes > 0ull && (!slot.upload_buf || slot.capacity < required_bytes || !slot.mapped_ptr)) {
+        if (slot.upload_buf) {
+            if (slot.mapped_ptr) {
+                D3D12_RANGE zero_write{0u, 0u};
+                slot.upload_buf->Unmap(0u, &zero_write);
+                slot.mapped_ptr = nullptr;
+            }
+            slot.upload_buf->Release();
+            slot.upload_buf = nullptr;
+            slot.capacity = 0ull;
+        }
+        const uint64_t alloc_bytes = AlignUp64(std::max<uint64_t>(required_bytes, 256ull * 1024ull), 65536ull);
+        D3D12_HEAP_PROPERTIES up_heap{};
+        up_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC up_desc{};
+        up_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        up_desc.Width = alloc_bytes;
+        up_desc.Height = 1u;
+        up_desc.DepthOrArraySize = 1u;
+        up_desc.MipLevels = 1u;
+        up_desc.Format = DXGI_FORMAT_UNKNOWN;
+        up_desc.SampleDesc.Count = 1u;
+        up_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
 
-    HRESULT hr = host_dev_->CreateCommittedResource(
-        &up_heap, D3D12_HEAP_FLAG_NONE, &up_desc,
-        D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&unified_upload_buf_));
-    if (SUCCEEDED(hr)) {
-        unified_upload_capacity_ = alloc_bytes;
+        hr = host_dev_->CreateCommittedResource(
+            &up_heap, D3D12_HEAP_FLAG_NONE, &up_desc,
+            D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(&slot.upload_buf));
+        if (FAILED(hr) || !slot.upload_buf) {
+            return FAILED(hr) ? hr : E_OUTOFMEMORY;
+        }
+        void* mapped = nullptr;
+        D3D12_RANGE read_none{0u, 0u};
+        hr = slot.upload_buf->Map(0u, &read_none, &mapped);
+        if (FAILED(hr) || !mapped) {
+            slot.upload_buf->Release();
+            slot.upload_buf = nullptr;
+            return FAILED(hr) ? hr : E_FAIL;
+        }
+        slot.mapped_ptr = static_cast<uint8_t*>(mapped);
+        slot.capacity = alloc_bytes;
     }
-    return hr;
+
+    out_slot_index = slot_idx;
+    return S_OK;
 }
 
 void DeviceX::ReleaseUnifiedMemoryObjects() {
@@ -9834,12 +10215,23 @@ void DeviceX::ReleaseUnifiedMemoryObjects() {
             unified_sync_direct_queue_->Release();
             unified_sync_direct_queue_ = nullptr;
         }
-        if (unified_upload_buf_) { unified_upload_buf_->Release(); unified_upload_buf_ = nullptr; }
-        if (unified_cmd_) { unified_cmd_->Release(); unified_cmd_ = nullptr; }
-        if (unified_alloc_) { unified_alloc_->Release(); unified_alloc_ = nullptr; }
+        for (auto& slot : unified_upload_ring_) {
+            if (slot.upload_buf) {
+                if (slot.mapped_ptr) {
+                    D3D12_RANGE zw{0u, 0u};
+                    slot.upload_buf->Unmap(0u, &zw);
+                    slot.mapped_ptr = nullptr;
+                }
+                slot.upload_buf->Release();
+                slot.upload_buf = nullptr;
+            }
+            if (slot.cmd) { slot.cmd->Release(); slot.cmd = nullptr; }
+            if (slot.alloc) { slot.alloc->Release(); slot.alloc = nullptr; }
+            slot.capacity = 0ull;
+            slot.fence_val = 0ull;
+        }
         if (unified_fence_) { unified_fence_->Release(); unified_fence_ = nullptr; }
         if (unified_fence_event_) { CloseHandle(unified_fence_event_); unified_fence_event_ = nullptr; }
-        unified_upload_capacity_ = 0ull;
     }
 }
 
@@ -9860,7 +10252,9 @@ bool DeviceX::RefreshDirtyUnifiedResources() noexcept {
     }
     bool any_dirty = HasDirtyUnifiedTextures();
     static std::atomic<uint32_t> s_refresh_tick{0u};
-    const bool reprobe_reserved = ((s_refresh_tick.fetch_add(1u, std::memory_order_relaxed) & 15u) == 0u);
+    const uint32_t tick = s_refresh_tick.fetch_add(1u, std::memory_order_relaxed);
+    const bool reprobe_reserved = ((tick & 31u) == 0u);
+    const bool probe_non_ww_uploaded_tex = !retail_scarlett_abi_ || ((tick & 31u) == 0u);
     std::lock_guard<std::mutex> lock(unified_mutex_);
     for (auto& [res, m] : unified_textures_) {
         if (m.mirrored_by_title_va) continue;
@@ -9882,15 +10276,13 @@ bool DeviceX::RefreshDirtyUnifiedResources() noexcept {
                 ((rdesc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
                                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) != 0 ||
                  rdesc.SampleDesc.Count > 1u ||
+                 IsDepthOrPlanarFormatForCopy(rdesc.Format) ||
                  rdesc.Layout == D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE)) {
                 m.cpu_readable = false;
                 continue;
             }
         }
         if (!m.cpu_readable) {
-            // Retail Scarlett titles frequently call CreatePlacedResourceX on MEM_RESERVE GPU pool
-            // VAs (e.g. 4K Bink2 Y/Cb/Cr planes & streaming textures) before committing pages.
-            // Periodically re-probe via VirtualQuery so newly committed ranges activate automatically.
             if (!reprobe_reserved || !IsReadableGuestVaRange(m.guest_va, m.byte_size)) {
                 continue;
             }
@@ -9903,6 +10295,7 @@ bool DeviceX::RefreshDirtyUnifiedResources() noexcept {
                                static_cast<SIZE_T>(AlignUp64(m.byte_size, 4096ull)),
                                &probe_page, &probe_cnt, &probe_gran) == 0u);
             m.dirty = true;
+            m.has_pending_hash = false;
             ++m.page_generation;
             dirty_unified_count_.fetch_add(1u, std::memory_order_acq_rel);
             any_dirty = true;
@@ -9923,8 +10316,14 @@ bool DeviceX::RefreshDirtyUnifiedResources() noexcept {
                 &gran);
             if (rc == 0u && page_cnt > 0u) {
                 modified = true;
+                m.has_pending_hash = false;
             }
         } else if (m.byte_size <= (64ull * 1024ull * 1024ull)) {
+            // Avoid scanning hundreds of MB of already-uploaded textures on every ExecuteCommandLists!
+            if (m.has_uploaded_once && m.dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+                !probe_non_ww_uploaded_tex) {
+                continue;
+            }
             uint64_t cur_hash = 0ull;
             if (SafeHashGuestMemoryFnv1a64(
                     reinterpret_cast<const void*>(static_cast<uintptr_t>(m.guest_va)),
@@ -9932,6 +10331,8 @@ bool DeviceX::RefreshDirtyUnifiedResources() noexcept {
                     cur_hash)) {
                 if (!m.has_uploaded_once || cur_hash != m.last_uploaded_hash) {
                     modified = true;
+                    m.pending_hash = cur_hash;
+                    m.has_pending_hash = true;
                 }
             } else {
                 m.cpu_readable = false;
@@ -9970,13 +10371,27 @@ HRESULT DeviceX::SyncAllUnifiedResourcesBeforeSubmit(
         }
     }
 
+    const uint64_t fence_before = [&]() {
+        std::lock_guard<std::mutex> lock(unified_upload_mutex_);
+        return unified_fence_val_;
+    }();
+
     HRESULT hr = S_OK;
     if (has_unified) {
-        hr = FlushDirtyUnifiedTextures(sync_queue, nullptr);
+        hr = FlushDirtyUnifiedTexturesInternal(sync_queue, nullptr, /*wait_for_gpu=*/false);
     }
     if (has_mirrored) {
-        const HRESULT mhr = FlushMirroredTitleVaPagesOnQueue(sync_queue, sync_type, nullptr);
+        const HRESULT mhr = FlushMirroredTitleVaPagesOnQueue(
+            sync_queue, sync_type, nullptr, /*wait_for_gpu=*/false);
         if (SUCCEEDED(hr)) hr = mhr;
+    }
+
+    // Cross-queue GPU-side ordering (Compute/Copy queue waits on Direct sync queue fence with ZERO CPU stall).
+    if (sync_queue != host_queue) {
+        std::lock_guard<std::mutex> lock(unified_upload_mutex_);
+        if (unified_fence_ && unified_fence_val_ > fence_before) {
+            (void)host_queue->Wait(unified_fence_, unified_fence_val_);
+        }
     }
     return hr;
 }
@@ -10147,6 +10562,13 @@ HRESULT STDMETHODCALLTYPE DeviceX::NotifyVirtualRemap(
 HRESULT STDMETHODCALLTYPE DeviceX::FlushDirtyUnifiedTextures(
     ID3D12CommandQueue* queue,
     uint32_t* out_flushed_count) {
+    return FlushDirtyUnifiedTexturesInternal(queue, out_flushed_count, /*wait_for_gpu=*/true);
+}
+
+HRESULT DeviceX::FlushDirtyUnifiedTexturesInternal(
+    ID3D12CommandQueue* queue,
+    uint32_t* out_flushed_count,
+    bool wait_for_gpu) {
     if (out_flushed_count) *out_flushed_count = 0u;
     if (!queue) {
         RecordDev("ID3D12DeviceX::FlushDirtyUnifiedTextures", -1, E_INVALIDARG);
@@ -10182,11 +10604,12 @@ HRESULT STDMETHODCALLTYPE DeviceX::FlushDirtyUnifiedTextures(
         for (auto& [res, m] : unified_textures_) {
             if (!m.dirty || !m.cpu_readable || !m.resource || m.mirrored_by_title_va) continue;
             const D3D12_RESOURCE_DESC rdesc = m.resource->GetDesc();
-            // Never CPU->GPU copy onto actively bound RTVs, DepthStencil, MSAA, or Reserved/Tiled textures.
+            // Never CPU->GPU copy onto actively bound RTVs, DepthStencil, MSAA, Depth/Planar, or Tiled textures.
             if (!m.allow_cpu_upload ||
                 (rdesc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
                  ((rdesc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0 ||
                   rdesc.SampleDesc.Count > 1u ||
+                  IsDepthOrPlanarFormatForCopy(rdesc.Format) ||
                   rdesc.Layout == D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE))) {
                 m.dirty = false;
                 dirty_unified_count_.fetch_sub(1u, std::memory_order_acq_rel);
@@ -10260,13 +10683,16 @@ HRESULT STDMETHODCALLTYPE DeviceX::FlushDirtyUnifiedTextures(
             item.row_sizes.resize(slices, 0ull);
             uint64_t total_copy = 0ull;
             bool footprint_ok = true;
+            D3D12_RESOURCE_DESC copy_desc = item.res_desc;
+            copy_desc.Format = MapTypelessFormatForSrv(copy_desc.Format);
             for (uint32_t s = 0u; s < slices; ++s) {
                 staging_cursor = AlignUp64(staging_cursor, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
                 UINT64 sub_total = 0ull;
                 const UINT sub_idx = s * mips;  // mip 0 of each slice
                 host_dev_->GetCopyableFootprints(
-                    &item.res_desc, sub_idx, 1u, staging_cursor,
+                    &copy_desc, sub_idx, 1u, staging_cursor,
                     &item.footprints[s], &item.num_rows[s], &item.row_sizes[s], &sub_total);
+                item.footprints[s].Footprint.Format = copy_desc.Format;
                 if (sub_total == 0ull || sub_total == UINT64_MAX ||
                     item.num_rows[s] == 0u || item.num_rows[s] == UINT_MAX ||
                     item.row_sizes[s] == 0ull || item.row_sizes[s] == UINT64_MAX) {
@@ -10313,30 +10739,19 @@ HRESULT STDMETHODCALLTYPE DeviceX::FlushDirtyUnifiedTextures(
     };
 
     std::lock_guard<std::mutex> upload_lock(unified_upload_mutex_);
-    HRESULT hr = S_OK;
-    if (staging_cursor > 0ull) {
-        hr = EnsureUnifiedUploadObjectsLocked();
-        if (SUCCEEDED(hr)) {
-            hr = EnsureUnifiedUploadBufferLocked(staging_cursor);
-        }
-        if (FAILED(hr)) {
-            release_pending();
-            RecordDev("ID3D12DeviceX::FlushDirtyUnifiedTextures", -1, hr);
-            return hr;
-        }
+    uint32_t ring_slot_idx = 0u;
+    HRESULT hr = AcquireUnifiedUploadRingSlotLocked(staging_cursor, ring_slot_idx);
+    if (FAILED(hr)) {
+        release_pending();
+        RecordDev("ID3D12DeviceX::FlushDirtyUnifiedTextures", -1, hr);
+        return hr;
     }
-
-    uint8_t* dst_base = nullptr;
-    if (staging_cursor > 0ull) {
-        void* mapped_ptr = nullptr;
-        D3D12_RANGE read_none{0u, 0u};
-        hr = unified_upload_buf_->Map(0u, &read_none, &mapped_ptr);
-        if (FAILED(hr) || !mapped_ptr) {
-            release_pending();
-            RecordDev("ID3D12DeviceX::FlushDirtyUnifiedTextures", -1, FAILED(hr) ? hr : E_FAIL);
-            return FAILED(hr) ? hr : E_FAIL;
-        }
-        dst_base = static_cast<uint8_t*>(mapped_ptr);
+    auto& ring_slot = unified_upload_ring_[ring_slot_idx];
+    uint8_t* dst_base = (staging_cursor > 0ull) ? ring_slot.mapped_ptr : nullptr;
+    if (staging_cursor > 0ull && !dst_base) {
+        release_pending();
+        RecordDev("ID3D12DeviceX::FlushDirtyUnifiedTextures", -1, E_FAIL);
+        return E_FAIL;
     }
 
     std::vector<size_t> uploaded_indices;
@@ -10360,7 +10775,10 @@ HRESULT STDMETHODCALLTYPE DeviceX::FlushDirtyUnifiedTextures(
         }
         const auto* src_base =
             reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(item.mapping.guest_va));
-        if (item.mapping.byte_size <= (64ull * 1024ull * 1024ull)) {
+        if (item.mapping.has_pending_hash) {
+            item.snapshot_hash = item.mapping.pending_hash;
+        } else if (!item.mapping.write_watch_enabled &&
+                   item.mapping.byte_size <= (64ull * 1024ull * 1024ull)) {
             uint64_t snap_h = 0ull;
             if (!SafeHashGuestMemoryFnv1a64(src_base, static_cast<size_t>(item.mapping.byte_size), snap_h)) {
                 skipped_unreadable_indices.push_back(idx);
@@ -10437,11 +10855,6 @@ HRESULT STDMETHODCALLTYPE DeviceX::FlushDirtyUnifiedTextures(
         }
     }
 
-    if (staging_cursor > 0ull) {
-        D3D12_RANGE written_range{0u, static_cast<SIZE_T>(staging_cursor)};
-        unified_upload_buf_->Unmap(0u, &written_range);
-    }
-
     if (uploaded_indices.empty()) {
         release_pending();
         RecordDev("ID3D12DeviceX::FlushDirtyUnifiedTextures", -1, S_OK);
@@ -10450,9 +10863,9 @@ HRESULT STDMETHODCALLTYPE DeviceX::FlushDirtyUnifiedTextures(
 
     uint64_t bytes_uploaded = 0ull;
     if (!gpu_copy_indices.empty()) {
-        hr = unified_alloc_->Reset();
+        hr = ring_slot.alloc->Reset();
         if (SUCCEEDED(hr)) {
-            hr = unified_cmd_->Reset(unified_alloc_, nullptr);
+            hr = ring_slot.cmd->Reset(ring_slot.alloc, nullptr);
         }
         if (FAILED(hr)) {
             release_pending();
@@ -10491,13 +10904,13 @@ HRESULT STDMETHODCALLTYPE DeviceX::FlushDirtyUnifiedTextures(
                 b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
                 b.Transition.StateBefore = st;
                 b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-                unified_cmd_->ResourceBarrier(1u, &b);
+                ring_slot.cmd->ResourceBarrier(1u, &b);
             }
 
             if (item.res_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
-                unified_cmd_->CopyBufferRegion(
+                ring_slot.cmd->CopyBufferRegion(
                     item.mapping.resource, 0ull,
-                    unified_upload_buf_, item.buffer_upload_offset,
+                    ring_slot.upload_buf, item.buffer_upload_offset,
                     item.copy_bytes);
             } else {
                 const uint32_t mips = (item.res_desc.MipLevels > 0u) ? item.res_desc.MipLevels : 1u;
@@ -10508,11 +10921,11 @@ HRESULT STDMETHODCALLTYPE DeviceX::FlushDirtyUnifiedTextures(
                     dst_loc.SubresourceIndex = static_cast<UINT>(s) * mips;
 
                     D3D12_TEXTURE_COPY_LOCATION src_loc{};
-                    src_loc.pResource = unified_upload_buf_;
+                    src_loc.pResource = ring_slot.upload_buf;
                     src_loc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
                     src_loc.PlacedFootprint = item.footprints[s];
 
-                    unified_cmd_->CopyTextureRegion(&dst_loc, 0u, 0u, 0u, &src_loc, nullptr);
+                    ring_slot.cmd->CopyTextureRegion(&dst_loc, 0u, 0u, 0u, &src_loc, nullptr);
                 }
             }
 
@@ -10523,25 +10936,16 @@ HRESULT STDMETHODCALLTYPE DeviceX::FlushDirtyUnifiedTextures(
                 b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
                 b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
                 b.Transition.StateAfter = st;
-                unified_cmd_->ResourceBarrier(1u, &b);
+                ring_slot.cmd->ResourceBarrier(1u, &b);
             }
             bytes_uploaded += item.copy_bytes;
         }
 
-        hr = unified_cmd_->Close();
+        hr = ring_slot.cmd->Close();
         if (FAILED(hr)) {
             if (CommandListX::IsDiagTraceEnabled()) {
                 std::fprintf(stderr, "[OpenScarlett][UNIFIED-CLOSE-FAIL] hr=0x%08lX n=%zu\n",
                              static_cast<unsigned long>(hr), gpu_copy_indices.size());
-                for (size_t fi = 0u; fi < std::min<size_t>(gpu_copy_indices.size(), 6u); ++fi) {
-                    const auto& it = pending[gpu_copy_indices[fi]];
-                    std::fprintf(stderr, "  [%zu] dim=%d %llux%u fmt=%d st=0x%X bytes=%llu\n",
-                                 fi, static_cast<int>(it.res_desc.Dimension),
-                                 static_cast<unsigned long long>(it.res_desc.Width), it.res_desc.Height,
-                                 static_cast<int>(it.res_desc.Format),
-                                 static_cast<unsigned>(it.mapping.current_state),
-                                 static_cast<unsigned long long>(it.copy_bytes));
-                }
                 std::fflush(stderr);
             }
             release_pending();
@@ -10549,12 +10953,22 @@ HRESULT STDMETHODCALLTYPE DeviceX::FlushDirtyUnifiedTextures(
             return hr;
         }
 
-        ID3D12CommandList* cmd_lists[] = {unified_cmd_};
+        ID3D12CommandList* cmd_lists[] = {ring_slot.cmd};
         host_queue->ExecuteCommandLists(1u, cmd_lists);
+        if (CommandListX::IsDiagTraceEnabled() && host_dev_) {
+            const HRESULT urem = host_dev_->GetDeviceRemovedReason();
+            if (FAILED(urem)) {
+                std::fprintf(stderr, "[OpenScarlett][UNIFIED-REMOVED] rem=0x%08lX n=%zu bytes=%llu\n",
+                             static_cast<unsigned long>(urem), gpu_copy_indices.size(),
+                             static_cast<unsigned long long>(bytes_uploaded));
+                std::fflush(stderr);
+            }
+        }
 
         const uint64_t fence_target = ++unified_fence_val_;
         hr = host_queue->Signal(unified_fence_, fence_target);
-        if (SUCCEEDED(hr) && unified_fence_->GetCompletedValue() < fence_target) {
+        ring_slot.fence_val = fence_target;
+        if (wait_for_gpu && SUCCEEDED(hr) && unified_fence_->GetCompletedValue() < fence_target) {
             hr = unified_fence_->SetEventOnCompletion(fence_target, unified_fence_event_);
             if (SUCCEEDED(hr)) {
                 const DWORD wr = WaitForSingleObject(unified_fence_event_, 15000u);
@@ -10575,6 +10989,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::FlushDirtyUnifiedTextures(
                 it->second.dirty &&
                 it->second.page_generation == item.mapping.page_generation) {
                 it->second.dirty = false;
+                it->second.has_pending_hash = false;
                 it->second.uploaded_generation = item.mapping.page_generation;
                 it->second.has_uploaded_once = true;
                 it->second.last_uploaded_hash = item.snapshot_hash;
@@ -10951,9 +11366,10 @@ void DeviceX::RegisterGuestBackedDescHeap(
     uint32_t inc_size, uint64_t guest_cpu_start, uint64_t guest_byte_size) {
     if (!host_heap || host_gpu_start == 0ull || guest_cpu_start == 0ull || guest_byte_size == 0ull) return;
     std::lock_guard<std::mutex> lk(guest_dh_mutex_);
+    const uint32_t ring_base = (host_num_descs >= 262144u) ? 65536u : 0u;
     guest_backed_desc_heaps_.push_back(GuestBackedDescHeap{
         host_heap, host_gpu_start, host_cpu_start, host_num_descs,
-        std::max<uint32_t>(1u, inc_size), guest_cpu_start, guest_byte_size, 0u, false});
+        std::max<uint32_t>(1u, inc_size), guest_cpu_start, guest_byte_size, ring_base, false});
     has_guest_backed_desc_heaps_.store(true, std::memory_order_release);
 }
 
@@ -11185,8 +11601,9 @@ D3D12_GPU_DESCRIPTOR_HANDLE DeviceX::MaterializeGuestDescriptorTable(
         return gpu_handle;
     }
 
+    const uint32_t ring_base = (target->host_num_descs >= 262144u) ? 65536u : 0u;
     if (target->ring_cursor + want_slots > target->host_num_descs) {
-        target->ring_cursor = 0u;
+        target->ring_cursor = ring_base;
         target->ring_wrapped = true;
     }
     const uint32_t base_slot = target->ring_cursor;
@@ -11471,7 +11888,8 @@ bool DeviceX::LookupMirroredTitleVaForResource(
 HRESULT DeviceX::FlushMirroredTitleVaPagesOnQueue(
     ID3D12CommandQueue* host_queue,
     D3D12_COMMAND_LIST_TYPE queue_type,
-    uint64_t* out_bytes_uploaded) {
+    uint64_t* out_bytes_uploaded,
+    bool wait_for_gpu) {
     if (out_bytes_uploaded) *out_bytes_uploaded = 0ull;
     if (!host_queue || !HasMirroredTitleVaRegions() ||
         queue_type != D3D12_COMMAND_LIST_TYPE_DIRECT) {
@@ -11489,9 +11907,6 @@ HRESULT DeviceX::FlushMirroredTitleVaPagesOnQueue(
     }
     if (candidate_vas.empty()) return S_OK;
 
-    // Fast dirty probe before touching any GPU command allocator.
-    // For non-write-watch regions, skip the duplicate probe pass so the chunk-hash scan
-    // runs only once inside FlushDirtyPagesToGpu.
     std::vector<uint64_t> dirty_vas;
     std::vector<openscarlett::DirtyPageRange> probe_ranges;
     for (uint64_t va : candidate_vas) {
@@ -11510,11 +11925,13 @@ HRESULT DeviceX::FlushMirroredTitleVaPagesOnQueue(
     if (dirty_vas.empty()) return S_OK;
 
     std::lock_guard<std::mutex> upload_lock(unified_upload_mutex_);
-    HRESULT hr = EnsureUnifiedUploadObjectsLocked();
+    uint32_t ring_slot_idx = 0u;
+    HRESULT hr = AcquireUnifiedUploadRingSlotLocked(0ull, ring_slot_idx);
     if (FAILED(hr)) return hr;
-    hr = unified_alloc_->Reset();
+    auto& ring_slot = unified_upload_ring_[ring_slot_idx];
+    hr = ring_slot.alloc->Reset();
     if (SUCCEEDED(hr)) {
-        hr = unified_cmd_->Reset(unified_alloc_, nullptr);
+        hr = ring_slot.cmd->Reset(ring_slot.alloc, nullptr);
     }
     if (FAILED(hr)) return hr;
 
@@ -11525,21 +11942,35 @@ HRESULT DeviceX::FlushMirroredTitleVaPagesOnQueue(
         if (!title_va_mirror_.LookupRegion(va, rinfo)) continue;
         openscarlett::FlushStats fstats{};
         if (title_va_mirror_.FlushDirtyPagesToGpu(
-                unified_cmd_, va, &fstats, rinfo.current_state).ok()) {
+                ring_slot.cmd, va, &fstats, rinfo.current_state).ok()) {
             total_uploaded += fstats.bytes_uploaded;
             regions_flushed += fstats.regions_flushed;
         }
     }
 
-    hr = unified_cmd_->Close();
+    hr = ring_slot.cmd->Close();
     if (FAILED(hr)) return hr;
 
     if (regions_flushed > 0ull) {
-        ID3D12CommandList* lists[] = {unified_cmd_};
+        ID3D12CommandList* lists[] = {ring_slot.cmd};
         host_queue->ExecuteCommandLists(1u, lists);
+        if (host_dev_) {
+            const HRESULT mrem = host_dev_->GetDeviceRemovedReason();
+            if (FAILED(mrem)) {
+                static std::atomic<bool> s_mr{false};
+                if (!s_mr.exchange(true)) {
+                    std::fprintf(stderr, "[OpenScarlett][MIRROR-REMOVED] rem=0x%08lX regions=%llu bytes=%llu\n",
+                                 static_cast<unsigned long>(mrem),
+                                 static_cast<unsigned long long>(regions_flushed),
+                                 static_cast<unsigned long long>(total_uploaded));
+                    std::fflush(stderr);
+                }
+            }
+        }
         const uint64_t target = ++unified_fence_val_;
         hr = host_queue->Signal(unified_fence_, target);
-        if (SUCCEEDED(hr) && unified_fence_->GetCompletedValue() < target) {
+        ring_slot.fence_val = target;
+        if (wait_for_gpu && SUCCEEDED(hr) && unified_fence_->GetCompletedValue() < target) {
             hr = unified_fence_->SetEventOnCompletion(target, unified_fence_event_);
             if (SUCCEEDED(hr)) {
                 const DWORD wr = WaitForSingleObject(unified_fence_event_, 15000u);

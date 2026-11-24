@@ -5886,9 +5886,20 @@ XGameResult OPENSCARLETT_GDK_CALL XGameSaveGetRemainingQuotaResult(
 // ===========================================================================
 // XSystem
 // ===========================================================================
+static bool IsLockhartConsoleTypeSelected() {
+    std::string v = GetEnvString("OPENSCARLETT_CONSOLE_TYPE");
+    if (v.empty()) v = GetEnvString("OPENSCARLETT_CONSOLE_PROFILE");
+    std::transform(v.begin(), v.end(), v.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return v == "lockhart" || v == "series_s" || v == "series-s" || v == "seriess" ||
+           v == "xss" || v == "3" || v == "s" || v == "8gb";
+}
+
 XSystemDeviceType OPENSCARLETT_GDK_CALL XSystemGetDeviceType(void) {
     RecordOk("XSystemGetDeviceType");
-    return XSystemDeviceType_XboxScarlettAnaconda;
+    return IsLockhartConsoleTypeSelected()
+               ? XSystemDeviceType_XboxScarlettLockhart
+               : XSystemDeviceType_XboxScarlettAnaconda;
 }
 
 XGameResult OPENSCARLETT_GDK_CALL XSystemGetConsoleId(
@@ -5924,7 +5935,8 @@ XSystemAnalyticsInfo OPENSCARLETT_GDK_CALL XSystemGetAnalyticsInfo(void) {
     info.osVersion.revision = 2499;
     info.hostingOsVersion = info.osVersion;
     std::snprintf(info.family, sizeof(info.family), "%s", "Windows.Xbox");
-    std::snprintf(info.form, sizeof(info.form), "%s", "Xbox Series X");
+    std::snprintf(info.form, sizeof(info.form), "%s",
+                  IsLockhartConsoleTypeSelected() ? "Xbox Series S" : "Xbox Series X");
     return info;
 }
 
@@ -6199,14 +6211,32 @@ XGameResult OPENSCARLETT_GDK_CALL XGameStreamingGetDisplayDetails(
         w = std::max<uint32_t>(320u, static_cast<uint32_t>(static_cast<double>(w) * scale));
         h = std::max<uint32_t>(180u, static_cast<uint32_t>(static_cast<double>(h) * scale));
     }
+    uint32_t max_w = 3840u;
+    uint32_t max_h = 2160u;
+    {
+        const std::string res_env = GetEnvString("OPENSCARLETT_DISPLAY_RES");
+        if (!res_env.empty()) {
+            char* sep = nullptr;
+            const unsigned long ew = std::strtoul(res_env.c_str(), &sep, 10);
+            if (sep && (*sep == 'x' || *sep == 'X')) {
+                const unsigned long eh = std::strtoul(sep + 1, nullptr, 10);
+                if (ew >= 320ul && eh >= 180ul && ew <= 7680ul && eh <= 4320ul) {
+                    w = static_cast<uint32_t>(ew);
+                    h = static_cast<uint32_t>(eh);
+                    max_w = w;
+                    max_h = h;
+                }
+            }
+        }
+    }
     displayDetails->preferredWidth = w;
     displayDetails->preferredHeight = h;
     displayDetails->safeAreaLeft = 0;
     displayDetails->safeAreaTop = 0;
     displayDetails->safeAreaRight = static_cast<int32_t>(w);
     displayDetails->safeAreaBottom = static_cast<int32_t>(h);
-    displayDetails->maxWidth = std::max<uint32_t>(w, 3840u);
-    displayDetails->maxHeight = std::max<uint32_t>(h, 2160u);
+    displayDetails->maxWidth = std::max<uint32_t>(w, max_w);
+    displayDetails->maxHeight = std::max<uint32_t>(h, max_h);
     displayDetails->maxPixels = displayDetails->maxWidth * displayDetails->maxHeight;
     displayDetails->flags = 0u;
     return RecordHr("XGameStreamingGetDisplayDetails", XGR_S_OK);
@@ -12424,9 +12454,12 @@ constexpr RealComInterfaceMapping kRealComMappings[] = {
     {{0x073B7DCBu, 0x1FCFu, 0x4030u, {0x94, 0xBE, 0xE3, 0xC9, 0xEB, 0x62, 0x34, 0x28}},
      {0x073B7DCBu, 0x1FCFu, 0x4030u, {0x94, 0xBE, 0xE3, 0xC9, 0xEB, 0x62, 0x34, 0x28}},
      kComAsyncTaskQueue},
-    // 6a. XStore main
+    // 6a. XStore main (GDK 2022+ and GRDK 2504/2510 XStoreImpl3)
     {{0x0DD112ACu, 0x7C24u, 0x448Cu, {0xB9, 0x2B, 0x39, 0x60, 0xFB, 0x5B, 0xD3, 0x0C}},
      {0xDE3DBDD4u, 0x0B37u, 0x4BDBu, {0xA1, 0x0E, 0xAC, 0xF3, 0xA3, 0x54, 0xD0, 0x6A}},
+     kComStore},
+    {{0x0DD112ACu, 0x7C24u, 0x448Cu, {0xB9, 0x2B, 0x39, 0x60, 0xFB, 0x5B, 0xD3, 0x0C}},
+     {0xB09D803Cu, 0x2414u, 0x4A05u, {0x82, 0xC6, 0x66, 0xDF, 0xDC, 0x9E, 0x9A, 0x44}},
      kComStore},
     // 6b. XStore IsAvailabilityPurchasable
     {{0x0DD112ACu, 0x7C24u, 0x448Cu, {0xB9, 0x2B, 0x39, 0x60, 0xFB, 0x5B, 0xD3, 0x0C}},
@@ -12487,9 +12520,12 @@ constexpr RealComInterfaceMapping kRealComMappings[] = {
     {{0x973A344Eu, 0x24BFu, 0x4D0Fu, {0x84, 0x57, 0x56, 0xC5, 0x34, 0x89, 0x2B, 0x29}},
      {0x50849859u, 0x0AD8u, 0x4F81u, {0x80, 0xE4, 0x5B, 0xC7, 0x86, 0x26, 0xF8, 0x52}},
      kComGameTitle},
-    // 16. XAppCapture screenshot & record
+    // 16. XAppCapture screenshot & record (GDK 2022+ and GRDK 2504/2510)
     {{0xA4F1AEE2u, 0x4BF1u, 0x4485u, {0xB0, 0x08, 0xA7, 0xC2, 0x6D, 0x52, 0xAC, 0x27}},
      {0x3A949778u, 0x772Eu, 0x4799u, {0xBD, 0xEA, 0x0A, 0x66, 0x39, 0xE9, 0x6B, 0xAA}},
+     kComAppCapture},
+    {{0xA4F1AEE2u, 0x4BF1u, 0x4485u, {0xB0, 0x08, 0xA7, 0xC2, 0x6D, 0x52, 0xAC, 0x27}},
+     {0x22E672D7u, 0xB4E3u, 0x406Cu, {0xBD, 0x50, 0x8F, 0x0D, 0x25, 0x23, 0x6F, 0x9E}},
      kComAppCapture},
     // 17. XPackage (GDK 2022+, legacy GDK 2021, and GRDK 2504/2510 XPackageImpl4)
     {{0xAF406016u, 0xE850u, 0x4AA8u, {0xA8, 0x8D, 0x2F, 0x3D, 0xCB, 0x9D, 0xAC, 0x7E}},
@@ -12509,9 +12545,12 @@ constexpr RealComInterfaceMapping kRealComMappings[] = {
     {{0xBBFBDCC7u, 0xBFE7u, 0x409Bu, {0xA5, 0xCA, 0xED, 0xF0, 0x54, 0x96, 0x0B, 0x4D}},
      {0xBBFBDCC7u, 0xBFE7u, 0x409Bu, {0xA5, 0xCA, 0xED, 0xF0, 0x54, 0x96, 0x0B, 0x4D}},
      kComGameEvent},
-    // 20. XGameUi (GDK 2022+ and legacy GDK 2021 IIDs + self-IID)
+    // 20. XGameUi (GDK 2022+, GRDK 2504/2510 EAF669DF, and legacy GDK 2021 IIDs + self-IID)
     {{0xDFCD4649u, 0x4FF8u, 0x4043u, {0xBA, 0x07, 0x35, 0xD6, 0x07, 0xDF, 0x98, 0xB0}},
      {0x72C4E70Fu, 0x4A67u, 0x481Bu, {0xBB, 0x84, 0xAA, 0x72, 0xED, 0xA1, 0x4F, 0xE5}},
+     kComGameUi},
+    {{0xDFCD4649u, 0x4FF8u, 0x4043u, {0xBA, 0x07, 0x35, 0xD6, 0x07, 0xDF, 0x98, 0xB0}},
+     {0xEAF669DFu, 0x5542u, 0x4590u, {0x99, 0xA3, 0x8D, 0xC0, 0x61, 0xF8, 0x37, 0xCC}},
      kComGameUi},
     {{0xDFCD4649u, 0x4FF8u, 0x4043u, {0xBA, 0x07, 0x35, 0xD6, 0x07, 0xDF, 0x98, 0xB0}},
      {0xFC0B9BD0u, 0x8898u, 0x4643u, {0xBE, 0xE0, 0x4E, 0xE6, 0xEE, 0x03, 0x4C, 0xB6}},

@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <list>
 #include <map>
 #include <memory>
@@ -215,7 +216,9 @@ struct UnifiedTextureMapping {
     bool write_watch_enabled = false;
     bool has_uploaded_once = false;
     bool mirrored_by_title_va = false;
+    bool has_pending_hash = false;
     uint64_t last_uploaded_hash = 0ull;
+    uint64_t pending_hash = 0ull;
 };
 
 struct XMemAllocationRecord {
@@ -311,6 +314,8 @@ public:
 
     // Lifecycle cleanup notifications invoked by proxy destructors to prevent stale pointer reuse.
     void NotifyResourceDestroyed(ID3D12Resource* host_resource) noexcept;
+    void DeferHostResourceRelease(ID3D12Resource* host_resource) noexcept;
+    void OnPresentFrameComplete(uint64_t present_frame) noexcept;
     void NotifyHeapDestroyed(ID3D12Heap* host_heap) noexcept;
     void NotifyPipelineDestroyed(ID3D12PipelineState* pso_key) noexcept;
 
@@ -345,7 +350,8 @@ public:
     HRESULT FlushMirroredTitleVaPagesOnQueue(
         ID3D12CommandQueue* host_queue,
         D3D12_COMMAND_LIST_TYPE queue_type,
-        uint64_t* out_bytes_uploaded = nullptr);
+        uint64_t* out_bytes_uploaded = nullptr,
+        bool wait_for_gpu = true);
     ID3D12Resource* ResolveBufferResourceByGpuVa(
         D3D12_GPU_VIRTUAL_ADDRESS va, uint64_t* out_offset_bytes = nullptr) const;
     XG_TILE_MODE GetTrackedResourceTileMode(ID3D12Resource* host_resource) const noexcept;
@@ -1040,7 +1046,13 @@ private:
     void TrackFallbackResource(IUnknown* obj, bool is_fallback);
     bool IsTrackedFallbackResource(ID3D12Resource* resource) const noexcept;
     HRESULT EnsureUnifiedUploadObjectsLocked();
-    HRESULT EnsureUnifiedUploadBufferLocked(uint64_t required_bytes);
+    HRESULT AcquireUnifiedUploadRingSlotLocked(
+        uint64_t required_bytes,
+        uint32_t& out_slot_index);
+    HRESULT FlushDirtyUnifiedTexturesInternal(
+        ID3D12CommandQueue* queue,
+        uint32_t* out_flushed_count,
+        bool wait_for_gpu);
     HRESULT EnsureInternalDirectSyncQueueLocked();
     void ReleaseUnifiedMemoryObjects();
     void AutoRegisterUnifiedResource(
@@ -1190,15 +1202,23 @@ private:
     uint64_t total_unified_flushes_{0ull};
     uint64_t total_unified_bytes_uploaded_{0ull};
 
+    static constexpr uint32_t kUnifiedUploadRingSlots = 8u;
+    struct UnifiedUploadRingSlot {
+        ID3D12CommandAllocator* alloc = nullptr;
+        ID3D12GraphicsCommandList* cmd = nullptr;
+        ID3D12Resource* upload_buf = nullptr;
+        uint8_t* mapped_ptr = nullptr;
+        uint64_t capacity = 0ull;
+        uint64_t fence_val = 0ull;
+    };
     std::mutex unified_upload_mutex_;
-    ID3D12CommandAllocator* unified_alloc_ = nullptr;
-    ID3D12GraphicsCommandList* unified_cmd_ = nullptr;
+    std::array<UnifiedUploadRingSlot, kUnifiedUploadRingSlots> unified_upload_ring_{};
+    uint32_t unified_upload_ring_cursor_ = 0u;
     ID3D12Fence* unified_fence_ = nullptr;
     HANDLE unified_fence_event_ = nullptr;
     uint64_t unified_fence_val_ = 0ull;
-    ID3D12Resource* unified_upload_buf_ = nullptr;
-    uint64_t unified_upload_capacity_ = 0ull;
     ID3D12CommandQueue* unified_sync_direct_queue_ = nullptr;
+    std::atomic<uint64_t> committed_non_rt_vram_bytes_{0ull};
 
     // Direct d3d12_xs -> Vulkan 1.4 routing state (active when OPENSCARLETT_BACKEND=vulkan)
     bool vulkan_routing_active_ = false;
@@ -1503,6 +1523,13 @@ private:
     std::atomic<uint32_t> lazy_lift_count_{0u};
     mutable std::mutex retail_state_mutex_;
     std::unordered_map<ID3D12Resource*, D3D12_RESOURCE_STATES> retail_res_states_;
+    struct DeferredResourceRelease {
+        ID3D12Resource* resource = nullptr;
+        uint64_t retire_frame = 0ull;
+    };
+    std::atomic<uint64_t> present_frame_count_{0ull};
+    std::mutex deferred_release_mutex_;
+    std::deque<DeferredResourceRelease> deferred_release_queue_;
 };
 
 }  // namespace openscarlett::d3d12_xs

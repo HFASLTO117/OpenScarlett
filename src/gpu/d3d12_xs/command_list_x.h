@@ -541,13 +541,14 @@ public:
     // without poisoning or aborting subsequent supported Draw/Dispatch/Copy/Barrier commands.
     void RecordUnsupportedExtensionIgnored(const char* ext_name, int32_t slot);
 
-private:
-    friend class CommandListExtendedProxy;
 #ifdef __ID3D12GraphicsCommandList7_INTERFACE_DEFINED__
     void ExecuteEnhancedBarriers(
         UINT32 num_barrier_groups,
         const D3D12_BARRIER_GROUP* barrier_groups);
 #endif
+
+private:
+    friend class CommandListExtendedProxy;
 
     std::atomic<ULONG> ref_count_{1};
     DeviceX* device_x_ = nullptr;
