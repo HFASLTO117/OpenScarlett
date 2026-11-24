@@ -213,6 +213,11 @@ private:
         bool write_watch_enabled = false;
         mutable bool fallback_hashes_initialized = false;
         mutable std::vector<uint64_t> fallback_chunk_hashes;
+        // Lock-free per-64KB-chunk dirty hint bitset populated by ResolveTitleVa() for large
+        // non-write-watch ring buffers (e.g. 182 MiB frame ring) so QueryDirtyLocked only hashes
+        // the ~4 chunks touched this frame instead of scanning 182 MiB twice per frame.
+        mutable std::vector<uint64_t> touched_chunk_bits;
+        mutable bool use_touched_chunk_hints = false;
 
         ID3D12Resource* gpu_shadow = nullptr;
         ID3D12Resource* upload_staging = nullptr;

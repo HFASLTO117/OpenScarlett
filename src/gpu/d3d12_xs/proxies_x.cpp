@@ -469,7 +469,10 @@ D3D12_RESOURCE_DESC STDMETHODCALLTYPE ResourceXProxy::GetDesc() {
 
 D3D12_GPU_VIRTUAL_ADDRESS STDMETHODCALLTYPE ResourceXProxy::GetGPUVirtualAddress() {
     if (host_res_) {
-        return host_res_->GetGPUVirtualAddress();
+        const D3D12_GPU_VIRTUAL_ADDRESS host_va = host_res_->GetGPUVirtualAddress();
+        if (host_va != 0ull) {
+            return host_va;
+        }
     }
     return xbox_gpu_va_;
 }

@@ -894,6 +894,15 @@ void STDMETHODCALLTYPE CommandListX::DrawInstanced(
     if (!skip_host && !last_pso_is_standin_ && !pso_missing) {
         host_list_->DrawInstanced(
             VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
+    } else if (last_pso_is_standin_ || pso_missing) {
+        static std::atomic<uint64_t> s_skip_di{0ull};
+        const uint64_t n = s_skip_di.fetch_add(1ull, std::memory_order_relaxed) + 1ull;
+        if (n == 1ull || (n % 500ull) == 0ull) {
+            std::fprintf(stderr, "[OpenScarlett][CL] DrawInstanced SKIPPED #%llu (v=%u standin=%d no_pso=%d)\n",
+                         static_cast<unsigned long long>(n), VertexCountPerInstance,
+                         last_pso_is_standin_ ? 1 : 0, pso_missing ? 1 : 0);
+            std::fflush(stderr);
+        }
     }
     RecordList("ID3D12GraphicsCommandListX::DrawInstanced", 12, S_OK);
 }
@@ -949,6 +958,15 @@ void STDMETHODCALLTYPE CommandListX::DrawIndexedInstanced(
         host_list_->DrawIndexedInstanced(
             IndexCountPerInstance, InstanceCount, StartIndexLocation,
             BaseVertexLocation, StartInstanceLocation);
+    } else if (last_pso_is_standin_ || pso_missing) {
+        static std::atomic<uint64_t> s_skip_dii{0ull};
+        const uint64_t n = s_skip_dii.fetch_add(1ull, std::memory_order_relaxed) + 1ull;
+        if (n == 1ull || (n % 500ull) == 0ull) {
+            std::fprintf(stderr, "[OpenScarlett][CL] DrawIndexedInstanced SKIPPED #%llu (idx=%u standin=%d no_pso=%d)\n",
+                         static_cast<unsigned long long>(n), IndexCountPerInstance,
+                         last_pso_is_standin_ ? 1 : 0, pso_missing ? 1 : 0);
+            std::fflush(stderr);
+        }
     }
     RecordList("ID3D12GraphicsCommandListX::DrawIndexedInstanced", 13, S_OK);
 }

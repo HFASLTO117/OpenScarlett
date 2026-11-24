@@ -188,6 +188,17 @@ Status TitleVAMirror::RegisterRegion(const TitleVaMappingDesc& desc,
         const UINT reset_rc = ResetWriteWatch(
             entry.cpu_backing_ptr, static_cast<SIZE_T>(entry.alloc_size_bytes));
         entry.write_watch_enabled = (reset_rc == 0u);
+        if (!entry.write_watch_enabled && entry.size_bytes >= kPageSize64KB) {
+            const size_t num_chunks =
+                static_cast<size_t>((entry.size_bytes + kPageSize64KB - 1ull) / kPageSize64KB);
+            entry.fallback_chunk_hashes.assign(num_chunks, 0ull);
+            // Seed all chunks as touched once for initial upload on <= 4 MiB buffers so static
+            // pre-populated buffers upload on first flush, then only re-hash touched chunks.
+            const uint64_t init_bits = (entry.size_bytes <= (4ull * 1024ull * 1024ull)) ? ~0ull : 0ull;
+            entry.touched_chunk_bits.assign((num_chunks + 63u) / 64u, init_bits);
+            entry.use_touched_chunk_hints = true;
+            entry.fallback_hashes_initialized = true;
+        }
     } else {
         void* mem = VirtualAlloc(
             nullptr,
@@ -366,6 +377,9 @@ Status TitleVAMirror::QueryDirtyLocked(RegionEntry& entry,
                 // so untouched zero pages are never redundantly uploaded over PCIe.
                 constexpr uint64_t kZeroChunkHash = 0ull;
                 entry.fallback_chunk_hashes.assign(num_chunks, kZeroChunkHash);
+                const uint64_t init_bits = (entry.size_bytes <= (4ull * 1024ull * 1024ull)) ? ~0ull : 0ull;
+                entry.touched_chunk_bits.assign((num_chunks + 63u) / 64u, init_bits);
+                entry.use_touched_chunk_hints = (entry.size_bytes >= kPageSize64KB);
                 entry.fallback_hashes_initialized = true;
             }
             const auto* base = static_cast<const uint8_t*>(entry.cpu_backing_ptr);
@@ -374,6 +388,17 @@ Status TitleVAMirror::QueryDirtyLocked(RegionEntry& entry,
             bool in_run = false;
             uint64_t dirty_chunks = 0ull;
             for (size_t c = 0u; c < num_chunks; ++c) {
+                if (entry.use_touched_chunk_hints) {
+                    const size_t wi_b = c >> 6u;
+                    const uint64_t bit = 1ull << (c & 63u);
+                    if (wi_b >= entry.touched_chunk_bits.size() ||
+                        (entry.touched_chunk_bits[wi_b] & bit) == 0ull) {
+                        continue;
+                    }
+                    if (reset_watch) {
+                        entry.touched_chunk_bits[wi_b] &= ~bit;
+                    }
+                }
                 const uint64_t off = static_cast<uint64_t>(c) * kChunk;
                 const uint64_t len = std::min<uint64_t>(kChunk, entry.size_bytes - off);
                 const auto* words = reinterpret_cast<const uint64_t*>(base + off);
@@ -768,6 +793,18 @@ bool TitleVAMirror::ResolveTitleVa(uint64_t title_va,
     if (idx < 0) return false;
     const RegionEntry& entry = regions_[static_cast<size_t>(idx)];
     const uint64_t rel = title_va - entry.title_va;
+    if (entry.use_touched_chunk_hints && !entry.touched_chunk_bits.empty()) {
+        const size_t c0 = static_cast<size_t>(rel / kPageSize64KB);
+        const size_t max_c = entry.fallback_chunk_hashes.size();
+        for (size_t c = c0; c <= c0 + 1u && c < max_c; ++c) {
+            const size_t wi = c >> 6u;
+            const uint64_t bit = 1ull << (c & 63u);
+            if (wi < entry.touched_chunk_bits.size()) {
+                _InterlockedOr64(reinterpret_cast<volatile long long*>(&entry.touched_chunk_bits[wi]),
+                                 static_cast<long long>(bit));
+            }
+        }
+    }
     out_offset = rel;
     out_pc_gpu_va = entry.pc_gpu_va ? (entry.pc_gpu_va + rel) : 0ull;
     return true;

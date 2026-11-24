@@ -760,7 +760,30 @@ XG_TILE_MODE ExtractXboxGfx10TileMode(D3D12_TEXTURE_LAYOUT layout) noexcept {
     return XG_TILE_MODE_LINEAR;
 }
 
+// Translate Xbox Scarlett-exclusive DXGI_FORMAT values (116..121) that desktop Windows
+// D3D12 rejects with E_INVALIDARG into equivalent desktop DXGI formats.
+DXGI_FORMAT SanitizeXboxDxgiFormat(DXGI_FORMAT fmt) noexcept {
+    switch (static_cast<uint32_t>(fmt)) {
+        case 115u:  // DXGI_FORMAT_B4G4R4A4_UNORM (no desktop RT/UAV support -> BGRA8)
+            return DXGI_FORMAT_B8G8R8A8_UNORM;
+        case 116u:  // DXGI_FORMAT_R10G10B10_7E3_A2_FLOAT
+        case 117u:  // DXGI_FORMAT_R10G10B10_6E4_A2_FLOAT
+            return DXGI_FORMAT_R16G16B16A16_FLOAT;
+        case 118u:  // DXGI_FORMAT_D16_UNORM_S8_UINT
+            return DXGI_FORMAT_D24_UNORM_S8_UINT;
+        case 119u:  // DXGI_FORMAT_R16_UNORM_X8_TYPELESS
+            return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        case 120u:  // DXGI_FORMAT_X16_TYPELESS_G8_UINT
+            return DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+        case 121u:  // DXGI_FORMAT_R16G8_TYPELESS (if emitted)
+            return DXGI_FORMAT_R24G8_TYPELESS;
+        default:
+            return fmt;
+    }
+}
+
 DXGI_FORMAT MapTypelessFormatForDsv(DXGI_FORMAT fmt) noexcept {
+    fmt = SanitizeXboxDxgiFormat(fmt);
     switch (fmt) {
         case DXGI_FORMAT_R32_TYPELESS:
         case DXGI_FORMAT_R32_FLOAT:
@@ -823,13 +846,31 @@ D3D12_RESOURCE_FLAGS SanitizeResourceFlagsForDimension(
     return static_cast<D3D12_RESOURCE_FLAGS>(clean);
 }
 
+bool FormatForbidsDesktopUav(DXGI_FORMAT fmt) noexcept {
+    return fmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+           fmt == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+           fmt == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB ||
+           fmt == DXGI_FORMAT_B5G6R5_UNORM ||
+           fmt == DXGI_FORMAT_B5G5R5A1_UNORM ||
+           fmt == DXGI_FORMAT_B4G4R4A4_UNORM ||
+           fmt == DXGI_FORMAT_A8_UNORM ||
+           (static_cast<uint32_t>(fmt) >= static_cast<uint32_t>(DXGI_FORMAT_BC1_TYPELESS) &&
+            static_cast<uint32_t>(fmt) <= static_cast<uint32_t>(DXGI_FORMAT_BC5_SNORM)) ||
+           (static_cast<uint32_t>(fmt) >= static_cast<uint32_t>(DXGI_FORMAT_BC6H_TYPELESS) &&
+            static_cast<uint32_t>(fmt) <= static_cast<uint32_t>(DXGI_FORMAT_BC7_UNORM_SRGB));
+}
+
 D3D12_RESOURCE_DESC SanitizeXboxResourceDesc(const D3D12_RESOURCE_DESC& desc) noexcept {
     D3D12_RESOURCE_DESC out = desc;
+    out.Format = SanitizeXboxDxgiFormat(out.Format);
     if (out.SampleDesc.Count == 0u) {
         out.SampleDesc.Count = 1u;
         out.SampleDesc.Quality = 0u;
     }
     out.Flags = SanitizeResourceFlagsForDimension(out.Dimension, desc.Flags, out.SampleDesc.Count);
+    if (FormatForbidsDesktopUav(out.Format) || out.SampleDesc.Count > 1u) {
+        out.Flags &= ~D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    }
     if (static_cast<uint32_t>(out.Layout) >= D3D12XBOX_TEXTURE_LAYOUT_GFX10_BASE) {
         out.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     }
@@ -838,11 +879,15 @@ D3D12_RESOURCE_DESC SanitizeXboxResourceDesc(const D3D12_RESOURCE_DESC& desc) no
 
 D3D12_RESOURCE_DESC1 SanitizeXboxResourceDesc1(const D3D12_RESOURCE_DESC1& desc) noexcept {
     D3D12_RESOURCE_DESC1 out = desc;
+    out.Format = SanitizeXboxDxgiFormat(out.Format);
     if (out.SampleDesc.Count == 0u) {
         out.SampleDesc.Count = 1u;
         out.SampleDesc.Quality = 0u;
     }
     out.Flags = SanitizeResourceFlagsForDimension(out.Dimension, desc.Flags, out.SampleDesc.Count);
+    if (FormatForbidsDesktopUav(out.Format) || out.SampleDesc.Count > 1u) {
+        out.Flags &= ~D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    }
     if (static_cast<uint32_t>(out.Layout) >= D3D12XBOX_TEXTURE_LAYOUT_GFX10_BASE) {
         out.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     }
@@ -4456,7 +4501,17 @@ void STDMETHODCALLTYPE DeviceX::CreateShaderResourceView(
             return;
         }
     }
-    host_dev_->CreateShaderResourceView(host_res, pDesc, DestDescriptor);
+    D3D12_SHADER_RESOURCE_VIEW_DESC clean_srv{};
+    const D3D12_SHADER_RESOURCE_VIEW_DESC* srv_ptr = pDesc;
+    if (pDesc != nullptr) {
+        const DXGI_FORMAT san_fmt = SanitizeXboxDxgiFormat(pDesc->Format);
+        if (san_fmt != pDesc->Format) {
+            clean_srv = *pDesc;
+            clean_srv.Format = san_fmt;
+            srv_ptr = &clean_srv;
+        }
+    }
+    host_dev_->CreateShaderResourceView(host_res, srv_ptr, DestDescriptor);
     static const bool trace_dd = []() {
         char v[16]{};
         return ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_DRAW_DATA", v, sizeof(v)) > 0 && v[0] == '1';
@@ -4553,6 +4608,13 @@ void STDMETHODCALLTYPE DeviceX::CreateRenderTargetView(
         rw_desc = *pDesc;
         rw_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
         desc_ptr = &rw_desc;
+    } else if (pDesc != nullptr) {
+        const DXGI_FORMAT san_fmt = SanitizeXboxDxgiFormat(pDesc->Format);
+        if (san_fmt != pDesc->Format) {
+            rw_desc = *pDesc;
+            rw_desc.Format = san_fmt;
+            desc_ptr = &rw_desc;
+        }
     }
     const bool valid_rtv =
         host_res != nullptr &&
@@ -8430,6 +8492,14 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResourceX(
     D3D12_RESOURCE_DESC clean_desc = SanitizeAndClampResourceDesc(*pDesc);
     D3D12_CLEAR_VALUE clean_clear{};
     const D3D12_CLEAR_VALUE* clear_ptr = pOptimizedClearValue;
+    if (pOptimizedClearValue != nullptr) {
+        const DXGI_FORMAT san_clear = SanitizeXboxDxgiFormat(pOptimizedClearValue->Format);
+        if (san_clear != pOptimizedClearValue->Format) {
+            clean_clear = *pOptimizedClearValue;
+            clean_clear.Format = san_clear;
+            clear_ptr = &clean_clear;
+        }
+    }
     bool did_r9g9b9e5_fallback = false;
     if (ShouldRewriteR9G9B9E5Uav(clean_desc)) {
         clean_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
@@ -8488,61 +8558,68 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResourceX(
     default_heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
     bool spilled_to_l0 = false;
     bool placed_in_alias_heap = false;
-    if ((FAILED(hr) || !host_res) && retail_scarlett_abi_ && VirtualAddress != 0ull &&
-        clean_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
-        const bool is_msaa = (clean_desc.SampleDesc.Count > 1u);
-        const uint64_t pool_bytes = is_msaa ? (64ull * 1024ull * 1024ull)
-                                            : (256ull * 1024ull * 1024ull);
-        const D3D12_RESOURCE_ALLOCATION_INFO ainfo =
-            host_dev_->GetResourceAllocationInfo(0u, 1u, &clean_desc);
-        const uint64_t req_align = std::max<uint64_t>(
-            ainfo.Alignment ? ainfo.Alignment : 65536ull, 65536ull);
-        if (ainfo.SizeInBytes > 0ull && ainfo.SizeInBytes <= pool_bytes) {
-            uint64_t heap_off = (VirtualAddress & (pool_bytes - 1ull)) & ~(req_align - 1ull);
-            if (heap_off + ainfo.SizeInBytes > pool_bytes) {
-                heap_off = 0ull;
-            }
-            const bool is_rt_ds =
-                (clean_desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
-                                     D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) != 0;
-            const uint64_t map_key = is_msaa ? 1ull : 0ull;
-            ID3D12Heap* alias_heap = nullptr;
-            {
-                std::lock_guard<std::mutex> alk(placed_alias_mutex_);
-                auto it = placed_alias_heaps_.find(map_key);
-                if (it != placed_alias_heaps_.end() && it->second) {
-                    alias_heap = it->second;
-                    alias_heap->AddRef();
-                } else {
-                    D3D12_HEAP_DESC hd{};
-                    hd.SizeInBytes = pool_bytes;
-                    hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
-                    hd.Alignment = is_msaa ? D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT
-                                           : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
-                    hd.Flags = D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES;
-                    ID3D12Heap* new_heap = nullptr;
-                    HRESULT hhr = host_dev_->CreateHeap(
-                        &hd, OS_D3D12_IID(ID3D12Heap), reinterpret_cast<void**>(&new_heap));
-                    if ((FAILED(hhr) || !new_heap) && is_rt_ds) {
-                        hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
-                        hhr = host_dev_->CreateHeap(
-                            &hd, OS_D3D12_IID(ID3D12Heap), reinterpret_cast<void**>(&new_heap));
-                    }
-                    if (SUCCEEDED(hhr) && new_heap) {
-                        placed_alias_heaps_[map_key] = new_heap;
-                        alias_heap = new_heap;
+    if ((FAILED(hr) || !host_res) && retail_scarlett_abi_ && VirtualAddress != 0ull) {
+        const bool is_buf = (clean_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER);
+        const bool is_msaa = (!is_buf && clean_desc.SampleDesc.Count > 1u);
+        const bool want_alias = !is_buf || (clean_desc.Width <= 65536ull);
+        if (want_alias) {
+            const uint64_t pool_bytes = is_buf ? (64ull * 1024ull * 1024ull)
+                                               : (is_msaa ? (64ull * 1024ull * 1024ull)
+                                                          : (256ull * 1024ull * 1024ull));
+            const D3D12_RESOURCE_ALLOCATION_INFO ainfo =
+                is_buf ? D3D12_RESOURCE_ALLOCATION_INFO{65536ull, 65536ull}
+                       : host_dev_->GetResourceAllocationInfo(0u, 1u, &clean_desc);
+            const uint64_t req_align = std::max<uint64_t>(
+                ainfo.Alignment ? ainfo.Alignment : 65536ull, 65536ull);
+            if (ainfo.SizeInBytes > 0ull && ainfo.SizeInBytes <= pool_bytes) {
+                uint64_t heap_off = (VirtualAddress & (pool_bytes - 1ull)) & ~(req_align - 1ull);
+                if (heap_off + ainfo.SizeInBytes > pool_bytes) {
+                    heap_off = 0ull;
+                }
+                const bool is_rt_ds =
+                    !is_buf &&
+                    (clean_desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                         D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) != 0;
+                const uint64_t map_key = is_buf ? 2ull : (is_msaa ? 1ull : 0ull);
+                ID3D12Heap* alias_heap = nullptr;
+                {
+                    std::lock_guard<std::mutex> alk(placed_alias_mutex_);
+                    auto it = placed_alias_heaps_.find(map_key);
+                    if (it != placed_alias_heaps_.end() && it->second) {
+                        alias_heap = it->second;
                         alias_heap->AddRef();
+                    } else {
+                        D3D12_HEAP_DESC hd{};
+                        hd.SizeInBytes = pool_bytes;
+                        hd.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+                        hd.Alignment = is_msaa ? D3D12_DEFAULT_MSAA_RESOURCE_PLACEMENT_ALIGNMENT
+                                               : D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+                        hd.Flags = is_buf ? D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS
+                                          : D3D12_HEAP_FLAG_ALLOW_ALL_BUFFERS_AND_TEXTURES;
+                        ID3D12Heap* new_heap = nullptr;
+                        HRESULT hhr = host_dev_->CreateHeap(
+                            &hd, OS_D3D12_IID(ID3D12Heap), reinterpret_cast<void**>(&new_heap));
+                        if ((FAILED(hhr) || !new_heap) && is_rt_ds) {
+                            hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES;
+                            hhr = host_dev_->CreateHeap(
+                                &hd, OS_D3D12_IID(ID3D12Heap), reinterpret_cast<void**>(&new_heap));
+                        }
+                        if (SUCCEEDED(hhr) && new_heap) {
+                            placed_alias_heaps_[map_key] = new_heap;
+                            alias_heap = new_heap;
+                            alias_heap->AddRef();
+                        }
                     }
                 }
-            }
-            if (alias_heap) {
-                hr = host_dev_->CreatePlacedResource(
-                    alias_heap, heap_off, &clean_desc, InitialState,
-                    clear_ptr, OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
-                if (SUCCEEDED(hr) && host_res) {
-                    placed_in_alias_heap = true;
+                if (alias_heap) {
+                    hr = host_dev_->CreatePlacedResource(
+                        alias_heap, heap_off, &clean_desc, InitialState,
+                        clear_ptr, OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
+                    if (SUCCEEDED(hr) && host_res) {
+                        placed_in_alias_heap = true;
+                    }
+                    alias_heap->Release();
                 }
-                alias_heap->Release();
             }
         }
     }
@@ -8574,6 +8651,77 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResourceX(
             hr = host_dev_->CreateCommittedResource(
                 &default_heap_props, D3D12_HEAP_FLAG_CREATE_NOT_RESIDENT, &clean_desc, InitialState,
                 clear_ptr, OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
+        }
+        // Third fallback for large (>64 KiB) buffers on 4 GiB GPUs when both L1 and L0
+        // committed allocations hit E_OUTOFMEMORY: place into an on-demand 64 MiB L0
+        // ALLOW_ONLY_BUFFERS spillover aliasing heap (map_key = 3, never touches <=64 KiB pool).
+        if ((FAILED(hr) || !host_res) && retail_scarlett_abi_ &&
+            clean_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+            clean_desc.Width > 0ull && clean_desc.Width <= 64ull * 1024ull * 1024ull) {
+            constexpr uint64_t kSpillPoolBytes = 64ull * 1024ull * 1024ull;
+            const uint64_t aligned_sz = (clean_desc.Width + 65535ull) & ~65535ull;
+            uint64_t heap_off = (VirtualAddress & (kSpillPoolBytes - 1ull)) & ~65535ull;
+            if (heap_off + aligned_sz > kSpillPoolBytes) {
+                heap_off = 0ull;
+            }
+            ID3D12Heap* spill_heap = nullptr;
+            {
+                std::lock_guard<std::mutex> alk(placed_alias_mutex_);
+                auto it = placed_alias_heaps_.find(3ull);
+                if (it != placed_alias_heaps_.end() && it->second) {
+                    spill_heap = it->second;
+                    spill_heap->AddRef();
+                } else {
+                    D3D12_HEAP_DESC hd{};
+                    hd.SizeInBytes = kSpillPoolBytes;
+                    hd.Properties = l0_props;
+                    hd.Alignment = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
+                    hd.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+                    ID3D12Heap* new_heap = nullptr;
+                    if (SUCCEEDED(host_dev_->CreateHeap(
+                            &hd, OS_D3D12_IID(ID3D12Heap), reinterpret_cast<void**>(&new_heap))) &&
+                        new_heap) {
+                        placed_alias_heaps_[3ull] = new_heap;
+                        spill_heap = new_heap;
+                        spill_heap->AddRef();
+                    } else {
+                        // Commit/VRAM already full: reuse the pre-allocated 64 MiB buffer heap (map_key=2)
+                        // at zero additional memory cost so large buffers never fail with E_OUTOFMEMORY.
+                        auto it2 = placed_alias_heaps_.find(2ull);
+                        if (it2 != placed_alias_heaps_.end() && it2->second) {
+                            spill_heap = it2->second;
+                            spill_heap->AddRef();
+                        }
+                    }
+                }
+            }
+            if (spill_heap) {
+                hr = host_dev_->CreatePlacedResource(
+                    spill_heap, heap_off, &clean_desc, InitialState,
+                    clear_ptr, OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
+                if (SUCCEEDED(hr) && host_res) {
+                    default_heap_props = l0_props;
+                    spilled_to_l0 = true;
+                    placed_in_alias_heap = true;
+                }
+                spill_heap->Release();
+            }
+        }
+    }
+    if ((FAILED(hr) || !host_res) && hr == E_INVALIDARG && retail_scarlett_abi_ &&
+        clean_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+        if ((clean_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) != 0) {
+            clean_desc.Flags &= ~D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+            hr = host_dev_->CreateCommittedResource(
+                &default_heap_props, D3D12_HEAP_FLAG_NONE, &clean_desc, InitialState,
+                clear_ptr, OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
+        }
+        if (FAILED(hr) || !host_res) {
+            clean_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+            clean_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+            hr = host_dev_->CreateCommittedResource(
+                &default_heap_props, D3D12_HEAP_FLAG_NONE, &clean_desc, D3D12_RESOURCE_STATE_COMMON,
+                nullptr, OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
         }
     }
 
@@ -8651,8 +8799,22 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResourceX(
             }
         }
         bool mirrored_by_title_va = false;
+        // Skip per-buffer TitleVAMirror staging allocation for tiny (<=16 KiB) all-zero GPU
+        // buffers (3,500+ 4 KiB render-graph pools) and L0-spilled OOM buffers so 16 GiB hosts
+        // never exhaust commit charge while keeping all CPU-written ring buffers mirrored in full.
+        bool skip_small_zero_mirror = false;
+        if (retail_scarlett_abi_ &&
+            clean_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+            mirror_bytes > 0ull && mirror_bytes <= 16384ull &&
+            IsReadableGuestVaRange(VirtualAddress, mirror_bytes)) {
+            const auto* gp = reinterpret_cast<const uint64_t*>(static_cast<uintptr_t>(VirtualAddress));
+            const size_t nw = static_cast<size_t>(mirror_bytes >> 3u);
+            uint64_t acc = 0ull;
+            for (size_t i = 0u; i < nw; ++i) acc |= gp[i];
+            if (acc == 0ull) skip_small_zero_mirror = true;
+        }
         if (clean_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
-            mirror_bytes > 0ull &&
+            mirror_bytes > 0ull && !skip_small_zero_mirror && !spilled_to_l0 &&
             IsReadableGuestVaRange(VirtualAddress, mirror_bytes)) {
             openscarlett::TitleVaMappingDesc mdesc{};
             mdesc.title_va = VirtualAddress;
@@ -8670,7 +8832,9 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResourceX(
                 mirrored_by_title_va = true;
             }
         }
-        AutoRegisterUnifiedResource(host_res, VirtualAddress, clean_desc, InitialState, mirrored_by_title_va);
+        if (!skip_small_zero_mirror) {
+            AutoRegisterUnifiedResource(host_res, VirtualAddress, clean_desc, InitialState, mirrored_by_title_va);
+        }
     }
     auto* proxy = new (std::nothrow) ResourceXProxy(
         this, host_res, &clean_desc, &default_heap_props, D3D12_HEAP_FLAG_NONE, VirtualAddress);
