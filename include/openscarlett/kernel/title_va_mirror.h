@@ -48,7 +48,8 @@ struct TitleVaMappingDesc {
 
     // Optional caller-provided PC GPU default-heap shadow resource.
     // When nullptr and a non-null ID3D12Device* is passed to RegisterRegion,
-    // TitleVAMirror creates a matching DEFAULT buffer plus UPLOAD/READBACK staging buffers.
+    // TitleVAMirror creates a matching DEFAULT buffer plus a persistently mapped UPLOAD
+    // staging buffer (READBACK staging is allocated lazily on first ScheduleGpuReadback).
     ID3D12Resource* gpu_shadow_resource = nullptr;
 
     // Optional explicit PC GPU VA (when 0 and gpu_shadow_resource is a buffer,
@@ -194,6 +195,11 @@ public:
     // Retrieves full metadata for the region containing `title_va`.
     bool LookupRegion(uint64_t title_va, TitleVaRegionInfo& out_info) const;
 
+    // Returns true if the region containing `title_va` currently has a persistently mapped
+    // upload staging buffer or a lazily allocated readback staging buffer.
+    bool HasPersistentUploadMapping(uint64_t title_va) const noexcept;
+    bool HasReadbackStaging(uint64_t title_va) const noexcept;
+
     // Returns cumulative mirror telemetry.
     TitleVaMirrorStats GetStats() const;
 
@@ -219,8 +225,10 @@ private:
         mutable std::vector<uint64_t> touched_chunk_bits;
         mutable bool use_touched_chunk_hints = false;
 
+        ID3D12Device* d3d_device = nullptr;
         ID3D12Resource* gpu_shadow = nullptr;
         ID3D12Resource* upload_staging = nullptr;
+        uint8_t* mapped_upload_ptr = nullptr;
         ID3D12Resource* readback_staging = nullptr;
         uint64_t pc_gpu_va = 0;
         D3D12_RESOURCE_STATES current_state = D3D12_RESOURCE_STATE_COMMON;
@@ -235,6 +243,7 @@ private:
 
     ptrdiff_t FindRegionIndexLocked(uint64_t title_va) const noexcept;
     void ReleaseEntryResources(RegionEntry& entry) noexcept;
+    Status EnsureReadbackStagingLocked(RegionEntry& entry);
     Status QueryDirtyLocked(RegionEntry& entry,
                             bool reset_watch,
                             std::vector<DirtyPageRange>& out_ranges,
@@ -243,6 +252,7 @@ private:
 
     uint64_t page_size_bytes_ = kPageSize4KB;
     mutable std::shared_mutex mutex_;
+    mutable std::vector<void*> watch_scratch_;
     // Sorted by RegionEntry::title_va ascending; non-overlapping intervals.
     std::vector<RegionEntry> regions_;
     std::vector<PendingReadback> pending_readbacks_;

@@ -609,7 +609,26 @@ void* OPENSCARLETT_KERNELX_CALL XMemShim_XMemVirtualAlloc(
     uint32_t dwMemoryType,
     uint32_t flProtect) {
     (void)dwMemoryType;
-    void* ptr = ::KernelXVirtualAllocFromApp(lpAddress, dwSize, flAllocationType, flProtect);
+    uint32_t effective_prot = flProtect;
+    if ((effective_prot & 0xFFu) == 0u) {
+        if ((effective_prot & 0x800u) != 0u ||
+            (((flAllocationType & MEM_RESERVE) != 0u) && ((flAllocationType & MEM_COMMIT) == 0u))) {
+            effective_prot |= PAGE_NOACCESS;
+        } else if ((effective_prot & PAGE_WRITECOMBINE) != 0u) {
+            effective_prot |= PAGE_READWRITE;
+        }
+    }
+    void* ptr = ::KernelXVirtualAllocFromApp(lpAddress, dwSize, flAllocationType, effective_prot);
+    if (!ptr && lpAddress == nullptr && dwSize > 0u && (flAllocationType & MEM_COMMIT) != 0u) {
+        // Retry with sanitized allocation type flags if guest passed proprietary high bits.
+        constexpr uint32_t kKnownAllocMask =
+            MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_TOP_DOWN |
+            MEM_WRITE_COMBINE | MEM_GRAPHICS | MEM_LARGE_PAGES | MEM_TITLE | MEM_4MB_PAGES;
+        const uint32_t sanitized_alloc = (flAllocationType & kKnownAllocMask) | MEM_RESERVE;
+        if (sanitized_alloc != flAllocationType) {
+            ptr = ::KernelXVirtualAllocFromApp(nullptr, dwSize, sanitized_alloc, effective_prot);
+        }
+    }
     if (lpAddress == nullptr && ptr != nullptr) {
         RecordPotentialAliasWindow(ptr, dwSize, flProtect);
     }

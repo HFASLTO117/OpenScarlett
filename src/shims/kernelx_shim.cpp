@@ -45,6 +45,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -76,6 +77,10 @@
 #pragma comment(linker, "/export:GetProcessAffinityMask=KernelXGetProcessAffinityMask")
 #pragma comment(linker, "/export:GetSystemInfo=KernelXGetSystemInfo")
 #pragma comment(linker, "/export:GetCurrentProcessorNumber=KernelXGetCurrentProcessorNumber")
+#pragma comment(linker, "/export:GlobalMemoryStatusEx=KernelXGlobalMemoryStatusEx")
+#pragma comment(linker, "/export:QueryInformationJobObject=KernelXQueryInformationJobObject")
+#pragma comment(linker, "/export:JobMemoryStatus=KernelXJobMemoryStatus")
+#pragma comment(linker, "/export:GetProcessInformation=KernelXGetProcessInformation")
 #endif
 
 namespace {
@@ -320,29 +325,88 @@ size_t DecodeXAllocAlignment(uint64_t attrs) {
     return alignment;
 }
 
+#if defined(_WIN32)
+struct ScopedLastErrorPreserve {
+    DWORD saved = ::GetLastError();
+    ~ScopedLastErrorPreserve() { ::SetLastError(saved); }
+};
+
+std::string ReadEnvLowerTrimmed(const char* name) {
+    char env_buf[128] = {};
+    const DWORD len = ::GetEnvironmentVariableA(name, env_buf, static_cast<DWORD>(sizeof(env_buf)));
+    if (len == 0u || len >= sizeof(env_buf)) {
+        return {};
+    }
+    size_t b = 0u;
+    size_t e = static_cast<size_t>(len);
+    while (b < e && std::isspace(static_cast<unsigned char>(env_buf[b]))) ++b;
+    while (e > b && std::isspace(static_cast<unsigned char>(env_buf[e - 1u]))) --e;
+    std::string v(env_buf + b, e - b);
+    std::transform(v.begin(), v.end(), v.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return v;
+}
+
+bool TryParseConsoleTypeString(const std::string& v, uint32_t& out_type) noexcept {
+    if (v.empty()) {
+        return false;
+    }
+    if (v == "lockhart" || v == "series_s" || v == "series-s" || v == "seriess" ||
+        v == "3" || v == "s" || v == "8gb" || v == "8gib") {
+        out_type = CONSOLE_TYPE_XBOX_SCARLETT_LOCKHART;
+        return true;
+    }
+    if (v == "anaconda" || v == "series_x" || v == "series-x" || v == "seriesx" ||
+        v == "4" || v == "x" || v == "13.5gb" || v == "16gb") {
+        out_type = CONSOLE_TYPE_XBOX_SCARLETT_ANACONDA;
+        return true;
+    }
+    if (v == "devkit" || v == "5") {
+        out_type = CONSOLE_TYPE_XBOX_SCARLETT_DEVKIT;
+        return true;
+    }
+    if (v == "auto") {
+        constexpr uint64_t kLockhartHostRamThresholdBytes = 18ull * 1024ull * 1024ull * 1024ull;
+        MEMORYSTATUSEX ms{};
+        ms.dwLength = sizeof(ms);
+        if (::GlobalMemoryStatusEx(&ms) && ms.ullTotalPhys > 0ull &&
+            ms.ullTotalPhys <= kLockhartHostRamThresholdBytes) {
+            out_type = CONSOLE_TYPE_XBOX_SCARLETT_LOCKHART;
+        } else {
+            out_type = CONSOLE_TYPE_XBOX_SCARLETT_ANACONDA;
+        }
+        return true;
+    }
+    return false;
+}
+#endif
+
 uint32_t ResolveConsoleType() {
 #if defined(_WIN32)
-    char env_buf[64] = {};
-    const DWORD len = GetEnvironmentVariableA("OPENSCARLETT_CONSOLE_TYPE", env_buf, static_cast<DWORD>(sizeof(env_buf)));
-    if (len > 0 && len < sizeof(env_buf)) {
-        std::string v(env_buf, len);
-        std::transform(v.begin(), v.end(), v.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        if (v == "lockhart" || v == "3" || v == "series_s") {
-            return CONSOLE_TYPE_XBOX_SCARLETT_LOCKHART;
-        }
-        if (v == "anaconda" || v == "4" || v == "series_x") {
-            return CONSOLE_TYPE_XBOX_SCARLETT_ANACONDA;
-        }
-        if (v == "devkit" || v == "5") {
-            return CONSOLE_TYPE_XBOX_SCARLETT_DEVKIT;
-        }
+    ScopedLastErrorPreserve preserve_err;
+    uint32_t parsed = CONSOLE_TYPE_XBOX_SCARLETT_ANACONDA;
+    if (TryParseConsoleTypeString(ReadEnvLowerTrimmed("OPENSCARLETT_CONSOLE_TYPE"), parsed)) {
+        return parsed;
+    }
+    if (TryParseConsoleTypeString(ReadEnvLowerTrimmed("OPENSCARLETT_CONSOLE_PROFILE"), parsed)) {
+        return parsed;
     }
 #endif
     return CONSOLE_TYPE_XBOX_SCARLETT_ANACONDA;
 }
 
 uint64_t GetTitleBudgetBytes() {
+#if defined(_WIN32)
+    ScopedLastErrorPreserve preserve_err;
+    const std::string mb_str = ReadEnvLowerTrimmed("OPENSCARLETT_TITLE_MEM_MB");
+    if (!mb_str.empty()) {
+        char* end_ptr = nullptr;
+        const unsigned long long mb = std::strtoull(mb_str.c_str(), &end_ptr, 10);
+        if (end_ptr != mb_str.c_str() && mb >= 64ull && mb <= 262144ull) {
+            return static_cast<uint64_t>(mb) * 1024ull * 1024ull;
+        }
+    }
+#endif
     if (ResolveConsoleType() == CONSOLE_TYPE_XBOX_SCARLETT_LOCKHART) {
         return kLockhartTitleBudgetBytes;
     }
@@ -355,6 +419,240 @@ uint64_t GetToolingBudgetBytes() {
     }
     return kAnacondaToolingBudgetBytes;
 }
+
+#if defined(_WIN32)
+bool IsPathOnCDriveKx(const std::wstring& path) noexcept {
+    if (path.size() >= 2u && path[1] == L':') {
+        return path[0] == L'C' || path[0] == L'c';
+    }
+    if (path.size() >= 6u &&
+        (path.compare(0u, 4u, L"\\\\?\\") == 0 || path.compare(0u, 4u, L"\\??\\") == 0) &&
+        path[5] == L':') {
+        return path[4] == L'C' || path[4] == L'c';
+    }
+    return false;
+}
+
+std::wstring ResolveKernelXSparseTempDir() {
+    wchar_t env_buf[MAX_PATH * 2]{};
+    const DWORD env_len = ::GetEnvironmentVariableW(
+        L"OPENSCARLETT_TMP_DIR", env_buf, static_cast<DWORD>(sizeof(env_buf) / sizeof(wchar_t)));
+    if (env_len > 0u && env_len < (sizeof(env_buf) / sizeof(wchar_t))) {
+        std::wstring custom(env_buf, env_len);
+        if (!IsPathOnCDriveKx(custom)) {
+            ::CreateDirectoryW(custom.c_str(), nullptr);
+            return custom;
+        }
+    }
+
+    const UINT e_type = ::GetDriveTypeW(L"E:\\");
+    if (e_type != DRIVE_NO_ROOT_DIR && e_type != DRIVE_UNKNOWN) {
+        ::CreateDirectoryW(L"E:\\OpenScarlett", nullptr);
+        const std::wstring e_tmp = L"E:\\OpenScarlett\\.tmp";
+        if (::CreateDirectoryW(e_tmp.c_str(), nullptr) || ::GetLastError() == ERROR_ALREADY_EXISTS) {
+            return e_tmp;
+        }
+    }
+
+    HMODULE self_mod = nullptr;
+    wchar_t dir_buf[MAX_PATH * 2]{};
+    if (::GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&ResolveConsoleType),
+            &self_mod) &&
+        self_mod) {
+        const DWORD n = ::GetModuleFileNameW(
+            self_mod, dir_buf, static_cast<DWORD>(sizeof(dir_buf) / sizeof(wchar_t)));
+        if (n > 0u && n < (sizeof(dir_buf) / sizeof(wchar_t))) {
+            std::wstring p(dir_buf, n);
+            const size_t sl = p.find_last_of(L"\\/");
+            if (sl != std::wstring::npos) {
+                std::wstring candidate = p.substr(0u, sl) + L"\\.tmp";
+                if (!IsPathOnCDriveKx(candidate)) {
+                    ::CreateDirectoryW(candidate.c_str(), nullptr);
+                    return candidate;
+                }
+            }
+        }
+    }
+    return {};
+}
+
+bool ShouldPreferSparseCommitKx(size_t byte_size, bool prefer_write_watch_first) noexcept {
+    char force_buf[16]{};
+    const DWORD flen = ::GetEnvironmentVariableA(
+        "OPENSCARLETT_FORCE_SPARSE_COMMIT", force_buf, static_cast<DWORD>(sizeof(force_buf)));
+    if (flen > 0u && force_buf[0] != '0') {
+        return true;
+    }
+    const size_t min_size = prefer_write_watch_first ? (128ull * 1024ull * 1024ull)
+                                                     : (32ull * 1024ull * 1024ull);
+    if (byte_size >= min_size) {
+        MEMORYSTATUSEX ms{};
+        ms.dwLength = sizeof(ms);
+        const uint64_t headroom = prefer_write_watch_first
+                                      ? (1536ull * 1024ull * 1024ull)
+                                      : (2048ull * 1024ull * 1024ull);
+        if (::GlobalMemoryStatusEx(&ms) &&
+            ms.ullAvailPageFile < static_cast<DWORDLONG>(byte_size) + headroom) {
+            return true;
+        }
+    }
+    return false;
+}
+
+HANDLE CreateSparseFileSectionKx(size_t byte_size, const wchar_t* prefix) noexcept {
+    const std::wstring backing_dir = ResolveKernelXSparseTempDir();
+    if (backing_dir.empty() || byte_size == 0u) {
+        return nullptr;
+    }
+    static std::atomic<uint64_t> s_sparse_seq{1};
+    const uint64_t seq = s_sparse_seq.fetch_add(1u, std::memory_order_relaxed);
+    wchar_t file_path[MAX_PATH * 2]{};
+    std::swprintf(file_path,
+                  sizeof(file_path) / sizeof(wchar_t),
+                  L"%ls\\%ls_%lu_%llu.bin",
+                  backing_dir.c_str(),
+                  prefix ? prefix : L"xmem",
+                  static_cast<unsigned long>(::GetCurrentProcessId()),
+                  static_cast<unsigned long long>(seq));
+    HANDLE hf = ::CreateFileW(
+        file_path,
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+        nullptr);
+    if (hf == INVALID_HANDLE_VALUE) {
+        return nullptr;
+    }
+    constexpr DWORD kFsctlSetSparse = 0x000900C4u;
+    DWORD bytes_ret = 0;
+    (void)::DeviceIoControl(hf, kFsctlSetSparse, nullptr, 0, nullptr, 0, &bytes_ret, nullptr);
+    LARGE_INTEGER li{};
+    li.QuadPart = static_cast<LONGLONG>(byte_size);
+    HANDLE hmap = nullptr;
+    if (::SetFilePointerEx(hf, li, nullptr, FILE_BEGIN) && ::SetEndOfFile(hf)) {
+        const DWORD hi = static_cast<DWORD>((static_cast<uint64_t>(byte_size) >> 32) & 0xFFFFFFFFull);
+        const DWORD lo = static_cast<DWORD>(static_cast<uint64_t>(byte_size) & 0xFFFFFFFFull);
+        hmap = ::CreateFileMappingW(hf, nullptr, PAGE_READWRITE, hi, lo, nullptr);
+    }
+    ::CloseHandle(hf);
+    return hmap;
+}
+
+struct KxMemAddressRequirements {
+    void* lowest_starting_address;
+    void* highest_ending_address;
+    SIZE_T alignment;
+};
+
+struct alignas(8) KxMemExtendedParameter {
+    uint64_t type_and_reserved;  // Low 8 bits: 1 == MemExtendedParameterAddressRequirements
+    union {
+        uint64_t ulong64;
+        void* pointer;
+        SIZE_T size;
+        HANDLE handle;
+        DWORD ulong;
+    } value;
+};
+
+using PfnKxVirtualAlloc2 = PVOID(WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, PVOID, ULONG);
+using PfnKxMapViewOfFile3 = PVOID(WINAPI*)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG, PVOID, ULONG);
+
+PfnKxVirtualAlloc2 GetKxVirtualAlloc2() noexcept {
+    static PfnKxVirtualAlloc2 s_fn = []() -> PfnKxVirtualAlloc2 {
+        HMODULE kb = ::GetModuleHandleW(L"kernelbase.dll");
+        return kb ? reinterpret_cast<PfnKxVirtualAlloc2>(::GetProcAddress(kb, "VirtualAlloc2")) : nullptr;
+    }();
+    return s_fn;
+}
+
+PfnKxMapViewOfFile3 GetKxMapViewOfFile3() noexcept {
+    static PfnKxMapViewOfFile3 s_fn = []() -> PfnKxMapViewOfFile3 {
+        HMODULE kb = ::GetModuleHandleW(L"kernelbase.dll");
+        return kb ? reinterpret_cast<PfnKxMapViewOfFile3>(::GetProcAddress(kb, "MapViewOfFile3")) : nullptr;
+    }();
+    return s_fn;
+}
+
+// Allocates VirtualAlloc / VirtualAlloc2 memory, trying MEM_WRITE_WATCH first whenever
+// MEM_RESERVE is requested, and falling back cleanly without MEM_WRITE_WATCH if rejected.
+void* AllocVirtualWriteWatched(void* base_addr,
+                               size_t byte_size,
+                               size_t alignment,
+                               DWORD win_alloc,
+                               DWORD win_prot) noexcept {
+    const bool try_write_watch = ((win_alloc & MEM_RESERVE) != 0u) &&
+                                 ((win_alloc & MEM_RESET) == 0u);
+    void* ptr = nullptr;
+    const PfnKxVirtualAlloc2 va2 = GetKxVirtualAlloc2();
+    if (base_addr == nullptr && alignment > kPage64KB && va2 != nullptr) {
+        KxMemAddressRequirements addr_req{nullptr, nullptr, alignment};
+        KxMemExtendedParameter ext{};
+        ext.type_and_reserved = 1ull;
+        ext.value.pointer = &addr_req;
+        if (try_write_watch) {
+            ptr = va2(::GetCurrentProcess(),
+                      nullptr,
+                      byte_size,
+                      win_alloc | MEM_WRITE_WATCH,
+                      win_prot,
+                      &ext,
+                      1u);
+        }
+        if (!ptr) {
+            ptr = va2(::GetCurrentProcess(), nullptr, byte_size, win_alloc, win_prot, &ext, 1u);
+        }
+    }
+    if (!ptr) {
+        if (try_write_watch) {
+            ptr = ::VirtualAlloc(base_addr, byte_size, win_alloc | MEM_WRITE_WATCH, win_prot);
+        }
+        if (!ptr) {
+            ptr = ::VirtualAlloc(base_addr, byte_size, win_alloc, win_prot);
+        }
+    }
+    if (ptr && try_write_watch && (win_alloc & MEM_COMMIT) != 0u) {
+        (void)::ResetWriteWatch(ptr, byte_size);
+    }
+    return ptr;
+}
+
+void* MapSparseViewAlignedKx(size_t byte_size,
+                             size_t alignment,
+                             DWORD win_prot,
+                             const wchar_t* prefix) noexcept {
+    const size_t map_size = AlignUp(byte_size, kPage64KB);
+    HANDLE hmap = CreateSparseFileSectionKx(map_size, prefix);
+    if (!hmap) {
+        return nullptr;
+    }
+    void* mapped = nullptr;
+    const PfnKxMapViewOfFile3 map3 = GetKxMapViewOfFile3();
+    if (alignment > kPage64KB && map3 != nullptr) {
+        KxMemAddressRequirements addr_req{nullptr, nullptr, alignment};
+        KxMemExtendedParameter ext{};
+        ext.type_and_reserved = 1ull;
+        ext.value.pointer = &addr_req;
+        const DWORD map_prot = (win_prot == PAGE_READONLY) ? PAGE_READONLY : PAGE_READWRITE;
+        mapped = map3(hmap, ::GetCurrentProcess(), nullptr, 0ull, map_size, 0u, map_prot, &ext, 1u);
+    }
+    if (!mapped) {
+        const DWORD access =
+            (win_prot == PAGE_READONLY) ? FILE_MAP_READ : (FILE_MAP_READ | FILE_MAP_WRITE);
+        mapped = ::MapViewOfFile(hmap, access, 0u, 0u, map_size);
+    }
+    ::CloseHandle(hmap);
+    if (mapped && win_prot == PAGE_NOACCESS) {
+        DWORD old_p = 0;
+        (void)::VirtualProtect(mapped, map_size, PAGE_NOACCESS, &old_p);
+    }
+    return mapped;
+}
+#endif
 
 #if defined(_WIN32)
 using FnSetThreadDescription = HRESULT(WINAPI*)(HANDLE, PCWSTR);
@@ -431,11 +729,18 @@ struct AppVirtualAllocRecord {
     bool is_file_mapping = false;
 };
 
+enum class XMemBackingKind : uint8_t {
+    AlignedHeap = 0,
+    VirtualAllocMem = 1,
+    FileMappingView = 2,
+};
+
 struct XMemAllocRecord {
     size_t requested_size = 0;
     size_t allocated_size = 0;
     size_t alignment = 16u;
     uint64_t attributes = 0;
+    XMemBackingKind backing = XMemBackingKind::AlignedHeap;
 };
 
 class KernelXState {
@@ -486,17 +791,67 @@ public:
             SetHostLastError(8u);
             return nullptr;
         }
-        const size_t alloc_size = AlignUp(dwSize, pad_granule);
-        const uint64_t used = CurrentTitleUsedBytes();
-        if (alloc_size > budget || used > budget - alloc_size) {
+        size_t alloc_size = AlignUp(dwSize, pad_granule);
+        if (alloc_size > budget) {
             SetHostLastError(8u);  // ERROR_NOT_ENOUGH_MEMORY
             return nullptr;
         }
 
-#if defined(_WIN32)
-        void* ptr = _aligned_malloc(alloc_size, alignment);
-#else
+        const uint32_t mem_type = static_cast<uint32_t>((dwAllocAttributes >> 28) & 0xFu);
+        const bool is_graphics_or_phys = (mem_type != XALLOC_MEMTYPE_HEAP);
+        const bool zero_init = ((dwAllocAttributes & XALLOC_FLAG_ZERO_INIT) != 0ull) || is_graphics_or_phys;
+        XMemBackingKind backing = XMemBackingKind::AlignedHeap;
         void* ptr = nullptr;
+        bool already_zeroed = false;
+
+#if defined(_WIN32)
+        const bool prefer_virtual =
+            is_graphics_or_phys || alloc_size >= kPage64KB || alignment >= kPage4KB;
+        if (prefer_virtual) {
+            alloc_size = AlignUp(alloc_size, kPage4KB);
+            if (!ShouldPreferSparseCommitKx(alloc_size, /*prefer_write_watch_first=*/true)) {
+                ptr = AllocVirtualWriteWatched(
+                    nullptr, alloc_size, alignment, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+                if (ptr) {
+                    backing = XMemBackingKind::VirtualAllocMem;
+                    already_zeroed = true;
+                }
+            }
+            if (!ptr) {
+                alloc_size = AlignUp(alloc_size, kPage64KB);
+                ptr = MapSparseViewAlignedKx(alloc_size, alignment, PAGE_READWRITE, L"xmemdef");
+                if (ptr) {
+                    backing = XMemBackingKind::FileMappingView;
+                    already_zeroed = true;
+                } else {
+                    ptr = AllocVirtualWriteWatched(
+                        nullptr, alloc_size, alignment, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+                    if (ptr) {
+                        backing = XMemBackingKind::VirtualAllocMem;
+                        already_zeroed = true;
+                    }
+                }
+            }
+        } else {
+            ptr = _aligned_malloc(alloc_size, alignment);
+            if (!ptr) {
+                alloc_size = AlignUp(alloc_size, kPage4KB);
+                ptr = AllocVirtualWriteWatched(
+                    nullptr, alloc_size, alignment, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+                if (ptr) {
+                    backing = XMemBackingKind::VirtualAllocMem;
+                    already_zeroed = true;
+                } else {
+                    alloc_size = AlignUp(alloc_size, kPage64KB);
+                    ptr = MapSparseViewAlignedKx(alloc_size, alignment, PAGE_READWRITE, L"xmemdef");
+                    if (ptr) {
+                        backing = XMemBackingKind::FileMappingView;
+                        already_zeroed = true;
+                    }
+                }
+            }
+        }
+#else
         if (posix_memalign(&ptr, std::max<size_t>(alignment, sizeof(void*)), alloc_size) != 0) {
             ptr = nullptr;
         }
@@ -506,9 +861,7 @@ public:
             return nullptr;
         }
 
-        const bool zero_init = ((dwAllocAttributes & XALLOC_FLAG_ZERO_INIT) != 0ull) ||
-                               (((dwAllocAttributes >> 28) & 0xFu) != XALLOC_MEMTYPE_HEAP);
-        if (zero_init) {
+        if (zero_init && !already_zeroed) {
             std::memset(ptr, 0, alloc_size);
         }
 
@@ -519,6 +872,7 @@ public:
             rec.allocated_size = alloc_size;
             rec.alignment = alignment;
             rec.attributes = dwAllocAttributes;
+            rec.backing = backing;
             xmem_allocs_.emplace(reinterpret_cast<uintptr_t>(ptr), rec);
         }
         xmem_allocated_bytes_.fetch_add(alloc_size, std::memory_order_acq_rel);
@@ -532,6 +886,7 @@ public:
             return true;
         }
         size_t freed_bytes = 0;
+        XMemBackingKind backing = XMemBackingKind::AlignedHeap;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             auto it = xmem_allocs_.find(reinterpret_cast<uintptr_t>(pAddress));
@@ -540,11 +895,19 @@ public:
                 return false;
             }
             freed_bytes = it->second.allocated_size;
+            backing = it->second.backing;
             xmem_allocs_.erase(it);
         }
 #if defined(_WIN32)
-        _aligned_free(pAddress);
+        if (backing == XMemBackingKind::VirtualAllocMem) {
+            ::VirtualFree(pAddress, 0u, MEM_RELEASE);
+        } else if (backing == XMemBackingKind::FileMappingView) {
+            ::UnmapViewOfFile(pAddress);
+        } else {
+            _aligned_free(pAddress);
+        }
 #else
+        (void)backing;
         std::free(pAddress);
 #endif
         xmem_allocated_bytes_.fetch_sub(freed_bytes, std::memory_order_acq_rel);
@@ -853,8 +1216,7 @@ public:
         }
         const size_t aligned_size = AlignUp(raw_size, kPage64KB);
         const uint64_t budget = GetTitleBudgetBytes();
-        const uint64_t used = CurrentTitleUsedBytes();
-        if (aligned_size > budget || used > budget - aligned_size) {
+        if (aligned_size > budget) {
             if (outActualSize) {
                 *outActualSize = 0;
             }
@@ -862,8 +1224,22 @@ public:
             return nullptr;
         }
 
+        bool is_file_mapped = false;
 #if defined(_WIN32)
-        void* ptr = VirtualAlloc(nullptr, aligned_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        void* ptr = nullptr;
+        if (!ShouldPreferSparseCommitKx(aligned_size, /*prefer_write_watch_first=*/true)) {
+            ptr = AllocVirtualWriteWatched(
+                nullptr, aligned_size, kPage64KB, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        }
+        if (!ptr) {
+            ptr = MapSparseViewAlignedKx(aligned_size, kPage64KB, PAGE_READWRITE, L"xaux");
+            if (ptr) {
+                is_file_mapped = true;
+            } else {
+                ptr = AllocVirtualWriteWatched(
+                    nullptr, aligned_size, kPage64KB, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+            }
+        }
 #else
         void* ptr = std::calloc(1, aligned_size);
 #endif
@@ -878,6 +1254,9 @@ public:
         {
             std::lock_guard<std::mutex> lock(mutex_);
             aux_allocs_.emplace(reinterpret_cast<uintptr_t>(ptr), aligned_size);
+            if (is_file_mapped) {
+                aux_file_mapped_.insert(reinterpret_cast<uintptr_t>(ptr));
+            }
         }
         aux_allocated_bytes_.fetch_add(aligned_size, std::memory_order_acq_rel);
         UpdateAndGetPeakTitleUsed();
@@ -893,21 +1272,33 @@ public:
             return 0;
         }
         size_t freed_size = 0;
+        bool was_file_mapped = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            auto it = aux_allocs_.find(reinterpret_cast<uintptr_t>(baseAddress));
+            const uintptr_t key = reinterpret_cast<uintptr_t>(baseAddress);
+            auto it = aux_allocs_.find(key);
             if (it == aux_allocs_.end()) {
                 SetHostLastError(87u);
                 return 0;
             }
             freed_size = it->second;
             aux_allocs_.erase(it);
+            auto fit = aux_file_mapped_.find(key);
+            if (fit != aux_file_mapped_.end()) {
+                was_file_mapped = true;
+                aux_file_mapped_.erase(fit);
+            }
         }
 #if defined(_WIN32)
-        if (!VirtualFree(baseAddress, 0, MEM_RELEASE)) {
+        if (was_file_mapped) {
+            if (!::UnmapViewOfFile(baseAddress)) {
+                return 0;
+            }
+        } else if (!VirtualFree(baseAddress, 0, MEM_RELEASE)) {
             return 0;
         }
 #else
+        (void)was_file_mapped;
         std::free(baseAddress);
 #endif
         aux_allocated_bytes_.fetch_sub(freed_size, std::memory_order_acq_rel);
@@ -932,17 +1323,16 @@ public:
         const size_t page_bytes = large_pages ? kPage4MB : kPage64KB;
         const MemoryPageSize page_enum = large_pages ? MemoryPageSize::Page4MB : MemoryPageSize::Page64KB;
         const uint64_t req_pages = *pNumberOfPages;
+        const uint64_t budget = GetTitleBudgetBytes();
 
-        if (req_pages > (GetTitleBudgetBytes() / page_bytes)) {
+        if (req_pages > (budget / page_bytes)) {
             *pNumberOfPages = 0;
             SetHostLastError(8u);  // ERROR_NOT_ENOUGH_MEMORY
             return 0;
         }
 
         const uint64_t total_bytes_64 = req_pages * static_cast<uint64_t>(page_bytes);
-        const uint64_t budget = GetTitleBudgetBytes();
-        const uint64_t used = CurrentTitleUsedBytes();
-        if (total_bytes_64 > budget || used > budget - total_bytes_64) {
+        if (total_bytes_64 > budget) {
             *pNumberOfPages = 0;
             SetHostLastError(8u);  // ERROR_NOT_ENOUGH_MEMORY
             return 0;
@@ -1463,10 +1853,16 @@ public:
         }
         const size_t aligned_size = AlignUp(size, align);
         const uint64_t budget = GetTitleBudgetBytes();
-        const uint64_t used = CurrentTitleUsedBytes();
+        const bool is_gpu_noaccess_window =
+            ((protection & 0xFFu) == PAGE_NOACCESS) || ((protection & 0x800u) != 0u);
 
-        if ((allocationType & MEM_COMMIT) != 0u &&
-            (aligned_size > budget || used > budget - aligned_size)) {
+        if ((allocationType & MEM_COMMIT) != 0u && !is_gpu_noaccess_window &&
+            aligned_size > budget) {
+            SetHostLastError(8u);
+            return nullptr;
+        }
+        constexpr size_t kMaxNoAccessWindowBytes = static_cast<size_t>(1024ull) * 1024ull * 1024ull * 1024ull;
+        if (aligned_size > kMaxNoAccessWindowBytes) {
             SetHostLastError(8u);
             return nullptr;
         }
@@ -1561,18 +1957,15 @@ public:
 
         // Explicit MEM_REPLACE_PLACEHOLDER (0x4000): replace a split OS placeholder range directly
         // via VirtualAlloc2(MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER) with fallback to
-        // MapViewOfFile3(MEM_REPLACE_PLACEHOLDER) when replacing a file-mapped / split placeholder.
+        // MapViewOfFile3(MEM_REPLACE_PLACEHOLDER) (including E:\OpenScarlett\.tmp sparse section).
         if (baseAddress != nullptr && is_replace_placeholder) {
 #if defined(_WIN32)
-            using PfnVirtualAlloc2 = PVOID(WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, void*, ULONG);
-            static PfnVirtualAlloc2 s_va2 = []() -> PfnVirtualAlloc2 {
-                HMODULE kb = GetModuleHandleW(L"kernelbase.dll");
-                return kb ? reinterpret_cast<PfnVirtualAlloc2>(GetProcAddress(kb, "VirtualAlloc2")) : nullptr;
-            }();
+            const PfnKxVirtualAlloc2 s_va2 = GetKxVirtualAlloc2();
             const size_t rep_size = AlignUp(size, kPage64KB);
             const DWORD win_prot = ToWin32PageProtect(protection);
             void* replaced = nullptr;
-            if (s_va2) {
+            bool replaced_via_file = false;
+            if (s_va2 && !ShouldPreferSparseCommitKx(rep_size, /*prefer_write_watch_first=*/true)) {
                 replaced = s_va2(
                     GetCurrentProcess(),
                     baseAddress,
@@ -1591,36 +1984,52 @@ public:
                         nullptr,
                         0u);
                 }
+                if (replaced) {
+                    (void)::ResetWriteWatch(replaced, rep_size);
+                }
             }
             if (!replaced) {
-                using PfnMapViewOfFile3 = PVOID(WINAPI*)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG, void*, ULONG);
-                static PfnMapViewOfFile3 s_map3 = []() -> PfnMapViewOfFile3 {
-                    HMODULE kb = GetModuleHandleW(L"kernelbase.dll");
-                    return kb ? reinterpret_cast<PfnMapViewOfFile3>(GetProcAddress(kb, "MapViewOfFile3")) : nullptr;
-                }();
+                const PfnKxMapViewOfFile3 s_map3 = GetKxMapViewOfFile3();
                 if (s_map3) {
+                    const DWORD map_prot = (win_prot == PAGE_READONLY) ? PAGE_READONLY : PAGE_READWRITE;
                     const DWORD hi = static_cast<DWORD>((static_cast<uint64_t>(rep_size) >> 32) & 0xFFFFFFFFull);
                     const DWORD lo = static_cast<DWORD>(static_cast<uint64_t>(rep_size) & 0xFFFFFFFFull);
-                    HANDLE hmap = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, hi, lo, nullptr);
+                    HANDLE hmap = ShouldPreferSparseCommitKx(rep_size, false)
+                                      ? nullptr
+                                      : CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, hi, lo, nullptr);
+                    if (!hmap) {
+                        hmap = CreateSparseFileSectionKx(rep_size, L"xrepl");
+                    }
                     if (hmap) {
                         replaced = s_map3(
                             hmap, GetCurrentProcess(), baseAddress, 0ull, rep_size,
-                            kMemReplacePlaceholder, win_prot, nullptr, 0u);
+                            kMemReplacePlaceholder, map_prot, nullptr, 0u);
                         CloseHandle(hmap);
+                        if (replaced) {
+                            replaced_via_file = true;
+                            if (win_prot == PAGE_NOACCESS) {
+                                DWORD old_p = 0;
+                                (void)VirtualProtect(replaced, rep_size, PAGE_NOACCESS, &old_p);
+                            }
+                        }
                     }
                 }
             }
             if (replaced) {
+                const size_t commit_charge = is_gpu_noaccess_window ? 0u : rep_size;
                 std::lock_guard<std::mutex> lock(mutex_);
                 AppVirtualAllocRecord rec{};
                 rec.base = reinterpret_cast<uintptr_t>(replaced);
                 rec.size = rep_size;
-                rec.committed_bytes = rep_size;
+                rec.committed_bytes = commit_charge;
                 rec.alloc_flags = allocationType;
                 rec.protection = protection;
                 rec.is_placeholder = false;
+                rec.is_file_mapping = replaced_via_file;
                 app_allocs_[rec.base] = rec;
-                app_committed_bytes_.fetch_add(rep_size, std::memory_order_acq_rel);
+                if (commit_charge > 0u) {
+                    app_committed_bytes_.fetch_add(commit_charge, std::memory_order_acq_rel);
+                }
                 return replaced;
             }
 #endif
@@ -1628,7 +2037,7 @@ public:
 
         // If committing inside a previously reserved OS placeholder (e.g. UE5 XboxCommon
         // FastAllocator calling XMemVirtualAlloc(va, size, MEM_COMMIT|MEM_PHYSICAL) inside a
-        // MEM_RESERVE|MEM_PHYSICAL reservation), commit each uncommitted granule page via
+        // MEM_RESERVE|MEM_PHYSICAL reservation), commit contiguous unmapped spans via
         // UnifiedMemoryManager::MapPhysicalAlias(MEM_REPLACE_PLACEHOLDER).
         if (baseAddress != nullptr && (allocationType & MEM_COMMIT) != 0u &&
             UnifiedMemoryManager::SupportsOsPlaceholders()) {
@@ -1648,30 +2057,37 @@ public:
                 }
             }
             if (in_placeholder) {
-                // Windows VirtualAlloc2 placeholders can always be split at 64 KiB granularity,
-                // even when the enclosing reservation used 4 MiB alignment.
                 const size_t commit_gran = kPage64KB;
                 const uintptr_t page_start = req & ~(commit_gran - 1u);
                 const uintptr_t page_end = std::min<uintptr_t>(
                     AlignUp(req + size, commit_gran), ph_base + ph_size);
                 const uint32_t mem_flags = ToUnifiedFlags(allocationType, protection);
                 const MemoryProtection prot = ToMemoryProtection(protection);
-                for (uintptr_t cur = page_start; cur < page_end; cur += commit_gran) {
-                    void* slot_ptr = reinterpret_cast<void*>(cur);
+                uintptr_t cur = page_start;
+                while (cur < page_end) {
                     UnifiedMemoryAlias existing{};
-                    if (memory_.LookupAliasByHostPtr(slot_ptr, existing)) {
+                    if (memory_.LookupAliasByHostPtr(reinterpret_cast<void*>(cur), existing)) {
+                        cur += commit_gran;
                         continue;
                     }
+                    const uintptr_t run_start = cur;
+                    cur += commit_gran;
+                    while (cur < page_end &&
+                           !memory_.LookupAliasByHostPtr(reinterpret_cast<void*>(cur), existing)) {
+                        cur += commit_gran;
+                    }
+                    const size_t run_bytes = static_cast<size_t>(cur - run_start);
+                    void* slot_ptr = reinterpret_cast<void*>(run_start);
                     PhysicalAllocation phys{};
                     Status ast = memory_.AllocatePhysicalPages(
-                        commit_gran, MemoryPageSize::Page64KB, mem_flags, phys);
+                        run_bytes, MemoryPageSize::Page64KB, mem_flags, phys);
                     if (!ast.ok()) {
                         SetHostLastError(8u);
                         return nullptr;
                     }
                     UnifiedMemoryAlias alias{};
                     Status mst = memory_.MapPhysicalAlias(
-                        phys.physical_id, 0u, commit_gran, prot, mem_flags, slot_ptr, alias);
+                        phys.physical_id, 0u, run_bytes, prot, mem_flags, slot_ptr, alias);
                     if (!mst.ok()) {
                         (void)memory_.FreePhysicalPages(phys.physical_id);
                         std::fprintf(stderr,
@@ -1685,7 +2101,7 @@ public:
                     std::lock_guard<std::mutex> lock(mutex_);
                     ActiveTitleMapping mapping{};
                     mapping.base_va = reinterpret_cast<uintptr_t>(alias.host_ptr);
-                    mapping.size_bytes = commit_gran;
+                    mapping.size_bytes = run_bytes;
                     mapping.page_size_bytes = commit_gran;
                     mapping.primary_physical_id = phys.physical_id;
                     mapping.alloc_flags = allocationType;
@@ -1711,87 +2127,32 @@ public:
             return nullptr;
         }
         const DWORD win_prot = ToWin32PageProtect(protection);
-        bool prefer_sparse = false;
-        if (baseAddress == nullptr && (allocationType & MEM_COMMIT) != 0u &&
-            aligned_size >= (64ull * 1024ull * 1024ull)) {
-            MEMORYSTATUSEX ms{};
-            ms.dwLength = sizeof(ms);
-            if (GlobalMemoryStatusEx(&ms) &&
-                ms.ullAvailPageFile < static_cast<DWORDLONG>(aligned_size) + (2ull * 1024ull * 1024ull * 1024ull)) {
-                prefer_sparse = true;
-            }
-        }
+        const bool prefer_sparse =
+            (baseAddress == nullptr) &&
+            ((allocationType & MEM_COMMIT) != 0u) &&
+            (is_gpu_noaccess_window
+                 ? (aligned_size >= (32ull * 1024ull * 1024ull))
+                 : ShouldPreferSparseCommitKx(aligned_size, /*prefer_write_watch_first=*/true));
         void* ptr = nullptr;
         if (!prefer_sparse) {
-            if ((win_alloc & MEM_RESERVE) != 0u && (win_alloc & MEM_RESET) == 0u &&
-                (win_prot == PAGE_READWRITE || win_prot == PAGE_NOACCESS)) {
-                ptr = VirtualAlloc(baseAddress, aligned_size, win_alloc | MEM_WRITE_WATCH, win_prot);
-            }
-            if (!ptr) {
-                ptr = VirtualAlloc(baseAddress, aligned_size, win_alloc, win_prot);
-            }
+            ptr = AllocVirtualWriteWatched(baseAddress, aligned_size, align, win_alloc, win_prot);
         }
-        if (!ptr && baseAddress == nullptr && (allocationType & MEM_COMMIT) != 0u &&
-            (prefer_sparse || GetLastError() == ERROR_COMMITMENT_LIMIT || GetLastError() == ERROR_NOT_ENOUGH_MEMORY)) {
-            // Host pagefile commit limit exhausted (common when retail Scarlett titles pre-commit
-            // multi-GiB pools on 8-16 GiB laptops). Back the allocation with a sparse NTFS file
-            // (FSCTL_SET_SPARSE + FILE_FLAG_DELETE_ON_CLOSE) located alongside kernelx.dll so
-            // untouched pages consume zero commit charge and zero disk blocks.
-            HMODULE self_mod = nullptr;
-            wchar_t dir_buf[MAX_PATH * 2]{};
-            std::wstring backing_dir;
-            if (GetModuleHandleExW(
-                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                    reinterpret_cast<LPCWSTR>(&ResolveConsoleType),
-                    &self_mod) && self_mod) {
-                const DWORD n = GetModuleFileNameW(self_mod, dir_buf, static_cast<DWORD>(sizeof(dir_buf) / sizeof(wchar_t)));
-                if (n > 0u && n < (sizeof(dir_buf) / sizeof(wchar_t))) {
-                    std::wstring p(dir_buf, n);
-                    const size_t sl = p.find_last_of(L"\\/");
-                    if (sl != std::wstring::npos) {
-                        backing_dir = p.substr(0, sl) + L"\\.xmem_sparse";
-                    }
-                }
+        if (!ptr && baseAddress == nullptr && (allocationType & MEM_COMMIT) != 0u) {
+            // Host pagefile commit pressure fallback: back the allocation with a sparse NTFS file
+            // on E:\OpenScarlett\.tmp (never C:\) so untouched pages consume zero commit charge
+            // and zero disk blocks instead of returning NULL.
+            void* mapped = MapSparseViewAlignedKx(aligned_size, align, win_prot, L"xmem");
+            if (mapped) {
+                ptr = mapped;
+                allocated_via_file_mapping = true;
+            } else if (prefer_sparse) {
+                ptr = AllocVirtualWriteWatched(baseAddress, aligned_size, align, win_alloc, win_prot);
             }
-            if (!backing_dir.empty()) {
-                CreateDirectoryW(backing_dir.c_str(), nullptr);
-                static std::atomic<uint64_t> s_sparse_seq{1};
-                const uint64_t seq = s_sparse_seq.fetch_add(1, std::memory_order_relaxed);
-                wchar_t file_path[MAX_PATH * 2]{};
-                std::swprintf(file_path, sizeof(file_path) / sizeof(wchar_t),
-                              L"%ls\\xmem_%lu_%llu.bin",
-                              backing_dir.c_str(),
-                              static_cast<unsigned long>(GetCurrentProcessId()),
-                              static_cast<unsigned long long>(seq));
-                HANDLE hf = CreateFileW(
-                    file_path,
-                    GENERIC_READ | GENERIC_WRITE,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                    nullptr,
-                    CREATE_ALWAYS,
-                    FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
-                    nullptr);
-                if (hf != INVALID_HANDLE_VALUE) {
-                    constexpr DWORD kFsctlSetSparse = 0x000900C4u;
-                    DWORD bytes_ret = 0;
-                    (void)DeviceIoControl(hf, kFsctlSetSparse, nullptr, 0, nullptr, 0, &bytes_ret, nullptr);
-                    LARGE_INTEGER li{};
-                    li.QuadPart = static_cast<LONGLONG>(aligned_size);
-                    if (SetFilePointerEx(hf, li, nullptr, FILE_BEGIN) && SetEndOfFile(hf)) {
-                        const DWORD hi = static_cast<DWORD>((static_cast<uint64_t>(aligned_size) >> 32) & 0xFFFFFFFFull);
-                        const DWORD lo = static_cast<DWORD>(static_cast<uint64_t>(aligned_size) & 0xFFFFFFFFull);
-                        HANDLE hmap = CreateFileMappingW(hf, nullptr, PAGE_READWRITE, hi, lo, nullptr);
-                        if (hmap) {
-                            void* mapped = MapViewOfFile(hmap, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, aligned_size);
-                            CloseHandle(hmap);
-                            if (mapped) {
-                                ptr = mapped;
-                                allocated_via_file_mapping = true;
-                            }
-                        }
-                    }
-                    CloseHandle(hf);
-                }
+            if (!ptr && is_gpu_noaccess_window) {
+                // GPU-only PAGE_NOACCESS VA window never needs CPU commit; MEM_RESERVE alone
+                // provides a valid non-overlapping process VA window with zero commit charge.
+                ptr = AllocVirtualWriteWatched(
+                    nullptr, aligned_size, align, MEM_RESERVE | (win_alloc & MEM_TOP_DOWN), PAGE_NOACCESS);
             }
         }
         if (!ptr && baseAddress != nullptr && (allocationType & MEM_COMMIT) != 0u &&
@@ -1801,13 +2162,7 @@ public:
                 if (mbi.State == MEM_COMMIT) {
                     ptr = baseAddress;
                 } else if (mbi.State == MEM_RESERVE && mbi.Type == MEM_PRIVATE) {
-                    // Untracked OS placeholder (e.g. reserved via kernelbase!VirtualAlloc2 or split
-                    // via MEM_PRESERVE_PLACEHOLDER): back directly with MapViewOfFile3(MEM_REPLACE_PLACEHOLDER).
-                    using PfnMapViewOfFile3 = PVOID(WINAPI*)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG, void*, ULONG);
-                    static PfnMapViewOfFile3 s_map3 = []() -> PfnMapViewOfFile3 {
-                        HMODULE kb = GetModuleHandleW(L"kernelbase.dll");
-                        return kb ? reinterpret_cast<PfnMapViewOfFile3>(GetProcAddress(kb, "MapViewOfFile3")) : nullptr;
-                    }();
+                    const PfnKxMapViewOfFile3 s_map3 = GetKxMapViewOfFile3();
                     if (s_map3) {
                         constexpr DWORD kMemPreservePlaceholder = 0x00000002u;
                         const size_t map_bytes = AlignUp(size, kPage64KB);
@@ -1816,14 +2171,25 @@ public:
                         }
                         const DWORD hi = static_cast<DWORD>((static_cast<uint64_t>(map_bytes) >> 32) & 0xFFFFFFFFull);
                         const DWORD lo = static_cast<DWORD>(static_cast<uint64_t>(map_bytes) & 0xFFFFFFFFull);
-                        HANDLE hmap = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, hi, lo, nullptr);
+                        HANDLE hmap = ShouldPreferSparseCommitKx(map_bytes, false)
+                                          ? nullptr
+                                          : CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, hi, lo, nullptr);
+                        if (!hmap) {
+                            hmap = CreateSparseFileSectionKx(map_bytes, L"xph");
+                        }
                         if (hmap) {
+                            const DWORD map_prot = (win_prot == PAGE_READONLY) ? PAGE_READONLY : PAGE_READWRITE;
                             void* mapped = s_map3(
                                 hmap, GetCurrentProcess(), baseAddress, 0ull, map_bytes,
-                                static_cast<ULONG>(kMemReplacePlaceholder), PAGE_READWRITE, nullptr, 0u);
+                                static_cast<ULONG>(kMemReplacePlaceholder), map_prot, nullptr, 0u);
                             CloseHandle(hmap);
                             if (mapped) {
                                 ptr = mapped;
+                                allocated_via_file_mapping = true;
+                                if (win_prot == PAGE_NOACCESS) {
+                                    DWORD old_p = 0;
+                                    (void)VirtualProtect(mapped, map_bytes, PAGE_NOACCESS, &old_p);
+                                }
                             }
                         }
                     }
@@ -1844,10 +2210,12 @@ public:
         {
             std::lock_guard<std::mutex> lock(mutex_);
             const uintptr_t key = reinterpret_cast<uintptr_t>(ptr);
+            const size_t commit_charge =
+                (((allocationType & MEM_COMMIT) != 0u) && !is_gpu_noaccess_window) ? aligned_size : 0u;
             auto it = app_allocs_.find(key);
             if (it != app_allocs_.end()) {
-                if ((allocationType & MEM_COMMIT) != 0u) {
-                    const size_t new_committed = std::max(it->second.committed_bytes, aligned_size);
+                if (commit_charge > 0u) {
+                    const size_t new_committed = std::max(it->second.committed_bytes, commit_charge);
                     const size_t delta = new_committed - it->second.committed_bytes;
                     it->second.committed_bytes = new_committed;
                     app_committed_bytes_.fetch_add(delta, std::memory_order_acq_rel);
@@ -1857,7 +2225,7 @@ public:
                 AppVirtualAllocRecord rec{};
                 rec.base = key;
                 rec.size = aligned_size;
-                rec.committed_bytes = (allocationType & MEM_COMMIT) ? aligned_size : 0;
+                rec.committed_bytes = commit_charge;
                 rec.alloc_flags = allocationType;
                 rec.protection = protection;
                 rec.is_placeholder = false;
@@ -2563,7 +2931,11 @@ public:
                 }
             } else {
 #if defined(_WIN32)
-                VirtualFree(reinterpret_cast<void*>(base), 0, MEM_RELEASE);
+                if (rec.is_file_mapping) {
+                    ::UnmapViewOfFile(reinterpret_cast<void*>(base));
+                } else {
+                    VirtualFree(reinterpret_cast<void*>(base), 0, MEM_RELEASE);
+                }
 #else
                 std::free(reinterpret_cast<void*>(base));
 #endif
@@ -2572,10 +2944,16 @@ public:
         app_allocs_.clear();
 
         for (auto& [ptr, rec] : xmem_allocs_) {
-            (void)rec;
 #if defined(_WIN32)
-            _aligned_free(reinterpret_cast<void*>(ptr));
+            if (rec.backing == XMemBackingKind::VirtualAllocMem) {
+                ::VirtualFree(reinterpret_cast<void*>(ptr), 0u, MEM_RELEASE);
+            } else if (rec.backing == XMemBackingKind::FileMappingView) {
+                ::UnmapViewOfFile(reinterpret_cast<void*>(ptr));
+            } else {
+                _aligned_free(reinterpret_cast<void*>(ptr));
+            }
 #else
+            (void)rec;
             std::free(reinterpret_cast<void*>(ptr));
 #endif
         }
@@ -2584,12 +2962,17 @@ public:
         for (auto& [ptr, sz] : aux_allocs_) {
             (void)sz;
 #if defined(_WIN32)
-            VirtualFree(reinterpret_cast<void*>(ptr), 0, MEM_RELEASE);
+            if (aux_file_mapped_.find(ptr) != aux_file_mapped_.end()) {
+                ::UnmapViewOfFile(reinterpret_cast<void*>(ptr));
+            } else {
+                VirtualFree(reinterpret_cast<void*>(ptr), 0, MEM_RELEASE);
+            }
 #else
             std::free(reinterpret_cast<void*>(ptr));
 #endif
         }
         aux_allocs_.clear();
+        aux_file_mapped_.clear();
 
         pfn_table_.clear();
         pools_.clear();
@@ -2633,6 +3016,7 @@ private:
     std::unordered_map<uintptr_t, AppVirtualAllocRecord> app_allocs_;
     std::unordered_map<uintptr_t, XMemAllocRecord> xmem_allocs_;
     std::unordered_map<uintptr_t, size_t> aux_allocs_;
+    std::unordered_set<uintptr_t> aux_file_mapped_;
     std::unordered_map<uint32_t, std::wstring> thread_names_;
     std::unordered_map<uint32_t, uint64_t> thread_affinities_;
     std::unordered_map<uint32_t, uint32_t> thread_ideal_procs_;
@@ -2657,9 +3041,9 @@ int32_t OPENSCARLETT_KERNELX_CALL TitleMemoryStatus(TITLEMEMORYSTATUS* lpBuffer)
 
     auto& state = KernelXState::Instance();
     const uint64_t total = GetTitleBudgetBytes();
-    const uint64_t used = state.CurrentTitleUsedBytes();
-    const uint64_t peak = state.UpdateAndGetPeakTitleUsed();
-    const uint64_t avail = (total > used) ? (total - used) : 0ull;
+    const uint64_t used = std::min<uint64_t>(state.CurrentTitleUsedBytes(), total);
+    const uint64_t peak = std::min<uint64_t>(state.UpdateAndGetPeakTitleUsed(), total);
+    const uint64_t avail = total - used;
 
     lpBuffer->dwLength = static_cast<uint32_t>(sizeof(TITLEMEMORYSTATUS));
     lpBuffer->dwReserved = 0;
@@ -2673,6 +3057,212 @@ int32_t OPENSCARLETT_KERNELX_CALL TitleMemoryStatus(TITLEMEMORYSTATUS* lpBuffer)
 
     RecordTelemetry(__func__, CallOutcome::Ok, kHrOk);
     return 1;
+}
+
+OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL KernelXJobMemoryStatus(
+    TITLEMEMORYSTATUS* lpBuffer) {
+    if (!lpBuffer) {
+        SetHostLastError(87u);
+        RecordTelemetry("JobMemoryStatus", CallOutcome::Error, kHrInvalidArg);
+        return 0;
+    }
+    if (lpBuffer->dwLength != 0 && lpBuffer->dwLength < sizeof(TITLEMEMORYSTATUS)) {
+        SetHostLastError(87u);
+        RecordTelemetry("JobMemoryStatus", CallOutcome::Error, kHrInvalidArg);
+        return 0;
+    }
+    auto& state = KernelXState::Instance();
+    const uint64_t total = GetTitleBudgetBytes();
+    const uint64_t used = std::min<uint64_t>(state.CurrentTitleUsedBytes(), total);
+    const uint64_t peak = std::min<uint64_t>(state.UpdateAndGetPeakTitleUsed(), total);
+    const uint64_t avail = total - used;
+
+    lpBuffer->dwLength = static_cast<uint32_t>(sizeof(TITLEMEMORYSTATUS));
+    lpBuffer->dwReserved = 0;
+    lpBuffer->ullTotalMem = total;
+    lpBuffer->ullAvailMem = avail;
+    lpBuffer->ullLegacyUsed = used;
+    lpBuffer->ullLegacyPeak = peak;
+    lpBuffer->ullLegacyAvail = avail;
+    lpBuffer->ullTitleUsed = used;
+    lpBuffer->ullTitleAvail = avail;
+
+    RecordTelemetry("JobMemoryStatus", CallOutcome::Ok, kHrOk);
+    return 1;
+}
+
+OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL KernelXGlobalMemoryStatusEx(
+    void* lpBuffer) {
+#if defined(_WIN32)
+    auto* ms = static_cast<MEMORYSTATUSEX*>(lpBuffer);
+    if (!ms || (ms->dwLength != 0u && ms->dwLength < sizeof(MEMORYSTATUSEX))) {
+        SetHostLastError(87u);
+        RecordTelemetry("GlobalMemoryStatusEx", CallOutcome::Error, kHrInvalidArg);
+        return 0;
+    }
+    MEMORYSTATUSEX host_ms{};
+    host_ms.dwLength = sizeof(host_ms);
+    if (!::GlobalMemoryStatusEx(&host_ms)) {
+        host_ms.ullTotalVirtual = 0x00007FFFFFFFE000ull;
+        host_ms.ullAvailVirtual = 0x00007FFE00000000ull;
+    }
+    auto& state = KernelXState::Instance();
+    const uint64_t budget = GetTitleBudgetBytes();
+    const uint64_t used = std::min<uint64_t>(state.CurrentTitleUsedBytes(), budget);
+    const uint64_t avail = budget - used;
+
+    ms->dwLength = sizeof(MEMORYSTATUSEX);
+    ms->dwMemoryLoad = budget > 0ull
+                           ? static_cast<DWORD>(std::min<uint64_t>(100ull, (used * 100ull) / budget))
+                           : 0u;
+    ms->ullTotalPhys = budget;
+    ms->ullAvailPhys = avail;
+    ms->ullTotalPageFile = budget;
+    ms->ullAvailPageFile = avail;
+    ms->ullTotalVirtual = host_ms.ullTotalVirtual;
+    ms->ullAvailVirtual = host_ms.ullAvailVirtual;
+    ms->ullAvailExtendedVirtual = 0ull;
+    SetHostLastError(0u);
+    RecordTelemetry("GlobalMemoryStatusEx", CallOutcome::Ok, kHrOk);
+    return 1;
+#else
+    (void)lpBuffer;
+    SetHostLastError(87u);
+    return 0;
+#endif
+}
+
+OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL KernelXQueryInformationJobObject(
+    void* hJob,
+    int jobObjectInfoClass,
+    void* lpJobObjectInformation,
+    uint32_t cbJobObjectInformationLength,
+    uint32_t* lpReturnLength) {
+#if defined(_WIN32)
+    if (!lpJobObjectInformation) {
+        SetHostLastError(87u);
+        RecordTelemetry("QueryInformationJobObject", CallOutcome::Error, kHrInvalidArg);
+        return 0;
+    }
+    const uint64_t budget = GetTitleBudgetBytes();
+    auto& state = KernelXState::Instance();
+    const uint64_t used = std::min<uint64_t>(state.CurrentTitleUsedBytes(), budget);
+    const uint64_t peak = std::min<uint64_t>(state.UpdateAndGetPeakTitleUsed(), budget);
+
+    if (jobObjectInfoClass == static_cast<int>(JobObjectExtendedLimitInformation)) {
+        if (cbJobObjectInformationLength < sizeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION)) {
+            if (lpReturnLength) *lpReturnLength = sizeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION);
+            SetHostLastError(24u);  // ERROR_BAD_LENGTH
+            RecordTelemetry("QueryInformationJobObject", CallOutcome::Error, kHrInvalidArg);
+            return 0;
+        }
+        auto* ext = static_cast<JOBOBJECT_EXTENDED_LIMIT_INFORMATION*>(lpJobObjectInformation);
+        DWORD host_ret = 0u;
+        if (!::QueryInformationJobObject(static_cast<HANDLE>(hJob),
+                                         JobObjectExtendedLimitInformation,
+                                         ext,
+                                         cbJobObjectInformationLength,
+                                         &host_ret)) {
+            if (hJob != nullptr) {
+                RecordTelemetry("QueryInformationJobObject", CallOutcome::Error, kHrFail);
+                return 0;
+            }
+            std::memset(ext, 0, sizeof(*ext));
+        }
+        ext->BasicLimitInformation.LimitFlags |=
+            (JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_JOB_MEMORY);
+        ext->ProcessMemoryLimit = static_cast<SIZE_T>(budget);
+        ext->JobMemoryLimit = static_cast<SIZE_T>(budget);
+        ext->PeakProcessMemoryUsed = static_cast<SIZE_T>(
+            std::min<uint64_t>(std::max<uint64_t>(peak, ext->PeakProcessMemoryUsed), budget));
+        ext->PeakJobMemoryUsed = static_cast<SIZE_T>(
+            std::min<uint64_t>(std::max<uint64_t>(peak, ext->PeakJobMemoryUsed), budget));
+        if (lpReturnLength) *lpReturnLength = sizeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION);
+        SetHostLastError(0u);
+        RecordTelemetry("QueryInformationJobObject", CallOutcome::Ok, kHrOk);
+        return 1;
+    }
+
+    DWORD host_ret = 0u;
+    const BOOL ok = ::QueryInformationJobObject(
+        static_cast<HANDLE>(hJob),
+        static_cast<JOBOBJECTINFOCLASS>(jobObjectInfoClass),
+        lpJobObjectInformation,
+        cbJobObjectInformationLength,
+        &host_ret);
+    if (lpReturnLength) *lpReturnLength = static_cast<uint32_t>(host_ret);
+    (void)used;
+    RecordTelemetry("QueryInformationJobObject", ok ? CallOutcome::Ok : CallOutcome::Error,
+                    ok ? kHrOk : kHrFail);
+    return ok ? 1 : 0;
+#else
+    (void)hJob;
+    (void)jobObjectInfoClass;
+    (void)lpJobObjectInformation;
+    (void)cbJobObjectInformationLength;
+    (void)lpReturnLength;
+    return 0;
+#endif
+}
+
+OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL KernelXGetProcessInformation(
+    void* hProcess,
+    int processInformationClass,
+    void* processInformation,
+    uint32_t processInformationSize) {
+#if defined(_WIN32)
+    // ProcessAppMemoryInfo == 9 in Win10/GameCore PROCESS_INFORMATION_CLASS
+    constexpr int kProcessAppMemoryInfo = 9;
+    struct KxAppMemoryInformation {
+        uint64_t AvailableCommit;
+        uint64_t PrivateCommitUsage;
+        uint64_t PeakPrivateCommitUsage;
+        uint64_t TotalCommitUsage;
+    };
+    if (processInformationClass == kProcessAppMemoryInfo) {
+        if (!processInformation || processInformationSize < sizeof(KxAppMemoryInformation)) {
+            SetHostLastError(87u);
+            RecordTelemetry("GetProcessInformation", CallOutcome::Error, kHrInvalidArg);
+            return 0;
+        }
+        auto& state = KernelXState::Instance();
+        const uint64_t budget = GetTitleBudgetBytes();
+        const uint64_t used = std::min<uint64_t>(state.CurrentTitleUsedBytes(), budget);
+        const uint64_t peak = std::min<uint64_t>(state.UpdateAndGetPeakTitleUsed(), budget);
+        auto* out = static_cast<KxAppMemoryInformation*>(processInformation);
+        out->AvailableCommit = budget - used;
+        out->PrivateCommitUsage = used;
+        out->PeakPrivateCommitUsage = peak;
+        out->TotalCommitUsage = used;
+        SetHostLastError(0u);
+        RecordTelemetry("GetProcessInformation", CallOutcome::Ok, kHrOk);
+        return 1;
+    }
+    using PfnGetProcessInformation = BOOL(WINAPI*)(HANDLE, int, LPVOID, DWORD);
+    static PfnGetProcessInformation s_fn = []() -> PfnGetProcessInformation {
+        HMODULE kb = ::GetModuleHandleW(L"kernelbase.dll");
+        if (!kb) kb = ::GetModuleHandleW(L"kernel32.dll");
+        return kb ? reinterpret_cast<PfnGetProcessInformation>(
+                        ::GetProcAddress(kb, "GetProcessInformation"))
+                  : nullptr;
+    }();
+    if (!s_fn) {
+        SetHostLastError(87u);
+        RecordTelemetry("GetProcessInformation", CallOutcome::Error, kHrInvalidArg);
+        return 0;
+    }
+    const BOOL ok = s_fn(
+        static_cast<HANDLE>(hProcess), processInformationClass, processInformation, processInformationSize);
+    RecordTelemetry("GetProcessInformation", ok ? CallOutcome::Ok : CallOutcome::Error,
+                    ok ? kHrOk : kHrFail);
+    return ok ? 1 : 0;
+#else
+    (void)hProcess;
+    (void)processInformationClass;
+    (void)processInformation;
+    (void)processInformationSize;
+    return 0;
+#endif
 }
 
 int32_t OPENSCARLETT_KERNELX_CALL ToolingMemoryStatus(TOOLINGMEMORYSTATUS* lpBuffer) {
@@ -2878,8 +3468,8 @@ OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL XMemGetWorkingSetStat
 
     auto& state = KernelXState::Instance();
     const uint64_t title_budget = GetTitleBudgetBytes();
-    const uint64_t tracked_used = state.CurrentTitleUsedBytes();
-    const uint64_t tracked_peak = state.UpdateAndGetPeakTitleUsed();
+    const uint64_t tracked_used = std::min<uint64_t>(state.CurrentTitleUsedBytes(), title_budget);
+    const uint64_t tracked_peak = std::min<uint64_t>(state.UpdateAndGetPeakTitleUsed(), title_budget);
 
     XMEM_WORKING_SET_STATISTICS stats{};
     stats.Size = sizeof(XMEM_WORKING_SET_STATISTICS);
@@ -2887,25 +3477,11 @@ OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL XMemGetWorkingSetStat
     stats.WorkingSetBytes = tracked_used;
     stats.PeakWorkingSetBytes = tracked_peak;
     stats.PrivateUsageBytes = tracked_used;
-    stats.AvailablePhysicalBytes = (title_budget > tracked_used) ? (title_budget - tracked_used) : 0ull;
+    stats.AvailablePhysicalBytes = title_budget - tracked_used;
     stats.PageFaultCount = 0ull;
     stats.TrackedTitleAllocBytes = tracked_used;
 
 #if defined(_WIN32)
-    MEMORYSTATUSEX mem_status{};
-    mem_status.dwLength = sizeof(mem_status);
-    if (::GlobalMemoryStatusEx(&mem_status)) {
-        if (mem_status.ullTotalPhys > 0ull) {
-            stats.TotalPhysicalBytes = std::min<uint64_t>(title_budget, mem_status.ullTotalPhys);
-            if (stats.TotalPhysicalBytes == 0ull) {
-                stats.TotalPhysicalBytes = title_budget;
-            }
-        }
-        const uint64_t title_avail =
-            (stats.TotalPhysicalBytes > tracked_used) ? (stats.TotalPhysicalBytes - tracked_used) : 0ull;
-        stats.AvailablePhysicalBytes = std::min<uint64_t>(title_avail, mem_status.ullAvailPhys);
-    }
-
     struct OsProcessMemoryCountersEx {
         DWORD cb;
         DWORD PageFaultCount;
@@ -2937,16 +3513,22 @@ OPENSCARLETT_KERNELX_API int32_t OPENSCARLETT_KERNELX_CALL XMemGetWorkingSetStat
         OsProcessMemoryCountersEx pmc{};
         pmc.cb = sizeof(pmc);
         if (pfn_get_pmi(::GetCurrentProcess(), &pmc, sizeof(pmc))) {
-            stats.WorkingSetBytes = std::max<uint64_t>(
-                tracked_used, static_cast<uint64_t>(pmc.WorkingSetSize));
-            stats.PeakWorkingSetBytes = std::max<uint64_t>(
-                std::max<uint64_t>(tracked_peak, stats.WorkingSetBytes),
-                static_cast<uint64_t>(pmc.PeakWorkingSetSize));
-            stats.PrivateUsageBytes = std::max<uint64_t>(
-                tracked_used, static_cast<uint64_t>(pmc.PrivateUsage));
+            stats.WorkingSetBytes = std::min<uint64_t>(
+                title_budget,
+                std::max<uint64_t>(tracked_used, static_cast<uint64_t>(pmc.WorkingSetSize)));
+            stats.PeakWorkingSetBytes = std::min<uint64_t>(
+                title_budget,
+                std::max<uint64_t>(
+                    std::max<uint64_t>(tracked_peak, stats.WorkingSetBytes),
+                    static_cast<uint64_t>(pmc.PeakWorkingSetSize)));
+            stats.PrivateUsageBytes = std::min<uint64_t>(
+                title_budget,
+                std::max<uint64_t>(tracked_used, static_cast<uint64_t>(pmc.PrivateUsage)));
             stats.PageFaultCount = static_cast<uint64_t>(pmc.PageFaultCount);
         }
     }
+    stats.AvailablePhysicalBytes =
+        (title_budget > stats.WorkingSetBytes) ? (title_budget - stats.WorkingSetBytes) : 0ull;
 #endif
 
     if (is_two_arg_xbox_abi) {

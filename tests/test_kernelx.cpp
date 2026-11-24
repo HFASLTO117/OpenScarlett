@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <string>
 #include <vector>
 
 #if defined(_WIN32)
@@ -588,6 +589,204 @@ void TestKernelXExports() {
     std::printf("[PASS] Test 4: kernelx.dll exports, live aliasing & CallTelemetry verified\n");
 }
 
+#if defined(_WIN32)
+class ScopedEnvVar {
+public:
+    ScopedEnvVar(const char* name, const char* value) : name_(name) {
+        char buf[256] = {};
+        const DWORD n = ::GetEnvironmentVariableA(name, buf, static_cast<DWORD>(sizeof(buf)));
+        if (n > 0u && n < sizeof(buf)) {
+            had_old_ = true;
+            old_.assign(buf, n);
+        }
+        ::SetEnvironmentVariableA(name, value);
+    }
+    ~ScopedEnvVar() {
+        ::SetEnvironmentVariableA(name_, had_old_ ? old_.c_str() : nullptr);
+    }
+
+private:
+    const char* name_;
+    bool had_old_ = false;
+    std::string old_;
+};
+
+void TestLockhartBudgetWriteWatchAndSparseFallback() {
+    ScopedEnvVar guard_type("OPENSCARLETT_CONSOLE_TYPE", nullptr);
+    ScopedEnvVar guard_prof("OPENSCARLETT_CONSOLE_PROFILE", nullptr);
+    ScopedEnvVar guard_mb("OPENSCARLETT_TITLE_MEM_MB", nullptr);
+    ScopedEnvVar guard_sparse("OPENSCARLETT_FORCE_SPARSE_COMMIT", nullptr);
+
+    HMODULE h_kx = ::GetModuleHandleW(L"kernelx.dll");
+    OS_REQUIRE(h_kx != nullptr);
+
+    using PfnGlobalMemoryStatusEx = int32_t(__stdcall*)(MEMORYSTATUSEX*);
+    using PfnQueryJobObj = int32_t(__stdcall*)(HANDLE, int, void*, uint32_t, uint32_t*);
+    using PfnJobMemStatus = int32_t(__stdcall*)(TITLEMEMORYSTATUS*);
+    using PfnWsStats = int32_t(__stdcall*)(uintptr_t, void*);
+
+    auto p_gms = reinterpret_cast<PfnGlobalMemoryStatusEx>(
+        ::GetProcAddress(h_kx, "GlobalMemoryStatusEx"));
+    auto p_qjob = reinterpret_cast<PfnQueryJobObj>(
+        ::GetProcAddress(h_kx, "QueryInformationJobObject"));
+    auto p_jmem = reinterpret_cast<PfnJobMemStatus>(
+        ::GetProcAddress(h_kx, "JobMemoryStatus"));
+    auto p_ws = reinterpret_cast<PfnWsStats>(
+        ::GetProcAddress(h_kx, "XMemGetWorkingSetStatistics"));
+    OS_REQUIRE(p_gms != nullptr && p_qjob != nullptr && p_jmem != nullptr && p_ws != nullptr);
+
+    // 1. Verify OPENSCARLETT_CONSOLE_PROFILE Lockhart aliases & 8 GiB budget across all APIs.
+    constexpr uint64_t kLockhartBytes = 8ull * 1024ull * 1024ull * 1024ull;
+    const char* kLockhartTokens[] = {"lockhart", "series_s", "series-s", "3", "s", "8GB"};
+    for (const char* tok : kLockhartTokens) {
+        ::SetEnvironmentVariableA("OPENSCARLETT_CONSOLE_PROFILE", tok);
+        OS_REQUIRE(GetConsoleType() == CONSOLE_TYPE_XBOX_SCARLETT_LOCKHART);
+
+        TITLEMEMORYSTATUS tms{};
+        tms.dwLength = sizeof(tms);
+        OS_REQUIRE(TitleMemoryStatus(&tms) == 1);
+        OS_REQUIRE(tms.ullTotalMem == kLockhartBytes);
+        OS_REQUIRE(tms.ullTitleAvail <= kLockhartBytes);
+
+        TITLEMEMORYSTATUS jms{};
+        jms.dwLength = sizeof(jms);
+        OS_REQUIRE(p_jmem(&jms) == 1);
+        OS_REQUIRE(jms.ullTotalMem == kLockhartBytes);
+
+        MEMORYSTATUSEX ms{};
+        ms.dwLength = sizeof(ms);
+        OS_REQUIRE(p_gms(&ms) == 1);
+        OS_REQUIRE(ms.ullTotalPhys == kLockhartBytes);
+        OS_REQUIRE(ms.ullTotalPageFile == kLockhartBytes);
+
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION job_ext{};
+        uint32_t ret_len = 0u;
+        OS_REQUIRE(p_qjob(nullptr,
+                          static_cast<int>(JobObjectExtendedLimitInformation),
+                          &job_ext,
+                          sizeof(job_ext),
+                          &ret_len) == 1);
+        OS_REQUIRE(job_ext.JobMemoryLimit == kLockhartBytes);
+        OS_REQUIRE(job_ext.ProcessMemoryLimit == kLockhartBytes);
+
+        struct Ws32 {
+            uint64_t total;
+            uint64_t avail;
+            uint64_t ws;
+            uint64_t peak;
+        } ws32{};
+        std::memset(&ws32, 0xCC, sizeof(ws32));
+        OS_REQUIRE(p_ws(0x20000001u, &ws32) == 1);
+        OS_REQUIRE(ws32.total == kLockhartBytes);
+        OS_REQUIRE(ws32.avail <= kLockhartBytes);
+    }
+
+    // 2. Verify "auto" profile selection based on host physical RAM (<= 18 GiB -> Lockhart).
+    ::SetEnvironmentVariableA("OPENSCARLETT_CONSOLE_PROFILE", "auto");
+    MEMORYSTATUSEX real_host_ms{};
+    real_host_ms.dwLength = sizeof(real_host_ms);
+    OS_REQUIRE(::GlobalMemoryStatusEx(&real_host_ms) != FALSE);
+    const uint32_t expected_auto =
+        (real_host_ms.ullTotalPhys <= (18ull * 1024ull * 1024ull * 1024ull))
+            ? CONSOLE_TYPE_XBOX_SCARLETT_LOCKHART
+            : CONSOLE_TYPE_XBOX_SCARLETT_ANACONDA;
+    OS_REQUIRE(GetConsoleType() == expected_auto);
+
+    // 3. Verify OPENSCARLETT_TITLE_MEM_MB explicit budget override (e.g. 6144 MiB).
+    ::SetEnvironmentVariableA("OPENSCARLETT_CONSOLE_PROFILE", "lockhart");
+    ::SetEnvironmentVariableA("OPENSCARLETT_TITLE_MEM_MB", "6144");
+    constexpr uint64_t kOverride6GiB = 6144ull * 1024ull * 1024ull;
+    {
+        TITLEMEMORYSTATUS tms{};
+        tms.dwLength = sizeof(tms);
+        OS_REQUIRE(TitleMemoryStatus(&tms) == 1);
+        OS_REQUIRE(tms.ullTotalMem == kOverride6GiB);
+
+        MEMORYSTATUSEX ms{};
+        ms.dwLength = sizeof(ms);
+        OS_REQUIRE(p_gms(&ms) == 1);
+        OS_REQUIRE(ms.ullTotalPhys == kOverride6GiB);
+    }
+    ::SetEnvironmentVariableA("OPENSCARLETT_TITLE_MEM_MB", nullptr);
+    ::SetEnvironmentVariableA("OPENSCARLETT_CONSOLE_PROFILE", nullptr);
+
+    // 4. Verify hardware MEM_WRITE_WATCH on VirtualAllocFromApp (MEM_RESERVE|MEM_COMMIT & MEM_RESERVE),
+    //    XMemAllocDefault (graphics WC), and UnifiedMemoryManager::Allocate.
+    {
+        void* rw_mem = KernelXVirtualAllocFromApp(
+            nullptr, 4u * 4096u, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | PAGE_WRITECOMBINE);
+        OS_REQUIRE(rw_mem != nullptr);
+        static_cast<uint32_t*>(rw_mem)[(2u * 4096u) / 4u] = 0x12345678u;
+        void* dirty[8] = {};
+        ULONG_PTR count = 8u;
+        DWORD gran = 0u;
+        OS_REQUIRE(::GetWriteWatch(WRITE_WATCH_FLAG_RESET, rw_mem, 4u * 4096u, dirty, &count, &gran) == 0u);
+        OS_REQUIRE(count == 1u && dirty[0] == static_cast<uint8_t*>(rw_mem) + 2u * 4096u);
+        OS_REQUIRE(KernelXVirtualFree(rw_mem, 0u, MEM_RELEASE) == 1);
+
+        void* res_only = KernelXVirtualAllocFromApp(nullptr, k64KiB, MEM_RESERVE, PAGE_READWRITE);
+        OS_REQUIRE(res_only != nullptr);
+        void* committed = KernelXVirtualAllocFromApp(res_only, k64KiB, MEM_COMMIT, PAGE_READWRITE);
+        OS_REQUIRE(committed == res_only);
+        static_cast<uint32_t*>(committed)[4096u / 4u] = 0xCAFEBABEu;
+        count = 8u;
+        OS_REQUIRE(::GetWriteWatch(WRITE_WATCH_FLAG_RESET, committed, k64KiB, dirty, &count, &gran) == 0u);
+        OS_REQUIRE(count == 1u && dirty[0] == static_cast<uint8_t*>(committed) + 4096u);
+        OS_REQUIRE(KernelXVirtualFree(res_only, 0u, MEM_RELEASE) == 1);
+
+        const uint64_t gfx_attr = MAKE_XALLOC_ATTRIBUTES(
+            0, 1, 0, 0, 4, XALLOC_ALIGNMENT_64K, XALLOC_MEMTYPE_GRAPHICS_WRITECOMBINE, XALLOC_PAGESIZE_64KB, 1);
+        void* xm_gfx = XMemAllocDefault(2u * k64KiB, gfx_attr);
+        OS_REQUIRE(xm_gfx != nullptr);
+        static_cast<uint64_t*>(xm_gfx)[0] = 0xABCD0123456789EFULL;
+        count = 8u;
+        OS_REQUIRE(::GetWriteWatch(WRITE_WATCH_FLAG_RESET, xm_gfx, 2u * k64KiB, dirty, &count, &gran) == 0u);
+        OS_REQUIRE(count == 1u && dirty[0] == xm_gfx);
+        XMemFreeDefault(xm_gfx, gfx_attr);
+
+        UnifiedMemoryManager umm;
+        UnifiedMemoryBlock ublk{};
+        OS_REQUIRE(umm.Allocate(2u * k64KiB, MemoryPageSize::Page64KB, true, true, ublk).ok());
+        static_cast<uint32_t*>(ublk.host_ptr)[(3u * 4096u) / 4u] = 0x778899AAu;
+        count = 8u;
+        OS_REQUIRE(::GetWriteWatch(WRITE_WATCH_FLAG_RESET, ublk.host_ptr, ublk.size, dirty, &count, &gran) == 0u);
+        OS_REQUIRE(count == 1u && dirty[0] == static_cast<uint8_t*>(ublk.host_ptr) + 3u * 4096u);
+        OS_REQUIRE(umm.Free(ublk.gpu_va).ok());
+    }
+
+    // 5. Verify anti-OOM sparse file-mapping fallback on E:\OpenScarlett\.tmp (never C:\).
+    ::SetEnvironmentVariableA("OPENSCARLETT_FORCE_SPARSE_COMMIT", "1");
+    {
+        void* sp_va = KernelXVirtualAllocFromApp(
+            nullptr, 2u * k64KiB, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        OS_REQUIRE(sp_va != nullptr);
+        static_cast<uint64_t*>(sp_va)[0] = 0x5350415253455641ull;
+        OS_REQUIRE(static_cast<uint64_t*>(sp_va)[0] == 0x5350415253455641ull);
+        OS_REQUIRE(KernelXVirtualFree(sp_va, 0u, MEM_RELEASE) == 1);
+
+        const uint64_t def_attr = MAKE_XALLOC_ATTRIBUTES(
+            0, 1, 0, 0, 5, XALLOC_ALIGNMENT_64K, XALLOC_MEMTYPE_GRAPHICS_CACHEABLE, XALLOC_PAGESIZE_64KB, 1);
+        void* sp_xm = XMemAllocDefault(2u * k64KiB, def_attr);
+        OS_REQUIRE(sp_xm != nullptr);
+        static_cast<uint64_t*>(sp_xm)[1] = 0x535041525345584Dull;
+        OS_REQUIRE(static_cast<uint64_t*>(sp_xm)[1] == 0x535041525345584Dull);
+        XMemFreeDefault(sp_xm, def_attr);
+
+        uint64_t sp_pages = 2u;
+        uint64_t sp_pfns[2] = {};
+        OS_REQUIRE(AllocateTitlePhysicalPages(nullptr, MEM_GRAPHICS | MEM_COMMIT, &sp_pages, sp_pfns) == 1);
+        void* sp_alias = MapTitleVirtualMemory(nullptr, 2u, MEM_GRAPHICS, PAGE_READWRITE, sp_pfns);
+        OS_REQUIRE(sp_alias != nullptr);
+        static_cast<uint64_t*>(sp_alias)[0] = 0x5048595353504152ull;
+        OS_REQUIRE(UnmapTitleVirtualMemory(sp_alias, 2u) == 1);
+        OS_REQUIRE(FreeTitlePhysicalPages(nullptr, 2u, sp_pfns) == 1);
+    }
+    ::SetEnvironmentVariableA("OPENSCARLETT_FORCE_SPARSE_COMMIT", nullptr);
+
+    std::printf("[PASS] Test 5: Lockhart 8 GiB budget, MEM_WRITE_WATCH & E:\\OpenScarlett\\.tmp sparse fallback verified\n");
+}
+#endif
+
 }  // namespace
 
 int main() {
@@ -595,6 +794,9 @@ int main() {
     TestOs4MiBAliasing();
     TestGpuTilePool();
     TestKernelXExports();
-    std::printf("[PASS] test_kernelx: all 4 test suites passed!\n");
+#if defined(_WIN32)
+    TestLockhartBudgetWriteWatchAndSparseFallback();
+#endif
+    std::printf("[PASS] test_kernelx: all test suites passed!\n");
     return 0;
 }
