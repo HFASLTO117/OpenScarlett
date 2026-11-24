@@ -442,24 +442,40 @@ public:
     int32_t GetResultCount(
         XAPU_CONNECTION_HANDLE connection,
         uint32_t* out_result_count) {
-        if (!out_result_count || !IsWritablePointer(out_result_count, sizeof(uint32_t))) {
-            return XAPU_E_INVALIDARG;
-        }
-        *out_result_count = 0u;
-
         if (!connection) {
+            if (out_result_count && IsWritablePointer(out_result_count, sizeof(uint32_t))) {
+                *out_result_count = 0u;
+            }
             return XAPU_E_INVALIDARG;
         }
 
         std::shared_ptr<XApuConnectionState> state = Lookup(connection);
         if (!state) {
+            if (out_result_count && IsWritablePointer(out_result_count, sizeof(uint32_t))) {
+                *out_result_count = 0u;
+            }
             return XAPU_E_INVALIDARG;
         }
 
+        // Retail Scarlett ABI (verified against GTA VI at +0x4EAA854):
+        // calls XApuGetResultCount(handle, 0) with RDX=0 and reads the
+        // pending result count directly from EAX (0 = empty). Returning
+        // E_INVALIDARG (0x80070057) caused the caller to loop 2.14B times
+        // while holding its global audio mutex!
+        if (state->xbox_retail_mode &&
+            (!out_result_count || !IsWritablePointer(out_result_count, sizeof(uint32_t)))) {
+            std::lock_guard<std::mutex> lk(state->queue_mutex);
+            const size_t count = state->xbox_result_queue.size();
+            return static_cast<int32_t>((std::min)(count, static_cast<size_t>(0x7FFFFFFFu)));
+        }
+
+        if (!out_result_count || !IsWritablePointer(out_result_count, sizeof(uint32_t))) {
+            return XAPU_E_INVALIDARG;
+        }
+        *out_result_count = 0u;
+
         std::lock_guard<std::mutex> lk(state->queue_mutex);
-        const size_t count = state->xbox_retail_mode
-                                 ? state->xbox_result_queue.size()
-                                 : state->result_queue.size();
+        const size_t count = state->xbox_result_queue.size() + state->result_queue.size();
         const size_t max_u32 = static_cast<size_t>((std::numeric_limits<uint32_t>::max)());
         *out_result_count = static_cast<uint32_t>((std::min)(count, max_u32));
         return XAPU_S_OK;

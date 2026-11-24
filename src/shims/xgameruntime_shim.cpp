@@ -58,6 +58,22 @@ inline XGameResult RecordHr(const char* sym, XGameResult hr) {
         hr >= 0 ? openscarlett::CallOutcome::Ok : openscarlett::CallOutcome::Error,
         hr,
         -1);
+    static const bool trace_xgr = []() {
+        char v[16]{};
+        return ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_XGR", v, sizeof(v)) > 0 && v[0] == '1';
+    }();
+    if (trace_xgr && sym) {
+        static std::mutex s_xgr_mu;
+        static std::unordered_map<std::string, uint32_t> s_xgr_cnt;
+        std::lock_guard<std::mutex> lk(s_xgr_mu);
+        uint32_t& c = s_xgr_cnt[sym];
+        ++c;
+        if (c <= 3u || (c % 500u) == 0u) {
+            std::fprintf(stderr, "[OpenScarlett][XGR] %s (#%u) -> hr=0x%08X\n",
+                         sym, c, static_cast<unsigned>(hr));
+            std::fflush(stderr);
+        }
+    }
     return hr;
 }
 
@@ -10678,9 +10694,15 @@ XGameResult OPENSCARLETT_GDK_CALL XNetworkingGetConnectivityHint(
     if (!connectivityHint) {
         return RecordHr("XNetworkingGetConnectivityHint", XGR_E_INVALIDARG);
     }
-    connectivityHint->connectivityLevel = XNetworkingConnectivityLevelHint_InternetAccess;
-    connectivityHint->connectivityCost = XNetworkingConnectivityCostHint_Unrestricted;
-    connectivityHint->ianaInterfaceType = 6u;  // IF_TYPE_ETHERNET_CSMACD
+    const bool offline = !GetEnvString("OPENSCARLETT_OFFLINE").empty() &&
+                         GetEnvString("OPENSCARLETT_OFFLINE") != "0";
+    connectivityHint->connectivityLevel = offline
+                                              ? XNetworkingConnectivityLevelHint_None
+                                              : XNetworkingConnectivityLevelHint_InternetAccess;
+    connectivityHint->connectivityCost = offline
+                                             ? XNetworkingConnectivityCostHint_Unknown
+                                             : XNetworkingConnectivityCostHint_Unrestricted;
+    connectivityHint->ianaInterfaceType = offline ? 0u : 6u;  // IF_TYPE_ETHERNET_CSMACD
     connectivityHint->networkInitialized = true;
     connectivityHint->approachingDataLimit = false;
     connectivityHint->overDataLimit = false;

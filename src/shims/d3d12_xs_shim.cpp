@@ -558,9 +558,32 @@ bool EnvEnablesD3D12Debug() noexcept {
 
 inline D3D12_RESOURCE_DESC SanitizeRetailResourceDesc(const D3D12_RESOURCE_DESC& src) noexcept {
     D3D12_RESOURCE_DESC d = src;
-    if (static_cast<uint32_t>(d.Format) == 118u) {
-        // Xbox Scarlett console DXGI_FORMAT_D16_UNORM_S8_UINT (118) -> PC D24_UNORM_S8_UINT (45).
-        d.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+    switch (static_cast<uint32_t>(d.Format)) {
+        case 115u:  // DXGI_FORMAT_B4G4R4A4_UNORM (no RT/UAV support on desktop GPUs -> BGRA8)
+            if ((static_cast<uint32_t>(d.Flags) &
+                 (static_cast<uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) |
+                  static_cast<uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS))) != 0u) {
+                d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            }
+            break;
+        case 116u:  // DXGI_FORMAT_R10G10B10_7E3_A2_FLOAT
+        case 117u:  // DXGI_FORMAT_R10G10B10_6E4_A2_FLOAT
+            d.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+            break;
+        case 118u:  // DXGI_FORMAT_D16_UNORM_S8_UINT
+            d.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+            break;
+        case 119u:  // DXGI_FORMAT_R16_UNORM_X8_TYPELESS
+            d.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+            break;
+        case 120u:  // DXGI_FORMAT_X16_TYPELESS_G8_UINT
+            d.Format = DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+            break;
+        case 121u:  // DXGI_FORMAT_R16G8_TYPELESS
+            d.Format = DXGI_FORMAT_R24G8_TYPELESS;
+            break;
+        default:
+            break;
     }
     if (d.SampleDesc.Count == 0u) {
         d.SampleDesc.Count = 1u;
@@ -579,11 +602,30 @@ inline D3D12_RESOURCE_DESC SanitizeRetailResourceDesc(const D3D12_RESOURCE_DESC&
     } else {
         flags &= ~static_cast<uint32_t>(D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE);
     }
+    // Desktop D3D12 forbids ALLOW_UNORDERED_ACCESS on SRGB, MSAA, BC, and 16-bit packed (B5G6R5/B5G5R5A1/B4G4R4A4) formats.
+    if ((flags & static_cast<uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) != 0u) {
+        const bool no_uav_fmt =
+            d.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+            d.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+            d.Format == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB ||
+            d.Format == DXGI_FORMAT_B5G6R5_UNORM ||
+            d.Format == DXGI_FORMAT_B5G5R5A1_UNORM ||
+            d.Format == DXGI_FORMAT_B4G4R4A4_UNORM ||
+            d.Format == DXGI_FORMAT_A8_UNORM ||
+            (static_cast<uint32_t>(d.Format) >= static_cast<uint32_t>(DXGI_FORMAT_BC1_TYPELESS) &&
+             static_cast<uint32_t>(d.Format) <= static_cast<uint32_t>(DXGI_FORMAT_BC5_SNORM)) ||
+            (static_cast<uint32_t>(d.Format) >= static_cast<uint32_t>(DXGI_FORMAT_BC6H_TYPELESS) &&
+             static_cast<uint32_t>(d.Format) <= static_cast<uint32_t>(DXGI_FORMAT_BC7_UNORM_SRGB));
+        if (no_uav_fmt || d.SampleDesc.Count > 1u) {
+            flags &= ~static_cast<uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        }
+    }
     if ((flags & static_cast<uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) != 0u ||
         d.SampleDesc.Count > 1u) {
         flags &= ~static_cast<uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS);
     }
-    if (static_cast<uint32_t>(d.Layout) >= D3D12XBOX_TEXTURE_LAYOUT_GFX10_BASE) {
+    if (static_cast<uint32_t>(d.Layout) >= D3D12XBOX_TEXTURE_LAYOUT_GFX10_BASE ||
+        (d.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER && d.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR)) {
         d.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
     }
     if (d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
@@ -1714,6 +1756,44 @@ public:
                 visibleMask, numResourceDescs,
                 clean_descs.empty() ? nullptr : clean_descs.data(),
                 pResourceAllocationInfo1);
+            if (res.SizeInBytes == UINT64_MAX && !clean_descs.empty()) {
+                static std::atomic<uint32_t> s_rai2_fb{0u};
+                const uint32_t n = s_rai2_fb.fetch_add(1u, std::memory_order_relaxed);
+                if (n < 16u && pResourceDescs) {
+                    const auto& rd = pResourceDescs[0];
+                    std::fprintf(stderr,
+                        "[OpenScarlett][d3d12_xs] GetResourceAllocationInfo2 fallback #%u: dim=%u %llux%u D=%u mips=%u fmt=%u samp=%u/%u lay=0x%X flags=0x%X align=0x%llX\n",
+                        n, static_cast<unsigned>(rd.Dimension),
+                        static_cast<unsigned long long>(rd.Width), rd.Height, rd.DepthOrArraySize,
+                        rd.MipLevels, static_cast<unsigned>(rd.Format),
+                        rd.SampleDesc.Count, rd.SampleDesc.Quality,
+                        static_cast<unsigned>(rd.Layout), static_cast<unsigned>(rd.Flags),
+                        static_cast<unsigned long long>(rd.Alignment));
+                    std::fflush(stderr);
+                }
+                for (auto& cd : clean_descs) {
+                    cd.Alignment = 0ull;
+                    cd.Flags = D3D12_RESOURCE_FLAG_NONE;
+                    cd.Layout = (cd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+                                    ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+                                    : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+                    if (cd.SampleDesc.Count > 1u) {
+                        cd.SampleDesc.Count = 1u;
+                        cd.SampleDesc.Quality = 0u;
+                    }
+                }
+                res = self->inner_->GetResourceAllocationInfo1(
+                    visibleMask, numResourceDescs, clean_descs.data(), pResourceAllocationInfo1);
+                if (res.SizeInBytes == UINT64_MAX) {
+                    for (auto& cd : clean_descs) {
+                        if (cd.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+                            cd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                        }
+                    }
+                    res = self->inner_->GetResourceAllocationInfo1(
+                        visibleMask, numResourceDescs, clean_descs.data(), pResourceAllocationInfo1);
+                }
+            }
         }
         if (out_ret) {
             *out_ret = res;

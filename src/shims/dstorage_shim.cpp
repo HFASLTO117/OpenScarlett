@@ -1404,11 +1404,25 @@ public:
 
     void Submit() {
         RecordOk("IDStorageQueueX::Submit", 6);
+        static const bool trace_ds = []() {
+            char v[16]{};
+            return ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_DSTORAGE", v, sizeof(v)) > 0 && v[0] == '1';
+        }();
+        static std::atomic<uint32_t> s_ds_submits{0u};
         bool flushed = false;
+        size_t staged_n = 0u;
         {
             std::lock_guard<std::mutex> lk(mutex_);
             if (closed_ || staged_.empty()) return;
+            staged_n = staged_.size();
             flushed = FlushStagedLocked();
+        }
+        if (trace_ds && flushed) {
+            const uint32_t n = s_ds_submits.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if (n <= 5u || (n % 200u) == 0u) {
+                std::fprintf(stderr, "[OpenScarlett][DSTORAGE] Submit #%u (staged=%zu)\n", n, staged_n);
+                std::fflush(stderr);
+            }
         }
         if (flushed) {
             DStoragePriorityScheduler::Global().NotifyWorkAvailable();
