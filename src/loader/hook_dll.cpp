@@ -4988,13 +4988,53 @@ LPVOID WINAPI Hook_WinHttpConnect(LPVOID hSession, LPCWSTR pswzServerName, WORD 
 }
 
 LONG CALLBACK Zen2IllegalInstructionVeh(PEXCEPTION_POINTERS ep) {
-    if (!ep || !ep->ExceptionRecord || !ep->ContextRecord ||
-        ep->ExceptionRecord->ExceptionCode != EXCEPTION_ILLEGAL_INSTRUCTION) {
+    if (!ep || !ep->ExceptionRecord || !ep->ContextRecord) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
+    const DWORD exc_code = ep->ExceptionRecord->ExceptionCode;
     auto* ctx = ep->ContextRecord;
     auto* p = reinterpret_cast<uint8_t*>(ctx->Rip);
     if (!p) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (exc_code == EXCEPTION_BREAKPOINT) {
+        static const bool continue_int3 = []() {
+            char buf[16]{};
+            return ::GetEnvironmentVariableA("OPENSCARLETT_CONTINUE_INT3", buf, sizeof(buf)) > 0 && buf[0] != '0';
+        }();
+        if (continue_int3) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (::VirtualQuery(p, &mbi, sizeof(mbi)) != 0u && mbi.State == MEM_COMMIT && *p == 0xCCu) {
+                static std::atomic<uint32_t> s_int3_cnt{0u};
+                const uint32_t n = s_int3_cnt.fetch_add(1u, std::memory_order_relaxed);
+                if (n < 16u || (n % 100u) == 0u) {
+                    HMODULE mod = nullptr;
+                    char mod_name[MAX_PATH]{};
+                    uintptr_t rva = 0u;
+                    if (::GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                                 GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                             reinterpret_cast<LPCSTR>(ctx->Rip), &mod) &&
+                        mod) {
+                        ::GetModuleFileNameA(mod, mod_name, static_cast<DWORD>(sizeof(mod_name)));
+                        rva = static_cast<uintptr_t>(ctx->Rip) - reinterpret_cast<uintptr_t>(mod);
+                    }
+                    std::fprintf(stderr,
+                                 "[OpenScarlett][VEH-INT3] #%u rip=0x%llX (%s+0x%llX) rcx=0x%llX rdx=0x%llX r8=0x%llX r14=0x%llX\n",
+                                 n, static_cast<unsigned long long>(ctx->Rip), mod_name,
+                                 static_cast<unsigned long long>(rva),
+                                 static_cast<unsigned long long>(ctx->Rcx),
+                                 static_cast<unsigned long long>(ctx->Rdx),
+                                 static_cast<unsigned long long>(ctx->R8),
+                                 static_cast<unsigned long long>(ctx->R14));
+                    std::fflush(stderr);
+                }
+                ctx->Rip += 1u;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    if (exc_code != EXCEPTION_ILLEGAL_INSTRUCTION) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
 

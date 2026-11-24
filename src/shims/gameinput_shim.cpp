@@ -974,6 +974,116 @@ bool PollPhysicalGamepad(
             }
         }
     }
+    struct AutoNavEvent {
+        uint64_t time_ms = 0ull;
+        uint32_t mask = 0u;
+    };
+    static const std::vector<AutoNavEvent> s_autonav = []() {
+        std::vector<AutoNavEvent> evs;
+        char buf[512]{};
+        const DWORD n = ::GetEnvironmentVariableA("OPENSCARLETT_AUTONAV", buf, sizeof(buf));
+        if (n == 0u || n >= sizeof(buf)) return evs;
+        const char* p = buf;
+        while (*p) {
+            while (*p == ',' || *p == ' ') ++p;
+            if (!*p) break;
+            char* end = nullptr;
+            const uint64_t t = std::strtoull(p, &end, 10);
+            if (!end || *end != ':') break;
+            p = end + 1;
+            uint32_t m = 0u;
+            switch (*p) {
+                case 'A': case 'a': m = GameInputGamepadA; break;
+                case 'B': case 'b': m = GameInputGamepadB; break;
+                case 'X': case 'x': m = GameInputGamepadX; break;
+                case 'Y': case 'y': m = GameInputGamepadY; break;
+                case 'U': case 'u': m = GameInputGamepadDPadUp; break;
+                case 'D': case 'd': m = GameInputGamepadDPadDown; break;
+                case 'L': case 'l': m = GameInputGamepadDPadLeft; break;
+                case 'R': case 'r': m = GameInputGamepadDPadRight; break;
+                case 'S': case 's': m = GameInputGamepadMenu; break;
+                default: break;
+            }
+            if (m != 0u) evs.push_back({t, m});
+            while (*p && *p != ',') ++p;
+        }
+        return evs;
+    }();
+    if (!s_autonav.empty()) {
+        static const uint64_t s_nav_t0_ms = ::GetTickCount64();
+        const uint64_t elapsed = ::GetTickCount64() - s_nav_t0_ms;
+        for (const auto& ev : s_autonav) {
+            if (elapsed >= ev.time_ms && elapsed < ev.time_ms + 300ull) {
+                found = true;
+                out_gamepad.buttons |= ev.mask;
+            }
+        }
+    }
+    // Live interactive input file (OPENSCARLETT_LIVE_INPUT_FILE): format "<seq>:<CMD>[:<dur_ms>]"
+    // where CMD is A/B/X/Y/U/D/L/R/S/RSD/RSU/LSD/LSU. Each new <seq> fires a single clean hold.
+    static const std::string s_live_input_path = []() -> std::string {
+        char buf[MAX_PATH]{};
+        const DWORD n = ::GetEnvironmentVariableA("OPENSCARLETT_LIVE_INPUT_FILE", buf, sizeof(buf));
+        return (n > 0u && n < sizeof(buf)) ? std::string(buf, n) : std::string();
+    }();
+    if (!s_live_input_path.empty()) {
+        static std::mutex s_live_mu;
+        static uint64_t s_last_poll_ms = 0ull;
+        static uint64_t s_last_seq = 0ull;
+        static uint64_t s_active_until_ms = 0ull;
+        static uint32_t s_active_btn = 0u;
+        static float s_active_rsy = 0.0f;
+        static float s_active_lsy = 0.0f;
+        const uint64_t now_ms = ::GetTickCount64();
+        std::lock_guard<std::mutex> lk(s_live_mu);
+        if (now_ms - s_last_poll_ms >= 50ull) {
+            s_last_poll_ms = now_ms;
+            FILE* f = nullptr;
+            if (::fopen_s(&f, s_live_input_path.c_str(), "rb") == 0 && f) {
+                char line[128]{};
+                if (std::fgets(line, static_cast<int>(sizeof(line)), f)) {
+                    char* end = nullptr;
+                    const uint64_t seq = std::strtoull(line, &end, 10);
+                    if (end && *end == ':' && seq > s_last_seq) {
+                        s_last_seq = seq;
+                        const char* cmd = end + 1;
+                        uint32_t btn = 0u;
+                        float rsy = 0.0f;
+                        float lsy = 0.0f;
+                        uint64_t dur = 250ull;
+                        if (std::strncmp(cmd, "RSD", 3) == 0) { rsy = -1.0f; dur = 3000ull; }
+                        else if (std::strncmp(cmd, "RSU", 3) == 0) { rsy = 1.0f; dur = 1500ull; }
+                        else if (std::strncmp(cmd, "LSD", 3) == 0) { lsy = -1.0f; dur = 400ull; }
+                        else if (std::strncmp(cmd, "LSU", 3) == 0) { lsy = 1.0f; dur = 400ull; }
+                        else if (cmd[0] == 'A') { btn = GameInputGamepadA; }
+                        else if (cmd[0] == 'B') { btn = GameInputGamepadB; }
+                        else if (cmd[0] == 'X') { btn = GameInputGamepadX; }
+                        else if (cmd[0] == 'Y') { btn = GameInputGamepadY; }
+                        else if (cmd[0] == 'U') { btn = GameInputGamepadDPadUp; }
+                        else if (cmd[0] == 'D') { btn = GameInputGamepadDPadDown; }
+                        else if (cmd[0] == 'L') { btn = GameInputGamepadDPadLeft; }
+                        else if (cmd[0] == 'R') { btn = GameInputGamepadDPadRight; }
+                        else if (cmd[0] == 'S') { btn = GameInputGamepadMenu; }
+                        if (const char* col2 = std::strchr(cmd, ':')) {
+                            const uint64_t parsed_dur = std::strtoull(col2 + 1, nullptr, 10);
+                            if (parsed_dur > 0ull && parsed_dur <= 15000ull) dur = parsed_dur;
+                        }
+                        s_active_btn = btn;
+                        s_active_rsy = rsy;
+                        s_active_lsy = lsy;
+                        s_active_until_ms = now_ms + dur;
+                    }
+                }
+                std::fclose(f);
+            }
+        }
+        if (now_ms < s_active_until_ms) {
+            found = true;
+            out_gamepad.buttons |= s_active_btn;
+            if (s_active_rsy != 0.0f) out_gamepad.rightThumbstickY = s_active_rsy;
+            if (s_active_lsy != 0.0f) out_gamepad.leftThumbstickY = s_active_lsy;
+        }
+    }
 
     static const std::string s_trace_gi_path = []() {
         char buf[512]{};

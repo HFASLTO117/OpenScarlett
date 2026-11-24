@@ -3965,11 +3965,18 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
     if (want_capture_this_frame && !last_present_pixels_.empty() &&
         last_present_width_ > 0u && last_present_height_ > 0u) {
         openscarlett::FrameBufferRgba8 fb{};
-        fb.width = last_present_width_;
-        fb.height = last_present_height_;
-        fb.pixels = last_present_pixels_;
-        if (fb.WritePng(capture_png_path).ok()) {
-            capture_png_written_ = true;
+        try {
+            fb.width = last_present_width_;
+            fb.height = last_present_height_;
+            fb.pixels.swap(last_present_pixels_);
+            if (fb.WritePng(capture_png_path).ok()) {
+                capture_png_written_ = true;
+            }
+        } catch (const std::bad_alloc&) {
+            // Skip diagnostic capture rather than crashing guest under tight host commit limits.
+        }
+        if (last_present_pixels_.empty() && !fb.pixels.empty()) {
+            last_present_pixels_.swap(fb.pixels);
         }
         // Diagnostic: if Scaleform/UI rendered into an offscreen RTV before blitting to the
         // swapchain plane, read back that offscreen UI RTV as well to isolate UI draw vs blit.

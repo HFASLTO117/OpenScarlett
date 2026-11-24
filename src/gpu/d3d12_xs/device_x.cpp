@@ -4316,10 +4316,56 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateRootSignature(
                                     (dt.NumDescriptorRanges == 2u &&
                                      dt.pDescriptorRanges[0].RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SRV &&
                                      dt.pDescriptorRanges[0].BaseShaderRegister == 2u &&
+                                     dt.pDescriptorRanges[0].NumDescriptors == 1u &&
                                      dt.pDescriptorRanges[0].RegisterSpace == 1u &&
                                      dt.pDescriptorRanges[1].RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_CBV &&
                                      dt.pDescriptorRanges[1].BaseShaderRegister == 0u &&
+                                     dt.pDescriptorRanges[1].NumDescriptors == 1u &&
                                      dt.pDescriptorRanges[1].RegisterSpace == 1u);
+                                bool other_param_uses_s1_ext = false;
+                                if (scaleform_t2_b0_pair) {
+                                    const D3D12_SHADER_VISIBILITY target_vis =
+                                        params_1_1[static_cast<size_t>(target_pi)].ShaderVisibility;
+                                    for (UINT oi = 0u; oi < aug.Desc_1_1.NumParameters && !other_param_uses_s1_ext; ++oi) {
+                                        if (static_cast<int>(oi) == target_pi) continue;
+                                        const auto& orp = aug.Desc_1_1.pParameters[oi];
+                                        const bool vis_overlap =
+                                            (target_vis == D3D12_SHADER_VISIBILITY_ALL) ||
+                                            (orp.ShaderVisibility == D3D12_SHADER_VISIBILITY_ALL) ||
+                                            (target_vis == orp.ShaderVisibility);
+                                        if (!vis_overlap) continue;
+                                        if (orp.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE &&
+                                            orp.DescriptorTable.pDescriptorRanges) {
+                                            for (UINT ori = 0u; ori < orp.DescriptorTable.NumDescriptorRanges; ++ori) {
+                                                const auto& org = orp.DescriptorTable.pDescriptorRanges[ori];
+                                                if (org.RegisterSpace != 1u || org.NumDescriptors == 0u) continue;
+                                                const uint64_t rlo = org.BaseShaderRegister;
+                                                const uint64_t rhi = (org.NumDescriptors == UINT_MAX)
+                                                                         ? UINT64_MAX
+                                                                         : (rlo + org.NumDescriptors - 1ull);
+                                                if ((org.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_CBV &&
+                                                     rhi >= 1ull && rlo <= 31ull) ||
+                                                    (org.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SRV &&
+                                                     rhi >= 3ull && rlo <= 15ull)) {
+                                                    other_param_uses_s1_ext = true;
+                                                    break;
+                                                }
+                                            }
+                                        } else if (orp.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV ||
+                                                   orp.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV) {
+                                            if (orp.Descriptor.RegisterSpace == 1u) {
+                                                if ((orp.ParameterType == D3D12_ROOT_PARAMETER_TYPE_CBV &&
+                                                     orp.Descriptor.ShaderRegister >= 1u &&
+                                                     orp.Descriptor.ShaderRegister <= 31u) ||
+                                                    (orp.ParameterType == D3D12_ROOT_PARAMETER_TYPE_SRV &&
+                                                     orp.Descriptor.ShaderRegister >= 3u &&
+                                                     orp.Descriptor.ShaderRegister <= 15u)) {
+                                                    other_param_uses_s1_ext = true;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 for (UINT ri = 0u; ri < dt.NumDescriptorRanges; ++ri) {
                                     D3D12_DESCRIPTOR_RANGE1 rg = dt.pDescriptorRanges[ri];
                                     const UINT off =
@@ -4342,6 +4388,29 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateRootSignature(
                                     b7_alias.OffsetInDescriptorsFromTableStart =
                                         scaleform_t2_b0_pair ? 0u : b0_table_off;
                                     expanded_ranges_1_1.push_back(b7_alias);
+                                    if (scaleform_t2_b0_pair && !other_param_uses_s1_ext) {
+                                        // Retail UI/font pipelines sharing the {t2, b0} space1 root
+                                        // signature also bind CBV b1..b6 space1 (@0) and SRV t3..t15
+                                        // space1 (@1) in PSV0 metadata.
+                                        D3D12_DESCRIPTOR_RANGE1 cb_mid = b7_alias;
+                                        cb_mid.BaseShaderRegister = 1u;
+                                        cb_mid.NumDescriptors = 6u;
+                                        cb_mid.OffsetInDescriptorsFromTableStart = 0u;
+                                        D3D12_DESCRIPTOR_RANGE1 cb_hi = b7_alias;
+                                        cb_hi.BaseShaderRegister = 8u;
+                                        cb_hi.NumDescriptors = 24u;
+                                        cb_hi.OffsetInDescriptorsFromTableStart = 0u;
+                                        D3D12_DESCRIPTOR_RANGE1 srv_ext{};
+                                        srv_ext.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+                                        srv_ext.NumDescriptors = 13u;
+                                        srv_ext.BaseShaderRegister = 3u;
+                                        srv_ext.RegisterSpace = 1u;
+                                        srv_ext.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
+                                        srv_ext.OffsetInDescriptorsFromTableStart = 1u;
+                                        expanded_ranges_1_1.push_back(cb_mid);
+                                        expanded_ranges_1_1.push_back(cb_hi);
+                                        expanded_ranges_1_1.push_back(srv_ext);
+                                    }
                                 }
                                 if (!has_s2) {
                                     D3D12_DESCRIPTOR_RANGE1 s2_srv{};
@@ -10331,22 +10400,35 @@ HRESULT STDMETHODCALLTYPE DeviceX::FlushDirtyUnifiedTextures(
                      item.footprints[s].Footprint.Depth > 0u)
                         ? item.footprints[s].Footprint.Depth
                         : 1u;
-                for (UINT z = 0u; z < depth && copy_ok; ++z) {
-                    for (UINT y = 0u; y < item.num_rows[s]; ++y) {
-                        const uint64_t row_idx = static_cast<uint64_t>(z) * item.num_rows[s] + y;
-                        const uint64_t src_off = src_slice_offset + row_idx * src_row_pitch;
-                        if (src_off + row_bytes <= item.mapping.byte_size) {
-                            if (!SafeCopyGuestMemory(
-                                    dst_slice + static_cast<size_t>(row_idx) * static_cast<size_t>(dst_row_pitch),
-                                    src_base + src_off,
-                                    static_cast<size_t>(row_bytes))) {
-                                copy_ok = false;
-                                break;
+                const uint64_t total_rows = static_cast<uint64_t>(depth) * item.num_rows[s];
+                const uint64_t slice_bytes = src_row_pitch * total_rows;
+                const uint64_t copy_bytes =
+                    (total_rows > 0u) ? (dst_row_pitch * (total_rows - 1u) + row_bytes) : 0ull;
+                if (src_row_pitch == dst_row_pitch && total_rows > 0u &&
+                    src_slice_offset <= item.mapping.byte_size &&
+                    copy_bytes <= item.mapping.byte_size - src_slice_offset) {
+                    if (!SafeCopyGuestMemory(
+                            dst_slice, src_base + src_slice_offset, static_cast<size_t>(copy_bytes))) {
+                        copy_ok = false;
+                    }
+                } else {
+                    for (UINT z = 0u; z < depth && copy_ok; ++z) {
+                        for (UINT y = 0u; y < item.num_rows[s]; ++y) {
+                            const uint64_t row_idx = static_cast<uint64_t>(z) * item.num_rows[s] + y;
+                            const uint64_t src_off = src_slice_offset + row_idx * src_row_pitch;
+                            if (src_off + row_bytes <= item.mapping.byte_size) {
+                                if (!SafeCopyGuestMemory(
+                                        dst_slice + static_cast<size_t>(row_idx) * static_cast<size_t>(dst_row_pitch),
+                                        src_base + src_off,
+                                        static_cast<size_t>(row_bytes))) {
+                                    copy_ok = false;
+                                    break;
+                                }
                             }
                         }
                     }
                 }
-                src_slice_offset += src_row_pitch * static_cast<uint64_t>(item.num_rows[s]) * depth;
+                src_slice_offset += slice_bytes;
             }
             if (copy_ok) {
                 uploaded_indices.push_back(idx);

@@ -2010,6 +2010,23 @@ private:
                 return OS_DSTORAGE_E_DECOMPRESSION_ERROR;
             }
             if (bcpack_mode == 0u && stage_buf.size() != dst_size) {
+                static const bool trace_ds_z = []() {
+#if defined(_WIN32)
+                    char buf[16]{};
+                    return ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_DSTORAGE", buf, sizeof(buf)) > 0 && buf[0] != '0';
+#else
+                    return false;
+#endif
+                }();
+                if (trace_ds_z) {
+                    std::fprintf(stderr,
+                                 "[OpenScarlett][dstorage] ZLIB-SIZE-MISMATCH stage=%zu dst=%zu src=%zu off=0x%llX\n",
+                                 stage_buf.size(), dst_size, cur_size,
+                                 req.Options.SourceType == DSTORAGE_REQUEST_SOURCE_FILE
+                                     ? static_cast<unsigned long long>(req.Source.File.Offset)
+                                     : 0ull);
+                    std::fflush(stderr);
+                }
                 return OS_DSTORAGE_E_DECOMPRESSION_ERROR;
             }
             cur_ptr = stage_buf.data();
