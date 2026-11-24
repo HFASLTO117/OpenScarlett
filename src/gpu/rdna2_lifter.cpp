@@ -234,10 +234,15 @@ uint32_t ModuleDynamicSampledArraySize(const Rdna2IrModule& ir) noexcept {
 
 enum GlslStd450Op : uint32_t {
     GlslRoundEven = 2,
+    GlslTrunc = 3,
     GlslFAbs = 4,
     GlslFloor = 8,
     GlslCeil = 9,
     GlslFract = 10,
+    GlslSin = 13,
+    GlslCos = 14,
+    GlslExp2 = 29,
+    GlslLog2 = 30,
     GlslSqrt = 31,
     GlslInverseSqrt = 32,
     GlslFMin = 37,
@@ -820,8 +825,13 @@ public:
         }
 
         const bool uses_stage_in = ModuleUsesStageInput(ir_);
-        const bool uses_dual_uav = ir_.uses_uav1;
-        const bool uses_uav0 = ir_.uses_uav0 || (ir_.uses_uav && !ir_.uses_uav1);
+        const bool psv0_in0_srv = ir_.stage_contract.psv0_bindings.enabled &&
+                                  ir_.stage_contract.psv0_bindings.in0_is_srv &&
+                                  !ir_.stage_contract.psv0_bindings.in0_is_cbv;
+        const bool uses_uav_writes = ModuleUsesOp(ir_, IrOp::StoreUav) ||
+                                     ModuleUsesOp(ir_, IrOp::StoreUavSubDword);
+        const bool uses_dual_uav = ir_.uses_uav1 && !(psv0_in0_srv && !uses_uav_writes);
+        const bool uses_uav0 = ir_.uses_uav0 || (ir_.uses_uav && !uses_dual_uav);
         const bool uses_fma = ModuleUsesOp(ir_, IrOp::FFma) || ModuleUsesOp(ir_, IrOp::FFma16) || ModuleUsesOp(ir_, IrOp::FmaMix);
         const bool uses_mad = ModuleUsesOp(ir_, IrOp::FMad);
         const bool uses_alignbyte = ModuleUsesOp(ir_, IrOp::AlignByte);
@@ -908,11 +918,23 @@ public:
                     if ((inst.op == IrOp::LoadUav || inst.op == IrOp::SmemSpanCheck ||
                          inst.op == IrOp::LoadUavSpanElem) &&
                         (inst.imm_u32 & kIrLoadCbHeapFlagLifter) != 0u) {
+                        const uint32_t s2_p1 = (inst.imm_u32 >> 24) & 0x1Fu;
+                        if (s2_p1 > 0u) {
+                            const uint32_t s2 = s2_p1 - 1u;
+                            if (s2 < 16u &&
+                                ((ir_.used_space2_srv_slots & (1u << s2)) != 0u) &&
+                                ((ir_.used_space2_tex_slots & (1u << s2)) != 0u)) {
+                                // Collision fallback: t<s2> space2 is owned by Texture2D; use _srv0/_in0.
+                                if (has_dual_srv0) needs_srv0_decl = true;
+                                else if (in0_is_cbv || in0_is_srv) needs_in0_decl = true;
+                            }
+                            continue;
+                        }
                         if (has_dual_srv0) {
                             needs_srv0_decl = true;
                             continue;
                         }
-                        if (in0_is_cbv) {
+                        if (in0_is_cbv || in0_is_srv) {
                             needs_in0_decl = true;
                             continue;
                         }
@@ -953,6 +975,30 @@ public:
         }
         if (uses_dual_uav) {
             hdr << "RWByteAddressBuffer _out0 : register(u1);\n";
+        }
+        // Hardware descriptor-table slot resources (space2): exact s[8:9]+slot*32 mapping for
+        // multi-texture / multi-CBV Scarlett shaders (e.g. YUV420 video, PBR G-buffer, post-FX).
+        for (uint32_t s2 = 0u; s2 < 16u; ++s2) {
+            const bool has_s2_tex = (ir_.used_space2_tex_slots & (1u << s2)) != 0u;
+            if (((ir_.used_space2_srv_slots & (1u << s2)) != 0u) && !has_s2_tex) {
+                hdr << "ByteAddressBuffer _srv_s" << s2 << " : register(t" << s2 << ", space2);\n";
+            }
+            if ((ir_.used_space2_cbv_slots & (1u << s2)) != 0u) {
+                hdr << "cbuffer _cb_s" << s2 << " : register(b" << s2 << ", space2) {\n"
+                    << "    uint4 _cb_s" << s2 << "_d[4096];\n"
+                    << "};\n"
+                    << "uint _os_cb_s" << s2 << "_load(uint off) {\n"
+                    << "    if (off >= 65536u) return 0u;\n"
+                    << "    uint dw = off >> 2u;\n"
+                    << "    uint4 q = _cb_s" << s2 << "_d[(dw >> 2u) & 4095u];\n"
+                    << "    uint l = dw & 3u;\n"
+                    << "    return (l == 0u) ? q.x : ((l == 1u) ? q.y : ((l == 2u) ? q.z : q.w));\n"
+                    << "}\n";
+            }
+            if (has_s2_tex) {
+                const char* tex_elem = (ir_.texture_srv_format == Rdna2TextureFormat::Uint4) ? "uint4" : "float4";
+                hdr << "Texture2D<" << tex_elem << "> _tex_s" << s2 << " : register(t" << s2 << ", space2);\n";
+            }
         }
         uint32_t next_t = 0u;
         if (ir_.uses_texture_srv) {
@@ -1122,7 +1168,7 @@ public:
         }
         if (uses_buf_load_fmt) {
             hdr << "// UB-free sub-dword merge & MTBUF D16 format-conversion helpers (shifts strictly < 32)\n";
-            if (uses_uav0 || in0_is_cbv) {
+            if (uses_uav0 || in0_is_cbv || in0_is_srv) {
                 if (in0_is_cbv) {
                     hdr << "uint _os_load_unaligned_u0(uint byte_addr) {\n"
                            "    uint aligned = byte_addr & ~3u;\n"
@@ -1301,7 +1347,7 @@ public:
                        "    float gy = ((asuint(g.y) & 0x7F800000u) == 0x7F800000u) ? 0.0 : g.y;\n"
                        "    return float2(gx, gy);\n"
                        "}\n"
-                       "float4 _os_sample_affine_quad(float2 uv) {\n"
+                       "float4 _os_sample_affine_quad_t(Texture2D<float4> _tex, float2 uv) {\n"
                        "    float2 _q_uv_x = QuadReadAcrossX(uv);\n"
                        "    float2 _q_uv_y = QuadReadAcrossY(uv);\n"
                        "    float2 _q_uv_d = QuadReadAcrossDiagonal(uv);\n"
@@ -1312,10 +1358,16 @@ public:
                        "    float2 _ddy = _os_sanitize_grad(ddy_fine(uv));\n"
                        "    float2 _grad_x = (dot(_ddx, _ddx) > 0.0) ? _ddx : ((dot(_quad_dx, _quad_dx) > 0.0) ? _quad_dx : _quad_dd);\n"
                        "    float2 _grad_y = (dot(_ddy, _ddy) > 0.0) ? _ddy : _quad_dy;\n"
-                       "    return _tex0.SampleGrad(_samp0, uv, _grad_x, _grad_y);\n"
+                       "    return _tex.SampleGrad(_samp0, uv, _grad_x, _grad_y);\n"
+                       "}\n"
+                       "float4 _os_sample_affine_quad(float2 uv) {\n"
+                       "    return _os_sample_affine_quad_t(_tex0, uv);\n"
                        "}\n";
             } else {
-                hdr << "float4 _os_sample_affine_quad(float2 uv) {\n"
+                hdr << "float4 _os_sample_affine_quad_t(Texture2D<float4> _tex, float2 uv) {\n"
+                       "    return _tex.SampleGrad(_samp0, uv, ddx(uv), ddy(uv));\n"
+                       "}\n"
+                       "float4 _os_sample_affine_quad(float2 uv) {\n"
                        "    return _tex0.SampleGrad(_samp0, uv, ddx(uv), ddy(uv));\n"
                        "}\n";
             }
@@ -1877,8 +1929,54 @@ private:
                 }
                 const uint32_t span_dwords = std::max(1u, (inst.imm_u32 >> 16) & 0xFFu);
                 const uint32_t span_bytes = span_dwords * 4u;
+                const uint32_t s2_p1 = (inst.imm_u32 >> 24) & 0x1Fu;
                 const bool is_cb = (inst.imm_u32 & kIrLoadCbHeapFlagLifter) != 0u;
                 const uint32_t cb_reg = inst.imm_u32 & 0xFFu;
+                if (s2_p1 > 0u) {
+                    const uint32_t s2 = s2_p1 - 1u;
+                    const bool s2_srv_bit = (s2 < 16u) && ((ir_.used_space2_srv_slots & (1u << s2)) != 0u);
+                    const bool s2_tex_bit = (s2 < 16u) && ((ir_.used_space2_tex_slots & (1u << s2)) != 0u);
+                    os << ind << "{\n";
+                    os << ind << "    uint _sp_off = " << AsU32(inst.operands[0]) << ";\n";
+                    if (s2_srv_bit) {
+                        const auto& pb_loc = ir_.stage_contract.psv0_bindings;
+                        const std::string sbuf =
+                            !s2_tex_bit ? ("_srv_s" + std::to_string(s2))
+                                        : ((pb_loc.enabled && pb_loc.in0_is_cbv && pb_loc.has_srv0) ? "_srv0" : "_in0");
+                        os << ind << "    uint _sp_len = 0u; " << sbuf << ".GetDimensions(_sp_len);\n";
+                        os << ind << "    uint _sp_lim = (_sp_len > 0u) ? _sp_len : 65536u;\n";
+                        os << ind << "    bool _sp_ok = (_sp_off < 0x80000000u) && (_sp_off <= _sp_lim) && ((_sp_lim - _sp_off) >= " << span_bytes << "u);\n";
+                        os << ind << "    _v" << inst.id << " = _sp_ok;\n";
+                        if (!elems.empty()) {
+                            os << ind << "    if (_sp_ok) {\n";
+                            for (const auto* e : elems) {
+                                const uint32_t k = (e->imm_u32 >> 16) & 0xFFu;
+                                os << ind << "        _v" << e->id << " = " << sbuf << ".Load(_sp_off + " << (k * 4u) << "u);\n";
+                            }
+                            os << ind << "    } else if (_sp_off < 0x80000000u && _sp_off < _sp_lim) {\n";
+                            os << ind << "        uint _sp_t[" << span_dwords << "];\n";
+                            os << ind << "        uint _sp_rem = _sp_lim - _sp_off;\n";
+                            os << ind << "        for (uint _k = 0u; _k < " << span_dwords << "u; ++_k) {\n";
+                            os << ind << "            _sp_t[_k] = (_sp_rem >= ((_k + 1u) * 4u)) ? " << sbuf << ".Load(_sp_off + (_k * 4u)) : 0u;\n";
+                            os << ind << "        }\n";
+                            for (const auto* e : elems) {
+                                const uint32_t k = (e->imm_u32 >> 16) & 0xFFu;
+                                os << ind << "        _v" << e->id << " = _sp_t[" << (k < span_dwords ? k : 0u) << "];\n";
+                            }
+                            os << ind << "    }\n";
+                        }
+                    } else {
+                        os << ind << "    bool _sp_ok = (_sp_off < 65536u) && ((65536u - _sp_off) >= " << span_bytes << "u);\n";
+                        os << ind << "    _v" << inst.id << " = _sp_ok;\n";
+                        for (const auto* e : elems) {
+                            const uint32_t k = (e->imm_u32 >> 16) & 0xFFu;
+                            os << ind << "    _v" << e->id << " = _os_cb_s" << s2 << "_load(_sp_off + " << (k * 4u) << "u);\n";
+                        }
+                    }
+                    os << ind << "}\n";
+                    ii = next_ii - 1u;
+                    continue;
+                }
                 const bool use_dual_srv0 =
                     is_cb && ir_.stage_contract.psv0_bindings.enabled &&
                     ir_.stage_contract.psv0_bindings.in0_is_cbv &&
@@ -1887,12 +1985,17 @@ private:
                     !use_dual_srv0 &&
                     ir_.stage_contract.psv0_bindings.enabled && ir_.stage_contract.psv0_bindings.in0_is_cbv &&
                     (is_cb || cb_reg == 0u || !ir_.uses_uav1);
+                const bool use_in0_srv =
+                    !use_dual_srv0 && !use_in0_cbv &&
+                    ir_.stage_contract.psv0_bindings.enabled && ir_.stage_contract.psv0_bindings.in0_is_srv;
                 const char* buf = use_dual_srv0
                                       ? "_srv0"
-                                      : (((inst.imm_u32 & 0xFFu) == 1u && ir_.uses_uav1) ? "_out0" : "_in0");
+                                      : (use_in0_srv
+                                             ? "_in0"
+                                             : (((inst.imm_u32 & 0xFFu) == 1u && ir_.uses_uav1) ? "_out0" : "_in0"));
                 os << ind << "{\n";
                 os << ind << "    uint _sp_off = " << AsU32(inst.operands[0]) << ";\n";
-                if (is_cb && !use_in0_cbv && !use_dual_srv0) {
+                if (is_cb && !use_in0_cbv && !use_dual_srv0 && !use_in0_srv) {
                     os << ind << "    bool _sp_ok = (_sp_off < 65536u) && ((65536u - _sp_off) >= " << span_bytes << "u);\n";
                     os << ind << "    _v" << inst.id << " = _sp_ok;\n";
                     if (!elems.empty()) {
@@ -2038,6 +2141,22 @@ private:
                     os << ind << "_v" << inst.id << " = _rc" << inst.imm_u32 << ";\n";
                     break;
                 case IrOp::LoadUav: {
+                    const uint32_t s2_p1 = (inst.imm_u32 >> 24) & 0x1Fu;
+                    if (s2_p1 > 0u) {
+                        const uint32_t s2 = s2_p1 - 1u;
+                        const bool s2_srv_bit = (s2 < 16u) && ((ir_.used_space2_srv_slots & (1u << s2)) != 0u);
+                        const bool s2_tex_bit = (s2 < 16u) && ((ir_.used_space2_tex_slots & (1u << s2)) != 0u);
+                        if (s2_srv_bit && !s2_tex_bit) {
+                            os << ind << "_v" << inst.id << " = _srv_s" << s2 << ".Load(" << AsU32(inst.operands[0]) << ");\n";
+                        } else if (s2_srv_bit && s2_tex_bit) {
+                            const auto& pb_loc = ir_.stage_contract.psv0_bindings;
+                            const char* sbuf = (pb_loc.enabled && pb_loc.in0_is_cbv && pb_loc.has_srv0) ? "_srv0" : "_in0";
+                            os << ind << "_v" << inst.id << " = " << sbuf << ".Load(" << AsU32(inst.operands[0]) << ");\n";
+                        } else {
+                            os << ind << "_v" << inst.id << " = _os_cb_s" << s2 << "_load(" << AsU32(inst.operands[0]) << ");\n";
+                        }
+                        break;
+                    }
                     const uint32_t cb_reg = inst.imm_u32 & 0xFFu;
                     const bool is_cb = (inst.imm_u32 & kIrLoadCbHeapFlagLifter) != 0u;
                     const bool use_dual_srv0 =
@@ -2048,11 +2167,14 @@ private:
                         !use_dual_srv0 &&
                         ir_.stage_contract.psv0_bindings.enabled && ir_.stage_contract.psv0_bindings.in0_is_cbv &&
                         (is_cb || cb_reg == 0u || !ir_.uses_uav1);
+                    const bool use_in0_srv =
+                        !use_dual_srv0 && !in0_cbv &&
+                        ir_.stage_contract.psv0_bindings.enabled && ir_.stage_contract.psv0_bindings.in0_is_srv;
                     if (use_dual_srv0) {
                         os << ind << "_v" << inst.id << " = _srv0.Load(" << AsU32(inst.operands[0]) << ");\n";
                     } else if (in0_cbv) {
                         os << ind << "_v" << inst.id << " = _os_in0_cb_load(" << AsU32(inst.operands[0]) << ");\n";
-                    } else if (is_cb) {
+                    } else if (is_cb && !use_in0_srv) {
                         // Safe out-of-range s_buffer_load clamping (Leonida #4573)
                         os << ind << "{ uint _cb_off = " << AsU32(inst.operands[0]) << "; "
                            << "if (_cb_off >= 65536u) { _v" << inst.id << " = 0u; } else { "
@@ -2063,19 +2185,38 @@ private:
                     } else if (in0_cbv) {
                         os << ind << "_v" << inst.id << " = _os_in0_cb_load(" << AsU32(inst.operands[0]) << ");\n";
                     } else if ((inst.imm_u32 & kIrLoadSmemBoundsCheckFlag) != 0u) {
-                        const char* buf = ((inst.imm_u32 & 0xFFu) == 1u && ir_.uses_uav1) ? "_out0" : "_in0";
+                        const char* buf = (!use_in0_srv && (inst.imm_u32 & 0xFFu) == 1u && ir_.uses_uav1) ? "_out0" : "_in0";
                         os << ind << "{ uint _sb_off = " << AsU32(inst.operands[0]) << "; uint _sb_len = 0u; "
                            << buf << ".GetDimensions(_sb_len); "
                            << "bool _sb_ok = (_sb_off < 0x80000000u) && ((_sb_len > 0u) ? ((_sb_off < _sb_len) && ((_sb_off + 4u) <= _sb_len)) : (_sb_off < 65536u)); "
                            << "_v" << inst.id << " = _sb_ok ? " << buf << ".Load(_sb_off) : 0u; }\n";
                     } else {
-                        const char* buf = (inst.imm_u32 == 1u && ir_.uses_uav1) ? "_out0" : "_in0";
+                        const char* buf = (!use_in0_srv && inst.imm_u32 == 1u && ir_.uses_uav1) ? "_out0" : "_in0";
                         os << ind << "_v" << inst.id << " = " << buf << ".Load(" << AsU32(inst.operands[0]) << ");\n";
                     }
                     break;
                 }
                 case IrOp::LoadUavSpanElem: {
+                    const uint32_t s2_p1 = (inst.imm_u32 >> 24) & 0x1Fu;
                     const uint32_t k = (inst.imm_u32 >> 16) & 0xFFu;
+                    if (s2_p1 > 0u) {
+                        const uint32_t s2 = s2_p1 - 1u;
+                        const bool s2_srv_bit = (s2 < 16u) && ((ir_.used_space2_srv_slots & (1u << s2)) != 0u);
+                        const bool s2_tex_bit = (s2 < 16u) && ((ir_.used_space2_tex_slots & (1u << s2)) != 0u);
+                        if (s2_srv_bit && !s2_tex_bit) {
+                            os << ind << "{ uint _so = " << AsU32(inst.operands[0]) << " + " << (k * 4u) << "u; "
+                               << "_v" << inst.id << " = _srv_s" << s2 << ".Load(_so); }\n";
+                        } else if (s2_srv_bit && s2_tex_bit) {
+                            const auto& pb_loc = ir_.stage_contract.psv0_bindings;
+                            const char* sbuf = (pb_loc.enabled && pb_loc.in0_is_cbv && pb_loc.has_srv0) ? "_srv0" : "_in0";
+                            os << ind << "{ uint _so = " << AsU32(inst.operands[0]) << " + " << (k * 4u) << "u; "
+                               << "_v" << inst.id << " = " << sbuf << ".Load(_so); }\n";
+                        } else {
+                            os << ind << "{ uint _so = " << AsU32(inst.operands[0]) << " + " << (k * 4u) << "u; "
+                               << "_v" << inst.id << " = _os_cb_s" << s2 << "_load(_so); }\n";
+                        }
+                        break;
+                    }
                     const bool is_cb = (inst.imm_u32 & kIrLoadCbHeapFlagLifter) != 0u;
                     const uint32_t cb_reg = inst.imm_u32 & 0xFFu;
                     const bool use_dual_srv0 =
@@ -2087,19 +2228,22 @@ private:
                         ir_.stage_contract.psv0_bindings.enabled &&
                         ir_.stage_contract.psv0_bindings.in0_is_cbv &&
                         (is_cb || cb_reg == 0u || !ir_.uses_uav1);
+                    const bool use_in0_srv =
+                        !use_dual_srv0 && !use_in0_cb &&
+                        ir_.stage_contract.psv0_bindings.enabled && ir_.stage_contract.psv0_bindings.in0_is_srv;
                     if (use_dual_srv0) {
                         os << ind << "{ uint _so = " << AsU32(inst.operands[0]) << " + " << (k * 4u) << "u; "
                            << "_v" << inst.id << " = _srv0.Load(_so); }\n";
                     } else if (use_in0_cb) {
                         os << ind << "{ uint _so = " << AsU32(inst.operands[0]) << " + " << (k * 4u) << "u; "
                            << "_v" << inst.id << " = _os_in0_cb_load(_so); }\n";
-                    } else if (is_cb) {
+                    } else if (is_cb && !use_in0_srv) {
                         os << ind << "{ uint _so = " << AsU32(inst.operands[0]) << " + " << (k * 4u) << "u; "
                            << "if (" << AsBool(inst.operands[1]) << " || (_so < 65536u && (65536u - _so) >= 4u)) { "
                            << "uint _dw = _so >> 2u; uint4 _q = _cb_heap_" << cb_reg << "[(_dw >> 2u) & 4095u]; uint _l = _dw & 3u; "
                            << "_v" << inst.id << " = (_l == 0u) ? _q.x : ((_l == 1u) ? _q.y : ((_l == 2u) ? _q.z : _q.w)); } else { _v" << inst.id << " = 0u; } }\n";
                     } else {
-                        const char* buf = (cb_reg == 1u && ir_.uses_uav1) ? "_out0" : "_in0";
+                        const char* buf = (!use_in0_srv && cb_reg == 1u && ir_.uses_uav1) ? "_out0" : "_in0";
                         os << ind << "{ uint _so = " << AsU32(inst.operands[0]) << " + " << (k * 4u) << "u; "
                            << "if (" << AsBool(inst.operands[1]) << ") { _v" << inst.id << " = " << buf << ".Load(_so); } else { "
                            << "uint _sl = 0u; " << buf << ".GetDimensions(_sl); uint _lim = (_sl > 0u) ? _sl : 65536u; "
@@ -2140,7 +2284,15 @@ private:
                     const uint32_t comp_idx = (inst.imm_u32 >> 12) & 0xFu;
                     const bool is_d16 = ((inst.imm_u32 >> 16) & 1u) != 0u;
                     const bool has_hi = ((inst.imm_u32 >> 17) & 1u) != 0u;
-                    const char* loader = (uav_slot == 1u && ir_.uses_uav1) ? "_os_load_unaligned_u1" : "_os_load_unaligned_u0";
+                    const bool force_u0_srv =
+                        ir_.stage_contract.psv0_bindings.enabled &&
+                        ir_.stage_contract.psv0_bindings.in0_is_srv &&
+                        !ir_.stage_contract.psv0_bindings.in0_is_cbv &&
+                        !ModuleUsesOp(ir_, IrOp::StoreUav) &&
+                        !ModuleUsesOp(ir_, IrOp::StoreUavSubDword);
+                    const char* loader = (!force_u0_srv && uav_slot == 1u && ir_.uses_uav1)
+                                             ? "_os_load_unaligned_u1"
+                                             : "_os_load_unaligned_u0";
                     const Rdna2MtbufFormatInfo fmt_info = GetRdna2MtbufFormatInfo(static_cast<uint8_t>(fmt));
                     const uint32_t elem_bytes = fmt_info.component_bytes ? fmt_info.component_bytes : 4u;
                     const std::string base_addr = AsU32(inst.operands[0]);
@@ -2168,17 +2320,20 @@ private:
                     }
                     break;
                 }
-                case IrOp::ImageSample:
+                case IrOp::ImageSample: {
+                    const uint32_t t_s2 = (inst.imm_u32 >> 24) & 0x1Fu;
+                    const std::string tname = (t_s2 > 0u) ? ("_tex_s" + std::to_string(t_s2 - 1u)) : "_tex0";
                     if ((inst.imm_u32 & 0x80u) != 0u) {
-                        os << ind << "_v" << inst.id << " = _tex0.SampleCmpLevelZero(_samp_cmp0, float2("
+                        os << ind << "_v" << inst.id << " = " << tname << ".SampleCmpLevelZero(_samp_cmp0, float2("
                            << AsF32(inst.operands[0]) << ", " << AsF32(inst.operands[1]) << "), "
                            << AsF32(inst.operands[2]) << ");\n";
                     } else {
-                        os << ind << "_v" << inst.id << " = _tex0.SampleLevel(_samp0, float2("
+                        os << ind << "_v" << inst.id << " = " << tname << ".SampleLevel(_samp0, float2("
                            << AsF32(inst.operands[0]) << ", " << AsF32(inst.operands[1]) << "), "
                            << AsF32(inst.operands[2]) << ")." << kSwiz[inst.imm_u32 & 3u] << ";\n";
                     }
                     break;
+                }
                 case IrOp::ImageSampleDynamic: {
                     const std::string idx_expr = use_sm65_
                         ? ("NonUniformResourceIndex(" + AsU32(inst.operands[3]) + ")")
@@ -2196,11 +2351,19 @@ private:
                     }
                     break;
                 }
-                case IrOp::ImageSampleImplicit:
-                    os << ind << "_v" << inst.id << " = _os_sample_affine_quad(float2("
-                       << AsF32(inst.operands[0]) << ", " << AsF32(inst.operands[1]) << "))."
-                       << kSwiz[inst.imm_u32 & 3u] << ";\n";
+                case IrOp::ImageSampleImplicit: {
+                    const uint32_t t_s2 = (inst.imm_u32 >> 24) & 0x1Fu;
+                    if (t_s2 > 0u) {
+                        os << ind << "_v" << inst.id << " = _os_sample_affine_quad_t(_tex_s" << (t_s2 - 1u)
+                           << ", float2(" << AsF32(inst.operands[0]) << ", " << AsF32(inst.operands[1]) << "))."
+                           << kSwiz[inst.imm_u32 & 3u] << ";\n";
+                    } else {
+                        os << ind << "_v" << inst.id << " = _os_sample_affine_quad(float2("
+                           << AsF32(inst.operands[0]) << ", " << AsF32(inst.operands[1]) << "))."
+                           << kSwiz[inst.imm_u32 & 3u] << ";\n";
+                    }
                     break;
+                }
                 case IrOp::ImageSampleMinLod: {
                     // Preserved MinLod clamp in HLSL (Xbox2Windows 747b21a)
                     const uint32_t ch = inst.imm_u32 & 3u;
@@ -2664,6 +2827,24 @@ private:
                     break;
                 case IrOp::FFract:
                     os << ind << "_v" << inst.id << " = _os_fract_f32(" << AsF32(inst.operands[0]) << ");\n";
+                    break;
+                case IrOp::FTrunc:
+                    os << ind << "_v" << inst.id << " = trunc(" << AsF32(inst.operands[0]) << ");\n";
+                    break;
+                case IrOp::FRndne:
+                    os << ind << "_v" << inst.id << " = round(" << AsF32(inst.operands[0]) << ");\n";
+                    break;
+                case IrOp::FExp2:
+                    os << ind << "_v" << inst.id << " = exp2(" << AsF32(inst.operands[0]) << ");\n";
+                    break;
+                case IrOp::FLog2:
+                    os << ind << "_v" << inst.id << " = log2(" << AsF32(inst.operands[0]) << ");\n";
+                    break;
+                case IrOp::FSinCycles:
+                    os << ind << "_v" << inst.id << " = sin((" << AsF32(inst.operands[0]) << ") * 6.28318530718f);\n";
+                    break;
+                case IrOp::FCosCycles:
+                    os << ind << "_v" << inst.id << " = cos((" << AsF32(inst.operands[0]) << ") * 6.28318530718f);\n";
                     break;
                 case IrOp::FDot2: {
                     const std::string a = AsU32(inst.operands[0]);
@@ -6511,6 +6692,30 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                     EmitSpvInst(sec_fn, SpvOpLogicalOr, {t_bool, non_fin, is_nan, is_inf});
                     EmitSpvInst(sec_fn, SpvOpExtInst, {t_f32, fr, glsl_ext_id, GlslFract, fx});
                     EmitSpvInst(sec_fn, SpvOpSelect, {t_f32, res, non_fin, get_const_f32(BitsToFloat(0x7FC00000u)), fr});
+                    break;
+                }
+                case IrOp::FTrunc:
+                    EmitSpvInst(sec_fn, SpvOpExtInst, {t_f32, res, glsl_ext_id, GlslTrunc, get_as_f32(inst.operands[0])});
+                    break;
+                case IrOp::FRndne:
+                    EmitSpvInst(sec_fn, SpvOpExtInst, {t_f32, res, glsl_ext_id, GlslRoundEven, get_as_f32(inst.operands[0])});
+                    break;
+                case IrOp::FExp2:
+                    EmitSpvInst(sec_fn, SpvOpExtInst, {t_f32, res, glsl_ext_id, GlslExp2, get_as_f32(inst.operands[0])});
+                    break;
+                case IrOp::FLog2:
+                    EmitSpvInst(sec_fn, SpvOpExtInst, {t_f32, res, glsl_ext_id, GlslLog2, get_as_f32(inst.operands[0])});
+                    break;
+                case IrOp::FSinCycles: {
+                    uint32_t rad = alloc_id();
+                    EmitSpvInst(sec_fn, SpvOpFMul, {t_f32, rad, get_as_f32(inst.operands[0]), get_const_f32(6.28318530718f)});
+                    EmitSpvInst(sec_fn, SpvOpExtInst, {t_f32, res, glsl_ext_id, GlslSin, rad});
+                    break;
+                }
+                case IrOp::FCosCycles: {
+                    uint32_t rad = alloc_id();
+                    EmitSpvInst(sec_fn, SpvOpFMul, {t_f32, rad, get_as_f32(inst.operands[0]), get_const_f32(6.28318530718f)});
+                    EmitSpvInst(sec_fn, SpvOpExtInst, {t_f32, res, glsl_ext_id, GlslCos, rad});
                     break;
                 }
                 case IrOp::FDot2: {

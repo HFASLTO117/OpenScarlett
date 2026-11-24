@@ -1195,14 +1195,58 @@ public:
         out.Options.DestinationType = DSTORAGE_REQUEST_DESTINATION_MEMORY;
         out.Options.SourceType = from_memory ? DSTORAGE_REQUEST_SOURCE_MEMORY : DSTORAGE_REQUEST_SOURCE_FILE;
         if (from_memory) {
-            out.Source.Memory.Source = x.Source;
+            void* src_buf = x.Source;
+#if defined(_WIN32)
+            if (!src_phys && src_buf) {
+                using ResolveFn = uint64_t(__stdcall*)(uint64_t);
+                static std::atomic<ResolveFn> s_xmem_resolve{nullptr};
+                static std::atomic<bool> s_xmem_probed{false};
+                ResolveFn fn = s_xmem_resolve.load(std::memory_order_acquire);
+                if (!fn && !s_xmem_probed.load(std::memory_order_relaxed)) {
+                    if (HMODULE hm = ::GetModuleHandleA("xmem.dll")) {
+                        fn = reinterpret_cast<ResolveFn>(
+                            ::GetProcAddress(hm, "OpenScarlett_XMemResolveCpuAliasVa"));
+                        if (fn) s_xmem_resolve.store(fn, std::memory_order_release);
+                        s_xmem_probed.store(true, std::memory_order_release);
+                    }
+                }
+                if (fn) {
+                    const uint64_t orig = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(src_buf));
+                    const uint64_t resolved = fn(orig);
+                    if (resolved != 0ull) src_buf = reinterpret_cast<void*>(static_cast<uintptr_t>(resolved));
+                }
+            }
+#endif
+            out.Source.Memory.Source = src_buf;
             out.Source.Memory.Size = x.SourceSize;
         } else {
             out.Source.File.Source = x.File;
             out.Source.File.Offset = x.FileOffset;
             out.Source.File.Size = x.SourceSize;
         }
-        out.Destination.Memory.Buffer = x.Destination;
+        void* dst_buf = x.Destination;
+#if defined(_WIN32)
+        if (!dest_phys && dst_buf) {
+            using ResolveFn = uint64_t(__stdcall*)(uint64_t);
+            static std::atomic<ResolveFn> s_xmem_resolve_dst{nullptr};
+            static std::atomic<bool> s_xmem_probed_dst{false};
+            ResolveFn fn = s_xmem_resolve_dst.load(std::memory_order_acquire);
+            if (!fn && !s_xmem_probed_dst.load(std::memory_order_relaxed)) {
+                if (HMODULE hm = ::GetModuleHandleA("xmem.dll")) {
+                    fn = reinterpret_cast<ResolveFn>(
+                        ::GetProcAddress(hm, "OpenScarlett_XMemResolveCpuAliasVa"));
+                    if (fn) s_xmem_resolve_dst.store(fn, std::memory_order_release);
+                    s_xmem_probed_dst.store(true, std::memory_order_release);
+                }
+            }
+            if (fn) {
+                const uint64_t orig = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(dst_buf));
+                const uint64_t resolved = fn(orig);
+                if (resolved != 0ull) dst_buf = reinterpret_cast<void*>(static_cast<uintptr_t>(resolved));
+            }
+        }
+#endif
+        out.Destination.Memory.Buffer = dst_buf;
         out.Destination.Memory.Size = x.DestinationSize;
         out.UncompressedSize = x.DestinationSize;
         out.CancellationTag = x.CancellationTag;
@@ -2886,6 +2930,32 @@ private:
     }
 
     void RecordFailure(int32_t hr, const QueueItem& item) {
+        static const bool trace_ds = []() {
+#if defined(_WIN32)
+            char buf[16]{};
+            return ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_DSTORAGE", buf, sizeof(buf)) > 0 && buf[0] != '0';
+#else
+            return false;
+#endif
+        }();
+        if (trace_ds) {
+            static std::atomic<uint32_t> s_fail_log{0u};
+            if (s_fail_log.fetch_add(1u, std::memory_order_relaxed) < 24u) {
+                std::fprintf(stderr,
+                             "[OpenScarlett][dstorage] FAIL hr=0x%08lX opts=0x%llX dst=%p dstSz=0x%X srcSz=0x%X off=0x%llX\n",
+                             static_cast<unsigned long>(hr),
+                             static_cast<unsigned long long>(item.xbox_options),
+                             item.request.Destination.Memory.Buffer,
+                             item.request.Destination.Memory.Size,
+                             item.request.Options.SourceType == DSTORAGE_REQUEST_SOURCE_FILE
+                                 ? item.request.Source.File.Size
+                                 : item.request.Source.Memory.Size,
+                             item.request.Options.SourceType == DSTORAGE_REQUEST_SOURCE_FILE
+                                 ? static_cast<unsigned long long>(item.request.Source.File.Offset)
+                                 : 0ull);
+                std::fflush(stderr);
+            }
+        }
         const OpenScarlettDStorageRequestDesc& req = item.request;
         std::lock_guard<std::mutex> lk(error_mutex_);
         if (error_record_.FailureCount == 0) {

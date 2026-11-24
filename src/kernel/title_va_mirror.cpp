@@ -188,14 +188,11 @@ Status TitleVAMirror::RegisterRegion(const TitleVaMappingDesc& desc,
         const UINT reset_rc = ResetWriteWatch(
             entry.cpu_backing_ptr, static_cast<SIZE_T>(entry.alloc_size_bytes));
         entry.write_watch_enabled = (reset_rc == 0u);
-        if (!entry.write_watch_enabled && entry.size_bytes >= kPageSize64KB) {
+        if (!entry.write_watch_enabled && entry.size_bytes > (16ull * 1024ull * 1024ull)) {
             const size_t num_chunks =
                 static_cast<size_t>((entry.size_bytes + kPageSize64KB - 1ull) / kPageSize64KB);
             entry.fallback_chunk_hashes.assign(num_chunks, 0ull);
-            // Seed all chunks as touched once for initial upload on <= 4 MiB buffers so static
-            // pre-populated buffers upload on first flush, then only re-hash touched chunks.
-            const uint64_t init_bits = (entry.size_bytes <= (4ull * 1024ull * 1024ull)) ? ~0ull : 0ull;
-            entry.touched_chunk_bits.assign((num_chunks + 63u) / 64u, init_bits);
+            entry.touched_chunk_bits.assign((num_chunks + 63u) / 64u, 0ull);
             entry.use_touched_chunk_hints = true;
             entry.fallback_hashes_initialized = true;
         }
@@ -377,9 +374,10 @@ Status TitleVAMirror::QueryDirtyLocked(RegionEntry& entry,
                 // so untouched zero pages are never redundantly uploaded over PCIe.
                 constexpr uint64_t kZeroChunkHash = 0ull;
                 entry.fallback_chunk_hashes.assign(num_chunks, kZeroChunkHash);
-                const uint64_t init_bits = (entry.size_bytes <= (4ull * 1024ull * 1024ull)) ? ~0ull : 0ull;
-                entry.touched_chunk_bits.assign((num_chunks + 63u) / 64u, init_bits);
-                entry.use_touched_chunk_hints = (entry.size_bytes >= kPageSize64KB);
+                entry.use_touched_chunk_hints = (entry.size_bytes > (16ull * 1024ull * 1024ull));
+                if (entry.use_touched_chunk_hints) {
+                    entry.touched_chunk_bits.assign((num_chunks + 63u) / 64u, 0ull);
+                }
                 entry.fallback_hashes_initialized = true;
             }
             const auto* base = static_cast<const uint8_t*>(entry.cpu_backing_ptr);
@@ -796,7 +794,7 @@ bool TitleVAMirror::ResolveTitleVa(uint64_t title_va,
     if (entry.use_touched_chunk_hints && !entry.touched_chunk_bits.empty()) {
         const size_t c0 = static_cast<size_t>(rel / kPageSize64KB);
         const size_t max_c = entry.fallback_chunk_hashes.size();
-        for (size_t c = c0; c <= c0 + 1u && c < max_c; ++c) {
+        for (size_t c = c0; c <= c0 + 7u && c < max_c; ++c) {
             const size_t wi = c >> 6u;
             const uint64_t bit = 1ull << (c & 63u);
             if (wi < entry.touched_chunk_bits.size()) {

@@ -616,6 +616,9 @@ private:
     ID3D12PipelineState* last_host_pso_ = nullptr;
     ID3D12DescriptorHeap* bound_cbv_srv_uav_heap_ = nullptr;
     ID3D12DescriptorHeap* bound_sampler_heap_ = nullptr;
+    uint32_t last_raw_topology_ = 0u;
+    D3D12_VERTEX_BUFFER_VIEW last_vb0_raw_{};
+    D3D12_VERTEX_BUFFER_VIEW last_vb0_host_{};
     mutable std::mutex aaa_rec_mutex_;
     std::vector<uint64_t> written_mirrored_vas_;
     std::vector<DeferredCpuWrite32> deferred_cpu_writes_;
@@ -688,6 +691,8 @@ private:
     bool last_pso_is_standin_ = false;
     bool last_gfx_rs_is_empty_ = false;
     bool last_cmp_rs_is_empty_ = false;
+    ID3D12RootSignature* last_host_graphics_rs_ = nullptr;
+    ID3D12Resource* last_bound_rtv0_res_ = nullptr;
     std::atomic<bool> last_close_failed_{false};
     mutable std::mutex diag_ops_mutex_;
     std::vector<std::string> diag_ops_;

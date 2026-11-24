@@ -955,6 +955,26 @@ bool PollPhysicalGamepad(
         }
     }
 
+    static const uint64_t s_autopress_start_ms = []() -> uint64_t {
+        char buf[32]{};
+        const DWORD n = ::GetEnvironmentVariableA("OPENSCARLETT_AUTOPRESS_A_MS", buf, sizeof(buf));
+        if (n > 0u && n < sizeof(buf)) {
+            return std::strtoull(buf, nullptr, 10);
+        }
+        return 0ull;
+    }();
+    if (s_autopress_start_ms > 0ull) {
+        static const uint64_t s_t0_ms = ::GetTickCount64();
+        const uint64_t elapsed = ::GetTickCount64() - s_t0_ms;
+        if (elapsed >= s_autopress_start_ms) {
+            const uint64_t phase = (elapsed - s_autopress_start_ms) % 5000ull;
+            if (phase < 300ull) {
+                found = true;
+                out_gamepad.buttons |= GameInputGamepadA;
+            }
+        }
+    }
+
     static const std::string s_trace_gi_path = []() {
         char buf[512]{};
         DWORD n = ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_GAMEINPUT", buf, sizeof(buf));

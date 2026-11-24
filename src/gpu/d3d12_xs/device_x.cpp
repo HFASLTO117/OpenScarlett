@@ -386,6 +386,26 @@ DXGI_FORMAT MapTypelessFormatForSrv(DXGI_FORMAT fmt) noexcept {
     }
 }
 
+// Resolves a console GPU-only alias VA (e.g. a paired PAGE_NOACCESS | PAGE_GPU_READONLY
+// XMemVirtualAlloc window) back to its CPU-readable mirror VA when xmem.dll has paired them.
+uint64_t ResolveGuestCpuAliasVa(uint64_t va) noexcept {
+    if (va == 0ull) return 0ull;
+    using Fn = uint64_t(__stdcall*)(uint64_t);
+    static std::atomic<Fn> s_fn{nullptr};
+    static std::atomic<bool> s_probed{false};
+    Fn fn = s_fn.load(std::memory_order_acquire);
+    if (!fn && !s_probed.load(std::memory_order_relaxed)) {
+        if (HMODULE hm = ::GetModuleHandleA("xmem.dll")) {
+            fn = reinterpret_cast<Fn>(::GetProcAddress(hm, "OpenScarlett_XMemResolveCpuAliasVa"));
+            if (fn) {
+                s_fn.store(fn, std::memory_order_release);
+            }
+            s_probed.store(true, std::memory_order_release);
+        }
+    }
+    return fn ? fn(va) : va;
+}
+
 bool IsReadableGuestVaRange(uint64_t va, uint64_t byte_size) noexcept {
     if (va == 0ull || byte_size == 0ull) return false;
     if (va > UINT64_MAX - byte_size) return false;
@@ -673,10 +693,32 @@ bool SafeHashGuestMemoryFnv1a64(const void* src, size_t byte_count, uint64_t& ou
 #if defined(_MSC_VER)
     __try {
         const auto* p = static_cast<const uint8_t*>(src);
-        uint64_t h = 14695981039346656037ull;
-        for (size_t i = 0u; i < byte_count; ++i) {
-            h ^= static_cast<uint64_t>(p[i]);
-            h *= 1099511628211ull;
+        uint64_t h = 14695981039346656037ull ^ static_cast<uint64_t>(byte_count);
+        if (byte_count > (256u * 1024u)) {
+            // Fast O(1) strided 64-bit probe (head + tail + 256 strided points) so large
+            // streaming textures (>256 KiB) never stall ExecuteCommandLists for seconds.
+            const size_t stride = std::max<size_t>(8u, (byte_count / 256u) & ~size_t(7u));
+            for (size_t off = 0u; off + 8u <= byte_count; off += stride) {
+                uint64_t w = 0ull;
+                std::memcpy(&w, p + off, sizeof(w));
+                h = (h ^ w) * 1099511628211ull;
+            }
+            for (size_t off = byte_count - 64u; off + 8u <= byte_count; off += 8u) {
+                uint64_t w = 0ull;
+                std::memcpy(&w, p + off, sizeof(w));
+                h = (h ^ w) * 1099511628211ull;
+            }
+        } else {
+            size_t i = 0u;
+            for (; i + 8u <= byte_count; i += 8u) {
+                uint64_t w = 0ull;
+                std::memcpy(&w, p + i, sizeof(w));
+                h = (h ^ w) * 1099511628211ull;
+            }
+            for (; i < byte_count; ++i) {
+                h ^= static_cast<uint64_t>(p[i]);
+                h *= 1099511628211ull;
+            }
         }
         out_hash = h;
         return true;
@@ -1964,9 +2006,34 @@ void DeviceX::NotifyResourceDestroyed(ID3D12Resource* host_resource) noexcept {
         }
     }
     {
+        ID3D12Resource* unified_res_release = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(unified_mutex_);
+            auto uit = unified_textures_.find(host_resource);
+            if (uit != unified_textures_.end()) {
+                if (uit->second.dirty) {
+                    dirty_unified_count_.fetch_sub(1u, std::memory_order_acq_rel);
+                }
+                unified_res_release = uit->second.resource;
+                unified_textures_.erase(uit);
+                registered_unified_count_.store(
+                    static_cast<uint32_t>(unified_textures_.size()), std::memory_order_release);
+            }
+        }
+        if (unified_res_release) {
+            unified_res_release->Release();
+        }
+    }
+    {
         std::lock_guard<std::mutex> lock(fallback_mutex_);
         r9g9b9e5_fallback_resources_.erase(host_resource);
     }
+    {
+        std::lock_guard<std::mutex> slk(retail_state_mutex_);
+        retail_res_states_.erase(host_resource);
+    }
+    ID3D12Resource* expected_dii = host_resource;
+    (void)last_dii_rtv_.compare_exchange_strong(expected_dii, nullptr, std::memory_order_acq_rel);
     if (vulkan_routing_active_) {
         std::lock_guard<std::mutex> lock(vk_state_mutex_);
         vk_resources_.erase(host_resource);
@@ -2000,11 +2067,34 @@ void DeviceX::NotifyDescriptorHeapDestroyed(ID3D12DescriptorHeap* host_heap) noe
         std::lock_guard<std::mutex> lock(virt_sampler_mutex_);
         virtual_sampler_heaps_.erase(host_heap);
     }
+    {
+        std::lock_guard<std::mutex> glk(guest_dh_mutex_);
+        auto it_end = std::remove_if(
+            guest_backed_desc_heaps_.begin(), guest_backed_desc_heaps_.end(),
+            [host_heap](const GuestBackedDescHeap& g) { return g.host_heap == host_heap; });
+        if (it_end != guest_backed_desc_heaps_.end()) {
+            guest_backed_desc_heaps_.erase(it_end, guest_backed_desc_heaps_.end());
+            has_guest_backed_desc_heaps_.store(
+                !guest_backed_desc_heaps_.empty(), std::memory_order_release);
+        }
+    }
     std::lock_guard<std::mutex> lock(residency_mutex_);
     auto it = desc_heap_window0_vas_.find(host_heap);
     if (it != desc_heap_window0_vas_.end()) {
         openscarlett::SparseVramFree(sparse_window_iso_, it->second);
         desc_heap_window0_vas_.erase(it);
+    }
+}
+
+void DeviceX::NotifyRootSignatureDestroyed(ID3D12RootSignature* host_rs) noexcept {
+    if (!host_rs) return;
+    {
+        std::lock_guard<std::mutex> glk(guest_dh_mutex_);
+        rs_table_slot_counts_.erase(host_rs);
+    }
+    {
+        std::lock_guard<std::mutex> dlk(diag_meta_mutex_);
+        diag_rs_map_.erase(host_rs);
     }
 }
 
@@ -2329,6 +2419,36 @@ DeviceX::~DeviceX() {
             cbv_align_ring_ = nullptr;
             cbv_align_ring_gpu_.store(0ull, std::memory_order_release);
         }
+    }
+    {
+        std::lock_guard<std::mutex> tlk(transient_ring_mutex_);
+        if (transient_ring_) {
+            if (transient_ring_cpu_) {
+                transient_ring_->Unmap(0u, nullptr);
+                transient_ring_cpu_ = nullptr;
+            }
+            transient_ring_->Release();
+            transient_ring_ = nullptr;
+            transient_ring_gpu_ = 0ull;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> glk(guest_dh_mutex_);
+        if (shadow_cbv_srv_uav_heap_) {
+            shadow_cbv_srv_uav_heap_->Release();
+            shadow_cbv_srv_uav_heap_ = nullptr;
+            shadow_cbv_srv_uav_cpu_start_.ptr = 0u;
+            shadow_null_srv_cpu_.ptr = 0u;
+            shadow_cbv_srv_uav_cap_ = 0u;
+            shadow_static_cursor_ = 1u;
+            shadow_dynamic_cursor_ = 0u;
+        }
+        shadow_slot_keys_.clear();
+        shadow_slot_valid_.clear();
+        desc32_to_shadow_cpu_.clear();
+        rs_table_slot_counts_.clear();
+        guest_backed_desc_heaps_.clear();
+        has_guest_backed_desc_heaps_.store(false, std::memory_order_relaxed);
     }
     {
         std::lock_guard<std::mutex> alk(placed_alias_mutex_);
@@ -3874,13 +3994,33 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateDescriptorHeap(
             safe.NumDescriptors > 2048u) {
             safe.NumDescriptors = 2048u;
         }
-        if (safe.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
+        // First retry with sanitized Flags/NodeMask while preserving the full console NumDescriptors
+        // (Resource Binding Tier 3 desktop GPUs like Turing/Ampere/RDNA support >1,000,000 CBV_SRV_UAV).
+        hr = host_dev_->CreateDescriptorHeap(
+            &safe, OS_D3D12_IID(ID3D12DescriptorHeap), reinterpret_cast<void**>(&host_heap));
+        if ((FAILED(hr) || !host_heap) &&
+            safe.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
             (safe.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE) != 0 &&
             safe.NumDescriptors > 1000000u) {
             safe.NumDescriptors = 1000000u;
+            hr = host_dev_->CreateDescriptorHeap(
+                &safe, OS_D3D12_IID(ID3D12DescriptorHeap), reinterpret_cast<void**>(&host_heap));
         }
-        hr = host_dev_->CreateDescriptorHeap(
-            &safe, OS_D3D12_IID(ID3D12DescriptorHeap), reinterpret_cast<void**>(&host_heap));
+    }
+    if (SUCCEEDED(hr) && host_heap && CommandListX::IsDiagTraceEnabled() && pDescriptorHeapDesc) {
+        const auto hd = host_heap->GetDesc();
+        const UINT inc = host_dev_->GetDescriptorHandleIncrementSize(hd.Type);
+        const auto c0 = host_heap->GetCPUDescriptorHandleForHeapStart();
+        const auto g0 = (hd.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)
+                            ? host_heap->GetGPUDescriptorHandleForHeapStart()
+                            : D3D12_GPU_DESCRIPTOR_HANDLE{0ull};
+        std::fprintf(stderr,
+                     "[OpenScarlett][DH] type=%d reqN=%u reqFlags=0x%X -> hostN=%u hostFlags=0x%X inc=%u cpu0=0x%llX gpu0=0x%llX\n",
+                     static_cast<int>(pDescriptorHeapDesc->Type), pDescriptorHeapDesc->NumDescriptors,
+                     static_cast<unsigned>(pDescriptorHeapDesc->Flags), hd.NumDescriptors,
+                     static_cast<unsigned>(hd.Flags), inc,
+                     static_cast<unsigned long long>(c0.ptr), static_cast<unsigned long long>(g0.ptr));
+        std::fflush(stderr);
     }
     if (FAILED(hr) || !host_heap) {
         RecordDev("ID3D12DeviceX::CreateDescriptorHeap", 14, hr);
@@ -4058,24 +4198,41 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateRootSignature(
                             params_1_1.assign(aug.Desc_1_1.pParameters, aug.Desc_1_1.pParameters + 1u);
                             D3D12_DESCRIPTOR_RANGE1 r0 = aug.Desc_1_1.pParameters[0].DescriptorTable.pDescriptorRanges[0];
                             r0.OffsetInDescriptorsFromTableStart = 0u;
-                            D3D12_DESCRIPTOR_RANGE1 r1{};
-                            r1.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-                            r1.NumDescriptors = 1u;
-                            r1.BaseShaderRegister = 7u;
-                            r1.RegisterSpace = 1u;
-                            r1.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
-                            r1.OffsetInDescriptorsFromTableStart = 0u;
-                            D3D12_DESCRIPTOR_RANGE1 r2 = r1;
-                            r2.BaseShaderRegister = 277u;
-                            r2.OffsetInDescriptorsFromTableStart = 1u;
-                            D3D12_DESCRIPTOR_RANGE1 r3{};
-                            r3.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
-                            r3.NumDescriptors = 1u;
-                            r3.BaseShaderRegister = 0u;
-                            r3.RegisterSpace = 1u;
-                            r3.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
-                            r3.OffsetInDescriptorsFromTableStart = 2u;
-                            expanded_ranges_1_1 = {r0, r1, r2, r3};
+                            auto make_rng = [](D3D12_DESCRIPTOR_RANGE_TYPE rt, UINT reg, UINT off) {
+                                D3D12_DESCRIPTOR_RANGE1 r{};
+                                r.RangeType = rt;
+                                r.NumDescriptors = 1u;
+                                r.BaseShaderRegister = reg;
+                                r.RegisterSpace = 1u;
+                                r.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
+                                r.OffsetInDescriptorsFromTableStart = off;
+                                return r;
+                            };
+                            auto make_s2_rng = [](D3D12_DESCRIPTOR_RANGE_TYPE rt, UINT count) {
+                                D3D12_DESCRIPTOR_RANGE1 r{};
+                                r.RangeType = rt;
+                                r.NumDescriptors = count;
+                                r.BaseShaderRegister = 0u;
+                                r.RegisterSpace = 2u;
+                                r.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
+                                r.OffsetInDescriptorsFromTableStart = 0u;
+                                return r;
+                            };
+                            // Slot @0..@15 space2 overlay maps every hardware s[8:9]+slot*32 SRV/CBV
+                            // directly without collisions across multi-texture / multi-CBV shaders.
+                            expanded_ranges_1_1 = {
+                                r0,
+                                make_rng(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2u, 0u),
+                                make_rng(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3u, 0u),
+                                make_rng(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 7u, 0u),
+                                make_rng(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 5u, 1u),
+                                make_rng(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 72u, 1u),
+                                make_rng(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 277u, 1u),
+                                make_rng(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 0u, 2u),
+                                make_rng(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 3u, 3u),
+                                make_s2_rng(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 16u),
+                                make_s2_rng(D3D12_DESCRIPTOR_RANGE_TYPE_CBV, 16u),
+                            };
                             params_1_1[0].DescriptorTable.NumDescriptorRanges = static_cast<UINT>(expanded_ranges_1_1.size());
                             params_1_1[0].DescriptorTable.pDescriptorRanges = expanded_ranges_1_1.data();
                             aug.Desc_1_1.pParameters = params_1_1.data();
@@ -4087,10 +4244,167 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateRootSignature(
                                     samps.push_back(ss);
                                 }
                             }
+                        } else if (aug.Desc_1_1.NumParameters >= 1u && aug.Desc_1_1.pParameters) {
+                            // Retail Scarlett Scaleform/UI pipelines share a root signature declaring
+                            // CBV b0 space1 across both instanced (b0 space1) and non-instanced
+                            // (b7 space1) shaders reading the exact same descriptor slot. Alias b7
+                            // space1 at b0 space1's table offset when b7 space1 is not already present,
+                            // and overlay space2 SRV/CBV slots @0..@15 on all retail descriptor tables
+                            // so any lifted XDAT shader can bind its exact hardware descriptor slots.
+                            int target_pi = -1;
+                            int fallback_s2_pi = -1;
+                            bool add_b7_alias = false;
+                            UINT b0_table_off = 0u;
+                            for (UINT pi = 0u; pi < aug.Desc_1_1.NumParameters && target_pi < 0; ++pi) {
+                                const auto& rp = aug.Desc_1_1.pParameters[pi];
+                                if (rp.ParameterType != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE ||
+                                    !rp.DescriptorTable.pDescriptorRanges ||
+                                    rp.DescriptorTable.NumDescriptorRanges == 0u) {
+                                    continue;
+                                }
+                                bool has_b0_s1 = false;
+                                bool has_b7_s1 = false;
+                                bool has_s2 = false;
+                                bool is_sampler_table = false;
+                                UINT cur_off = 0u;
+                                for (UINT ri = 0u; ri < rp.DescriptorTable.NumDescriptorRanges; ++ri) {
+                                    const auto& rg = rp.DescriptorTable.pDescriptorRanges[ri];
+                                    const UINT off =
+                                        (rg.OffsetInDescriptorsFromTableStart == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND)
+                                            ? cur_off
+                                            : rg.OffsetInDescriptorsFromTableStart;
+                                    if (rg.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER) {
+                                        is_sampler_table = true;
+                                    }
+                                    if (rg.RegisterSpace == 2u) {
+                                        has_s2 = true;
+                                    }
+                                    if (rg.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_CBV &&
+                                        rg.RegisterSpace == 1u) {
+                                        if (rg.BaseShaderRegister <= 0u &&
+                                            rg.BaseShaderRegister + rg.NumDescriptors > 0u) {
+                                            has_b0_s1 = true;
+                                            b0_table_off = off;
+                                        }
+                                        if (rg.BaseShaderRegister <= 7u &&
+                                            rg.BaseShaderRegister + rg.NumDescriptors > 7u) {
+                                            has_b7_s1 = true;
+                                        }
+                                    }
+                                    cur_off = off + rg.NumDescriptors;
+                                }
+                                if (has_b0_s1 && !has_b7_s1) {
+                                    target_pi = static_cast<int>(pi);
+                                    add_b7_alias = true;
+                                } else if (!is_sampler_table && !has_s2 && fallback_s2_pi < 0) {
+                                    fallback_s2_pi = static_cast<int>(pi);
+                                }
+                            }
+                            if (target_pi < 0 && fallback_s2_pi >= 0) {
+                                target_pi = fallback_s2_pi;
+                                add_b7_alias = false;
+                            }
+                            if (target_pi >= 0) {
+                                params_1_1.assign(aug.Desc_1_1.pParameters,
+                                                  aug.Desc_1_1.pParameters + aug.Desc_1_1.NumParameters);
+                                const auto& dt = params_1_1[static_cast<size_t>(target_pi)].DescriptorTable;
+                                expanded_ranges_1_1.reserve(dt.NumDescriptorRanges + 3u);
+                                UINT cur_off = 0u;
+                                bool has_s2 = false;
+                                const bool scaleform_t2_b0_pair =
+                                    add_b7_alias &&
+                                    (dt.NumDescriptorRanges == 2u &&
+                                     dt.pDescriptorRanges[0].RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SRV &&
+                                     dt.pDescriptorRanges[0].BaseShaderRegister == 2u &&
+                                     dt.pDescriptorRanges[0].RegisterSpace == 1u &&
+                                     dt.pDescriptorRanges[1].RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_CBV &&
+                                     dt.pDescriptorRanges[1].BaseShaderRegister == 0u &&
+                                     dt.pDescriptorRanges[1].RegisterSpace == 1u);
+                                for (UINT ri = 0u; ri < dt.NumDescriptorRanges; ++ri) {
+                                    D3D12_DESCRIPTOR_RANGE1 rg = dt.pDescriptorRanges[ri];
+                                    const UINT off =
+                                        (rg.OffsetInDescriptorsFromTableStart == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND)
+                                            ? cur_off
+                                            : rg.OffsetInDescriptorsFromTableStart;
+                                    if (rg.RegisterSpace == 2u) has_s2 = true;
+                                    rg.OffsetInDescriptorsFromTableStart =
+                                        (scaleform_t2_b0_pair && ri == 1u) ? 0u : off;
+                                    expanded_ranges_1_1.push_back(rg);
+                                    cur_off = off + rg.NumDescriptors;
+                                }
+                                if (add_b7_alias) {
+                                    D3D12_DESCRIPTOR_RANGE1 b7_alias{};
+                                    b7_alias.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
+                                    b7_alias.NumDescriptors = 1u;
+                                    b7_alias.BaseShaderRegister = 7u;
+                                    b7_alias.RegisterSpace = 1u;
+                                    b7_alias.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
+                                    b7_alias.OffsetInDescriptorsFromTableStart =
+                                        scaleform_t2_b0_pair ? 0u : b0_table_off;
+                                    expanded_ranges_1_1.push_back(b7_alias);
+                                }
+                                if (!has_s2) {
+                                    D3D12_DESCRIPTOR_RANGE1 s2_srv{};
+                                    s2_srv.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+                                    s2_srv.NumDescriptors = 16u;
+                                    s2_srv.BaseShaderRegister = 0u;
+                                    s2_srv.RegisterSpace = 2u;
+                                    s2_srv.Flags = D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE;
+                                    s2_srv.OffsetInDescriptorsFromTableStart = 0u;
+                                    D3D12_DESCRIPTOR_RANGE1 s2_cbv = s2_srv;
+                                    s2_cbv.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_CBV;
+                                    expanded_ranges_1_1.push_back(s2_srv);
+                                    expanded_ranges_1_1.push_back(s2_cbv);
+                                }
+                                params_1_1[static_cast<size_t>(target_pi)].DescriptorTable.NumDescriptorRanges =
+                                    static_cast<UINT>(expanded_ranges_1_1.size());
+                                params_1_1[static_cast<size_t>(target_pi)].DescriptorTable.pDescriptorRanges =
+                                    expanded_ranges_1_1.data();
+                                aug.Desc_1_1.pParameters = params_1_1.data();
+                                static const bool trace_sf_rs = []() {
+                                    char v[16]{};
+                                    return ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_SF_DRAW", v, sizeof(v)) > 0 && v[0] == '1';
+                                }();
+                                if (trace_sf_rs) {
+                                    std::fprintf(stderr,
+                                                 "[OpenScarlett][SF-RS] aliased b7->b0 space1 at param=%d off=%u (nRanges=%u nParams=%u nSamps=%u)\n",
+                                                 target_pi, b0_table_off,
+                                                 static_cast<unsigned>(expanded_ranges_1_1.size()),
+                                                 aug.Desc_1_1.NumParameters,
+                                                 aug.Desc_1_1.NumStaticSamplers);
+                                    std::fflush(stderr);
+                                }
+                            }
                         }
                         if (aug.Desc_1_1.pStaticSamplers && aug.Desc_1_1.NumStaticSamplers > 0u) {
                             samps.insert(samps.begin(), aug.Desc_1_1.pStaticSamplers,
                                          aug.Desc_1_1.pStaticSamplers + aug.Desc_1_1.NumStaticSamplers);
+                        } else if (samps.empty() && aug.Desc_1_1.pParameters) {
+                            bool has_sampler_table = false;
+                            bool has_space1 = false;
+                            for (UINT pi = 0u; pi < aug.Desc_1_1.NumParameters; ++pi) {
+                                const auto& rp = aug.Desc_1_1.pParameters[pi];
+                                if (rp.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE &&
+                                    rp.DescriptorTable.pDescriptorRanges) {
+                                    for (UINT ri = 0u; ri < rp.DescriptorTable.NumDescriptorRanges; ++ri) {
+                                        const auto& rg = rp.DescriptorTable.pDescriptorRanges[ri];
+                                        if (rg.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SAMPLER) {
+                                            has_sampler_table = true;
+                                        }
+                                        if (rg.RegisterSpace == 1u) {
+                                            has_space1 = true;
+                                        }
+                                    }
+                                }
+                            }
+                            if (has_space1 && !has_sampler_table) {
+                                for (UINT sreg = 0u; sreg < 22u; ++sreg) {
+                                    D3D12_STATIC_SAMPLER_DESC ss = fallback_samp;
+                                    ss.ShaderRegister = sreg;
+                                    ss.RegisterSpace = 1u;
+                                    samps.push_back(ss);
+                                }
+                            }
                         }
                         samps.push_back(fallback_samp);
                         aug.Desc_1_1.NumStaticSamplers = static_cast<UINT>(samps.size());
@@ -4111,6 +4425,43 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateRootSignature(
                         hr = host_dev_->CreateRootSignature(
                             0u, aug_blob->GetBufferPointer(), aug_blob->GetBufferSize(),
                             OS_D3D12_IID(ID3D12RootSignature), reinterpret_cast<void**>(&host_rs));
+                        if (SUCCEEDED(hr) && host_rs) {
+                            RecordRootSigTableSizes(host_rs, aug);
+                        }
+                        if (SUCCEEDED(hr) && host_rs &&
+                            aug.Version == D3D_ROOT_SIGNATURE_VERSION_1_1) {
+                            std::string rsd = "{";
+                            for (UINT pi = 0u; pi < aug.Desc_1_1.NumParameters; ++pi) {
+                                const auto& rp = aug.Desc_1_1.pParameters[pi];
+                                char pb[96];
+                                if (rp.ParameterType == D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE) {
+                                    std::snprintf(pb, sizeof(pb), "p%u:DT[", pi);
+                                    rsd += pb;
+                                    UINT cur = 0u;
+                                    for (UINT ri = 0u; ri < rp.DescriptorTable.NumDescriptorRanges; ++ri) {
+                                        const auto& rg = rp.DescriptorTable.pDescriptorRanges[ri];
+                                        const UINT off = (rg.OffsetInDescriptorsFromTableStart == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND)
+                                                             ? cur : rg.OffsetInDescriptorsFromTableStart;
+                                        const char tc = (rg.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_CBV) ? 'b'
+                                                        : (rg.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_SRV) ? 't'
+                                                        : (rg.RangeType == D3D12_DESCRIPTOR_RANGE_TYPE_UAV) ? 'u' : 's';
+                                        std::snprintf(pb, sizeof(pb), "%s%c%u(n=%u,sp=%u)@%u",
+                                                      ri ? "," : "", tc, rg.BaseShaderRegister,
+                                                      rg.NumDescriptors, rg.RegisterSpace, off);
+                                        rsd += pb;
+                                        cur = off + rg.NumDescriptors;
+                                    }
+                                    rsd += "] ";
+                                } else {
+                                    std::snprintf(pb, sizeof(pb), "p%u:T%d ", pi, static_cast<int>(rp.ParameterType));
+                                    rsd += pb;
+                                }
+                            }
+                            char sb[48];
+                            std::snprintf(sb, sizeof(sb), "samps=%u}", aug.Desc_1_1.NumStaticSamplers);
+                            rsd += sb;
+                            RecordDiagRootSig(host_rs, std::move(rsd));
+                        }
                         aug_blob->Release();
                     }
                     if (err_blob) err_blob->Release();
@@ -4295,10 +4646,17 @@ void STDMETHODCALLTYPE DeviceX::CreateConstantBufferView(
     D3D12_GPU_VIRTUAL_ADDRESS gpu_va = pDesc ? pDesc->BufferLocation : 0ull;
     if (pDesc && pDesc->BufferLocation != 0ull) {
         D3D12_GPU_VIRTUAL_ADDRESS mapped_va = TranslateGuestGpuVa(pDesc->BufferLocation);
-        if ((mapped_va & 255ull) != 0ull) {
+        const UINT aligned_size = (pDesc->SizeInBytes + 255u) & ~255u;
+        if (retail_scarlett_abi_ && mapped_va == pDesc->BufferLocation) {
+            const D3D12_GPU_VIRTUAL_ADDRESS uploaded = UploadTransientGuestBufferForDesktop(
+                pDesc->BufferLocation, aligned_size ? aligned_size : 256u, 256ull,
+                /*allow_same_frame_cache=*/false);
+            if (uploaded != 0ull) {
+                mapped_va = uploaded;
+            }
+        } else if ((mapped_va & 255ull) != 0ull) {
             mapped_va = AlignRootCbvGpuVaForDesktop(mapped_va, pDesc->BufferLocation);
         }
-        const UINT aligned_size = (pDesc->SizeInBytes + 255u) & ~255u;
         if (mapped_va != pDesc->BufferLocation || aligned_size != pDesc->SizeInBytes) {
             translated = *pDesc;
             translated.BufferLocation = mapped_va;
@@ -4307,7 +4665,41 @@ void STDMETHODCALLTYPE DeviceX::CreateConstantBufferView(
             gpu_va = mapped_va;
         }
     }
-    host_dev_->CreateConstantBufferView(desc_ptr, DestDescriptor);
+    uint64_t guest_wb = 0ull;
+    D3D12_CPU_DESCRIPTOR_HANDLE eff_dest = DestDescriptor;
+    if (has_guest_backed_desc_heaps_.load(std::memory_order_acquire)) {
+        RedirectGuestDescDestIfNeeded(eff_dest, guest_wb);
+    }
+    host_dev_->CreateConstantBufferView(desc_ptr, eff_dest);
+    if (has_guest_backed_desc_heaps_.load(std::memory_order_acquire)) {
+        SnapshotCreatedDescriptorToShadow(eff_dest, guest_wb);
+    }
+    static const bool trace_sf_cbv = []() {
+        char v[16]{};
+        return ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_SF_DRAW", v, sizeof(v)) > 0 && v[0] == '1';
+    }();
+    static std::atomic<uint32_t> s_sf_cbv_log{0u};
+    if (trace_sf_cbv && pDesc && pDesc->BufferLocation != 0ull &&
+        (pDesc->SizeInBytes == 64u || pDesc->SizeInBytes == 256u ||
+         pDesc->SizeInBytes == 1024u || pDesc->SizeInBytes == 4096u ||
+         pDesc->BufferLocation < 0x10000000ull) &&
+        s_sf_cbv_log.fetch_add(1u, std::memory_order_relaxed) < 12u) {
+        std::fprintf(stderr,
+                     "[OpenScarlett][SF-CBV] cpu=0x%llX raw=0x%llX -> host=0x%llX sz=%u",
+                     static_cast<unsigned long long>(DestDescriptor.ptr),
+                     static_cast<unsigned long long>(pDesc->BufferLocation),
+                     static_cast<unsigned long long>(gpu_va),
+                     pDesc->SizeInBytes);
+        float f[16]{};
+        if (SafeCopyGuestMemory(f, reinterpret_cast<const void*>(static_cast<uintptr_t>(pDesc->BufferLocation)), 64u)) {
+            std::fprintf(stderr,
+                         " f0..7=[%.3f,%.3f,%.3f,%.3f | %.3f,%.3f,%.3f,%.3f] f8..15=[%.4f,%.4f,%.4f,%.4f | %.4f,%.4f,%.4f,%.4f]",
+                         f[0], f[1], f[2], f[3], f[4], f[5], f[6], f[7],
+                         f[8], f[9], f[10], f[11], f[12], f[13], f[14], f[15]);
+        }
+        std::fprintf(stderr, "\n");
+        std::fflush(stderr);
+    }
     static const bool trace_dd = []() {
         char v[16]{};
         return ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_DRAW_DATA", v, sizeof(v)) > 0 && v[0] == '1';
@@ -4341,6 +4733,13 @@ void STDMETHODCALLTYPE DeviceX::CreateConstantBufferView(
         std::fflush(stderr);
     }
     TrackPagedDescriptorWrite(DestDescriptor);
+    if (CommandListX::IsDiagTraceEnabled() && pDesc) {
+        char db[128];
+        std::snprintf(db, sizeof(db), "CBV(raw=0x%llX->0x%llX sz=%u)",
+                      static_cast<unsigned long long>(pDesc->BufferLocation),
+                      static_cast<unsigned long long>(gpu_va), pDesc->SizeInBytes);
+        RecordDiagDescriptor(DestDescriptor.ptr, db);
+    }
     if (const auto hook = descriptor_create_hook_.load(std::memory_order_acquire)) {
         hook(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, DestDescriptor, nullptr, gpu_va,
              descriptor_create_ctx_.load(std::memory_order_acquire));
@@ -4379,13 +4778,52 @@ void DeviceX::CreatePlacedShaderResourceViewX(
                 stride = 4u;
             }
             if (stride > 0u && want_bytes >= stride) {
-                srv.Buffer.FirstElement += byte_off / stride;
-                const uint64_t max_elems = avail / stride;
-                if (srv.Buffer.NumElements == 0u || srv.Buffer.NumElements > max_elems) {
-                    srv.Buffer.NumElements = static_cast<UINT>(std::min<uint64_t>(want_bytes / stride, max_elems));
+                uint64_t guest_wb = 0ull;
+                D3D12_CPU_DESCRIPTOR_HANDLE eff_dest = destDescriptor;
+                if (has_guest_backed_desc_heaps_.load(std::memory_order_acquire)) {
+                    RedirectGuestDescDestIfNeeded(eff_dest, guest_wb);
                 }
-                host_dev_->CreateShaderResourceView(rinfo.gpu_shadow_resource, &srv, destDescriptor);
+                ID3D12Resource* srv_res = rinfo.gpu_shadow_resource;
+                bool used_ring = false;
+                const bool is_raw_or_structured =
+                    ((srv.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) != 0u) ||
+                    (srv.Buffer.StructureByteStride > 0u);
+                const uint64_t orig_first = srv.Buffer.FirstElement;
+                const uint64_t eff_va = gpu_va + orig_first * stride;
+                const uint64_t eff_byte_off = byte_off + orig_first * stride;
+                const uint64_t eff_avail = (rinfo.size_bytes > eff_byte_off) ? (rinfo.size_bytes - eff_byte_off) : 0ull;
+                const uint64_t eff_want = std::min<uint64_t>(want_bytes, eff_avail);
+                if (is_raw_or_structured && eff_want >= stride && eff_want <= 65536ull && (256u % stride) == 0u) {
+                    const D3D12_GPU_VIRTUAL_ADDRESS ring_gpu = UploadTransientGuestBufferForDesktop(
+                        eff_va, eff_want, 256ull, /*allow_same_frame_cache=*/false);
+                    if (ring_gpu != 0ull && transient_ring_ && ring_gpu >= transient_ring_gpu_) {
+                        const uint64_t ring_off = ring_gpu - transient_ring_gpu_;
+                        srv.Buffer.FirstElement = ring_off / stride;
+                        srv.Buffer.NumElements = static_cast<UINT>(eff_want / stride);
+                        srv_res = transient_ring_;
+                        used_ring = true;
+                    }
+                }
+                if (!used_ring) {
+                    srv.Buffer.FirstElement += byte_off / stride;
+                    const uint64_t max_elems = avail / stride;
+                    if (srv.Buffer.NumElements == 0u || srv.Buffer.NumElements > max_elems) {
+                        srv.Buffer.NumElements = static_cast<UINT>(std::min<uint64_t>(want_bytes / stride, max_elems));
+                    }
+                    uint64_t dummy_pc = 0ull, dummy_off = 0ull;
+                    (void)title_va_mirror_.ResolveTitleVa(gpu_va, dummy_pc, dummy_off);
+                }
+                host_dev_->CreateShaderResourceView(srv_res, &srv, eff_dest);
+                if (has_guest_backed_desc_heaps_.load(std::memory_order_acquire)) {
+                    SnapshotCreatedDescriptorToShadow(eff_dest, guest_wb, /*prefer_static_partition=*/false);
+                }
                 TrackPagedDescriptorWrite(destDescriptor);
+                if (CommandListX::IsDiagTraceEnabled()) {
+                    char db[128];
+                    std::snprintf(db, sizeof(db), "PLACED_BUF_SRV(va=0x%llX elems=%u)",
+                                  static_cast<unsigned long long>(gpu_va), srv.Buffer.NumElements);
+                    RecordDiagDescriptor(destDescriptor.ptr, db);
+                }
                 return;
             }
         }
@@ -4402,21 +4840,48 @@ void DeviceX::CreatePlacedShaderResourceViewX(
         null_srv.Buffer.NumElements = 1u;
         null_srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
     }
-    host_dev_->CreateShaderResourceView(nullptr, &null_srv, destDescriptor);
+    uint64_t guest_wb = 0ull;
+    D3D12_CPU_DESCRIPTOR_HANDLE eff_dest = destDescriptor;
+    if (has_guest_backed_desc_heaps_.load(std::memory_order_acquire)) {
+        RedirectGuestDescDestIfNeeded(eff_dest, guest_wb);
+    }
+    host_dev_->CreateShaderResourceView(nullptr, &null_srv, eff_dest);
+    if (has_guest_backed_desc_heaps_.load(std::memory_order_acquire)) {
+        SnapshotCreatedDescriptorToShadow(eff_dest, guest_wb);
+    }
     TrackPagedDescriptorWrite(destDescriptor);
+    if (CommandListX::IsDiagTraceEnabled()) {
+        char db[128];
+        std::snprintf(db, sizeof(db), "PLACED_NULL_SRV(dim=%d vdim=%d va=0x%llX %llux%u fmt=%d)",
+                      static_cast<int>(pResourceDesc->Dimension), static_cast<int>(srv.ViewDimension),
+                      static_cast<unsigned long long>(gpu_va),
+                      static_cast<unsigned long long>(pResourceDesc->Width), pResourceDesc->Height,
+                      static_cast<int>(pResourceDesc->Format));
+        RecordDiagDescriptor(destDescriptor.ptr, db);
+    }
 }
 
 void STDMETHODCALLTYPE DeviceX::CreateShaderResourceView(
     ID3D12Resource* pResource, const D3D12_SHADER_RESOURCE_VIEW_DESC* pDesc,
     D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
     ID3D12Resource* host_res = UnwrapResource(pResource);
+    uint64_t guest_wb = 0ull;
+    const D3D12_CPU_DESCRIPTOR_HANDLE orig_dest = DestDescriptor;
+    const bool srv_is_static_tex =
+        (host_res != nullptr && host_res->GetDesc().Dimension != D3D12_RESOURCE_DIMENSION_BUFFER);
+    if (has_guest_backed_desc_heaps_.load(std::memory_order_acquire)) {
+        RedirectGuestDescDestIfNeeded(DestDescriptor, guest_wb, srv_is_static_tex);
+    }
     const auto notify_hook = [&]() {
+        if (has_guest_backed_desc_heaps_.load(std::memory_order_acquire)) {
+            SnapshotCreatedDescriptorToShadow(DestDescriptor, guest_wb, srv_is_static_tex);
+        }
         if (const auto hook = descriptor_create_hook_.load(std::memory_order_acquire)) {
             const D3D12_GPU_VIRTUAL_ADDRESS va =
                 (host_res && host_res->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
                     ? host_res->GetGPUVirtualAddress()
                     : 0ull;
-            hook(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, DestDescriptor, host_res, va,
+            hook(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, orig_dest, host_res, va,
                  descriptor_create_ctx_.load(std::memory_order_acquire));
         }
     };
@@ -4544,6 +5009,19 @@ void STDMETHODCALLTYPE DeviceX::CreateShaderResourceView(
         }
     }
     TrackPagedDescriptorWrite(DestDescriptor);
+    if (CommandListX::IsDiagTraceEnabled()) {
+        char db[144];
+        if (host_res) {
+            const auto rd = host_res->GetDesc();
+            std::snprintf(db, sizeof(db), "SRV(res=%p dim=%d %llux%u fmt=%d vdim=%d)",
+                          static_cast<void*>(host_res), static_cast<int>(rd.Dimension),
+                          static_cast<unsigned long long>(rd.Width), rd.Height,
+                          static_cast<int>(rd.Format), pDesc ? static_cast<int>(pDesc->ViewDimension) : -1);
+        } else {
+            std::snprintf(db, sizeof(db), "SRV(NULL vdim=%d)", pDesc ? static_cast<int>(pDesc->ViewDimension) : -1);
+        }
+        RecordDiagDescriptor(DestDescriptor.ptr, db);
+    }
     notify_hook();
     RecordDev("ID3D12DeviceX::CreateShaderResourceView", 18, S_OK);
 }
@@ -4566,6 +5044,11 @@ void STDMETHODCALLTYPE DeviceX::CreateUnorderedAccessView(
         desc_ptr = &rw_desc;
         RecordDev("ID3D12DeviceX::CreateUnorderedAccessView[R9G9B9E5Fallback]", 19, S_OK);
     }
+    uint64_t guest_wb = 0ull;
+    const D3D12_CPU_DESCRIPTOR_HANDLE orig_dest = DestDescriptor;
+    if (has_guest_backed_desc_heaps_.load(std::memory_order_acquire)) {
+        RedirectGuestDescDestIfNeeded(DestDescriptor, guest_wb);
+    }
     if (retail_scarlett_abi_ && host_res != nullptr &&
         (host_res->GetDesc().Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0) {
         // Xbox allows UAVs on depth-stencil/non-UAV textures (e.g. HTILE/VSM); substitute a valid
@@ -4578,12 +5061,18 @@ void STDMETHODCALLTYPE DeviceX::CreateUnorderedAccessView(
         null_uav.Buffer.StructureByteStride = 0u;
         null_uav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
         host_dev_->CreateUnorderedAccessView(nullptr, nullptr, &null_uav, DestDescriptor);
+        if (has_guest_backed_desc_heaps_.load(std::memory_order_acquire)) {
+            SnapshotCreatedDescriptorToShadow(DestDescriptor, guest_wb);
+        }
         RecordDev("ID3D12DeviceX::CreateUnorderedAccessView[NonUavFallback]", 19, S_OK);
         RecordDev("ID3D12DeviceX::CreateUnorderedAccessView", 19, S_OK);
         return;
     }
     host_dev_->CreateUnorderedAccessView(host_res, host_counter, desc_ptr, DestDescriptor);
-    TrackPagedDescriptorWrite(DestDescriptor);
+    if (has_guest_backed_desc_heaps_.load(std::memory_order_acquire)) {
+        SnapshotCreatedDescriptorToShadow(DestDescriptor, guest_wb);
+    }
+    TrackPagedDescriptorWrite(orig_dest);
     if (const auto hook = descriptor_create_hook_.load(std::memory_order_acquire)) {
         const D3D12_GPU_VIRTUAL_ADDRESS va =
             (host_res && host_res->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
@@ -4622,6 +5111,27 @@ void STDMETHODCALLTYPE DeviceX::CreateRenderTargetView(
     if (!retail_scarlett_abi_ || valid_rtv) {
         host_dev_->CreateRenderTargetView(host_res, desc_ptr, DestDescriptor);
     }
+    if (valid_rtv && host_res && HasRegisteredUnifiedTextures()) {
+        // Once a texture is bound as an RTV on the GPU, never overwrite GPU output with CPU uploads.
+        std::lock_guard<std::mutex> ulk(unified_mutex_);
+        auto uit = unified_textures_.find(host_res);
+        if (uit != unified_textures_.end()) {
+            uit->second.allow_cpu_upload = false;
+            uit->second.cpu_readable = false;
+            if (uit->second.dirty) {
+                uit->second.dirty = false;
+                dirty_unified_count_.fetch_sub(1u, std::memory_order_acq_rel);
+            }
+        }
+    }
+    if (retail_scarlett_abi_ && host_res && !valid_rtv && CommandListX::IsDiagTraceEnabled()) {
+        const auto rd = host_res->GetDesc();
+        std::fprintf(stderr, "[OpenScarlett][RTV-REJECT] res=%p dim=%d %llux%u fmt=%d flags=0x%X\n",
+                     static_cast<void*>(host_res), static_cast<int>(rd.Dimension),
+                     static_cast<unsigned long long>(rd.Width), rd.Height,
+                     static_cast<int>(rd.Format), static_cast<unsigned>(rd.Flags));
+        std::fflush(stderr);
+    }
     if (retail_scarlett_abi_) {
         std::lock_guard<std::mutex> lk(valid_view_mutex_);
         if (valid_rtv) {
@@ -4629,6 +5139,15 @@ void STDMETHODCALLTYPE DeviceX::CreateRenderTargetView(
         } else {
             valid_rtv_handles_.erase(DestDescriptor.ptr);
         }
+    }
+    if (CommandListX::IsDiagTraceEnabled() && host_res) {
+        const auto rd = host_res->GetDesc();
+        char db[128];
+        std::snprintf(db, sizeof(db), "RTV(res=%p %llux%u fmt=%d)",
+                      static_cast<void*>(host_res),
+                      static_cast<unsigned long long>(rd.Width), rd.Height,
+                      static_cast<int>(rd.Format));
+        RecordDiagDescriptor(DestDescriptor.ptr, db);
     }
     if (vulkan_routing_active_ && host_res) {
         std::lock_guard<std::mutex> lock(vk_state_mutex_);
@@ -4735,6 +5254,17 @@ void STDMETHODCALLTYPE DeviceX::CopyDescriptors(
         NumDestDescriptorRanges, pDestDescriptorRangeStarts, pDestDescriptorRangeSizes,
         NumSrcDescriptorRanges, pSrcDescriptorRangeStarts, pSrcDescriptorRangeSizes,
         DescriptorHeapsType);
+    if (CommandListX::IsDiagTraceEnabled() && DescriptorHeapsType == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
+        pDestDescriptorRangeStarts && pSrcDescriptorRangeStarts) {
+        static std::atomic<uint32_t> s_cd_log{0u};
+        if (s_cd_log.fetch_add(1u, std::memory_order_relaxed) < 8u) {
+            std::fprintf(stderr, "[OpenScarlett][COPY-DESC] nd=%u ns=%u dst0=0x%llX src0=0x%llX\n",
+                         NumDestDescriptorRanges, NumSrcDescriptorRanges,
+                         static_cast<unsigned long long>(pDestDescriptorRangeStarts[0].ptr),
+                         static_cast<unsigned long long>(pSrcDescriptorRangeStarts[0].ptr));
+            std::fflush(stderr);
+        }
+    }
     if (DescriptorHeapsType == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV &&
         pDestDescriptorRangeStarts && pSrcDescriptorRangeStarts &&
         NumDestDescriptorRanges > 0u && NumSrcDescriptorRanges > 0u) {
@@ -4751,6 +5281,9 @@ void STDMETHODCALLTYPE DeviceX::CopyDescriptors(
             D3D12_CPU_DESCRIPTOR_HANDLE src_h{
                 pSrcDescriptorRangeStarts[src_r].ptr + static_cast<SIZE_T>(src_i) * inc};
             sampler_feedback_mgr_.CopyPreservedView(dst_h, src_h);
+            if (CommandListX::IsDiagTraceEnabled()) {
+                CopyDiagDescriptor(dst_h.ptr, src_h.ptr);
+            }
             TrackPagedDescriptorWrite(dst_h);
             ++dst_i;
             ++src_i;
@@ -4775,6 +5308,16 @@ void STDMETHODCALLTYPE DeviceX::CopyDescriptorsSimple(
     }
     host_dev_->CopyDescriptorsSimple(
         NumDescriptors, DestDescriptorRangeStart, SrcDescriptorRangeStart, DescriptorHeapsType);
+    if (CommandListX::IsDiagTraceEnabled() && DescriptorHeapsType == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+        static std::atomic<uint32_t> s_cds_log{0u};
+        if (s_cds_log.fetch_add(1u, std::memory_order_relaxed) < 8u) {
+            std::fprintf(stderr, "[OpenScarlett][COPY-SIMPLE] n=%u dst=0x%llX src=0x%llX\n",
+                         NumDescriptors,
+                         static_cast<unsigned long long>(DestDescriptorRangeStart.ptr),
+                         static_cast<unsigned long long>(SrcDescriptorRangeStart.ptr));
+            std::fflush(stderr);
+        }
+    }
     if (DescriptorHeapsType == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV && NumDescriptors > 0u) {
         const UINT inc = host_dev_->GetDescriptorHandleIncrementSize(DescriptorHeapsType);
         for (UINT i = 0u; i < NumDescriptors; ++i) {
@@ -4783,6 +5326,9 @@ void STDMETHODCALLTYPE DeviceX::CopyDescriptorsSimple(
             D3D12_CPU_DESCRIPTOR_HANDLE src_h{
                 SrcDescriptorRangeStart.ptr + static_cast<SIZE_T>(i) * inc};
             sampler_feedback_mgr_.CopyPreservedView(dst_h, src_h);
+            if (CommandListX::IsDiagTraceEnabled()) {
+                CopyDiagDescriptor(dst_h.ptr, src_h.ptr);
+            }
         }
         TrackPagedDescriptorWrite(DestDescriptorRangeStart);
     }
@@ -5028,6 +5574,9 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommittedResource(
     }
     if (did_r9g9b9e5_fallback) {
         RecordDev("ID3D12DeviceX::R9G9B9E5UavFallback", 27, S_OK);
+    }
+    if (retail_scarlett_abi_ && host_res) {
+        SetRetailResourceState(host_res, InitialResourceState);
     }
     auto* proxy = new (std::nothrow) ResourceXProxy(
         this, host_res, desc_ptr, pHeapProperties, clean_heap_flags, 0ull);
@@ -6027,7 +6576,7 @@ void DeviceX::LiftPendingXdatGraphicsPso(PipelineStateXProxy* proxy) {
         }
         if (!s_disk_cache_dir.empty()) {
             char cpath[320]{};
-            std::snprintf(cpath, sizeof(cpath), "%s\\v5_%016llx.dxil",
+            std::snprintf(cpath, sizeof(cpath), "%s\\v7_%016llx.dxil",
                           s_disk_cache_dir.c_str(), static_cast<unsigned long long>(h));
             FILE* cf = nullptr;
             if (::fopen_s(&cf, cpath, "rb") == 0 && cf) {
@@ -6058,7 +6607,7 @@ void DeviceX::LiftPendingXdatGraphicsPso(PipelineStateXProxy* proxy) {
             out_err = st.message;
         } else if (!s_disk_cache_dir.empty()) {
             char cpath[320]{};
-            std::snprintf(cpath, sizeof(cpath), "%s\\v5_%016llx.dxil",
+            std::snprintf(cpath, sizeof(cpath), "%s\\v7_%016llx.dxil",
                           s_disk_cache_dir.c_str(), static_cast<unsigned long long>(h));
             FILE* cf = nullptr;
             if (::fopen_s(&cf, cpath, "wb") == 0 && cf) {
@@ -6081,6 +6630,7 @@ void DeviceX::LiftPendingXdatGraphicsPso(PipelineStateXProxy* proxy) {
 
     static std::atomic<uint32_t> s_bound_seq{0u};
     const uint32_t seq = s_bound_seq.fetch_add(1u, std::memory_order_relaxed);
+    lazy_lift_count_.fetch_add(1u, std::memory_order_release);
     if (!vs_ok || !ps_ok) {
         if (seq < 24u) {
             std::fprintf(stderr,
@@ -6137,19 +6687,33 @@ void DeviceX::LiftPendingXdatGraphicsPso(PipelineStateXProxy* proxy) {
     }
     if (seq < 24u) {
         std::fprintf(stderr,
-                     "[OpenScarlett][d3d12_xs] LAZY-LIFT #%u pso=%p rs=%p (raw vs=%zuB ps=%zuB -> dxil vs=%zuB ps=%zuB rts=%u fmt0=%d dsv=%d il=%u) -> hr=0x%08lX",
+                     "[OpenScarlett][d3d12_xs] LAZY-LIFT #%u pso=%p rs=%p (raw vs=%zuB ps=%zuB -> dxil vs=%zuB ps=%zuB rts=%u fmt0=%d dsv=%d il=%u cull=%d depth=%d/%d stencil=%d blend0=%d/%d/%d wm=0x%x) -> hr=0x%08lX",
                      seq, static_cast<void*>(proxy), static_cast<void*>(pd->host_rs),
                      pd->vs_blob.size(), pd->ps_blob.size(),
                      vs_dxil.size(), ps_dxil.size(),
                      gpso.NumRenderTargets,
                      gpso.NumRenderTargets > 0u ? static_cast<int>(gpso.RTVFormats[0]) : 0,
                      static_cast<int>(gpso.DSVFormat), gpso.InputLayout.NumElements,
+                     static_cast<int>(gpso.RasterizerState.CullMode),
+                     gpso.DepthStencilState.DepthEnable ? 1 : 0,
+                     static_cast<int>(gpso.DepthStencilState.DepthFunc),
+                     gpso.DepthStencilState.StencilEnable ? 1 : 0,
+                     gpso.BlendState.RenderTarget[0].BlendEnable ? 1 : 0,
+                     static_cast<int>(gpso.BlendState.RenderTarget[0].SrcBlend),
+                     static_cast<int>(gpso.BlendState.RenderTarget[0].DestBlend),
+                     static_cast<unsigned>(gpso.BlendState.RenderTarget[0].RenderTargetWriteMask),
                      static_cast<unsigned long>(hr));
         for (UINT ei = 0u; ei < gpso.InputLayout.NumElements && gpso.InputLayout.pInputElementDescs; ++ei) {
             const auto& ie = gpso.InputLayout.pInputElementDescs[ei];
             std::fprintf(stderr, " [IL%u:%s%u fmt=%d slot=%u off=%u]", ei,
                          ie.SemanticName ? ie.SemanticName : "?", ie.SemanticIndex,
                          static_cast<int>(ie.Format), ie.InputSlot, ie.AlignedByteOffset);
+        }
+        if (FAILED(hr)) {
+            const std::string rs_desc = DescribeDiagRootSig(pd->host_rs);
+            if (!rs_desc.empty()) {
+                std::fprintf(stderr, " RS=%s", rs_desc.c_str());
+            }
         }
         std::fprintf(stderr, "\n");
         std::fflush(stderr);
@@ -7407,6 +7971,9 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreateCommittedResource1(
     if (did_r9g9b9e5_fallback) {
         RecordDev("ID3D12DeviceX::R9G9B9E5UavFallback", 53, S_OK);
     }
+    if (retail_scarlett_abi_ && host_res) {
+        SetRetailResourceState(host_res, InitialResourceState);
+    }
     auto* proxy = new (std::nothrow) ResourceXProxy(
         this, host_res, desc_ptr, pHeapProperties, clean_heap_flags, 0ull);
     host_res->Release();
@@ -8512,6 +9079,32 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResourceX(
         }
     }
 
+    // On Xbox Series X, color textures (e.g. video decode output targets) may be bound as RTVs
+    // without explicitly setting ALLOW_RENDER_TARGET on CreatePlacedResourceX. Preserve the
+    // original flags for unified-texture CPU upload decisions while enabling desktop RTV binding.
+    const bool orig_had_gpu_only_flags =
+        (clean_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) &&
+        ((clean_desc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                              D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                              D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) != 0 ||
+         clean_desc.SampleDesc.Count > 1u ||
+         clean_desc.Layout == D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE);
+    if (retail_scarlett_abi_ &&
+        clean_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+        (clean_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) == 0 &&
+        clean_desc.Layout != D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE &&
+        clean_desc.Width >= 256u && clean_desc.Height >= 256u &&
+        (clean_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+         clean_desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+         clean_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+         clean_desc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB ||
+         clean_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT ||
+         clean_desc.Format == DXGI_FORMAT_R11G11B10_FLOAT ||
+         clean_desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM)) {
+        clean_desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    }
+    D3D12_RESOURCE_STATES actual_initial_state = InitialState;
+
     // If VirtualAddress falls inside an attached XMem graphics allocation, place directly
     // into its backing desktop ID3D12Heap so GPU virtual addresses bind cleanly on desktop!
     HRESULT hr = E_FAIL;
@@ -8717,11 +9310,23 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResourceX(
                 clear_ptr, OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
         }
         if (FAILED(hr) || !host_res) {
-            clean_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+            const D3D12_RESOURCE_FLAGS keep_rt =
+                clean_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
             clean_desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-            hr = host_dev_->CreateCommittedResource(
-                &default_heap_props, D3D12_HEAP_FLAG_NONE, &clean_desc, D3D12_RESOURCE_STATE_COMMON,
-                nullptr, OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
+            if (keep_rt != D3D12_RESOURCE_FLAG_NONE) {
+                clean_desc.Flags = keep_rt;
+                hr = host_dev_->CreateCommittedResource(
+                    &default_heap_props, D3D12_HEAP_FLAG_NONE, &clean_desc, D3D12_RESOURCE_STATE_COMMON,
+                    nullptr, OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
+                if (SUCCEEDED(hr) && host_res) actual_initial_state = D3D12_RESOURCE_STATE_COMMON;
+            }
+            if (FAILED(hr) || !host_res) {
+                clean_desc.Flags = D3D12_RESOURCE_FLAG_NONE;
+                hr = host_dev_->CreateCommittedResource(
+                    &default_heap_props, D3D12_HEAP_FLAG_NONE, &clean_desc, D3D12_RESOURCE_STATE_COMMON,
+                    nullptr, OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&host_res));
+                if (SUCCEEDED(hr) && host_res) actual_initial_state = D3D12_RESOURCE_STATE_COMMON;
+            }
         }
     }
 
@@ -8803,11 +9408,12 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResourceX(
         // buffers (3,500+ 4 KiB render-graph pools) and L0-spilled OOM buffers so 16 GiB hosts
         // never exhaust commit charge while keeping all CPU-written ring buffers mirrored in full.
         bool skip_small_zero_mirror = false;
+        const uint64_t cpu_va = ResolveGuestCpuAliasVa(VirtualAddress);
         if (retail_scarlett_abi_ &&
             clean_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
             mirror_bytes > 0ull && mirror_bytes <= 16384ull &&
-            IsReadableGuestVaRange(VirtualAddress, mirror_bytes)) {
-            const auto* gp = reinterpret_cast<const uint64_t*>(static_cast<uintptr_t>(VirtualAddress));
+            IsReadableGuestVaRange(cpu_va, mirror_bytes)) {
+            const auto* gp = reinterpret_cast<const uint64_t*>(static_cast<uintptr_t>(cpu_va));
             const size_t nw = static_cast<size_t>(mirror_bytes >> 3u);
             uint64_t acc = 0ull;
             for (size_t i = 0u; i < nw; ++i) acc |= gp[i];
@@ -8815,14 +9421,15 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResourceX(
         }
         if (clean_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
             mirror_bytes > 0ull && !skip_small_zero_mirror && !spilled_to_l0 &&
-            IsReadableGuestVaRange(VirtualAddress, mirror_bytes)) {
+            IsReadableGuestVaRange(cpu_va, mirror_bytes)) {
             openscarlett::TitleVaMappingDesc mdesc{};
             mdesc.title_va = VirtualAddress;
             mdesc.size_bytes = mirror_bytes;
             mdesc.kind = openscarlett::TitleVaResourceKind::Buffer;
-            mdesc.existing_write_watch_cpu_ptr = reinterpret_cast<void*>(static_cast<uintptr_t>(VirtualAddress));
+            mdesc.existing_write_watch_cpu_ptr =
+                reinterpret_cast<void*>(static_cast<uintptr_t>(cpu_va));
             mdesc.gpu_shadow_resource = host_res;
-            mdesc.initial_state = InitialState;
+            mdesc.initial_state = actual_initial_state;
             openscarlett::TitleVaRegionInfo reg_info{};
             if (title_va_mirror_.RegisterRegion(mdesc, host_dev_, reg_info).ok()) {
                 std::lock_guard<std::mutex> lock(mirrored_res_mutex_);
@@ -8832,9 +9439,29 @@ HRESULT STDMETHODCALLTYPE DeviceX::CreatePlacedResourceX(
                 mirrored_by_title_va = true;
             }
         }
-        if (!skip_small_zero_mirror) {
-            AutoRegisterUnifiedResource(host_res, VirtualAddress, clean_desc, InitialState, mirrored_by_title_va);
+        if (!skip_small_zero_mirror && !spilled_to_l0 && !orig_had_gpu_only_flags) {
+            AutoRegisterUnifiedResource(host_res, cpu_va, clean_desc, actual_initial_state, mirrored_by_title_va);
         }
+    }
+    if (retail_scarlett_abi_ && host_res) {
+        // Strip buffer-only state bits (e.g. VERTEX_AND_CONSTANT_BUFFER / INDEX_BUFFER) from textures
+        // so subsequent ResourceBarrier transitions never fail Close() with E_INVALIDARG.
+        if (clean_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+            constexpr UINT kTexAllowed =
+                static_cast<UINT>(D3D12_RESOURCE_STATE_RENDER_TARGET) |
+                static_cast<UINT>(D3D12_RESOURCE_STATE_UNORDERED_ACCESS) |
+                static_cast<UINT>(D3D12_RESOURCE_STATE_DEPTH_WRITE) |
+                static_cast<UINT>(D3D12_RESOURCE_STATE_DEPTH_READ) |
+                static_cast<UINT>(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) |
+                static_cast<UINT>(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) |
+                static_cast<UINT>(D3D12_RESOURCE_STATE_COPY_DEST) |
+                static_cast<UINT>(D3D12_RESOURCE_STATE_COPY_SOURCE) |
+                static_cast<UINT>(D3D12_RESOURCE_STATE_RESOLVE_DEST) |
+                static_cast<UINT>(D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+            actual_initial_state = static_cast<D3D12_RESOURCE_STATES>(
+                static_cast<UINT>(actual_initial_state) & kTexAllowed);
+        }
+        SetRetailResourceState(host_res, actual_initial_state);
     }
     auto* proxy = new (std::nothrow) ResourceXProxy(
         this, host_res, &clean_desc, &default_heap_props, D3D12_HEAP_FLAG_NONE, VirtualAddress);
@@ -8960,13 +9587,44 @@ void DeviceX::NotifyResourceStateTransition(
     }
 }
 
+void DeviceX::RegisterUmaShadowMapping(
+    ID3D12Resource* resource, void* cpu_ptr, const D3D12_RESOURCE_DESC& desc) {
+    if (!resource || !cpu_ptr) return;
+    const uint64_t va = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(cpu_ptr));
+    D3D12_RESOURCE_STATES st = D3D12_RESOURCE_STATE_COMMON;
+    {
+        std::lock_guard<std::mutex> rlk(retail_state_mutex_);
+        auto it = retail_res_states_.find(resource);
+        if (it != retail_res_states_.end()) {
+            st = it->second;
+        }
+    }
+    AutoRegisterUnifiedResource(resource, va, desc, st, false, /*use_footprint_row_pitch=*/true);
+}
+
+void DeviceX::MarkUmaShadowDirty(ID3D12Resource* resource) noexcept {
+    if (!resource) return;
+    std::lock_guard<std::mutex> lock(unified_mutex_);
+    auto it = unified_textures_.find(resource);
+    if (it != unified_textures_.end() && !it->second.mirrored_by_title_va) {
+        it->second.cpu_readable = true;
+        if (!it->second.dirty) {
+            it->second.dirty = true;
+            ++it->second.page_generation;
+            dirty_unified_count_.fetch_add(1u, std::memory_order_acq_rel);
+        }
+    }
+}
+
 void DeviceX::AutoRegisterUnifiedResource(
     ID3D12Resource* resource,
     uint64_t guest_va,
     const D3D12_RESOURCE_DESC& desc,
     D3D12_RESOURCE_STATES initial_state,
-    bool mirrored_by_title_va) {
+    bool mirrored_by_title_va,
+    bool use_footprint_row_pitch) {
     if (!resource || guest_va == 0ull) return;
+    guest_va = ResolveGuestCpuAliasVa(guest_va);
     if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
         desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE1D &&
         desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE3D &&
@@ -8985,9 +9643,13 @@ void DeviceX::AutoRegisterUnifiedResource(
         UINT64 row_bytes = 0ull;
         UINT64 total_bytes = 0ull;
         host_dev_->GetCopyableFootprints(&desc, 0u, 1u, 0ull, &fp, &num_rows, &row_bytes, &total_bytes);
-        row_pitch = static_cast<uint32_t>(row_bytes);
+        const bool aligned_pitch =
+            (use_footprint_row_pitch || desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR) &&
+            fp.Footprint.RowPitch >= row_bytes;
+        row_pitch = aligned_pitch ? fp.Footprint.RowPitch : static_cast<uint32_t>(row_bytes);
         const uint32_t slices = (desc.DepthOrArraySize > 0u) ? desc.DepthOrArraySize : 1u;
-        linear_size = row_bytes * static_cast<uint64_t>(num_rows) * static_cast<uint64_t>(slices);
+        linear_size = static_cast<uint64_t>(row_pitch) * static_cast<uint64_t>(num_rows) *
+                      static_cast<uint64_t>(slices);
     }
 
     D3D12XBOX_UNIFIED_TEXTURE_DESC udesc{};
@@ -9128,6 +9790,8 @@ bool DeviceX::RefreshDirtyUnifiedResources() noexcept {
         return false;
     }
     bool any_dirty = HasDirtyUnifiedTextures();
+    static std::atomic<uint32_t> s_refresh_tick{0u};
+    const bool reprobe_reserved = ((s_refresh_tick.fetch_add(1u, std::memory_order_relaxed) & 15u) == 0u);
     std::lock_guard<std::mutex> lock(unified_mutex_);
     for (auto& [res, m] : unified_textures_) {
         if (m.mirrored_by_title_va) continue;
@@ -9135,21 +9799,45 @@ bool DeviceX::RefreshDirtyUnifiedResources() noexcept {
             any_dirty = true;
             continue;
         }
-        if (!m.cpu_readable || m.guest_va == 0ull || m.byte_size == 0ull) {
+        if (m.guest_va == 0ull || m.byte_size == 0ull) {
             continue;
         }
-        // Never hash or CPU->GPU upload RenderTarget, DepthStencil, UAV, MSAA, or Tiled textures.
+        // Never hash or CPU->GPU upload textures actively used as RTV, DepthStencil, UAV, MSAA, or Tiled.
+        if (!m.allow_cpu_upload) {
+            m.cpu_readable = false;
+            continue;
+        }
         if (m.resource) {
             const D3D12_RESOURCE_DESC rdesc = m.resource->GetDesc();
             if (rdesc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
-                ((rdesc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
-                                 D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                ((rdesc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
                                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) != 0 ||
                  rdesc.SampleDesc.Count > 1u ||
                  rdesc.Layout == D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE)) {
                 m.cpu_readable = false;
                 continue;
             }
+        }
+        if (!m.cpu_readable) {
+            // Retail Scarlett titles frequently call CreatePlacedResourceX on MEM_RESERVE GPU pool
+            // VAs (e.g. 4K Bink2 Y/Cb/Cr planes & streaming textures) before committing pages.
+            // Periodically re-probe via VirtualQuery so newly committed ranges activate automatically.
+            if (!reprobe_reserved || !IsReadableGuestVaRange(m.guest_va, m.byte_size)) {
+                continue;
+            }
+            m.cpu_readable = true;
+            void* probe_page = nullptr;
+            ULONG_PTR probe_cnt = 1u;
+            DWORD probe_gran = 4096u;
+            m.write_watch_enabled =
+                (GetWriteWatch(0u, reinterpret_cast<void*>(static_cast<uintptr_t>(m.guest_va)),
+                               static_cast<SIZE_T>(AlignUp64(m.byte_size, 4096ull)),
+                               &probe_page, &probe_cnt, &probe_gran) == 0u);
+            m.dirty = true;
+            ++m.page_generation;
+            dirty_unified_count_.fetch_add(1u, std::memory_order_acq_rel);
+            any_dirty = true;
+            continue;
         }
         bool modified = false;
         if (m.write_watch_enabled) {
@@ -9167,15 +9855,17 @@ bool DeviceX::RefreshDirtyUnifiedResources() noexcept {
             if (rc == 0u && page_cnt > 0u) {
                 modified = true;
             }
-        } else if (m.byte_size <= (64ull * 1024ull * 1024ull) &&
-                   IsReadableGuestVaRange(m.guest_va, m.byte_size)) {
+        } else if (m.byte_size <= (64ull * 1024ull * 1024ull)) {
             uint64_t cur_hash = 0ull;
             if (SafeHashGuestMemoryFnv1a64(
                     reinterpret_cast<const void*>(static_cast<uintptr_t>(m.guest_va)),
                     static_cast<size_t>(m.byte_size),
-                    cur_hash) &&
-                (!m.has_uploaded_once || cur_hash != m.last_uploaded_hash)) {
-                modified = true;
+                    cur_hash)) {
+                if (!m.has_uploaded_once || cur_hash != m.last_uploaded_hash) {
+                    modified = true;
+                }
+            } else {
+                m.cpu_readable = false;
             }
         }
         if (modified) {
@@ -9423,12 +10113,12 @@ HRESULT STDMETHODCALLTYPE DeviceX::FlushDirtyUnifiedTextures(
         for (auto& [res, m] : unified_textures_) {
             if (!m.dirty || !m.cpu_readable || !m.resource || m.mirrored_by_title_va) continue;
             const D3D12_RESOURCE_DESC rdesc = m.resource->GetDesc();
-            // Never CPU->GPU copy onto RenderTarget, DepthStencil, MSAA, or Reserved/Tiled textures.
-            if (rdesc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
-                ((rdesc.Flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
-                                 D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)) != 0 ||
-                 rdesc.SampleDesc.Count > 1u ||
-                 rdesc.Layout == D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE)) {
+            // Never CPU->GPU copy onto actively bound RTVs, DepthStencil, MSAA, or Reserved/Tiled textures.
+            if (!m.allow_cpu_upload ||
+                (rdesc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER &&
+                 ((rdesc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0 ||
+                  rdesc.SampleDesc.Count > 1u ||
+                  rdesc.Layout == D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE))) {
                 m.dirty = false;
                 dirty_unified_count_.fetch_sub(1u, std::memory_order_acq_rel);
                 continue;
@@ -9460,16 +10150,33 @@ HRESULT STDMETHODCALLTYPE DeviceX::FlushDirtyUnifiedTextures(
     }
 
     // Compute staging buffer layout (512-byte aligned per subresource).
+    // Cap each flush batch at 32 MiB so a burst of streaming textures never allocates a
+    // 500+ MiB UPLOAD staging buffer or stalls ExecuteCommandLists for seconds.
+    constexpr uint64_t kMaxBatchStagingBytes = 32ull * 1024ull * 1024ull;
     uint64_t staging_cursor = 0ull;
-    for (auto& item : pending) {
+    size_t batch_limit = pending.size();
+    for (size_t pi = 0u; pi < pending.size(); ++pi) {
+        auto& item = pending[pi];
         if (item.skip_gpu_copy_native_cpu_heap) {
             item.copy_bytes = item.mapping.byte_size;
             continue;
         }
+        const uint64_t prev_cursor = staging_cursor;
         staging_cursor = AlignUp64(staging_cursor, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
         if (item.res_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
+            const uint64_t sz = std::min<uint64_t>(item.mapping.byte_size, item.res_desc.Width);
+            if (prev_cursor > 0ull && staging_cursor + sz > kMaxBatchStagingBytes) {
+                staging_cursor = prev_cursor;
+                batch_limit = pi;
+                break;
+            }
+            if (sz > kMaxBatchStagingBytes) {
+                staging_cursor = prev_cursor;
+                item.copy_bytes = 0ull;
+                continue;
+            }
             item.buffer_upload_offset = staging_cursor;
-            item.copy_bytes = std::min<uint64_t>(item.mapping.byte_size, item.res_desc.Width);
+            item.copy_bytes = sz;
             staging_cursor += item.copy_bytes;
         } else if (item.res_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
                    item.res_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D ||
@@ -9500,11 +10207,31 @@ HRESULT STDMETHODCALLTYPE DeviceX::FlushDirtyUnifiedTextures(
                 staging_cursor += sub_total;
                 total_copy += item.row_sizes[s] * static_cast<uint64_t>(item.num_rows[s]);
             }
+            if (prev_cursor > 0ull && staging_cursor > kMaxBatchStagingBytes) {
+                staging_cursor = prev_cursor;
+                item.footprints.clear();
+                item.copy_bytes = 0ull;
+                batch_limit = pi;
+                break;
+            }
+            if (staging_cursor - prev_cursor > kMaxBatchStagingBytes) {
+                staging_cursor = prev_cursor;
+                footprint_ok = false;
+            }
             item.copy_bytes = footprint_ok ? total_copy : 0ull;
             if (!footprint_ok) {
                 item.footprints.clear();
             }
         }
+    }
+    if (batch_limit < pending.size()) {
+        for (size_t ri = batch_limit; ri < pending.size(); ++ri) {
+            if (pending[ri].mapping.resource) {
+                pending[ri].mapping.resource->Release();
+                pending[ri].mapping.resource = nullptr;
+            }
+        }
+        pending.resize(batch_limit);
     }
 
     auto release_pending = [&]() {
@@ -9545,6 +10272,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::FlushDirtyUnifiedTextures(
 
     std::vector<size_t> uploaded_indices;
     std::vector<size_t> gpu_copy_indices;
+    std::vector<size_t> skipped_unreadable_indices;
     uploaded_indices.reserve(pending.size());
     gpu_copy_indices.reserve(pending.size());
 
@@ -9552,6 +10280,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::FlushDirtyUnifiedTextures(
         auto& item = pending[idx];
         if (item.copy_bytes == 0ull ||
             !IsReadableGuestVaRange(item.mapping.guest_va, item.mapping.byte_size)) {
+            skipped_unreadable_indices.push_back(idx);
             continue;
         }
         if (item.mapping.write_watch_enabled) {
@@ -9565,6 +10294,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::FlushDirtyUnifiedTextures(
         if (item.mapping.byte_size <= (64ull * 1024ull * 1024ull)) {
             uint64_t snap_h = 0ull;
             if (!SafeHashGuestMemoryFnv1a64(src_base, static_cast<size_t>(item.mapping.byte_size), snap_h)) {
+                skipped_unreadable_indices.push_back(idx);
                 continue;
             }
             item.snapshot_hash = snap_h;
@@ -9577,6 +10307,7 @@ HRESULT STDMETHODCALLTYPE DeviceX::FlushDirtyUnifiedTextures(
         if (item.res_desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER) {
             if (!SafeCopyGuestMemory(dst_base + item.buffer_upload_offset, src_base,
                                      static_cast<size_t>(item.copy_bytes))) {
+                skipped_unreadable_indices.push_back(idx);
                 continue;
             }
             uploaded_indices.push_back(idx);
@@ -9649,7 +10380,28 @@ HRESULT STDMETHODCALLTYPE DeviceX::FlushDirtyUnifiedTextures(
 
         for (size_t idx : gpu_copy_indices) {
             const auto& item = pending[idx];
-            const D3D12_RESOURCE_STATES st = item.mapping.current_state;
+            D3D12_RESOURCE_STATES st =
+                retail_scarlett_abi_
+                    ? GetRetailResourceState(item.mapping.resource, item.mapping.current_state)
+                    : item.mapping.current_state;
+            if (retail_scarlett_abi_) {
+                if (item.res_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+                    constexpr UINT kTexAllowed =
+                        static_cast<UINT>(D3D12_RESOURCE_STATE_RENDER_TARGET) |
+                        static_cast<UINT>(D3D12_RESOURCE_STATE_UNORDERED_ACCESS) |
+                        static_cast<UINT>(D3D12_RESOURCE_STATE_DEPTH_WRITE) |
+                        static_cast<UINT>(D3D12_RESOURCE_STATE_DEPTH_READ) |
+                        static_cast<UINT>(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE) |
+                        static_cast<UINT>(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) |
+                        static_cast<UINT>(D3D12_RESOURCE_STATE_COPY_DEST) |
+                        static_cast<UINT>(D3D12_RESOURCE_STATE_COPY_SOURCE) |
+                        static_cast<UINT>(D3D12_RESOURCE_STATE_RESOLVE_DEST) |
+                        static_cast<UINT>(D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+                    st = static_cast<D3D12_RESOURCE_STATES>(static_cast<UINT>(st) & kTexAllowed);
+                } else {
+                    st = static_cast<D3D12_RESOURCE_STATES>(static_cast<UINT>(st) & 0x0FFFu);
+                }
+            }
             if (st != D3D12_RESOURCE_STATE_COPY_DEST) {
                 D3D12_RESOURCE_BARRIER b{};
                 b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -9696,6 +10448,20 @@ HRESULT STDMETHODCALLTYPE DeviceX::FlushDirtyUnifiedTextures(
 
         hr = unified_cmd_->Close();
         if (FAILED(hr)) {
+            if (CommandListX::IsDiagTraceEnabled()) {
+                std::fprintf(stderr, "[OpenScarlett][UNIFIED-CLOSE-FAIL] hr=0x%08lX n=%zu\n",
+                             static_cast<unsigned long>(hr), gpu_copy_indices.size());
+                for (size_t fi = 0u; fi < std::min<size_t>(gpu_copy_indices.size(), 6u); ++fi) {
+                    const auto& it = pending[gpu_copy_indices[fi]];
+                    std::fprintf(stderr, "  [%zu] dim=%d %llux%u fmt=%d st=0x%X bytes=%llu\n",
+                                 fi, static_cast<int>(it.res_desc.Dimension),
+                                 static_cast<unsigned long long>(it.res_desc.Width), it.res_desc.Height,
+                                 static_cast<int>(it.res_desc.Format),
+                                 static_cast<unsigned>(it.mapping.current_state),
+                                 static_cast<unsigned long long>(it.copy_bytes));
+                }
+                std::fflush(stderr);
+            }
             release_pending();
             RecordDev("ID3D12DeviceX::FlushDirtyUnifiedTextures", -1, hr);
             return hr;
@@ -9732,6 +10498,17 @@ HRESULT STDMETHODCALLTYPE DeviceX::FlushDirtyUnifiedTextures(
                 it->second.last_uploaded_hash = item.snapshot_hash;
                 dirty_unified_count_.fetch_sub(1u, std::memory_order_acq_rel);
                 ++flushed_count;
+            }
+        }
+        for (size_t idx : skipped_unreadable_indices) {
+            const auto& item = pending[idx];
+            auto it = unified_textures_.find(item.mapping.resource);
+            if (it != unified_textures_.end() &&
+                it->second.dirty &&
+                it->second.page_generation == item.mapping.page_generation) {
+                it->second.dirty = false;
+                it->second.cpu_readable = false;
+                dirty_unified_count_.fetch_sub(1u, std::memory_order_acq_rel);
             }
         }
         ++total_unified_flushes_;
@@ -10001,6 +10778,475 @@ ID3D12Resource* DeviceX::ResolveBufferResourceByGpuVa(
         }
     }
     return nullptr;
+}
+
+D3D12_GPU_VIRTUAL_ADDRESS DeviceX::UploadTransientGuestBufferForDesktop(
+    D3D12_GPU_VIRTUAL_ADDRESS guest_va,
+    uint64_t size_bytes,
+    uint64_t alignment,
+    bool allow_same_frame_cache) {
+    if (guest_va == 0ull || size_bytes == 0ull || !host_dev_) {
+        return 0ull;
+    }
+    guest_va = ResolveGuestCpuAliasVa(guest_va);
+    constexpr uint64_t kRingBytes = 64ull * 1024ull * 1024ull;
+    constexpr uint64_t kMaxSingleUpload = 8ull * 1024ull * 1024ull;
+    const uint64_t copy_bytes = std::min<uint64_t>(size_bytes, kMaxSingleUpload);
+    const uint64_t align = std::max<uint64_t>(alignment ? alignment : 16ull, 16ull);
+    const uint64_t cur_frame = next_frame_token_.load(std::memory_order_relaxed);
+
+    std::lock_guard<std::mutex> lk(transient_ring_mutex_);
+    if (allow_same_frame_cache) {
+        for (const auto& s : transient_ring_cache_) {
+            if (s.frame_token == cur_frame &&
+                s.host_gpu_start != 0ull &&
+                guest_va >= s.raw_start &&
+                guest_va + copy_bytes <= s.raw_end) {
+                return s.host_gpu_start + (guest_va - s.raw_start);
+            }
+        }
+    }
+
+    if (!transient_ring_cpu_) {
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC rd{};
+        rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        rd.Width = kRingBytes;
+        rd.Height = 1u;
+        rd.DepthOrArraySize = 1u;
+        rd.MipLevels = 1u;
+        rd.Format = DXGI_FORMAT_UNKNOWN;
+        rd.SampleDesc.Count = 1u;
+        rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ID3D12Resource* ring = nullptr;
+        if (SUCCEEDED(host_dev_->CreateCommittedResource(
+                &hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                OS_D3D12_IID(ID3D12Resource), reinterpret_cast<void**>(&ring))) &&
+            ring) {
+            void* p = nullptr;
+            D3D12_RANGE zero_read{0u, 0u};
+            if (SUCCEEDED(ring->Map(0u, &zero_read, &p)) && p) {
+                transient_ring_ = ring;
+                transient_ring_cpu_ = static_cast<uint8_t*>(p);
+                transient_ring_gpu_ = ring->GetGPUVirtualAddress();
+                transient_ring_cursor_ = 0ull;
+            } else {
+                ring->Release();
+            }
+        }
+    }
+    if (!transient_ring_cpu_ || transient_ring_gpu_ == 0ull) {
+        return 0ull;
+    }
+
+    const uint64_t alloc_bytes = AlignUp64(copy_bytes, align);
+    uint64_t off = AlignUp64(transient_ring_cursor_, align);
+    if (off + alloc_bytes > kRingBytes) {
+        off = 0ull;
+    }
+    uint8_t* dst = transient_ring_cpu_ + off;
+    if (!SafeCopyGuestMemory(dst, reinterpret_cast<const void*>(static_cast<uintptr_t>(guest_va)),
+                             static_cast<size_t>(copy_bytes))) {
+        return 0ull;
+    }
+    if (alloc_bytes > copy_bytes) {
+        std::memset(dst + copy_bytes, 0, static_cast<size_t>(alloc_bytes - copy_bytes));
+    }
+    transient_ring_cursor_ = off + alloc_bytes;
+    const D3D12_GPU_VIRTUAL_ADDRESS out_gpu = transient_ring_gpu_ + off;
+    if (allow_same_frame_cache) {
+        transient_ring_cache_[transient_ring_cache_next_ & 7u] =
+            TransientRingSlice{guest_va, guest_va + copy_bytes, out_gpu, cur_frame};
+        ++transient_ring_cache_next_;
+    }
+    return out_gpu;
+}
+
+void DeviceX::RegisterGuestBackedDescHeap(
+    ID3D12DescriptorHeap* host_heap,
+    uint64_t host_gpu_start, uint64_t host_cpu_start, uint32_t host_num_descs,
+    uint32_t inc_size, uint64_t guest_cpu_start, uint64_t guest_byte_size) {
+    if (!host_heap || host_gpu_start == 0ull || guest_cpu_start == 0ull || guest_byte_size == 0ull) return;
+    std::lock_guard<std::mutex> lk(guest_dh_mutex_);
+    guest_backed_desc_heaps_.push_back(GuestBackedDescHeap{
+        host_heap, host_gpu_start, host_cpu_start, host_num_descs,
+        std::max<uint32_t>(1u, inc_size), guest_cpu_start, guest_byte_size, 0u, false});
+    has_guest_backed_desc_heaps_.store(true, std::memory_order_release);
+}
+
+bool DeviceX::EnsureShadowDescHeapLocked() noexcept {
+    if (shadow_cbv_srv_uav_heap_) return true;
+    if (!host_dev_) return false;
+    constexpr uint32_t kShadowCap = 131072u;
+    constexpr uint32_t kStaticPartitionEnd = 32768u;
+    D3D12_DESCRIPTOR_HEAP_DESC hd{};
+    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    hd.NumDescriptors = kShadowCap;
+    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+    ID3D12DescriptorHeap* sh = nullptr;
+    if (FAILED(host_dev_->CreateDescriptorHeap(
+            &hd, OS_D3D12_IID(ID3D12DescriptorHeap), reinterpret_cast<void**>(&sh))) ||
+        !sh) {
+        return false;
+    }
+    shadow_cbv_srv_uav_heap_ = sh;
+    shadow_cbv_srv_uav_cpu_start_ = sh->GetCPUDescriptorHandleForHeapStart();
+    shadow_cbv_srv_uav_inc_ =
+        std::max<uint32_t>(1u, host_dev_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
+    shadow_cbv_srv_uav_cap_ = kShadowCap;
+    shadow_static_cursor_ = 1u;
+    shadow_dynamic_cursor_ = kStaticPartitionEnd;
+    shadow_slot_keys_.assign(kShadowCap, Desc32Key{});
+    shadow_slot_valid_.assign(kShadowCap, 0u);
+    // Reserve slot 0 for a valid null raw-buffer SRV copied onto empty/unmapped wrapped ring slots.
+    shadow_null_srv_cpu_ = shadow_cbv_srv_uav_cpu_start_;
+    D3D12_SHADER_RESOURCE_VIEW_DESC null_srv{};
+    null_srv.Format = DXGI_FORMAT_R32_TYPELESS;
+    null_srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    null_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    null_srv.Buffer.NumElements = 1u;
+    null_srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
+    host_dev_->CreateShaderResourceView(nullptr, &null_srv, shadow_null_srv_cpu_);
+    return true;
+}
+
+uint32_t DeviceX::AllocShadowSlotLocked(bool prefer_static_partition) noexcept {
+    constexpr uint32_t kStaticStart = 1u;
+    constexpr uint32_t kStaticEnd = 32768u;
+    uint32_t slot = 1u;
+    if (prefer_static_partition && shadow_cbv_srv_uav_cap_ > kStaticEnd) {
+        slot = shadow_static_cursor_;
+        shadow_static_cursor_ = (slot + 1u < kStaticEnd) ? (slot + 1u) : kStaticStart;
+    } else {
+        const uint32_t dyn_start = (shadow_cbv_srv_uav_cap_ > kStaticEnd) ? kStaticEnd : 1u;
+        slot = shadow_dynamic_cursor_;
+        if (slot < dyn_start || slot >= shadow_cbv_srv_uav_cap_) slot = dyn_start;
+        shadow_dynamic_cursor_ = (slot + 1u < shadow_cbv_srv_uav_cap_) ? (slot + 1u) : dyn_start;
+    }
+    if (slot < shadow_slot_valid_.size() && shadow_slot_valid_[slot]) {
+        const uint64_t slot_cpu =
+            shadow_cbv_srv_uav_cpu_start_.ptr + static_cast<uint64_t>(slot) * shadow_cbv_srv_uav_inc_;
+        auto it = desc32_to_shadow_cpu_.find(shadow_slot_keys_[slot]);
+        if (it != desc32_to_shadow_cpu_.end() && it->second == slot_cpu) {
+            desc32_to_shadow_cpu_.erase(it);
+        }
+        shadow_slot_valid_[slot] = 0u;
+    }
+    return slot;
+}
+
+bool DeviceX::RedirectGuestDescDestIfNeeded(
+    D3D12_CPU_DESCRIPTOR_HANDLE& dst, uint64_t& out_guest_writeback_addr,
+    bool prefer_static_partition) {
+    out_guest_writeback_addr = 0ull;
+    if (dst.ptr == 0u) return false;
+    std::lock_guard<std::mutex> lk(guest_dh_mutex_);
+    bool in_guest = false;
+    for (const auto& g : guest_backed_desc_heaps_) {
+        if (dst.ptr >= g.guest_cpu_start && dst.ptr < g.guest_cpu_start + g.guest_byte_size) {
+            in_guest = true;
+            break;
+        }
+    }
+    if (!in_guest) return false;
+    if (!EnsureShadowDescHeapLocked()) return false;
+    const uint32_t slot = AllocShadowSlotLocked(prefer_static_partition);
+    out_guest_writeback_addr = dst.ptr;
+    dst.ptr = shadow_cbv_srv_uav_cpu_start_.ptr + static_cast<SIZE_T>(slot) * shadow_cbv_srv_uav_inc_;
+    return true;
+}
+
+void DeviceX::SnapshotCreatedDescriptorToShadow(
+    D3D12_CPU_DESCRIPTOR_HANDLE created_cpu_handle, uint64_t guest_writeback_addr,
+    bool prefer_static_partition) {
+    if (created_cpu_handle.ptr == 0u || !host_dev_) return;
+
+    std::lock_guard<std::mutex> lk(guest_dh_mutex_);
+    if (!EnsureShadowDescHeapLocked()) return;
+    Desc32Key key{};
+    const size_t copy_len = std::min<size_t>(sizeof(key.bytes), shadow_cbv_srv_uav_inc_);
+    if (!SafeCopyGuestMemory(key.bytes, reinterpret_cast<const void*>(created_cpu_handle.ptr), copy_len)) {
+        return;
+    }
+    bool all_zero = true;
+    for (uint8_t b : key.bytes) {
+        if (b != 0u) { all_zero = false; break; }
+    }
+    if (all_zero) return;
+
+    if (guest_writeback_addr != 0ull) {
+        std::memcpy(reinterpret_cast<void*>(static_cast<uintptr_t>(guest_writeback_addr)),
+                    key.bytes, copy_len);
+        const uint64_t rel =
+            (created_cpu_handle.ptr >= shadow_cbv_srv_uav_cpu_start_.ptr)
+                ? (created_cpu_handle.ptr - shadow_cbv_srv_uav_cpu_start_.ptr) / shadow_cbv_srv_uav_inc_
+                : UINT64_MAX;
+        if (rel < shadow_slot_keys_.size()) {
+            shadow_slot_keys_[static_cast<size_t>(rel)] = key;
+            shadow_slot_valid_[static_cast<size_t>(rel)] = 1u;
+        }
+        desc32_to_shadow_cpu_[key] = created_cpu_handle.ptr;
+        return;
+    }
+    const uint32_t slot = AllocShadowSlotLocked(prefer_static_partition);
+    const D3D12_CPU_DESCRIPTOR_HANDLE shadow_dst{
+        shadow_cbv_srv_uav_cpu_start_.ptr + static_cast<SIZE_T>(slot) * shadow_cbv_srv_uav_inc_};
+    host_dev_->CopyDescriptorsSimple(
+        1u, shadow_dst, created_cpu_handle, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    shadow_slot_keys_[slot] = key;
+    shadow_slot_valid_[slot] = 1u;
+    desc32_to_shadow_cpu_[key] = shadow_dst.ptr;
+}
+
+void DeviceX::RecordRootSigTableSizes(void* host_rs, const D3D12_VERSIONED_ROOT_SIGNATURE_DESC& desc) {
+    if (!host_rs) return;
+    std::vector<uint32_t> counts;
+    if (desc.Version == D3D_ROOT_SIGNATURE_VERSION_1_1 && desc.Desc_1_1.pParameters) {
+        counts.assign(desc.Desc_1_1.NumParameters, 0u);
+        for (UINT pi = 0u; pi < desc.Desc_1_1.NumParameters; ++pi) {
+            const auto& rp = desc.Desc_1_1.pParameters[pi];
+            if (rp.ParameterType != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE ||
+                !rp.DescriptorTable.pDescriptorRanges) {
+                continue;
+            }
+            UINT cur = 0u;
+            UINT max_end = 0u;
+            for (UINT ri = 0u; ri < rp.DescriptorTable.NumDescriptorRanges; ++ri) {
+                const auto& rg = rp.DescriptorTable.pDescriptorRanges[ri];
+                const UINT off = (rg.OffsetInDescriptorsFromTableStart == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND)
+                                     ? cur
+                                     : rg.OffsetInDescriptorsFromTableStart;
+                if (rg.NumDescriptors == UINT_MAX) {
+                    max_end = std::max<UINT>(max_end, std::min<UINT>(off + 64u, 128u));
+                    cur = off + 64u;
+                } else {
+                    const UINT end = off + rg.NumDescriptors;
+                    max_end = std::max<UINT>(max_end, end);
+                    cur = end;
+                }
+            }
+            counts[pi] = max_end;
+        }
+    } else if (desc.Version == D3D_ROOT_SIGNATURE_VERSION_1_0 && desc.Desc_1_0.pParameters) {
+        counts.assign(desc.Desc_1_0.NumParameters, 0u);
+        for (UINT pi = 0u; pi < desc.Desc_1_0.NumParameters; ++pi) {
+            const auto& rp = desc.Desc_1_0.pParameters[pi];
+            if (rp.ParameterType != D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE ||
+                !rp.DescriptorTable.pDescriptorRanges) {
+                continue;
+            }
+            UINT cur = 0u;
+            UINT max_end = 0u;
+            for (UINT ri = 0u; ri < rp.DescriptorTable.NumDescriptorRanges; ++ri) {
+                const auto& rg = rp.DescriptorTable.pDescriptorRanges[ri];
+                const UINT off = (rg.OffsetInDescriptorsFromTableStart == D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND)
+                                     ? cur
+                                     : rg.OffsetInDescriptorsFromTableStart;
+                if (rg.NumDescriptors == UINT_MAX) {
+                    max_end = std::max<UINT>(max_end, std::min<UINT>(off + 64u, 128u));
+                    cur = off + 64u;
+                } else {
+                    const UINT end = off + rg.NumDescriptors;
+                    max_end = std::max<UINT>(max_end, end);
+                    cur = end;
+                }
+            }
+            counts[pi] = max_end;
+        }
+    }
+    if (!counts.empty()) {
+        std::lock_guard<std::mutex> lk(guest_dh_mutex_);
+        rs_table_slot_counts_[host_rs] = std::move(counts);
+    }
+}
+
+D3D12_GPU_DESCRIPTOR_HANDLE DeviceX::MaterializeGuestDescriptorTable(
+    D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle,
+    ID3D12RootSignature* bound_host_rs,
+    UINT root_param_index,
+    uint32_t* out_copied_hits,
+    uint32_t* out_slot_count) {
+    if (out_copied_hits) *out_copied_hits = 0u;
+    if (out_slot_count) *out_slot_count = 0u;
+    if (gpu_handle.ptr == 0ull || !host_dev_ ||
+        !has_guest_backed_desc_heaps_.load(std::memory_order_acquire)) {
+        return gpu_handle;
+    }
+
+    std::lock_guard<std::mutex> lk(guest_dh_mutex_);
+    GuestBackedDescHeap* target = nullptr;
+    for (auto& g : guest_backed_desc_heaps_) {
+        if (gpu_handle.ptr >= g.host_gpu_start &&
+            gpu_handle.ptr < g.host_gpu_start + g.guest_byte_size) {
+            target = &g;
+            break;
+        }
+    }
+    if (!target || target->host_num_descs == 0u) {
+        return gpu_handle;
+    }
+
+    const uint64_t byte_off = gpu_handle.ptr - target->host_gpu_start;
+    const uint64_t guest_ptr = target->guest_cpu_start + byte_off;
+    const uint64_t rem_slots = (target->guest_byte_size - byte_off) / target->inc_size;
+    uint32_t want_slots = 16u;
+    if (bound_host_rs) {
+        auto rit = rs_table_slot_counts_.find(bound_host_rs);
+        if (rit != rs_table_slot_counts_.end() && root_param_index < rit->second.size() &&
+            rit->second[root_param_index] > 0u) {
+            want_slots = rit->second[root_param_index];
+        }
+    }
+    want_slots = static_cast<uint32_t>(std::min<uint64_t>(std::clamp<uint32_t>(want_slots, 1u, 128u), rem_slots));
+    if (want_slots == 0u || want_slots > target->host_num_descs) {
+        return gpu_handle;
+    }
+
+    if (target->ring_cursor + want_slots > target->host_num_descs) {
+        target->ring_cursor = 0u;
+        target->ring_wrapped = true;
+    }
+    const uint32_t base_slot = target->ring_cursor;
+    target->ring_cursor += want_slots;
+
+    const size_t copy_len = std::min<size_t>(sizeof(Desc32Key::bytes), target->inc_size);
+    uint32_t hits = 0u;
+    for (uint32_t i = 0u; i < want_slots; ++i) {
+        const D3D12_CPU_DESCRIPTOR_HANDLE dst_sv{
+            static_cast<SIZE_T>(target->host_cpu_start + static_cast<uint64_t>(base_slot + i) * target->inc_size)};
+        Desc32Key key{};
+        const uint64_t src_addr = guest_ptr + static_cast<uint64_t>(i) * target->inc_size;
+        bool copied_valid = false;
+        if (SafeCopyGuestMemory(key.bytes, reinterpret_cast<const void*>(static_cast<uintptr_t>(src_addr)), copy_len)) {
+            bool all_zero = true;
+            for (uint8_t b : key.bytes) {
+                if (b != 0u) { all_zero = false; break; }
+            }
+            if (!all_zero) {
+                auto it = desc32_to_shadow_cpu_.find(key);
+                if (it != desc32_to_shadow_cpu_.end()) {
+                    host_dev_->CopyDescriptorsSimple(
+                        1u, dst_sv, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(it->second)},
+                        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                    ++hits;
+                    copied_valid = true;
+                }
+            }
+        }
+        if (!copied_valid && target->ring_wrapped && shadow_null_srv_cpu_.ptr != 0u) {
+            host_dev_->CopyDescriptorsSimple(
+                1u, dst_sv, shadow_null_srv_cpu_, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        }
+    }
+    if (out_copied_hits) *out_copied_hits = hits;
+    if (out_slot_count) *out_slot_count = want_slots;
+    return D3D12_GPU_DESCRIPTOR_HANDLE{
+        target->host_gpu_start + static_cast<uint64_t>(base_slot) * target->inc_size};
+}
+
+void DeviceX::RecordDiagDescriptor(uint64_t cpu_ptr, std::string desc) {
+    if (cpu_ptr == 0ull) return;
+    std::lock_guard<std::mutex> lk(diag_meta_mutex_);
+    if (diag_desc_map_.size() >= 20000u) return;
+    diag_desc_map_[cpu_ptr] = std::move(desc);
+}
+
+void DeviceX::CopyDiagDescriptor(uint64_t dst_cpu_ptr, uint64_t src_cpu_ptr) {
+    if (dst_cpu_ptr == 0ull) return;
+    std::lock_guard<std::mutex> lk(diag_meta_mutex_);
+    auto it = diag_desc_map_.find(src_cpu_ptr);
+    if (it != diag_desc_map_.end()) {
+        diag_desc_map_[dst_cpu_ptr] = it->second;
+    }
+}
+
+std::string DeviceX::DescribeDiagDescriptorTable(D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle, uint32_t max_slots) {
+    if (gpu_handle.ptr == 0ull) return {};
+    uint64_t cpu_base = 0ull;
+    uint32_t inc = 32u;
+    uint32_t avail = 0u;
+    {
+        std::lock_guard<std::mutex> lk(paged_desc_mutex_);
+        for (const auto& [h, st] : paged_desc_heaps_) {
+            (void)h;
+            const uint64_t g0 = st.gpu_start.ptr;
+            const uint64_t span = static_cast<uint64_t>(st.num_descriptors) * st.inc_size;
+            if (g0 != 0ull && gpu_handle.ptr >= g0 && gpu_handle.ptr < g0 + span) {
+                const uint64_t idx = (gpu_handle.ptr - g0) / st.inc_size;
+                cpu_base = st.cpu_start.ptr + idx * st.inc_size;
+                inc = st.inc_size;
+                avail = static_cast<uint32_t>(std::min<uint64_t>(max_slots, st.num_descriptors - idx));
+                break;
+            }
+        }
+    }
+    if (cpu_base == 0ull || avail == 0u) return {};
+    std::string out;
+    std::lock_guard<std::mutex> lk(diag_meta_mutex_);
+    for (uint32_t i = 0u; i < avail; ++i) {
+        auto it = diag_desc_map_.find(cpu_base + static_cast<uint64_t>(i) * inc);
+        if (it != diag_desc_map_.end()) {
+            char pfx[24];
+            std::snprintf(pfx, sizeof(pfx), "%s+%u:", out.empty() ? "{" : " ", i);
+            out += pfx;
+            out += it->second;
+        }
+    }
+    if (out.empty()) {
+        uint64_t gcpu = 0ull;
+        {
+            std::lock_guard<std::mutex> glk(guest_dh_mutex_);
+            for (const auto& g : guest_backed_desc_heaps_) {
+                if (gpu_handle.ptr >= g.host_gpu_start &&
+                    gpu_handle.ptr < g.host_gpu_start + g.guest_byte_size) {
+                    gcpu = g.guest_cpu_start + (gpu_handle.ptr - g.host_gpu_start);
+                    break;
+                }
+            }
+        }
+        std::string gdesc;
+        if (gcpu != 0ull) {
+            for (uint32_t s = 0u; s < 4u; ++s) {
+                const uint64_t saddr = gcpu + static_cast<uint64_t>(s) * inc;
+                auto it = diag_desc_map_.find(saddr);
+                uint32_t gd[8]{};
+                const bool gok = SafeCopyGuestMemory(gd, reinterpret_cast<const void*>(static_cast<uintptr_t>(saddr)), 32u);
+                char sb[160];
+                if (it != diag_desc_map_.end()) {
+                    std::snprintf(sb, sizeof(sb), " g+%u:%s", s, it->second.c_str());
+                } else {
+                    std::snprintf(sb, sizeof(sb), " g+%u[%d]=%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X",
+                                  s, gok ? 1 : 0, gd[0], gd[1], gd[2], gd[3], gd[4], gd[5], gd[6], gd[7]);
+                }
+                gdesc += sb;
+            }
+        }
+        char nf[96];
+        std::snprintf(nf, sizeof(nf), "{gcpu=0x%llX map=%zu",
+                      static_cast<unsigned long long>(gcpu), diag_desc_map_.size());
+        return std::string(nf) + gdesc + "}";
+    }
+    out += "}";
+    return out;
+}
+
+std::string DeviceX::DescribeDiagRtv(uint64_t cpu_ptr) {
+    std::lock_guard<std::mutex> lk(diag_meta_mutex_);
+    auto it = diag_desc_map_.find(cpu_ptr);
+    return (it != diag_desc_map_.end()) ? it->second : std::string{};
+}
+
+void DeviceX::RecordDiagRootSig(void* host_rs, std::string desc) {
+    if (!host_rs) return;
+    std::lock_guard<std::mutex> lk(diag_meta_mutex_);
+    diag_rs_map_[host_rs] = std::move(desc);
+}
+
+std::string DeviceX::DescribeDiagRootSig(void* host_rs) {
+    std::lock_guard<std::mutex> lk(diag_meta_mutex_);
+    auto it = diag_rs_map_.find(host_rs);
+    return (it != diag_rs_map_.end()) ? it->second : std::string{};
 }
 
 D3D12_GPU_VIRTUAL_ADDRESS DeviceX::AlignRootCbvGpuVaForDesktop(

@@ -353,11 +353,17 @@ Rdna2Opcode DecodeVop1Opcode(uint16_t raw) {
         case 0x07: return Rdna2Opcode::V_CVT_U32_F32;
         case 0x08: return Rdna2Opcode::V_CVT_I32_F32;
         case 0x20: return Rdna2Opcode::V_FRACT_F32;
+        case 0x21: return Rdna2Opcode::V_TRUNC_F32;
         case 0x22: return Rdna2Opcode::V_CEIL_F32;
+        case 0x23: return Rdna2Opcode::V_RNDNE_F32;
         case 0x24: return Rdna2Opcode::V_FLOOR_F32;
+        case 0x25: return Rdna2Opcode::V_EXP_F32;
+        case 0x27: return Rdna2Opcode::V_LOG_F32;
         case 0x2A: return Rdna2Opcode::V_RCP_F32;
         case 0x2E: return Rdna2Opcode::V_RSQ_F32;
         case 0x33: return Rdna2Opcode::V_SQRT_F32;
+        case 0x35: return Rdna2Opcode::V_SIN_F32;
+        case 0x36: return Rdna2Opcode::V_COS_F32;
         case 0x63: return Rdna2Opcode::V_CVT_NORM_I16_F16;
         case 0x64: return Rdna2Opcode::V_CVT_NORM_U16_F16;
         case 0x65: return Rdna2Opcode::V_SWAP_B32;
@@ -375,11 +381,17 @@ uint16_t EncodeVop1Opcode(Rdna2Opcode op) {
         case Rdna2Opcode::V_CVT_U32_F32:       return 0x07;
         case Rdna2Opcode::V_CVT_I32_F32:       return 0x08;
         case Rdna2Opcode::V_FRACT_F32:         return 0x20;
+        case Rdna2Opcode::V_TRUNC_F32:         return 0x21;
         case Rdna2Opcode::V_CEIL_F32:          return 0x22;
+        case Rdna2Opcode::V_RNDNE_F32:         return 0x23;
         case Rdna2Opcode::V_FLOOR_F32:         return 0x24;
+        case Rdna2Opcode::V_EXP_F32:           return 0x25;
+        case Rdna2Opcode::V_LOG_F32:           return 0x27;
         case Rdna2Opcode::V_RCP_F32:           return 0x2A;
         case Rdna2Opcode::V_RSQ_F32:           return 0x2E;
         case Rdna2Opcode::V_SQRT_F32:          return 0x33;
+        case Rdna2Opcode::V_SIN_F32:           return 0x35;
+        case Rdna2Opcode::V_COS_F32:           return 0x36;
         case Rdna2Opcode::V_CVT_NORM_I16_F16:  return 0x63;
         case Rdna2Opcode::V_CVT_NORM_U16_F16:  return 0x64;
         case Rdna2Opcode::V_SWAP_B32:          return 0x65;
@@ -761,8 +773,8 @@ Rdna2Opcode DecodeMubufOpcode(uint16_t raw) {
         case 0x0B: return Rdna2Opcode::BUFFER_LOAD_FORMAT_D16_XYZW;
         case 0x0C: return Rdna2Opcode::BUFFER_LOAD_DWORD;        // GFX10.3 buffer_load_dword
         case 0x0D: return Rdna2Opcode::BUFFER_LOAD_FORMAT_XY;    // GFX10.3 buffer_load_dwordx2
-        case 0x0E: return Rdna2Opcode::BUFFER_LOAD_FORMAT_XYZ;   // GFX10.3 buffer_load_dwordx3
-        case 0x0F: return Rdna2Opcode::BUFFER_LOAD_FORMAT_XYZW;  // GFX10.3 buffer_load_dwordx4
+        case 0x0E: return Rdna2Opcode::BUFFER_LOAD_FORMAT_XYZW;  // GFX10.3 buffer_load_dwordx4 (4 dwords)
+        case 0x0F: return Rdna2Opcode::BUFFER_LOAD_FORMAT_XYZ;   // GFX10.3 buffer_load_dwordx3 (3 dwords)
         case 0x14: return Rdna2Opcode::BUFFER_LOAD_DWORD;
         case 0x19: return Rdna2Opcode::BUFFER_STORE_BYTE_D16_HI;
         case 0x1B: return Rdna2Opcode::BUFFER_STORE_SHORT_D16_HI;
@@ -2281,6 +2293,12 @@ const char* Rdna2OpcodeName(Rdna2Opcode op) noexcept {
         case Rdna2Opcode::V_FLOOR_F32:        return "v_floor_f32";
         case Rdna2Opcode::V_CEIL_F32:         return "v_ceil_f32";
         case Rdna2Opcode::V_FRACT_F32:        return "v_fract_f32";
+        case Rdna2Opcode::V_TRUNC_F32:        return "v_trunc_f32";
+        case Rdna2Opcode::V_RNDNE_F32:        return "v_rndne_f32";
+        case Rdna2Opcode::V_EXP_F32:          return "v_exp_f32";
+        case Rdna2Opcode::V_LOG_F32:          return "v_log_f32";
+        case Rdna2Opcode::V_SIN_F32:          return "v_sin_f32";
+        case Rdna2Opcode::V_COS_F32:          return "v_cos_f32";
         case Rdna2Opcode::V_CVT_NORM_I16_F16: return "v_cvt_norm_i16_f16";
         case Rdna2Opcode::V_CVT_NORM_U16_F16: return "v_cvt_norm_u16_f16";
         case Rdna2Opcode::V_SWAP_B32:         return "v_swap_b32";

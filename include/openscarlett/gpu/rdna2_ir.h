@@ -91,6 +91,12 @@ enum class IrOp : uint16_t {
     FFloor,
     FCeil,
     FFract,
+    FTrunc,
+    FRndne,
+    FExp2,
+    FLog2,
+    FSinCycles,
+    FCosCycles,
     FDot2,          // V_DOT2_F32_F16(a_packed, b_packed, c_f32)
 
     // Integer / bitwise arithmetic
@@ -309,6 +315,9 @@ struct Rdna2IrModule {
     bool uses_texture_load = false;
     bool uses_texture2d_mip_srv = false;
     bool uses_texture3d_srv = false;
+    uint32_t used_space2_tex_slots = 0u;
+    uint32_t used_space2_cbv_slots = 0u;
+    uint32_t used_space2_srv_slots = 0u;
     bool uses_texture_cube_srv = false;
     bool uses_texture_uav = false;
     bool uses_texture_u32_uav = false;

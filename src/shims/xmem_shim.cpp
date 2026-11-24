@@ -16,6 +16,7 @@
 #include <cstring>
 #include <mutex>
 #include <unordered_set>
+#include <vector>
 
 #if defined(_MSC_VER)
 // Export standard unprefixed Xbox xmem.dll symbols pointing to our thin
@@ -520,6 +521,87 @@ int32_t OPENSCARLETT_KERNELX_CALL XMemShim_XMemIsToolsMemAvailable(void) {
     return 0;
 }
 
+namespace {
+
+struct XMemWindowRange {
+    uint64_t base = 0ull;
+    uint64_t size = 0ull;
+};
+
+struct XMemGpuCpuAliasWindow {
+    uint64_t gpu_base = 0ull;
+    uint64_t cpu_base = 0ull;
+    uint64_t size = 0ull;
+};
+
+std::mutex& AliasWindowMutex() {
+    static std::mutex m;
+    return m;
+}
+
+std::vector<XMemWindowRange>& PendingCpuWindows() {
+    static std::vector<XMemWindowRange> v;
+    return v;
+}
+
+std::vector<XMemWindowRange>& PendingGpuWindows() {
+    static std::vector<XMemWindowRange> v;
+    return v;
+}
+
+std::vector<XMemGpuCpuAliasWindow>& PairedAliasWindows() {
+    static std::vector<XMemGpuCpuAliasWindow> v;
+    return v;
+}
+
+void RecordPotentialAliasWindow(void* ptr, size_t dwSize, uint32_t flProtect) noexcept {
+    constexpr size_t kMinPairedWindowBytes = 256ull * 1024ull * 1024ull;
+    if (!ptr || dwSize < kMinPairedWindowBytes) return;
+    const uint64_t base = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ptr));
+    const uint64_t size = static_cast<uint64_t>(dwSize);
+    const uint32_t low_prot = flProtect & 0xFFu;
+    const bool is_gpu_only = ((flProtect & 0x800u) != 0u) || (low_prot == 0x01u /*PAGE_NOACCESS*/);
+    const bool is_cpu_rw = !is_gpu_only && (low_prot == 0x04u /*PAGE_READWRITE*/);
+    if (!is_gpu_only && !is_cpu_rw) return;
+
+    std::lock_guard<std::mutex> lk(AliasWindowMutex());
+    if (is_gpu_only) {
+        auto& cpus = PendingCpuWindows();
+        for (auto it = cpus.rbegin(); it != cpus.rend(); ++it) {
+            if (it->size == size && it->base != base) {
+                PairedAliasWindows().push_back({base, it->base, size});
+                cpus.erase(std::next(it).base());
+                return;
+            }
+        }
+        PendingGpuWindows().push_back({base, size});
+    } else {
+        auto& gpus = PendingGpuWindows();
+        for (auto it = gpus.rbegin(); it != gpus.rend(); ++it) {
+            if (it->size == size && it->base != base) {
+                PairedAliasWindows().push_back({it->base, base, size});
+                gpus.erase(std::next(it).base());
+                return;
+            }
+        }
+        PendingCpuWindows().push_back({base, size});
+    }
+}
+
+}  // namespace
+
+extern "C" __declspec(dllexport) uint64_t OPENSCARLETT_KERNELX_CALL
+OpenScarlett_XMemResolveCpuAliasVa(uint64_t va) {
+    if (va == 0ull) return 0ull;
+    std::lock_guard<std::mutex> lk(AliasWindowMutex());
+    for (const auto& w : PairedAliasWindows()) {
+        if (va >= w.gpu_base && (va - w.gpu_base) < w.size) {
+            return w.cpu_base + (va - w.gpu_base);
+        }
+    }
+    return va;
+}
+
 void* OPENSCARLETT_KERNELX_CALL XMemShim_XMemVirtualAlloc(
     void* lpAddress,
     size_t dwSize,
@@ -528,6 +610,9 @@ void* OPENSCARLETT_KERNELX_CALL XMemShim_XMemVirtualAlloc(
     uint32_t flProtect) {
     (void)dwMemoryType;
     void* ptr = ::KernelXVirtualAllocFromApp(lpAddress, dwSize, flAllocationType, flProtect);
+    if (lpAddress == nullptr && ptr != nullptr) {
+        RecordPotentialAliasWindow(ptr, dwSize, flProtect);
+    }
     static const bool trace_xmem = []() {
 #if defined(_WIN32)
         char buf[16] = {};

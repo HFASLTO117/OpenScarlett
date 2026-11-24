@@ -24,3 +24,4 @@ EXPORTS
     XMemGetWorkingSetStatistics = XMemShim_XMemGetWorkingSetStatistics
     XMemTransferMemory = XMemShim_XMemTransferMemory
     XMemGetTelemetryCallCountForTest = XMemShim_GetTelemetryCallCountForTest
+    OpenScarlett_XMemResolveCpuAliasVa
