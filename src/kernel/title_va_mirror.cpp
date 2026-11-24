@@ -110,6 +110,10 @@ void TitleVAMirror::ReleaseEntryResources(RegionEntry& entry) noexcept {
         entry.readback_staging = nullptr;
     }
     if (entry.upload_staging) {
+        if (entry.mapped_upload_ptr) {
+            entry.upload_staging->Unmap(0u, nullptr);
+            entry.mapped_upload_ptr = nullptr;
+        }
         entry.upload_staging->Release();
         entry.upload_staging = nullptr;
     }
@@ -117,11 +121,41 @@ void TitleVAMirror::ReleaseEntryResources(RegionEntry& entry) noexcept {
         entry.gpu_shadow->Release();
         entry.gpu_shadow = nullptr;
     }
+    if (entry.d3d_device) {
+        entry.d3d_device->Release();
+        entry.d3d_device = nullptr;
+    }
     if (entry.owns_cpu_memory && entry.cpu_backing_ptr) {
         VirtualFree(entry.cpu_backing_ptr, 0, MEM_RELEASE);
         entry.cpu_backing_ptr = nullptr;
         entry.owns_cpu_memory = false;
     }
+}
+
+Status TitleVAMirror::EnsureReadbackStagingLocked(RegionEntry& entry) {
+    if (entry.readback_staging != nullptr) {
+        return Status::Ok();
+    }
+    if (entry.d3d_device == nullptr && entry.gpu_shadow != nullptr) {
+        (void)entry.gpu_shadow->GetDevice(
+            OS_UUIDOF(ID3D12Device), reinterpret_cast<void**>(&entry.d3d_device));
+    }
+    if (entry.d3d_device == nullptr) {
+        return Status::Error(StatusCode::DeviceError,
+                             "Title-VA region has no cached D3D12 device for lazy readback staging");
+    }
+    const HRESULT hr = CreateCommittedBuffer(
+        entry.d3d_device,
+        D3D12_HEAP_TYPE_READBACK,
+        entry.alloc_size_bytes,
+        D3D12_RESOURCE_FLAG_NONE,
+        D3D12_RESOURCE_STATE_COPY_DEST,
+        &entry.readback_staging);
+    if (FAILED(hr) || !entry.readback_staging) {
+        return Status::Error(StatusCode::DeviceError,
+                             "Failed to lazily create readback staging buffer for TitleVAMirror");
+    }
+    return Status::Ok();
 }
 
 ptrdiff_t TitleVAMirror::FindRegionIndexLocked(uint64_t title_va) const noexcept {
@@ -216,10 +250,21 @@ Status TitleVAMirror::RegisterRegion(const TitleVaMappingDesc& desc,
                          ? desc.title_va
                          : reinterpret_cast<uint64_t>(entry.cpu_backing_ptr);
 
-    // Step 2: Attach or create PC GPU shadow + staging resources.
+    // Step 2: Attach or create PC GPU shadow + persistently mapped upload staging resource.
+    // Note: readback_staging is intentionally NOT allocated upfront; it is created lazily on
+    // first ScheduleGpuReadback() to avoid doubling host system RAM commit for upload-only buffers.
+    if (device != nullptr) {
+        entry.d3d_device = device;
+        entry.d3d_device->AddRef();
+    }
+
     if (desc.gpu_shadow_resource != nullptr) {
         entry.gpu_shadow = desc.gpu_shadow_resource;
         entry.gpu_shadow->AddRef();
+        if (entry.d3d_device == nullptr) {
+            (void)entry.gpu_shadow->GetDevice(
+                OS_UUIDOF(ID3D12Device), reinterpret_cast<void**>(&entry.d3d_device));
+        }
         const D3D12_RESOURCE_DESC rdesc = entry.gpu_shadow->GetDesc();
         if (desc.pc_gpu_va != 0ull) {
             entry.pc_gpu_va = desc.pc_gpu_va;
@@ -256,22 +301,18 @@ Status TitleVAMirror::RegisterRegion(const TitleVaMappingDesc& desc,
             D3D12_RESOURCE_FLAG_NONE,
             D3D12_RESOURCE_STATE_GENERIC_READ,
             &entry.upload_staging);
-        if (FAILED(hr)) {
+        if (FAILED(hr) || !entry.upload_staging) {
             ReleaseEntryResources(entry);
             return Status::Error(StatusCode::DeviceError,
                                  "Failed to create upload staging buffer for TitleVAMirror");
         }
-        hr = CreateCommittedBuffer(
-            device,
-            D3D12_HEAP_TYPE_READBACK,
-            entry.alloc_size_bytes,
-            D3D12_RESOURCE_FLAG_NONE,
-            D3D12_RESOURCE_STATE_COPY_DEST,
-            &entry.readback_staging);
-        if (FAILED(hr)) {
+        const D3D12_RANGE empty_read{0, 0};
+        hr = entry.upload_staging->Map(
+            0u, &empty_read, reinterpret_cast<void**>(&entry.mapped_upload_ptr));
+        if (FAILED(hr) || !entry.mapped_upload_ptr) {
             ReleaseEntryResources(entry);
             return Status::Error(StatusCode::DeviceError,
-                                 "Failed to create readback staging buffer for TitleVAMirror");
+                                 "Failed to persistently map upload staging buffer for TitleVAMirror");
         }
     }
 
@@ -459,43 +500,125 @@ Status TitleVAMirror::QueryDirtyLocked(RegionEntry& entry,
     }
 
     const DWORD flags = reset_watch ? WRITE_WATCH_FLAG_RESET : 0u;
-    std::vector<void*> dirty_addrs;
-    std::vector<void*> batch(static_cast<size_t>(std::max<uint64_t>(total_pages + 16ull, 64ull)));
-
     const uintptr_t base_addr = reinterpret_cast<uintptr_t>(entry.cpu_backing_ptr);
     const uintptr_t end_addr = base_addr + static_cast<uintptr_t>(entry.alloc_size_bytes);
     DWORD granularity = static_cast<DWORD>(page_size_bytes_);
 
+    // Fast path: probe with a fixed stack buffer first so clean or lightly-dirty regions
+    // (0..511 dirty pages) incur zero CRT heap allocations per GPU submit.
+    constexpr size_t kStackBatchCap = 512u;
+    void* stack_batch[kStackBatchCap];
+    ULONG_PTR first_count = static_cast<ULONG_PTR>(kStackBatchCap);
+    const UINT first_rc = GetWriteWatch(
+        flags,
+        entry.cpu_backing_ptr,
+        static_cast<SIZE_T>(entry.alloc_size_bytes),
+        stack_batch,
+        &first_count,
+        &granularity);
+    if (first_rc != 0u) {
+        return Status::Error(StatusCode::DeviceError, "Win32 GetWriteWatch failed");
+    }
+
+    const uint64_t gran = granularity ? static_cast<uint64_t>(granularity) : page_size_bytes_;
+    if (first_count == 0u) {
+        out_dirty_pages = 0ull;
+        out_clean_pages = total_pages;
+        return Status::Ok();
+    }
+
+    auto coalesce_sorted_unique = [&](void* const* addrs, size_t n) {
+        out_dirty_pages = static_cast<uint64_t>(n);
+        out_clean_pages = (total_pages >= out_dirty_pages) ? (total_pages - out_dirty_pages) : 0ull;
+        for (size_t i = 0; i < n; ++i) {
+            const uintptr_t addr = reinterpret_cast<uintptr_t>(addrs[i]);
+            if (addr < base_addr || addr >= end_addr) continue;
+            const uint64_t raw_off = static_cast<uint64_t>(addr - base_addr);
+            if (raw_off >= entry.size_bytes) continue;
+            const uint64_t page_len = std::min<uint64_t>(gran, entry.size_bytes - raw_off);
+            if (!out_ranges.empty() &&
+                out_ranges.back().offset + out_ranges.back().size == raw_off) {
+                out_ranges.back().size += page_len;
+            } else {
+                out_ranges.push_back(DirtyPageRange{raw_off, page_len});
+            }
+        }
+    };
+
+    if (first_count < static_cast<ULONG_PTR>(kStackBatchCap)) {
+        size_t valid_n = 0u;
+        bool strictly_sorted = true;
+        uintptr_t prev_addr = 0u;
+        for (ULONG_PTR i = 0; i < first_count; ++i) {
+            const uintptr_t addr = reinterpret_cast<uintptr_t>(stack_batch[i]);
+            if (addr >= base_addr && addr < end_addr) {
+                if (valid_n > 0u && addr <= prev_addr) {
+                    strictly_sorted = false;
+                }
+                prev_addr = addr;
+                stack_batch[valid_n++] = stack_batch[i];
+            }
+        }
+        if (valid_n == 0u) {
+            out_dirty_pages = 0ull;
+            out_clean_pages = total_pages;
+            return Status::Ok();
+        }
+        if (!strictly_sorted) {
+            std::sort(stack_batch, stack_batch + valid_n);
+            valid_n = static_cast<size_t>(
+                std::unique(stack_batch, stack_batch + valid_n) - stack_batch);
+        }
+        coalesce_sorted_unique(stack_batch, valid_n);
+        return Status::Ok();
+    }
+
+    // Large dirty burst (>= 512 dirty pages): drain remaining pages using reusable watch_scratch_.
+    std::vector<void*> dirty_addrs;
+    const size_t target_batch = static_cast<size_t>(
+        std::min<uint64_t>(std::max<uint64_t>(total_pages + 16ull, 1024ull),
+                           reset_watch ? 65536ull : (total_pages + 16ull)));
+    if (watch_scratch_.size() < target_batch) {
+        watch_scratch_.resize(target_batch);
+    }
+
+    if (reset_watch) {
+        dirty_addrs.reserve(static_cast<size_t>(first_count) * 2u);
+        for (ULONG_PTR i = 0; i < first_count; ++i) {
+            const uintptr_t addr = reinterpret_cast<uintptr_t>(stack_batch[i]);
+            if (addr >= base_addr && addr < end_addr) {
+                dirty_addrs.push_back(stack_batch[i]);
+            }
+        }
+    }
+
     for (;;) {
-        ULONG_PTR count = static_cast<ULONG_PTR>(batch.size());
+        ULONG_PTR count = static_cast<ULONG_PTR>(watch_scratch_.size());
         const UINT rc = GetWriteWatch(
             flags,
             entry.cpu_backing_ptr,
             static_cast<SIZE_T>(entry.alloc_size_bytes),
-            batch.data(),
+            watch_scratch_.data(),
             &count,
             &granularity);
         if (rc != 0u) {
             return Status::Error(StatusCode::DeviceError, "Win32 GetWriteWatch failed");
         }
         for (ULONG_PTR i = 0; i < count; ++i) {
-            const uintptr_t addr = reinterpret_cast<uintptr_t>(batch[i]);
+            const uintptr_t addr = reinterpret_cast<uintptr_t>(watch_scratch_[i]);
             if (addr >= base_addr && addr < end_addr) {
-                dirty_addrs.push_back(batch[i]);
+                dirty_addrs.push_back(watch_scratch_[i]);
             }
         }
-        // If reset_watch is false, GetWriteWatch does not drain pages on retry, so stop after
-        // one pass (and grow batch if it filled completely).
-        if (count < static_cast<ULONG_PTR>(batch.size())) {
+        if (count < static_cast<ULONG_PTR>(watch_scratch_.size())) {
             break;
         }
         if (!reset_watch) {
             dirty_addrs.clear();
-            batch.resize(batch.size() * 2u);
+            watch_scratch_.resize(watch_scratch_.size() * 2u);
         }
     }
 
-    const uint64_t gran = granularity ? static_cast<uint64_t>(granularity) : page_size_bytes_;
     if (dirty_addrs.empty()) {
         out_dirty_pages = 0ull;
         out_clean_pages = total_pages;
@@ -504,23 +627,7 @@ Status TitleVAMirror::QueryDirtyLocked(RegionEntry& entry,
 
     std::sort(dirty_addrs.begin(), dirty_addrs.end());
     dirty_addrs.erase(std::unique(dirty_addrs.begin(), dirty_addrs.end()), dirty_addrs.end());
-
-    out_dirty_pages = static_cast<uint64_t>(dirty_addrs.size());
-    out_clean_pages = (total_pages >= out_dirty_pages) ? (total_pages - out_dirty_pages) : 0ull;
-
-    // Coalesce contiguous dirty page runs into minimal copy ranges clamped to entry.size_bytes.
-    for (void* p : dirty_addrs) {
-        const uint64_t raw_off =
-            static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p) - base_addr);
-        if (raw_off >= entry.size_bytes) continue;
-        const uint64_t page_len = std::min<uint64_t>(gran, entry.size_bytes - raw_off);
-        if (!out_ranges.empty() &&
-            out_ranges.back().offset + out_ranges.back().size == raw_off) {
-            out_ranges.back().size += page_len;
-        } else {
-            out_ranges.push_back(DirtyPageRange{raw_off, page_len});
-        }
-    }
+    coalesce_sorted_unique(dirty_addrs.data(), dirty_addrs.size());
     return Status::Ok();
 }
 
@@ -568,23 +675,20 @@ Status TitleVAMirror::FlushDirtyPagesToGpu(ID3D12GraphicsCommandList* cmd_list,
     std::unique_lock<std::shared_mutex> lock(mutex_);
 
     FlushStats local_stats{};
-    std::vector<size_t> target_indices;
-    if (title_va_or_zero_for_all == 0ull) {
-        target_indices.reserve(regions_.size());
-        for (size_t i = 0; i < regions_.size(); ++i) {
-            target_indices.push_back(i);
-        }
-    } else {
+    size_t begin_idx = 0u;
+    size_t end_idx = regions_.size();
+    if (title_va_or_zero_for_all != 0ull) {
         const ptrdiff_t idx = FindRegionIndexLocked(title_va_or_zero_for_all);
         if (idx < 0) {
             return Status::Error(StatusCode::NotFound,
                                  "TitleVAMirror::FlushDirtyPagesToGpu region not found");
         }
-        target_indices.push_back(static_cast<size_t>(idx));
+        begin_idx = static_cast<size_t>(idx);
+        end_idx = begin_idx + 1u;
     }
 
     std::vector<DirtyPageRange> ranges;
-    for (const size_t idx : target_indices) {
+    for (size_t idx = begin_idx; idx < end_idx; ++idx) {
         RegionEntry& entry = regions_[idx];
         ++local_stats.regions_inspected;
 
@@ -612,23 +716,27 @@ Status TitleVAMirror::FlushDirtyPagesToGpu(ID3D12GraphicsCommandList* cmd_list,
         uint64_t region_bytes = 0ull;
         for (const auto& r : ranges) {
             region_bytes += r.size;
-            local_stats.flushed_ranges.push_back(r);
+            if (out_stats != nullptr) {
+                local_stats.flushed_ranges.push_back(r);
+            }
         }
 
         if (entry.upload_staging != nullptr && entry.cpu_backing_ptr != nullptr) {
-            uint8_t* upload_ptr = nullptr;
-            const D3D12_RANGE empty_read{0, 0};
-            const HRESULT hr = entry.upload_staging->Map(
-                0u, &empty_read, reinterpret_cast<void**>(&upload_ptr));
-            if (FAILED(hr) || !upload_ptr) {
-                return Status::Error(StatusCode::DeviceError,
-                                     "Failed to map TitleVAMirror upload staging buffer");
+            if (entry.mapped_upload_ptr == nullptr) {
+                const D3D12_RANGE empty_read{0, 0};
+                const HRESULT hr = entry.upload_staging->Map(
+                    0u, &empty_read, reinterpret_cast<void**>(&entry.mapped_upload_ptr));
+                if (FAILED(hr) || !entry.mapped_upload_ptr) {
+                    return Status::Error(StatusCode::DeviceError,
+                                         "Failed to map TitleVAMirror upload staging buffer");
+                }
             }
             const auto* cpu_bytes = static_cast<const uint8_t*>(entry.cpu_backing_ptr);
             for (const auto& r : ranges) {
-                std::memcpy(upload_ptr + r.offset, cpu_bytes + r.offset, static_cast<size_t>(r.size));
+                std::memcpy(entry.mapped_upload_ptr + r.offset,
+                            cpu_bytes + r.offset,
+                            static_cast<size_t>(r.size));
             }
-            entry.upload_staging->Unmap(0u, nullptr);
         }
 
         if (cmd_list != nullptr && entry.gpu_shadow != nullptr &&
@@ -673,9 +781,9 @@ Status TitleVAMirror::ScheduleGpuReadback(ID3D12GraphicsCommandList* cmd_list,
     }
 
     RegionEntry& entry = regions_[static_cast<size_t>(idx)];
-    if (!entry.gpu_shadow || !entry.readback_staging) {
+    if (!entry.gpu_shadow || entry.kind != TitleVaResourceKind::Buffer) {
         return Status::Error(StatusCode::DeviceError,
-                             "Title-VA region has no GPU shadow or readback staging buffer");
+                             "Title-VA region has no GPU shadow buffer for readback");
     }
 
     const uint64_t base_off = (title_va - entry.title_va) + offset;
@@ -686,6 +794,11 @@ Status TitleVAMirror::ScheduleGpuReadback(ID3D12GraphicsCommandList* cmd_list,
         (size_bytes == 0ull) ? (entry.size_bytes - base_off) : size_bytes;
     if (copy_len == 0ull || base_off + copy_len > entry.size_bytes) {
         return Status::Error(StatusCode::InvalidArgument, "Readback range exceeds region bounds");
+    }
+
+    const Status rbst = EnsureReadbackStagingLocked(entry);
+    if (!rbst.ok()) {
+        return rbst;
     }
 
     EmitTransitionBarrier(
@@ -839,6 +952,20 @@ bool TitleVAMirror::LookupRegion(uint64_t title_va, TitleVaRegionInfo& out_info)
     out_info.pc_gpu_va = entry.pc_gpu_va;
     out_info.current_state = entry.current_state;
     return true;
+}
+
+bool TitleVAMirror::HasPersistentUploadMapping(uint64_t title_va) const noexcept {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    const ptrdiff_t idx = FindRegionIndexLocked(title_va);
+    if (idx < 0) return false;
+    return regions_[static_cast<size_t>(idx)].mapped_upload_ptr != nullptr;
+}
+
+bool TitleVAMirror::HasReadbackStaging(uint64_t title_va) const noexcept {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    const ptrdiff_t idx = FindRegionIndexLocked(title_va);
+    if (idx < 0) return false;
+    return regions_[static_cast<size_t>(idx)].readback_staging != nullptr;
 }
 
 TitleVaMirrorStats TitleVAMirror::GetStats() const {

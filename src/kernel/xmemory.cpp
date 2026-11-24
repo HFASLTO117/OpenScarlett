@@ -1,8 +1,12 @@
 #include "openscarlett/kernel/xmemory.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
+#include <string>
+#include <unordered_set>
 
 #if defined(_WIN32)
 #include <malloc.h>
@@ -17,25 +21,17 @@ size_t AlignUp(size_t value, size_t alignment) {
     return (value + alignment - 1u) & ~(alignment - 1u);
 }
 
-void* AllocAligned(size_t size, size_t alignment) {
 #if defined(_WIN32)
-    return _aligned_malloc(size, alignment);
-#else
-    void* ptr = nullptr;
-    if (posix_memalign(&ptr, alignment, size) != 0) {
-        return nullptr;
-    }
-    return ptr;
-#endif
+std::mutex& VirtualBlockSetMutex() {
+    static std::mutex m;
+    return m;
 }
 
-void FreeAligned(void* ptr) {
-#if defined(_WIN32)
-    _aligned_free(ptr);
-#else
-    std::free(ptr);
-#endif
+std::unordered_set<void*>& VirtualBlockSet() {
+    static std::unordered_set<void*> s;
+    return s;
 }
+#endif
 
 #if defined(_WIN32)
 constexpr DWORD kMemCoalescePlaceholders = 0x00000001u;
@@ -105,7 +101,204 @@ DWORD ToWin32Protect(MemoryProtection prot) {
         default: return PAGE_READWRITE;
     }
 }
+
+bool IsPathOnCDriveW(const std::wstring& path) noexcept {
+    if (path.size() >= 2u && path[1] == L':') {
+        return path[0] == L'C' || path[0] == L'c';
+    }
+    if (path.size() >= 6u &&
+        (path.compare(0u, 4u, L"\\\\?\\") == 0 || path.compare(0u, 4u, L"\\??\\") == 0) &&
+        path[5] == L':') {
+        return path[4] == L'C' || path[4] == L'c';
+    }
+    return false;
+}
+
+std::wstring ResolveXMemorySparseTempDir() {
+    wchar_t env_buf[MAX_PATH * 2]{};
+    const DWORD env_len = GetEnvironmentVariableW(
+        L"OPENSCARLETT_TMP_DIR", env_buf, static_cast<DWORD>(sizeof(env_buf) / sizeof(wchar_t)));
+    if (env_len > 0u && env_len < (sizeof(env_buf) / sizeof(wchar_t))) {
+        std::wstring custom(env_buf, env_len);
+        if (!IsPathOnCDriveW(custom)) {
+            CreateDirectoryW(custom.c_str(), nullptr);
+            return custom;
+        }
+    }
+
+    const UINT e_type = GetDriveTypeW(L"E:\\");
+    if (e_type != DRIVE_NO_ROOT_DIR && e_type != DRIVE_UNKNOWN) {
+        CreateDirectoryW(L"E:\\OpenScarlett", nullptr);
+        const std::wstring e_tmp = L"E:\\OpenScarlett\\.tmp";
+        if (CreateDirectoryW(e_tmp.c_str(), nullptr) || GetLastError() == ERROR_ALREADY_EXISTS) {
+            return e_tmp;
+        }
+    }
+
+    HMODULE self_mod = nullptr;
+    wchar_t dir_buf[MAX_PATH * 2]{};
+    if (GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&UnifiedMemoryManager::SupportsOsPlaceholders),
+            &self_mod) &&
+        self_mod) {
+        const DWORD n = GetModuleFileNameW(
+            self_mod, dir_buf, static_cast<DWORD>(sizeof(dir_buf) / sizeof(wchar_t)));
+        if (n > 0u && n < (sizeof(dir_buf) / sizeof(wchar_t))) {
+            std::wstring p(dir_buf, n);
+            const size_t sl = p.find_last_of(L"\\/");
+            if (sl != std::wstring::npos) {
+                std::wstring candidate = p.substr(0u, sl) + L"\\.tmp";
+                if (!IsPathOnCDriveW(candidate)) {
+                    CreateDirectoryW(candidate.c_str(), nullptr);
+                    return candidate;
+                }
+            }
+        }
+    }
+    return {};
+}
+
+bool ShouldForceSparseSection(size_t aligned_size) noexcept {
+    char force_buf[16]{};
+    const DWORD flen = GetEnvironmentVariableA(
+        "OPENSCARLETT_FORCE_SPARSE_COMMIT", force_buf, static_cast<DWORD>(sizeof(force_buf)));
+    if (flen > 0u && force_buf[0] != '0') {
+        return true;
+    }
+    if (aligned_size >= (32ull * 1024ull * 1024ull)) {
+        MEMORYSTATUSEX ms{};
+        ms.dwLength = sizeof(ms);
+        if (GlobalMemoryStatusEx(&ms) &&
+            ms.ullAvailPageFile <
+                static_cast<DWORDLONG>(aligned_size) + (2ull * 1024ull * 1024ull * 1024ull)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+HANDLE CreateSparseBackedSection(size_t aligned_size) noexcept {
+    const std::wstring backing_dir = ResolveXMemorySparseTempDir();
+    if (backing_dir.empty()) {
+        return nullptr;
+    }
+    static std::atomic<uint64_t> s_phys_sparse_seq{1};
+    const uint64_t seq = s_phys_sparse_seq.fetch_add(1u, std::memory_order_relaxed);
+    wchar_t file_path[MAX_PATH * 2]{};
+    std::swprintf(file_path,
+                  sizeof(file_path) / sizeof(wchar_t),
+                  L"%ls\\xphys_%lu_%llu.bin",
+                  backing_dir.c_str(),
+                  static_cast<unsigned long>(GetCurrentProcessId()),
+                  static_cast<unsigned long long>(seq));
+    HANDLE hf = CreateFileW(
+        file_path,
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+        nullptr);
+    if (hf == INVALID_HANDLE_VALUE) {
+        return nullptr;
+    }
+    constexpr DWORD kFsctlSetSparse = 0x000900C4u;
+    DWORD bytes_ret = 0;
+    (void)DeviceIoControl(hf, kFsctlSetSparse, nullptr, 0, nullptr, 0, &bytes_ret, nullptr);
+    LARGE_INTEGER li{};
+    li.QuadPart = static_cast<LONGLONG>(aligned_size);
+    HANDLE section = nullptr;
+    if (SetFilePointerEx(hf, li, nullptr, FILE_BEGIN) && SetEndOfFile(hf)) {
+        const DWORD hi = static_cast<DWORD>((static_cast<uint64_t>(aligned_size) >> 32) & 0xFFFFFFFFull);
+        const DWORD lo = static_cast<DWORD>(static_cast<uint64_t>(aligned_size) & 0xFFFFFFFFull);
+        section = CreateFileMappingW(hf, nullptr, PAGE_READWRITE, hi, lo, nullptr);
+    }
+    CloseHandle(hf);
+    return section;
+}
 #endif
+
+void* AllocAligned(size_t size, size_t alignment, bool& out_zeroed_by_os) {
+    out_zeroed_by_os = false;
+#if defined(_WIN32)
+    const size_t v_size = AlignUp(size, 4096u);
+    void* v_ptr = nullptr;
+    if (alignment > 65536u && PlaceholderApi().virtual_alloc2 != nullptr) {
+        OsMemAddressRequirements addr_req{};
+        addr_req.lowest_starting_address = nullptr;
+        addr_req.highest_ending_address = nullptr;
+        addr_req.alignment = alignment;
+
+        OsMemExtendedParameter ext{};
+        ext.type_and_reserved = 1ull;  // MemExtendedParameterAddressRequirements
+        ext.value.pointer = &addr_req;
+
+        v_ptr = PlaceholderApi().virtual_alloc2(
+            GetCurrentProcess(),
+            nullptr,
+            v_size,
+            MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
+            PAGE_READWRITE,
+            &ext,
+            1u);
+        if (!v_ptr) {
+            v_ptr = PlaceholderApi().virtual_alloc2(
+                GetCurrentProcess(),
+                nullptr,
+                v_size,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+                &ext,
+                1u);
+        }
+    } else if (alignment <= 65536u) {
+        v_ptr = VirtualAlloc(
+            nullptr, v_size, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
+        if (!v_ptr) {
+            v_ptr = VirtualAlloc(nullptr, v_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        }
+    }
+    if (v_ptr) {
+        (void)ResetWriteWatch(v_ptr, v_size);
+        {
+            std::lock_guard<std::mutex> lk(VirtualBlockSetMutex());
+            VirtualBlockSet().insert(v_ptr);
+        }
+        out_zeroed_by_os = true;
+        return v_ptr;
+    }
+    return _aligned_malloc(size, alignment);
+#else
+    void* ptr = nullptr;
+    if (posix_memalign(&ptr, alignment, size) != 0) {
+        return nullptr;
+    }
+    return ptr;
+#endif
+}
+
+void FreeAligned(void* ptr) {
+    if (!ptr) return;
+#if defined(_WIN32)
+    bool was_virtual = false;
+    {
+        std::lock_guard<std::mutex> lk(VirtualBlockSetMutex());
+        auto it = VirtualBlockSet().find(ptr);
+        if (it != VirtualBlockSet().end()) {
+            VirtualBlockSet().erase(it);
+            was_virtual = true;
+        }
+    }
+    if (was_virtual) {
+        VirtualFree(ptr, 0, MEM_RELEASE);
+        return;
+    }
+    _aligned_free(ptr);
+#else
+    std::free(ptr);
+#endif
+}
 
 }  // namespace
 
@@ -173,11 +366,14 @@ Status UnifiedMemoryManager::Allocate(size_t size,
 
     const size_t alignment = static_cast<size_t>(page_size);
     const size_t aligned_size = AlignUp(size, alignment);
-    void* mem = AllocAligned(aligned_size, alignment);
+    bool zeroed_by_os = false;
+    void* mem = AllocAligned(aligned_size, alignment, zeroed_by_os);
     if (!mem) {
         return Status::Error(StatusCode::OutOfMemory, "Unified memory allocation failed");
     }
-    std::memset(mem, 0, aligned_size);
+    if (!zeroed_by_os) {
+        std::memset(mem, 0, aligned_size);
+    }
 
     std::lock_guard<std::mutex> lock(mutex_);
     const GpuVirtualAddress va = AlignUp(static_cast<size_t>(next_gpu_va_), alignment);
@@ -257,69 +453,19 @@ Status UnifiedMemoryManager::AllocatePhysicalPages(size_t size,
 #if defined(_WIN32)
     const DWORD hi = static_cast<DWORD>((static_cast<uint64_t>(aligned_size) >> 32) & 0xFFFFFFFFull);
     const DWORD lo = static_cast<DWORD>(static_cast<uint64_t>(aligned_size) & 0xFFFFFFFFull);
-    bool prefer_sparse = false;
-    if (aligned_size >= (64ull * 1024ull * 1024ull)) {
-        MEMORYSTATUSEX ms{};
-        ms.dwLength = sizeof(ms);
-        if (GlobalMemoryStatusEx(&ms) &&
-            ms.ullAvailPageFile < static_cast<DWORDLONG>(aligned_size) + (2ull * 1024ull * 1024ull * 1024ull)) {
-            prefer_sparse = true;
-        }
-    }
+    const bool prefer_sparse = ShouldForceSparseSection(aligned_size);
     HANDLE section = prefer_sparse
                          ? nullptr
                          : CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, hi, lo, nullptr);
     if (!section) {
-        // Fallback when Windows pagefile commit limit is exhausted on 8-16 GiB hosts:
-        // back the section with an NTFS sparse file (FSCTL_SET_SPARSE + FILE_FLAG_DELETE_ON_CLOSE)
-        // placed beside the OpenScarlett DLL so MapViewOfFile3(MEM_REPLACE_PLACEHOLDER) still works
-        // natively with zero commit charge and zero disk blocks for untouched pages.
-        HMODULE self_mod = nullptr;
-        wchar_t dir_buf[MAX_PATH * 2]{};
-        std::wstring backing_dir;
-        if (GetModuleHandleExW(
-                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                reinterpret_cast<LPCWSTR>(&UnifiedMemoryManager::SupportsOsPlaceholders),
-                &self_mod) && self_mod) {
-            const DWORD n = GetModuleFileNameW(self_mod, dir_buf, static_cast<DWORD>(sizeof(dir_buf) / sizeof(wchar_t)));
-            if (n > 0u && n < (sizeof(dir_buf) / sizeof(wchar_t))) {
-                std::wstring p(dir_buf, n);
-                const size_t sl = p.find_last_of(L"\\/");
-                if (sl != std::wstring::npos) {
-                    backing_dir = p.substr(0, sl) + L"\\.xmem_sparse";
-                }
-            }
-        }
-        if (!backing_dir.empty()) {
-            CreateDirectoryW(backing_dir.c_str(), nullptr);
-            static std::atomic<uint64_t> s_phys_sparse_seq{1};
-            const uint64_t seq = s_phys_sparse_seq.fetch_add(1, std::memory_order_relaxed);
-            wchar_t file_path[MAX_PATH * 2]{};
-            std::swprintf(file_path, sizeof(file_path) / sizeof(wchar_t),
-                          L"%ls\\xphys_%lu_%llu.bin",
-                          backing_dir.c_str(),
-                          static_cast<unsigned long>(GetCurrentProcessId()),
-                          static_cast<unsigned long long>(seq));
-            HANDLE hf = CreateFileW(
-                file_path,
-                GENERIC_READ | GENERIC_WRITE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                nullptr,
-                CREATE_ALWAYS,
-                FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
-                nullptr);
-            if (hf != INVALID_HANDLE_VALUE) {
-                constexpr DWORD kFsctlSetSparse = 0x000900C4u;
-                DWORD bytes_ret = 0;
-                (void)DeviceIoControl(hf, kFsctlSetSparse, nullptr, 0, nullptr, 0, &bytes_ret, nullptr);
-                LARGE_INTEGER li{};
-                li.QuadPart = static_cast<LONGLONG>(aligned_size);
-                if (SetFilePointerEx(hf, li, nullptr, FILE_BEGIN) && SetEndOfFile(hf)) {
-                    section = CreateFileMappingW(hf, nullptr, PAGE_READWRITE, hi, lo, nullptr);
-                }
-                CloseHandle(hf);
-            }
-        }
+        // Fallback when Windows pagefile commit limit is tight on 8-16 GiB hosts:
+        // back the section with an NTFS sparse file on E:\OpenScarlett\.tmp (never C:\)
+        // so MapViewOfFile3(MEM_REPLACE_PLACEHOLDER) works natively with zero commit charge
+        // and zero disk blocks for untouched pages.
+        section = CreateSparseBackedSection(aligned_size);
+    }
+    if (!section && prefer_sparse) {
+        section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, hi, lo, nullptr);
     }
     if (!section) {
         return Status::Error(StatusCode::OutOfMemory, "CreateFileMappingW failed for physical page pool");

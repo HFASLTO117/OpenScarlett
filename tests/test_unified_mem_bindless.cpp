@@ -344,6 +344,8 @@ void RunTitleVaMirrorLiveTest(D3D12TestContext& ctx) {
     OS_REQUIRE(reg.write_watch_enabled);
     OS_REQUIRE(reg.gpu_shadow_resource != nullptr);
     OS_REQUIRE(reg.pc_gpu_va != 0ull);
+    OS_REQUIRE(mirror.HasPersistentUploadMapping(kTitleVaBase));
+    OS_REQUIRE(!mirror.HasReadbackStaging(kTitleVaBase));
 
     // 1B. Register an existing caller-allocated MEM_WRITE_WATCH region to test coalescing & lookup.
     constexpr uint64_t kCoalesceBytes = 64ull * 1024ull;
@@ -362,6 +364,8 @@ void RunTitleVaMirrorLiveTest(D3D12TestContext& ctx) {
     OS_REQUIRE(mirror.RegisterRegion(ext_desc, ctx.device.Get(), ext_reg).ok());
     OS_REQUIRE(ext_reg.write_watch_enabled);
     OS_REQUIRE(!ext_reg.owns_cpu_memory);
+    OS_REQUIRE(mirror.HasPersistentUploadMapping(kCoalesceTitleVa));
+    OS_REQUIRE(!mirror.HasReadbackStaging(kCoalesceTitleVa));
 
     // Verify fast O(log N) ResolveTitleVa lookup (exact base, interior offset, and miss).
     uint64_t resolved_gpu_va = 0ull;
@@ -506,8 +510,11 @@ void RunTitleVaMirrorLiveTest(D3D12TestContext& ctx) {
     ctx.cmd->ResourceBarrier(1u, &uav_barrier);
 
     // 1F. Schedule GPU readback tagged with next fence value, submit, and complete readback!
+    OS_REQUIRE(!mirror.HasReadbackStaging(kTitleVaBase));
     const uint64_t expected_fence = ctx.fence_val + 1ull;
     OS_REQUIRE(mirror.ScheduleGpuReadback(ctx.cmd.Get(), kTitleVaBase, expected_fence).ok());
+    OS_REQUIRE(mirror.HasReadbackStaging(kTitleVaBase));
+    OS_REQUIRE(!mirror.HasReadbackStaging(kCoalesceTitleVa));
 
     uint64_t completed_fence = 0ull;
     OS_REQUIRE(ctx.SubmitAndWait(completed_fence));
