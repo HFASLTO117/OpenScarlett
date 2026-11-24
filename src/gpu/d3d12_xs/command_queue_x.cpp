@@ -1773,14 +1773,61 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
                 tmp_fence->Release();
             }
             const HRESULT rem_hr = device_x_->HostDevice()->GetDeviceRemovedReason();
+            static const bool dump_dbg_iq = []() {
+                char v[16]{};
+                return ::GetEnvironmentVariableA("OPENSCARLETT_ENABLE_D3D12_DEBUG", v, sizeof(v)) > 0 && v[0] == '1';
+            }();
+            if (dump_dbg_iq) {
+                static std::atomic<uint32_t> s_iq_printed{0u};
+                ID3D12InfoQueue* iq = nullptr;
+                if (s_iq_printed.load(std::memory_order_relaxed) < 80u &&
+                    SUCCEEDED(device_x_->HostDevice()->QueryInterface(IID_PPV_ARGS(&iq))) && iq) {
+                    const UINT64 nmsg = iq->GetNumStoredMessagesAllowedByRetrievalFilter();
+                    for (UINT64 mi = 0u; mi < nmsg && s_iq_printed.load(std::memory_order_relaxed) < 80u; ++mi) {
+                        SIZE_T len = 0u;
+                        iq->GetMessage(mi, nullptr, &len);
+                        if (len > 0u) {
+                            std::vector<uint8_t> mb(len);
+                            auto* msg = reinterpret_cast<D3D12_MESSAGE*>(mb.data());
+                            if (SUCCEEDED(iq->GetMessage(mi, msg, &len)) && msg->pDescription &&
+                                msg->Severity <= D3D12_MESSAGE_SEVERITY_WARNING) {
+                                s_iq_printed.fetch_add(1u, std::memory_order_relaxed);
+                                std::fprintf(stderr, "[D3D12-DBG sev=%d id=%d] %s\n",
+                                             static_cast<int>(msg->Severity),
+                                             static_cast<int>(msg->ID),
+                                             msg->pDescription);
+                            }
+                        }
+                    }
+                    iq->ClearStoredMessages();
+                    iq->Release();
+                    std::fflush(stderr);
+                }
+            }
             static const bool dump_all_ops = []() {
                 char v[16]{};
                 return ::GetEnvironmentVariableA("OPENSCARLETT_DUMP_CL_OPS", v, sizeof(v)) > 0 && v[0] == '1';
             }();
             static std::atomic<uint32_t> s_dump_exec_count{0u};
+            static std::atomic<uint32_t> s_dump_dii_count{0u};
             if (dump_all_ops) {
                 const uint32_t seq = s_dump_exec_count.fetch_add(1u, std::memory_order_relaxed);
-                if (seq < 25u) {
+                bool has_dii = false;
+                if (seq >= 25u && s_dump_dii_count.load(std::memory_order_relaxed) < 4u) {
+                    for (UINT i = 0; i < NumCommandLists && !has_dii; ++i) {
+                        if (CommandListX* clx = CommandListX::TryFromCommandList(ppCommandLists[i])) {
+                            const auto ops = clx->CopyDiagOps();
+                            for (const auto& op : ops) {
+                                if (op.find("DrawIndexedInstanced") != std::string::npos) {
+                                    has_dii = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                const bool dump_now = (seq < 5u) || (has_dii && s_dump_dii_count.fetch_add(1u, std::memory_order_relaxed) < 4u);
+                if (dump_now) {
                     std::lock_guard<std::mutex> dlk(s_diag_mu);
                     FILE* f = nullptr;
                     if (::fopen_s(&f, CommandListX::DiagTraceLogPath(), "a") == 0 && f) {
@@ -3232,7 +3279,10 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
 
     const uint32_t width = static_cast<uint32_t>(src_desc.Width);
     const uint32_t height = src_desc.Height;
-    const D3D12_RESOURCE_STATES caller_state = pPlaneParameters[0].ResourceState;
+    const D3D12_RESOURCE_STATES caller_state =
+        (device_x_ && device_x_->IsRetailScarlettAbi())
+            ? device_x_->GetRetailResourceState(src_tex, pPlaneParameters[0].ResourceState)
+            : pPlaneParameters[0].ResourceState;
 
     // Ensure window subclass is active and pump pending Win32 messages WITHOUT holding present_mutex_.
     const bool force_headless = EnvFlagTrueA("OPENSCARLETT_PRESENTX_HEADLESS");
@@ -3898,6 +3948,89 @@ HRESULT STDMETHODCALLTYPE CommandQueueX::PresentX(
         fb.pixels = last_present_pixels_;
         if (fb.WritePng(capture_png_path).ok()) {
             capture_png_written_ = true;
+        }
+        // Diagnostic: if Scaleform/UI rendered into an offscreen RTV before blitting to the
+        // swapchain plane, read back that offscreen UI RTV as well to isolate UI draw vs blit.
+        ID3D12Resource* ui_rtv =
+            (EnvFlagTrueA("OPENSCARLETT_CAPTURE_UI_RTV") && device_x_) ? device_x_->LastDiiRtv() : nullptr;
+        if (ui_rtv && ui_rtv != src_tex && readback_buf_ && present_alloc_ && present_cmd_) {
+            const D3D12_RESOURCE_DESC ud = ui_rtv->GetDesc();
+            if (ud.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && ud.Width == width && ud.Height == height) {
+                D3D12_PLACED_SUBRESOURCE_FOOTPRINT ufp{};
+                UINT urows = 0u;
+                UINT64 ursz = 0ull, utot = 0ull;
+                device_x_->HostDevice()->GetCopyableFootprints(&ud, 0u, 1u, 0ull, &ufp, &urows, &ursz, &utot);
+                if (utot <= readback_buf_->GetDesc().Width &&
+                    SUCCEEDED(present_alloc_->Reset()) && SUCCEEDED(present_cmd_->Reset(present_alloc_, nullptr))) {
+                    D3D12_RESOURCE_BARRIER b0{};
+                    b0.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                    b0.Transition.pResource = ui_rtv;
+                    b0.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                    b0.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                    b0.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+                    present_cmd_->ResourceBarrier(1u, &b0);
+                    D3D12_TEXTURE_COPY_LOCATION ul_src{};
+                    ul_src.pResource = ui_rtv;
+                    ul_src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    D3D12_TEXTURE_COPY_LOCATION ul_dst{};
+                    ul_dst.pResource = readback_buf_;
+                    ul_dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                    ul_dst.PlacedFootprint = ufp;
+                    present_cmd_->CopyTextureRegion(&ul_dst, 0u, 0u, 0u, &ul_src, nullptr);
+                    std::swap(b0.Transition.StateBefore, b0.Transition.StateAfter);
+                    present_cmd_->ResourceBarrier(1u, &b0);
+                    if (SUCCEEDED(present_cmd_->Close())) {
+                        ID3D12CommandList* ul_lists[] = {present_cmd_};
+                        host_queue_->ExecuteCommandLists(1u, ul_lists);
+                        const uint64_t uv = ++present_fence_val_;
+                        if (SUCCEEDED(host_queue_->Signal(present_fence_, uv))) {
+                            if (present_fence_->GetCompletedValue() < uv) {
+                                present_fence_->SetEventOnCompletion(uv, present_fence_event_);
+                                WaitForSingleObject(present_fence_event_, 5000u);
+                            }
+                            void* umap = nullptr;
+                            D3D12_RANGE ur{0u, static_cast<SIZE_T>(utot)};
+                            if (SUCCEEDED(readback_buf_->Map(0u, &ur, &umap)) && umap) {
+                                uint32_t max_r = 0, max_g = 0, max_b = 0, max_a = 0;
+                                uint64_t nz_rgb = 0, nz_a = 0;
+                                std::vector<uint8_t> u_rgba(static_cast<size_t>(width) * height * 4u);
+                                const auto* srcp = static_cast<const uint8_t*>(umap);
+                                for (uint32_t y = 0u; y < height; ++y) {
+                                    const uint8_t* row = srcp + static_cast<size_t>(y) * ufp.Footprint.RowPitch;
+                                    uint8_t* dstrow = u_rgba.data() + static_cast<size_t>(y) * width * 4u;
+                                    std::memcpy(dstrow, row, static_cast<size_t>(width) * 4u);
+                                    for (uint32_t x = 0u; x < width; ++x) {
+                                        const uint8_t r = row[x * 4u + 0u];
+                                        const uint8_t g = row[x * 4u + 1u];
+                                        const uint8_t b = row[x * 4u + 2u];
+                                        const uint8_t a = row[x * 4u + 3u];
+                                        if (r > max_r) max_r = r;
+                                        if (g > max_g) max_g = g;
+                                        if (b > max_b) max_b = b;
+                                        if (a > max_a) max_a = a;
+                                        if (r | g | b) ++nz_rgb;
+                                        if (a) ++nz_a;
+                                    }
+                                }
+                                D3D12_RANGE zw{0u, 0u};
+                                readback_buf_->Unmap(0u, &zw);
+                                std::fprintf(stderr,
+                                             "[OpenScarlett][UI-RTV] res=%p %ux%u fmt=%d max_rgba=(%u,%u,%u,%u) nz_rgb=%llu nz_a=%llu\n",
+                                             static_cast<void*>(ui_rtv), width, height, static_cast<int>(ud.Format),
+                                             max_r, max_g, max_b, max_a,
+                                             static_cast<unsigned long long>(nz_rgb),
+                                             static_cast<unsigned long long>(nz_a));
+                                std::fflush(stderr);
+                                openscarlett::FrameBufferRgba8 ufb{};
+                                ufb.width = width;
+                                ufb.height = height;
+                                ufb.pixels = std::move(u_rgba);
+                                (void)ufb.WritePng(capture_png_path + ".ui.png");
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 

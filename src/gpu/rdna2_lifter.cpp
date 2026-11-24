@@ -912,7 +912,7 @@ public:
                             needs_srv0_decl = true;
                             continue;
                         }
-                        if (in0_is_cbv) {
+                        if (in0_is_cbv || in0_is_srv) {
                             needs_in0_decl = true;
                             continue;
                         }
@@ -1887,12 +1887,17 @@ private:
                     !use_dual_srv0 &&
                     ir_.stage_contract.psv0_bindings.enabled && ir_.stage_contract.psv0_bindings.in0_is_cbv &&
                     (is_cb || cb_reg == 0u || !ir_.uses_uav1);
+                const bool use_in0_srv =
+                    !use_dual_srv0 && !use_in0_cbv &&
+                    ir_.stage_contract.psv0_bindings.enabled && ir_.stage_contract.psv0_bindings.in0_is_srv;
                 const char* buf = use_dual_srv0
                                       ? "_srv0"
-                                      : (((inst.imm_u32 & 0xFFu) == 1u && ir_.uses_uav1) ? "_out0" : "_in0");
+                                      : (use_in0_srv
+                                             ? "_in0"
+                                             : (((inst.imm_u32 & 0xFFu) == 1u && ir_.uses_uav1) ? "_out0" : "_in0"));
                 os << ind << "{\n";
                 os << ind << "    uint _sp_off = " << AsU32(inst.operands[0]) << ";\n";
-                if (is_cb && !use_in0_cbv && !use_dual_srv0) {
+                if (is_cb && !use_in0_cbv && !use_dual_srv0 && !use_in0_srv) {
                     os << ind << "    bool _sp_ok = (_sp_off < 65536u) && ((65536u - _sp_off) >= " << span_bytes << "u);\n";
                     os << ind << "    _v" << inst.id << " = _sp_ok;\n";
                     if (!elems.empty()) {
@@ -2048,11 +2053,14 @@ private:
                         !use_dual_srv0 &&
                         ir_.stage_contract.psv0_bindings.enabled && ir_.stage_contract.psv0_bindings.in0_is_cbv &&
                         (is_cb || cb_reg == 0u || !ir_.uses_uav1);
+                    const bool use_in0_srv =
+                        !use_dual_srv0 && !in0_cbv &&
+                        ir_.stage_contract.psv0_bindings.enabled && ir_.stage_contract.psv0_bindings.in0_is_srv;
                     if (use_dual_srv0) {
                         os << ind << "_v" << inst.id << " = _srv0.Load(" << AsU32(inst.operands[0]) << ");\n";
                     } else if (in0_cbv) {
                         os << ind << "_v" << inst.id << " = _os_in0_cb_load(" << AsU32(inst.operands[0]) << ");\n";
-                    } else if (is_cb) {
+                    } else if (is_cb && !use_in0_srv) {
                         // Safe out-of-range s_buffer_load clamping (Leonida #4573)
                         os << ind << "{ uint _cb_off = " << AsU32(inst.operands[0]) << "; "
                            << "if (_cb_off >= 65536u) { _v" << inst.id << " = 0u; } else { "
@@ -2087,19 +2095,22 @@ private:
                         ir_.stage_contract.psv0_bindings.enabled &&
                         ir_.stage_contract.psv0_bindings.in0_is_cbv &&
                         (is_cb || cb_reg == 0u || !ir_.uses_uav1);
+                    const bool use_in0_srv =
+                        !use_dual_srv0 && !use_in0_cb &&
+                        ir_.stage_contract.psv0_bindings.enabled && ir_.stage_contract.psv0_bindings.in0_is_srv;
                     if (use_dual_srv0) {
                         os << ind << "{ uint _so = " << AsU32(inst.operands[0]) << " + " << (k * 4u) << "u; "
                            << "_v" << inst.id << " = _srv0.Load(_so); }\n";
                     } else if (use_in0_cb) {
                         os << ind << "{ uint _so = " << AsU32(inst.operands[0]) << " + " << (k * 4u) << "u; "
                            << "_v" << inst.id << " = _os_in0_cb_load(_so); }\n";
-                    } else if (is_cb) {
+                    } else if (is_cb && !use_in0_srv) {
                         os << ind << "{ uint _so = " << AsU32(inst.operands[0]) << " + " << (k * 4u) << "u; "
                            << "if (" << AsBool(inst.operands[1]) << " || (_so < 65536u && (65536u - _so) >= 4u)) { "
                            << "uint _dw = _so >> 2u; uint4 _q = _cb_heap_" << cb_reg << "[(_dw >> 2u) & 4095u]; uint _l = _dw & 3u; "
                            << "_v" << inst.id << " = (_l == 0u) ? _q.x : ((_l == 1u) ? _q.y : ((_l == 2u) ? _q.z : _q.w)); } else { _v" << inst.id << " = 0u; } }\n";
                     } else {
-                        const char* buf = (cb_reg == 1u && ir_.uses_uav1) ? "_out0" : "_in0";
+                        const char* buf = (!use_in0_srv && cb_reg == 1u && ir_.uses_uav1) ? "_out0" : "_in0";
                         os << ind << "{ uint _so = " << AsU32(inst.operands[0]) << " + " << (k * 4u) << "u; "
                            << "if (" << AsBool(inst.operands[1]) << ") { _v" << inst.id << " = " << buf << ".Load(_so); } else { "
                            << "uint _sl = 0u; " << buf << ".GetDimensions(_sl); uint _lim = (_sl > 0u) ? _sl : 65536u; "

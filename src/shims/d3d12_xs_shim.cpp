@@ -2119,6 +2119,18 @@ public:
             }
             auto* retail_heap = new (std::nothrow) ScarlettRetailDescriptorHeapProxy(
                 inner_heap, guest_cpu_base, guest_byte_size);
+            if (auto* dh = openscarlett::d3d12_xs::TryGetDescriptorHeapProxy(inner_heap)) {
+                if (ID3D12DescriptorHeap* hh = dh->HostDescriptorHeap()) {
+                    const auto hd = hh->GetDesc();
+                    const UINT inc = inner_->GetDescriptorHandleIncrementSize(hd.Type);
+                    const uint64_t hcpu = hh->GetCPUDescriptorHandleForHeapStart().ptr;
+                    const uint64_t hgpu = (hd.Flags & D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)
+                                              ? hh->GetGPUDescriptorHandleForHeapStart().ptr
+                                              : 0ull;
+                    inner_->RegisterGuestBackedDescHeap(
+                        hgpu, hcpu, hd.NumDescriptors, inc, guest_cpu_base, guest_byte_size);
+                }
+            }
             inner_heap->Release();
             if (!retail_heap) {
                 return E_OUTOFMEMORY;
@@ -3112,6 +3124,21 @@ HRESULT CreateWrappedDeviceInternal(
     uint32_t retail_scarlett_version = 0u) {
     // Opt-in D3D12 Agility SDK discovery (graceful fallback to inbox d3d12.dll when absent).
     TryConfigureAgilitySdkOnce();
+    {
+        char dbg_env[16]{};
+        if (::GetEnvironmentVariableA("OPENSCARLETT_ENABLE_D3D12_DEBUG", dbg_env, sizeof(dbg_env)) > 0 &&
+            dbg_env[0] == '1') {
+            auto fn_dbg = reinterpret_cast<PfnD3D12GetDebugInterface>(
+                openscarlett::ResolveHostD3D12Proc("D3D12GetDebugInterface"));
+            ID3D12Debug* dbg = nullptr;
+            if (fn_dbg && SUCCEEDED(fn_dbg(IID_PPV_ARGS(&dbg))) && dbg) {
+                dbg->EnableDebugLayer();
+                dbg->Release();
+                std::fprintf(stderr, "[OpenScarlett][d3d12_xs] D3D12 Debug Layer ENABLED via OPENSCARLETT_ENABLE_D3D12_DEBUG=1\n");
+                std::fflush(stderr);
+            }
+        }
+    }
 
     auto host_create = reinterpret_cast<PfnD3D12CreateDevice>(
         openscarlett::ResolveHostD3D12Proc("D3D12CreateDevice"));

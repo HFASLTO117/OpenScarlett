@@ -727,6 +727,8 @@ HRESULT STDMETHODCALLTYPE CommandListX::Reset(
     depth_bounds_max_.store(1.0f, std::memory_order_relaxed);
     view_instance_mask_.store(0u, std::memory_order_relaxed);
     last_host_compute_rs_ = nullptr;
+    last_host_graphics_rs_ = nullptr;
+    last_bound_rtv0_res_ = nullptr;
     last_host_pso_ = UnwrapPipelineState(pInitialState);
     bound_cbv_srv_uav_heap_ = nullptr;
     bound_sampler_heap_ = nullptr;
@@ -814,6 +816,8 @@ void STDMETHODCALLTYPE CommandListX::ClearState(ID3D12PipelineState* pPipelineSt
     depth_bounds_max_.store(1.0f, std::memory_order_relaxed);
     view_instance_mask_.store(0u, std::memory_order_relaxed);
     last_host_compute_rs_ = nullptr;
+    last_host_graphics_rs_ = nullptr;
+    last_bound_rtv0_res_ = nullptr;
     last_host_pso_ = UnwrapPipelineState(pPipelineState);
     bound_cbv_srv_uav_heap_ = nullptr;
     bound_sampler_heap_ = nullptr;
@@ -846,6 +850,23 @@ void STDMETHODCALLTYPE CommandListX::ClearState(ID3D12PipelineState* pPipelineSt
     host_list_->ClearState(host_pso);
     RecordList("ID3D12GraphicsCommandListX::ClearState", 11, S_OK);
 }
+
+namespace {
+bool SafeCopyBytes72(void* dst, const void* src) noexcept {
+    if (!dst || !src) return false;
+#if defined(_MSC_VER)
+    __try {
+        std::memcpy(dst, src, 72u);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+#else
+    std::memcpy(dst, src, 72u);
+    return true;
+#endif
+}
+}  // namespace
 
 void STDMETHODCALLTYPE CommandListX::DrawInstanced(
     UINT VertexCountPerInstance, UINT InstanceCount,
@@ -892,8 +913,92 @@ void STDMETHODCALLTYPE CommandListX::DrawInstanced(
         AppendDiagOp(buf);
     }
     if (!skip_host && !last_pso_is_standin_ && !pso_missing) {
-        host_list_->DrawInstanced(
-            VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
+        // Xbox Scarlett RECTLIST (topology 17/19) draws a full rectangle from 3 vertices (V0,V1,V2)
+        // with implicit 4th corner V3 = V1 + V2 - V0. Expand 3 -> 6 vertices (2 matching-winding
+        // triangles) so fullscreen UI/blit quads cover 100% of the 4K screen on desktop D3D12.
+        bool drew_rectlist_quad = false;
+        if (device_x_ && device_x_->IsRetailScarlettAbi() &&
+            (last_raw_topology_ == 17u || last_raw_topology_ == 19u) &&
+            VertexCountPerInstance == 3u &&
+            last_vb0_raw_.BufferLocation != 0ull &&
+            last_vb0_raw_.StrideInBytes == 24u &&
+            last_vb0_raw_.SizeInBytes >= (StartVertexLocation + 3u) * 24u) {
+            const uint64_t src_va =
+                last_vb0_raw_.BufferLocation + static_cast<uint64_t>(StartVertexLocation) * 24ull;
+            void* src_cpu = reinterpret_cast<void*>(static_cast<uintptr_t>(src_va));
+            alignas(16) uint8_t quad6[6u * 24u]{};
+            const bool copied = SafeCopyBytes72(quad6, src_cpu);
+            if (copied) {
+                auto rd_f = [&](size_t v, size_t off) -> float {
+                    float val = 0.0f;
+                    std::memcpy(&val, quad6 + v * 24u + off, 4u);
+                    return val;
+                };
+                auto wr_f = [&](size_t v, size_t off, float val) {
+                    std::memcpy(quad6 + v * 24u + off, &val, 4u);
+                };
+                // Identify the right-angle corner (opposite the longest edge / hypotenuse) so
+                // RECTLIST expansion works for any Xbox vertex ordering (e.g. V1 at 90 deg in
+                // RAGE UI/blit quads: V0=TL, V1=BL, V2=BR -> V3 = V0 + V2 - V1 = TR) while
+                // preserving exact front-face winding!
+                auto dist2 = [&](size_t a, size_t b) -> float {
+                    const float dx = rd_f(a, 0u) - rd_f(b, 0u);
+                    const float dy = rd_f(a, 4u) - rd_f(b, 4u);
+                    const float dz = rd_f(a, 8u) - rd_f(b, 8u);
+                    return dx * dx + dy * dy + dz * dz;
+                };
+                const float d01 = dist2(0u, 1u);
+                const float d12 = dist2(1u, 2u);
+                const float d02 = dist2(0u, 2u);
+                size_t ca = 1u, cb = 2u, cc = 0u;  // V3 = Va + Vb - Vc
+                if (d02 >= d12 && d02 >= d01) {
+                    // Hypotenuse (V0, V2), 90 deg at V1 -> Tri 2 = (V0, V2, V3)
+                    ca = 0u; cb = 2u; cc = 1u;
+                    std::memcpy(quad6 + 3u * 24u, quad6 + 0u * 24u, 24u);
+                    std::memcpy(quad6 + 4u * 24u, quad6 + 2u * 24u, 24u);
+                    std::memcpy(quad6 + 5u * 24u, quad6 + 1u * 24u, 24u);
+                    for (size_t off : {size_t(0u), size_t(4u), size_t(8u), size_t(16u), size_t(20u)}) {
+                        wr_f(5u, off, rd_f(ca, off) + rd_f(cb, off) - rd_f(cc, off));
+                    }
+                } else if (d01 >= d12 && d01 >= d02) {
+                    // Hypotenuse (V0, V1), 90 deg at V2 -> Tri 2 = (V0, V3, V1)
+                    ca = 0u; cb = 1u; cc = 2u;
+                    std::memcpy(quad6 + 3u * 24u, quad6 + 0u * 24u, 24u);
+                    std::memcpy(quad6 + 4u * 24u, quad6 + 2u * 24u, 24u);
+                    std::memcpy(quad6 + 5u * 24u, quad6 + 1u * 24u, 24u);
+                    for (size_t off : {size_t(0u), size_t(4u), size_t(8u), size_t(16u), size_t(20u)}) {
+                        wr_f(4u, off, rd_f(ca, off) + rd_f(cb, off) - rd_f(cc, off));
+                    }
+                } else {
+                    // Hypotenuse (V1, V2), 90 deg at V0 -> Tri 2 = (V1, V3, V2)
+                    ca = 1u; cb = 2u; cc = 0u;
+                    std::memcpy(quad6 + 3u * 24u, quad6 + 1u * 24u, 24u);
+                    std::memcpy(quad6 + 4u * 24u, quad6 + 0u * 24u, 24u);
+                    std::memcpy(quad6 + 5u * 24u, quad6 + 2u * 24u, 24u);
+                    for (size_t off : {size_t(0u), size_t(4u), size_t(8u), size_t(16u), size_t(20u)}) {
+                        wr_f(4u, off, rd_f(ca, off) + rd_f(cb, off) - rd_f(cc, off));
+                    }
+                }
+                const D3D12_GPU_VIRTUAL_ADDRESS quad_gpu =
+                    device_x_->UploadTransientGuestBufferForDesktop(
+                        static_cast<D3D12_GPU_VIRTUAL_ADDRESS>(reinterpret_cast<uintptr_t>(quad6)),
+                        sizeof(quad6), 256ull, /*allow_same_frame_cache=*/false);
+                if (quad_gpu != 0ull) {
+                    D3D12_VERTEX_BUFFER_VIEW qv{};
+                    qv.BufferLocation = quad_gpu;
+                    qv.SizeInBytes = static_cast<UINT>(sizeof(quad6));
+                    qv.StrideInBytes = 24u;
+                    host_list_->IASetVertexBuffers(0u, 1u, &qv);
+                    host_list_->DrawInstanced(6u, InstanceCount, 0u, StartInstanceLocation);
+                    host_list_->IASetVertexBuffers(0u, 1u, &last_vb0_host_);
+                    drew_rectlist_quad = true;
+                }
+            }
+        }
+        if (!drew_rectlist_quad) {
+            host_list_->DrawInstanced(
+                VertexCountPerInstance, InstanceCount, StartVertexLocation, StartInstanceLocation);
+        }
     } else if (last_pso_is_standin_ || pso_missing) {
         static std::atomic<uint64_t> s_skip_di{0ull};
         const uint64_t n = s_skip_di.fetch_add(1ull, std::memory_order_relaxed) + 1ull;
@@ -955,6 +1060,21 @@ void STDMETHODCALLTYPE CommandListX::DrawIndexedInstanced(
         AppendDiagOp(buf);
     }
     if (!skip_host && !last_pso_is_standin_ && !pso_missing) {
+        if (device_x_ && last_bound_rtv0_res_) {
+            device_x_->SetLastDiiRtv(last_bound_rtv0_res_);
+        }
+        static const bool trace_sf_dii = []() {
+            char v[16]{};
+            return ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_SF_DRAW", v, sizeof(v)) > 0 && v[0] == '1';
+        }();
+        static std::atomic<uint32_t> s_sf_dii_log{0u};
+        if (trace_sf_dii && s_sf_dii_log.fetch_add(1u, std::memory_order_relaxed) < 10u) {
+            std::fprintf(stderr,
+                         "[OpenScarlett][SF-DII] idx=%u inst=%u startIdx=%u baseV=%d pso=%p empty_rs=%d\n",
+                         IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation,
+                         static_cast<void*>(last_host_pso_), last_gfx_rs_is_empty_ ? 1 : 0);
+            std::fflush(stderr);
+        }
         host_list_->DrawIndexedInstanced(
             IndexCountPerInstance, InstanceCount, StartIndexLocation,
             BaseVertexLocation, StartInstanceLocation);
@@ -1491,6 +1611,7 @@ void STDMETHODCALLTYPE CommandListX::IASetPrimitiveTopology(
     D3D12_PRIMITIVE_TOPOLOGY PrimitiveTopology) {
     D3D12_PRIMITIVE_TOPOLOGY clean_topo = PrimitiveTopology;
     const uint32_t raw_t = static_cast<uint32_t>(PrimitiveTopology);
+    last_raw_topology_ = raw_t;
     if (device_x_ && device_x_->IsRetailScarlettAbi()) {
         // Xbox Scarlett console-only topologies (e.g. 19=RECTLIST, 18=QUADLIST, 17=LINELOOP,
         // 20=TRIANGLEFAN, 0=UNDEFINED) are invalid in PC D3D12 and hang NVIDIA pushbuffers.
@@ -2302,6 +2423,7 @@ void STDMETHODCALLTYPE CommandListX::SetComputeRootSignature(
 void STDMETHODCALLTYPE CommandListX::SetGraphicsRootSignature(
     ID3D12RootSignature* pRootSignature) {
     ID3D12RootSignature* host_rs = UnwrapRootSignature(pRootSignature);
+    last_host_graphics_rs_ = host_rs;
     last_gfx_rs_is_empty_ = false;
     if (pRootSignature && IsKnownProxyPointer(pRootSignature)) {
         IOpenScarlettProxyInspect* insp = nullptr;
@@ -2316,7 +2438,8 @@ void STDMETHODCALLTYPE CommandListX::SetGraphicsRootSignature(
         char buf[96];
         std::snprintf(buf, sizeof(buf), "SetGraphicsRootSig(%p empty=%d)",
                       static_cast<void*>(host_rs), last_gfx_rs_is_empty_ ? 1 : 0);
-        AppendDiagOp(buf);
+        std::string rs_info = device_x_ ? device_x_->DescribeDiagRootSig(host_rs) : std::string{};
+        AppendDiagOp(rs_info.empty() ? std::string(buf) : (std::string(buf) + " " + rs_info));
     }
     host_list_->SetGraphicsRootSignature(host_rs);
     RecordList("ID3D12GraphicsCommandListX::SetGraphicsRootSignature", 30, S_OK);
@@ -2326,6 +2449,8 @@ void STDMETHODCALLTYPE CommandListX::SetComputeRootDescriptorTable(
     UINT RootParameterIndex, D3D12_GPU_DESCRIPTOR_HANDLE BaseDescriptor) {
     if (device_x_) {
         BaseDescriptor = device_x_->TranslateGpuDescriptorHandle(BaseDescriptor);
+        BaseDescriptor = device_x_->MaterializeGuestDescriptorTable(
+            BaseDescriptor, last_host_compute_rs_, RootParameterIndex);
         const uint32_t sgpr_slot = (RootParameterIndex * 2u) % 14u;
         (void)device_x_->GetDescriptorBridge().SetRootSgprTablePtr(sgpr_slot, BaseDescriptor.ptr);
         device_x_->RecordBridgeTableBind();
@@ -2344,18 +2469,26 @@ void STDMETHODCALLTYPE CommandListX::SetComputeRootDescriptorTable(
 
 void STDMETHODCALLTYPE CommandListX::SetGraphicsRootDescriptorTable(
     UINT RootParameterIndex, D3D12_GPU_DESCRIPTOR_HANDLE BaseDescriptor) {
+    const D3D12_GPU_DESCRIPTOR_HANDLE orig_gpu = BaseDescriptor;
+    uint32_t mat_hits = 0u;
+    uint32_t mat_slots = 0u;
     if (device_x_) {
         BaseDescriptor = device_x_->TranslateGpuDescriptorHandle(BaseDescriptor);
+        BaseDescriptor = device_x_->MaterializeGuestDescriptorTable(
+            BaseDescriptor, last_host_graphics_rs_, RootParameterIndex, &mat_hits, &mat_slots);
         const uint32_t sgpr_slot = (RootParameterIndex * 2u) % 14u;
         (void)device_x_->GetDescriptorBridge().SetRootSgprTablePtr(sgpr_slot, BaseDescriptor.ptr);
         device_x_->RecordBridgeTableBind();
     }
     if (IsDiagTraceEnabled()) {
-        char buf[96];
-        std::snprintf(buf, sizeof(buf), "SetGfxRootDescTable(rp=%u gpu=0x%llX skip=%d)",
-                      RootParameterIndex, static_cast<unsigned long long>(BaseDescriptor.ptr),
+        std::string extra = device_x_ ? device_x_->DescribeDiagDescriptorTable(orig_gpu, 4u) : std::string{};
+        char buf[160];
+        std::snprintf(buf, sizeof(buf), "SetGfxRootDescTable(rp=%u gpu=0x%llX->0x%llX mat=%u/%u skip=%d)",
+                      RootParameterIndex, static_cast<unsigned long long>(orig_gpu.ptr),
+                      static_cast<unsigned long long>(BaseDescriptor.ptr),
+                      mat_hits, mat_slots,
                       last_gfx_rs_is_empty_ ? 1 : 0);
-        AppendDiagOp(buf);
+        AppendDiagOp(extra.empty() ? std::string(buf) : (std::string(buf) + " " + extra));
     }
     if (!last_gfx_rs_is_empty_ && !last_pso_is_standin_) {
         host_list_->SetGraphicsRootDescriptorTable(RootParameterIndex, BaseDescriptor);
@@ -2645,6 +2778,16 @@ void STDMETHODCALLTYPE CommandListX::IASetIndexBuffer(const D3D12_INDEX_BUFFER_V
         if (device_x_ && translated_view.BufferLocation != 0ull) {
             translated_view.BufferLocation =
                 device_x_->TranslateGuestGpuVa(translated_view.BufferLocation);
+            if (device_x_->IsRetailScarlettAbi() &&
+                translated_view.BufferLocation == pView->BufferLocation &&
+                pView->SizeInBytes > 0u) {
+                const D3D12_GPU_VIRTUAL_ADDRESS uploaded =
+                    device_x_->UploadTransientGuestBufferForDesktop(
+                        pView->BufferLocation, pView->SizeInBytes, 16ull, true);
+                if (uploaded != 0ull) {
+                    translated_view.BufferLocation = uploaded;
+                }
+            }
         }
         pass_view = &translated_view;
     }
@@ -2664,6 +2807,27 @@ void STDMETHODCALLTYPE CommandListX::IASetIndexBuffer(const D3D12_INDEX_BUFFER_V
         } else {
             vk_has_ibv_ = false;
         }
+    }
+    static const bool trace_sf = []() {
+        char v[16]{};
+        return ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_SF_DRAW", v, sizeof(v)) > 0 && v[0] == '1';
+    }();
+    static std::atomic<uint32_t> s_sf_ib_log{0u};
+    if (trace_sf && pView && s_sf_ib_log.fetch_add(1u, std::memory_order_relaxed) < 8u) {
+        const auto* ib16 = reinterpret_cast<const uint16_t*>(static_cast<uintptr_t>(pView->BufferLocation));
+        std::fprintf(stderr,
+                     "[OpenScarlett][SF-IB] raw=0x%llX -> host=0x%llX (mapped=%d) sz=%u fmt=%d idx0..5=[%u,%u,%u,%u,%u,%u]\n",
+                     static_cast<unsigned long long>(pView->BufferLocation),
+                     static_cast<unsigned long long>(translated_view.BufferLocation),
+                     (translated_view.BufferLocation != pView->BufferLocation) ? 1 : 0,
+                     pView->SizeInBytes, static_cast<int>(pView->Format),
+                     (pView->SizeInBytes >= 12u) ? ib16[0] : 0u,
+                     (pView->SizeInBytes >= 12u) ? ib16[1] : 0u,
+                     (pView->SizeInBytes >= 12u) ? ib16[2] : 0u,
+                     (pView->SizeInBytes >= 12u) ? ib16[3] : 0u,
+                     (pView->SizeInBytes >= 12u) ? ib16[4] : 0u,
+                     (pView->SizeInBytes >= 12u) ? ib16[5] : 0u);
+        std::fflush(stderr);
     }
     host_list_->IASetIndexBuffer(pass_view);
     RecordList("ID3D12GraphicsCommandListX::IASetIndexBuffer", 43, S_OK);
@@ -2690,9 +2854,23 @@ void STDMETHODCALLTYPE CommandListX::IASetVertexBuffers(
             if (device_x_ && translated[i].BufferLocation != 0ull) {
                 translated[i].BufferLocation =
                     device_x_->TranslateGuestGpuVa(translated[i].BufferLocation);
+                if (device_x_->IsRetailScarlettAbi() &&
+                    translated[i].BufferLocation == pViews[i].BufferLocation &&
+                    pViews[i].SizeInBytes > 0u) {
+                    const D3D12_GPU_VIRTUAL_ADDRESS uploaded =
+                        device_x_->UploadTransientGuestBufferForDesktop(
+                            pViews[i].BufferLocation, pViews[i].SizeInBytes, 16ull, true);
+                    if (uploaded != 0ull) {
+                        translated[i].BufferLocation = uploaded;
+                    }
+                }
             }
         }
         pass_views = translated;
+        if (StartSlot == 0u && NumViews > 0u) {
+            last_vb0_raw_ = pViews[0];
+            last_vb0_host_ = translated[0];
+        }
     }
     if (IsDiagTraceEnabled() && pViews) {
         char buf[128];
@@ -2701,6 +2879,34 @@ void STDMETHODCALLTYPE CommandListX::IASetVertexBuffers(
                       static_cast<unsigned long long>(pViews[0].BufferLocation),
                       static_cast<unsigned long long>(translated[0].BufferLocation));
         AppendDiagOp(buf);
+    }
+    static const bool trace_sf_vb = []() {
+        char v[16]{};
+        return ::GetEnvironmentVariableA("OPENSCARLETT_TRACE_SF_DRAW", v, sizeof(v)) > 0 && v[0] == '1';
+    }();
+    static std::atomic<uint32_t> s_sf_vb_log{0u};
+    if (trace_sf_vb && pViews && pViews[0].StrideInBytes == 16u &&
+        s_sf_vb_log.fetch_add(1u, std::memory_order_relaxed) < 8u) {
+        const uint32_t sz = pViews[0].SizeInBytes;
+        std::fprintf(stderr,
+                     "[OpenScarlett][SF-VB] raw=0x%llX -> host=0x%llX (mapped=%d) sz=%u stride=16",
+                     static_cast<unsigned long long>(pViews[0].BufferLocation),
+                     static_cast<unsigned long long>(translated[0].BufferLocation),
+                     (translated[0].BufferLocation != pViews[0].BufferLocation) ? 1 : 0, sz);
+        if (pViews[0].BufferLocation >= 0x10000ull && sz >= 48u) {
+            const auto* vb = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(pViews[0].BufferLocation));
+            for (uint32_t vi = 0u; vi < 3u; ++vi) {
+                uint32_t c0 = 0u, c1 = 0u;
+                float px = 0.f, py = 0.f;
+                std::memcpy(&c0, vb + vi * 16u + 0u, 4u);
+                std::memcpy(&c1, vb + vi * 16u + 4u, 4u);
+                std::memcpy(&px, vb + vi * 16u + 8u, 4u);
+                std::memcpy(&py, vb + vi * 16u + 12u, 4u);
+                std::fprintf(stderr, " v%u(c0=0x%08X c1=0x%08X pos=%.1f,%.1f)", vi, c0, c1, px, py);
+            }
+        }
+        std::fprintf(stderr, "\n");
+        std::fflush(stderr);
     }
     static const bool trace_dd = []() {
         char v[16]{};
@@ -2779,6 +2985,39 @@ void STDMETHODCALLTYPE CommandListX::OMSetRenderTargets(
             (pDepthStencilDescriptor && device_x_->IsValidRetailDsvHandle(pDepthStencilDescriptor->ptr))
                 ? pDepthStencilDescriptor
                 : nullptr;
+        ID3D12Resource* prev_rtv0 = last_bound_rtv0_res_;
+        ID3D12Resource* next_rtv0 =
+            (clean_n > 0u) ? device_x_->LookupRetailRtvResource(clean_rtvs[0].ptr) : nullptr;
+        // Scarlett titles synchronize passes via FlushGpuCachesX instead of D3D12 ResourceBarrier.
+        // Emit explicit RENDER_TARGET -> PIXEL_SHADER_RESOURCE (flushing ROP/DCC decompression so
+        // subsequent passes like UI blit sample fresh pixels) and -> RENDER_TARGET transitions.
+        if (prev_rtv0 && prev_rtv0 != next_rtv0) {
+            const D3D12_RESOURCE_STATES before = device_x_->TransitionRetailResourceState(
+                prev_rtv0, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            if (before != D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE) {
+                D3D12_RESOURCE_BARRIER tb{};
+                tb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                tb.Transition.pResource = prev_rtv0;
+                tb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                tb.Transition.StateBefore = before;
+                tb.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+                host_list_->ResourceBarrier(1u, &tb);
+            }
+        }
+        if (next_rtv0) {
+            const D3D12_RESOURCE_STATES before = device_x_->TransitionRetailResourceState(
+                next_rtv0, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON);
+            if (before != D3D12_RESOURCE_STATE_RENDER_TARGET) {
+                D3D12_RESOURCE_BARRIER tb{};
+                tb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                tb.Transition.pResource = next_rtv0;
+                tb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                tb.Transition.StateBefore = before;
+                tb.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                host_list_->ResourceBarrier(1u, &tb);
+            }
+        }
+        last_bound_rtv0_res_ = next_rtv0;
         if (IsDiagTraceEnabled()) {
             char buf[144];
             std::snprintf(buf, sizeof(buf), "OMSetRenderTargets(n=%u->%u rtv0=0x%llX dsv=%d->%d dsv_h=0x%llX)",
@@ -2786,7 +3025,8 @@ void STDMETHODCALLTYPE CommandListX::OMSetRenderTargets(
                           clean_n > 0u ? static_cast<unsigned long long>(clean_rtvs[0].ptr) : 0ull,
                           pDepthStencilDescriptor ? 1 : 0, clean_dsv ? 1 : 0,
                           clean_dsv ? static_cast<unsigned long long>(clean_dsv->ptr) : 0ull);
-            AppendDiagOp(buf);
+            std::string rtv_info = (clean_n > 0u && device_x_) ? device_x_->DescribeDiagRtv(clean_rtvs[0].ptr) : std::string{};
+            AppendDiagOp(rtv_info.empty() ? std::string(buf) : (std::string(buf) + " [" + rtv_info + "]"));
         }
         host_list_->OMSetRenderTargets(clean_n, clean_n > 0u ? clean_rtvs : nullptr, FALSE, clean_dsv);
     } else {
@@ -2867,24 +3107,19 @@ void STDMETHODCALLTYPE CommandListX::ClearRenderTargetView(
                 ? device_x_->LookupRetailRtvResource(RenderTargetView.ptr)
                 : nullptr;
         if (rtv_res) {
-            D3D12_RESOURCE_BARRIER b{};
-            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            b.Transition.pResource = rtv_res;
-            b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-            b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-            host_list_->ResourceBarrier(1u, &b);
+            const D3D12_RESOURCE_STATES before = device_x_->TransitionRetailResourceState(
+                rtv_res, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COMMON);
+            if (before != D3D12_RESOURCE_STATE_RENDER_TARGET) {
+                D3D12_RESOURCE_BARRIER b{};
+                b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                b.Transition.pResource = rtv_res;
+                b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                b.Transition.StateBefore = before;
+                b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                host_list_->ResourceBarrier(1u, &b);
+            }
         }
         host_list_->ClearRenderTargetView(RenderTargetView, ColorRGBA, NumRects, pRects);
-        if (rtv_res) {
-            D3D12_RESOURCE_BARRIER b{};
-            b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-            b.Transition.pResource = rtv_res;
-            b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-            b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-            b.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
-            host_list_->ResourceBarrier(1u, &b);
-        }
     }
     RecordList("ID3D12GraphicsCommandListX::ClearRenderTargetView", 48, S_OK);
 }

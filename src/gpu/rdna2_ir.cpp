@@ -3895,13 +3895,27 @@ Status BuildRdna2Ir(
                     if (uav_slot == 0u) out_module.uses_uav0 = true;
                     else out_module.uses_uav1 = true;
 
+                    bool idx_is_d16 = false;
+                    const uint32_t idx_comps = FormatLoadComponentCount(inst.opcode, idx_is_d16);
                     IrValueId addr = kInvalidIrValue;
                     if (inst.offen) {
                         addr = eval_operand(inst.src[1], false);
                     } else if (inst.idxen) {
                         IrValueId idx = eval_operand(inst.src[1], false);
-                        IrValueId sh = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, 2u, 0.0f);
-                        addr = emit_in_bb(IrOp::Shl, IrType::U32, {idx, sh});
+                        const uint32_t elem_stride = idx_is_d16 ? (idx_comps * 2u) : (idx_comps * 4u);
+                        if (elem_stride == 16u) {
+                            IrValueId sh = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, 4u, 0.0f);
+                            addr = emit_in_bb(IrOp::Shl, IrType::U32, {idx, sh});
+                        } else if (elem_stride == 8u) {
+                            IrValueId sh = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, 3u, 0.0f);
+                            addr = emit_in_bb(IrOp::Shl, IrType::U32, {idx, sh});
+                        } else if (elem_stride == 4u) {
+                            IrValueId sh = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, 2u, 0.0f);
+                            addr = emit_in_bb(IrOp::Shl, IrType::U32, {idx, sh});
+                        } else {
+                            IrValueId st = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, elem_stride, 0.0f);
+                            addr = emit_in_bb(IrOp::IMul, IrType::U32, {idx, st});
+                        }
                     } else {
                         addr = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, 0u, 0.0f);
                     }

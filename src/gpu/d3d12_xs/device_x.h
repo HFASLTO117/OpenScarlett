@@ -246,6 +246,35 @@ public:
         const D3D12_RESOURCE_DESC* pResourceDesc,
         const void* pViewDesc,
         D3D12_CPU_DESCRIPTOR_HANDLE destDescriptor);
+    void SetLastDiiRtv(ID3D12Resource* res) noexcept {
+        last_dii_rtv_.store(res, std::memory_order_release);
+    }
+    ID3D12Resource* LastDiiRtv() const noexcept {
+        return last_dii_rtv_.load(std::memory_order_acquire);
+    }
+    void SetRetailResourceState(ID3D12Resource* res, D3D12_RESOURCE_STATES st) noexcept {
+        if (!res) return;
+        std::lock_guard<std::mutex> lk(retail_state_mutex_);
+        retail_res_states_[res] = st;
+    }
+    D3D12_RESOURCE_STATES GetRetailResourceState(
+        ID3D12Resource* res, D3D12_RESOURCE_STATES fallback = D3D12_RESOURCE_STATE_COMMON) const noexcept {
+        if (!res) return fallback;
+        std::lock_guard<std::mutex> lk(retail_state_mutex_);
+        auto it = retail_res_states_.find(res);
+        return (it != retail_res_states_.end()) ? it->second : fallback;
+    }
+    D3D12_RESOURCE_STATES TransitionRetailResourceState(
+        ID3D12Resource* res, D3D12_RESOURCE_STATES new_state,
+        D3D12_RESOURCE_STATES default_before = D3D12_RESOURCE_STATE_COMMON) noexcept {
+        if (!res) return new_state;
+        std::lock_guard<std::mutex> lk(retail_state_mutex_);
+        auto it = retail_res_states_.find(res);
+        const D3D12_RESOURCE_STATES old_state =
+            (it != retail_res_states_.end()) ? it->second : default_before;
+        retail_res_states_[res] = new_state;
+        return old_state;
+    }
     ID3D12Resource* LookupRetailRtvResource(SIZE_T ptr) const noexcept {
         std::lock_guard<std::mutex> lk(valid_view_mutex_);
         auto it = valid_rtv_handles_.find(ptr);
@@ -406,6 +435,14 @@ public:
     D3D12_GPU_VIRTUAL_ADDRESS AlignRootCbvGpuVaForDesktop(
         D3D12_GPU_VIRTUAL_ADDRESS translated_va,
         D3D12_GPU_VIRTUAL_ADDRESS guest_va_fallback = 0ull);
+    // Uploads an unmapped Xbox unified CPU/TitleVA slice (e.g. Scaleform dynamic VB/IB/CBV
+    // allocated directly in CPU heap without CreatePlacedResourceX) into a persistently-mapped
+    // desktop UPLOAD ring and returns a real desktop D3D12_GPU_VIRTUAL_ADDRESS.
+    D3D12_GPU_VIRTUAL_ADDRESS UploadTransientGuestBufferForDesktop(
+        D3D12_GPU_VIRTUAL_ADDRESS guest_va,
+        uint64_t size_bytes,
+        uint64_t alignment = 256ull,
+        bool allow_same_frame_cache = true);
     uint32_t FrameIntervalMicroseconds() const noexcept {
         return frame_interval_us_.load(std::memory_order_relaxed);
     }
@@ -956,6 +993,21 @@ public:
     }
 
     void NotifyDescriptorHeapDestroyed(ID3D12DescriptorHeap* host_heap) noexcept;
+    void RegisterGuestBackedDescHeap(
+        uint64_t host_gpu_start, uint64_t host_cpu_start, uint32_t host_num_descs,
+        uint32_t inc_size, uint64_t guest_cpu_start, uint64_t guest_byte_size);
+    D3D12_GPU_DESCRIPTOR_HANDLE MaterializeGuestDescriptorTable(
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle,
+        ID3D12RootSignature* bound_host_rs,
+        UINT root_param_index,
+        uint32_t* out_copied_hits = nullptr,
+        uint32_t* out_slot_count = nullptr);
+    void RecordDiagDescriptor(uint64_t cpu_ptr, std::string desc);
+    void CopyDiagDescriptor(uint64_t dst_cpu_ptr, uint64_t src_cpu_ptr);
+    std::string DescribeDiagDescriptorTable(D3D12_GPU_DESCRIPTOR_HANDLE gpu_handle, uint32_t max_slots);
+    std::string DescribeDiagRtv(uint64_t cpu_ptr);
+    void RecordDiagRootSig(void* host_rs, std::string desc);
+    std::string DescribeDiagRootSig(void* host_rs);
 
 private:
     struct TrackedBufferVa {
@@ -1353,10 +1405,86 @@ private:
     std::atomic<D3D12_GPU_VIRTUAL_ADDRESS> cbv_align_ring_gpu_{0ull};
     std::atomic<uint32_t> cbv_align_ring_cursor_{0u};
 
+    // 64 MiB persistently-mapped UPLOAD ring for unmapped retail Xbox CPU/TitleVA VB/IB/CBV buffers
+    // (e.g. Scaleform UI dynamic vertex/index/constant buffers allocated directly in CPU heap).
+    struct TransientRingSlice {
+        uint64_t raw_start = 0ull;
+        uint64_t raw_end = 0ull;
+        D3D12_GPU_VIRTUAL_ADDRESS host_gpu_start = 0ull;
+        uint64_t frame_token = 0ull;
+    };
+    std::mutex transient_ring_mutex_;
+    ID3D12Resource* transient_ring_ = nullptr;
+    uint8_t* transient_ring_cpu_ = nullptr;
+    D3D12_GPU_VIRTUAL_ADDRESS transient_ring_gpu_ = 0ull;
+    uint64_t transient_ring_cursor_ = 0ull;
+    std::array<TransientRingSlice, 8u> transient_ring_cache_{};
+    uint32_t transient_ring_cache_next_ = 0u;
+
     // 64 MiB VA-bucketed aliasing heaps for CreatePlacedResourceX textures so Xbox transient
     // render-graph resources placed at overlapping physical VAs share host VRAM (zero bloat).
     std::mutex placed_alias_mutex_;
     std::unordered_map<uint64_t, ID3D12Heap*> placed_alias_heaps_;
+
+    // Guest-backed Scarlett shader-visible descriptor heap mirror (e.g. GTA VI 1,245,184-slot heap).
+    // Retail titles memcpy 32-byte descriptors from CPU staging heaps directly into guest_cpu_start
+    // instead of calling ID3D12Device::CopyDescriptors; we shadow created staging descriptors and
+    // materialize each bound descriptor table into the real host shader-visible heap via
+    // spec-legal CopyDescriptorsSimple (also folding virtual slots >= host_num_descs cleanly in-bounds).
+    struct Desc32Key {
+        uint8_t bytes[32]{};
+        bool operator==(const Desc32Key& o) const noexcept {
+            return std::memcmp(bytes, o.bytes, 32u) == 0;
+        }
+    };
+    struct Desc32KeyHash {
+        size_t operator()(const Desc32Key& k) const noexcept {
+            uint64_t h = 14695981039346656037ull;
+            for (size_t i = 0u; i < 4u; ++i) {
+                uint64_t w = 0ull;
+                std::memcpy(&w, k.bytes + i * 8u, 8u);
+                h ^= w;
+                h *= 1099511628211ull;
+            }
+            return static_cast<size_t>(h);
+        }
+    };
+    struct GuestBackedDescHeap {
+        uint64_t host_gpu_start = 0ull;
+        uint64_t host_cpu_start = 0ull;
+        uint32_t host_num_descs = 0u;
+        uint32_t inc_size = 32u;
+        uint64_t guest_cpu_start = 0ull;
+        uint64_t guest_byte_size = 0ull;
+        uint32_t ring_cursor = 0u;
+    };
+    bool EnsureShadowDescHeapLocked() noexcept;
+    bool RedirectGuestDescDestIfNeeded(
+        D3D12_CPU_DESCRIPTOR_HANDLE& dst, uint64_t& out_guest_writeback_addr);
+    void SnapshotCreatedDescriptorToShadow(
+        D3D12_CPU_DESCRIPTOR_HANDLE created_cpu_handle, uint64_t guest_writeback_addr = 0ull,
+        ID3D12Resource* opt_res = nullptr);
+    void RecordRootSigTableSizes(void* host_rs, const D3D12_VERSIONED_ROOT_SIGNATURE_DESC& desc);
+
+    std::atomic<bool> has_guest_backed_desc_heaps_{false};
+    mutable std::mutex guest_dh_mutex_;
+    std::vector<GuestBackedDescHeap> guest_backed_desc_heaps_;
+    ID3D12DescriptorHeap* shadow_cbv_srv_uav_heap_ = nullptr;
+    D3D12_CPU_DESCRIPTOR_HANDLE shadow_cbv_srv_uav_cpu_start_{0u};
+    uint32_t shadow_cbv_srv_uav_inc_ = 32u;
+    uint32_t shadow_cbv_srv_uav_cap_ = 0u;
+    uint32_t shadow_cbv_srv_uav_cursor_ = 0u;
+    std::unordered_map<Desc32Key, uint64_t, Desc32KeyHash> desc32_to_shadow_cpu_;
+    std::unordered_map<Desc32Key, ID3D12Resource*, Desc32KeyHash> desc32_to_res_;
+    std::unordered_map<void*, std::vector<uint32_t>> rs_table_slot_counts_;
+
+    // Diagnostic-only (OPENSCARLETT_TRACE_D3D12_LOG) descriptor & root signature inspector.
+    mutable std::mutex diag_meta_mutex_;
+    std::unordered_map<uint64_t, std::string> diag_desc_map_;
+    std::unordered_map<void*, std::string> diag_rs_map_;
+    std::atomic<ID3D12Resource*> last_dii_rtv_{nullptr};
+    mutable std::mutex retail_state_mutex_;
+    std::unordered_map<ID3D12Resource*, D3D12_RESOURCE_STATES> retail_res_states_;
 };
 
 }  // namespace openscarlett::d3d12_xs

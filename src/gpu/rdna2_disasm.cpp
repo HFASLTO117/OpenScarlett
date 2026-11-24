@@ -761,8 +761,8 @@ Rdna2Opcode DecodeMubufOpcode(uint16_t raw) {
         case 0x0B: return Rdna2Opcode::BUFFER_LOAD_FORMAT_D16_XYZW;
         case 0x0C: return Rdna2Opcode::BUFFER_LOAD_DWORD;        // GFX10.3 buffer_load_dword
         case 0x0D: return Rdna2Opcode::BUFFER_LOAD_FORMAT_XY;    // GFX10.3 buffer_load_dwordx2
-        case 0x0E: return Rdna2Opcode::BUFFER_LOAD_FORMAT_XYZ;   // GFX10.3 buffer_load_dwordx3
-        case 0x0F: return Rdna2Opcode::BUFFER_LOAD_FORMAT_XYZW;  // GFX10.3 buffer_load_dwordx4
+        case 0x0E: return Rdna2Opcode::BUFFER_LOAD_FORMAT_XYZW;  // GFX10.3 buffer_load_dwordx4 (4 dwords)
+        case 0x0F: return Rdna2Opcode::BUFFER_LOAD_FORMAT_XYZ;   // GFX10.3 buffer_load_dwordx3 (3 dwords)
         case 0x14: return Rdna2Opcode::BUFFER_LOAD_DWORD;
         case 0x19: return Rdna2Opcode::BUFFER_STORE_BYTE_D16_HI;
         case 0x1B: return Rdna2Opcode::BUFFER_STORE_SHORT_D16_HI;
