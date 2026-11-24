@@ -23,9 +23,14 @@ inline bool IsRetailTraceEnabled() noexcept {
     static const bool enabled = []() noexcept -> bool {
 #if defined(_WIN32)
         char v[16]{};
-        const DWORD n = ::GetEnvironmentVariableA(
+        const DWORD na = ::GetEnvironmentVariableA(
+            "OPENSCARLETT_TRACE_AUDIO", v, static_cast<DWORD>(sizeof(v)));
+        if (na > 0u && v[0] != '0') {
+            return true;
+        }
+        const DWORD nr = ::GetEnvironmentVariableA(
             "OPENSCARLETT_TRACE_RETAIL", v, static_cast<DWORD>(sizeof(v)));
-        return n > 0u && v[0] != '0';
+        return nr > 0u && v[0] != '0';
 #else
         return false;
 #endif

@@ -295,6 +295,71 @@ void TestXApuRetailEngine() {
         OS_REQUIRE(p_disconnect(conn) == XAPU_S_OK);
     }
 
+    // 1C. Retail GTA VI XApu sequence: proc=1, shm=0x104000, opt=1, zeroed Start pitch=0.0f,
+    //     1-arg XApuGetResultCount(conn, nullptr) returning pending count in EAX, and mono
+    //     Opus decode with firstFrame=312 pre-skip & frameCount=0x3C0 (960).
+    {
+        using PfnGetCount = int32_t(__stdcall*)(XAPU_CONNECTION_HANDLE, uint32_t*);
+        auto p_get_count = LoadExport<PfnGetCount>(mod, "XApuGetResultCount");
+
+        XApuConnectInput in{};
+        in.processType = XApuProcessType_DecodeOpus;
+        in.streamCount = 256u;
+        in.commandQueueDepth = 2u;
+        in.sharedMemoryBytes = 0x104000u;
+        in.maxFrameCountPerOutput = 0u;
+        in.options = 1u;
+
+        XApuConnectOutput out{};
+        XAPU_CONNECTION_HANDLE conn = nullptr;
+        OS_REQUIRE(p_connect(&in, &out, &conn) == XAPU_S_OK);
+        OS_REQUIRE(conn != nullptr && out.baseAddress != nullptr);
+        OS_REQUIRE(p_get_count(conn, nullptr) == 0);
+
+        XApuRetailStartCommand start_cmd{};
+        start_cmd.header.type = XApuRetailCommand_Start;
+        start_cmd.header.streamIndex = 3u;
+        start_cmd.channels = 1u;
+        start_cmd.startPitch = 0.0f;  // Zeroed struct must default to 1.0f, NOT 0.125f!
+        OS_REQUIRE(p_enqueue(conn, &start_cmd, 0u) == XAPU_S_OK);
+        OS_REQUIRE(p_get_count(conn, nullptr) == 1);
+
+        XApuRetailResult res{};
+        OS_REQUIRE(p_dequeue(conn, &res, sizeof(res), nullptr) == XAPU_S_OK);
+        OS_REQUIRE(res.currentPitch == 1.0f);
+        OS_REQUIRE(p_get_count(conn, nullptr) == 0);
+
+        const auto pkt = openscarlett::BuildOpusTestPacket(1u, 11u, 64u);
+        std::vector<float> out_pcm(960u, 0.0f);
+        XApuRetailDataCommand data_cmd{};
+        data_cmd.header.type = XApuRetailCommand_Data;
+        data_cmd.header.streamIndex = 3u;
+        data_cmd.pitchRamp = 0.0f;
+        data_cmd.targetPitch = 0.0f;
+        data_cmd.firstFrame = 312u;
+        data_cmd.frameCount = 0x3C0u;
+        data_cmd.inputDataLength = static_cast<uint32_t>(pkt.size());
+        data_cmd.inputDataPtr = reinterpret_cast<uint64_t>(pkt.data());
+        data_cmd.maxOutputDataLength = static_cast<uint32_t>(out_pcm.size() * sizeof(float));
+        data_cmd.outputDataPtr = reinterpret_cast<uint64_t>(out_pcm.data());
+
+        OS_REQUIRE(p_enqueue(conn, &data_cmd, 0u) == XAPU_S_OK);
+        OS_REQUIRE(p_get_count(conn, nullptr) == 1);
+        OS_REQUIRE(p_dequeue(conn, &res, sizeof(res), nullptr) == XAPU_S_OK);
+        OS_REQUIRE(res.hresult == XAPU_S_OK);
+        OS_REQUIRE(res.currentPitch == 1.0f);
+        OS_REQUIRE(res.outputFrameCount == 960u - 312u);
+        OS_REQUIRE(res.outputDataLength == (960u - 312u) * sizeof(float));
+
+        float peak = 0.0f;
+        for (uint32_t i = 0u; i < res.outputFrameCount; ++i) {
+            OS_REQUIRE(std::isfinite(out_pcm[i]));
+            peak = (std::max)(peak, std::fabs(out_pcm[i]));
+        }
+        OS_REQUIRE(peak > 0.001f);
+        OS_REQUIRE(p_disconnect(conn) == XAPU_S_OK);
+    }
+
     ::FreeLibrary(mod);
     std::printf("  PASS: xapu.dll retail engine.\n");
 }

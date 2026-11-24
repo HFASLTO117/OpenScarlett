@@ -806,8 +806,25 @@ struct OpusMftDecoder::Impl {
         }
     }
 
+    static HMODULE LoadSystem32Dll(const wchar_t* dll_name) {
+        wchar_t sys_dir[MAX_PATH]{};
+        const UINT len = GetSystemDirectoryW(sys_dir, MAX_PATH);
+        if (len > 0u && len < MAX_PATH - 32u) {
+            std::wstring full(sys_dir, len);
+            if (!full.empty() && full.back() != L'\\') {
+                full.push_back(L'\\');
+            }
+            full.append(dll_name);
+            HMODULE mod = LoadLibraryW(full.c_str());
+            if (mod) {
+                return mod;
+            }
+        }
+        return LoadLibraryW(dll_name);
+    }
+
     bool LoadMfPlat() {
-        mfplat_mod = LoadLibraryW(L"mfplat.dll");
+        mfplat_mod = LoadSystem32Dll(L"mfplat.dll");
         if (!mfplat_mod) {
             return false;
         }
@@ -828,8 +845,8 @@ struct OpusMftDecoder::Impl {
     }
 
     bool InstantiateOpusMft() {
-        // Method 1: Direct LoadLibraryW("MSOpusDecoder.dll") + DllGetClassObject
-        opus_mod = LoadLibraryW(L"MSOpusDecoder.dll");
+        // Method 1: Direct System32\MSOpusDecoder.dll + DllGetClassObject
+        opus_mod = LoadSystem32Dll(L"MSOpusDecoder.dll");
         if (opus_mod) {
             auto pfn_get_class = reinterpret_cast<PfnDllGetClassObject>(
                 reinterpret_cast<void*>(GetProcAddress(opus_mod, "DllGetClassObject")));
@@ -937,6 +954,10 @@ struct OpusMftDecoder::Impl {
     }
 
     bool NegotiateOutputType() {
+        const uint32_t want_sr = (config.sample_rate != 0u) ? config.sample_rate : 48000u;
+        const uint32_t want_ch = std::clamp<uint32_t>(config.channels, 1u, 2u);
+        IMFMediaType* exact_float = nullptr;
+        IMFMediaType* exact_pcm = nullptr;
         IMFMediaType* chosen_float = nullptr;
         IMFMediaType* chosen_pcm = nullptr;
 
@@ -947,24 +968,41 @@ struct OpusMftDecoder::Impl {
                 break;
             }
             GUID subtype{};
+            UINT32 cand_sr = 0u;
+            UINT32 cand_ch = 0u;
+            (void)cand->GetUINT32(kMfMtAudioSamplesPerSecond, &cand_sr);
+            (void)cand->GetUINT32(kMfMtAudioNumChannels, &cand_ch);
+            const bool exact_match = (cand_ch == want_ch && cand_sr == want_sr);
             if (SUCCEEDED(cand->GetGUID(kMfMtSubtype, &subtype))) {
-                if (std::memcmp(&subtype, &kMfAudioFormatFloat, sizeof(GUID)) == 0 && !chosen_float) {
-                    chosen_float = cand;
-                    cand = nullptr;
-                } else if (std::memcmp(&subtype, &kMfAudioFormatPcm, sizeof(GUID)) == 0 && !chosen_pcm) {
-                    chosen_pcm = cand;
-                    cand = nullptr;
+                if (std::memcmp(&subtype, &kMfAudioFormatFloat, sizeof(GUID)) == 0) {
+                    if (exact_match && !exact_float) {
+                        exact_float = cand;
+                        cand = nullptr;
+                    } else if (!chosen_float) {
+                        chosen_float = cand;
+                        cand = nullptr;
+                    }
+                } else if (std::memcmp(&subtype, &kMfAudioFormatPcm, sizeof(GUID)) == 0) {
+                    if (exact_match && !exact_pcm) {
+                        exact_pcm = cand;
+                        cand = nullptr;
+                    } else if (!chosen_pcm) {
+                        chosen_pcm = cand;
+                        cand = nullptr;
+                    }
                 }
             }
             if (cand) cand->Release();
         }
 
-        IMFMediaType* selected = chosen_float ? chosen_float : chosen_pcm;
+        IMFMediaType* selected = exact_float ? exact_float
+                                 : (exact_pcm ? exact_pcm
+                                    : (chosen_float ? chosen_float : chosen_pcm));
         if (!selected) {
             // Manually construct a float32 output media type as fallback.
             if (SUCCEEDED(pfn_mf_create_media_type(&selected)) && selected) {
-                const uint32_t sr = (config.sample_rate != 0u) ? config.sample_rate : 48000u;
-                const uint32_t ch = std::clamp<uint32_t>(config.channels, 1u, 2u);
+                const uint32_t sr = want_sr;
+                const uint32_t ch = want_ch;
                 selected->SetGUID(kMfMtMajorType, kMfMediaTypeAudio);
                 selected->SetGUID(kMfMtSubtype, kMfAudioFormatFloat);
                 selected->SetUINT32(kMfMtAudioNumChannels, ch);
@@ -974,9 +1012,14 @@ struct OpusMftDecoder::Impl {
                 selected->SetUINT32(kMfMtAudioAvgBytesPerSecond, sr * ch * 4u);
             }
         }
+        auto release_unused = [&]() {
+            if (exact_float && exact_float != selected) exact_float->Release();
+            if (exact_pcm && exact_pcm != selected) exact_pcm->Release();
+            if (chosen_float && chosen_float != selected) chosen_float->Release();
+            if (chosen_pcm && chosen_pcm != selected) chosen_pcm->Release();
+        };
         if (!selected) {
-            if (chosen_float) chosen_float->Release();
-            if (chosen_pcm) chosen_pcm->Release();
+            release_unused();
             return false;
         }
 
@@ -984,8 +1027,8 @@ struct OpusMftDecoder::Impl {
         stats.last_hresult = static_cast<int32_t>(hr);
         if (SUCCEEDED(hr)) {
             GUID sub{};
-            UINT32 sr = config.sample_rate != 0u ? config.sample_rate : 48000u;
-            UINT32 ch = config.channels != 0u ? config.channels : 2u;
+            UINT32 sr = want_sr;
+            UINT32 ch = want_ch;
             UINT32 bits = 32u;
             if (SUCCEEDED(selected->GetGUID(kMfMtSubtype, &sub))) {
                 output_is_float = (std::memcmp(&sub, &kMfAudioFormatFloat, sizeof(GUID)) == 0);
@@ -1006,8 +1049,7 @@ struct OpusMftDecoder::Impl {
             }
         }
 
-        if (chosen_float && chosen_float != selected) chosen_float->Release();
-        if (chosen_pcm && chosen_pcm != selected) chosen_pcm->Release();
+        release_unused();
         selected->Release();
         return SUCCEEDED(hr);
     }

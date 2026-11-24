@@ -805,7 +805,7 @@ private:
                 if (IsReadablePointer(command, 0x2Cu)) {
                     float raw_pitch = 1.0f;
                     std::memcpy(&raw_pitch, cmd_bytes + 0x28, sizeof(float));
-                    start_pitch = std::isfinite(raw_pitch)
+                    start_pitch = (std::isfinite(raw_pitch) && raw_pitch > 0.0f)
                                       ? std::clamp(raw_pitch, 0.125f, 8.0f)
                                       : 1.0f;
                 }
@@ -927,11 +927,15 @@ private:
                 std::vector<float> decoded;
                 if (input_data_len > 0u && IsReadablePointer(in_ptr, input_data_len)) {
                     const auto* in_u8 = static_cast<const uint8_t*>(in_ptr);
-                    openscarlett::Status st = stream.decoder->DecodeStream(
-                        in_u8, input_data_len, decoded, openscarlett::OpusPacketFraming::Auto);
+                    // Retail XApu Data commands pass a single raw RFC 6716 Opus packet
+                    // (caller strips any 2-byte length prefix). Try DecodePacket directly
+                    // first so Auto length-prefix detection cannot falsely split raw packets.
+                    openscarlett::Status st =
+                        stream.decoder->DecodePacket(in_u8, input_data_len, decoded);
                     if (!st.ok()) {
                         decoded.clear();
-                        st = stream.decoder->DecodePacket(in_u8, input_data_len, decoded);
+                        st = stream.decoder->DecodeStream(
+                            in_u8, input_data_len, decoded, openscarlett::OpusPacketFraming::Auto);
                     }
                     if (!st.ok()) {
                         res.hresult = XAPU_E_BAD_OPUS_PACKET;
@@ -941,6 +945,32 @@ private:
                 }
                 if (flush_end && res.hresult == XAPU_S_OK) {
                     (void)stream.decoder->Drain(decoded);
+                }
+
+                // Normalize decoded channel count to stream.channels so MFT channel mismatches
+                // never stretch or compress playback speed (half-speed/double-speed garbling).
+                const uint32_t dec_ch =
+                    std::max<uint32_t>(1u, static_cast<uint32_t>(stream.decoder->Stats().output_channels));
+                if (dec_ch != ch && !decoded.empty()) {
+                    const size_t raw_frames = decoded.size() / dec_ch;
+                    std::vector<float> remapped(raw_frames * ch, 0.0f);
+                    if (dec_ch == 2u && ch == 1u) {
+                        for (size_t f = 0u; f < raw_frames; ++f) {
+                            remapped[f] = 0.5f * (decoded[f * 2u] + decoded[f * 2u + 1u]);
+                        }
+                    } else if (dec_ch == 1u && ch == 2u) {
+                        for (size_t f = 0u; f < raw_frames; ++f) {
+                            remapped[f * 2u] = decoded[f];
+                            remapped[f * 2u + 1u] = decoded[f];
+                        }
+                    } else {
+                        for (size_t f = 0u; f < raw_frames; ++f) {
+                            for (uint32_t c = 0u; c < ch; ++c) {
+                                remapped[f * ch + c] = decoded[f * dec_ch + (c % dec_ch)];
+                            }
+                        }
+                    }
+                    decoded = std::move(remapped);
                 }
 
                 const uint32_t decoded_frames = static_cast<uint32_t>(decoded.size() / ch);
@@ -1146,6 +1176,29 @@ private:
         res.outputDataLength = out_frames * ch * static_cast<uint32_t>(sizeof(float));
         res.currentPitch = stream.current_pitch;
         res.inputDataLength = input_bytes_consumed;
+
+        static std::atomic<uint64_t> data_trace_cnt{0u};
+        if (ShouldTraceRetailCall(data_trace_cnt)) {
+            uint8_t b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0;
+            if (input_data_len >= 6u && IsReadablePointer(in_ptr, 6u)) {
+                const auto* p = static_cast<const uint8_t*>(in_ptr);
+                b0 = p[0]; b1 = p[1]; b2 = p[2]; b3 = p[3]; b4 = p[4]; b5 = p[5];
+            }
+            const char* backend_name =
+                stream.decoder
+                    ? (stream.decoder->IsNativeMftActive() ? "NativeMFT" : "FallbackTOC")
+                    : "None";
+            const uint32_t dec_ch = stream.decoder ? stream.decoder->Stats().output_channels : 0u;
+            const uint32_t dec_sr = stream.decoder ? stream.decoder->Stats().output_sample_rate : 0u;
+            openscarlett::audio::TraceRetailAudio(
+                "xapu", nullptr,
+                "Data(st=%u ch=%u proc=%u opt=0x%X inLen=%u [%02X %02X %02X %02X %02X %02X] firstF=%u reqF=%u maxOut=%u -> outF=%u outB=%u hr=0x%08X backend=%s dec=%uHz/%uch)",
+                hdr.streamIndex, ch, state.process_type, hdr.options,
+                input_data_len, b0, b1, b2, b3, b4, b5,
+                first_frame, frame_count, max_output_len,
+                out_frames, res.outputDataLength, static_cast<uint32_t>(res.hresult),
+                backend_name, dec_sr, dec_ch);
+        }
     }
 
     std::shared_ptr<XApuConnectionState> Lookup(XAPU_CONNECTION_HANDLE connection) {
