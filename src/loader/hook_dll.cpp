@@ -5083,6 +5083,114 @@ LONG CALLBACK Zen2IllegalInstructionVeh(PEXCEPTION_POINTERS ep) {
         }
     }
 
+    // 4. AMD SSE4A (Xbox Series X Zen 2 hardware feature absent on Intel CPUs):
+    //    - INSERTQ xmm1, xmm2, imm8, imm8 : F2 [REX] 0F 78 /r ib ib
+    //    - INSERTQ xmm1, xmm2             : F2 [REX] 0F 79 /r
+    //    - EXTRQ   xmm1, imm8, imm8       : 66 [REX] 0F 78 /0 ib ib
+    //    - EXTRQ   xmm1, xmm2             : 66 [REX] 0F 79 /r
+    if (p[0] == 0xF2u || p[0] == 0x66u) {
+        const uint8_t pfx = p[0];
+        size_t idx = 1u;
+        uint8_t rex = 0u;
+        if ((p[idx] & 0xF0u) == 0x40u) {
+            rex = p[idx++];
+        }
+        if (p[idx] == 0x0Fu && (p[idx + 1u] == 0x78u || p[idx + 1u] == 0x79u)) {
+            const uint8_t op2 = p[idx + 1u];
+            const uint8_t modrm = p[idx + 2u];
+            const uint8_t mod = static_cast<uint8_t>((modrm >> 6u) & 3u);
+            const uint8_t reg_raw = static_cast<uint8_t>((modrm >> 3u) & 7u);
+            const uint8_t rm_raw = static_cast<uint8_t>(modrm & 7u);
+            if (mod == 3u) {
+                const uint32_t reg_idx = static_cast<uint32_t>(reg_raw) | ((rex & 0x04u) ? 8u : 0u);
+                const uint32_t rm_idx = static_cast<uint32_t>(rm_raw) | ((rex & 0x01u) ? 8u : 0u);
+                M128A* xmms = &ctx->Xmm0;
+                auto make_mask = [](uint32_t len) noexcept -> uint64_t {
+                    return (len == 0u || len >= 64u) ? ~0ull : ((1ull << len) - 1ull);
+                };
+                if (pfx == 0xF2u && op2 == 0x78u) {
+                    // INSERTQ xmm1(reg), xmm2(rm), imm8(len), imm8(bit_index)
+                    const uint32_t len = p[idx + 3u] & 0x3Fu;
+                    const uint32_t bit = p[idx + 4u] & 0x3Fu;
+                    const uint64_t mask = make_mask(len);
+                    const uint64_t dst = xmms[reg_idx].Low;
+                    const uint64_t src = xmms[rm_idx].Low;
+                    xmms[reg_idx].Low = (dst & ~(mask << bit)) | ((src & mask) << bit);
+                    ctx->Rip += idx + 5u;
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+                if (pfx == 0xF2u && op2 == 0x79u) {
+                    // INSERTQ xmm1(reg), xmm2(rm) (len/idx in xmm2.High[5:0], [13:8])
+                    const uint64_t ctrl = static_cast<uint64_t>(xmms[rm_idx].High);
+                    const uint32_t len = static_cast<uint32_t>(ctrl & 0x3Full);
+                    const uint32_t bit = static_cast<uint32_t>((ctrl >> 8u) & 0x3Full);
+                    const uint64_t mask = make_mask(len);
+                    const uint64_t dst = xmms[reg_idx].Low;
+                    const uint64_t src = xmms[rm_idx].Low;
+                    xmms[reg_idx].Low = (dst & ~(mask << bit)) | ((src & mask) << bit);
+                    ctx->Rip += idx + 3u;
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+                if (pfx == 0x66u && op2 == 0x78u && reg_raw == 0u) {
+                    // EXTRQ xmm1(rm), imm8(len), imm8(bit_index)
+                    const uint32_t len = p[idx + 3u] & 0x3Fu;
+                    const uint32_t bit = p[idx + 4u] & 0x3Fu;
+                    const uint64_t mask = make_mask(len);
+                    xmms[rm_idx].Low = (xmms[rm_idx].Low >> bit) & mask;
+                    ctx->Rip += idx + 5u;
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+                if (pfx == 0x66u && op2 == 0x79u) {
+                    // EXTRQ xmm1(reg), xmm2(rm) (len/idx in xmm2.Low[5:0], [13:8])
+                    const uint64_t ctrl = xmms[rm_idx].Low;
+                    const uint32_t len = static_cast<uint32_t>(ctrl & 0x3Full);
+                    const uint32_t bit = static_cast<uint32_t>((ctrl >> 8u) & 0x3Full);
+                    const uint64_t mask = make_mask(len);
+                    xmms[reg_idx].Low = (xmms[reg_idx].Low >> bit) & mask;
+                    ctx->Rip += idx + 3u;
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+            }
+        }
+    }
+
+    if (g_trace_ods) {
+        static std::atomic<uint32_t> s_unhandled_ud{0u};
+        if (s_unhandled_ud.fetch_add(1u, std::memory_order_relaxed) < 4u) {
+            HMODULE mod = nullptr;
+            char mod_name[MAX_PATH]{};
+            uintptr_t rva = 0u;
+            if (::GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                         GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                     reinterpret_cast<LPCSTR>(ctx->Rip), &mod) &&
+                mod) {
+                ::GetModuleFileNameA(mod, mod_name, static_cast<DWORD>(sizeof(mod_name)));
+                rva = static_cast<uintptr_t>(ctx->Rip) - reinterpret_cast<uintptr_t>(mod);
+            }
+            uint8_t bytes[12]{};
+            size_t avail = 0u;
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (::VirtualQuery(p, &mbi, sizeof(mbi)) != 0u && mbi.State == MEM_COMMIT) {
+                const uintptr_t seg_end =
+                    reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+                const uintptr_t cur_ip = reinterpret_cast<uintptr_t>(p);
+                if (seg_end > cur_ip) {
+                    avail = std::min<size_t>(sizeof(bytes), static_cast<size_t>(seg_end - cur_ip));
+                    std::memcpy(bytes, p, avail);
+                }
+            }
+            std::fprintf(stderr,
+                         "[OpenScarlett][VEH-UD] rip=0x%llX (%s+0x%llX) avail=%zu bytes=%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X rax=0x%llX rcx=0x%llX rdx=0x%llX\n",
+                         static_cast<unsigned long long>(ctx->Rip), mod_name,
+                         static_cast<unsigned long long>(rva), avail,
+                         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
+                         bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11],
+                         static_cast<unsigned long long>(ctx->Rax),
+                         static_cast<unsigned long long>(ctx->Rcx),
+                         static_cast<unsigned long long>(ctx->Rdx));
+            std::fflush(stderr);
+        }
+    }
     return EXCEPTION_CONTINUE_SEARCH;
 }
 

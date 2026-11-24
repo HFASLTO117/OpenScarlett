@@ -918,6 +918,18 @@ public:
                     if ((inst.op == IrOp::LoadUav || inst.op == IrOp::SmemSpanCheck ||
                          inst.op == IrOp::LoadUavSpanElem) &&
                         (inst.imm_u32 & kIrLoadCbHeapFlagLifter) != 0u) {
+                        const uint32_t s2_p1 = (inst.imm_u32 >> 24) & 0x1Fu;
+                        if (s2_p1 > 0u) {
+                            const uint32_t s2 = s2_p1 - 1u;
+                            if (s2 < 16u &&
+                                ((ir_.used_space2_srv_slots & (1u << s2)) != 0u) &&
+                                ((ir_.used_space2_tex_slots & (1u << s2)) != 0u)) {
+                                // Collision fallback: t<s2> space2 is owned by Texture2D; use _srv0/_in0.
+                                if (has_dual_srv0) needs_srv0_decl = true;
+                                else if (in0_is_cbv || in0_is_srv) needs_in0_decl = true;
+                            }
+                            continue;
+                        }
                         if (has_dual_srv0) {
                             needs_srv0_decl = true;
                             continue;
@@ -963,6 +975,30 @@ public:
         }
         if (uses_dual_uav) {
             hdr << "RWByteAddressBuffer _out0 : register(u1);\n";
+        }
+        // Hardware descriptor-table slot resources (space2): exact s[8:9]+slot*32 mapping for
+        // multi-texture / multi-CBV Scarlett shaders (e.g. YUV420 video, PBR G-buffer, post-FX).
+        for (uint32_t s2 = 0u; s2 < 16u; ++s2) {
+            const bool has_s2_tex = (ir_.used_space2_tex_slots & (1u << s2)) != 0u;
+            if (((ir_.used_space2_srv_slots & (1u << s2)) != 0u) && !has_s2_tex) {
+                hdr << "ByteAddressBuffer _srv_s" << s2 << " : register(t" << s2 << ", space2);\n";
+            }
+            if ((ir_.used_space2_cbv_slots & (1u << s2)) != 0u) {
+                hdr << "cbuffer _cb_s" << s2 << " : register(b" << s2 << ", space2) {\n"
+                    << "    uint4 _cb_s" << s2 << "_d[4096];\n"
+                    << "};\n"
+                    << "uint _os_cb_s" << s2 << "_load(uint off) {\n"
+                    << "    if (off >= 65536u) return 0u;\n"
+                    << "    uint dw = off >> 2u;\n"
+                    << "    uint4 q = _cb_s" << s2 << "_d[(dw >> 2u) & 4095u];\n"
+                    << "    uint l = dw & 3u;\n"
+                    << "    return (l == 0u) ? q.x : ((l == 1u) ? q.y : ((l == 2u) ? q.z : q.w));\n"
+                    << "}\n";
+            }
+            if (has_s2_tex) {
+                const char* tex_elem = (ir_.texture_srv_format == Rdna2TextureFormat::Uint4) ? "uint4" : "float4";
+                hdr << "Texture2D<" << tex_elem << "> _tex_s" << s2 << " : register(t" << s2 << ", space2);\n";
+            }
         }
         uint32_t next_t = 0u;
         if (ir_.uses_texture_srv) {
@@ -1311,7 +1347,7 @@ public:
                        "    float gy = ((asuint(g.y) & 0x7F800000u) == 0x7F800000u) ? 0.0 : g.y;\n"
                        "    return float2(gx, gy);\n"
                        "}\n"
-                       "float4 _os_sample_affine_quad(float2 uv) {\n"
+                       "float4 _os_sample_affine_quad_t(Texture2D<float4> _tex, float2 uv) {\n"
                        "    float2 _q_uv_x = QuadReadAcrossX(uv);\n"
                        "    float2 _q_uv_y = QuadReadAcrossY(uv);\n"
                        "    float2 _q_uv_d = QuadReadAcrossDiagonal(uv);\n"
@@ -1322,10 +1358,16 @@ public:
                        "    float2 _ddy = _os_sanitize_grad(ddy_fine(uv));\n"
                        "    float2 _grad_x = (dot(_ddx, _ddx) > 0.0) ? _ddx : ((dot(_quad_dx, _quad_dx) > 0.0) ? _quad_dx : _quad_dd);\n"
                        "    float2 _grad_y = (dot(_ddy, _ddy) > 0.0) ? _ddy : _quad_dy;\n"
-                       "    return _tex0.SampleGrad(_samp0, uv, _grad_x, _grad_y);\n"
+                       "    return _tex.SampleGrad(_samp0, uv, _grad_x, _grad_y);\n"
+                       "}\n"
+                       "float4 _os_sample_affine_quad(float2 uv) {\n"
+                       "    return _os_sample_affine_quad_t(_tex0, uv);\n"
                        "}\n";
             } else {
-                hdr << "float4 _os_sample_affine_quad(float2 uv) {\n"
+                hdr << "float4 _os_sample_affine_quad_t(Texture2D<float4> _tex, float2 uv) {\n"
+                       "    return _tex.SampleGrad(_samp0, uv, ddx(uv), ddy(uv));\n"
+                       "}\n"
+                       "float4 _os_sample_affine_quad(float2 uv) {\n"
                        "    return _tex0.SampleGrad(_samp0, uv, ddx(uv), ddy(uv));\n"
                        "}\n";
             }
@@ -1887,8 +1929,54 @@ private:
                 }
                 const uint32_t span_dwords = std::max(1u, (inst.imm_u32 >> 16) & 0xFFu);
                 const uint32_t span_bytes = span_dwords * 4u;
+                const uint32_t s2_p1 = (inst.imm_u32 >> 24) & 0x1Fu;
                 const bool is_cb = (inst.imm_u32 & kIrLoadCbHeapFlagLifter) != 0u;
                 const uint32_t cb_reg = inst.imm_u32 & 0xFFu;
+                if (s2_p1 > 0u) {
+                    const uint32_t s2 = s2_p1 - 1u;
+                    const bool s2_srv_bit = (s2 < 16u) && ((ir_.used_space2_srv_slots & (1u << s2)) != 0u);
+                    const bool s2_tex_bit = (s2 < 16u) && ((ir_.used_space2_tex_slots & (1u << s2)) != 0u);
+                    os << ind << "{\n";
+                    os << ind << "    uint _sp_off = " << AsU32(inst.operands[0]) << ";\n";
+                    if (s2_srv_bit) {
+                        const auto& pb_loc = ir_.stage_contract.psv0_bindings;
+                        const std::string sbuf =
+                            !s2_tex_bit ? ("_srv_s" + std::to_string(s2))
+                                        : ((pb_loc.enabled && pb_loc.in0_is_cbv && pb_loc.has_srv0) ? "_srv0" : "_in0");
+                        os << ind << "    uint _sp_len = 0u; " << sbuf << ".GetDimensions(_sp_len);\n";
+                        os << ind << "    uint _sp_lim = (_sp_len > 0u) ? _sp_len : 65536u;\n";
+                        os << ind << "    bool _sp_ok = (_sp_off < 0x80000000u) && (_sp_off <= _sp_lim) && ((_sp_lim - _sp_off) >= " << span_bytes << "u);\n";
+                        os << ind << "    _v" << inst.id << " = _sp_ok;\n";
+                        if (!elems.empty()) {
+                            os << ind << "    if (_sp_ok) {\n";
+                            for (const auto* e : elems) {
+                                const uint32_t k = (e->imm_u32 >> 16) & 0xFFu;
+                                os << ind << "        _v" << e->id << " = " << sbuf << ".Load(_sp_off + " << (k * 4u) << "u);\n";
+                            }
+                            os << ind << "    } else if (_sp_off < 0x80000000u && _sp_off < _sp_lim) {\n";
+                            os << ind << "        uint _sp_t[" << span_dwords << "];\n";
+                            os << ind << "        uint _sp_rem = _sp_lim - _sp_off;\n";
+                            os << ind << "        for (uint _k = 0u; _k < " << span_dwords << "u; ++_k) {\n";
+                            os << ind << "            _sp_t[_k] = (_sp_rem >= ((_k + 1u) * 4u)) ? " << sbuf << ".Load(_sp_off + (_k * 4u)) : 0u;\n";
+                            os << ind << "        }\n";
+                            for (const auto* e : elems) {
+                                const uint32_t k = (e->imm_u32 >> 16) & 0xFFu;
+                                os << ind << "        _v" << e->id << " = _sp_t[" << (k < span_dwords ? k : 0u) << "];\n";
+                            }
+                            os << ind << "    }\n";
+                        }
+                    } else {
+                        os << ind << "    bool _sp_ok = (_sp_off < 65536u) && ((65536u - _sp_off) >= " << span_bytes << "u);\n";
+                        os << ind << "    _v" << inst.id << " = _sp_ok;\n";
+                        for (const auto* e : elems) {
+                            const uint32_t k = (e->imm_u32 >> 16) & 0xFFu;
+                            os << ind << "    _v" << e->id << " = _os_cb_s" << s2 << "_load(_sp_off + " << (k * 4u) << "u);\n";
+                        }
+                    }
+                    os << ind << "}\n";
+                    ii = next_ii - 1u;
+                    continue;
+                }
                 const bool use_dual_srv0 =
                     is_cb && ir_.stage_contract.psv0_bindings.enabled &&
                     ir_.stage_contract.psv0_bindings.in0_is_cbv &&
@@ -2053,6 +2141,22 @@ private:
                     os << ind << "_v" << inst.id << " = _rc" << inst.imm_u32 << ";\n";
                     break;
                 case IrOp::LoadUav: {
+                    const uint32_t s2_p1 = (inst.imm_u32 >> 24) & 0x1Fu;
+                    if (s2_p1 > 0u) {
+                        const uint32_t s2 = s2_p1 - 1u;
+                        const bool s2_srv_bit = (s2 < 16u) && ((ir_.used_space2_srv_slots & (1u << s2)) != 0u);
+                        const bool s2_tex_bit = (s2 < 16u) && ((ir_.used_space2_tex_slots & (1u << s2)) != 0u);
+                        if (s2_srv_bit && !s2_tex_bit) {
+                            os << ind << "_v" << inst.id << " = _srv_s" << s2 << ".Load(" << AsU32(inst.operands[0]) << ");\n";
+                        } else if (s2_srv_bit && s2_tex_bit) {
+                            const auto& pb_loc = ir_.stage_contract.psv0_bindings;
+                            const char* sbuf = (pb_loc.enabled && pb_loc.in0_is_cbv && pb_loc.has_srv0) ? "_srv0" : "_in0";
+                            os << ind << "_v" << inst.id << " = " << sbuf << ".Load(" << AsU32(inst.operands[0]) << ");\n";
+                        } else {
+                            os << ind << "_v" << inst.id << " = _os_cb_s" << s2 << "_load(" << AsU32(inst.operands[0]) << ");\n";
+                        }
+                        break;
+                    }
                     const uint32_t cb_reg = inst.imm_u32 & 0xFFu;
                     const bool is_cb = (inst.imm_u32 & kIrLoadCbHeapFlagLifter) != 0u;
                     const bool use_dual_srv0 =
@@ -2093,7 +2197,26 @@ private:
                     break;
                 }
                 case IrOp::LoadUavSpanElem: {
+                    const uint32_t s2_p1 = (inst.imm_u32 >> 24) & 0x1Fu;
                     const uint32_t k = (inst.imm_u32 >> 16) & 0xFFu;
+                    if (s2_p1 > 0u) {
+                        const uint32_t s2 = s2_p1 - 1u;
+                        const bool s2_srv_bit = (s2 < 16u) && ((ir_.used_space2_srv_slots & (1u << s2)) != 0u);
+                        const bool s2_tex_bit = (s2 < 16u) && ((ir_.used_space2_tex_slots & (1u << s2)) != 0u);
+                        if (s2_srv_bit && !s2_tex_bit) {
+                            os << ind << "{ uint _so = " << AsU32(inst.operands[0]) << " + " << (k * 4u) << "u; "
+                               << "_v" << inst.id << " = _srv_s" << s2 << ".Load(_so); }\n";
+                        } else if (s2_srv_bit && s2_tex_bit) {
+                            const auto& pb_loc = ir_.stage_contract.psv0_bindings;
+                            const char* sbuf = (pb_loc.enabled && pb_loc.in0_is_cbv && pb_loc.has_srv0) ? "_srv0" : "_in0";
+                            os << ind << "{ uint _so = " << AsU32(inst.operands[0]) << " + " << (k * 4u) << "u; "
+                               << "_v" << inst.id << " = " << sbuf << ".Load(_so); }\n";
+                        } else {
+                            os << ind << "{ uint _so = " << AsU32(inst.operands[0]) << " + " << (k * 4u) << "u; "
+                               << "_v" << inst.id << " = _os_cb_s" << s2 << "_load(_so); }\n";
+                        }
+                        break;
+                    }
                     const bool is_cb = (inst.imm_u32 & kIrLoadCbHeapFlagLifter) != 0u;
                     const uint32_t cb_reg = inst.imm_u32 & 0xFFu;
                     const bool use_dual_srv0 =
@@ -2197,17 +2320,20 @@ private:
                     }
                     break;
                 }
-                case IrOp::ImageSample:
+                case IrOp::ImageSample: {
+                    const uint32_t t_s2 = (inst.imm_u32 >> 24) & 0x1Fu;
+                    const std::string tname = (t_s2 > 0u) ? ("_tex_s" + std::to_string(t_s2 - 1u)) : "_tex0";
                     if ((inst.imm_u32 & 0x80u) != 0u) {
-                        os << ind << "_v" << inst.id << " = _tex0.SampleCmpLevelZero(_samp_cmp0, float2("
+                        os << ind << "_v" << inst.id << " = " << tname << ".SampleCmpLevelZero(_samp_cmp0, float2("
                            << AsF32(inst.operands[0]) << ", " << AsF32(inst.operands[1]) << "), "
                            << AsF32(inst.operands[2]) << ");\n";
                     } else {
-                        os << ind << "_v" << inst.id << " = _tex0.SampleLevel(_samp0, float2("
+                        os << ind << "_v" << inst.id << " = " << tname << ".SampleLevel(_samp0, float2("
                            << AsF32(inst.operands[0]) << ", " << AsF32(inst.operands[1]) << "), "
                            << AsF32(inst.operands[2]) << ")." << kSwiz[inst.imm_u32 & 3u] << ";\n";
                     }
                     break;
+                }
                 case IrOp::ImageSampleDynamic: {
                     const std::string idx_expr = use_sm65_
                         ? ("NonUniformResourceIndex(" + AsU32(inst.operands[3]) + ")")
@@ -2225,11 +2351,19 @@ private:
                     }
                     break;
                 }
-                case IrOp::ImageSampleImplicit:
-                    os << ind << "_v" << inst.id << " = _os_sample_affine_quad(float2("
-                       << AsF32(inst.operands[0]) << ", " << AsF32(inst.operands[1]) << "))."
-                       << kSwiz[inst.imm_u32 & 3u] << ";\n";
+                case IrOp::ImageSampleImplicit: {
+                    const uint32_t t_s2 = (inst.imm_u32 >> 24) & 0x1Fu;
+                    if (t_s2 > 0u) {
+                        os << ind << "_v" << inst.id << " = _os_sample_affine_quad_t(_tex_s" << (t_s2 - 1u)
+                           << ", float2(" << AsF32(inst.operands[0]) << ", " << AsF32(inst.operands[1]) << "))."
+                           << kSwiz[inst.imm_u32 & 3u] << ";\n";
+                    } else {
+                        os << ind << "_v" << inst.id << " = _os_sample_affine_quad(float2("
+                           << AsF32(inst.operands[0]) << ", " << AsF32(inst.operands[1]) << "))."
+                           << kSwiz[inst.imm_u32 & 3u] << ";\n";
+                    }
                     break;
+                }
                 case IrOp::ImageSampleMinLod: {
                     // Preserved MinLod clamp in HLSL (Xbox2Windows 747b21a)
                     const uint32_t ch = inst.imm_u32 & 3u;

@@ -1808,12 +1808,28 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
                 char v[16]{};
                 return ::GetEnvironmentVariableA("OPENSCARLETT_DUMP_CL_OPS", v, sizeof(v)) > 0 && v[0] == '1';
             }();
+            static const uint32_t dump_after_exec = []() -> uint32_t {
+                char v[32]{};
+                if (::GetEnvironmentVariableA("OPENSCARLETT_DUMP_CL_AFTER_EXEC", v, sizeof(v)) > 0) {
+                    return static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+                }
+                return 0u;
+            }();
+            static const uint32_t dump_after_lift = []() -> uint32_t {
+                char v[32]{};
+                if (::GetEnvironmentVariableA("OPENSCARLETT_DUMP_AFTER_LIFT", v, sizeof(v)) > 0) {
+                    return static_cast<uint32_t>(std::strtoul(v, nullptr, 10));
+                }
+                return 0u;
+            }();
             static std::atomic<uint32_t> s_dump_exec_count{0u};
             static std::atomic<uint32_t> s_dump_dii_count{0u};
+            static std::atomic<uint32_t> s_dump_lift_count{0u};
             if (dump_all_ops) {
                 const uint32_t seq = s_dump_exec_count.fetch_add(1u, std::memory_order_relaxed);
                 bool has_dii = false;
-                if (seq >= 25u && s_dump_dii_count.load(std::memory_order_relaxed) < 4u) {
+                if (dump_after_exec == 0u && dump_after_lift == 0u && seq >= 25u &&
+                    s_dump_dii_count.load(std::memory_order_relaxed) < 4u) {
                     for (UINT i = 0; i < NumCommandLists && !has_dii; ++i) {
                         if (CommandListX* clx = CommandListX::TryFromCommandList(ppCommandLists[i])) {
                             const auto ops = clx->CopyDiagOps();
@@ -1826,7 +1842,13 @@ void STDMETHODCALLTYPE CommandQueueX::ExecuteCommandLists(
                         }
                     }
                 }
-                const bool dump_now = (seq < 5u) || (has_dii && s_dump_dii_count.fetch_add(1u, std::memory_order_relaxed) < 4u);
+                const bool dump_now =
+                    (dump_after_lift > 0u)
+                        ? (device_x_ && device_x_->LazyLiftCount() >= dump_after_lift &&
+                           s_dump_lift_count.fetch_add(1u, std::memory_order_relaxed) < 6u)
+                        : ((dump_after_exec > 0u)
+                               ? (seq >= dump_after_exec && seq < dump_after_exec + 6u)
+                               : ((seq < 5u) || (has_dii && s_dump_dii_count.fetch_add(1u, std::memory_order_relaxed) < 4u)));
                 if (dump_now) {
                     std::lock_guard<std::mutex> dlk(s_diag_mu);
                     FILE* f = nullptr;

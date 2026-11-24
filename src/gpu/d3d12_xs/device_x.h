@@ -210,6 +210,7 @@ struct UnifiedTextureMapping {
     uint64_t page_generation = 1ull;
     uint64_t uploaded_generation = 0ull;
     bool dirty = false;
+    bool allow_cpu_upload = true;
     bool cpu_readable = false;
     bool write_watch_enabled = false;
     bool has_uploaded_once = false;
@@ -251,6 +252,9 @@ public:
     }
     ID3D12Resource* LastDiiRtv() const noexcept {
         return last_dii_rtv_.load(std::memory_order_acquire);
+    }
+    uint32_t LazyLiftCount() const noexcept {
+        return lazy_lift_count_.load(std::memory_order_acquire);
     }
     void SetRetailResourceState(ID3D12Resource* res, D3D12_RESOURCE_STATES st) noexcept {
         if (!res) return;
@@ -461,6 +465,9 @@ public:
         D3D12_COMMAND_LIST_TYPE queue_type);
     void NotifyResourceStateTransition(
         ID3D12Resource* resource, D3D12_RESOURCE_STATES new_state) noexcept;
+    void RegisterUmaShadowMapping(
+        ID3D12Resource* resource, void* cpu_ptr, const D3D12_RESOURCE_DESC& desc);
+    void MarkUmaShadowDirty(ID3D12Resource* resource) noexcept;
 
     // IUnknown (slots 0..2)
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override;
@@ -1041,7 +1048,8 @@ private:
         uint64_t guest_va,
         const D3D12_RESOURCE_DESC& desc,
         D3D12_RESOURCE_STATES initial_state,
-        bool mirrored_by_title_va = false);
+        bool mirrored_by_title_va = false,
+        bool use_footprint_row_pitch = false);
     ID3D12RootSignature* SynthesizeHostRootSignatureFromXboxDesc(
         const openscarlett::XboxRootSignatureDesc& desc);
     void SyncXboxContainerSgprMapToBridge(const openscarlett::XboxParsedShaderContainer& parsed);
@@ -1492,6 +1500,7 @@ private:
     std::unordered_map<uint64_t, std::string> diag_desc_map_;
     std::unordered_map<void*, std::string> diag_rs_map_;
     std::atomic<ID3D12Resource*> last_dii_rtv_{nullptr};
+    std::atomic<uint32_t> lazy_lift_count_{0u};
     mutable std::mutex retail_state_mutex_;
     std::unordered_map<ID3D12Resource*, D3D12_RESOURCE_STATES> retail_res_states_;
 };

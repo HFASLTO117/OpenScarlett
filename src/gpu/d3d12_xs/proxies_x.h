@@ -212,7 +212,7 @@ private:
     D3D12_GPU_VIRTUAL_ADDRESS xbox_gpu_va_ = 0ull;
     std::mutex uma_map_mutex_;
     std::vector<uint8_t> uma_cpu_shadow_;
-    bool uma_shadow_mapped_ = false;
+    uint32_t uma_shadow_map_count_ = 0u;
     bool l0_spilled_from_default_ = false;
 };
 

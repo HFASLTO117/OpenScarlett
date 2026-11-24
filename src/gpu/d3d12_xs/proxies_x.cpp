@@ -431,8 +431,11 @@ HRESULT STDMETHODCALLTYPE ResourceXProxy::Map(
         // Add 256 KiB alignment headroom for Xbox XG tiled surface sizes that exceed PC GetResourceAllocationInfo.
         const uint64_t padded_bytes = ((alloc_bytes + 65535ull) & ~65535ull) + 262144ull;
         uma_cpu_shadow_.assign(static_cast<size_t>(padded_bytes), 0u);
+        if (device_x_ && host_res_) {
+            device_x_->RegisterUmaShadowMapping(host_res_, uma_cpu_shadow_.data(), cached_desc_);
+        }
     }
-    uma_shadow_mapped_ = true;
+    ++uma_shadow_map_count_;
     if (ppData) {
         *ppData = uma_cpu_shadow_.data();
     }
@@ -441,12 +444,23 @@ HRESULT STDMETHODCALLTYPE ResourceXProxy::Map(
 
 void STDMETHODCALLTYPE ResourceXProxy::Unmap(
     UINT Subresource, const D3D12_RANGE* pWrittenRange) {
+    bool was_shadow = false;
     {
         std::lock_guard<std::mutex> lk(uma_map_mutex_);
-        if (uma_shadow_mapped_) {
-            uma_shadow_mapped_ = false;
+        if (uma_shadow_map_count_ > 0u) {
+            --uma_shadow_map_count_;
+            was_shadow = true;
+        } else if (!uma_cpu_shadow_.empty()) {
+            // Never forward mismatched Unmap to a DEFAULT host resource backed by UMA shadow.
             return;
         }
+    }
+    if (was_shadow) {
+        if (device_x_ && host_res_ &&
+            (!pWrittenRange || pWrittenRange->End == 0u || pWrittenRange->End > pWrittenRange->Begin)) {
+            device_x_->MarkUmaShadowDirty(host_res_);
+        }
+        return;
     }
     if (host_res_) host_res_->Unmap(Subresource, pWrittenRange);
 }

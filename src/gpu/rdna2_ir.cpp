@@ -433,6 +433,11 @@ void AddUnique(std::vector<uint32_t>& vec, uint32_t val) {
 struct RegState {
     std::array<IrValueId, 256> vgpr{};
     std::array<IrValueId, 106> sgpr{};
+    std::array<int16_t, 106> sgpr_desc_slot = []() {
+        std::array<int16_t, 106> a{};
+        a.fill(-1);
+        return a;
+    }();
     IrValueId scc = kInvalidIrValue;
     IrValueId vcc = kInvalidIrValue;
     IrValueId vcc_hi = kInvalidIrValue;
@@ -1779,6 +1784,13 @@ Status BuildRdna2Ir(
                 }
                 for (size_t r = 0; r < 106; ++r) {
                     state.sgpr[r] = merge_reg([r](const RegState& s) { return s.sgpr[r]; });
+                    int16_t slot = exit_states[ready_preds[0]].sgpr_desc_slot[r];
+                    for (size_t pi = 1u; pi < ready_preds.size() && slot >= 0; ++pi) {
+                        if (exit_states[ready_preds[pi]].sgpr_desc_slot[r] != slot) {
+                            slot = -1;
+                        }
+                    }
+                    state.sgpr_desc_slot[r] = slot;
                 }
                 state.scc = merge_reg([](const RegState& s) { return s.scc; });
                 state.vcc = merge_reg([](const RegState& s) { return s.vcc; });
@@ -1865,6 +1877,15 @@ Status BuildRdna2Ir(
                 state.sgpr[r] = make_loop_phi(PendingRegKind::Sgpr, static_cast<uint16_t>(r),
                                               loop_mod.sgpr[r] != 0u,
                                               [r](const RegState& s) { return s.sgpr[r]; }, IrType::U32);
+                if (loop_mod.sgpr[r] == 0u && !ready_preds.empty()) {
+                    int16_t slot = exit_states[ready_preds[0]].sgpr_desc_slot[r];
+                    for (size_t pi = 1u; pi < ready_preds.size() && slot >= 0; ++pi) {
+                        if (exit_states[ready_preds[pi]].sgpr_desc_slot[r] != slot) {
+                            slot = -1;
+                        }
+                    }
+                    state.sgpr_desc_slot[r] = slot;
+                }
             }
             state.scc = make_loop_phi(PendingRegKind::Scc, 0u, loop_mod.scc,
                                       [](const RegState& s) { return s.scc; }, IrType::Bool);
@@ -2073,6 +2094,7 @@ Status BuildRdna2Ir(
                     }
                 }
                 state.sgpr[dst.reg_index] = val;
+                state.sgpr_desc_slot[dst.reg_index] = -1;
             } else if (dst.kind == Rdna2OperandKind::VccLo) {
                 if (state.vcc != kInvalidIrValue) {
                     ballot_cache.erase(state.vcc);
@@ -3828,7 +3850,31 @@ Status BuildRdna2Ir(
                     const uint32_t raw_off = static_cast<uint32_t>(signed_off);
                     const bool static_zero_soff =
                         (inst.soffset == 0x7Du || inst.soffset == 0x7Cu || inst.soffset == 128u);
-                    if (inst.sbase == 0u && static_zero_soff && signed_off >= 0 && (static_cast<uint32_t>(signed_off) / 4u) < 16u) {
+                    const uint32_t sbase_reg = static_cast<uint32_t>(inst.sbase) * 2u;
+                    uint32_t s2_flags = 0u;
+                    if (out_module.stage_contract.psv0_bindings.enabled &&
+                        inst.raw_opcode >= 0x08u && sbase_reg < 106u &&
+                        state.sgpr_desc_slot[sbase_reg] >= 0) {
+                        const uint32_t slot = static_cast<uint32_t>(state.sgpr_desc_slot[sbase_reg]);
+                        if (slot == 0u && out_module.stage_contract.psv0_bindings.has_srv0) {
+                            out_module.used_space2_srv_slots |= (1u << slot);
+                        } else {
+                            out_module.used_space2_cbv_slots |= (1u << slot);
+                        }
+                        s2_flags = ((slot + 1u) & 0x1Fu) << 24;
+                    }
+                    if (s2_flags != 0u) {
+                        IrValueId off = emit_in_bb(IrOp::ConstU32, IrType::U32, {}, raw_off, 0.0f);
+                        if (inst.soffset < 106u) {
+                            off = emit_in_bb(IrOp::IAdd, IrType::U32, {off, read_sgpr(inst.soffset)});
+                        } else if (inst.soffset >= 129u && inst.soffset <= 192u) {
+                            IrValueId imm_s = emit_in_bb(IrOp::ConstU32, IrType::U32, {},
+                                                         static_cast<uint32_t>(inst.soffset - 128u), 0.0f);
+                            off = emit_in_bb(IrOp::IAdd, IrType::U32, {off, imm_s});
+                        }
+                        write_dst(inst.dst, emit_in_bb(IrOp::LoadUav, IrType::U32, {off},
+                                                       s2_flags | kIrLoadCbHeapFlag | kIrLoadSmemBoundsCheckFlag));
+                    } else if (inst.sbase == 0u && static_zero_soff && signed_off >= 0 && (static_cast<uint32_t>(signed_off) / 4u) < 16u) {
                         write_dst(inst.dst, get_root_const(static_cast<uint32_t>(signed_off) / 4u));
                     } else if (inst.sbase != 0u) {
                         // Mixed-heap safety: CB loads with non-zero base SGPR offset route to
@@ -3872,8 +3918,33 @@ Status BuildRdna2Ir(
                     const int32_t signed_off = inst.mem_offset;
                     const uint32_t raw_off = static_cast<uint32_t>(signed_off);
                     const uint8_t dst_base = static_cast<uint8_t>(inst.dst.reg_index);
+                    const uint32_t sbase_reg = static_cast<uint32_t>(inst.sbase) * 2u;
+                    const bool static_zero_soff =
+                        (inst.soffset == 0x7Du || inst.soffset == 0x7Cu || inst.soffset == 128u);
+                    // Detect hardware descriptor-table loads (s_load_dwordx4 / x8 from root table
+                    // pointer s[8:9] + static slot*32) before write_dst clears destination SGPRs.
+                    int16_t loaded_desc_slot = -1;
+                    if (out_module.stage_contract.psv0_bindings.enabled &&
+                        static_zero_soff &&
+                        (inst.raw_opcode == 0x02u || inst.raw_opcode == 0x03u) &&
+                        inst.sbase > 0u && sbase_reg < 106u &&
+                        state.sgpr_desc_slot[sbase_reg] < 0 &&
+                        signed_off >= 0 && (signed_off & 31) == 0 && (signed_off / 32) < 16 &&
+                        dst_base < 106u) {
+                        loaded_desc_slot = static_cast<int16_t>(signed_off / 32);
+                    }
                     uint32_t base_flags = 0u;
-                    if (inst.sbase != 0u) {
+                    if (out_module.stage_contract.psv0_bindings.enabled &&
+                        inst.raw_opcode >= 0x08u && sbase_reg < 106u &&
+                        state.sgpr_desc_slot[sbase_reg] >= 0) {
+                        const uint32_t slot = static_cast<uint32_t>(state.sgpr_desc_slot[sbase_reg]);
+                        if (slot == 0u && out_module.stage_contract.psv0_bindings.has_srv0) {
+                            out_module.used_space2_srv_slots |= (1u << slot);
+                        } else {
+                            out_module.used_space2_cbv_slots |= (1u << slot);
+                        }
+                        base_flags = kIrLoadCbHeapFlag | (((slot + 1u) & 0x1Fu) << 24);
+                    } else if (inst.sbase != 0u) {
                         base_flags = kIrLoadCbHeapFlag | static_cast<uint32_t>(inst.sbase & 0xFFu);
                     } else {
                         out_module.uses_uav = true;
@@ -3893,6 +3964,9 @@ Status BuildRdna2Ir(
                         IrValueId elem = emit_in_bb(IrOp::LoadUavSpanElem, IrType::U32, {off, span_ok},
                                                     base_flags | (k << 16));
                         write_dst(Rdna2Operand::Sgpr(static_cast<uint8_t>(dst_base + k)), elem);
+                    }
+                    if (loaded_desc_slot >= 0 && dst_base < 106u) {
+                        state.sgpr_desc_slot[dst_base] = loaded_desc_slot;
                     }
                     break;
                 }
@@ -4215,6 +4289,14 @@ Status BuildRdna2Ir(
                     const uint8_t vaddr_base = static_cast<uint8_t>(inst.src[0].reg_index);
                     const uint8_t vdata_base = static_cast<uint8_t>(inst.dst.reg_index);
                     const uint8_t dmask = inst.mimg_dmask ? inst.mimg_dmask : 0xFu;
+                    uint32_t tex_s2_flags = 0u;
+                    const uint32_t srsrc_sgpr = static_cast<uint32_t>(inst.srsrc) * 4u;
+                    if (out_module.stage_contract.psv0_bindings.enabled &&
+                        srsrc_sgpr < 106u && state.sgpr_desc_slot[srsrc_sgpr] >= 0) {
+                        const uint32_t slot = static_cast<uint32_t>(state.sgpr_desc_slot[srsrc_sgpr]);
+                        out_module.used_space2_tex_slots |= (1u << slot);
+                        tex_s2_flags = ((slot + 1u) & 0x1Fu) << 24;
+                    }
                     uint8_t out_reg = vdata_base;
                     if (inst.opcode == Rdna2Opcode::IMAGE_SAMPLE_C_LZ) {
                         // RDNA2 ISA: image_sample_c_lz takes vaddr[0]=dref, vaddr[1]=u, vaddr[2]=v
@@ -4226,7 +4308,7 @@ Status BuildRdna2Ir(
                         IrValueId v = read_vgpr(reg_v, true);
                         for (uint32_t ch = 0; ch < 4u; ++ch) {
                             if ((dmask & (1u << ch)) != 0u) {
-                                state.vgpr[out_reg++] = emit_in_bb(IrOp::ImageSample, IrType::F32, {u, v, dref}, ch | 0x80u);
+                                state.vgpr[out_reg++] = emit_in_bb(IrOp::ImageSample, IrType::F32, {u, v, dref}, ch | 0x80u | tex_s2_flags);
                             }
                         }
                     } else {
@@ -4239,7 +4321,7 @@ Status BuildRdna2Ir(
                             out_module.uses_pixel_quad_derivatives = true;
                             for (uint32_t ch = 0; ch < 4u; ++ch) {
                                 if ((dmask & (1u << ch)) != 0u) {
-                                    state.vgpr[out_reg++] = emit_in_bb(IrOp::ImageSampleImplicit, IrType::F32, {u, v}, ch);
+                                    state.vgpr[out_reg++] = emit_in_bb(IrOp::ImageSampleImplicit, IrType::F32, {u, v}, ch | tex_s2_flags);
                                 }
                             }
                         } else {
@@ -4250,7 +4332,7 @@ Status BuildRdna2Ir(
                             }
                             for (uint32_t ch = 0; ch < 4u; ++ch) {
                                 if ((dmask & (1u << ch)) != 0u) {
-                                    state.vgpr[out_reg++] = emit_in_bb(IrOp::ImageSample, IrType::F32, {u, v, lod}, ch);
+                                    state.vgpr[out_reg++] = emit_in_bb(IrOp::ImageSample, IrType::F32, {u, v, lod}, ch | tex_s2_flags);
                                 }
                             }
                         }
