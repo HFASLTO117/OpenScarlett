@@ -1,5 +1,7 @@
 #include <windows.h>
+#include <winreg.h>
 #include <psapi.h>
+#include <intrin.h>
 
 #include <algorithm>
 #include <atomic>
@@ -353,6 +355,16 @@ using PfnCreateProcessW = BOOL(WINAPI*)(LPCWSTR,
                                         LPPROCESS_INFORMATION);
 using PfnExitProcess = VOID(WINAPI*)(UINT);
 using PfnOutputDebugStringA = VOID(WINAPI*)(LPCSTR);
+using PfnGlobalMemoryStatusEx = BOOL(WINAPI*)(LPMEMORYSTATUSEX);
+using PfnRegOpenKeyW = LSTATUS(APIENTRY*)(HKEY, LPCWSTR, PHKEY);
+using PfnRegOpenKeyA = LSTATUS(APIENTRY*)(HKEY, LPCSTR, PHKEY);
+using PfnRegOpenKeyExW = LSTATUS(APIENTRY*)(HKEY, LPCWSTR, DWORD, REGSAM, PHKEY);
+using PfnRegOpenKeyExA = LSTATUS(APIENTRY*)(HKEY, LPCSTR, DWORD, REGSAM, PHKEY);
+using PfnRegQueryValueExW = LSTATUS(APIENTRY*)(HKEY, LPCWSTR, LPDWORD, LPDWORD, LPBYTE, LPDWORD);
+using PfnRegQueryValueExA = LSTATUS(APIENTRY*)(HKEY, LPCSTR, LPDWORD, LPDWORD, LPBYTE, LPDWORD);
+using PfnRegGetValueW = LSTATUS(APIENTRY*)(HKEY, LPCWSTR, LPCWSTR, DWORD, LPDWORD, PVOID, LPDWORD);
+using PfnRegGetValueA = LSTATUS(APIENTRY*)(HKEY, LPCSTR, LPCSTR, DWORD, LPDWORD, PVOID, LPDWORD);
+using PfnRegCloseKey = LSTATUS(APIENTRY*)(HKEY);
 using PfnWinHttpConnect = LPVOID(WINAPI*)(LPVOID, LPCWSTR, WORD, DWORD);
 
 PfnLoadLibraryA g_real_LoadLibraryA = nullptr;
@@ -405,6 +417,24 @@ PfnCreateProcessA g_kernelbase_CreateProcessA = nullptr;
 PfnCreateProcessW g_kernelbase_CreateProcessW = nullptr;
 PfnExitProcess g_real_ExitProcess = nullptr;
 PfnOutputDebugStringA g_real_OutputDebugStringA = nullptr;
+PfnGlobalMemoryStatusEx g_real_GlobalMemoryStatusEx = nullptr;
+PfnGlobalMemoryStatusEx g_kernelbase_GlobalMemoryStatusEx = nullptr;
+PfnRegOpenKeyW g_real_RegOpenKeyW = nullptr;
+PfnRegOpenKeyA g_real_RegOpenKeyA = nullptr;
+PfnRegOpenKeyExW g_real_RegOpenKeyExW = nullptr;
+PfnRegOpenKeyExA g_real_RegOpenKeyExA = nullptr;
+PfnRegQueryValueExW g_real_RegQueryValueExW = nullptr;
+PfnRegQueryValueExA g_real_RegQueryValueExA = nullptr;
+PfnRegGetValueW g_real_RegGetValueW = nullptr;
+PfnRegGetValueA g_real_RegGetValueA = nullptr;
+PfnRegCloseKey g_real_RegCloseKey = nullptr;
+PfnRegOpenKeyExW g_advapi32_RegOpenKeyExW = nullptr;
+PfnRegOpenKeyExA g_advapi32_RegOpenKeyExA = nullptr;
+PfnRegQueryValueExW g_advapi32_RegQueryValueExW = nullptr;
+PfnRegQueryValueExA g_advapi32_RegQueryValueExA = nullptr;
+PfnRegGetValueW g_advapi32_RegGetValueW = nullptr;
+PfnRegGetValueA g_advapi32_RegGetValueA = nullptr;
+PfnRegCloseKey g_advapi32_RegCloseKey = nullptr;
 PfnWinHttpConnect g_real_WinHttpConnect = nullptr;
 bool g_offline_block_winhttp = false;
 bool g_trace_ods = false;
@@ -423,6 +453,7 @@ HMODULE g_self_module = nullptr;
 HMODULE g_kernel32_mod = nullptr;
 HMODULE g_kernelbase_mod = nullptr;
 HMODULE g_ntdll_mod = nullptr;
+HMODULE g_advapi32_mod = nullptr;
 std::wstring g_shim_dir_w;
 std::wstring g_hook_dll_path_w;
 std::wstring g_guest_dir_w;
@@ -679,6 +710,7 @@ bool IsHookableImportDll(const char* dll_name) {
     if (lo == "kernel32.dll" ||
         lo == "kernelbase.dll" ||
         lo == "ntdll.dll" ||
+        lo == "advapi32.dll" ||
         (g_offline_block_winhttp && lo == "winhttp.dll") ||
         lo.rfind("api-ms-win-core-", 0) == 0) {
         return true;
@@ -687,7 +719,8 @@ bool IsHookableImportDll(const char* dll_name) {
         std::string target_dll;
         if (g_pe_forwarder.ResolveApiSetContract(lo, target_dll)) {
             const std::string tlo = ToLowerAsciiA(target_dll);
-            return tlo == "kernel32.dll" || tlo == "kernelbase.dll" || tlo == "ntdll.dll";
+            return tlo == "kernel32.dll" || tlo == "kernelbase.dll" ||
+                   tlo == "ntdll.dll" || tlo == "advapi32.dll";
         }
     }
     return false;
@@ -754,9 +787,21 @@ int FlushTelemetryInternal(bool only_once) {
 }
 
 // Forward declarations for recursive IAT/delay-load patching and forwarded GetProcAddress
+bool IsModuleInShimDir(HMODULE mod);
+void EnsureAdvapi32ProcsResolved() noexcept;
 void PatchModuleImports(HMODULE mod);
 void PatchAllLoadedNonSystemModules();
 FARPROC WINAPI Hook_GetProcAddress(HMODULE hModule, LPCSTR lpProcName);
+BOOL WINAPI Hook_GlobalMemoryStatusEx(LPMEMORYSTATUSEX lpBuffer);
+LSTATUS APIENTRY Hook_RegOpenKeyW(HKEY hKey, LPCWSTR lpSubKey, PHKEY phkResult);
+LSTATUS APIENTRY Hook_RegOpenKeyA(HKEY hKey, LPCSTR lpSubKey, PHKEY phkResult);
+LSTATUS APIENTRY Hook_RegOpenKeyExW(HKEY hKey, LPCWSTR lpSubKey, DWORD ulOptions, REGSAM samDesired, PHKEY phkResult);
+LSTATUS APIENTRY Hook_RegOpenKeyExA(HKEY hKey, LPCSTR lpSubKey, DWORD ulOptions, REGSAM samDesired, PHKEY phkResult);
+LSTATUS APIENTRY Hook_RegQueryValueExW(HKEY hKey, LPCWSTR lpValueName, LPDWORD lpReserved, LPDWORD lpType, LPBYTE lpData, LPDWORD lpcbData);
+LSTATUS APIENTRY Hook_RegQueryValueExA(HKEY hKey, LPCSTR lpValueName, LPDWORD lpReserved, LPDWORD lpType, LPBYTE lpData, LPDWORD lpcbData);
+LSTATUS APIENTRY Hook_RegGetValueW(HKEY hkey, LPCWSTR lpSubKey, LPCWSTR lpValue, DWORD dwFlags, LPDWORD pdwType, PVOID pvData, LPDWORD pcbData);
+LSTATUS APIENTRY Hook_RegGetValueA(HKEY hkey, LPCSTR lpSubKey, LPCSTR lpValue, DWORD dwFlags, LPDWORD pdwType, PVOID pvData, LPDWORD pcbData);
+LSTATUS APIENTRY Hook_RegCloseKey(HKEY hKey);
 OS_NTSTATUS NTAPI Hook_NtCreateFile(PHANDLE FileHandle,
                                     ACCESS_MASK DesiredAccess,
                                     OS_OBJECT_ATTRIBUTES* ObjectAttributes,
@@ -1591,7 +1636,45 @@ FARPROC WINAPI Hook_GetProcAddress(HMODULE hModule, LPCSTR lpProcName) {
                 std::strcmp(lpProcName, "GetFinalPathNameByHandleW") == 0) {
                 return reinterpret_cast<FARPROC>(&Hook_GetFinalPathNameByHandleW);
             }
-        } else if (g_ntdll_mod != nullptr && hModule == g_ntdll_mod) {
+            if ((g_real_GlobalMemoryStatusEx != nullptr ||
+                 g_kernelbase_GlobalMemoryStatusEx != nullptr) &&
+                std::strcmp(lpProcName, "GlobalMemoryStatusEx") == 0) {
+                return reinterpret_cast<FARPROC>(&Hook_GlobalMemoryStatusEx);
+            }
+        }
+        EnsureAdvapi32ProcsResolved();
+        if (hModule == g_kernel32_mod ||
+            (g_kernelbase_mod != nullptr && hModule == g_kernelbase_mod) ||
+            (g_advapi32_mod != nullptr && hModule == g_advapi32_mod)) {
+            if (std::strcmp(lpProcName, "RegOpenKeyW") == 0) {
+                return reinterpret_cast<FARPROC>(&Hook_RegOpenKeyW);
+            }
+            if (std::strcmp(lpProcName, "RegOpenKeyExW") == 0 && g_real_RegOpenKeyExW != nullptr) {
+                return reinterpret_cast<FARPROC>(&Hook_RegOpenKeyExW);
+            }
+            if (std::strcmp(lpProcName, "RegOpenKeyA") == 0) {
+                return reinterpret_cast<FARPROC>(&Hook_RegOpenKeyA);
+            }
+            if (std::strcmp(lpProcName, "RegOpenKeyExA") == 0 && g_real_RegOpenKeyExA != nullptr) {
+                return reinterpret_cast<FARPROC>(&Hook_RegOpenKeyExA);
+            }
+            if (std::strcmp(lpProcName, "RegQueryValueExW") == 0 && g_real_RegQueryValueExW != nullptr) {
+                return reinterpret_cast<FARPROC>(&Hook_RegQueryValueExW);
+            }
+            if (std::strcmp(lpProcName, "RegQueryValueExA") == 0 && g_real_RegQueryValueExA != nullptr) {
+                return reinterpret_cast<FARPROC>(&Hook_RegQueryValueExA);
+            }
+            if (std::strcmp(lpProcName, "RegGetValueW") == 0 && g_real_RegGetValueW != nullptr) {
+                return reinterpret_cast<FARPROC>(&Hook_RegGetValueW);
+            }
+            if (std::strcmp(lpProcName, "RegGetValueA") == 0 && g_real_RegGetValueA != nullptr) {
+                return reinterpret_cast<FARPROC>(&Hook_RegGetValueA);
+            }
+            if (std::strcmp(lpProcName, "RegCloseKey") == 0 && g_real_RegCloseKey != nullptr) {
+                return reinterpret_cast<FARPROC>(&Hook_RegCloseKey);
+            }
+        }
+        if (g_ntdll_mod != nullptr && hModule == g_ntdll_mod) {
             if (g_real_NtCreateFile != nullptr && std::strcmp(lpProcName, "NtCreateFile") == 0) {
                 return reinterpret_cast<FARPROC>(&Hook_NtCreateFile);
             }
@@ -4987,7 +5070,862 @@ LPVOID WINAPI Hook_WinHttpConnect(LPVOID hSession, LPCWSTR pswzServerName, WORD 
                : nullptr;
 }
 
+DWORD ReadNormalizedConsoleModeEnv(char (&out_buf)[64]) noexcept {
+    out_buf[0] = '\0';
+    DWORD len = ::GetEnvironmentVariableA(
+        "OPENSCARLETT_CONSOLE_TYPE", out_buf, static_cast<DWORD>(sizeof(out_buf)));
+    if (len == 0u || len >= sizeof(out_buf)) {
+        len = ::GetEnvironmentVariableA(
+            "OPENSCARLETT_CONSOLE_PROFILE", out_buf, static_cast<DWORD>(sizeof(out_buf)));
+    }
+    if (len == 0u || len >= sizeof(out_buf)) {
+        out_buf[0] = '\0';
+        return 0u;
+    }
+    DWORD start = 0u;
+    while (start < len && (out_buf[start] == ' ' || out_buf[start] == '\t')) {
+        ++start;
+    }
+    while (len > start && (out_buf[len - 1u] == ' ' || out_buf[len - 1u] == '\t')) {
+        --len;
+    }
+    const DWORD trimmed = len - start;
+    for (DWORD i = 0u; i < trimmed; ++i) {
+        char c = out_buf[start + i];
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
+        out_buf[i] = c;
+    }
+    out_buf[trimmed] = '\0';
+    return trimmed;
+}
+
+bool IsLockhartProfileToken(std::string_view mode) noexcept {
+    return mode == "lockhart" || mode == "seriess" || mode == "series_s" ||
+           mode == "series-s" || mode == "xss" || mode == "3" || mode == "6" ||
+           mode == "s" || mode == "8gb";
+}
+
+bool IsAnacondaProfileToken(std::string_view mode) noexcept {
+    return mode == "anaconda" || mode == "seriesx" || mode == "series_x" ||
+           mode == "series-x" || mode == "xsx" || mode == "4" || mode == "7" ||
+           mode == "x" || mode == "16gb";
+}
+
+bool IsDevkitProfileToken(std::string_view mode) noexcept {
+    return mode == "devkit" || mode == "scarlett_devkit" ||
+           mode == "series_x_devkit" || mode == "8";
+}
+
+uint64_t QueryRawHostTotalPhysBytes() noexcept {
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof(ms);
+    PfnGlobalMemoryStatusEx real_fn = g_real_GlobalMemoryStatusEx
+                                          ? g_real_GlobalMemoryStatusEx
+                                          : g_kernelbase_GlobalMemoryStatusEx;
+    if (real_fn && real_fn(&ms)) {
+        return ms.ullTotalPhys;
+    }
+    if (::GlobalMemoryStatusEx(&ms)) {
+        return ms.ullTotalPhys;
+    }
+    return 0ull;
+}
+
+uint64_t ResolveGuestConsoleMemoryCapBytes() noexcept {
+    char cap_mb_buf[32]{};
+    const DWORD cap_mb_len = ::GetEnvironmentVariableA(
+        "OPENSCARLETT_MEMORY_CAP_MB", cap_mb_buf, static_cast<DWORD>(sizeof(cap_mb_buf)));
+    if (cap_mb_len > 0u && cap_mb_len < sizeof(cap_mb_buf)) {
+        uint64_t parsed_mb = 0ull;
+        bool any_digit = false;
+        for (DWORD i = 0u; i < cap_mb_len; ++i) {
+            const char c = cap_mb_buf[i];
+            if (c >= '0' && c <= '9') {
+                parsed_mb = parsed_mb * 10ull + static_cast<uint64_t>(c - '0');
+                any_digit = true;
+            } else {
+                break;
+            }
+        }
+        if (any_digit && parsed_mb >= 512ull) {
+            return parsed_mb * 1024ull * 1024ull;
+        }
+    }
+
+    char console_buf[64]{};
+    const DWORD console_len = ReadNormalizedConsoleModeEnv(console_buf);
+    if (console_len == 0u) {
+        return 0ull;
+    }
+    const std::string_view mode(console_buf, console_len);
+    if (IsLockhartProfileToken(mode)) {
+        return 8ull * 1024ull * 1024ull * 1024ull;  // 8 GiB Lockhart title budget
+    }
+    if (mode == "auto") {
+        const uint64_t host_phys = QueryRawHostTotalPhysBytes();
+        if (host_phys > 0ull && host_phys <= 18ull * 1024ull * 1024ull * 1024ull) {
+            return 8ull * 1024ull * 1024ull * 1024ull;
+        }
+        return 13824ull * 1024ull * 1024ull;
+    }
+    if (IsAnacondaProfileToken(mode)) {
+        return 13824ull * 1024ull * 1024ull;  // 13.5 GiB Anaconda title budget
+    }
+    if (IsDevkitProfileToken(mode)) {
+        return 32ull * 1024ull * 1024ull * 1024ull;
+    }
+    return 0ull;
+}
+
+// ---------------------------------------------------------------------------
+// Virtualized HKLM\Software\Microsoft\Windows NT\CurrentVersion\OEM\ConsoleMode
+// Used by XGamingRuntimeThunks.lib!XSystemGetDeviceType():
+//   - 0x60 -> XSystemDeviceType::XboxScarlettLockhart (6)
+//   - 0x64 -> XSystemDeviceType::XboxScarlettAnaconda (7)
+//   - 0x68 -> XSystemDeviceType::XboxScarlettDevkit   (8)
+// Never touches or mutates the real host Windows registry.
+// ---------------------------------------------------------------------------
+constexpr uintptr_t kSyntheticOemConsoleKeyVal = 0x05CA0EE0u;
+
+inline HKEY GetSyntheticOemConsoleKey() noexcept {
+    return reinterpret_cast<HKEY>(kSyntheticOemConsoleKeyVal);
+}
+
+DWORD ResolveConsoleModeRegistryDword() noexcept {
+    char console_buf[64]{};
+    const DWORD console_len = ReadNormalizedConsoleModeEnv(console_buf);
+    if (console_len > 0u) {
+        const std::string_view mode(console_buf, console_len);
+        if (IsLockhartProfileToken(mode)) {
+            return 0x60u;  // XboxScarlettLockhart (6)
+        }
+        if (IsDevkitProfileToken(mode)) {
+            return 0x68u;  // XboxScarlettDevkit (8)
+        }
+        if (IsAnacondaProfileToken(mode)) {
+            return 0x64u;  // XboxScarlettAnaconda (7)
+        }
+        if (mode == "auto") {
+            const uint64_t host_phys = QueryRawHostTotalPhysBytes();
+            if (host_phys > 0ull && host_phys <= 18ull * 1024ull * 1024ull * 1024ull) {
+                return 0x60u;  // Lockhart on <= 18 GiB host RAM
+            }
+            return 0x64u;  // Anaconda on > 18 GiB host RAM
+        }
+    }
+    return 0x64u;  // Default: XboxScarlettAnaconda (7)
+}
+
+bool IsOemConsoleSubKeyW(LPCWSTR sub_key) noexcept {
+    if (!sub_key) {
+        return false;
+    }
+    while (*sub_key == L'\\' || *sub_key == L'/') {
+        ++sub_key;
+    }
+    static constexpr wchar_t kTarget[] = L"software\\microsoft\\windows nt\\currentversion\\oem";
+    constexpr size_t kTargetLen = (sizeof(kTarget) / sizeof(wchar_t)) - 1u;
+    size_t i = 0u;
+    for (; i < kTargetLen; ++i) {
+        wchar_t c = sub_key[i];
+        if (c == L'\0') {
+            return false;
+        }
+        if (c == L'/') {
+            c = L'\\';
+        } else if (c >= L'A' && c <= L'Z') {
+            c = static_cast<wchar_t>(c - L'A' + L'a');
+        }
+        if (c != kTarget[i]) {
+            return false;
+        }
+    }
+    while (sub_key[i] == L'\\' || sub_key[i] == L'/') {
+        ++i;
+    }
+    return sub_key[i] == L'\0';
+}
+
+bool IsOemConsoleSubKeyA(LPCSTR sub_key) noexcept {
+    if (!sub_key) {
+        return false;
+    }
+    while (*sub_key == '\\' || *sub_key == '/') {
+        ++sub_key;
+    }
+    static constexpr char kTarget[] = "software\\microsoft\\windows nt\\currentversion\\oem";
+    constexpr size_t kTargetLen = sizeof(kTarget) - 1u;
+    size_t i = 0u;
+    for (; i < kTargetLen; ++i) {
+        char c = sub_key[i];
+        if (c == '\0') {
+            return false;
+        }
+        if (c == '/') {
+            c = '\\';
+        } else if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
+        if (c != kTarget[i]) {
+            return false;
+        }
+    }
+    while (sub_key[i] == '\\' || sub_key[i] == '/') {
+        ++i;
+    }
+    return sub_key[i] == '\0';
+}
+
+bool IsConsoleModeValueNameW(LPCWSTR name) noexcept {
+    if (!name) {
+        return false;
+    }
+    static constexpr wchar_t kTarget[] = L"consolemode";
+    constexpr size_t kTargetLen = (sizeof(kTarget) / sizeof(wchar_t)) - 1u;
+    for (size_t i = 0u; i < kTargetLen; ++i) {
+        wchar_t c = name[i];
+        if (c >= L'A' && c <= L'Z') {
+            c = static_cast<wchar_t>(c - L'A' + L'a');
+        }
+        if (c != kTarget[i]) {
+            return false;
+        }
+    }
+    return name[kTargetLen] == L'\0';
+}
+
+bool IsConsoleModeValueNameA(LPCSTR name) noexcept {
+    if (!name) {
+        return false;
+    }
+    static constexpr char kTarget[] = "consolemode";
+    constexpr size_t kTargetLen = sizeof(kTarget) - 1u;
+    for (size_t i = 0u; i < kTargetLen; ++i) {
+        char c = name[i];
+        if (c >= 'A' && c <= 'Z') {
+            c = static_cast<char>(c - 'A' + 'a');
+        }
+        if (c != kTarget[i]) {
+            return false;
+        }
+    }
+    return name[kTargetLen] == '\0';
+}
+
+void EnsureAdvapi32ProcsResolved() noexcept {
+    if (g_advapi32_mod != nullptr) {
+        return;
+    }
+    HMODULE adv = g_real_GetModuleHandleW
+                      ? g_real_GetModuleHandleW(L"advapi32.dll")
+                      : ::GetModuleHandleW(L"advapi32.dll");
+    if (!adv) {
+        return;
+    }
+    PfnGetProcAddress gpa = g_real_GetProcAddress ? g_real_GetProcAddress : &::GetProcAddress;
+    if (!g_real_RegOpenKeyW) {
+        g_real_RegOpenKeyW = reinterpret_cast<PfnRegOpenKeyW>(gpa(adv, "RegOpenKeyW"));
+    }
+    if (!g_real_RegOpenKeyA) {
+        g_real_RegOpenKeyA = reinterpret_cast<PfnRegOpenKeyA>(gpa(adv, "RegOpenKeyA"));
+    }
+    g_advapi32_RegOpenKeyExW = reinterpret_cast<PfnRegOpenKeyExW>(gpa(adv, "RegOpenKeyExW"));
+    g_advapi32_RegOpenKeyExA = reinterpret_cast<PfnRegOpenKeyExA>(gpa(adv, "RegOpenKeyExA"));
+    g_advapi32_RegQueryValueExW = reinterpret_cast<PfnRegQueryValueExW>(gpa(adv, "RegQueryValueExW"));
+    g_advapi32_RegQueryValueExA = reinterpret_cast<PfnRegQueryValueExA>(gpa(adv, "RegQueryValueExA"));
+    g_advapi32_RegGetValueW = reinterpret_cast<PfnRegGetValueW>(gpa(adv, "RegGetValueW"));
+    g_advapi32_RegGetValueA = reinterpret_cast<PfnRegGetValueA>(gpa(adv, "RegGetValueA"));
+    g_advapi32_RegCloseKey = reinterpret_cast<PfnRegCloseKey>(gpa(adv, "RegCloseKey"));
+    g_advapi32_mod = adv;
+}
+
+LSTATUS WriteConsoleModeRegDword(LPDWORD lpType, LPBYTE lpData, LPDWORD lpcbData, const char* api_tag) {
+    const DWORD mode = ResolveConsoleModeRegistryDword();
+    if (!g_shutting_down.load(std::memory_order_acquire)) {
+        openscarlett::CallTelemetry::Global().Record(
+            "advapi32.dll",
+            api_tag,
+            openscarlett::CallOutcome::Ok,
+            static_cast<int32_t>(mode),
+            -1);
+    }
+    if (lpType) {
+        *lpType = REG_DWORD;
+    }
+    if (!lpData) {
+        if (lpcbData) {
+            *lpcbData = static_cast<DWORD>(sizeof(DWORD));
+        }
+        return ERROR_SUCCESS;
+    }
+    if (!lpcbData) {
+        return ERROR_INVALID_PARAMETER;
+    }
+    if (*lpcbData < sizeof(DWORD)) {
+        *lpcbData = static_cast<DWORD>(sizeof(DWORD));
+        return ERROR_MORE_DATA;
+    }
+    std::memcpy(lpData, &mode, sizeof(DWORD));
+    *lpcbData = static_cast<DWORD>(sizeof(DWORD));
+    return ERROR_SUCCESS;
+}
+
+LSTATUS APIENTRY Hook_RegOpenKeyW(HKEY hKey, LPCWSTR lpSubKey, PHKEY phkResult) {
+    if (hKey == HKEY_LOCAL_MACHINE && IsOemConsoleSubKeyW(lpSubKey)) {
+        if (!phkResult) {
+            return ERROR_INVALID_PARAMETER;
+        }
+        *phkResult = GetSyntheticOemConsoleKey();
+        return ERROR_SUCCESS;
+    }
+    if (hKey == GetSyntheticOemConsoleKey() && (!lpSubKey || lpSubKey[0] == L'\0')) {
+        if (!phkResult) {
+            return ERROR_INVALID_PARAMETER;
+        }
+        *phkResult = GetSyntheticOemConsoleKey();
+        return ERROR_SUCCESS;
+    }
+    EnsureAdvapi32ProcsResolved();
+    if (g_real_RegOpenKeyW) {
+        return g_real_RegOpenKeyW(hKey, lpSubKey, phkResult);
+    }
+    if (!phkResult) {
+        return ERROR_INVALID_PARAMETER;
+    }
+    if (!lpSubKey || lpSubKey[0] == L'\0') {
+        *phkResult = hKey;
+        return ERROR_SUCCESS;
+    }
+    return g_real_RegOpenKeyExW
+               ? g_real_RegOpenKeyExW(hKey, lpSubKey, 0u, MAXIMUM_ALLOWED, phkResult)
+               : ERROR_INVALID_FUNCTION;
+}
+
+LSTATUS APIENTRY Hook_RegOpenKeyA(HKEY hKey, LPCSTR lpSubKey, PHKEY phkResult) {
+    if (hKey == HKEY_LOCAL_MACHINE && IsOemConsoleSubKeyA(lpSubKey)) {
+        if (!phkResult) {
+            return ERROR_INVALID_PARAMETER;
+        }
+        *phkResult = GetSyntheticOemConsoleKey();
+        return ERROR_SUCCESS;
+    }
+    if (hKey == GetSyntheticOemConsoleKey() && (!lpSubKey || lpSubKey[0] == '\0')) {
+        if (!phkResult) {
+            return ERROR_INVALID_PARAMETER;
+        }
+        *phkResult = GetSyntheticOemConsoleKey();
+        return ERROR_SUCCESS;
+    }
+    EnsureAdvapi32ProcsResolved();
+    if (g_real_RegOpenKeyA) {
+        return g_real_RegOpenKeyA(hKey, lpSubKey, phkResult);
+    }
+    if (!phkResult) {
+        return ERROR_INVALID_PARAMETER;
+    }
+    if (!lpSubKey || lpSubKey[0] == '\0') {
+        *phkResult = hKey;
+        return ERROR_SUCCESS;
+    }
+    return g_real_RegOpenKeyExA
+               ? g_real_RegOpenKeyExA(hKey, lpSubKey, 0u, MAXIMUM_ALLOWED, phkResult)
+               : ERROR_INVALID_FUNCTION;
+}
+
+LSTATUS APIENTRY Hook_RegOpenKeyExW(
+    HKEY hKey, LPCWSTR lpSubKey, DWORD ulOptions, REGSAM samDesired, PHKEY phkResult) {
+    if (hKey == HKEY_LOCAL_MACHINE && IsOemConsoleSubKeyW(lpSubKey)) {
+        if (!phkResult) {
+            return ERROR_INVALID_PARAMETER;
+        }
+        *phkResult = GetSyntheticOemConsoleKey();
+        return ERROR_SUCCESS;
+    }
+    if (hKey == GetSyntheticOemConsoleKey() && (!lpSubKey || lpSubKey[0] == L'\0')) {
+        if (!phkResult) {
+            return ERROR_INVALID_PARAMETER;
+        }
+        *phkResult = GetSyntheticOemConsoleKey();
+        return ERROR_SUCCESS;
+    }
+    return g_real_RegOpenKeyExW
+               ? g_real_RegOpenKeyExW(hKey, lpSubKey, ulOptions, samDesired, phkResult)
+               : ERROR_INVALID_FUNCTION;
+}
+
+LSTATUS APIENTRY Hook_RegOpenKeyExA(
+    HKEY hKey, LPCSTR lpSubKey, DWORD ulOptions, REGSAM samDesired, PHKEY phkResult) {
+    if (hKey == HKEY_LOCAL_MACHINE && IsOemConsoleSubKeyA(lpSubKey)) {
+        if (!phkResult) {
+            return ERROR_INVALID_PARAMETER;
+        }
+        *phkResult = GetSyntheticOemConsoleKey();
+        return ERROR_SUCCESS;
+    }
+    if (hKey == GetSyntheticOemConsoleKey() && (!lpSubKey || lpSubKey[0] == '\0')) {
+        if (!phkResult) {
+            return ERROR_INVALID_PARAMETER;
+        }
+        *phkResult = GetSyntheticOemConsoleKey();
+        return ERROR_SUCCESS;
+    }
+    return g_real_RegOpenKeyExA
+               ? g_real_RegOpenKeyExA(hKey, lpSubKey, ulOptions, samDesired, phkResult)
+               : ERROR_INVALID_FUNCTION;
+}
+
+LSTATUS APIENTRY Hook_RegQueryValueExW(
+    HKEY hKey, LPCWSTR lpValueName, LPDWORD lpReserved, LPDWORD lpType, LPBYTE lpData, LPDWORD lpcbData) {
+    if (hKey == GetSyntheticOemConsoleKey()) {
+        if (IsConsoleModeValueNameW(lpValueName)) {
+            return WriteConsoleModeRegDword(lpType, lpData, lpcbData, "RegQueryValueExW:OEM.ConsoleMode");
+        }
+        return ERROR_FILE_NOT_FOUND;
+    }
+    return g_real_RegQueryValueExW
+               ? g_real_RegQueryValueExW(hKey, lpValueName, lpReserved, lpType, lpData, lpcbData)
+               : ERROR_INVALID_FUNCTION;
+}
+
+LSTATUS APIENTRY Hook_RegQueryValueExA(
+    HKEY hKey, LPCSTR lpValueName, LPDWORD lpReserved, LPDWORD lpType, LPBYTE lpData, LPDWORD lpcbData) {
+    if (hKey == GetSyntheticOemConsoleKey()) {
+        if (IsConsoleModeValueNameA(lpValueName)) {
+            return WriteConsoleModeRegDword(lpType, lpData, lpcbData, "RegQueryValueExA:OEM.ConsoleMode");
+        }
+        return ERROR_FILE_NOT_FOUND;
+    }
+    return g_real_RegQueryValueExA
+               ? g_real_RegQueryValueExA(hKey, lpValueName, lpReserved, lpType, lpData, lpcbData)
+               : ERROR_INVALID_FUNCTION;
+}
+
+LSTATUS APIENTRY Hook_RegGetValueW(
+    HKEY hkey, LPCWSTR lpSubKey, LPCWSTR lpValue, DWORD dwFlags, LPDWORD pdwType, PVOID pvData, LPDWORD pcbData) {
+    const bool match_hklm_oem = (hkey == HKEY_LOCAL_MACHINE && IsOemConsoleSubKeyW(lpSubKey));
+    const bool match_syn_oem = (hkey == GetSyntheticOemConsoleKey() && (!lpSubKey || lpSubKey[0] == L'\0'));
+    if (match_hklm_oem || match_syn_oem) {
+        if (!IsConsoleModeValueNameW(lpValue)) {
+            if ((dwFlags & RRF_ZEROONFAILURE) != 0u && pvData && pcbData && *pcbData > 0u) {
+                std::memset(pvData, 0, *pcbData);
+            }
+            return ERROR_FILE_NOT_FOUND;
+        }
+        const DWORD type_mask = dwFlags & 0x0000FFFFu;
+        if (type_mask != 0u && (type_mask & RRF_RT_REG_DWORD) == 0u) {
+            if ((dwFlags & RRF_ZEROONFAILURE) != 0u && pvData && pcbData && *pcbData > 0u) {
+                std::memset(pvData, 0, *pcbData);
+            }
+            return ERROR_UNSUPPORTED_TYPE;
+        }
+        const LSTATUS st = WriteConsoleModeRegDword(
+            pdwType, static_cast<LPBYTE>(pvData), pcbData, "RegGetValueW:OEM.ConsoleMode");
+        if (st != ERROR_SUCCESS && (dwFlags & RRF_ZEROONFAILURE) != 0u && pvData && pcbData && *pcbData > 0u) {
+            std::memset(pvData, 0, *pcbData);
+        }
+        return st;
+    }
+    if (hkey == GetSyntheticOemConsoleKey()) {
+        return ERROR_FILE_NOT_FOUND;
+    }
+    return g_real_RegGetValueW
+               ? g_real_RegGetValueW(hkey, lpSubKey, lpValue, dwFlags, pdwType, pvData, pcbData)
+               : ERROR_INVALID_FUNCTION;
+}
+
+LSTATUS APIENTRY Hook_RegGetValueA(
+    HKEY hkey, LPCSTR lpSubKey, LPCSTR lpValue, DWORD dwFlags, LPDWORD pdwType, PVOID pvData, LPDWORD pcbData) {
+    const bool match_hklm_oem = (hkey == HKEY_LOCAL_MACHINE && IsOemConsoleSubKeyA(lpSubKey));
+    const bool match_syn_oem = (hkey == GetSyntheticOemConsoleKey() && (!lpSubKey || lpSubKey[0] == '\0'));
+    if (match_hklm_oem || match_syn_oem) {
+        if (!IsConsoleModeValueNameA(lpValue)) {
+            if ((dwFlags & RRF_ZEROONFAILURE) != 0u && pvData && pcbData && *pcbData > 0u) {
+                std::memset(pvData, 0, *pcbData);
+            }
+            return ERROR_FILE_NOT_FOUND;
+        }
+        const DWORD type_mask = dwFlags & 0x0000FFFFu;
+        if (type_mask != 0u && (type_mask & RRF_RT_REG_DWORD) == 0u) {
+            if ((dwFlags & RRF_ZEROONFAILURE) != 0u && pvData && pcbData && *pcbData > 0u) {
+                std::memset(pvData, 0, *pcbData);
+            }
+            return ERROR_UNSUPPORTED_TYPE;
+        }
+        const LSTATUS st = WriteConsoleModeRegDword(
+            pdwType, static_cast<LPBYTE>(pvData), pcbData, "RegGetValueA:OEM.ConsoleMode");
+        if (st != ERROR_SUCCESS && (dwFlags & RRF_ZEROONFAILURE) != 0u && pvData && pcbData && *pcbData > 0u) {
+            std::memset(pvData, 0, *pcbData);
+        }
+        return st;
+    }
+    if (hkey == GetSyntheticOemConsoleKey()) {
+        return ERROR_FILE_NOT_FOUND;
+    }
+    return g_real_RegGetValueA
+               ? g_real_RegGetValueA(hkey, lpSubKey, lpValue, dwFlags, pdwType, pvData, pcbData)
+               : ERROR_INVALID_FUNCTION;
+}
+
+LSTATUS APIENTRY Hook_RegCloseKey(HKEY hKey) {
+    if (hKey == GetSyntheticOemConsoleKey()) {
+        return ERROR_SUCCESS;
+    }
+    return g_real_RegCloseKey ? g_real_RegCloseKey(hKey) : ERROR_INVALID_FUNCTION;
+}
+
+BOOL WINAPI Hook_GlobalMemoryStatusEx(LPMEMORYSTATUSEX lpBuffer) {
+    PfnGlobalMemoryStatusEx real_fn = g_real_GlobalMemoryStatusEx
+                                          ? g_real_GlobalMemoryStatusEx
+                                          : g_kernelbase_GlobalMemoryStatusEx;
+    const BOOL ok = real_fn ? real_fn(lpBuffer) : ::GlobalMemoryStatusEx(lpBuffer);
+    if (!ok || !lpBuffer || g_shutting_down.load(std::memory_order_acquire)) {
+        return ok;
+    }
+
+    const uint64_t cap_bytes = ResolveGuestConsoleMemoryCapBytes();
+    if (cap_bytes == 0ull) {
+        return ok;
+    }
+
+    // Never cap queries made by OpenScarlett shims (kernelx.dll / xmem.dll sparse-file commit
+    // checks) or Windows system/driver DLLs — only cap guest/title executable & DLL queries.
+    HMODULE caller_mod = nullptr;
+    const PVOID ret_addr = _ReturnAddress();
+    const BOOL got_mod = g_real_GetModuleHandleExW
+                             ? g_real_GetModuleHandleExW(
+                                   GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   reinterpret_cast<LPCWSTR>(ret_addr),
+                                   &caller_mod)
+                             : ::GetModuleHandleExW(
+                                   GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                   reinterpret_cast<LPCWSTR>(ret_addr),
+                                   &caller_mod);
+    if (got_mod && caller_mod != nullptr) {
+        if (caller_mod == g_self_module ||
+            IsModuleInShimDir(caller_mod) ||
+            IsWindowsSystemModule(caller_mod)) {
+            return ok;
+        }
+    }
+
+    if (lpBuffer->ullTotalPhys > cap_bytes) {
+        lpBuffer->ullTotalPhys = cap_bytes;
+    }
+    if (lpBuffer->ullAvailPhys > cap_bytes) {
+        lpBuffer->ullAvailPhys = cap_bytes;
+    }
+    // GameOS titles do not have a multi-dozen-GiB desktop swapfile; cap commit limits so
+    // engines like RAGE9 do not size streaming/virtual pools off host ullAvailPageFile.
+    if (lpBuffer->ullTotalPageFile > cap_bytes) {
+        lpBuffer->ullTotalPageFile = cap_bytes;
+    }
+    if (lpBuffer->ullAvailPageFile > lpBuffer->ullAvailPhys) {
+        lpBuffer->ullAvailPageFile = lpBuffer->ullAvailPhys;
+    }
+    if (lpBuffer->ullTotalPhys > 0ull) {
+        const uint64_t used = (lpBuffer->ullTotalPhys >= lpBuffer->ullAvailPhys)
+                                  ? (lpBuffer->ullTotalPhys - lpBuffer->ullAvailPhys)
+                                  : 0ull;
+        lpBuffer->dwMemoryLoad = static_cast<DWORD>(
+            std::min<uint64_t>(100ull, (used * 100ull) / lpBuffer->ullTotalPhys));
+    }
+    return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Exact x86-64 Zen 2 Instruction Length Decoder & Thread-Safe Hot-Patcher
+// ---------------------------------------------------------------------------
+constexpr size_t kMaxX64InsnBytes = 15u;
+SRWLOCK g_veh_hotpatch_lock = SRWLOCK_INIT;
+
+struct HotpatchedSiteEntry {
+    uint8_t length = 0u;
+};
+
+std::unordered_map<uintptr_t, HotpatchedSiteEntry>* GetHotpatchedSitesLocked() {
+    // Intentionally heap-leaked singleton so worker threads hitting VEH during
+    // process teardown never race static destructor order.
+    static auto* s_sites = new std::unordered_map<uintptr_t, HotpatchedSiteEntry>();
+    return s_sites;
+}
+
+bool IsReadableCodePageProtect(DWORD prot) noexcept {
+    if ((prot & (PAGE_GUARD | PAGE_NOACCESS)) != 0u) {
+        return false;
+    }
+    const DWORD base = prot & 0xFFu;
+    return base == PAGE_EXECUTE ||
+           base == PAGE_EXECUTE_READ ||
+           base == PAGE_EXECUTE_READWRITE ||
+           base == PAGE_EXECUTE_WRITECOPY ||
+           base == PAGE_READONLY ||
+           base == PAGE_READWRITE ||
+           base == PAGE_WRITECOPY;
+}
+
+size_t ReadInsnBytesSafe64(const uint8_t* rip_ptr, uint8_t (&out)[kMaxX64InsnBytes]) noexcept {
+    std::memset(out, 0, sizeof(out));
+    if (!rip_ptr) {
+        return 0u;
+    }
+    uintptr_t cursor = reinterpret_cast<uintptr_t>(rip_ptr);
+    size_t copied = 0u;
+    while (copied < kMaxX64InsnBytes) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (::VirtualQuery(reinterpret_cast<LPCVOID>(cursor), &mbi, sizeof(mbi)) == 0u) {
+            break;
+        }
+        if (mbi.State != MEM_COMMIT || !IsReadableCodePageProtect(mbi.Protect)) {
+            break;
+        }
+        const uintptr_t region_end =
+            reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+        if (region_end <= cursor) {
+            break;
+        }
+        const size_t step = std::min<size_t>(
+            kMaxX64InsnBytes - copied, static_cast<size_t>(region_end - cursor));
+        std::memcpy(out + copied, reinterpret_cast<const void*>(cursor), step);
+        copied += step;
+        cursor += step;
+    }
+    return copied;
+}
+
+struct DecodedPrefixes64 {
+    size_t opcode_offset = 0u;
+    uint8_t rex = 0u;
+    uint8_t last_f2_f3 = 0u;  // 0, 0xF2, or 0xF3 (group-1 mandatory prefix priority)
+    bool has_66 = false;
+    bool has_67 = false;
+    bool has_lock = false;
+};
+
+bool ScanPrefixes64(const uint8_t* b, size_t avail, DecodedPrefixes64& out) noexcept {
+    out = DecodedPrefixes64{};
+    size_t i = 0u;
+    while (i < avail && i + 1u < kMaxX64InsnBytes) {
+        const uint8_t c = b[i];
+        if (c == 0x66u) {
+            out.has_66 = true;
+            out.rex = 0u;  // AMD64 rule: REX before a legacy prefix is ignored/superseded
+            ++i;
+        } else if (c == 0x67u) {
+            out.has_67 = true;
+            out.rex = 0u;
+            ++i;
+        } else if (c == 0xF2u || c == 0xF3u) {
+            out.last_f2_f3 = c;
+            out.rex = 0u;
+            ++i;
+        } else if (c == 0xF0u) {
+            out.has_lock = true;
+            out.rex = 0u;
+            ++i;
+        } else if (c == 0x26u || c == 0x2Eu || c == 0x36u ||
+                   c == 0x3Eu || c == 0x64u || c == 0x65u) {
+            out.rex = 0u;
+            ++i;
+        } else if ((c & 0xF0u) == 0x40u) {
+            out.rex = c;
+            ++i;
+        } else {
+            // Includes 2/3-byte VEX (0xC5/0xC4), EVEX (0x62), XOP (0x8F), and 0x0F escape.
+            break;
+        }
+    }
+    out.opcode_offset = i;
+    return i < avail;
+}
+
+size_t DecodeModRmInsnLength64(
+    const uint8_t* b,
+    size_t avail,
+    size_t modrm_offset,
+    size_t imm_bytes = 0u) noexcept {
+    if (modrm_offset >= avail) {
+        return 0u;
+    }
+    const uint8_t modrm = b[modrm_offset];
+    const uint8_t mod = static_cast<uint8_t>((modrm >> 6u) & 3u);
+    const uint8_t rm = static_cast<uint8_t>(modrm & 7u);
+    size_t len = modrm_offset + 1u;
+    if (mod != 3u) {
+        if (rm == 4u) {
+            // SIB byte follows ModRM (applies to both rsp [REX.B=0] and r12 [REX.B=1]).
+            if (len >= avail) {
+                return 0u;
+            }
+            const uint8_t sib = b[len++];
+            if (mod == 0u && (sib & 7u) == 5u) {
+                // base == 5 (rbp / r13) with mod == 00 encodes disp32 with no base register.
+                len += 4u;
+            }
+        } else if (mod == 0u && rm == 5u) {
+            // RIP-relative [rip + disp32] (or [eip + disp32] with 0x67) for both REX.B=0 and REX.B=1.
+            len += 4u;
+        }
+        if (mod == 1u) {
+            len += 1u;  // disp8
+        } else if (mod == 2u) {
+            len += 4u;  // disp32
+        }
+    }
+    len += imm_bytes;
+    if (len > kMaxX64InsnBytes || len > avail) {
+        return 0u;
+    }
+    return len;
+}
+
+uint64_t ReadContextGpr64(const CONTEXT* ctx, uint32_t reg_idx) noexcept {
+    switch (reg_idx & 15u) {
+        case 0u: return ctx->Rax;
+        case 1u: return ctx->Rcx;
+        case 2u: return ctx->Rdx;
+        case 3u: return ctx->Rbx;
+        case 4u: return ctx->Rsp;
+        case 5u: return ctx->Rbp;
+        case 6u: return ctx->Rsi;
+        case 7u: return ctx->Rdi;
+        case 8u: return ctx->R8;
+        case 9u: return ctx->R9;
+        case 10u: return ctx->R10;
+        case 11u: return ctx->R11;
+        case 12u: return ctx->R12;
+        case 13u: return ctx->R13;
+        case 14u: return ctx->R14;
+        default: return ctx->R15;
+    }
+}
+
+void WriteContextGpr64(CONTEXT* ctx, uint32_t reg_idx, uint64_t val) noexcept {
+    switch (reg_idx & 15u) {
+        case 0u: ctx->Rax = val; break;
+        case 1u: ctx->Rcx = val; break;
+        case 2u: ctx->Rdx = val; break;
+        case 3u: ctx->Rbx = val; break;
+        case 4u: ctx->Rsp = val; break;
+        case 5u: ctx->Rbp = val; break;
+        case 6u: ctx->Rsi = val; break;
+        case 7u: ctx->Rdi = val; break;
+        case 8u: ctx->R8 = val; break;
+        case 9u: ctx->R9 = val; break;
+        case 10u: ctx->R10 = val; break;
+        case 11u: ctx->R11 = val; break;
+        case 12u: ctx->R12 = val; break;
+        case 13u: ctx->R13 = val; break;
+        case 14u: ctx->R14 = val; break;
+        default: ctx->R15 = val; break;
+    }
+}
+
+bool ComputeEffectiveAddress64(
+    const CONTEXT* ctx,
+    const DecodedPrefixes64& pfx,
+    const uint8_t* b,
+    size_t modrm_offset,
+    size_t insn_len,
+    uint64_t& out_ea) noexcept {
+    out_ea = 0ull;
+    const uint8_t modrm = b[modrm_offset];
+    const uint8_t mod = static_cast<uint8_t>((modrm >> 6u) & 3u);
+    const uint8_t rm_raw = static_cast<uint8_t>(modrm & 7u);
+    if (mod == 3u) {
+        return false;
+    }
+    const uint32_t rex_x = (pfx.rex & 0x02u) ? 8u : 0u;
+    const uint32_t rex_b = (pfx.rex & 0x01u) ? 8u : 0u;
+    size_t pos = modrm_offset + 1u;
+    uint64_t ea = 0ull;
+
+    if (rm_raw == 4u) {
+        const uint8_t sib = b[pos++];
+        const uint32_t scale_shift = (sib >> 6u) & 3u;
+        const uint32_t index_reg = ((sib >> 3u) & 7u) | rex_x;
+        const uint32_t base_raw = sib & 7u;
+        if (mod == 0u && base_raw == 5u) {
+            int32_t disp32 = 0;
+            std::memcpy(&disp32, b + pos, 4u);
+            pos += 4u;
+            ea += static_cast<uint64_t>(static_cast<int64_t>(disp32));
+        } else {
+            ea += ReadContextGpr64(ctx, base_raw | rex_b);
+        }
+        // index_reg == 4 (RSP with REX.X=0) encodes "no index"; R12 (index_reg == 12) is scaled.
+        if (index_reg != 4u) {
+            ea += ReadContextGpr64(ctx, index_reg) << scale_shift;
+        }
+    } else if (mod == 0u && rm_raw == 5u) {
+        int32_t disp32 = 0;
+        std::memcpy(&disp32, b + pos, 4u);
+        pos += 4u;
+        const uint64_t next_rip = pfx.has_67
+                                      ? ((ctx->Rip + insn_len) & 0xFFFFFFFFull)
+                                      : (ctx->Rip + insn_len);
+        ea = next_rip + static_cast<uint64_t>(static_cast<int64_t>(disp32));
+    } else {
+        ea = ReadContextGpr64(ctx, rm_raw | rex_b);
+    }
+
+    if (mod == 1u) {
+        const int8_t disp8 = static_cast<int8_t>(b[pos++]);
+        ea += static_cast<uint64_t>(static_cast<int64_t>(disp8));
+    } else if (mod == 2u) {
+        int32_t disp32 = 0;
+        std::memcpy(&disp32, b + pos, 4u);
+        pos += 4u;
+        ea += static_cast<uint64_t>(static_cast<int64_t>(disp32));
+    }
+
+    if (pos != insn_len) {
+        return false;
+    }
+    if (pfx.has_67) {
+        ea &= 0xFFFFFFFFull;
+    }
+    out_ea = ea;
+    return true;
+}
+
+void HotPatchToNopsThreadSafe(uint8_t* p, size_t insn_len) noexcept {
+    if (!p || insn_len == 0u || insn_len > kMaxX64InsnBytes) {
+        return;
+    }
+    const uintptr_t site_rip = reinterpret_cast<uintptr_t>(p);
+    ::AcquireSRWLockExclusive(&g_veh_hotpatch_lock);
+    auto* sites = GetHotpatchedSitesLocked();
+    if (sites->find(site_rip) == sites->end()) {
+        DWORD old_prot = 0u;
+        if (::VirtualProtect(p, insn_len, PAGE_EXECUTE_READWRITE, &old_prot)) {
+            if (insn_len > 1u) {
+                // Stage 0xCC (INT3) at byte 0 while filling tail NOPs so concurrent CPU cores
+                // never fetch a torn instruction boundary mid-patch.
+                _InterlockedExchange8(reinterpret_cast<volatile char*>(p), static_cast<char>(0xCCu));
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                std::memset(p + 1u, 0x90, insn_len - 1u);
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                _InterlockedExchange8(reinterpret_cast<volatile char*>(p), static_cast<char>(0x90u));
+            } else {
+                _InterlockedExchange8(reinterpret_cast<volatile char*>(p), static_cast<char>(0x90u));
+            }
+            (*sites)[site_rip] = HotpatchedSiteEntry{static_cast<uint8_t>(insn_len)};
+            DWORD dummy = 0u;
+            ::VirtualProtect(p, insn_len, old_prot, &dummy);
+            ::FlushInstructionCache(::GetCurrentProcess(), p, insn_len);
+        }
+    }
+    ::ReleaseSRWLockExclusive(&g_veh_hotpatch_lock);
+}
+
 LONG CALLBACK Zen2IllegalInstructionVeh(PEXCEPTION_POINTERS ep) {
+    static_assert(offsetof(CONTEXT, Xmm15) - offsetof(CONTEXT, Xmm0) == 15u * sizeof(M128A),
+                  "CONTEXT XMM0..XMM15 register array must be contiguous");
+
     if (!ep || !ep->ExceptionRecord || !ep->ContextRecord) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
@@ -4998,6 +5936,26 @@ LONG CALLBACK Zen2IllegalInstructionVeh(PEXCEPTION_POINTERS ep) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
     if (exc_code == EXCEPTION_BREAKPOINT) {
+        // Check if another worker thread hit our transient 0xCC barrier during HotPatchToNopsThreadSafe.
+        {
+            const uintptr_t rip_val = static_cast<uintptr_t>(ctx->Rip);
+            uintptr_t resume_rip = 0u;
+            ::AcquireSRWLockShared(&g_veh_hotpatch_lock);
+            auto* sites = GetHotpatchedSitesLocked();
+            auto it = sites->find(rip_val);
+            if (it == sites->end() && rip_val > 0u) {
+                it = sites->find(rip_val - 1u);
+            }
+            if (it != sites->end()) {
+                resume_rip = it->first + it->second.length;
+            }
+            ::ReleaseSRWLockShared(&g_veh_hotpatch_lock);
+            if (resume_rip != 0u) {
+                ctx->Rip = resume_rip;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
+
         static const bool continue_int3 = []() {
             char buf[16]{};
             return ::GetEnvironmentVariableA("OPENSCARLETT_CONTINUE_INT3", buf, sizeof(buf)) > 0 && buf[0] != '0';
@@ -5038,156 +5996,194 @@ LONG CALLBACK Zen2IllegalInstructionVeh(PEXCEPTION_POINTERS ep) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    // 1. AMD Zen 2 CLZERO (0F 01 FC): zeroes the 64-byte cache line at [RAX & ~63].
-    if (p[0] == 0x0Fu && p[1] == 0x01u && p[2] == 0xFCu) {
-        void* line = reinterpret_cast<void*>(ctx->Rax & ~63ull);
-        std::memset(line, 0, 64u);
-        ctx->Rip += 3u;
-        return EXCEPTION_CONTINUE_EXECUTION;
+    // Fast path for concurrent threads whose #UD was queued right as a sibling thread NOP-patched Rip.
+    {
+        const uintptr_t rip_val = static_cast<uintptr_t>(ctx->Rip);
+        uint8_t patched_len = 0u;
+        ::AcquireSRWLockShared(&g_veh_hotpatch_lock);
+        auto* sites = GetHotpatchedSitesLocked();
+        auto it = sites->find(rip_val);
+        if (it != sites->end()) {
+            patched_len = it->second.length;
+        }
+        ::ReleaseSRWLockShared(&g_veh_hotpatch_lock);
+        if (patched_len > 0u) {
+            ctx->Rip += patched_len;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
     }
 
-    // 1b. AMD Zen 2 MONITORX (0F 01 FA) & MWAITX (0F 01 FB): user-mode memory monitor/wait.
-    if (p[0] == 0x0Fu && p[1] == 0x01u && (p[2] == 0xFAu || p[2] == 0xFBu)) {
-        if (p[2] == 0xFAu) {
-            DWORD old_prot = 0;
-            if (::VirtualProtect(p, 3u, PAGE_EXECUTE_READWRITE, &old_prot)) {
-                std::memset(p, 0x90, 3u);
-                ::VirtualProtect(p, 3u, old_prot, &old_prot);
-                ::FlushInstructionCache(::GetCurrentProcess(), p, 3u);
+    uint8_t insn[kMaxX64InsnBytes]{};
+    const size_t avail = ReadInsnBytesSafe64(p, insn);
+    DecodedPrefixes64 pfx{};
+    if (avail >= 3u && ScanPrefixes64(insn, avail, pfx) && !pfx.has_lock) {
+        const size_t op_off = pfx.opcode_offset;
+
+        // 1. Two-byte 0F 01 <ext> AMD Zen 2 instructions (CLZERO, MONITORX, MWAITX, RDPRU, MCOMMIT).
+        if (op_off + 2u < avail && insn[op_off] == 0x0Fu && insn[op_off + 1u] == 0x01u) {
+            const uint8_t ext = insn[op_off + 2u];
+            const size_t insn_len = op_off + 3u;
+            if (insn_len <= kMaxX64InsnBytes) {
+                // 1a. CLZERO ([67/REX] 0F 01 FC): zeroes 64-byte cache line at [rAX & ~63].
+                if (ext == 0xFCu && !pfx.has_66 && pfx.last_f2_f3 == 0u) {
+                    const uint64_t addr = pfx.has_67
+                                              ? (static_cast<uint64_t>(static_cast<uint32_t>(ctx->Rax)) & ~63ull)
+                                              : (ctx->Rax & ~63ull);
+                    std::memset(reinterpret_cast<void*>(addr), 0, 64u);
+                    ctx->Rip += insn_len;
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+                // 1b. MCOMMIT (F3 [REX] 0F 01 FA): AMD memory-commit barrier -> hot-patch to NOPs.
+                if (ext == 0xFAu && pfx.last_f2_f3 == 0xF3u && !pfx.has_66) {
+                    HotPatchToNopsThreadSafe(p, insn_len);
+                    ctx->Rip += insn_len;
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+                // 1c. MONITORX ([67/REX] 0F 01 FA) & MWAITX ([67/REX] 0F 01 FB).
+                if ((ext == 0xFAu || ext == 0xFBu) && pfx.last_f2_f3 == 0u && !pfx.has_66) {
+                    if (ext == 0xFAu) {
+                        HotPatchToNopsThreadSafe(p, insn_len);
+                    } else {
+                        ::SwitchToThread();
+                    }
+                    ctx->Rip += insn_len;
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+                // 1d. RDPRU ([REX] 0F 01 FD): read processor register -> return RDTSC in EDX:EAX.
+                if (ext == 0xFDu && pfx.last_f2_f3 == 0u && !pfx.has_66) {
+                    const uint64_t tsc = __rdtsc();
+                    ctx->Rax = static_cast<uint32_t>(tsc & 0xFFFFFFFFull);
+                    ctx->Rdx = static_cast<uint32_t>(tsc >> 32u);
+                    ctx->Rip += insn_len;
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
             }
-        } else {
-            ::SwitchToThread();
         }
-        ctx->Rip += 3u;
-        return EXCEPTION_CONTINUE_EXECUTION;
-    }
 
-    // 1c. AMD Zen 2 RDPRU (0F 01 FD): read processor register (APERF/MPERF) -> return QPC/RDTSC.
-    if (p[0] == 0x0Fu && p[1] == 0x01u && p[2] == 0xFDu) {
-        const uint64_t tsc = __rdtsc();
-        ctx->Rax = static_cast<uint32_t>(tsc & 0xFFFFFFFFull);
-        ctx->Rdx = static_cast<uint32_t>(tsc >> 32u);
-        ctx->Rip += 3u;
-        return EXCEPTION_CONTINUE_EXECUTION;
-    }
-
-    // 2. AMD Zen 2 MCOMMIT (F3 0F 01 FA): memory-commit barrier -> NOP on desktop x86-64.
-    if (p[0] == 0xF3u && p[1] == 0x0Fu && p[2] == 0x01u && p[3] == 0xFAu) {
-        DWORD old_prot = 0;
-        if (::VirtualProtect(p, 4u, PAGE_EXECUTE_READWRITE, &old_prot)) {
-            std::memset(p, 0x90, 4u);
-            ::VirtualProtect(p, 4u, old_prot, &old_prot);
-            ::FlushInstructionCache(::GetCurrentProcess(), p, 4u);
-        }
-        ctx->Rip += 4u;
-        return EXCEPTION_CONTINUE_EXECUTION;
-    }
-
-    // 3. CLWB (66 [REX] 0F AE /6) and CLFLUSHOPT (66 [REX] 0F AE /7):
-    //    Supported on Xbox Series X Zen 2 and Intel Ice Lake+, missing on Intel Skylake/Coffee Lake.
-    //    Hot-patch to NOPs so tight descriptor/cache-flush loops run at native speed without re-trapping.
-    if (p[0] == 0x66u) {
-        size_t idx = 1u;
-        if ((p[idx] & 0xF0u) == 0x40u) {
-            ++idx;  // REX prefix
-        }
-        if (p[idx] == 0x0Fu && p[idx + 1u] == 0xAEu) {
-            const uint8_t modrm = p[idx + 2u];
+        // 2. CLWB (66 [REX] 0F AE /6) and CLFLUSHOPT (66 [REX] 0F AE /7):
+        //    Supported on Xbox Series X Zen 2 and Intel Ice Lake+, missing on Skylake/Coffee Lake.
+        //    Hot-patch exact ModRM+SIB+disp instruction bytes to NOPs.
+        if (pfx.has_66 && pfx.last_f2_f3 == 0u &&
+            op_off + 2u < avail && insn[op_off] == 0x0Fu && insn[op_off + 1u] == 0xAEu) {
+            const uint8_t modrm = insn[op_off + 2u];
             const uint8_t mod = static_cast<uint8_t>((modrm >> 6u) & 3u);
             const uint8_t reg = static_cast<uint8_t>((modrm >> 3u) & 7u);
-            const uint8_t rm = static_cast<uint8_t>(modrm & 7u);
             if (mod != 3u && (reg == 6u || reg == 7u)) {
-                size_t len = idx + 3u;
-                if (rm == 4u) {
-                    const uint8_t sib = p[len++];
-                    if (mod == 0u && (sib & 7u) == 5u) {
-                        len += 4u;
-                    }
-                } else if (mod == 0u && rm == 5u) {
-                    len += 4u;
+                const size_t insn_len = DecodeModRmInsnLength64(insn, avail, op_off + 2u, 0u);
+                if (insn_len > 0u) {
+                    HotPatchToNopsThreadSafe(p, insn_len);
+                    ctx->Rip += insn_len;
+                    return EXCEPTION_CONTINUE_EXECUTION;
                 }
-                if (mod == 1u) {
-                    len += 1u;
-                } else if (mod == 2u) {
-                    len += 4u;
-                }
-                DWORD old_prot = 0;
-                if (::VirtualProtect(p, len, PAGE_EXECUTE_READWRITE, &old_prot)) {
-                    std::memset(p, 0x90, len);
-                    ::VirtualProtect(p, len, old_prot, &old_prot);
-                    ::FlushInstructionCache(::GetCurrentProcess(), p, len);
-                }
-                ctx->Rip += len;
-                return EXCEPTION_CONTINUE_EXECUTION;
             }
         }
-    }
 
-    // 4. AMD SSE4A (Xbox Series X Zen 2 hardware feature absent on Intel CPUs):
-    //    - INSERTQ xmm1, xmm2, imm8, imm8 : F2 [REX] 0F 78 /r ib ib
-    //    - INSERTQ xmm1, xmm2             : F2 [REX] 0F 79 /r
-    //    - EXTRQ   xmm1, imm8, imm8       : 66 [REX] 0F 78 /0 ib ib
-    //    - EXTRQ   xmm1, xmm2             : 66 [REX] 0F 79 /r
-    if (p[0] == 0xF2u || p[0] == 0x66u) {
-        const uint8_t pfx = p[0];
-        size_t idx = 1u;
-        uint8_t rex = 0u;
-        if ((p[idx] & 0xF0u) == 0x40u) {
-            rex = p[idx++];
-        }
-        if (p[idx] == 0x0Fu && (p[idx + 1u] == 0x78u || p[idx + 1u] == 0x79u)) {
-            const uint8_t op2 = p[idx + 1u];
-            const uint8_t modrm = p[idx + 2u];
+        // 3. RDPID r64 (F3 [REX] 0F C7 /7, mod == 3):
+        //    Supported on Zen 2 & Ice Lake+, missing on Coffee Lake / Comet Lake laptops.
+        if (pfx.last_f2_f3 == 0xF3u && !pfx.has_66 &&
+            op_off + 2u < avail && insn[op_off] == 0x0Fu && insn[op_off + 1u] == 0xC7u) {
+            const uint8_t modrm = insn[op_off + 2u];
             const uint8_t mod = static_cast<uint8_t>((modrm >> 6u) & 3u);
-            const uint8_t reg_raw = static_cast<uint8_t>((modrm >> 3u) & 7u);
+            const uint8_t reg = static_cast<uint8_t>((modrm >> 3u) & 7u);
             const uint8_t rm_raw = static_cast<uint8_t>(modrm & 7u);
-            if (mod == 3u) {
-                const uint32_t reg_idx = static_cast<uint32_t>(reg_raw) | ((rex & 0x04u) ? 8u : 0u);
-                const uint32_t rm_idx = static_cast<uint32_t>(rm_raw) | ((rex & 0x01u) ? 8u : 0u);
-                M128A* xmms = &ctx->Xmm0;
-                auto make_mask = [](uint32_t len) noexcept -> uint64_t {
-                    return (len == 0u || len >= 64u) ? ~0ull : ((1ull << len) - 1ull);
-                };
-                if (pfx == 0xF2u && op2 == 0x78u) {
-                    // INSERTQ xmm1(reg), xmm2(rm), imm8(len), imm8(bit_index)
-                    const uint32_t len = p[idx + 3u] & 0x3Fu;
-                    const uint32_t bit = p[idx + 4u] & 0x3Fu;
-                    const uint64_t mask = make_mask(len);
-                    const uint64_t dst = xmms[reg_idx].Low;
-                    const uint64_t src = xmms[rm_idx].Low;
-                    xmms[reg_idx].Low = (dst & ~(mask << bit)) | ((src & mask) << bit);
-                    ctx->Rip += idx + 5u;
+            if (mod == 3u && reg == 7u) {
+                const size_t insn_len = DecodeModRmInsnLength64(insn, avail, op_off + 2u, 0u);
+                if (insn_len > 0u) {
+                    unsigned int aux = 0u;
+                    (void)__rdtscp(&aux);
+                    const uint32_t dst_gpr = static_cast<uint32_t>(rm_raw) |
+                                             ((pfx.rex & 0x01u) ? 8u : 0u);
+                    WriteContextGpr64(ctx, dst_gpr, static_cast<uint64_t>(aux));
+                    ctx->Rip += insn_len;
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
-                if (pfx == 0xF2u && op2 == 0x79u) {
-                    // INSERTQ xmm1(reg), xmm2(rm) (len/idx in xmm2.High[5:0], [13:8])
-                    const uint64_t ctrl = static_cast<uint64_t>(xmms[rm_idx].High);
-                    const uint32_t len = static_cast<uint32_t>(ctrl & 0x3Full);
-                    const uint32_t bit = static_cast<uint32_t>((ctrl >> 8u) & 0x3Full);
-                    const uint64_t mask = make_mask(len);
-                    const uint64_t dst = xmms[reg_idx].Low;
-                    const uint64_t src = xmms[rm_idx].Low;
-                    xmms[reg_idx].Low = (dst & ~(mask << bit)) | ((src & mask) << bit);
-                    ctx->Rip += idx + 3u;
-                    return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
+
+        // 4. AMD SSE4A (Xbox Series X|S Zen 2 hardware ISA absent on all Intel CPUs):
+        //    - INSERTQ xmm1, xmm2, imm8, imm8 : F2 [REX] 0F 78 /r ib ib
+        //    - INSERTQ xmm1, xmm2             : F2 [REX] 0F 79 /r
+        //    - EXTRQ   xmm1, imm8, imm8       : 66 [REX] 0F 78 /0 ib ib
+        //    - EXTRQ   xmm1, xmm2             : 66 [REX] 0F 79 /r
+        //    - MOVNTSD m64, xmm1              : F2 [REX] 0F 2B /r
+        //    - MOVNTSS m32, xmm1              : F3 [REX] 0F 2B /r
+        if (op_off + 2u < avail && insn[op_off] == 0x0Fu) {
+            const uint8_t op2 = insn[op_off + 1u];
+            if ((op2 == 0x78u || op2 == 0x79u) &&
+                (pfx.last_f2_f3 == 0xF2u || (pfx.has_66 && pfx.last_f2_f3 == 0u))) {
+                const uint8_t modrm = insn[op_off + 2u];
+                const uint8_t mod = static_cast<uint8_t>((modrm >> 6u) & 3u);
+                const uint8_t reg_raw = static_cast<uint8_t>((modrm >> 3u) & 7u);
+                const uint8_t rm_raw = static_cast<uint8_t>(modrm & 7u);
+                const size_t imm_cnt = (op2 == 0x78u) ? 2u : 0u;
+                const size_t insn_len = DecodeModRmInsnLength64(insn, avail, op_off + 2u, imm_cnt);
+                if (mod == 3u && insn_len > 0u) {
+                    const uint32_t reg_idx =
+                        static_cast<uint32_t>(reg_raw) | ((pfx.rex & 0x04u) ? 8u : 0u);
+                    const uint32_t rm_idx =
+                        static_cast<uint32_t>(rm_raw) | ((pfx.rex & 0x01u) ? 8u : 0u);
+                    M128A* xmms = &ctx->Xmm0;
+                    auto make_mask = [](uint32_t bit_len) noexcept -> uint64_t {
+                        return (bit_len == 0u || bit_len >= 64u) ? ~0ull : ((1ull << bit_len) - 1ull);
+                    };
+                    if (pfx.last_f2_f3 == 0xF2u && op2 == 0x78u) {
+                        const uint32_t bit_len = static_cast<uint32_t>(insn[op_off + 3u] & 0x3Fu);
+                        const uint32_t bit_idx = static_cast<uint32_t>(insn[op_off + 4u] & 0x3Fu);
+                        const uint64_t mask = make_mask(bit_len);
+                        const uint64_t dst = xmms[reg_idx].Low;
+                        const uint64_t src = xmms[rm_idx].Low;
+                        xmms[reg_idx].Low = (dst & ~(mask << bit_idx)) | ((src & mask) << bit_idx);
+                        ctx->Rip += insn_len;
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+                    if (pfx.last_f2_f3 == 0xF2u && op2 == 0x79u) {
+                        const uint64_t ctrl = static_cast<uint64_t>(xmms[rm_idx].High);
+                        const uint32_t bit_len = static_cast<uint32_t>(ctrl & 0x3Full);
+                        const uint32_t bit_idx = static_cast<uint32_t>((ctrl >> 8u) & 0x3Full);
+                        const uint64_t mask = make_mask(bit_len);
+                        const uint64_t dst = xmms[reg_idx].Low;
+                        const uint64_t src = xmms[rm_idx].Low;
+                        xmms[reg_idx].Low = (dst & ~(mask << bit_idx)) | ((src & mask) << bit_idx);
+                        ctx->Rip += insn_len;
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+                    if (pfx.has_66 && pfx.last_f2_f3 == 0u && op2 == 0x78u && reg_raw == 0u) {
+                        const uint32_t bit_len = static_cast<uint32_t>(insn[op_off + 3u] & 0x3Fu);
+                        const uint32_t bit_idx = static_cast<uint32_t>(insn[op_off + 4u] & 0x3Fu);
+                        const uint64_t mask = make_mask(bit_len);
+                        xmms[rm_idx].Low = (xmms[rm_idx].Low >> bit_idx) & mask;
+                        ctx->Rip += insn_len;
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+                    if (pfx.has_66 && pfx.last_f2_f3 == 0u && op2 == 0x79u) {
+                        const uint64_t ctrl = xmms[rm_idx].Low;
+                        const uint32_t bit_len = static_cast<uint32_t>(ctrl & 0x3Full);
+                        const uint32_t bit_idx = static_cast<uint32_t>((ctrl >> 8u) & 0x3Full);
+                        const uint64_t mask = make_mask(bit_len);
+                        xmms[reg_idx].Low = (xmms[reg_idx].Low >> bit_idx) & mask;
+                        ctx->Rip += insn_len;
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    }
                 }
-                if (pfx == 0x66u && op2 == 0x78u && reg_raw == 0u) {
-                    // EXTRQ xmm1(rm), imm8(len), imm8(bit_index)
-                    const uint32_t len = p[idx + 3u] & 0x3Fu;
-                    const uint32_t bit = p[idx + 4u] & 0x3Fu;
-                    const uint64_t mask = make_mask(len);
-                    xmms[rm_idx].Low = (xmms[rm_idx].Low >> bit) & mask;
-                    ctx->Rip += idx + 5u;
-                    return EXCEPTION_CONTINUE_EXECUTION;
-                }
-                if (pfx == 0x66u && op2 == 0x79u) {
-                    // EXTRQ xmm1(reg), xmm2(rm) (len/idx in xmm2.Low[5:0], [13:8])
-                    const uint64_t ctrl = xmms[rm_idx].Low;
-                    const uint32_t len = static_cast<uint32_t>(ctrl & 0x3Full);
-                    const uint32_t bit = static_cast<uint32_t>((ctrl >> 8u) & 0x3Full);
-                    const uint64_t mask = make_mask(len);
-                    xmms[reg_idx].Low = (xmms[reg_idx].Low >> bit) & mask;
-                    ctx->Rip += idx + 3u;
+            } else if (op2 == 0x2Bu && (pfx.last_f2_f3 == 0xF2u || pfx.last_f2_f3 == 0xF3u)) {
+                const uint8_t modrm = insn[op_off + 2u];
+                const uint8_t mod = static_cast<uint8_t>((modrm >> 6u) & 3u);
+                const uint8_t reg_raw = static_cast<uint8_t>((modrm >> 3u) & 7u);
+                const size_t insn_len = DecodeModRmInsnLength64(insn, avail, op_off + 2u, 0u);
+                uint64_t ea = 0ull;
+                if (mod != 3u && insn_len > 0u &&
+                    ComputeEffectiveAddress64(ctx, pfx, insn, op_off + 2u, insn_len, ea)) {
+                    const uint32_t reg_idx =
+                        static_cast<uint32_t>(reg_raw) | ((pfx.rex & 0x04u) ? 8u : 0u);
+                    const M128A* xmms = &ctx->Xmm0;
+                    if (pfx.last_f2_f3 == 0xF2u) {
+                        const uint64_t v64 = xmms[reg_idx].Low;
+                        std::memcpy(reinterpret_cast<void*>(ea), &v64, sizeof(v64));
+                    } else {
+                        const uint32_t v32 = static_cast<uint32_t>(xmms[reg_idx].Low & 0xFFFFFFFFull);
+                        std::memcpy(reinterpret_cast<void*>(ea), &v32, sizeof(v32));
+                    }
+                    ctx->Rip += insn_len;
                     return EXCEPTION_CONTINUE_EXECUTION;
                 }
             }
@@ -5208,21 +6204,21 @@ LONG CALLBACK Zen2IllegalInstructionVeh(PEXCEPTION_POINTERS ep) {
                 rva = static_cast<uintptr_t>(ctx->Rip) - reinterpret_cast<uintptr_t>(mod);
             }
             uint8_t bytes[12]{};
-            size_t avail = 0u;
+            size_t dump_avail = 0u;
             MEMORY_BASIC_INFORMATION mbi{};
             if (::VirtualQuery(p, &mbi, sizeof(mbi)) != 0u && mbi.State == MEM_COMMIT) {
                 const uintptr_t seg_end =
                     reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
                 const uintptr_t cur_ip = reinterpret_cast<uintptr_t>(p);
                 if (seg_end > cur_ip) {
-                    avail = std::min<size_t>(sizeof(bytes), static_cast<size_t>(seg_end - cur_ip));
-                    std::memcpy(bytes, p, avail);
+                    dump_avail = std::min<size_t>(sizeof(bytes), static_cast<size_t>(seg_end - cur_ip));
+                    std::memcpy(bytes, p, dump_avail);
                 }
             }
             std::fprintf(stderr,
                          "[OpenScarlett][VEH-UD] rip=0x%llX (%s+0x%llX) avail=%zu bytes=%02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X rax=0x%llX rcx=0x%llX rdx=0x%llX\n",
                          static_cast<unsigned long long>(ctx->Rip), mod_name,
-                         static_cast<unsigned long long>(rva), avail,
+                         static_cast<unsigned long long>(rva), dump_avail,
                          bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
                          bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11],
                          static_cast<unsigned long long>(ctx->Rax),
@@ -5416,6 +6412,26 @@ void* ResolveHookForSymbol(const char* name) {
          reinterpret_cast<void**>(&g_real_ExitProcess)},
         {"OutputDebugStringA", reinterpret_cast<void*>(&Hook_OutputDebugStringA),
          reinterpret_cast<void**>(&g_real_OutputDebugStringA)},
+        {"GlobalMemoryStatusEx", reinterpret_cast<void*>(&Hook_GlobalMemoryStatusEx),
+         reinterpret_cast<void**>(&g_real_GlobalMemoryStatusEx)},
+        {"RegOpenKeyW", reinterpret_cast<void*>(&Hook_RegOpenKeyW),
+         reinterpret_cast<void**>(&g_real_RegOpenKeyExW)},
+        {"RegOpenKeyA", reinterpret_cast<void*>(&Hook_RegOpenKeyA),
+         reinterpret_cast<void**>(&g_real_RegOpenKeyExA)},
+        {"RegOpenKeyExW", reinterpret_cast<void*>(&Hook_RegOpenKeyExW),
+         reinterpret_cast<void**>(&g_real_RegOpenKeyExW)},
+        {"RegOpenKeyExA", reinterpret_cast<void*>(&Hook_RegOpenKeyExA),
+         reinterpret_cast<void**>(&g_real_RegOpenKeyExA)},
+        {"RegQueryValueExW", reinterpret_cast<void*>(&Hook_RegQueryValueExW),
+         reinterpret_cast<void**>(&g_real_RegQueryValueExW)},
+        {"RegQueryValueExA", reinterpret_cast<void*>(&Hook_RegQueryValueExA),
+         reinterpret_cast<void**>(&g_real_RegQueryValueExA)},
+        {"RegGetValueW", reinterpret_cast<void*>(&Hook_RegGetValueW),
+         reinterpret_cast<void**>(&g_real_RegGetValueW)},
+        {"RegGetValueA", reinterpret_cast<void*>(&Hook_RegGetValueA),
+         reinterpret_cast<void**>(&g_real_RegGetValueA)},
+        {"RegCloseKey", reinterpret_cast<void*>(&Hook_RegCloseKey),
+         reinterpret_cast<void**>(&g_real_RegCloseKey)},
         {"WinHttpConnect", reinterpret_cast<void*>(&Hook_WinHttpConnect),
          reinterpret_cast<void**>(&g_real_WinHttpConnect)},
         {"NtCreateFile", reinterpret_cast<void*>(&Hook_NtCreateFile),
@@ -5472,6 +6488,25 @@ void* ResolveHookForRealAddress(ULONGLONG addr) {
     if (void* p = match(g_kernelbase_CreateProcessW, &Hook_CreateProcessW)) return p;
     if (void* p = match(g_real_ExitProcess, &Hook_ExitProcess)) return p;
     if (void* p = match(g_real_OutputDebugStringA, &Hook_OutputDebugStringA)) return p;
+    if (void* p = match(g_real_GlobalMemoryStatusEx, &Hook_GlobalMemoryStatusEx)) return p;
+    if (void* p = match(g_kernelbase_GlobalMemoryStatusEx, &Hook_GlobalMemoryStatusEx)) return p;
+    EnsureAdvapi32ProcsResolved();
+    if (void* p = match(g_real_RegOpenKeyW, &Hook_RegOpenKeyW)) return p;
+    if (void* p = match(g_real_RegOpenKeyA, &Hook_RegOpenKeyA)) return p;
+    if (void* p = match(g_real_RegOpenKeyExW, &Hook_RegOpenKeyExW)) return p;
+    if (void* p = match(g_advapi32_RegOpenKeyExW, &Hook_RegOpenKeyExW)) return p;
+    if (void* p = match(g_real_RegOpenKeyExA, &Hook_RegOpenKeyExA)) return p;
+    if (void* p = match(g_advapi32_RegOpenKeyExA, &Hook_RegOpenKeyExA)) return p;
+    if (void* p = match(g_real_RegQueryValueExW, &Hook_RegQueryValueExW)) return p;
+    if (void* p = match(g_advapi32_RegQueryValueExW, &Hook_RegQueryValueExW)) return p;
+    if (void* p = match(g_real_RegQueryValueExA, &Hook_RegQueryValueExA)) return p;
+    if (void* p = match(g_advapi32_RegQueryValueExA, &Hook_RegQueryValueExA)) return p;
+    if (void* p = match(g_real_RegGetValueW, &Hook_RegGetValueW)) return p;
+    if (void* p = match(g_advapi32_RegGetValueW, &Hook_RegGetValueW)) return p;
+    if (void* p = match(g_real_RegGetValueA, &Hook_RegGetValueA)) return p;
+    if (void* p = match(g_advapi32_RegGetValueA, &Hook_RegGetValueA)) return p;
+    if (void* p = match(g_real_RegCloseKey, &Hook_RegCloseKey)) return p;
+    if (void* p = match(g_advapi32_RegCloseKey, &Hook_RegCloseKey)) return p;
     if (void* p = match(g_real_WinHttpConnect, &Hook_WinHttpConnect)) return p;
     if (void* p = match(g_real_NtCreateFile, &Hook_NtCreateFile)) return p;
     if (void* p = match(g_real_NtOpenFile, &Hook_NtOpenFile)) return p;
@@ -6151,6 +7186,53 @@ bool InitializeHookRuntime(HMODULE self_mod) {
     g_real_ExitProcess = reinterpret_cast<PfnExitProcess>(::GetProcAddress(k32, "ExitProcess"));
     g_real_OutputDebugStringA =
         reinterpret_cast<PfnOutputDebugStringA>(::GetProcAddress(k32, "OutputDebugStringA"));
+    g_real_GlobalMemoryStatusEx =
+        reinterpret_cast<PfnGlobalMemoryStatusEx>(::GetProcAddress(k32, "GlobalMemoryStatusEx"));
+    if (g_kernelbase_mod != nullptr) {
+        g_kernelbase_GlobalMemoryStatusEx = reinterpret_cast<PfnGlobalMemoryStatusEx>(
+            ::GetProcAddress(g_kernelbase_mod, "GlobalMemoryStatusEx"));
+        if (g_real_GlobalMemoryStatusEx == nullptr) {
+            g_real_GlobalMemoryStatusEx = g_kernelbase_GlobalMemoryStatusEx;
+        }
+        g_real_RegOpenKeyExW =
+            reinterpret_cast<PfnRegOpenKeyExW>(::GetProcAddress(g_kernelbase_mod, "RegOpenKeyExW"));
+        g_real_RegOpenKeyExA =
+            reinterpret_cast<PfnRegOpenKeyExA>(::GetProcAddress(g_kernelbase_mod, "RegOpenKeyExA"));
+        g_real_RegQueryValueExW = reinterpret_cast<PfnRegQueryValueExW>(
+            ::GetProcAddress(g_kernelbase_mod, "RegQueryValueExW"));
+        g_real_RegQueryValueExA = reinterpret_cast<PfnRegQueryValueExA>(
+            ::GetProcAddress(g_kernelbase_mod, "RegQueryValueExA"));
+        g_real_RegGetValueW =
+            reinterpret_cast<PfnRegGetValueW>(::GetProcAddress(g_kernelbase_mod, "RegGetValueW"));
+        g_real_RegGetValueA =
+            reinterpret_cast<PfnRegGetValueA>(::GetProcAddress(g_kernelbase_mod, "RegGetValueA"));
+        g_real_RegCloseKey =
+            reinterpret_cast<PfnRegCloseKey>(::GetProcAddress(g_kernelbase_mod, "RegCloseKey"));
+    }
+    if (!g_real_RegOpenKeyExW) {
+        g_real_RegOpenKeyExW = reinterpret_cast<PfnRegOpenKeyExW>(::GetProcAddress(k32, "RegOpenKeyExW"));
+    }
+    if (!g_real_RegOpenKeyExA) {
+        g_real_RegOpenKeyExA = reinterpret_cast<PfnRegOpenKeyExA>(::GetProcAddress(k32, "RegOpenKeyExA"));
+    }
+    if (!g_real_RegQueryValueExW) {
+        g_real_RegQueryValueExW =
+            reinterpret_cast<PfnRegQueryValueExW>(::GetProcAddress(k32, "RegQueryValueExW"));
+    }
+    if (!g_real_RegQueryValueExA) {
+        g_real_RegQueryValueExA =
+            reinterpret_cast<PfnRegQueryValueExA>(::GetProcAddress(k32, "RegQueryValueExA"));
+    }
+    if (!g_real_RegGetValueW) {
+        g_real_RegGetValueW = reinterpret_cast<PfnRegGetValueW>(::GetProcAddress(k32, "RegGetValueW"));
+    }
+    if (!g_real_RegGetValueA) {
+        g_real_RegGetValueA = reinterpret_cast<PfnRegGetValueA>(::GetProcAddress(k32, "RegGetValueA"));
+    }
+    if (!g_real_RegCloseKey) {
+        g_real_RegCloseKey = reinterpret_cast<PfnRegCloseKey>(::GetProcAddress(k32, "RegCloseKey"));
+    }
+    EnsureAdvapi32ProcsResolved();
     {
         char off_buf[16]{};
         const DWORD off_len = ::GetEnvironmentVariableA("OPENSCARLETT_OFFLINE", off_buf, static_cast<DWORD>(sizeof(off_buf)));

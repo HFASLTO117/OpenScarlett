@@ -35,6 +35,9 @@ inline bool IntersectAabb(const RtAabb& box,
                           const RtRay& ray,
                           float t_best,
                           float& out_t_near) noexcept {
+    if (box.min.x > box.max.x || box.min.y > box.max.y || box.min.z > box.max.z) {
+        return false;
+    }
     float tmin = ray.t_min;
     float tmax = t_best;
     for (int a = 0; a < 3; ++a) {
@@ -512,10 +515,25 @@ bool BvhAccelerationStructure::GetNodeView(uint32_t index, BvhNodeView& out_node
 
 Status BvhAccelerationStructure::Build(const std::vector<RtTriangle>& triangles) {
     if (triangles.empty()) {
-        return Status::Error(StatusCode::RaytracingError, "Cannot build BVH from 0 triangles");
+        triangles_.clear();
+        tri_indices_.clear();
+        nodes_.clear();
+        leaf_node_count_ = 0u;
+        max_tree_depth_ = 0u;
+        return Status::Ok();
     }
 
     triangles_ = triangles;
+    auto sanitize_vec3 = [](Vec3& v) noexcept {
+        if (!std::isfinite(v.x)) v.x = 0.0f;
+        if (!std::isfinite(v.y)) v.y = 0.0f;
+        if (!std::isfinite(v.z)) v.z = 0.0f;
+    };
+    for (auto& tri : triangles_) {
+        sanitize_vec3(tri.v0);
+        sanitize_vec3(tri.v1);
+        sanitize_vec3(tri.v2);
+    }
     tri_indices_.resize(triangles_.size());
     std::iota(tri_indices_.begin(), tri_indices_.end(), 0u);
 
@@ -853,9 +871,6 @@ Vec3 BvhAccelerationStructure::TraceColor(const RtRay& ray,
 Status BvhAccelerationStructure::RenderScene(const RtDispatchParams& params,
                                              FrameBufferRgba8& out_frame,
                                              RtStats* out_stats) const {
-    if (nodes_.empty()) {
-        return Status::Error(StatusCode::RaytracingError, "BVH is empty");
-    }
     if (params.width == 0 || params.height == 0) {
         return Status::Error(StatusCode::InvalidArgument, "RT dispatch dimensions must be > 0");
     }

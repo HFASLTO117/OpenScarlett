@@ -56,8 +56,99 @@ using PfnXMemSize = size_t(__stdcall*)(void*, uint64_t);
 using PfnMapTitleVirtualMemory = void*(__stdcall*)(
     void*, uint64_t, uint32_t, uint32_t, const uint64_t*);
 using PfnUnmapTitleVirtualMemory = int32_t(__stdcall*)(void*, uint64_t);
+using PfnXMemResolveCpuAliasVa = uint64_t(__stdcall*)(uint64_t);
 
 constexpr uint32_t kKxMemGraphics = 0x10000000u;
+
+PfnXMemResolveCpuAliasVa GetXMemResolveFn() noexcept {
+    static std::atomic<PfnXMemResolveCpuAliasVa> s_fn{nullptr};
+    static std::atomic<uint64_t> s_next_probe_ms{0u};
+    PfnXMemResolveCpuAliasVa fn = s_fn.load(std::memory_order_acquire);
+    if (fn) {
+        return fn;
+    }
+    const uint64_t now_ms = ::GetTickCount64();
+    const uint64_t next_ms = s_next_probe_ms.load(std::memory_order_relaxed);
+    if (now_ms < next_ms) {
+        return nullptr;
+    }
+    s_next_probe_ms.store(now_ms + 250ull, std::memory_order_relaxed);
+    if (HMODULE hm = ::GetModuleHandleW(L"xmem.dll")) {
+        fn = reinterpret_cast<PfnXMemResolveCpuAliasVa>(
+            reinterpret_cast<void*>(::GetProcAddress(hm, "OpenScarlett_XMemResolveCpuAliasVa")));
+        if (fn) {
+            s_fn.store(fn, std::memory_order_release);
+        }
+    }
+    return fn;
+}
+
+void* ResolveCpuAliasPointer(void* ptr) noexcept {
+    if (!ptr) {
+        return nullptr;
+    }
+    if (PfnXMemResolveCpuAliasVa fn = GetXMemResolveFn()) {
+        const uint64_t orig = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ptr));
+        const uint64_t resolved = fn(orig);
+        if (resolved != 0ull) {
+            return reinterpret_cast<void*>(static_cast<uintptr_t>(resolved));
+        }
+    }
+    return ptr;
+}
+
+const void* ResolveCpuAliasConstPointer(const void* ptr) noexcept {
+    return ResolveCpuAliasPointer(const_cast<void*>(ptr));
+}
+
+struct CachedKernelxExports {
+    PfnQueryTitlePhysicalPages query_phys = nullptr;
+    PfnXMemSize xmem_size = nullptr;
+    PfnMapTitleVirtualMemory map_title_vm = nullptr;
+    PfnUnmapTitleVirtualMemory unmap_title_vm = nullptr;
+};
+
+CachedKernelxExports GetKernelxExports() noexcept {
+    static std::atomic<HMODULE> s_mod{nullptr};
+    static std::atomic<PfnQueryTitlePhysicalPages> s_query{nullptr};
+    static std::atomic<PfnXMemSize> s_xmem_size{nullptr};
+    static std::atomic<PfnMapTitleVirtualMemory> s_map{nullptr};
+    static std::atomic<PfnUnmapTitleVirtualMemory> s_unmap{nullptr};
+    static std::atomic<uint64_t> s_next_probe_ms{0u};
+
+    CachedKernelxExports out{};
+    out.query_phys = s_query.load(std::memory_order_acquire);
+    out.xmem_size = s_xmem_size.load(std::memory_order_acquire);
+    out.map_title_vm = s_map.load(std::memory_order_acquire);
+    out.unmap_title_vm = s_unmap.load(std::memory_order_acquire);
+    if (s_mod.load(std::memory_order_acquire) != nullptr) {
+        return out;
+    }
+
+    const uint64_t now_ms = ::GetTickCount64();
+    const uint64_t next_ms = s_next_probe_ms.load(std::memory_order_relaxed);
+    if (now_ms < next_ms) {
+        return out;
+    }
+    s_next_probe_ms.store(now_ms + 250ull, std::memory_order_relaxed);
+
+    if (HMODULE h_kx = ::GetModuleHandleW(L"kernelx.dll")) {
+        out.query_phys = reinterpret_cast<PfnQueryTitlePhysicalPages>(
+            reinterpret_cast<void*>(::GetProcAddress(h_kx, "QueryTitlePhysicalPages")));
+        out.xmem_size = reinterpret_cast<PfnXMemSize>(
+            reinterpret_cast<void*>(::GetProcAddress(h_kx, "XMemSize")));
+        out.map_title_vm = reinterpret_cast<PfnMapTitleVirtualMemory>(
+            reinterpret_cast<void*>(::GetProcAddress(h_kx, "MapTitleVirtualMemory")));
+        out.unmap_title_vm = reinterpret_cast<PfnUnmapTitleVirtualMemory>(
+            reinterpret_cast<void*>(::GetProcAddress(h_kx, "UnmapTitleVirtualMemory")));
+        if (out.query_phys) s_query.store(out.query_phys, std::memory_order_release);
+        if (out.xmem_size) s_xmem_size.store(out.xmem_size, std::memory_order_release);
+        if (out.map_title_vm) s_map.store(out.map_title_vm, std::memory_order_release);
+        if (out.unmap_title_vm) s_unmap.store(out.unmap_title_vm, std::memory_order_release);
+        s_mod.store(h_kx, std::memory_order_release);
+    }
+    return out;
+}
 
 bool IsWin32ProtectReadable(DWORD prot) {
     if ((prot & (PAGE_GUARD | PAGE_NOACCESS)) != 0u) {
@@ -107,6 +198,121 @@ bool IsWin32ProtectWritable(DWORD prot) {
 }
 #endif
 
+// ===========================================================================
+// Zero-Alloc Reusable Per-Worker Scratch Buffers (16 MiB steady-state cap)
+// Eliminates per-request NtAllocateVirtualMemory/NtFreeVirtualMemory churn
+// across multi-GB .rpf world streaming on IOCP & decompression worker threads.
+// ===========================================================================
+constexpr size_t kMaxRetainedScratchBytes = 16u * 1024u * 1024u;
+constexpr size_t kMaxRetainedPageSlots = 4096u;
+
+void TrimByteScratchIfOversized(std::vector<uint8_t>& v) noexcept {
+    v.clear();
+    if (v.capacity() > kMaxRetainedScratchBytes) {
+        std::vector<uint8_t>().swap(v);
+    }
+}
+
+void ReserveZlibOutputHint(std::vector<uint8_t>& out, size_t src_size, size_t target_hint) {
+    const size_t cap_hint = std::min<size_t>({
+        target_hint,
+        kMaxRetainedScratchBytes,
+        (src_size <= (SIZE_MAX - 65536u) / 32u) ? (src_size * 32u + 65536u) : kMaxRetainedScratchBytes,
+    });
+    if (out.capacity() < cap_hint) {
+        out.reserve(cap_hint);
+    }
+}
+
+struct WorkerScratchPool {
+    bool req_in_use = false;
+    bool phys_in_use = false;
+    std::vector<uint8_t> buf_a;
+    std::vector<uint8_t> buf_b;
+    std::vector<uint8_t> buf_c;
+    std::vector<uint64_t> pfns;
+    std::vector<uint8_t*> page_ptrs;
+};
+
+WorkerScratchPool& GetWorkerScratchPool() noexcept {
+    thread_local WorkerScratchPool tl_pool;
+    return tl_pool;
+}
+
+class ScopedRequestScratch {
+public:
+    ScopedRequestScratch() noexcept : pool_(GetWorkerScratchPool()) {
+        if (!pool_.req_in_use) {
+            pool_.req_in_use = true;
+            owns_pool_ = true;
+            pool_.buf_a.clear();
+            pool_.buf_b.clear();
+            pool_.buf_c.clear();
+        }
+    }
+
+    ~ScopedRequestScratch() {
+        if (owns_pool_) {
+            TrimByteScratchIfOversized(pool_.buf_a);
+            TrimByteScratchIfOversized(pool_.buf_b);
+            TrimByteScratchIfOversized(pool_.buf_c);
+            pool_.req_in_use = false;
+        }
+    }
+
+    ScopedRequestScratch(const ScopedRequestScratch&) = delete;
+    ScopedRequestScratch& operator=(const ScopedRequestScratch&) = delete;
+
+    std::vector<uint8_t>& a() noexcept { return owns_pool_ ? pool_.buf_a : fallback_a_; }
+    std::vector<uint8_t>& b() noexcept { return owns_pool_ ? pool_.buf_b : fallback_b_; }
+    std::vector<uint8_t>& c() noexcept { return owns_pool_ ? pool_.buf_c : fallback_c_; }
+
+private:
+    WorkerScratchPool& pool_;
+    bool owns_pool_ = false;
+    std::vector<uint8_t> fallback_a_;
+    std::vector<uint8_t> fallback_b_;
+    std::vector<uint8_t> fallback_c_;
+};
+
+class ScopedPhysPageScratch {
+public:
+    ScopedPhysPageScratch() noexcept : pool_(GetWorkerScratchPool()) {
+        if (!pool_.phys_in_use) {
+            pool_.phys_in_use = true;
+            owns_pool_ = true;
+            pool_.pfns.clear();
+            pool_.page_ptrs.clear();
+        }
+    }
+
+    ~ScopedPhysPageScratch() {
+        if (owns_pool_) {
+            pool_.pfns.clear();
+            if (pool_.pfns.capacity() > kMaxRetainedPageSlots) {
+                std::vector<uint64_t>().swap(pool_.pfns);
+            }
+            pool_.page_ptrs.clear();
+            if (pool_.page_ptrs.capacity() > kMaxRetainedPageSlots) {
+                std::vector<uint8_t*>().swap(pool_.page_ptrs);
+            }
+            pool_.phys_in_use = false;
+        }
+    }
+
+    ScopedPhysPageScratch(const ScopedPhysPageScratch&) = delete;
+    ScopedPhysPageScratch& operator=(const ScopedPhysPageScratch&) = delete;
+
+    std::vector<uint64_t>& pfns() noexcept { return owns_pool_ ? pool_.pfns : fallback_pfns_; }
+    std::vector<uint8_t*>& page_ptrs() noexcept { return owns_pool_ ? pool_.page_ptrs : fallback_ptrs_; }
+
+private:
+    WorkerScratchPool& pool_;
+    bool owns_pool_ = false;
+    std::vector<uint64_t> fallback_pfns_;
+    std::vector<uint8_t*> fallback_ptrs_;
+};
+
 struct DestinationClassification {
     bool is_physical_page = false;
     bool is_xmem = false;
@@ -115,7 +321,7 @@ struct DestinationClassification {
 };
 
 int32_t ValidateAndClassifyDestination(
-    void* dst_ptr,
+    void*& dst_ptr,
     size_t dst_cap,
     DestinationClassification& out_class) {
     out_class = DestinationClassification{};
@@ -124,10 +330,13 @@ int32_t ValidateAndClassifyDestination(
     }
 
 #if defined(_WIN32)
+    dst_ptr = ResolveCpuAliasPointer(dst_ptr);
     uintptr_t cursor = reinterpret_cast<uintptr_t>(dst_ptr);
     if (cursor + dst_cap < cursor) {
         return OS_DSTORAGE_E_INVALIDARG;
     }
+    uintptr_t first_alloc_base = cursor;
+    bool captured_first_base = false;
     size_t remaining = dst_cap;
     while (remaining > 0u) {
         MEMORY_BASIC_INFORMATION mbi{};
@@ -136,6 +345,10 @@ int32_t ValidateAndClassifyDestination(
         }
         if (mbi.State != MEM_COMMIT || !IsWin32ProtectWritable(mbi.Protect)) {
             return OS_DSTORAGE_E_INVALIDARG;
+        }
+        if (!captured_first_base) {
+            first_alloc_base = reinterpret_cast<uintptr_t>(mbi.AllocationBase);
+            captured_first_base = true;
         }
         const uintptr_t region_end =
             reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
@@ -148,44 +361,43 @@ int32_t ValidateAndClassifyDestination(
         remaining -= step;
     }
 
-    HMODULE h_kx = GetModuleHandleW(L"kernelx.dll");
-    if (h_kx) {
-        auto fn_query = reinterpret_cast<PfnQueryTitlePhysicalPages>(
-            reinterpret_cast<void*>(GetProcAddress(h_kx, "QueryTitlePhysicalPages")));
-        if (fn_query) {
-            uint64_t phys_id = 0u;
-            uint64_t map_size = 0u;
-            uint32_t flags = 0u;
-            if (fn_query(dst_ptr, &phys_id, &map_size, &flags) != 0) {
-                out_class.is_physical_page = true;
-                out_class.physical_id = phys_id;
-                uint64_t covered = map_size;
-                // Walk adjacent scatter-mapped physical pages (e.g. TileHeap mapped
-                // 64 KiB at a time via XMemMapPhysicalPagesScatter).
-                while (covered > 0u && covered < dst_cap) {
-                    uint64_t next_phys = 0u;
-                    uint64_t next_size = 0u;
-                    uint32_t next_flags = 0u;
-                    void* next_ptr = static_cast<uint8_t*>(dst_ptr) + covered;
-                    if (fn_query(next_ptr, &next_phys, &next_size, &next_flags) == 0 ||
-                        next_size == 0u) {
-                        break;
-                    }
-                    covered += next_size;
+    const CachedKernelxExports kx = GetKernelxExports();
+    if (kx.query_phys) {
+        uint64_t phys_id = 0u;
+        uint64_t map_size = 0u;
+        uint32_t flags = 0u;
+        if (kx.query_phys(dst_ptr, &phys_id, &map_size, &flags) != 0 && map_size > 0u) {
+            out_class.is_physical_page = true;
+            out_class.physical_id = phys_id;
+            const uintptr_t start_va = reinterpret_cast<uintptr_t>(dst_ptr);
+            const uint64_t off_in_view =
+                (start_va >= first_alloc_base && (start_va - first_alloc_base) < map_size)
+                    ? static_cast<uint64_t>(start_va - first_alloc_base)
+                    : 0ull;
+            uint64_t covered = map_size - off_in_view;
+            // Walk adjacent scatter-mapped physical pages (e.g. TileHeap / RPF scatter pages
+            // mapped 64 KiB at a time via XMemMapPhysicalPagesScatter, including unaligned starts).
+            while (covered > 0u && covered < dst_cap) {
+                uint64_t next_phys = 0u;
+                uint64_t next_size = 0u;
+                uint32_t next_flags = 0u;
+                void* next_ptr = static_cast<uint8_t*>(dst_ptr) + covered;
+                if (kx.query_phys(next_ptr, &next_phys, &next_size, &next_flags) == 0 ||
+                    next_size == 0u) {
+                    break;
                 }
-                out_class.physical_mapping_size = covered;
-                if (covered > 0u && dst_cap > covered) {
-                    return OS_DSTORAGE_E_REQUEST_TOO_LARGE;
-                }
+                covered += next_size;
+            }
+            out_class.physical_mapping_size = covered;
+            if (covered > 0u && dst_cap > covered) {
+                return OS_DSTORAGE_E_REQUEST_TOO_LARGE;
             }
         }
-        auto fn_xmem_size = reinterpret_cast<PfnXMemSize>(
-            reinterpret_cast<void*>(GetProcAddress(h_kx, "XMemSize")));
-        if (fn_xmem_size) {
-            const size_t xsz = fn_xmem_size(dst_ptr, 0u);
-            if (xsz > 0u) {
-                out_class.is_xmem = true;
-            }
+    }
+    if (kx.xmem_size) {
+        const size_t xsz = kx.xmem_size(dst_ptr, 0u);
+        if (xsz > 0u) {
+            out_class.is_xmem = true;
         }
     }
 #else
@@ -349,7 +561,9 @@ int32_t TransferPhysicalPageArray(
         return OS_DSTORAGE_E_INVALIDARG;
     }
 
-    std::vector<uint64_t> pfns(static_cast<size_t>(page_count), 0ull);
+    ScopedPhysPageScratch phys_scratch;
+    std::vector<uint64_t>& pfns = phys_scratch.pfns();
+    pfns.resize(static_cast<size_t>(page_count));
     for (size_t i = 0u; i < pfns.size(); ++i) {
         pfns[i] = static_cast<uint64_t>(page_array[i]);
         if (pfns[i] == 0ull) {
@@ -361,7 +575,8 @@ int32_t TransferPhysicalPageArray(
     // Path 1: Resolve through attached openscarlett::TitleVAMirror if registered.
     if (title_va_mirror_ptr) {
         auto* mirror = static_cast<openscarlett::TitleVAMirror*>(title_va_mirror_ptr);
-        std::vector<uint8_t*> page_ptrs(pfns.size(), nullptr);
+        std::vector<uint8_t*>& page_ptrs = phys_scratch.page_ptrs();
+        page_ptrs.assign(pfns.size(), nullptr);
         bool all_resolved = true;
         for (size_t i = 0u; i < pfns.size(); ++i) {
             void* cpu_ptr = nullptr;
@@ -397,15 +612,12 @@ int32_t TransferPhysicalPageArray(
     }
 
     // Path 2: Resolve through kernelx.dll MapTitleVirtualMemory / UnmapTitleVirtualMemory.
-    HMODULE h_kx = GetModuleHandleW(L"kernelx.dll");
-    if (h_kx) {
-        auto fn_map = reinterpret_cast<PfnMapTitleVirtualMemory>(
-            reinterpret_cast<void*>(GetProcAddress(h_kx, "MapTitleVirtualMemory")));
-        auto fn_unmap = reinterpret_cast<PfnUnmapTitleVirtualMemory>(
-            reinterpret_cast<void*>(GetProcAddress(h_kx, "UnmapTitleVirtualMemory")));
-        if (fn_map && fn_unmap) {
-            const uint32_t prot = is_write ? PAGE_READWRITE : PAGE_READONLY;
-            void* mapped = fn_map(nullptr, page_count, kKxMemGraphics, prot, pfns.data());
+    const CachedKernelxExports kx = GetKernelxExports();
+    if (kx.map_title_vm && kx.unmap_title_vm) {
+        const uint32_t prot = is_write ? PAGE_READWRITE : PAGE_READONLY;
+        constexpr uint64_t kMaxWindowPages = 256ull;  // 16 MiB VA window per chunk
+        if (page_count <= kMaxWindowPages) {
+            void* mapped = kx.map_title_vm(nullptr, page_count, kKxMemGraphics, prot, pfns.data());
             if (mapped) {
                 auto* base = static_cast<uint8_t*>(mapped) + page_offset;
                 if (is_write) {
@@ -413,9 +625,46 @@ int32_t TransferPhysicalPageArray(
                 } else {
                     std::memcpy(host_buf, base, byte_size);
                 }
-                fn_unmap(mapped, page_count);
+                kx.unmap_title_vm(mapped, page_count);
                 return OS_DSTORAGE_S_OK;
             }
+        } else {
+            // Multi-chunk scatter transfer for >16 MiB physical page arrays: pre-validate every
+            // window before writing so invalid PFNs are strictly rejected with zero partial writes.
+            if (is_write) {
+                for (uint64_t base_pg = 0ull; base_pg < page_count; base_pg += kMaxWindowPages) {
+                    const uint64_t win_pages = std::min<uint64_t>(kMaxWindowPages, page_count - base_pg);
+                    void* probe = kx.map_title_vm(
+                        nullptr, win_pages, kKxMemGraphics, PAGE_READONLY, pfns.data() + base_pg);
+                    if (!probe) {
+                        return OS_DSTORAGE_E_INVALIDARG;
+                    }
+                    kx.unmap_title_vm(probe, win_pages);
+                }
+            }
+            size_t copied = 0u;
+            size_t cur_off = static_cast<size_t>(page_offset);
+            for (uint64_t base_pg = 0ull; base_pg < page_count && copied < byte_size;
+                 base_pg += kMaxWindowPages) {
+                const uint64_t win_pages = std::min<uint64_t>(kMaxWindowPages, page_count - base_pg);
+                void* mapped = kx.map_title_vm(
+                    nullptr, win_pages, kKxMemGraphics, prot, pfns.data() + base_pg);
+                if (!mapped) {
+                    return OS_DSTORAGE_E_INVALIDARG;
+                }
+                const size_t win_bytes = static_cast<size_t>(win_pages * kPage64KB) - cur_off;
+                const size_t step = std::min<size_t>(byte_size - copied, win_bytes);
+                auto* base = static_cast<uint8_t*>(mapped) + cur_off;
+                if (is_write) {
+                    std::memcpy(base, host_buf + copied, step);
+                } else {
+                    std::memcpy(host_buf + copied, base, step);
+                }
+                kx.unmap_title_vm(mapped, win_pages);
+                copied += step;
+                cur_off = 0u;
+            }
+            return OS_DSTORAGE_S_OK;
         }
     }
     return OS_DSTORAGE_E_INVALIDARG;
@@ -464,7 +713,10 @@ public:
         }
     }
 
-    bool AttachFile(HANDLE hfile) {
+    bool AttachFile(HANDLE hfile, bool* out_skip_iocp_on_sync = nullptr) {
+        if (out_skip_iocp_on_sync) {
+            *out_skip_iocp_on_sync = false;
+        }
         std::vector<std::thread> to_join;
         HANDLE to_close = nullptr;
         {
@@ -488,6 +740,12 @@ public:
                     iocp_ = nullptr;
                 }
             } else {
+                const BOOL skip_ok = SetFileCompletionNotificationModes(
+                    hfile,
+                    FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE);
+                if (out_skip_iocp_on_sync) {
+                    *out_skip_iocp_on_sync = (skip_ok != FALSE);
+                }
                 ++active_files_;
                 return true;
             }
@@ -581,14 +839,19 @@ public:
 #if defined(_WIN32)
         HANDLE hfile,
         bool iocp_attached = false,
-        const wchar_t* path = nullptr
+        const wchar_t* path = nullptr,
+        bool skip_iocp_on_sync = false
 #else
         void* hfile,
         bool iocp_attached = false,
-        const wchar_t* path = nullptr
+        const wchar_t* path = nullptr,
+        bool skip_iocp_on_sync = false
 #endif
         )
-        : file_handle_(hfile), iocp_attached_(iocp_attached), file_path_(path ? path : L"") {}
+        : file_handle_(hfile),
+          iocp_attached_(iocp_attached),
+          skip_iocp_on_sync_(skip_iocp_on_sync),
+          file_path_(path ? path : L"") {}
 
     ~DStorageFileImpl() {
         CloseInternal();
@@ -682,7 +945,7 @@ public:
             return OS_DSTORAGE_E_IO_ERROR;
         }
         out.resize(size);
-        constexpr uint32_t kReadChunkBytes = 256u * 1024u;  // 256 KiB async overlapped chunk
+        constexpr uint32_t kReadChunkBytes = 4u * 1024u * 1024u;  // 4 MiB async overlapped chunk
         constexpr uint64_t k64GiB = 64ull * 1024ull * 1024ull * 1024ull;
 
         auto& rt = GetRuntime();
@@ -718,9 +981,15 @@ public:
                     return OS_DSTORAGE_E_IO_ERROR;
                 }
             }
-            // Note: On a handle associated with an IOCP (without FILE_SKIP_COMPLETION_PORT_ON_SUCCESS),
-            // Windows ALWAYS queues a completion packet even when ReadFile returns TRUE synchronously.
-            if (iocp_attached_) {
+            if (ok && skip_iocp_on_sync_) {
+                // FILE_SKIP_COMPLETION_PORT_ON_SUCCESS guarantees no IOCP packet was queued
+                // when ReadFile completed synchronously from the OS file cache.
+                if (imm_bytes == 0u) {
+                    out.clear();
+                    return OS_DSTORAGE_E_IO_ERROR;
+                }
+                total_read += imm_bytes;
+            } else if (iocp_attached_) {
                 AcquireSRWLockExclusive(&op.lock);
                 while (!op.completed) {
                     if (closing_.load(std::memory_order_acquire) ||
@@ -813,6 +1082,7 @@ private:
     void* file_handle_ = nullptr;
 #endif
     bool iocp_attached_ = false;
+    bool skip_iocp_on_sync_ = false;
     std::wstring file_path_;
 };
 
@@ -1198,23 +1468,7 @@ public:
             void* src_buf = x.Source;
 #if defined(_WIN32)
             if (!src_phys && src_buf) {
-                using ResolveFn = uint64_t(__stdcall*)(uint64_t);
-                static std::atomic<ResolveFn> s_xmem_resolve{nullptr};
-                static std::atomic<bool> s_xmem_probed{false};
-                ResolveFn fn = s_xmem_resolve.load(std::memory_order_acquire);
-                if (!fn && !s_xmem_probed.load(std::memory_order_relaxed)) {
-                    if (HMODULE hm = ::GetModuleHandleA("xmem.dll")) {
-                        fn = reinterpret_cast<ResolveFn>(
-                            ::GetProcAddress(hm, "OpenScarlett_XMemResolveCpuAliasVa"));
-                        if (fn) s_xmem_resolve.store(fn, std::memory_order_release);
-                        s_xmem_probed.store(true, std::memory_order_release);
-                    }
-                }
-                if (fn) {
-                    const uint64_t orig = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(src_buf));
-                    const uint64_t resolved = fn(orig);
-                    if (resolved != 0ull) src_buf = reinterpret_cast<void*>(static_cast<uintptr_t>(resolved));
-                }
+                src_buf = ResolveCpuAliasPointer(src_buf);
             }
 #endif
             out.Source.Memory.Source = src_buf;
@@ -1227,23 +1481,7 @@ public:
         void* dst_buf = x.Destination;
 #if defined(_WIN32)
         if (!dest_phys && dst_buf) {
-            using ResolveFn = uint64_t(__stdcall*)(uint64_t);
-            static std::atomic<ResolveFn> s_xmem_resolve_dst{nullptr};
-            static std::atomic<bool> s_xmem_probed_dst{false};
-            ResolveFn fn = s_xmem_resolve_dst.load(std::memory_order_acquire);
-            if (!fn && !s_xmem_probed_dst.load(std::memory_order_relaxed)) {
-                if (HMODULE hm = ::GetModuleHandleA("xmem.dll")) {
-                    fn = reinterpret_cast<ResolveFn>(
-                        ::GetProcAddress(hm, "OpenScarlett_XMemResolveCpuAliasVa"));
-                    if (fn) s_xmem_resolve_dst.store(fn, std::memory_order_release);
-                    s_xmem_probed_dst.store(true, std::memory_order_release);
-                }
-            }
-            if (fn) {
-                const uint64_t orig = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(dst_buf));
-                const uint64_t resolved = fn(orig);
-                if (resolved != 0ull) dst_buf = reinterpret_cast<void*>(static_cast<uintptr_t>(resolved));
-            }
+            dst_buf = ResolveCpuAliasPointer(dst_buf);
         }
 #endif
         out.Destination.Memory.Buffer = dst_buf;
@@ -1914,8 +2152,10 @@ private:
             if (req.Source.Memory.Size == 0u) {
                 return OS_DSTORAGE_E_INVALIDARG;
             }
+            const void* resolved_src = req.Source.Memory.Source;
 #if defined(_WIN32)
-            if (!ValidateReadableRange(req.Source.Memory.Source, req.Source.Memory.Size)) {
+            resolved_src = ResolveCpuAliasConstPointer(resolved_src);
+            if (!ValidateReadableRange(resolved_src, req.Source.Memory.Size)) {
                 return OS_DSTORAGE_E_INVALIDARG;
             }
 #endif
@@ -1924,7 +2164,7 @@ private:
                 req.Source.Memory.Size > staging_limit) {
                 return OS_DSTORAGE_E_STAGING_BUFFER_TOO_SMALL;
             }
-            out_ptr = static_cast<const uint8_t*>(req.Source.Memory.Source);
+            out_ptr = static_cast<const uint8_t*>(resolved_src);
             out_size = req.Source.Memory.Size;
             return OS_DSTORAGE_S_OK;
         }
@@ -1960,15 +2200,19 @@ private:
             static_cast<size_t>(staging_size_ref_->load(std::memory_order_acquire));
 
         // 1. Validate virtual destination before reading/decompressing (physical page array validated below).
+        void* resolved_dst = req.Destination.Memory.Buffer;
         DestinationClassification dst_class{};
         if (!dest_phys) {
             const int32_t dhr = ValidateAndClassifyDestination(
-                req.Destination.Memory.Buffer, dst_size, dst_class);
+                resolved_dst, dst_size, dst_class);
             if (dhr < 0) return dhr;
         }
 
+        ScopedRequestScratch scratch;
+        std::vector<uint8_t>& buf_a = scratch.a();
+        std::vector<uint8_t>& buf_b = scratch.b();
+
         // 2. Acquire source bytes (IOCP file read, virtual memory, or physical page array).
-        std::vector<uint8_t> src_storage;
         const uint8_t* src_ptr = nullptr;
         size_t src_size = 0u;
         if (src_phys) {
@@ -1976,26 +2220,25 @@ private:
                 !req.Source.Memory.Source || req.Source.Memory.Size == 0u) {
                 return OS_DSTORAGE_E_INVALIDARG;
             }
-            src_storage.resize(req.Source.Memory.Size);
+            buf_a.resize(req.Source.Memory.Size);
             const int32_t phr = TransferPhysicalPageArray(
                 title_va_mirror_.load(std::memory_order_acquire),
                 static_cast<const uintptr_t*>(req.Source.Memory.Source),
                 item.xbox_src_page_offset,
                 req.Source.Memory.Size,
                 false,
-                src_storage.data());
+                buf_a.data());
             if (phr < 0) return phr;
-            src_ptr = src_storage.data();
-            src_size = src_storage.size();
+            src_ptr = buf_a.data();
+            src_size = buf_a.size();
         } else {
             const int32_t shr = AcquireSourceBytes(
-                req, staging_limit, src_storage, src_ptr, src_size, cancel_flag, false);
+                req, staging_limit, buf_a, src_ptr, src_size, cancel_flag, false);
             if (shr < 0) return shr;
         }
         if (is_canceled()) return OS_DSTORAGE_E_CANCELLED;
 
         // 3. Stage 1 Decompression: RFC 1950/1951 Zlib if Options.ZlibDecompress is set.
-        std::vector<uint8_t> stage_buf;
         const uint8_t* cur_ptr = src_ptr;
         size_t cur_size = src_size;
 
@@ -2006,10 +2249,11 @@ private:
                     : std::max(dst_size, static_cast<size_t>(item.xbox_intermediate_size));
             if (zlib_max == 0u) return OS_DSTORAGE_E_INVALIDARG;
             if (zlib_max > staging_limit) return OS_DSTORAGE_E_STAGING_BUFFER_TOO_SMALL;
-            if (!zlib_rfc1950::Decompress(cur_ptr, cur_size, zlib_max, stage_buf)) {
+            ReserveZlibOutputHint(buf_b, cur_size, (bcpack_mode == 0u) ? dst_size : zlib_max);
+            if (!zlib_rfc1950::Decompress(cur_ptr, cur_size, zlib_max, buf_b)) {
                 return OS_DSTORAGE_E_DECOMPRESSION_ERROR;
             }
-            if (bcpack_mode == 0u && stage_buf.size() != dst_size) {
+            if (bcpack_mode == 0u && buf_b.size() != dst_size) {
                 static const bool trace_ds_z = []() {
 #if defined(_WIN32)
                     char buf[16]{};
@@ -2021,7 +2265,7 @@ private:
                 if (trace_ds_z) {
                     std::fprintf(stderr,
                                  "[OpenScarlett][dstorage] ZLIB-SIZE-MISMATCH stage=%zu dst=%zu src=%zu off=0x%llX\n",
-                                 stage_buf.size(), dst_size, cur_size,
+                                 buf_b.size(), dst_size, cur_size,
                                  req.Options.SourceType == DSTORAGE_REQUEST_SOURCE_FILE
                                      ? static_cast<unsigned long long>(req.Source.File.Offset)
                                      : 0ull);
@@ -2029,8 +2273,8 @@ private:
                 }
                 return OS_DSTORAGE_E_DECOMPRESSION_ERROR;
             }
-            cur_ptr = stage_buf.data();
-            cur_size = stage_buf.size();
+            cur_ptr = buf_b.data();
+            cur_size = buf_b.size();
             last_intermediate_size_.store(
                 static_cast<uint32_t>(std::min<size_t>(cur_size, UINT32_MAX)),
                 std::memory_order_release);
@@ -2040,7 +2284,6 @@ private:
         if (is_canceled()) return OS_DSTORAGE_E_CANCELLED;
 
         // 4. Stage 2 Decompression: Hardware BCPack BC1-BC7 if Options.BcpackMode != NONE.
-        std::vector<uint8_t> bcpack_out;
         if (bcpack_mode != 0u) {
             if (dst_size > staging_limit) {
                 return OS_DSTORAGE_E_STAGING_BUFFER_TOO_SMALL;
@@ -2050,6 +2293,8 @@ private:
             if (blk_bytes == 0u || (dst_size % blk_bytes) != 0u) {
                 return OS_DSTORAGE_E_DECOMPRESSION_ERROR;
             }
+            std::vector<uint8_t>& bcpack_out =
+                (!buf_a.empty() && cur_ptr == buf_a.data()) ? buf_b : buf_a;
             bcpack_out.resize(dst_size);
             size_t written = 0u;
             auto st = openscarlett::BcPackHwDecodeBitstream(
@@ -2085,8 +2330,9 @@ private:
         }
 
         // 5. Stage 3 Hardware Swizzle (Options.SwizzleMode).
-        std::vector<uint8_t> swizzled_out;
         if (swizzle_mode != 0u) {
+            std::vector<uint8_t>& swizzled_out =
+                (!buf_a.empty() && cur_ptr == buf_a.data()) ? buf_b : buf_a;
             if (!ApplyXboxSwizzle64KB(swizzle_mode, cur_ptr, cur_size, swizzled_out)) {
                 return OS_DSTORAGE_E_INVALIDARG;
             }
@@ -2101,7 +2347,7 @@ private:
         if (dest_phys) {
             const int32_t phr = TransferPhysicalPageArray(
                 title_va_mirror_.load(std::memory_order_acquire),
-                static_cast<const uintptr_t*>(req.Destination.Memory.Buffer),
+                static_cast<const uintptr_t*>(resolved_dst),
                 item.xbox_dest_page_offset,
                 static_cast<uint32_t>(cur_size),
                 true,
@@ -2113,7 +2359,7 @@ private:
             return OS_DSTORAGE_S_OK;
         }
 
-        auto* dst_ptr = static_cast<uint8_t*>(req.Destination.Memory.Buffer);
+        auto* dst_ptr = static_cast<uint8_t*>(resolved_dst);
         constexpr size_t kCopyChunk = 65536u;
         size_t copied = 0u;
         while (copied < cur_size) {
@@ -2221,6 +2467,7 @@ private:
                 if (req.UncompressedSize != 0u && req.UncompressedSize > staging_limit) {
                     return OS_DSTORAGE_E_STAGING_BUFFER_TOO_SMALL;
                 }
+                ReserveZlibOutputHint(out_data, src_size, max_out);
                 if (zlib_rfc1950::Decompress(src_ptr, src_size, max_out, out_data)) {
                     if (req.UncompressedSize != 0u && out_data.size() != req.UncompressedSize) {
                         out_data.clear();
@@ -2288,11 +2535,11 @@ private:
         const uint8_t* src_ptr,
         size_t src_size,
         size_t staging_limit,
+        std::vector<uint8_t>& unpacked,
         const std::atomic<bool>* cancel_flag) {
         auto* dst_res = static_cast<ID3D12Resource*>(req.Destination.Memory.Buffer);
         if (!dst_res) return OS_DSTORAGE_E_INVALIDARG;
 
-        std::vector<uint8_t> unpacked;
         const int32_t dhr = DecompressToVector(req, src_ptr, src_size, staging_limit, unpacked, cancel_flag);
         if (dhr < 0) return dhr;
         if (cancel_flag && cancel_flag->load(std::memory_order_acquire)) {
@@ -2369,6 +2616,8 @@ private:
         const uint8_t* src_ptr,
         size_t src_size,
         size_t staging_limit,
+        std::vector<uint8_t>& unpacked,
+        std::vector<uint8_t>& linear_buf,
         const std::atomic<bool>* cancel_flag) {
         if (!req.Destination.Memory.Buffer) return OS_DSTORAGE_E_INVALIDARG;
 
@@ -2393,7 +2642,6 @@ private:
         if (!dst_tex) return OS_DSTORAGE_E_INVALIDARG;
 
         // 1. Decompress source stream in parallel on worker thread BEFORE locking GPU upload ring!
-        std::vector<uint8_t> unpacked;
         const int32_t dhr = DecompressToVector(req, src_ptr, src_size, staging_limit, unpacked, cancel_flag);
         if (dhr < 0) return dhr;
         if (cancel_flag && cancel_flag->load(std::memory_order_acquire)) {
@@ -2427,7 +2675,7 @@ private:
         }
 
         // 3. If source layout is GFX10 tiled, route automatically through XgGpuUntiler!
-        std::vector<uint8_t> linear_buf;
+        linear_buf.clear();
         const uint8_t* upload_src = unpacked.data();
         size_t upload_src_size = unpacked.size();
         uint32_t src_row_pitch = local_desc.src_row_pitch;
@@ -2631,21 +2879,25 @@ private:
         const size_t staging_limit =
             static_cast<size_t>(staging_size_ref_->load(std::memory_order_acquire));
 
+        ScopedRequestScratch scratch;
+        std::vector<uint8_t>& file_buf = scratch.a();
+        std::vector<uint8_t>& work_buf = scratch.b();
+
         // Handle GPU texture & buffer destinations (automatic BCPack/GDeflate -> XgGpuUntiler upload).
         if (req.Options.DestinationType == DSTORAGE_REQUEST_DESTINATION_TEXTURE_REGION ||
             req.Options.DestinationType == DSTORAGE_REQUEST_DESTINATION_MULTIPLE_SUBRESOURCES ||
             req.Options.DestinationType == DSTORAGE_REQUEST_DESTINATION_TILES ||
             req.Options.DestinationType == DSTORAGE_REQUEST_DESTINATION_BUFFER) {
 #if defined(_WIN32)
-            std::vector<uint8_t> file_buf;
             const uint8_t* src_ptr = nullptr;
             size_t src_size = 0u;
             const int32_t src_hr = AcquireSourceBytes(req, staging_limit, file_buf, src_ptr, src_size, cancel_flag);
             if (src_hr < 0) return src_hr;
             if (req.Options.DestinationType == DSTORAGE_REQUEST_DESTINATION_BUFFER) {
-                return ExecuteGpuBufferRequest(req, src_ptr, src_size, staging_limit, cancel_flag);
+                return ExecuteGpuBufferRequest(req, src_ptr, src_size, staging_limit, work_buf, cancel_flag);
             }
-            return ExecuteGpuTextureRequest(req, src_ptr, src_size, staging_limit, cancel_flag);
+            return ExecuteGpuTextureRequest(
+                req, src_ptr, src_size, staging_limit, work_buf, scratch.c(), cancel_flag);
 #else
             return OS_DSTORAGE_E_INVALIDARG;
 #endif
@@ -2661,15 +2913,15 @@ private:
             return OS_DSTORAGE_E_INVALIDARG;
         }
 
-        auto* dst_ptr = static_cast<uint8_t*>(req.Destination.Memory.Buffer);
+        void* raw_dst_ptr = req.Destination.Memory.Buffer;
         const size_t dst_cap = req.Destination.Memory.Size;
         DestinationClassification dst_class{};
-        const int32_t dst_hr = ValidateAndClassifyDestination(dst_ptr, dst_cap, dst_class);
+        const int32_t dst_hr = ValidateAndClassifyDestination(raw_dst_ptr, dst_cap, dst_class);
         if (dst_hr < 0) {
             return dst_hr;
         }
+        auto* dst_ptr = static_cast<uint8_t*>(raw_dst_ptr);
 
-        std::vector<uint8_t> file_buf;
         const uint8_t* src_ptr = nullptr;
         size_t src_size = 0;
         const int32_t src_hr = AcquireSourceBytes(req, staging_limit, file_buf, src_ptr, src_size, cancel_flag);
@@ -2782,9 +3034,9 @@ private:
                     return OS_DSTORAGE_S_OK;
                 }
 
-                std::vector<uint8_t> staging(header_uncompressed);
+                work_buf.resize(header_uncompressed);
                 const auto res = openscarlett::GDeflateDecompress(
-                    src_ptr, src_size, staging.data(), staging.size(), &out_size);
+                    src_ptr, src_size, work_buf.data(), work_buf.size(), &out_size);
                 if (res != openscarlett::GDeflateResult::Ok) {
                     return OS_DSTORAGE_E_DECOMPRESSION_ERROR;
                 }
@@ -2798,7 +3050,7 @@ private:
                     return OS_DSTORAGE_E_CANCELLED;
                 }
                 if (out_size > 0u) {
-                    std::memcpy(dst_ptr, staging.data(), out_size);
+                    std::memcpy(dst_ptr, work_buf.data(), out_size);
                 }
                 record_destination_write();
                 return OS_DSTORAGE_S_OK;
@@ -2812,17 +3064,17 @@ private:
                     return OS_DSTORAGE_E_REQUEST_TOO_LARGE;
                 }
                 const size_t max_out = std::min(dst_cap, staging_limit);
-                std::vector<uint8_t> unpacked;
-                if (zlib_rfc1950::Decompress(src_ptr, src_size, max_out, unpacked)) {
-                    if (req.UncompressedSize != 0u && unpacked.size() != req.UncompressedSize) {
+                ReserveZlibOutputHint(work_buf, src_size, max_out);
+                if (zlib_rfc1950::Decompress(src_ptr, src_size, max_out, work_buf)) {
+                    if (req.UncompressedSize != 0u && work_buf.size() != req.UncompressedSize) {
                         return OS_DSTORAGE_E_DECOMPRESSION_ERROR;
                     }
                     if (is_canceled()) return OS_DSTORAGE_E_CANCELLED;
                     last_intermediate_size_.store(
-                        static_cast<uint32_t>(std::min<size_t>(unpacked.size(), UINT32_MAX)),
+                        static_cast<uint32_t>(std::min<size_t>(work_buf.size(), UINT32_MAX)),
                         std::memory_order_release);
-                    if (!unpacked.empty()) {
-                        std::memcpy(dst_ptr, unpacked.data(), unpacked.size());
+                    if (!work_buf.empty()) {
+                        std::memcpy(dst_ptr, work_buf.data(), work_buf.size());
                     }
                     GetRuntime().total_zlib_decompressions.fetch_add(1u, std::memory_order_relaxed);
                     record_destination_write();
@@ -2845,12 +3097,12 @@ private:
                     return OS_DSTORAGE_E_DECOMPRESSION_ERROR;
                 }
                 if (is_canceled()) return OS_DSTORAGE_E_CANCELLED;
-                if (!openscarlett::BcPackDecompress(src_ptr, src_size, unpacked).ok()) {
+                if (!openscarlett::BcPackDecompress(src_ptr, src_size, work_buf).ok()) {
                     return OS_DSTORAGE_E_DECOMPRESSION_ERROR;
                 }
-                if (unpacked.size() > dst_cap) return OS_DSTORAGE_E_REQUEST_TOO_LARGE;
-                if (!unpacked.empty()) {
-                    std::memcpy(dst_ptr, unpacked.data(), unpacked.size());
+                if (work_buf.size() > dst_cap) return OS_DSTORAGE_E_REQUEST_TOO_LARGE;
+                if (!work_buf.empty()) {
+                    std::memcpy(dst_ptr, work_buf.data(), work_buf.size());
                 }
                 record_destination_write();
                 return OS_DSTORAGE_S_OK;
@@ -2877,22 +3129,21 @@ private:
                     return OS_DSTORAGE_E_CANCELLED;
                 }
 
-                std::vector<uint8_t> unpacked;
-                const auto st = openscarlett::BcPackDecompress(src_ptr, src_size, unpacked);
+                const auto st = openscarlett::BcPackDecompress(src_ptr, src_size, work_buf);
                 if (!st.ok()) {
                     return OS_DSTORAGE_E_DECOMPRESSION_ERROR;
                 }
-                if (unpacked.size() > dst_cap) {
+                if (work_buf.size() > dst_cap) {
                     return OS_DSTORAGE_E_REQUEST_TOO_LARGE;
                 }
-                if (req.UncompressedSize != 0u && unpacked.size() != req.UncompressedSize) {
+                if (req.UncompressedSize != 0u && work_buf.size() != req.UncompressedSize) {
                     return OS_DSTORAGE_E_DECOMPRESSION_ERROR;
                 }
                 if (is_canceled()) {
                     return OS_DSTORAGE_E_CANCELLED;
                 }
-                if (!unpacked.empty()) {
-                    std::memcpy(dst_ptr, unpacked.data(), unpacked.size());
+                if (!work_buf.empty()) {
+                    std::memcpy(dst_ptr, work_buf.data(), work_buf.size());
                 }
                 record_destination_write();
                 return OS_DSTORAGE_S_OK;
@@ -3520,8 +3771,9 @@ public:
         if (h == INVALID_HANDLE_VALUE) {
             return RecordHr("IDStorageFactoryX::OpenFile", OS_DSTORAGE_E_FILE_NOT_FOUND, 4);
         }
-        const bool attached = DStorageIocpEngine::Global().AttachFile(h);
-        auto* f = new (std::nothrow) DStorageFileImpl(h, attached, path);
+        bool skip_sync = false;
+        const bool attached = DStorageIocpEngine::Global().AttachFile(h, &skip_sync);
+        auto* f = new (std::nothrow) DStorageFileImpl(h, attached, path, skip_sync);
         if (!f) {
             CloseHandle(h);
             if (attached) DStorageIocpEngine::Global().DetachFile();
@@ -3827,6 +4079,9 @@ int32_t OPENSCARLETT_DSTORAGE_CALL OpenScarlettDStorageDecompressWithIntermediat
                         OS_DSTORAGE_E_STAGING_BUFFER_INVALID);
     }
 
+#if defined(_WIN32)
+    src = ResolveCpuAliasConstPointer(src);
+#endif
     DestinationClassification dst_class{};
     const int32_t dst_hr = ValidateAndClassifyDestination(dst, dst_size, dst_class);
     if (dst_hr < 0) {
@@ -3836,10 +4091,13 @@ int32_t OPENSCARLETT_DSTORAGE_CALL OpenScarlettDStorageDecompressWithIntermediat
     const auto* src_bytes = static_cast<const uint8_t*>(src);
     auto* dst_bytes = static_cast<uint8_t*>(dst);
 
+    ScopedRequestScratch scratch;
+    std::vector<uint8_t>& staging = scratch.a();
+
     // Check custom decompressor registry first.
     CustomDecompressorEntry custom{};
     if (GetRuntime().LookupCustom(static_cast<uint8_t>(format), custom)) {
-        std::vector<uint8_t> staging(intermediate_size);
+        staging.resize(intermediate_size);
         size_t out_sz = 0u;
         const int32_t chr = custom.callback(
             static_cast<uint8_t>(format),
@@ -3908,7 +4166,7 @@ int32_t OPENSCARLETT_DSTORAGE_CALL OpenScarlettDStorageDecompressWithIntermediat
                 }
                 RecordOk("DirectStorage::DecompressToPhysicalPages");
             } else {
-                std::vector<uint8_t> staging(intermediate_size);
+                staging.resize(intermediate_size);
                 const auto res = openscarlett::GDeflateDecompress(
                     src_bytes, src_size, staging.data(), staging.size(), &out_sz);
                 if (res != openscarlett::GDeflateResult::Ok) {
@@ -3943,20 +4201,19 @@ int32_t OPENSCARLETT_DSTORAGE_CALL OpenScarlettDStorageDecompressWithIntermediat
                 return RecordHr("OpenScarlettDStorageDecompressWithIntermediate",
                                 OS_DSTORAGE_E_REQUEST_TOO_LARGE);
             }
-            std::vector<uint8_t> unpacked;
-            if (!openscarlett::BcPackDecompress(src_bytes, src_size, unpacked).ok()) {
+            if (!openscarlett::BcPackDecompress(src_bytes, src_size, staging).ok()) {
                 return RecordHr("OpenScarlettDStorageDecompressWithIntermediate",
                                 OS_DSTORAGE_E_DECOMPRESSION_ERROR);
             }
-            if (unpacked.size() > dst_size) {
+            if (staging.size() > dst_size) {
                 return RecordHr("OpenScarlettDStorageDecompressWithIntermediate",
                                 OS_DSTORAGE_E_REQUEST_TOO_LARGE);
             }
-            if (!unpacked.empty()) {
-                std::memcpy(dst_bytes, unpacked.data(), unpacked.size());
+            if (!staging.empty()) {
+                std::memcpy(dst_bytes, staging.data(), staging.size());
             }
             if (out_decompressed_size) {
-                *out_decompressed_size = unpacked.size();
+                *out_decompressed_size = staging.size();
             }
             if (dst_class.is_physical_page) {
                 RecordOk("DirectStorage::DecompressToPhysicalPages");
