@@ -113,8 +113,12 @@ enum SpirvOp : uint16_t {
     SpvOpImageSampleDrefImplicitLod = 89,
     SpvOpImageSampleDrefExplicitLod = 90,
     SpvOpImageFetch = 95,
+    SpvOpImageGather = 96,
+    SpvOpImageDrefGather = 97,
     SpvOpImageRead = 98,
     SpvOpImageWrite = 99,
+    SpvOpImageQuerySizeLod = 103,
+    SpvOpImageQueryLevels = 105,
     SpvOpConvertFToU = 109,
     SpvOpConvertFToS = 110,
     SpvOpConvertSToF = 111,
@@ -170,9 +174,17 @@ enum SpirvOp : uint16_t {
     SpvOpMemoryBarrier = 225,
     SpvOpAtomicExchange = 229,
     SpvOpAtomicCompareExchange = 230,
+    SpvOpAtomicIIncrement = 232,
+    SpvOpAtomicIDecrement = 233,
     SpvOpAtomicIAdd = 234,
+    SpvOpAtomicISub = 235,
+    SpvOpAtomicSMin = 236,
+    SpvOpAtomicUMin = 237,
+    SpvOpAtomicSMax = 238,
+    SpvOpAtomicUMax = 239,
     SpvOpAtomicAnd = 240,
     SpvOpAtomicOr = 241,
+    SpvOpAtomicXor = 242,
     SpvOpPhi = 245,
     SpvOpLoopMerge = 246,
     SpvOpSelectionMerge = 247,
@@ -191,6 +203,7 @@ enum SpirvOp : uint16_t {
 
 constexpr uint32_t kSpvCapSampledImageArrayDynamicIndexing = 22u;
 constexpr uint32_t kSpvCapMinLod = 42u;
+constexpr uint32_t kSpvCapImageQuery = 50u;
 constexpr uint32_t kSpvCapGroupNonUniform = 61u;
 constexpr uint32_t kSpvCapGroupNonUniformBallot = 64u;
 constexpr uint32_t kSpvCapGroupNonUniformShuffle = 65u;
@@ -298,6 +311,7 @@ constexpr uint32_t kSpvDecPerPrimitiveEXT = 5271u;
 constexpr uint32_t kSpvBuiltInPosition = 0u;
 constexpr uint32_t kSpvBuiltInCullDistance = 4u;
 constexpr uint32_t kSpvBuiltInWorkgroupId = 26u;
+constexpr uint32_t kSpvBuiltInLocalInvocationId = 27u;
 constexpr uint32_t kSpvBuiltInGlobalInvocationId = 28u;
 constexpr uint32_t kSpvBuiltInLocalInvocationIndex = 29u;
 constexpr uint32_t kSpvBuiltInVertexIndex = 42u;
@@ -468,7 +482,8 @@ bool ModuleUsesViewportArrayIndex(const Rdna2IrModule& ir) noexcept {
 bool ModuleUsesComparisonSample(const Rdna2IrModule& ir) noexcept {
     for (const auto& bb : ir.blocks) {
         for (const auto& inst : bb.instructions) {
-            if (inst.op == IrOp::ImageSample && (inst.imm_u32 & 0x80u) != 0u) {
+            if ((inst.op == IrOp::ImageSample || inst.op == IrOp::ImageGather4) &&
+                (inst.imm_u32 & 0x80u) != 0u) {
                 return true;
             }
         }
@@ -824,14 +839,19 @@ public:
             return Status::Error(StatusCode::ShaderError, "Cannot emit HLSL from empty IR module");
         }
 
+        const auto& pb = ir_.stage_contract.psv0_bindings;
         const bool uses_stage_in = ModuleUsesStageInput(ir_);
-        const bool psv0_in0_srv = ir_.stage_contract.psv0_bindings.enabled &&
-                                  ir_.stage_contract.psv0_bindings.in0_is_srv &&
-                                  !ir_.stage_contract.psv0_bindings.in0_is_cbv;
+        const bool psv0_in0_srv = pb.enabled && pb.in0_is_srv && !pb.in0_is_cbv;
         const bool uses_uav_writes = ModuleUsesOp(ir_, IrOp::StoreUav) ||
-                                     ModuleUsesOp(ir_, IrOp::StoreUavSubDword);
-        const bool uses_dual_uav = ir_.uses_uav1 && !(psv0_in0_srv && !uses_uav_writes);
-        const bool uses_uav0 = ir_.uses_uav0 || (ir_.uses_uav && !uses_dual_uav);
+                                     ModuleUsesOp(ir_, IrOp::StoreUavSubDword) ||
+                                     ModuleUsesOp(ir_, IrOp::UavAtomic);
+        use_psv0_uav_bufs_ =
+            pb.enabled && !pb.uav_buffers.empty() && (ir_.used_psv0_uav_buf_mask != 0u || uses_uav_writes);
+        use_psv0_srv_texs_ =
+            pb.enabled && !pb.srv_textures.empty() && (ir_.used_psv0_srv_tex_mask != 0u);
+        const bool uses_dual_uav = !use_psv0_uav_bufs_ && ir_.uses_uav1 && !(psv0_in0_srv && !uses_uav_writes);
+        const bool uses_uav0 = (!use_psv0_uav_bufs_ && (ir_.uses_uav0 || (ir_.uses_uav && !uses_dual_uav))) ||
+                               ir_.uses_bvh_ray;
         const bool uses_fma = ModuleUsesOp(ir_, IrOp::FFma) || ModuleUsesOp(ir_, IrOp::FFma16) || ModuleUsesOp(ir_, IrOp::FmaMix);
         const bool uses_mad = ModuleUsesOp(ir_, IrOp::FMad);
         const bool uses_alignbyte = ModuleUsesOp(ir_, IrOp::AlignByte);
@@ -853,9 +873,32 @@ public:
         const bool uses_cmp_sample = ir_.uses_comparison_sample || ModuleUsesComparisonSample(ir_);
         const bool uses_dyn_sample = ir_.uses_dynamic_sampled_indexing || ModuleUsesOp(ir_, IrOp::ImageSampleDynamic);
         const uint32_t dyn_arr_len = uses_dyn_sample ? ModuleDynamicSampledArraySize(ir_) : 0u;
-        const bool uses_ps_quad_deriv =
-            (ir_.stage == ShaderStage::Pixel) &&
-            (ir_.uses_pixel_quad_derivatives || ModuleUsesOp(ir_, IrOp::ImageSampleImplicit));
+        bool uses_ps_quad_deriv = false;
+        bool uses_cube_load_fallback = false;
+        if (ir_.stage == ShaderStage::Pixel && ir_.texture_srv_format == Rdna2TextureFormat::Float4) {
+            for (const auto& bb_q : ir_.blocks) {
+                for (const auto& in_q : bb_q.instructions) {
+                    if (in_q.op == IrOp::ImageSampleImplicit) {
+                        std::string qn;
+                        uint32_t qk = 2u;
+                        ResolveSrvTexInfo(in_q.imm_u32, qn, qk);
+                        if (qk == 2u || qk == 3u) {
+                            uses_ps_quad_deriv = true;
+                        }
+                    }
+                }
+            }
+        }
+        for (const auto& bb_q : ir_.blocks) {
+            for (const auto& in_q : bb_q.instructions) {
+                if (in_q.op == IrOp::ImageLoad || in_q.op == IrOp::ImageLoadMip) {
+                    std::string qn;
+                    uint32_t qk = 2u;
+                    ResolveSrvTexInfo(in_q.imm_u32, qn, qk);
+                    if (qk == 5u || qk == 9u) uses_cube_load_fallback = true;
+                }
+            }
+        }
         const bool is_group_stage =
             (ir_.stage == ShaderStage::Compute || ir_.stage == ShaderStage::Mesh ||
              ir_.stage == ShaderStage::Amplification);
@@ -884,7 +927,6 @@ public:
         std::ostringstream hdr;
         hdr << "// Generated by OpenScarlett RDNA2 (XS2) -> HLSL Lifter\n";
 
-        const auto& pb = ir_.stage_contract.psv0_bindings;
         const bool in0_is_cbv = pb.enabled && pb.in0_is_cbv;
         const bool in0_is_srv = pb.enabled && pb.in0_is_srv;
 
@@ -976,6 +1018,16 @@ public:
         if (uses_dual_uav) {
             hdr << "RWByteAddressBuffer _out0 : register(u1);\n";
         }
+        if (use_psv0_uav_bufs_) {
+            for (size_t k = 0u; k < pb.uav_buffers.size() && k < 32u; ++k) {
+                const bool slot_used =
+                    ((ir_.used_psv0_uav_buf_mask & (1u << static_cast<uint32_t>(k))) != 0u) ||
+                    (k == 0u && ir_.uses_uav);
+                if (!slot_used) continue;
+                hdr << "RWByteAddressBuffer _uav_b" << k << " : register(u" << pb.uav_buffers[k].reg
+                    << ", space" << pb.uav_buffers[k].space << ");\n";
+            }
+        }
         // Hardware descriptor-table slot resources (space2): exact s[8:9]+slot*32 mapping for
         // multi-texture / multi-CBV Scarlett shaders (e.g. YUV420 video, PBR G-buffer, post-FX).
         for (uint32_t s2 = 0u; s2 < 16u; ++s2) {
@@ -1001,13 +1053,25 @@ public:
             }
         }
         uint32_t next_t = 0u;
-        if (ir_.uses_texture_srv) {
+        bool tex0_is_2d_float4 = false;
+        if (use_psv0_srv_texs_) {
+            const char* tex_elem = (ir_.texture_srv_format == Rdna2TextureFormat::Uint4) ? "uint4" : "float4";
+            for (size_t k = 0u; k < pb.srv_textures.size() && k < 31u; ++k) {
+                if ((ir_.used_psv0_srv_tex_mask & (1u << static_cast<uint32_t>(k))) == 0u) continue;
+                const auto& te = pb.srv_textures[k];
+                hdr << HlslSrvTexType(te.res_kind ? te.res_kind : 2u, tex_elem) << " _ptex" << k
+                    << " : register(t" << te.reg << ", space" << te.space << ");\n";
+            }
+        } else if (ir_.uses_texture_srv) {
             const char* tex_elem = (ir_.texture_srv_format == Rdna2TextureFormat::Uint4) ? "uint4" : "float4";
             if (pb.enabled && pb.has_tex0) {
-                hdr << "Texture2D<" << tex_elem << "> _tex0 : register(t" << pb.tex0_reg
+                const uint32_t tk = pb.tex0_res_kind ? pb.tex0_res_kind : 2u;
+                hdr << HlslSrvTexType(tk, tex_elem) << " _tex0 : register(t" << pb.tex0_reg
                     << ", space" << pb.tex0_space << ");\n";
+                tex0_is_2d_float4 = (tk == 2u) && (ir_.texture_srv_format == Rdna2TextureFormat::Float4);
             } else {
                 hdr << "Texture2D<" << tex_elem << "> _tex0 : register(t" << next_t++ << ");\n";
+                tex0_is_2d_float4 = (ir_.texture_srv_format == Rdna2TextureFormat::Float4);
             }
         }
         if (ir_.uses_texture3d_srv) {
@@ -1020,23 +1084,36 @@ public:
             hdr << "Texture2D<float4> _tex_arr[" << dyn_arr_len << "] : register(t" << next_t << ");\n";
             next_t += dyn_arr_len;
         }
-        if (ir_.uses_texture_sample || uses_dyn_sample) {
+        const bool needs_samp0 =
+            ir_.uses_texture_sample || uses_dyn_sample || uses_cube_load_fallback ||
+            (pb.enabled && uses_cmp_sample);
+        if (needs_samp0) {
             if (pb.enabled && pb.has_samp0) {
                 hdr << "SamplerState _samp0 : register(s" << pb.samp0_reg
                     << ", space" << pb.samp0_space << ");\n";
+            } else if (pb.enabled) {
+                hdr << "SamplerState _samp0 : register(s0, space99);\n";
             } else {
                 hdr << "SamplerState _samp0 : register(s0);\n";
             }
         }
-        if (uses_cmp_sample) {
+        if (uses_cmp_sample && !pb.enabled) {
             hdr << "SamplerComparisonState _samp_cmp0 : register(s1);\n";
         }
         uint32_t next_rw_u = uses_dual_uav ? 2u : 1u;
         if (ir_.uses_texture_uav) {
-            hdr << "RWTexture2D<float4> _rwtex0 : register(u" << next_rw_u++ << ");\n";
+            if (pb.enabled && pb.has_rwtex0) {
+                hdr << HlslRwTexType(pb.rwtex0_res_kind ? pb.rwtex0_res_kind : 2u, "float4")
+                    << " _rwtex0 : register(u" << pb.rwtex0_reg << ", space" << pb.rwtex0_space << ");\n";
+            } else {
+                hdr << "RWTexture2D<float4> _rwtex0 : register(u" << next_rw_u++ << ");\n";
+            }
         }
         if (ir_.uses_texture_u32_uav) {
-            if (ir_.texture_u32_uav_dim == 2u) {
+            if (pb.enabled && pb.has_rwimg_u32) {
+                hdr << HlslRwTexType(pb.rwimg_u32_res_kind ? pb.rwimg_u32_res_kind : 2u, "uint")
+                    << " _rwimg_u32 : register(u" << pb.rwimg_u32_reg << ", space" << pb.rwimg_u32_space << ");\n";
+            } else if (ir_.texture_u32_uav_dim == 2u) {
                 hdr << "RWTexture3D<uint> _rwimg_u32 : register(u" << next_rw_u++ << ");\n";
             } else if (ir_.texture_u32_uav_dim == 3u) {
                 hdr << "RWTexture2DArray<uint> _rwimg_u32 : register(u" << next_rw_u++ << ");\n";
@@ -1168,7 +1245,26 @@ public:
         }
         if (uses_buf_load_fmt) {
             hdr << "// UB-free sub-dword merge & MTBUF D16 format-conversion helpers (shifts strictly < 32)\n";
-            if (uses_uav0 || in0_is_cbv || in0_is_srv) {
+            if (use_psv0_uav_bufs_) {
+                hdr << "uint _os_load_unaligned_u0(uint byte_addr) {\n"
+                       "    uint aligned = byte_addr & ~3u;\n"
+                       "    uint bit_off = (byte_addr & 3u) << 3u;\n"
+                       "    uint w0 = _uav_b0.Load(aligned);\n"
+                       "    uint w1 = (bit_off != 0u) ? _uav_b0.Load(aligned + 4u) : 0u;\n"
+                       "    uint hi_sh = (32u - bit_off) & 31u;\n"
+                       "    return (w0 >> bit_off) | ((bit_off != 0u) ? (w1 << hi_sh) : 0u);\n"
+                       "}\n";
+                if (pb.uav_buffers.size() >= 2u && (ir_.used_psv0_uav_buf_mask & 2u) != 0u) {
+                    hdr << "uint _os_load_unaligned_u1(uint byte_addr) {\n"
+                           "    uint aligned = byte_addr & ~3u;\n"
+                           "    uint bit_off = (byte_addr & 3u) << 3u;\n"
+                           "    uint w0 = _uav_b1.Load(aligned);\n"
+                           "    uint w1 = (bit_off != 0u) ? _uav_b1.Load(aligned + 4u) : 0u;\n"
+                           "    uint hi_sh = (32u - bit_off) & 31u;\n"
+                           "    return (w0 >> bit_off) | ((bit_off != 0u) ? (w1 << hi_sh) : 0u);\n"
+                           "}\n";
+                }
+            } else if (uses_uav0 || in0_is_cbv || in0_is_srv) {
                 if (in0_is_cbv) {
                     hdr << "uint _os_load_unaligned_u0(uint byte_addr) {\n"
                            "    uint aligned = byte_addr & ~3u;\n"
@@ -1359,17 +1455,21 @@ public:
                        "    float2 _grad_x = (dot(_ddx, _ddx) > 0.0) ? _ddx : ((dot(_quad_dx, _quad_dx) > 0.0) ? _quad_dx : _quad_dd);\n"
                        "    float2 _grad_y = (dot(_ddy, _ddy) > 0.0) ? _ddy : _quad_dy;\n"
                        "    return _tex.SampleGrad(_samp0, uv, _grad_x, _grad_y);\n"
-                       "}\n"
-                       "float4 _os_sample_affine_quad(float2 uv) {\n"
-                       "    return _os_sample_affine_quad_t(_tex0, uv);\n"
                        "}\n";
+                if (tex0_is_2d_float4) {
+                    hdr << "float4 _os_sample_affine_quad(float2 uv) {\n"
+                           "    return _os_sample_affine_quad_t(_tex0, uv);\n"
+                           "}\n";
+                }
             } else {
                 hdr << "float4 _os_sample_affine_quad_t(Texture2D<float4> _tex, float2 uv) {\n"
                        "    return _tex.SampleGrad(_samp0, uv, ddx(uv), ddy(uv));\n"
-                       "}\n"
-                       "float4 _os_sample_affine_quad(float2 uv) {\n"
-                       "    return _tex0.SampleGrad(_samp0, uv, ddx(uv), ddy(uv));\n"
                        "}\n";
+                if (tex0_is_2d_float4) {
+                    hdr << "float4 _os_sample_affine_quad(float2 uv) {\n"
+                           "    return _tex0.SampleGrad(_samp0, uv, ddx(uv), ddy(uv));\n"
+                           "}\n";
+                }
             }
         }
         if (ir_.uses_bvh_ray) {
@@ -1466,7 +1566,14 @@ public:
                 out_target = use_sm65_ ? "cs_6_5" : "cs_5_0";
                 hdr << "[numthreads(" << ir_.threadgroup_x << ", " << ir_.threadgroup_y << ", "
                     << ir_.threadgroup_z << ")]\n";
-                hdr << "void main(uint3 _tid : SV_DispatchThreadID, uint _gtid : SV_GroupIndex) {\n";
+                hdr << "void main(uint3 _tid : SV_DispatchThreadID, uint _gtid : SV_GroupIndex";
+                if (ir_.uses_group_id) {
+                    hdr << ", uint3 _gid : SV_GroupID";
+                }
+                if (ir_.uses_group_thread_id) {
+                    hdr << ", uint3 _gtid3 : SV_GroupThreadID";
+                }
+                hdr << ") {\n";
                 if (ir_.uses_wave64_emulation) {
                     const uint32_t lane_mask = (ir_.wave_size == 64u) ? 63u : 31u;
                     const uint32_t wave_shift = (ir_.wave_size == 64u) ? 6u : 5u;
@@ -1621,8 +1728,11 @@ public:
                 hdr << "[outputtopology(\"triangle\")]\n";
                 hdr << "[numthreads(" << hw_tg_x << ", " << hw_tg_y << ", " << hw_tg_z << ")]\n";
                 hdr << "void main(\n";
-                if (ir_.uses_mesh_global_tid) {
+                if (ir_.uses_mesh_global_tid || ir_.uses_group_id) {
                     hdr << "    uint3 _gid : SV_GroupID,\n";
+                }
+                if (ir_.uses_group_thread_id) {
+                    hdr << "    uint3 _gtid3 : SV_GroupThreadID,\n";
                 }
                 hdr << "    uint _gtid : SV_GroupIndex,\n";
                 if (ir_.mesh_has_payload) {
@@ -1656,7 +1766,14 @@ public:
                 hdr << "};\n";
                 hdr << "groupshared ASPayload _payload;\n";
                 hdr << "[numthreads(" << hw_tg_x << ", " << hw_tg_y << ", " << hw_tg_z << ")]\n";
-                hdr << "void main(uint _gtid : SV_GroupIndex) {\n";
+                hdr << "void main(uint _gtid : SV_GroupIndex";
+                if (ir_.uses_group_id) {
+                    hdr << ", uint3 _gid : SV_GroupID";
+                }
+                if (ir_.uses_group_thread_id) {
+                    hdr << ", uint3 _gtid3 : SV_GroupThreadID";
+                }
+                hdr << ") {\n";
                 hdr << "    _payload._data[0] = 0u;\n";
                 hdr << "    _payload._data[1] = 0u;\n";
                 hdr << "    _payload._data[2] = 0u;\n";
@@ -1808,6 +1925,117 @@ public:
     }
 
 private:
+    static std::string HlslSrvTexType(uint32_t res_kind, const char* elem) {
+        switch (res_kind) {
+            case 1u: return std::string("Texture1D<") + elem + ">";
+            case 4u: return std::string("Texture3D<") + elem + ">";
+            case 5u: return std::string("TextureCube<") + elem + ">";
+            case 6u: return std::string("Texture1DArray<") + elem + ">";
+            case 7u:
+            case 8u: return std::string("Texture2DArray<") + elem + ">";
+            case 9u: return std::string("TextureCubeArray<") + elem + ">";
+            default: return std::string("Texture2D<") + elem + ">";
+        }
+    }
+
+    static std::string HlslRwTexType(uint32_t res_kind, const char* elem) {
+        switch (res_kind) {
+            case 1u: return std::string("RWTexture1D<") + elem + ">";
+            case 4u: return std::string("RWTexture3D<") + elem + ">";
+            case 6u: return std::string("RWTexture1DArray<") + elem + ">";
+            case 5u:
+            case 7u:
+            case 8u:
+            case 9u: return std::string("RWTexture2DArray<") + elem + ">";
+            default: return std::string("RWTexture2D<") + elem + ">";
+        }
+    }
+
+    static uint32_t ResKindFromMimgDim(uint32_t mimg_dim) noexcept {
+        switch (mimg_dim & 7u) {
+            case 0u: return 1u;  // 1D
+            case 2u: return 4u;  // 3D
+            case 3u: return 5u;  // Cube
+            case 4u: return 6u;  // 1DArray
+            case 5u:
+            case 7u: return 7u;  // 2DArray
+            default: return 2u;  // 2D
+        }
+    }
+
+    void ResolveSrvTexInfo(uint32_t imm_u32,
+                           std::string& out_name,
+                           uint32_t& out_kind,
+                           uint32_t dim_shift = 4u) const {
+        const uint32_t t_s2 = (imm_u32 >> 24) & 0x1Fu;
+        if (t_s2 > 0u) {
+            out_name = "_tex_s" + std::to_string(t_s2 - 1u);
+            out_kind = 2u;
+            return;
+        }
+        const auto& pb = ir_.stage_contract.psv0_bindings;
+        const uint32_t psv_p1 = (imm_u32 >> 8) & 0x1Fu;
+        if (use_psv0_srv_texs_ && !pb.srv_textures.empty()) {
+            const size_t idx = (psv_p1 > 0u)
+                                   ? std::min<size_t>(psv_p1 - 1u, pb.srv_textures.size() - 1u)
+                                   : 0u;
+            out_name = "_ptex" + std::to_string(idx);
+            out_kind = pb.srv_textures[idx].res_kind ? pb.srv_textures[idx].res_kind
+                                                     : ResKindFromMimgDim(imm_u32 >> dim_shift);
+            return;
+        }
+        out_name = "_tex0";
+        if (pb.enabled && pb.has_tex0 && pb.tex0_res_kind != 0u) {
+            out_kind = pb.tex0_res_kind;
+        } else {
+            out_kind = 2u;
+        }
+    }
+
+    std::string FormatSampleCoord(uint32_t res_kind,
+                                  IrValueId u_id,
+                                  IrValueId v_id,
+                                  IrValueId w_id) const {
+        const std::string u = AsF32(u_id);
+        const std::string v = (v_id != kInvalidIrValue) ? AsF32(v_id) : std::string("0.0");
+        const std::string w = (w_id != kInvalidIrValue) ? AsF32(w_id) : std::string("0.0");
+        switch (res_kind) {
+            case 1u: return u;
+            case 4u:
+            case 5u:
+            case 7u:
+            case 8u: return "float3(" + u + ", " + v + ", " + w + ")";
+            case 9u: return "float4(" + u + ", " + v + ", " + w + ", 0.0)";
+            default: return "float2(" + u + ", " + v + ")";
+        }
+    }
+
+    std::string FormatLoadCoord(uint32_t res_kind,
+                                IrValueId x_id,
+                                IrValueId y_id,
+                                IrValueId z_id,
+                                const std::string& mip_expr) const {
+        const std::string x = AsI32(x_id);
+        const std::string y = (y_id != kInvalidIrValue) ? AsI32(y_id) : std::string("0");
+        const std::string z = (z_id != kInvalidIrValue) ? AsI32(z_id) : std::string("0");
+        switch (res_kind) {
+            case 1u: return "int2(" + x + ", " + mip_expr + ")";
+            case 4u:
+            case 7u:
+            case 8u: return "int4(" + x + ", " + y + ", " + z + ", " + mip_expr + ")";
+            default: return "int3(" + x + ", " + y + ", " + mip_expr + ")";
+        }
+    }
+
+    std::string ResolveUavBufName(uint32_t slot) const {
+        const auto& pb = ir_.stage_contract.psv0_bindings;
+        if (use_psv0_uav_bufs_ && !pb.uav_buffers.empty()) {
+            const size_t idx = std::min<size_t>(slot, pb.uav_buffers.size() - 1u);
+            return "_uav_b" + std::to_string(idx);
+        }
+        return (slot == 1u && ir_.uses_uav1) ? "_out0" : "_in0";
+    }
+
     std::string Indent(int depth) const {
         return std::string(static_cast<size_t>(depth) * 4u, ' ');
     }
@@ -1984,15 +2212,19 @@ private:
                 const bool use_in0_cbv =
                     !use_dual_srv0 &&
                     ir_.stage_contract.psv0_bindings.enabled && ir_.stage_contract.psv0_bindings.in0_is_cbv &&
-                    (is_cb || cb_reg == 0u || !ir_.uses_uav1);
+                    (is_cb || (!use_psv0_uav_bufs_ && (cb_reg == 0u || !ir_.uses_uav1)));
                 const bool use_in0_srv =
                     !use_dual_srv0 && !use_in0_cbv &&
-                    ir_.stage_contract.psv0_bindings.enabled && ir_.stage_contract.psv0_bindings.in0_is_srv;
-                const char* buf = use_dual_srv0
-                                      ? "_srv0"
-                                      : (use_in0_srv
-                                             ? "_in0"
-                                             : (((inst.imm_u32 & 0xFFu) == 1u && ir_.uses_uav1) ? "_out0" : "_in0"));
+                    ir_.stage_contract.psv0_bindings.enabled && ir_.stage_contract.psv0_bindings.in0_is_srv &&
+                    (is_cb || !use_psv0_uav_bufs_);
+                const std::string buf =
+                    use_dual_srv0
+                        ? std::string("_srv0")
+                        : (use_in0_srv
+                               ? std::string("_in0")
+                               : ((!is_cb && use_psv0_uav_bufs_)
+                                      ? ResolveUavBufName(cb_reg)
+                                      : std::string((cb_reg == 1u && ir_.uses_uav1) ? "_out0" : "_in0")));
                 os << ind << "{\n";
                 os << ind << "    uint _sp_off = " << AsU32(inst.operands[0]) << ";\n";
                 if (is_cb && !use_in0_cbv && !use_dual_srv0 && !use_in0_srv) {
@@ -2082,6 +2314,31 @@ private:
                         os << ind << "_v" << inst.id << " = _tid.x;\n";
                     }
                     break;
+                case IrOp::GroupId: {
+                    const uint32_t comp = inst.imm_u32 & 3u;
+                    if (ir_.stage == ShaderStage::Compute || ir_.stage == ShaderStage::Mesh ||
+                        ir_.stage == ShaderStage::Amplification) {
+                        os << ind << "_v" << inst.id << " = _gid." << kSwiz[comp < 3u ? comp : 0u] << ";\n";
+                    } else {
+                        os << ind << "_v" << inst.id << " = 0u;\n";
+                    }
+                    break;
+                }
+                case IrOp::GroupThreadId: {
+                    const uint32_t mode = inst.imm_u32 & 3u;
+                    if (ir_.stage == ShaderStage::Compute || ir_.stage == ShaderStage::Mesh ||
+                        ir_.stage == ShaderStage::Amplification) {
+                        if (mode == 3u) {
+                            os << ind << "_v" << inst.id
+                               << " = ((_gtid3.z & 0x3FFu) << 20u) | ((_gtid3.y & 0x3FFu) << 10u) | (_gtid3.x & 0x3FFu);\n";
+                        } else {
+                            os << ind << "_v" << inst.id << " = _gtid3." << kSwiz[mode] << ";\n";
+                        }
+                    } else {
+                        os << ind << "_v" << inst.id << " = 0u;\n";
+                    }
+                    break;
+                }
                 case IrOp::MeshGlobalThreadId: {
                     const char* lidx = (bounded_wave64_dispatcher_ || mesh_wave32_split_) ? "_w64_gtid" : "_gtid";
                     const uint32_t nt = inst.imm_u32 ? inst.imm_u32 : ir_.mesh_num_threads;
@@ -2166,10 +2423,11 @@ private:
                     const bool in0_cbv =
                         !use_dual_srv0 &&
                         ir_.stage_contract.psv0_bindings.enabled && ir_.stage_contract.psv0_bindings.in0_is_cbv &&
-                        (is_cb || cb_reg == 0u || !ir_.uses_uav1);
+                        (is_cb || (!use_psv0_uav_bufs_ && (cb_reg == 0u || !ir_.uses_uav1)));
                     const bool use_in0_srv =
                         !use_dual_srv0 && !in0_cbv &&
-                        ir_.stage_contract.psv0_bindings.enabled && ir_.stage_contract.psv0_bindings.in0_is_srv;
+                        ir_.stage_contract.psv0_bindings.enabled && ir_.stage_contract.psv0_bindings.in0_is_srv &&
+                        (is_cb || !use_psv0_uav_bufs_);
                     if (use_dual_srv0) {
                         os << ind << "_v" << inst.id << " = _srv0.Load(" << AsU32(inst.operands[0]) << ");\n";
                     } else if (in0_cbv) {
@@ -2182,16 +2440,16 @@ private:
                            << "uint4 _cb_q = _cb_heap_" << cb_reg << "[(_cb_dw >> 2u) & 4095u]; "
                            << "uint _cb_l = _cb_dw & 3u; "
                            << "_v" << inst.id << " = (_cb_l == 0u) ? _cb_q.x : ((_cb_l == 1u) ? _cb_q.y : ((_cb_l == 2u) ? _cb_q.z : _cb_q.w)); } }\n";
-                    } else if (in0_cbv) {
-                        os << ind << "_v" << inst.id << " = _os_in0_cb_load(" << AsU32(inst.operands[0]) << ");\n";
                     } else if ((inst.imm_u32 & kIrLoadSmemBoundsCheckFlag) != 0u) {
-                        const char* buf = (!use_in0_srv && (inst.imm_u32 & 0xFFu) == 1u && ir_.uses_uav1) ? "_out0" : "_in0";
+                        const std::string buf =
+                            use_in0_srv ? std::string("_in0") : ResolveUavBufName(cb_reg);
                         os << ind << "{ uint _sb_off = " << AsU32(inst.operands[0]) << "; uint _sb_len = 0u; "
                            << buf << ".GetDimensions(_sb_len); "
                            << "bool _sb_ok = (_sb_off < 0x80000000u) && ((_sb_len > 0u) ? ((_sb_off < _sb_len) && ((_sb_off + 4u) <= _sb_len)) : (_sb_off < 65536u)); "
                            << "_v" << inst.id << " = _sb_ok ? " << buf << ".Load(_sb_off) : 0u; }\n";
                     } else {
-                        const char* buf = (!use_in0_srv && inst.imm_u32 == 1u && ir_.uses_uav1) ? "_out0" : "_in0";
+                        const std::string buf =
+                            use_in0_srv ? std::string("_in0") : ResolveUavBufName(cb_reg);
                         os << ind << "_v" << inst.id << " = " << buf << ".Load(" << AsU32(inst.operands[0]) << ");\n";
                     }
                     break;
@@ -2227,10 +2485,11 @@ private:
                         !use_dual_srv0 &&
                         ir_.stage_contract.psv0_bindings.enabled &&
                         ir_.stage_contract.psv0_bindings.in0_is_cbv &&
-                        (is_cb || cb_reg == 0u || !ir_.uses_uav1);
+                        (is_cb || (!use_psv0_uav_bufs_ && (cb_reg == 0u || !ir_.uses_uav1)));
                     const bool use_in0_srv =
                         !use_dual_srv0 && !use_in0_cb &&
-                        ir_.stage_contract.psv0_bindings.enabled && ir_.stage_contract.psv0_bindings.in0_is_srv;
+                        ir_.stage_contract.psv0_bindings.enabled && ir_.stage_contract.psv0_bindings.in0_is_srv &&
+                        (is_cb || !use_psv0_uav_bufs_);
                     if (use_dual_srv0) {
                         os << ind << "{ uint _so = " << AsU32(inst.operands[0]) << " + " << (k * 4u) << "u; "
                            << "_v" << inst.id << " = _srv0.Load(_so); }\n";
@@ -2243,7 +2502,8 @@ private:
                            << "uint _dw = _so >> 2u; uint4 _q = _cb_heap_" << cb_reg << "[(_dw >> 2u) & 4095u]; uint _l = _dw & 3u; "
                            << "_v" << inst.id << " = (_l == 0u) ? _q.x : ((_l == 1u) ? _q.y : ((_l == 2u) ? _q.z : _q.w)); } else { _v" << inst.id << " = 0u; } }\n";
                     } else {
-                        const char* buf = (!use_in0_srv && cb_reg == 1u && ir_.uses_uav1) ? "_out0" : "_in0";
+                        const std::string buf =
+                            use_in0_srv ? std::string("_in0") : ResolveUavBufName(cb_reg);
                         os << ind << "{ uint _so = " << AsU32(inst.operands[0]) << " + " << (k * 4u) << "u; "
                            << "if (" << AsBool(inst.operands[1]) << ") { _v" << inst.id << " = " << buf << ".Load(_so); } else { "
                            << "uint _sl = 0u; " << buf << ".GetDimensions(_sl); uint _lim = (_sl > 0u) ? _sl : 65536u; "
@@ -2252,7 +2512,7 @@ private:
                     break;
                 }
                 case IrOp::StoreUav: {
-                    const char* buf = (inst.imm_u32 == 1u && ir_.uses_uav1) ? "_out0" : "_in0";
+                    const std::string buf = ResolveUavBufName(inst.imm_u32 & 0xFFu);
                     if (inst.exec_pred != kInvalidIrValue) {
                         os << ind << "if (" << AsBool(inst.exec_pred) << ") { "
                            << buf << ".Store(" << AsU32(inst.operands[0]) << ", " << AsU32(inst.operands[1]) << "); }\n";
@@ -2263,9 +2523,9 @@ private:
                 }
                 case IrOp::StoreUavSubDword: {
                     // Sub-dword byte/short atomic read-modify-write store (xbox-emulator #235)
-                    const uint32_t uav_slot = inst.imm_u32 & 0xFu;
+                    const uint32_t uav_slot = inst.imm_u32 & 0xFFu;
                     const uint32_t width_bytes = (inst.imm_u32 >> 8) & 0xFu;
-                    const char* buf = (uav_slot == 1u && ir_.uses_uav1) ? "_out0" : "_in0";
+                    const std::string buf = ResolveUavBufName(uav_slot);
                     const uint32_t val_mask = (width_bytes == 2u) ? 0xFFFFu : 0xFFu;
                     const uint32_t off_mask = (width_bytes == 2u) ? 2u : 3u;
                     os << ind;
@@ -2278,6 +2538,54 @@ private:
                        << buf << ".InterlockedAnd(_al, _clr); " << buf << ".InterlockedOr(_al, _ins); }\n";
                     break;
                 }
+                case IrOp::UavAtomic: {
+                    const uint32_t uav_slot = inst.imm_u32 & 0xFFu;
+                    const uint32_t raw_op = (inst.imm_u32 >> 8) & 0xFFu;
+                    const std::string buf = ResolveUavBufName(uav_slot);
+                    os << ind;
+                    if (inst.exec_pred != kInvalidIrValue) {
+                        os << "if (" << AsBool(inst.exec_pred) << ") ";
+                    }
+                    os << "{ uint _aa = (" << AsU32(inst.operands[0]) << ") & ~3u; uint _ad = "
+                       << AsU32(inst.operands[1]) << "; uint _ap = 0u; ";
+                    if (raw_op == 0x30u) {
+                        os << buf << ".InterlockedExchange(_aa, _ad, _ap); ";
+                    } else if (raw_op == 0x31u) {
+                        const std::string cmp_e =
+                            (inst.operands.size() >= 3u) ? AsU32(inst.operands[2]) : std::string("0u");
+                        os << buf << ".InterlockedCompareExchange(_aa, " << cmp_e << ", _ad, _ap); ";
+                    } else if (raw_op == 0x33u) {
+                        os << buf << ".InterlockedAdd(_aa, 0u - _ad, _ap); ";
+                    } else if (raw_op == 0x34u || raw_op == 0x36u) {
+                        const char* cmp_op = (raw_op == 0x34u) ? "<" : ">";
+                        os << "uint _cur = " << buf << ".Load(_aa); "
+                           << "for (uint _ai = 0u; _ai < 64u; ++_ai) { "
+                           << "uint _nxt = (asint(_cur) " << cmp_op << " asint(_ad)) ? _cur : _ad; "
+                           << "uint _old = 0u; " << buf << ".InterlockedCompareExchange(_aa, _cur, _nxt, _old); "
+                           << "if (_old == _cur) { _ap = _old; break; } _cur = _old; } ";
+                    } else if (raw_op == 0x35u) {
+                        os << buf << ".InterlockedMin(_aa, _ad, _ap); ";
+                    } else if (raw_op == 0x37u) {
+                        os << buf << ".InterlockedMax(_aa, _ad, _ap); ";
+                    } else if (raw_op == 0x38u) {
+                        os << buf << ".InterlockedAnd(_aa, _ad, _ap); ";
+                    } else if (raw_op == 0x39u) {
+                        os << buf << ".InterlockedOr(_aa, _ad, _ap); ";
+                    } else if (raw_op == 0x3Au) {
+                        os << buf << ".InterlockedXor(_aa, _ad, _ap); ";
+                    } else if (raw_op == 0x3Bu) {
+                        os << buf << ".InterlockedAdd(_aa, 1u, _ap); ";
+                    } else if (raw_op == 0x3Cu) {
+                        os << buf << ".InterlockedAdd(_aa, 0xFFFFFFFFu, _ap); ";
+                    } else {
+                        os << buf << ".InterlockedAdd(_aa, _ad, _ap); ";
+                    }
+                    if (inst.id != kInvalidIrValue) {
+                        os << "_v" << inst.id << " = _ap; ";
+                    }
+                    os << "}\n";
+                    break;
+                }
                 case IrOp::BufferLoadFormat: {
                     const uint32_t uav_slot = inst.imm_u32 & 0xFu;
                     const uint32_t fmt = (inst.imm_u32 >> 4) & 0x7Fu;
@@ -2288,9 +2596,15 @@ private:
                         ir_.stage_contract.psv0_bindings.enabled &&
                         ir_.stage_contract.psv0_bindings.in0_is_srv &&
                         !ir_.stage_contract.psv0_bindings.in0_is_cbv &&
+                        !use_psv0_uav_bufs_ &&
                         !ModuleUsesOp(ir_, IrOp::StoreUav) &&
                         !ModuleUsesOp(ir_, IrOp::StoreUavSubDword);
-                    const char* loader = (!force_u0_srv && uav_slot == 1u && ir_.uses_uav1)
+                    const bool has_u1_loader =
+                        use_psv0_uav_bufs_
+                            ? (ir_.stage_contract.psv0_bindings.uav_buffers.size() >= 2u &&
+                               (ir_.used_psv0_uav_buf_mask & 2u) != 0u)
+                            : ir_.uses_uav1;
+                    const char* loader = (!force_u0_srv && uav_slot == 1u && has_u1_loader)
                                              ? "_os_load_unaligned_u1"
                                              : "_os_load_unaligned_u0";
                     const Rdna2MtbufFormatInfo fmt_info = GetRdna2MtbufFormatInfo(static_cast<uint8_t>(fmt));
@@ -2321,16 +2635,29 @@ private:
                     break;
                 }
                 case IrOp::ImageSample: {
-                    const uint32_t t_s2 = (inst.imm_u32 >> 24) & 0x1Fu;
-                    const std::string tname = (t_s2 > 0u) ? ("_tex_s" + std::to_string(t_s2 - 1u)) : "_tex0";
-                    if ((inst.imm_u32 & 0x80u) != 0u) {
-                        os << ind << "_v" << inst.id << " = " << tname << ".SampleCmpLevelZero(_samp_cmp0, float2("
-                           << AsF32(inst.operands[0]) << ", " << AsF32(inst.operands[1]) << "), "
-                           << AsF32(inst.operands[2]) << ");\n";
+                    std::string tname;
+                    uint32_t tkind = 2u;
+                    ResolveSrvTexInfo(inst.imm_u32, tname, tkind);
+                    const IrValueId w_id = (inst.operands.size() >= 4u) ? inst.operands[3] : kInvalidIrValue;
+                    const std::string coord = FormatSampleCoord(tkind, inst.operands[0], inst.operands[1], w_id);
+                    const bool is_cmp = (inst.imm_u32 & 0x80u) != 0u;
+                    if (is_cmp) {
+                        if (!ir_.stage_contract.psv0_bindings.enabled && tkind == 2u) {
+                            os << ind << "_v" << inst.id << " = " << tname << ".SampleCmpLevelZero(_samp_cmp0, "
+                               << coord << ", " << AsF32(inst.operands[2]) << ");\n";
+                        } else {
+                            os << ind << "_v" << inst.id << " = ((" << AsF32(inst.operands[2]) << " <= (float)"
+                               << tname << ".SampleLevel(_samp0, " << coord << ", 0.0).x) ? 1.0 : 0.0);\n";
+                        }
                     } else {
-                        os << ind << "_v" << inst.id << " = " << tname << ".SampleLevel(_samp0, float2("
-                           << AsF32(inst.operands[0]) << ", " << AsF32(inst.operands[1]) << "), "
-                           << AsF32(inst.operands[2]) << ")." << kSwiz[inst.imm_u32 & 3u] << ";\n";
+                        const std::string samp_expr =
+                            tname + ".SampleLevel(_samp0, " + coord + ", " + AsF32(inst.operands[2]) + ")." +
+                            kSwiz[inst.imm_u32 & 3u];
+                        if (ir_.texture_srv_format == Rdna2TextureFormat::Uint4 && inst.type == IrType::F32) {
+                            os << ind << "_v" << inst.id << " = asfloat(" << samp_expr << ");\n";
+                        } else {
+                            os << ind << "_v" << inst.id << " = " << samp_expr << ";\n";
+                        }
                     }
                     break;
                 }
@@ -2339,10 +2666,17 @@ private:
                         ? ("NonUniformResourceIndex(" + AsU32(inst.operands[3]) + ")")
                         : AsU32(inst.operands[3]);
                     if ((inst.imm_u32 & 0x80u) != 0u) {
-                        os << ind << "_v" << inst.id << " = _tex_arr[" << idx_expr
-                           << "].SampleCmpLevelZero(_samp_cmp0, float2("
-                           << AsF32(inst.operands[0]) << ", " << AsF32(inst.operands[1]) << "), "
-                           << AsF32(inst.operands[2]) << ");\n";
+                        if (!ir_.stage_contract.psv0_bindings.enabled) {
+                            os << ind << "_v" << inst.id << " = _tex_arr[" << idx_expr
+                               << "].SampleCmpLevelZero(_samp_cmp0, float2("
+                               << AsF32(inst.operands[0]) << ", " << AsF32(inst.operands[1]) << "), "
+                               << AsF32(inst.operands[2]) << ");\n";
+                        } else {
+                            os << ind << "_v" << inst.id << " = ((" << AsF32(inst.operands[2])
+                               << " <= _tex_arr[" << idx_expr << "].SampleLevel(_samp0, float2("
+                               << AsF32(inst.operands[0]) << ", " << AsF32(inst.operands[1])
+                               << "), 0.0).x) ? 1.0 : 0.0);\n";
+                        }
                     } else {
                         os << ind << "_v" << inst.id << " = _tex_arr[" << idx_expr
                            << "].SampleLevel(_samp0, float2("
@@ -2352,15 +2686,34 @@ private:
                     break;
                 }
                 case IrOp::ImageSampleImplicit: {
-                    const uint32_t t_s2 = (inst.imm_u32 >> 24) & 0x1Fu;
-                    if (t_s2 > 0u) {
-                        os << ind << "_v" << inst.id << " = _os_sample_affine_quad_t(_tex_s" << (t_s2 - 1u)
-                           << ", float2(" << AsF32(inst.operands[0]) << ", " << AsF32(inst.operands[1]) << "))."
-                           << kSwiz[inst.imm_u32 & 3u] << ";\n";
+                    std::string tname;
+                    uint32_t tkind = 2u;
+                    ResolveSrvTexInfo(inst.imm_u32, tname, tkind);
+                    const IrValueId w_id = (inst.operands.size() >= 3u) ? inst.operands[2] : kInvalidIrValue;
+                    const char sw = kSwiz[inst.imm_u32 & 3u];
+                    if ((tkind == 2u || tkind == 3u) &&
+                        ir_.stage == ShaderStage::Pixel &&
+                        ir_.texture_srv_format == Rdna2TextureFormat::Float4) {
+                        if (tname == "_tex0" && !use_psv0_srv_texs_) {
+                            os << ind << "_v" << inst.id << " = _os_sample_affine_quad(float2("
+                               << AsF32(inst.operands[0]) << ", " << AsF32(inst.operands[1]) << "))."
+                               << sw << ";\n";
+                        } else {
+                            os << ind << "_v" << inst.id << " = _os_sample_affine_quad_t(" << tname
+                               << ", float2(" << AsF32(inst.operands[0]) << ", " << AsF32(inst.operands[1])
+                               << "))." << sw << ";\n";
+                        }
                     } else {
-                        os << ind << "_v" << inst.id << " = _os_sample_affine_quad(float2("
-                           << AsF32(inst.operands[0]) << ", " << AsF32(inst.operands[1]) << "))."
-                           << kSwiz[inst.imm_u32 & 3u] << ";\n";
+                        const std::string coord = FormatSampleCoord(tkind, inst.operands[0], inst.operands[1], w_id);
+                        const std::string call =
+                            (ir_.stage == ShaderStage::Pixel)
+                                ? (tname + ".Sample(_samp0, " + coord + ")." + sw)
+                                : (tname + ".SampleLevel(_samp0, " + coord + ", 0.0)." + sw);
+                        if (ir_.texture_srv_format == Rdna2TextureFormat::Uint4 && inst.type == IrType::F32) {
+                            os << ind << "_v" << inst.id << " = asfloat(" << call << ");\n";
+                        } else {
+                            os << ind << "_v" << inst.id << " = " << call << ";\n";
+                        }
                     }
                     break;
                 }
@@ -2369,83 +2722,197 @@ private:
                     const uint32_t ch = inst.imm_u32 & 3u;
                     const uint32_t var = (inst.imm_u32 >> 4) & 7u;
                     const bool is_ps = (ir_.stage == ShaderStage::Pixel);
-                    const std::string uv = "float2(" + AsF32(inst.operands[0]) + ", " + AsF32(inst.operands[1]) + ")";
+                    std::string tname;
+                    uint32_t tkind = 2u;
+                    ResolveSrvTexInfo(inst.imm_u32, tname, tkind, 16u);
+                    const IrValueId w_id = (inst.operands.size() >= 10u) ? inst.operands[9] : kInvalidIrValue;
+                    const std::string uv = FormatSampleCoord(tkind, inst.operands[0], inst.operands[1], w_id);
                     const std::string min_lod = AsF32(inst.operands[2]);
                     const std::string dref = AsF32(inst.operands[3]);
                     const std::string bias = AsF32(inst.operands[4]);
+                    if (tkind != 2u) {
+                        const std::string samp_call =
+                            is_ps ? (tname + ".Sample(_samp0, " + uv + ")")
+                                  : (tname + ".SampleLevel(_samp0, " + uv + ", max(" + min_lod + ", " + bias + "))");
+                        if (var >= 3u) {
+                            os << ind << "_v" << inst.id << " = ((" << dref << " <= (float)" << samp_call
+                               << ".x) ? 1.0 : 0.0);\n";
+                        } else {
+                            os << ind << "_v" << inst.id << " = (float)" << samp_call << "." << kSwiz[ch] << ";\n";
+                        }
+                        break;
+                    }
                     const std::string ddx_e = "float2(" + AsF32(inst.operands[5]) + ", " + AsF32(inst.operands[6]) + ")";
                     const std::string ddy_e = "float2(" + AsF32(inst.operands[7]) + ", " + AsF32(inst.operands[8]) + ")";
                     if (var == 0u) {  // CL
                         if (is_ps) {
-                            os << ind << "_v" << inst.id << " = _tex0.Sample(_samp0, " << uv
+                            os << ind << "_v" << inst.id << " = " << tname << ".Sample(_samp0, " << uv
                                << ", int2(0, 0), " << min_lod << ")." << kSwiz[ch] << ";\n";
                         } else {
-                            os << ind << "_v" << inst.id << " = _tex0.SampleGrad(_samp0, " << uv
+                            os << ind << "_v" << inst.id << " = " << tname << ".SampleGrad(_samp0, " << uv
                                << ", float2(0.0, 0.0), float2(0.0, 0.0), int2(0, 0), " << min_lod << ")." << kSwiz[ch] << ";\n";
                         }
                     } else if (var == 1u) {  // D_CL
-                        os << ind << "_v" << inst.id << " = _tex0.SampleGrad(_samp0, " << uv
+                        os << ind << "_v" << inst.id << " = " << tname << ".SampleGrad(_samp0, " << uv
                            << ", " << ddx_e << ", " << ddy_e << ", int2(0, 0), " << min_lod << ")." << kSwiz[ch] << ";\n";
                     } else if (var == 2u) {  // B_CL
                         if (is_ps) {
-                            os << ind << "_v" << inst.id << " = _tex0.SampleBias(_samp0, " << uv
+                            os << ind << "_v" << inst.id << " = " << tname << ".SampleBias(_samp0, " << uv
                                << ", " << bias << ", int2(0, 0), " << min_lod << ")." << kSwiz[ch] << ";\n";
                         } else {
-                            os << ind << "_v" << inst.id << " = _tex0.SampleGrad(_samp0, " << uv
+                            os << ind << "_v" << inst.id << " = " << tname << ".SampleGrad(_samp0, " << uv
                                << ", float2(0.0, 0.0), float2(0.0, 0.0), int2(0, 0), max(" << min_lod << ", " << bias << "))." << kSwiz[ch] << ";\n";
                         }
                     } else if (var == 3u) {  // C_CL
                         if (is_ps) {
-                            os << ind << "_v" << inst.id << " = ((" << dref << " <= _tex0.Sample(_samp0, " << uv
+                            os << ind << "_v" << inst.id << " = ((" << dref << " <= " << tname << ".Sample(_samp0, " << uv
                                << ", int2(0, 0), " << min_lod << ").x) ? 1.0 : 0.0);\n";
                         } else {
-                            os << ind << "_v" << inst.id << " = ((" << dref << " <= _tex0.SampleGrad(_samp0, " << uv
+                            os << ind << "_v" << inst.id << " = ((" << dref << " <= " << tname << ".SampleGrad(_samp0, " << uv
                                << ", float2(0.0, 0.0), float2(0.0, 0.0), int2(0, 0), " << min_lod << ").x) ? 1.0 : 0.0);\n";
                         }
                     } else if (var == 4u) {  // C_D_CL
-                        os << ind << "_v" << inst.id << " = ((" << dref << " <= _tex0.SampleGrad(_samp0, " << uv
+                        os << ind << "_v" << inst.id << " = ((" << dref << " <= " << tname << ".SampleGrad(_samp0, " << uv
                            << ", " << ddx_e << ", " << ddy_e << ", int2(0, 0), " << min_lod << ").x) ? 1.0 : 0.0);\n";
                     } else {  // C_B_CL (var == 5u)
                         if (is_ps) {
-                            os << ind << "_v" << inst.id << " = ((" << dref << " <= _tex0.SampleBias(_samp0, " << uv
+                            os << ind << "_v" << inst.id << " = ((" << dref << " <= " << tname << ".SampleBias(_samp0, " << uv
                                << ", " << bias << ", int2(0, 0), " << min_lod << ").x) ? 1.0 : 0.0);\n";
                         } else {
-                            os << ind << "_v" << inst.id << " = ((" << dref << " <= _tex0.SampleGrad(_samp0, " << uv
+                            os << ind << "_v" << inst.id << " = ((" << dref << " <= " << tname << ".SampleGrad(_samp0, " << uv
                                << ", float2(0.0, 0.0), float2(0.0, 0.0), int2(0, 0), max(" << min_lod << ", " << bias << ")).x) ? 1.0 : 0.0);\n";
                         }
                     }
                     break;
                 }
-                case IrOp::ImageLoad:
-                    os << ind << "_v" << inst.id << " = _tex0.Load(int3("
-                       << AsI32(inst.operands[0]) << ", " << AsI32(inst.operands[1]) << ", 0))."
-                       << kSwiz[inst.imm_u32 & 3u] << ";\n";
+                case IrOp::ImageGather4: {
+                    const uint32_t out_comp = inst.imm_u32 & 3u;
+                    const uint32_t gather_ch = (inst.imm_u32 >> 2) & 3u;
+                    const bool is_cmp = (inst.imm_u32 & 0x80u) != 0u;
+                    std::string tname;
+                    uint32_t tkind = 2u;
+                    ResolveSrvTexInfo(inst.imm_u32, tname, tkind);
+                    const std::string coord = FormatSampleCoord(tkind, inst.operands[0], inst.operands[1], inst.operands[2]);
+                    const bool supports_gather =
+                        (tkind == 2u || tkind == 3u || tkind == 5u || tkind == 7u || tkind == 8u || tkind == 9u);
+                    static constexpr const char* kGatherFn[4] = {
+                        "GatherRed", "GatherGreen", "GatherBlue", "GatherAlpha"};
+                    if (!supports_gather) {
+                        if (is_cmp) {
+                            os << ind << "_v" << inst.id << " = ((" << AsF32(inst.operands[3]) << " <= (float)"
+                               << tname << ".SampleLevel(_samp0, " << coord << ", 0.0).x) ? 1.0 : 0.0);\n";
+                        } else {
+                            os << ind << "_v" << inst.id << " = (float)" << tname << ".SampleLevel(_samp0, "
+                               << coord << ", 0.0)." << kSwiz[gather_ch] << ";\n";
+                        }
+                    } else if (is_cmp) {
+                        if (!ir_.stage_contract.psv0_bindings.enabled && tkind == 2u) {
+                            os << ind << "_v" << inst.id << " = " << tname << ".GatherCmpRed(_samp_cmp0, "
+                               << coord << ", " << AsF32(inst.operands[3]) << ")." << kSwiz[out_comp] << ";\n";
+                        } else {
+                            os << ind << "_v" << inst.id << " = ((" << AsF32(inst.operands[3]) << " <= (float)"
+                               << tname << ".GatherRed(_samp0, " << coord << ")." << kSwiz[out_comp]
+                               << ") ? 1.0 : 0.0);\n";
+                        }
+                    } else {
+                        const std::string g_expr =
+                            tname + "." + kGatherFn[gather_ch] + "(_samp0, " + coord + ")." + kSwiz[out_comp];
+                        if (ir_.texture_srv_format == Rdna2TextureFormat::Uint4 && inst.type == IrType::F32) {
+                            os << ind << "_v" << inst.id << " = asfloat(" << g_expr << ");\n";
+                        } else {
+                            os << ind << "_v" << inst.id << " = " << g_expr << ";\n";
+                        }
+                    }
                     break;
+                }
+                case IrOp::ImageGetResInfo: {
+                    const uint32_t comp = inst.imm_u32 & 3u;
+                    std::string tname;
+                    uint32_t tkind = 2u;
+                    ResolveSrvTexInfo(inst.imm_u32, tname, tkind);
+                    const std::string mip = AsU32(inst.operands[0]);
+                    os << ind << "{ uint _rw = 0u, _rh = 1u, _rd = 1u, _rl = 1u; ";
+                    if (tkind == 1u) {
+                        os << tname << ".GetDimensions(" << mip << ", _rw, _rl); ";
+                    } else if (tkind == 4u || tkind == 7u || tkind == 8u || tkind == 9u) {
+                        os << tname << ".GetDimensions(" << mip << ", _rw, _rh, _rd, _rl); ";
+                    } else if (tkind == 6u) {
+                        os << tname << ".GetDimensions(" << mip << ", _rw, _rd, _rl); ";
+                    } else {
+                        os << tname << ".GetDimensions(" << mip << ", _rw, _rh, _rl); ";
+                    }
+                    const char* pick = (comp == 0u) ? "_rw" : ((comp == 1u) ? "_rh" : ((comp == 2u) ? "_rd" : "_rl"));
+                    os << "_v" << inst.id << " = " << pick << "; }\n";
+                    break;
+                }
+                case IrOp::ImageLoad: {
+                    std::string tname;
+                    uint32_t tkind = 2u;
+                    ResolveSrvTexInfo(inst.imm_u32, tname, tkind);
+                    const IrValueId z_id = (inst.operands.size() >= 3u) ? inst.operands[2] : kInvalidIrValue;
+                    const char sw = kSwiz[inst.imm_u32 & 3u];
+                    if (tkind == 5u || tkind == 9u) {
+                        const std::string coord = FormatSampleCoord(tkind, inst.operands[0], inst.operands[1], z_id);
+                        os << ind << "_v" << inst.id << " = " << tname << ".SampleLevel(_samp0, "
+                           << coord << ", 0.0)." << sw << ";\n";
+                    } else {
+                        const std::string lcoord =
+                            FormatLoadCoord(tkind, inst.operands[0], inst.operands[1], z_id, "0");
+                        os << ind << "_v" << inst.id << " = " << tname << ".Load(" << lcoord << ")." << sw << ";\n";
+                    }
+                    break;
+                }
                 case IrOp::ImageLoadMip: {
                     const uint32_t ch = inst.imm_u32 & 3u;
                     const uint32_t dim = (inst.imm_u32 >> 4) & 7u;
-                    if (dim == 2u) {
+                    if (!ir_.stage_contract.psv0_bindings.enabled && dim == 2u) {
                         os << ind << "_v" << inst.id << " = _tex3d0.Load(int4("
                            << AsI32(inst.operands[0]) << ", " << AsI32(inst.operands[1]) << ", "
                            << AsI32(inst.operands[2]) << ", " << AsI32(inst.operands[3]) << "))."
                            << kSwiz[ch] << ";\n";
-                    } else if (dim == 3u) {
+                    } else if (!ir_.stage_contract.psv0_bindings.enabled && dim == 3u) {
                         os << ind << "_v" << inst.id << " = _texcube0.Load(int4("
                            << AsI32(inst.operands[0]) << ", " << AsI32(inst.operands[1]) << ", "
                            << AsI32(inst.operands[2]) << ", " << AsI32(inst.operands[3]) << "))."
                            << kSwiz[ch] << ";\n";
                     } else {
-                        os << ind << "_v" << inst.id << " = _tex0.Load(int3("
-                           << AsI32(inst.operands[0]) << ", " << AsI32(inst.operands[1]) << ", "
-                           << AsI32(inst.operands[3]) << "))." << kSwiz[ch] << ";\n";
+                        std::string tname;
+                        uint32_t tkind = 2u;
+                        ResolveSrvTexInfo(inst.imm_u32, tname, tkind);
+                        if (tkind == 5u || tkind == 9u) {
+                            const std::string coord =
+                                FormatSampleCoord(tkind, inst.operands[0], inst.operands[1], inst.operands[2]);
+                            os << ind << "_v" << inst.id << " = " << tname << ".SampleLevel(_samp0, "
+                               << coord << ", (float)" << AsU32(inst.operands[3]) << ")." << kSwiz[ch] << ";\n";
+                        } else {
+                            const std::string lcoord = FormatLoadCoord(
+                                tkind, inst.operands[0], inst.operands[1], inst.operands[2], AsI32(inst.operands[3]));
+                            os << ind << "_v" << inst.id << " = " << tname << ".Load(" << lcoord << ")." << kSwiz[ch] << ";\n";
+                        }
                     }
                     break;
                 }
-                case IrOp::ImageStore:
-                    os << ind << "_rwtex0[uint2(" << AsU32(inst.operands[0]) << ", " << AsU32(inst.operands[1])
-                       << ")] = float4(" << AsF32(inst.operands[2]) << ", " << AsF32(inst.operands[3])
-                       << ", " << AsF32(inst.operands[4]) << ", " << AsF32(inst.operands[5]) << ");\n";
+                case IrOp::ImageStore: {
+                    const auto& pb_rw = ir_.stage_contract.psv0_bindings;
+                    const uint32_t rw_kind =
+                        (pb_rw.enabled && pb_rw.has_rwtex0 && pb_rw.rwtex0_res_kind != 0u)
+                            ? pb_rw.rwtex0_res_kind
+                            : ResKindFromMimgDim(inst.imm_u32 & 7u);
+                    std::string idx_expr;
+                    if (rw_kind == 1u) {
+                        idx_expr = AsU32(inst.operands[0]);
+                    } else if (rw_kind == 4u || rw_kind == 5u || rw_kind == 7u || rw_kind == 8u || rw_kind == 9u) {
+                        const std::string z_e =
+                            (inst.operands.size() >= 7u) ? AsU32(inst.operands[6]) : std::string("0u");
+                        idx_expr = "uint3(" + AsU32(inst.operands[0]) + ", " + AsU32(inst.operands[1]) + ", " + z_e + ")";
+                    } else {
+                        idx_expr = "uint2(" + AsU32(inst.operands[0]) + ", " + AsU32(inst.operands[1]) + ")";
+                    }
+                    os << ind << "_rwtex0[" << idx_expr << "] = float4("
+                       << AsF32(inst.operands[2]) << ", " << AsF32(inst.operands[3]) << ", "
+                       << AsF32(inst.operands[4]) << ", " << AsF32(inst.operands[5]) << ");\n";
                     break;
+                }
                 case IrOp::ImageAtomicCmpSwap: {
                     const uint32_t dim = inst.imm_u32 & 7u;
                     if (dim == 2u || dim == 3u) {
@@ -3520,6 +3987,8 @@ private:
 
     const Rdna2IrModule& ir_;
     bool use_sm65_ = true;
+    bool use_psv0_uav_bufs_ = false;
+    bool use_psv0_srv_texs_ = false;
     bool bounded_wave64_dispatcher_ = false;
     bool mesh_wave32_split_ = false;
     uint32_t mesh_split_passes_ = 1u;
@@ -3555,6 +4024,7 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
     const bool is_mesh_or_task = is_mesh_stage || is_task_stage;
     const bool uses_cmp_sample = ir.uses_comparison_sample || ModuleUsesComparisonSample(ir);
     const bool uses_min_lod = ModuleUsesOp(ir, IrOp::ImageSampleMinLod);
+    const bool uses_img_query = ModuleUsesOp(ir, IrOp::ImageGetResInfo);
     const bool uses_dyn_sample = ir.uses_dynamic_sampled_indexing || ModuleUsesOp(ir, IrOp::ImageSampleDynamic);
     const bool uses_wave_swizzle = ModuleUsesWaveSwizzle(ir);
     const bool uses_ps_readfirstlane = (ir.stage == ShaderStage::Pixel) && ModuleUsesOp(ir, IrOp::WaveReadFirstLane);
@@ -3613,6 +4083,9 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
     if (uses_min_lod) {
         EmitSpvInst(sec_caps, SpvOpCapability, {kSpvCapMinLod});
     }
+    if (uses_img_query) {
+        EmitSpvInst(sec_caps, SpvOpCapability, {kSpvCapImageQuery});
+    }
     if (uses_wave_swizzle || uses_ps_readfirstlane || uses_ps_lane_id) {
         EmitSpvInst(sec_caps, SpvOpCapability, {kSpvCapGroupNonUniform});
         if (uses_wave_swizzle) {
@@ -3647,6 +4120,7 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
     const uint32_t t_f32 = alloc_id();
     const uint32_t t_v2f32 = alloc_id();
     const uint32_t t_v2i32 = alloc_id();
+    const uint32_t t_v2u32 = alloc_id();
     const uint32_t t_v3i32 = alloc_id();
     const uint32_t t_v3u32 = alloc_id();
     const uint32_t t_v4u32 = alloc_id();
@@ -3660,6 +4134,7 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
     EmitSpvInst(sec_types, SpvOpTypeFloat, {t_f32, 32u});
     EmitSpvInst(sec_types, SpvOpTypeVector, {t_v2f32, t_f32, 2u});
     EmitSpvInst(sec_types, SpvOpTypeVector, {t_v2i32, t_i32, 2u});
+    EmitSpvInst(sec_types, SpvOpTypeVector, {t_v2u32, t_u32, 2u});
     EmitSpvInst(sec_types, SpvOpTypeVector, {t_v3i32, t_i32, 3u});
     EmitSpvInst(sec_types, SpvOpTypeVector, {t_v3u32, t_u32, 3u});
     EmitSpvInst(sec_types, SpvOpTypeVector, {t_v4u32, t_u32, 4u});
@@ -3901,7 +4376,7 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
     uint32_t var_sg_lane = 0;
     const bool tex_srv_is_u32 = (ir.texture_srv_format == Rdna2TextureFormat::Uint4);
 
-    if (ir.uses_texture_sample || ir.uses_texture2d_mip_srv || uses_dyn_sample) {
+    if (ir.uses_texture_sample || ir.uses_texture2d_mip_srv || uses_dyn_sample || uses_img_query) {
         t_img2d = alloc_id();
         t_ptr_uc_img = alloc_id();
         // Depth=2 allows both regular OpImageSampleExplicitLod AND depth OpImageSampleDrefExplicitLod
@@ -3909,7 +4384,7 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         EmitSpvInst(sec_types, SpvOpTypeImage,
                     {t_img2d, tex_srv_is_u32 ? t_u32 : t_f32, 1u, depth_flag, 0u, 0u, 1u, kSpvImgFmtUnknown});
         EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_uc_img, kSpvStorageUniformConstant, t_img2d});
-        if (ir.uses_texture_sample || ir.uses_texture2d_mip_srv) {
+        if (ir.uses_texture_sample || ir.uses_texture2d_mip_srv || uses_img_query) {
             var_tex0 = alloc_id();
             EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_uc_img, var_tex0, kSpvStorageUniformConstant});
             EmitSpvInst(sec_decor, SpvOpDecorate, {var_tex0, kSpvDecDescriptorSet, 0u});
@@ -4095,33 +4570,56 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
 
     const bool uses_tid = ModuleUsesThreadId(ir);
     const bool uses_stage_in = ModuleUsesStageInput(ir);
-
-    if (ir.stage == ShaderStage::Compute) {
-        if (uses_tid || ir.uses_wave64_emulation || ir.uses_lds) {
+    uint32_t var_local_id = 0u;
+    uint32_t t_ptr_in_v3u32_dedup = 0u;
+    auto get_ptr_in_u32 = [&]() -> uint32_t {
+        if (t_ptr_in_u32 == 0u) {
             t_ptr_in_u32 = alloc_id();
             EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_in_u32, kSpvStorageInput, t_u32});
         }
+        return t_ptr_in_u32;
+    };
+    auto get_ptr_in_v3u32 = [&]() -> uint32_t {
+        if (t_ptr_in_v3u32_dedup == 0u) {
+            t_ptr_in_v3u32_dedup = alloc_id();
+            EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_in_v3u32_dedup, kSpvStorageInput, t_v3u32});
+        }
+        return t_ptr_in_v3u32_dedup;
+    };
+
+    if (ir.stage == ShaderStage::Compute) {
+        if (uses_tid || ir.uses_wave64_emulation || ir.uses_lds ||
+            ir.uses_group_id || ir.uses_group_thread_id) {
+            (void)get_ptr_in_u32();
+        }
         if (uses_tid) {
-            const uint32_t t_ptr_in_v3u32 = alloc_id();
-            EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_in_v3u32, kSpvStorageInput, t_v3u32});
             var_gid = alloc_id();
-            EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_in_v3u32, var_gid, kSpvStorageInput});
+            EmitSpvInst(sec_globals, SpvOpVariable, {get_ptr_in_v3u32(), var_gid, kSpvStorageInput});
             EmitSpvInst(sec_decor, SpvOpDecorate, {var_gid, kSpvDecBuiltIn, kSpvBuiltInGlobalInvocationId});
             interface_vars.push_back(var_gid);
         }
+        if (ir.uses_group_id) {
+            var_wg_id = alloc_id();
+            EmitSpvInst(sec_globals, SpvOpVariable, {get_ptr_in_v3u32(), var_wg_id, kSpvStorageInput});
+            EmitSpvInst(sec_decor, SpvOpDecorate, {var_wg_id, kSpvDecBuiltIn, kSpvBuiltInWorkgroupId});
+            interface_vars.push_back(var_wg_id);
+        }
+        if (ir.uses_group_thread_id) {
+            var_local_id = alloc_id();
+            EmitSpvInst(sec_globals, SpvOpVariable, {get_ptr_in_v3u32(), var_local_id, kSpvStorageInput});
+            EmitSpvInst(sec_decor, SpvOpDecorate, {var_local_id, kSpvDecBuiltIn, kSpvBuiltInLocalInvocationId});
+            interface_vars.push_back(var_local_id);
+        }
         if (ir.uses_wave64_emulation || ir.uses_lds) {
             var_local_idx = alloc_id();
-            EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_in_u32, var_local_idx, kSpvStorageInput});
+            EmitSpvInst(sec_globals, SpvOpVariable, {get_ptr_in_u32(), var_local_idx, kSpvStorageInput});
             EmitSpvInst(sec_decor, SpvOpDecorate, {var_local_idx, kSpvDecBuiltIn, kSpvBuiltInLocalInvocationIndex});
             interface_vars.push_back(var_local_idx);
         }
     }
 
     if (uses_wave_swizzle || uses_ps_lane_id) {
-        if (t_ptr_in_u32 == 0u) {
-            t_ptr_in_u32 = alloc_id();
-            EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_in_u32, kSpvStorageInput, t_u32});
-        }
+        (void)get_ptr_in_u32();
         var_sg_size = alloc_id();
         var_sg_lane = alloc_id();
         EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_in_u32, var_sg_size, kSpvStorageInput});
@@ -4180,20 +4678,22 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
         const uint32_t c_max_v = get_const_u32(max_v);
         const uint32_t c_max_p = get_const_u32(max_p);
 
-        t_ptr_in_u32 = alloc_id();
-        EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_in_u32, kSpvStorageInput, t_u32});
         var_local_idx = alloc_id();
-        EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_in_u32, var_local_idx, kSpvStorageInput});
+        EmitSpvInst(sec_globals, SpvOpVariable, {get_ptr_in_u32(), var_local_idx, kSpvStorageInput});
         EmitSpvInst(sec_decor, SpvOpDecorate, {var_local_idx, kSpvDecBuiltIn, kSpvBuiltInLocalInvocationIndex});
         interface_vars.push_back(var_local_idx);
 
-        if (ir.uses_mesh_global_tid) {
-            const uint32_t t_ptr_in_v3u32 = alloc_id();
-            EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_in_v3u32, kSpvStorageInput, t_v3u32});
+        if (ir.uses_mesh_global_tid || ir.uses_group_id) {
             var_wg_id = alloc_id();
-            EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_in_v3u32, var_wg_id, kSpvStorageInput});
+            EmitSpvInst(sec_globals, SpvOpVariable, {get_ptr_in_v3u32(), var_wg_id, kSpvStorageInput});
             EmitSpvInst(sec_decor, SpvOpDecorate, {var_wg_id, kSpvDecBuiltIn, kSpvBuiltInWorkgroupId});
             interface_vars.push_back(var_wg_id);
+        }
+        if (ir.uses_group_thread_id) {
+            var_local_id = alloc_id();
+            EmitSpvInst(sec_globals, SpvOpVariable, {get_ptr_in_v3u32(), var_local_id, kSpvStorageInput});
+            EmitSpvInst(sec_decor, SpvOpDecorate, {var_local_id, kSpvDecBuiltIn, kSpvBuiltInLocalInvocationId});
+            interface_vars.push_back(var_local_id);
         }
 
         // Per-vertex gl_MeshVerticesEXT[] (Block-decorated struct with BuiltIn Position + optional CullDistance)
@@ -4267,20 +4767,22 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
     }
 
     if (is_task_stage) {
-        t_ptr_in_u32 = alloc_id();
-        EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_in_u32, kSpvStorageInput, t_u32});
         var_local_idx = alloc_id();
-        EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_in_u32, var_local_idx, kSpvStorageInput});
+        EmitSpvInst(sec_globals, SpvOpVariable, {get_ptr_in_u32(), var_local_idx, kSpvStorageInput});
         EmitSpvInst(sec_decor, SpvOpDecorate, {var_local_idx, kSpvDecBuiltIn, kSpvBuiltInLocalInvocationIndex});
         interface_vars.push_back(var_local_idx);
 
-        if (ir.uses_mesh_global_tid) {
-            const uint32_t t_ptr_in_v3u32 = alloc_id();
-            EmitSpvInst(sec_types, SpvOpTypePointer, {t_ptr_in_v3u32, kSpvStorageInput, t_v3u32});
+        if (ir.uses_mesh_global_tid || ir.uses_group_id) {
             var_wg_id = alloc_id();
-            EmitSpvInst(sec_globals, SpvOpVariable, {t_ptr_in_v3u32, var_wg_id, kSpvStorageInput});
+            EmitSpvInst(sec_globals, SpvOpVariable, {get_ptr_in_v3u32(), var_wg_id, kSpvStorageInput});
             EmitSpvInst(sec_decor, SpvOpDecorate, {var_wg_id, kSpvDecBuiltIn, kSpvBuiltInWorkgroupId});
             interface_vars.push_back(var_wg_id);
+        }
+        if (ir.uses_group_thread_id) {
+            var_local_id = alloc_id();
+            EmitSpvInst(sec_globals, SpvOpVariable, {get_ptr_in_v3u32(), var_local_id, kSpvStorageInput});
+            EmitSpvInst(sec_decor, SpvOpDecorate, {var_local_id, kSpvDecBuiltIn, kSpvBuiltInLocalInvocationId});
+            interface_vars.push_back(var_local_id);
         }
 
         // Workgroup task payload in TaskPayloadWorkgroupEXT storage class:
@@ -4965,6 +5467,51 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                         EmitSpvInst(sec_fn, SpvOpBitcast, {t_u32, res, vid_i32});
                     } else if (ir.stage == ShaderStage::Mesh || ir.stage == ShaderStage::Amplification) {
                         EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, res, var_local_idx});
+                    } else {
+                        EmitSpvInst(sec_fn, SpvOpIAdd, {t_u32, res, c_u32_0, c_u32_0});
+                    }
+                    break;
+                case IrOp::GroupId:
+                    if (var_wg_id != 0u) {
+                        const uint32_t comp = std::min(2u, inst.imm_u32 & 3u);
+                        uint32_t ptr_c = alloc_id();
+                        EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_in_u32, ptr_c, var_wg_id, get_const_u32(comp)});
+                        EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, res, ptr_c});
+                    } else {
+                        EmitSpvInst(sec_fn, SpvOpIAdd, {t_u32, res, c_u32_0, c_u32_0});
+                    }
+                    break;
+                case IrOp::GroupThreadId:
+                    if (var_local_id != 0u) {
+                        const uint32_t mode = inst.imm_u32 & 3u;
+                        if (mode == 3u) {
+                            const uint32_t c_m10 = get_const_u32(0x3FFu);
+                            const uint32_t c_10 = get_const_u32(10u);
+                            const uint32_t c_20 = get_const_u32(20u);
+                            uint32_t px = alloc_id(), py = alloc_id(), pz = alloc_id();
+                            uint32_t lx = alloc_id(), ly = alloc_id(), lz = alloc_id();
+                            uint32_t mx = alloc_id(), my = alloc_id(), mz = alloc_id();
+                            uint32_t sy = alloc_id(), sz = alloc_id(), t0 = alloc_id();
+                            EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_in_u32, px, var_local_id, c_u32_0});
+                            EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_in_u32, py, var_local_id, c_u32_1});
+                            EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_in_u32, pz, var_local_id, c_u32_2});
+                            EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, lx, px});
+                            EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, ly, py});
+                            EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, lz, pz});
+                            EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, mx, lx, c_m10});
+                            EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, my, ly, c_m10});
+                            EmitSpvInst(sec_fn, SpvOpBitwiseAnd, {t_u32, mz, lz, c_m10});
+                            EmitSpvInst(sec_fn, SpvOpShiftLeftLogical, {t_u32, sy, my, c_10});
+                            EmitSpvInst(sec_fn, SpvOpShiftLeftLogical, {t_u32, sz, mz, c_20});
+                            EmitSpvInst(sec_fn, SpvOpBitwiseOr, {t_u32, t0, mx, sy});
+                            EmitSpvInst(sec_fn, SpvOpBitwiseOr, {t_u32, res, t0, sz});
+                        } else {
+                            uint32_t pc = alloc_id();
+                            EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_in_u32, pc, var_local_id, get_const_u32(mode)});
+                            EmitSpvInst(sec_fn, SpvOpLoad, {t_u32, res, pc});
+                        }
+                    } else {
+                        EmitSpvInst(sec_fn, SpvOpIAdd, {t_u32, res, c_u32_0, c_u32_0});
                     }
                     break;
                 case IrOp::MeshGlobalThreadId: {
@@ -5115,7 +5662,7 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                     break;
                 }
                 case IrOp::StoreUavSubDword: {
-                    const uint32_t uav_slot = inst.imm_u32 & 0xFu;
+                    const uint32_t uav_slot = inst.imm_u32 & 0xFFu;
                     const uint32_t width_bytes = (inst.imm_u32 >> 8) & 0xFu;
                     const uint32_t var_buf = (uav_slot == 1u && var_uav1 != 0u) ? var_uav1 : var_uav0;
                     const uint32_t byte_off = get_as_u32(inst.operands[0]);
@@ -5152,6 +5699,62 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                         bb_exit_labels[bi] = lbl_m;
                     } else {
                         emit_sub_atomics();
+                    }
+                    break;
+                }
+                case IrOp::UavAtomic: {
+                    const uint32_t uav_slot = inst.imm_u32 & 0xFFu;
+                    const uint32_t raw_op = (inst.imm_u32 >> 8) & 0xFFu;
+                    const uint32_t var_buf = (uav_slot == 1u && var_uav1 != 0u) ? var_uav1 : var_uav0;
+                    const uint32_t byte_off = get_as_u32(inst.operands[0]);
+                    const uint32_t data_u32 = get_as_u32(inst.operands[1]);
+                    const uint32_t cmp_u32 = (inst.operands.size() >= 3u) ? get_as_u32(inst.operands[2]) : c_u32_0;
+                    const uint32_t c_scope = get_const_u32(kSpvScopeDevice);
+                    const uint32_t c_sem = get_const_u32(kSpvMemSemNone);
+                    uint32_t dw = alloc_id(), ptr = alloc_id();
+                    EmitSpvInst(sec_fn, SpvOpShiftRightLogical, {t_u32, dw, byte_off, c_u32_2});
+                    EmitSpvInst(sec_fn, SpvOpAccessChain, {t_ptr_sb_u32, ptr, var_buf, c_i32_0, dw});
+                    auto emit_atomic_body = [&](uint32_t dst_id) {
+                        if (raw_op == 0x30u) {
+                            EmitSpvInst(sec_fn, SpvOpAtomicExchange, {t_u32, dst_id, ptr, c_scope, c_sem, data_u32});
+                        } else if (raw_op == 0x31u) {
+                            EmitSpvInst(sec_fn, SpvOpAtomicCompareExchange,
+                                        {t_u32, dst_id, ptr, c_scope, c_sem, c_sem, data_u32, cmp_u32});
+                        } else if (raw_op == 0x33u) {
+                            EmitSpvInst(sec_fn, SpvOpAtomicISub, {t_u32, dst_id, ptr, c_scope, c_sem, data_u32});
+                        } else if (raw_op == 0x34u || raw_op == 0x35u) {
+                            EmitSpvInst(sec_fn, SpvOpAtomicUMin, {t_u32, dst_id, ptr, c_scope, c_sem, data_u32});
+                        } else if (raw_op == 0x36u || raw_op == 0x37u) {
+                            EmitSpvInst(sec_fn, SpvOpAtomicUMax, {t_u32, dst_id, ptr, c_scope, c_sem, data_u32});
+                        } else if (raw_op == 0x38u) {
+                            EmitSpvInst(sec_fn, SpvOpAtomicAnd, {t_u32, dst_id, ptr, c_scope, c_sem, data_u32});
+                        } else if (raw_op == 0x39u) {
+                            EmitSpvInst(sec_fn, SpvOpAtomicOr, {t_u32, dst_id, ptr, c_scope, c_sem, data_u32});
+                        } else if (raw_op == 0x3Au) {
+                            EmitSpvInst(sec_fn, SpvOpAtomicXor, {t_u32, dst_id, ptr, c_scope, c_sem, data_u32});
+                        } else if (raw_op == 0x3Bu) {
+                            EmitSpvInst(sec_fn, SpvOpAtomicIIncrement, {t_u32, dst_id, ptr, c_scope, c_sem});
+                        } else if (raw_op == 0x3Cu) {
+                            EmitSpvInst(sec_fn, SpvOpAtomicIDecrement, {t_u32, dst_id, ptr, c_scope, c_sem});
+                        } else {
+                            EmitSpvInst(sec_fn, SpvOpAtomicIAdd, {t_u32, dst_id, ptr, c_scope, c_sem, data_u32});
+                        }
+                    };
+                    if (inst.exec_pred != kInvalidIrValue) {
+                        uint32_t pred = get_as_bool(inst.exec_pred);
+                        uint32_t lbl_t = alloc_id(), lbl_m = alloc_id(), at_id = alloc_id();
+                        EmitSpvInst(sec_fn, SpvOpSelectionMerge, {lbl_m, 0u});
+                        EmitSpvInst(sec_fn, SpvOpBranchConditional, {pred, lbl_t, lbl_m});
+                        EmitSpvInst(sec_fn, SpvOpLabel, {lbl_t});
+                        emit_atomic_body(at_id);
+                        EmitSpvInst(sec_fn, SpvOpBranch, {lbl_m});
+                        EmitSpvInst(sec_fn, SpvOpLabel, {lbl_m});
+                        if (res != 0u) {
+                            EmitSpvInst(sec_fn, SpvOpPhi, {t_u32, res, at_id, lbl_t, c_u32_0, bb_exit_labels[bi]});
+                        }
+                        bb_exit_labels[bi] = lbl_m;
+                    } else {
+                        emit_atomic_body(res != 0u ? res : alloc_id());
                     }
                     break;
                 }
@@ -5491,6 +6094,42 @@ Status EmitSpirv(const Rdna2IrModule& ir, std::vector<uint32_t>& out_spirv) {
                             EmitSpvInst(sec_fn, SpvOpImageSampleExplicitLod, {t_v4f32, rgba, si, uv, 0x84u, gdx, gdy, min_lod});
                         }
                         EmitSpvInst(sec_fn, SpvOpCompositeExtract, {t_f32, res, rgba, ch});
+                    }
+                    break;
+                }
+                case IrOp::ImageGather4: {
+                    const uint32_t out_comp = inst.imm_u32 & 3u;
+                    const uint32_t gather_ch = (inst.imm_u32 >> 2) & 3u;
+                    const bool is_cmp = (inst.imm_u32 & 0x80u) != 0u;
+                    uint32_t img = alloc_id(), samp = alloc_id(), si = alloc_id(), uv = alloc_id(), rgba = alloc_id();
+                    EmitSpvInst(sec_fn, SpvOpLoad, {t_img2d, img, var_tex0});
+                    EmitSpvInst(sec_fn, SpvOpLoad, {t_sampler, samp, var_samp0});
+                    EmitSpvInst(sec_fn, SpvOpSampledImage, {t_sampled_img2d, si, img, samp});
+                    EmitSpvInst(sec_fn, SpvOpCompositeConstruct,
+                                {t_v2f32, uv, get_as_f32(inst.operands[0]), get_as_f32(inst.operands[1])});
+                    if (is_cmp) {
+                        EmitSpvInst(sec_fn, SpvOpImageDrefGather,
+                                    {t_v4f32, rgba, si, uv, get_as_f32(inst.operands[3])});
+                    } else {
+                        EmitSpvInst(sec_fn, SpvOpImageGather,
+                                    {t_v4f32, rgba, si, uv, get_const_u32(gather_ch)});
+                    }
+                    EmitSpvInst(sec_fn, SpvOpCompositeExtract, {t_f32, res, rgba, out_comp});
+                    break;
+                }
+                case IrOp::ImageGetResInfo: {
+                    const uint32_t comp = inst.imm_u32 & 3u;
+                    uint32_t img = alloc_id();
+                    EmitSpvInst(sec_fn, SpvOpLoad, {t_img2d, img, var_tex0});
+                    if (comp == 3u) {
+                        EmitSpvInst(sec_fn, SpvOpImageQueryLevels, {t_u32, res, img});
+                    } else if (comp == 2u) {
+                        EmitSpvInst(sec_fn, SpvOpIAdd, {t_u32, res, c_u32_1, c_u32_0});
+                    } else {
+                        uint32_t sz2 = alloc_id();
+                        EmitSpvInst(sec_fn, SpvOpImageQuerySizeLod,
+                                    {t_v2u32, sz2, img, get_as_u32(inst.operands[0])});
+                        EmitSpvInst(sec_fn, SpvOpCompositeExtract, {t_u32, res, sz2, comp});
                     }
                     break;
                 }
@@ -8233,6 +8872,22 @@ Status LiftRdna2Xs2Shader(
     const Rdna2LiftOptions& options) {
     out_result = Rdna2LiftResult{};
 
+    {
+        static thread_local bool in_xdat_self_check = false;
+        static std::once_flag xdat_self_check_once;
+        static Status xdat_self_check_status = Status::Ok();
+        if (!in_xdat_self_check) {
+            std::call_once(xdat_self_check_once, []() {
+                in_xdat_self_check = true;
+                xdat_self_check_status = VerifyXdatFssmExtractionSelfCheck();
+                in_xdat_self_check = false;
+            });
+            if (!xdat_self_check_status.ok()) {
+                return xdat_self_check_status;
+            }
+        }
+    }
+
     XboxParsedShaderContainer full_info{};
     if (auto st = ParseFullXboxShaderContainer(xs2_bytes, full_info); !st.ok()) {
         CallTelemetry::Global().Record("rdna2_lifter", "LiftRdna2Xs2Shader", CallOutcome::Error, -1);
@@ -8256,6 +8911,8 @@ Status LiftRdna2Xs2Shader(
     const StageContractTable* contract_ptr =
         (!eff_opts.stage_contract.vertex_fetches.empty() ||
          !eff_opts.stage_contract.pixel_inputs.empty() ||
+         !eff_opts.stage_contract.vs_ia_inputs.empty() ||
+         eff_opts.stage_contract.psv0_bindings.enabled ||
          eff_opts.stage_contract.texture_srv_format != Rdna2TextureFormat::Float4)
             ? &eff_opts.stage_contract
             : nullptr;

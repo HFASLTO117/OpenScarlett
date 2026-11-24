@@ -26,6 +26,8 @@ enum class IrOp : uint16_t {
     ConstU32 = 0,
     ConstF32,
     ThreadIdX,
+    GroupId,            // imm_u32 = 0..2 (X/Y/Z) -> u32 (SV_GroupID / WorkgroupId)
+    GroupThreadId,      // imm_u32 = 0..2 (X/Y/Z) or 3 (packed 10-bit (z<<20)|(y<<10)|x) -> u32
     StageInput,     // Vertex/Pixel input lane (e.g. PS interpolated PARAM0 channel 0..3)
     LoadRootConst,  // Read 32-bit scalar constant from b0[imm_u32]
     LoadUav,        // Load 32-bit word from uav[imm_u32] at byte offset operands[0]
@@ -33,15 +35,18 @@ enum class IrOp : uint16_t {
     LoadUavSpanElem,// Load dword k of a span checked by operands[1] (imm_u32 = flags_slot | (elem_idx << 16))
     StoreUav,       // Store operands[1] to uav[imm_u32] at byte offset operands[0]
     StoreUavSubDword,// Sub-dword (byte/short) atomic RMW store to uav (imm_u32 = slot | (is_short<<8) | (from_hi16<<9))
+    UavAtomic,          // operands: [byte_addr_u32, data_u32, cmp_u32(opt)], imm_u32 = slot | (raw_op<<8) | (glc<<16)
 
     // Texture / Image ops (MIMG)
-    ImageSample,        // operands: [u_f32, v_f32, lod_or_dref_f32], imm_u32 = channel (0..3) | (is_cmp << 7) -> f32
+    ImageSample,        // operands: [u_f32, v_f32, lod_or_dref_f32, w_f32(opt)], imm_u32 = ch | (dim<<4) | (is_cmp<<7) | (tex_slot<<8) -> f32
     ImageSampleDynamic, // operands: [u_f32, v_f32, lod_or_dref_f32, desc_idx_u32], imm_u32 = ch | (is_cmp << 7) | (array_len << 8)
-    ImageSampleImplicit,// operands: [u_f32, v_f32], imm_u32 = channel (0..3) -> f32 (PS helper-lane quad derivatives)
+    ImageSampleImplicit,// operands: [u_f32, v_f32, w_f32(opt)], imm_u32 = ch | (dim<<4) | (tex_slot<<8) -> f32 (PS helper-lane quad derivatives)
     ImageSampleMinLod,  // operands: mode-specific + trailing min_lod_f32, imm_u32 = ch | (mode << 4) -> f32
-    ImageLoad,          // operands: [x_u32, y_u32], imm_u32 = channel (0..3) -> f32
-    ImageLoadMip,       // operands: [x_u32, y_u32, z_or_face_u32, mip_u32], imm_u32 = ch | (dim << 4) -> f32
-    ImageStore,         // operands: [x_u32, y_u32, r_f32, g_f32, b_f32, a_f32] -> void
+    ImageGather4,       // operands: [u_f32, v_f32, w_f32, dref_f32], imm_u32 = out_comp(0..3) | (gather_ch<<2) | (dim<<4) | (is_cmp<<7) | (tex_slot<<8) -> f32
+    ImageGetResInfo,    // operands: [mip_u32], imm_u32 = comp(0..3) | (dim<<4) | (tex_slot<<8) -> u32
+    ImageLoad,          // operands: [x_u32, y_u32, z_u32(opt)], imm_u32 = ch | (dim<<4) | (tex_slot<<8) -> f32
+    ImageLoadMip,       // operands: [x_u32, y_u32, z_or_face_u32, mip_u32], imm_u32 = ch | (dim << 4) | (tex_slot<<8) -> f32
+    ImageStore,         // operands: [x_u32, y_u32, r_f32, g_f32, b_f32, a_f32, z_u32(opt)], imm_u32 = dim | (uav_tex_slot<<8) -> void
     ImageAtomicCmpSwap, // operands: [x_u32, y_u32, z_or_face_u32, cmp_u32, src_u32], imm_u32 = dim -> prev_u32
     BvhIntersectRay,    // operands: [node_ptr, tmax, ox, oy, oz, dx, dy, dz], imm_u32 = comp (0=t,1=u,2=v,3=hit_id)
 
@@ -259,6 +264,14 @@ struct VsIaInputBinding {
     uint8_t dst_vgpr_base = 0u;
 };
 
+struct Psv0HlslResourceEntry {
+    uint32_t reg = 0u;
+    uint32_t space = 0u;
+    uint32_t res_type = 0u;    // PSVResourceType: 1=CBV, 2=Sampler, 3..5=SRV, 6..9=UAV
+    uint32_t res_kind = 0u;    // PSVResourceKind: 1=Tex1D, 2=Tex2D, 4=Tex3D, 5=TexCube, 6=Tex1DArr, 7=Tex2DArr, 9=TexCubeArr, 10=TypedBuf, 11=RawBuf, 12=StructBuf, 13=CBuf, 14=Sampler
+    uint32_t upper_bound = 0u;
+};
+
 struct Psv0HlslBindingOverrides {
     bool enabled = false;
     bool has_root_const = false;
@@ -274,9 +287,32 @@ struct Psv0HlslBindingOverrides {
     bool has_tex0 = false;
     uint32_t tex0_reg = 0u;
     uint32_t tex0_space = 0u;
+    uint32_t tex0_res_kind = 2u;
     bool has_samp0 = false;
     uint32_t samp0_reg = 0u;
     uint32_t samp0_space = 0u;
+    bool has_uav0 = false;
+    uint32_t uav0_reg = 0u;
+    uint32_t uav0_space = 0u;
+    bool has_uav1 = false;
+    uint32_t uav1_reg = 1u;
+    uint32_t uav1_space = 0u;
+    bool has_rwtex0 = false;
+    uint32_t rwtex0_reg = 0u;
+    uint32_t rwtex0_space = 0u;
+    uint32_t rwtex0_res_kind = 2u;
+    bool has_rwimg_u32 = false;
+    uint32_t rwimg_u32_reg = 0u;
+    uint32_t rwimg_u32_space = 0u;
+    uint32_t rwimg_u32_res_kind = 2u;
+    bool cs_fssm_abi = false;
+    uint32_t cs_user_sgpr_count = 0u;
+    std::vector<Psv0HlslResourceEntry> uav_buffers;
+    std::vector<Psv0HlslResourceEntry> uav_textures;
+    std::vector<Psv0HlslResourceEntry> srv_textures;
+    std::vector<Psv0HlslResourceEntry> srv_buffers;
+    std::vector<Psv0HlslResourceEntry> cbvs;
+    std::vector<Psv0HlslResourceEntry> samplers;
 };
 
 struct StageContractTable {
@@ -299,9 +335,15 @@ struct Rdna2IrModule {
     uint32_t next_value_id = 1;
     uint32_t max_root_const_index = 0;
     bool uses_root_constants = false;
+    bool uses_group_id = false;
+    bool uses_group_thread_id = false;
     bool uses_uav = false;
     bool uses_uav0 = false;
     bool uses_uav1 = false;
+    uint32_t used_psv0_uav_buf_mask = 0u;
+    uint32_t used_psv0_uav_tex_mask = 0u;
+    uint32_t used_psv0_srv_tex_mask = 0u;
+    uint32_t used_psv0_srv_buf_mask = 0u;
     bool uses_lds = false;
     uint32_t lds_size_dwords = 1024;
     bool uses_scratch = false;

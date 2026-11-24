@@ -372,8 +372,12 @@ struct XboxFssmMetadata {
     uint32_t sub_version = 0u;        // 5 (UE5-era) or 6 (GTA VI, +8 shift)
     uint32_t user_sgpr_count = 0u;    // FSSM +0xD4 bits [23:16]
     bool uses_fetch_shader = false;   // FSSM +0xD4 bit 2
+    bool wave32 = false;              // FSSM +0xD4 bit 5
     uint8_t fetch_sgpr_pair = 0u;     // FSSM +0xD4 bits [31:24]
     uint32_t fetch_first_vgpr = 4u;   // FSSM +0xD8
+    uint32_t threadgroup_x = 1u;      // FSSM +0x134 (+v_shift)
+    uint32_t threadgroup_y = 1u;      // FSSM +0x138 (+v_shift)
+    uint32_t threadgroup_z = 1u;      // FSSM +0x13C (+v_shift)
     uint32_t spi_ps_input_ena = 0u;   // FSSM +0x248 (v6) / +0x240 (v5)
     std::vector<XboxFssmVsFetchEntry> vs_fetches;
     std::vector<XboxFssmPsInterpEntry> ps_interps;
@@ -430,15 +434,23 @@ struct XboxFullDxbcBuildDesc {
 
 Status ParseFullXboxShaderContainer(const void* data, size_t size, XboxParsedShaderContainer& out_parsed);
 Status ParseFullXboxShaderContainer(const std::vector<uint8_t>& bytes, XboxParsedShaderContainer& out_parsed);
+bool ExtractXdatDxilChunkToXs2(const std::vector<uint8_t>& dxil_data, Xs2ShaderContainer& out_xs2);
 std::vector<uint8_t> BuildFullXboxDxbcContainer(const XboxFullDxbcBuildDesc& desc);
 
 // Populates Rdna2LiftOptions (FSSM pixel inputs, interpolation modes, vertex fetch mappings, etc.)
 // directly from a parsed Xbox shader container.
 void ApplyXboxContainerToLiftOptions(const XboxParsedShaderContainer& container, Rdna2LiftOptions& opts);
 
-// Infers descriptor-table and root-constant bindings from PM4/SGPR setup and RDNA2 ISA
-// when RTS0 is absent (especially Mesh/Amplification pipelines).
+// Infers descriptor-table and root-constant bindings from PM4/SGPR setup, PSV0 resource bindings,
+// and RDNA2 ISA when RTS0 is absent (especially XDAT and Mesh/Amplification pipelines).
 bool InferShaderRootBindingsWhenRts0Absent(XboxParsedShaderContainer& container);
+
+// Returns the effective XboxRootSignatureDesc (explicit RTS0 when present, else PSV0/ISA-inferred
+// root signature) so DeviceX::CreateComputePipelineState / CreatePipelineState can synthesize a
+// matching host ID3D12RootSignature even when RTS0 is stripped from XDAT blobs.
+bool GetEffectiveXboxShaderRootSignature(
+    const XboxParsedShaderContainer& container,
+    XboxRootSignatureDesc& out_root_sig);
 
 struct XboxContainerLiftOptions {
     Rdna2LiftOptions lift_options{};
@@ -467,6 +479,23 @@ Status LiftXboxShaderContainer(
     size_t size,
     XboxContainerLiftResult& out_result,
     const XboxContainerLiftOptions& options = {});
+
+// Convenience wrapper that lifts any Xbox shader container (including XDAT -> XBCH -> FSSM v5/v6
+// CS, MS, AS, VS, PS) directly to signed PC DXIL via in-process dxcompiler.dll / dxc.exe, while
+// populating optional parsed container metadata (including PSV0-synthesized root_signature).
+Status LiftXboxShaderContainerToDxil(
+    const void* data,
+    size_t size,
+    std::vector<uint8_t>& out_dxil,
+    XboxParsedShaderContainer* out_parsed = nullptr,
+    std::string* out_hlsl = nullptr,
+    std::string* out_diagnostics = nullptr,
+    const XboxContainerLiftOptions& options = {});
+
+// Self-check verifying XDAT -> XBCH -> FSSM v5/v6 ISA extraction (including 0xBF810000 FP32 literal
+// survival and early-out s_cbranch_execz -> s_endpgm survival), PSV0 root signature inference, and
+// live DXC compilation for CS, VS, and PS containers.
+Status VerifyXdatFssmExtractionSelfCheck();
 
 // ---------------------------------------------------------------------------
 // VS -> PS Interpolation Modifier PSO Linkage Validator & Matcher

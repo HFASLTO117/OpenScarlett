@@ -25,6 +25,142 @@ uint64_t ReadLe64(const uint8_t* p) noexcept {
     return v;
 }
 
+// Decodes the exact dword length (1..5) and control-flow role of a GFX10.3 / RDNA2 instruction
+// so TryExtractFssmIsaFromXdatDxilChunk never mistakes a 0xBF810000 (-1.0078125f) literal dword
+// or an early-exit basic block's s_endpgm for the end of the shader microcode stream.
+size_t ComputeRdna2InstWordInfo(
+    const uint32_t* words,
+    size_t rem_words,
+    bool& out_is_endpgm,
+    bool& out_is_uncond_term,
+    bool& out_is_rel_branch,
+    int16_t& out_branch_simm16,
+    bool& out_is_setpc) noexcept {
+    out_is_endpgm = false;
+    out_is_uncond_term = false;
+    out_is_rel_branch = false;
+    out_branch_simm16 = 0;
+    out_is_setpc = false;
+    if (!words || rem_words == 0u) return 1u;
+
+    const uint32_t w0 = words[0];
+
+    // SOPP: [31:23] == 0x17F (always 1 dword)
+    if ((w0 >> 23) == 0x17Fu) {
+        const uint16_t raw_op = static_cast<uint16_t>((w0 >> 16) & 0x7Fu);
+        const int16_t simm16 = static_cast<int16_t>(w0 & 0xFFFFu);
+        if (raw_op == 0x01u || raw_op == 0x1Bu || raw_op == 0x1Eu) {
+            // s_endpgm (0x01), s_endpgm_saved (0x1B), s_endpgm_ordered_ps_done (0x1E)
+            out_is_endpgm = true;
+            out_is_uncond_term = true;
+        } else if (raw_op == 0x02u) {
+            // s_branch (unconditional relative branch)
+            out_is_uncond_term = true;
+            out_is_rel_branch = true;
+            out_branch_simm16 = simm16;
+        } else if ((raw_op >= 0x04u && raw_op <= 0x0Au) ||
+                   (raw_op >= 0x17u && raw_op <= 0x1Au) ||
+                   (raw_op >= 0x23u && raw_op <= 0x26u)) {
+            // s_cbranch_scc0/1, vccz/nz, execz/nz, cdbgsys*, fork/join conditional branches
+            out_is_rel_branch = true;
+            out_branch_simm16 = simm16;
+        }
+        return 1u;
+    }
+
+    // SOP1: [31:23] == 0x17D (1 dword, +1 if ssrc0 == 0xFF literal)
+    if ((w0 >> 23) == 0x17Du) {
+        const uint16_t raw_op = static_cast<uint16_t>((w0 >> 8) & 0xFFu);
+        const uint8_t ssrc0 = static_cast<uint8_t>(w0 & 0xFFu);
+        if (raw_op == 0x1Du || raw_op == 0x20u) {  // s_setpc_b64
+            out_is_uncond_term = true;
+            out_is_setpc = true;
+        }
+        return (ssrc0 == 0xFFu && raw_op != 0x1Fu) ? 2u : 1u;
+    }
+
+    // SOPC: [31:23] == 0x17E (1 dword, +1 if ssrc0 == 0xFF or ssrc1 == 0xFF)
+    if ((w0 >> 23) == 0x17Eu) {
+        const uint8_t ssrc0 = static_cast<uint8_t>(w0 & 0xFFu);
+        const uint8_t ssrc1 = static_cast<uint8_t>((w0 >> 8) & 0xFFu);
+        return (ssrc0 == 0xFFu || ssrc1 == 0xFFu) ? 2u : 1u;
+    }
+
+    // SOPK: [31:28] == 0xB (1 dword, except s_setreg_imm32_b32 op 0x14 which is 2 dwords)
+    if ((w0 >> 28) == 0xBu) {
+        const uint16_t raw_op = static_cast<uint16_t>((w0 >> 23) & 0x1Fu);
+        if (raw_op == 0x15u || raw_op == 0x16u) {  // s_call_b64 (GFX10.3 0x15 / legacy 0x16)
+            out_is_rel_branch = true;
+            out_branch_simm16 = static_cast<int16_t>(w0 & 0xFFFFu);
+        }
+        return (raw_op == 0x14u) ? 2u : 1u;
+    }
+
+    // SOP2: [31:30] == 0x2 (1 dword, +1 if ssrc0 == 0xFF or ssrc1 == 0xFF)
+    if ((w0 >> 30) == 0x2u) {
+        const uint8_t ssrc0 = static_cast<uint8_t>(w0 & 0xFFu);
+        const uint8_t ssrc1 = static_cast<uint8_t>((w0 >> 8) & 0xFFu);
+        return (ssrc0 == 0xFFu || ssrc1 == 0xFFu) ? 2u : 1u;
+    }
+
+    // VOP1 ([31:25] == 0x3F) or VOPC ([31:25] == 0x3E)
+    if ((w0 >> 25) == 0x3Fu || (w0 >> 25) == 0x3Eu) {
+        const uint16_t src0 = static_cast<uint16_t>(w0 & 0x1FFu);
+        const bool has_ext = (src0 == 0xFFu || src0 == 0xF9u || src0 == 0xFAu ||
+                              src0 == 0xE9u || src0 == 0xEAu);
+        return has_ext ? 2u : 1u;
+    }
+
+    // VOP2: [31] == 0
+    if ((w0 >> 31) == 0x0u) {
+        const uint16_t raw_op = static_cast<uint16_t>((w0 >> 25) & 0x3Fu);
+        const uint16_t src0 = static_cast<uint16_t>(w0 & 0x1FFu);
+        // Mandatory 32-bit literal K opcodes: v_madmk_f32 (0x20/0x21), v_madak_f32 (0x21/0x22),
+        // v_fmamk_f32 (0x2C), v_fmaak_f32 (0x2D), v_fmamk_f16 (0x37), v_fmaak_f16 (0x38).
+        const bool mandatory_lit = (raw_op == 0x20u || raw_op == 0x21u || raw_op == 0x22u ||
+                                    raw_op == 0x2Cu || raw_op == 0x2Du ||
+                                    raw_op == 0x37u || raw_op == 0x38u);
+        const bool has_dpp_sdwa = (src0 == 0xE9u || src0 == 0xEAu || src0 == 0xF9u || src0 == 0xFAu);
+        if (has_dpp_sdwa) {
+            return mandatory_lit ? 3u : 2u;
+        }
+        if (src0 == 0xFFu || mandatory_lit) {
+            return 2u;
+        }
+        return 1u;
+    }
+
+    // VINTRP ([31:26] == 0x32) or LDSDIR ([31:24] == 0xCE): 1 dword
+    const uint32_t top6 = (w0 >> 26) & 0x3Fu;
+    if (top6 == 0x32u || (w0 >> 24) == 0xCEu) {
+        return 1u;
+    }
+
+    // VOP3P (0x33) or VOP3/VOP3B (0x35): 2 dwords, or 3 dwords if any src0/1/2 == 0xFF in word 1
+    if (top6 == 0x33u || top6 == 0x35u) {
+        if (rem_words < 2u) return 1u;
+        const uint32_t w1 = words[1];
+        const uint16_t src0 = static_cast<uint16_t>(w1 & 0x1FFu);
+        const uint16_t src1 = static_cast<uint16_t>((w1 >> 9) & 0x1FFu);
+        const uint16_t src2 = static_cast<uint16_t>((w1 >> 18) & 0x1FFu);
+        return (src0 == 0xFFu || src1 == 0xFFu || src2 == 0xFFu) ? 3u : 2u;
+    }
+
+    // MIMG (0x3C): 2 dwords + optional NSA address dwords (bits [2:1] of word 0)
+    if (top6 == 0x3Cu) {
+        const size_t nsa_dwords = static_cast<size_t>((w0 >> 1) & 0x3u);
+        return 2u + nsa_dwords;
+    }
+
+    // DS (0x36), FLAT/GLOBAL/SCRATCH (0x37), MUBUF (0x38), MTBUF (0x3A), SMEM (0x3D), EXP (0x3E): 2 dwords
+    if (top6 == 0x36u || top6 == 0x37u || top6 == 0x38u ||
+        top6 == 0x3Au || top6 == 0x3Du || top6 == 0x3Eu) {
+        return 2u;
+    }
+
+    return 1u;
+}
+
 // Extracts RDNA2 ISA words & stage metadata from a retail Xbox Series X|S DXIL chunk
 // carrying an XDAT -> XBCH (RFC 1950 zlib) -> FSSM microcode container.
 bool TryExtractFssmIsaFromXdatDxilChunk(
@@ -92,25 +228,152 @@ bool TryExtractFssmIsaFromXdatDxilChunk(
 
     const uint64_t isa_off = ReadLe64(fssm.data() + stage_hdr_off + 0x10u);
     const uint64_t isa_sz = ReadLe64(fssm.data() + stage_hdr_off + 0x18u);
-    if (isa_sz < 44u || isa_off + isa_sz > fssm.size()) {
+    if (isa_sz < 4u || isa_off + isa_sz > fssm.size()) {
         return false;
     }
 
-    // Skip the 40-byte (0x28) FSSM zero+hash-embedded VOP3 NOP prologue.
+    const size_t code_end = static_cast<size_t>(isa_off + isa_sz);
+    auto extract_reachable_isa = [&](size_t start_off,
+                                     std::vector<uint32_t>& words_out,
+                                     bool& saw_endpgm_out) -> bool {
+        words_out.clear();
+        saw_endpgm_out = false;
+        if (code_end < start_off + 4u) return false;
+        const size_t total_words = (code_end - start_off) / 4u;
+        std::vector<uint32_t> raw_region(total_words);
+        for (size_t wi = 0u; wi < total_words; ++wi) {
+            raw_region[wi] = ReadLe32(fssm.data() + start_off + wi * 4u);
+        }
+
+        words_out.reserve(total_words);
+        size_t max_branch_target_word = 0u;
+        bool saw_setpc = false;
+        size_t cur_word = 0u;
+        while (cur_word < total_words) {
+            const uint32_t w0 = raw_region[cur_word];
+            // Stop before trailing icache prefetch guard (s_code_end 0xBF9F*) or zero/0xFF padding
+            // once at least one s_endpgm has been seen and no forward branch targets past here.
+            if (saw_endpgm_out && cur_word >= max_branch_target_word &&
+                ((w0 & 0xFFFF0000u) == 0xBF9F0000u || w0 == 0x00000000u || w0 == 0xFFFFFFFFu)) {
+                break;
+            }
+
+            bool is_endpgm = false;
+            bool is_uncond_term = false;
+            bool is_rel_branch = false;
+            int16_t branch_simm16 = 0;
+            bool is_setpc = false;
+            size_t inst_words = ComputeRdna2InstWordInfo(
+                raw_region.data() + cur_word,
+                total_words - cur_word,
+                is_endpgm,
+                is_uncond_term,
+                is_rel_branch,
+                branch_simm16,
+                is_setpc);
+            if (inst_words > total_words - cur_word) {
+                inst_words = total_words - cur_word;
+            }
+
+            for (size_t k = 0u; k < inst_words; ++k) {
+                words_out.push_back(raw_region[cur_word + k]);
+            }
+
+            if (is_rel_branch) {
+                const int64_t target =
+                    static_cast<int64_t>(cur_word) + 1 + static_cast<int64_t>(branch_simm16);
+                if (target > 0 && static_cast<size_t>(target) < total_words) {
+                    max_branch_target_word =
+                        std::max(max_branch_target_word, static_cast<size_t>(target));
+                }
+            }
+            if (is_endpgm) saw_endpgm_out = true;
+            if (is_setpc) saw_setpc = true;
+
+            cur_word += inst_words;
+
+            // An unconditional terminator (s_endpgm*, s_branch, s_setpc_b64) has no fallthrough;
+            // if no forward branch in [0..cur_word) targets >= cur_word (and no indirect s_setpc_b64
+            // jump table was seen), cur_word is strictly past all reachable basic blocks — stopping
+            // immediately before any trailing FSSM constant/reflection footer dwords (e.g. 0x00000008).
+            if (is_uncond_term && saw_endpgm_out && !saw_setpc && cur_word > max_branch_target_word) {
+                break;
+            }
+        }
+        // Strip any trailing s_nop / s_code_end sled if it ran directly into padding.
+        while (words_out.size() > 1u &&
+               ((words_out.back() & 0xFFFF0000u) == 0xBF800000u ||
+                (words_out.back() & 0xFFFF0000u) == 0xBF9F0000u)) {
+            words_out.pop_back();
+        }
+        return !words_out.empty();
+    };
+
+    auto has_fssm_prologue_at = [&](size_t off) noexcept -> bool {
+        if (off + 0x28u > code_end) return false;
+        const uint64_t q0 = ReadLe64(fssm.data() + off);
+        const uint64_t q1 = ReadLe64(fssm.data() + off + 8u);
+        if (q0 == 0ull && q1 == 0ull) return true;
+        // Compute/Mesh FSSM 0x28-byte prologues can carry non-zero header dwords (e.g. w0=0x00000008,
+        // non-zero q1) in [+0x00..+0x0F] followed by the 24-byte shader-hash NOP sled at [+0x10..+0x27]
+        // (three 64-bit VOP3 v_nop_e64 instructions 0xD580xxxx, or SOPP s_nop 0xBF80xxxx).
+        const uint32_t w0 = ReadLe32(fssm.data() + off);
+        const uint32_t w1 = ReadLe32(fssm.data() + off + 4u);
+        const uint32_t w4 = ReadLe32(fssm.data() + off + 0x10u);
+        const uint32_t w6 = ReadLe32(fssm.data() + off + 0x18u);
+        const uint32_t w8 = ReadLe32(fssm.data() + off + 0x20u);
+        if ((w4 & 0xFFFE0000u) == 0xD5800000u &&
+            (w6 & 0xFFFE0000u) == 0xD5800000u &&
+            (w8 & 0xFFFE0000u) == 0xD5800000u) {
+            return true;
+        }
+        if ((q1 == 0ull || (w0 < 0x00010000u && w1 == 0u)) &&
+            ((w4 & 0xFC000000u) == 0xD4000000u || (w4 & 0xFFFF0000u) == 0xBF800000u)) {
+            return true;
+        }
+        return false;
+    };
+
     size_t code_start = static_cast<size_t>(isa_off);
-    if (isa_sz >= 0x2Cu &&
-        ReadLe64(fssm.data() + code_start) == 0ull &&
-        ReadLe64(fssm.data() + code_start + 8u) == 0ull) {
+    if (has_fssm_prologue_at(code_start)) {
         code_start += 0x28u;
     }
-    const size_t code_end = static_cast<size_t>(isa_off + isa_sz);
-    out_isa_words.clear();
-    out_isa_words.reserve((code_end - code_start) / 4u);
-    for (size_t pos = code_start; pos + 4u <= code_end; pos += 4u) {
-        const uint32_t w = ReadLe32(fssm.data() + pos);
-        out_isa_words.push_back(w);
-        if (w == 0xBF810000u) {  // s_endpgm
-            break;
+
+    bool saw_endpgm = false;
+    if (!extract_reachable_isa(code_start, out_isa_words, saw_endpgm)) {
+        return false;
+    }
+
+    // If isa_off started with non-code header/rodata words that did not match the all-zero check,
+    // verify disassembly and probe skipping the 0x28-byte FSSM prologue or pre-code rodata pool.
+    if (code_start == static_cast<size_t>(isa_off)) {
+        std::vector<Rdna2Instruction> probe_insts;
+        if (!saw_endpgm || !DisassembleRdna2Extended(out_isa_words, probe_insts).ok()) {
+            bool recovered = false;
+            if (isa_sz >= 0x2Cu) {
+                std::vector<uint32_t> cand_words;
+                bool cand_endpgm = false;
+                if (extract_reachable_isa(static_cast<size_t>(isa_off) + 0x28u, cand_words, cand_endpgm) &&
+                    cand_endpgm && DisassembleRdna2Extended(cand_words, probe_insts).ok()) {
+                    out_isa_words = std::move(cand_words);
+                    recovered = true;
+                }
+            }
+            if (!recovered) {
+                for (size_t off = static_cast<size_t>(isa_off) + 4u;
+                     off + 0x2Cu <= code_end;
+                     off += 4u) {
+                    if (!has_fssm_prologue_at(off)) continue;
+                    std::vector<uint32_t> cand_words;
+                    bool cand_endpgm = false;
+                    if (extract_reachable_isa(off + 0x28u, cand_words, cand_endpgm) &&
+                        cand_endpgm && DisassembleRdna2Extended(cand_words, probe_insts).ok()) {
+                        out_isa_words = std::move(cand_words);
+                        recovered = true;
+                        break;
+                    }
+                }
+            }
         }
     }
     if (out_isa_words.empty()) return false;
@@ -131,6 +394,9 @@ bool TryExtractFssmIsaFromXdatDxilChunk(
         default:
             if (stage_slot_off == 0x38u) stage = ShaderStage::Vertex;
             else if (stage_slot_off == 0x40u) stage = ShaderStage::Pixel;
+            else if (stage_slot_off == 0x48u) stage = ShaderStage::Compute;
+            else if (stage_slot_off == 0x50u) stage = ShaderStage::Mesh;
+            else if (stage_slot_off == 0x58u) stage = ShaderStage::Amplification;
             break;
     }
 
@@ -142,10 +408,12 @@ bool TryExtractFssmIsaFromXdatDxilChunk(
         const uint32_t flags_d4 = ReadLe32(fssm.data() + 0xD4u);
         out_fssm.uses_fetch_shader = ((flags_d4 >> 2u) & 1u) != 0u;
         const bool wave32_flag = ((flags_d4 >> 5u) & 1u) != 0u;
+        out_fssm.wave32 = wave32_flag;
         out_fssm.user_sgpr_count = (flags_d4 >> 16u) & 0xFFu;
         out_fssm.fetch_sgpr_pair = static_cast<uint8_t>((flags_d4 >> 24u) & 0xFFu);
         out_fssm.fetch_first_vgpr = ReadLe32(fssm.data() + 0xD8u);
-        if (stage == ShaderStage::Pixel || stage == ShaderStage::Compute) {
+        if (stage == ShaderStage::Pixel || stage == ShaderStage::Compute ||
+            stage == ShaderStage::Mesh || stage == ShaderStage::Amplification) {
             wave_sz = wave32_flag ? 32u : 64u;
         } else {
             wave_sz = 64u;
@@ -153,13 +421,21 @@ bool TryExtractFssmIsaFromXdatDxilChunk(
     }
 
     uint32_t tg_x = 1u, tg_y = 1u, tg_z = 1u;
-    if (stage == ShaderStage::Compute && fssm.size() >= 0x140u + v_shift) {
+    if ((stage == ShaderStage::Compute || stage == ShaderStage::Mesh || stage == ShaderStage::Amplification) &&
+        fssm.size() >= 0x140u + v_shift) {
         const uint32_t nx = ReadLe32(fssm.data() + 0x134u + v_shift);
         const uint32_t ny = ReadLe32(fssm.data() + 0x138u + v_shift);
         const uint32_t nz = ReadLe32(fssm.data() + 0x13Cu + v_shift);
-        if (nx > 0u && nx <= 1024u) tg_x = nx;
-        if (ny > 0u && ny <= 1024u) tg_y = ny;
-        if (nz > 0u && nz <= 1024u) tg_z = nz;
+        if (nx > 0u && nx <= 1024u && ny > 0u && ny <= 1024u && nz > 0u && nz <= 1024u &&
+            static_cast<uint64_t>(nx) * static_cast<uint64_t>(ny) * static_cast<uint64_t>(nz) <= 1024ull) {
+            tg_x = nx;
+            tg_y = ny;
+            tg_z = nz;
+        } else {
+            if (nx > 0u && nx <= 1024u) tg_x = nx;
+            if (ny > 0u && ny <= 1024u) tg_y = ny;
+            if (nz > 0u && nz <= 1024u) tg_z = nz;
+        }
     } else if (stage == ShaderStage::Vertex && fssm.size() >= 0x1D8u) {
         // Parse 5-byte VS fetch table entries at +0x138 (up to 32 entries, terminated by type==0).
         for (size_t fi = 0u; fi < 32u; ++fi) {
@@ -198,11 +474,14 @@ bool TryExtractFssmIsaFromXdatDxilChunk(
             out_fssm.spi_ps_input_ena = ReadLe32(fssm.data() + 0x240u + v_shift);
         }
     }
+    out_fssm.threadgroup_x = tg_x;
+    out_fssm.threadgroup_y = tg_y;
+    out_fssm.threadgroup_z = tg_z;
 
     out_xs2 = Xs2ShaderContainer{};
     out_xs2.stage = stage;
-    out_xs2.sgpr_count = (out_fssm.user_sgpr_count > 0u) ? std::max(32u, out_fssm.user_sgpr_count) : 32u;
-    out_xs2.vgpr_count = 32u;
+    out_xs2.sgpr_count = (out_fssm.user_sgpr_count > 0u) ? std::max(32u, out_fssm.user_sgpr_count + 8u) : 32u;
+    out_xs2.vgpr_count = 64u;
     out_xs2.wave_size = wave_sz;
     out_xs2.threadgroup_x = tg_x;
     out_xs2.threadgroup_y = tg_y;
@@ -776,6 +1055,13 @@ bool IsXboxShaderContainerBlob(const void* data, size_t size) noexcept {
             std::memcmp(bytes + off, "PM4R", 4u) == 0 ||
             std::memcmp(bytes + off, "RREG", 4u) == 0) {
             return true;
+        }
+        if (std::memcmp(bytes + off, "DXIL", 4u) == 0) {
+            const uint32_t csz = ReadLe32(bytes + off + 4u);
+            if (csz >= 48u && static_cast<uint64_t>(off) + 8ull + 48ull <= total_size &&
+                std::memcmp(bytes + off + 8u + 24u, "XDAT", 4u) == 0) {
+                return true;
+            }
         }
     }
     return false;
@@ -1705,8 +1991,11 @@ Status ParseFullXboxShaderContainer(const void* data, size_t size, XboxParsedSha
         }
         if (out_parsed.psv0.present) {
             out_parsed.xs2.wave_size = SelectGuestWaveSizeFromPsv0(out_parsed.psv0, out_parsed.xs2.wave_size);
-            if (out_parsed.psv0.num_threads_x > 0u || out_parsed.psv0.num_threads_y > 0u ||
-                out_parsed.psv0.num_threads_z > 0u) {
+            if ((out_parsed.psv0.num_threads_x > 0u || out_parsed.psv0.num_threads_y > 0u ||
+                 out_parsed.psv0.num_threads_z > 0u) &&
+                out_parsed.psv0.num_threads_x <= 1024u &&
+                out_parsed.psv0.num_threads_y <= 1024u &&
+                out_parsed.psv0.num_threads_z <= 1024u) {
                 out_parsed.xs2.threadgroup_x = out_parsed.psv0.num_threads_x ? out_parsed.psv0.num_threads_x : 1u;
                 out_parsed.xs2.threadgroup_y = out_parsed.psv0.num_threads_y ? out_parsed.psv0.num_threads_y : 1u;
                 out_parsed.xs2.threadgroup_z = out_parsed.psv0.num_threads_z ? out_parsed.psv0.num_threads_z : 1u;
@@ -1928,44 +2217,137 @@ void ApplyXboxContainerToLiftOptions(const XboxParsedShaderContainer& container,
     }
     if (container.shader_payload_fourcc == "XDAT") {
         auto& pb = opts.stage_contract.psv0_bindings;
+        pb = Psv0HlslBindingOverrides{};
         pb.enabled = true;
+        if (container.xs2.stage == ShaderStage::Compute) {
+            pb.cs_fssm_abi = true;
+            pb.cs_user_sgpr_count = container.fssm.present ? container.fssm.user_sgpr_count : 16u;
+        }
         // Default bindless fallback sampler at (s0, space99) (appended as static linear-clamp
         // sampler on retail root signatures) unless PSV0 specifies an explicit sampler slot.
         pb.has_samp0 = true;
         pb.samp0_reg = 0u;
         pb.samp0_space = 99u;
+        bool has_explicit_samp = false;
+
+        auto push_bounded_entries = [](std::vector<Psv0HlslResourceEntry>& vec,
+                                       const XboxPsv0ResourceBinding& rb,
+                                       uint32_t eff_kind,
+                                       size_t max_expand) {
+            const bool unbounded = (rb.upper_bound == 0xFFFFFFFFu || rb.upper_bound < rb.lower_bound);
+            const uint32_t count = unbounded ? 1u : std::min<uint32_t>(rb.upper_bound - rb.lower_bound + 1u,
+                                                                       static_cast<uint32_t>(max_expand));
+            for (uint32_t k = 0u; k < count && vec.size() < 32u; ++k) {
+                const uint32_t r = rb.lower_bound + k;
+                bool dup = false;
+                for (const auto& ex : vec) {
+                    if (ex.reg == r && ex.space == rb.space) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) {
+                    Psv0HlslResourceEntry ent{};
+                    ent.reg = r;
+                    ent.space = rb.space;
+                    ent.res_type = rb.res_type;
+                    ent.res_kind = eff_kind;
+                    ent.upper_bound = unbounded ? 0xFFFFFFFFu : rb.upper_bound;
+                    vec.push_back(ent);
+                }
+            }
+        };
+
         for (const auto& rb : container.psv0.resource_bindings) {
-            if (rb.res_kind == 13u /*CBuffer*/) {
+            const bool is_cbv = (rb.res_kind == 13u /*CBuffer*/) ||
+                                (rb.res_kind == 0u && rb.res_type == 2u && container.psv0.runtime_info_size > 0u &&
+                                 rb.lower_bound >= 500u);
+            const bool is_sampler = (rb.res_kind == 14u /*Sampler*/) ||
+                                    (rb.res_kind == 0u && (rb.res_type == 1u || rb.res_type == 2u) && !is_cbv);
+            const bool is_uav = (rb.res_type >= 6u && rb.res_type <= 9u);
+            const bool is_srv = (!is_cbv && !is_sampler && !is_uav) &&
+                                ((rb.res_type >= 3u && rb.res_type <= 5u) ||
+                                 (rb.res_kind >= 1u && rb.res_kind <= 12u) ||
+                                 rb.res_kind == 15u || rb.res_kind == 16u);
+
+            if (is_cbv) {
                 if (rb.lower_bound >= 500u && !pb.has_root_const) {
                     pb.has_root_const = true;
                     pb.root_const_reg = rb.lower_bound;
                     pb.root_const_space = rb.space;
-                } else if (!pb.in0_is_cbv) {
-                    pb.in0_is_cbv = true;
-                    pb.in0_is_srv = false;
-                    pb.in0_reg = rb.lower_bound;
-                    pb.in0_space = rb.space;
+                } else {
+                    push_bounded_entries(pb.cbvs, rb, 13u, 8u);
+                    if (!pb.in0_is_cbv || (pb.in0_space == 2u && rb.space != 2u)) {
+                        pb.in0_is_cbv = true;
+                        pb.in0_is_srv = false;
+                        pb.in0_reg = rb.lower_bound;
+                        pb.in0_space = rb.space;
+                    }
                 }
-            } else if (rb.res_kind == 11u /*RawBuffer*/ || rb.res_kind == 12u /*StructuredBuffer*/) {
-                if (!pb.has_srv0) {
-                    pb.has_srv0 = true;
-                    pb.srv0_reg = rb.lower_bound;
-                    pb.srv0_space = rb.space;
+            } else if (is_sampler) {
+                push_bounded_entries(pb.samplers, rb, 14u, 8u);
+                if (!has_explicit_samp || (pb.samp0_space != 0u && rb.space == 0u)) {
+                    pb.has_samp0 = true;
+                    pb.samp0_reg = rb.lower_bound;
+                    pb.samp0_space = rb.space;
+                    has_explicit_samp = true;
                 }
-                if (!pb.in0_is_cbv && !pb.in0_is_srv) {
-                    pb.in0_is_srv = true;
-                    pb.in0_reg = rb.lower_bound;
-                    pb.in0_space = rb.space;
+            } else if (is_uav) {
+                const uint32_t ekind = (rb.res_kind != 0u) ? rb.res_kind : ((rb.res_type == 6u) ? 2u : 11u);
+                if (ekind >= 1u && ekind <= 9u) {
+                    push_bounded_entries(pb.uav_textures, rb, ekind, 8u);
+                } else {
+                    push_bounded_entries(pb.uav_buffers, rb, ekind, 16u);
                 }
-            } else if (rb.res_kind == 2u /*Texture2D*/ && !pb.has_tex0) {
-                pb.has_tex0 = true;
-                pb.tex0_reg = rb.lower_bound;
-                pb.tex0_space = rb.space;
-            } else if (rb.res_kind == 14u /*Sampler*/ || (rb.res_type == 2u && rb.res_kind == 0u)) {
-                pb.has_samp0 = true;
-                pb.samp0_reg = rb.lower_bound;
-                pb.samp0_space = rb.space;
+            } else if (is_srv) {
+                const uint32_t ekind = (rb.res_kind != 0u) ? rb.res_kind : ((rb.res_type == 3u) ? 2u : 11u);
+                if (ekind >= 1u && ekind <= 9u) {
+                    push_bounded_entries(pb.srv_textures, rb, ekind, 16u);
+                    const bool prefer = !pb.has_tex0 ||
+                                        (pb.tex0_space == 2u && rb.space != 2u) ||
+                                        (pb.tex0_space != 0u && rb.space == 0u);
+                    if (prefer) {
+                        pb.has_tex0 = true;
+                        pb.tex0_reg = rb.lower_bound;
+                        pb.tex0_space = rb.space;
+                        pb.tex0_res_kind = ekind;
+                    }
+                } else {
+                    push_bounded_entries(pb.srv_buffers, rb, ekind, 16u);
+                    if (!pb.has_srv0 || (pb.srv0_space == 2u && rb.space != 2u)) {
+                        pb.has_srv0 = true;
+                        pb.srv0_reg = rb.lower_bound;
+                        pb.srv0_space = rb.space;
+                    }
+                    if (!pb.in0_is_cbv && (!pb.in0_is_srv || (pb.in0_space == 2u && rb.space != 2u))) {
+                        pb.in0_is_srv = true;
+                        pb.in0_reg = rb.lower_bound;
+                        pb.in0_space = rb.space;
+                    }
+                }
             }
+        }
+
+        if (!pb.uav_buffers.empty()) {
+            pb.has_uav0 = true;
+            pb.uav0_reg = pb.uav_buffers[0].reg;
+            pb.uav0_space = pb.uav_buffers[0].space;
+            if (pb.uav_buffers.size() >= 2u) {
+                pb.has_uav1 = true;
+                pb.uav1_reg = pb.uav_buffers[1].reg;
+                pb.uav1_space = pb.uav_buffers[1].space;
+            }
+        }
+        if (!pb.uav_textures.empty()) {
+            pb.has_rwtex0 = true;
+            pb.rwtex0_reg = pb.uav_textures[0].reg;
+            pb.rwtex0_space = pb.uav_textures[0].space;
+            pb.rwtex0_res_kind = pb.uav_textures[0].res_kind;
+            const size_t u32_idx = (pb.uav_textures.size() >= 2u) ? 1u : 0u;
+            pb.has_rwimg_u32 = true;
+            pb.rwimg_u32_reg = pb.uav_textures[u32_idx].reg;
+            pb.rwimg_u32_space = pb.uav_textures[u32_idx].space;
+            pb.rwimg_u32_res_kind = pb.uav_textures[u32_idx].res_kind;
         }
         if (container.xs2.stage == ShaderStage::Pixel && !container.fssm.ps_interps.empty()) {
             for (const auto& pe : container.fssm.ps_interps) {
@@ -2527,10 +2909,17 @@ bool InferShaderRootBindingsWhenRts0Absent(XboxParsedShaderContainer& container)
     bool uses_tex_uav = false;
     bool uses_tex_u32_uav = false;
 
+    const uint32_t rc_sgpr_limit =
+        (container.fssm.present && eff_stage == ShaderStage::Compute)
+            ? std::min<uint32_t>(16u, container.fssm.user_sgpr_count)
+            : 16u;
+    bool uses_space2_heap_loads = false;
+
     for (const auto& inst : instructions) {
-        // Track unread SGPRs s0..s15 read directly (inline root constants; skip s3 merged_wave_info on MS/GS)
+        // Track unread SGPRs s0..s15 read directly (inline root constants; skip s3 merged_wave_info on MS/GS
+        // and skip FSSM Compute tgid_x/y/z SGPRs at s[user_sgpr_count+0..2])
         for (uint8_t s = 0u; s < inst.src_count && s < 4u; ++s) {
-            if (inst.src[s].kind == Rdna2OperandKind::Sgpr && inst.src[s].reg_index < 16u) {
+            if (inst.src[s].kind == Rdna2OperandKind::Sgpr && inst.src[s].reg_index < rc_sgpr_limit) {
                 const uint32_t idx = inst.src[s].reg_index;
                 if (inst.encoding == Rdna2Encoding::SMEM) continue;
                 if ((eff_stage == ShaderStage::Mesh || eff_stage == ShaderStage::Geometry) && idx == 3u) {
@@ -2545,6 +2934,9 @@ bool InferShaderRootBindingsWhenRts0Absent(XboxParsedShaderContainer& container)
 
         if (inst.encoding == Rdna2Encoding::SMEM) {
             uses_smem_cbv = true;
+            if (inst.raw_opcode >= 0x02u && inst.raw_opcode <= 0x04u) {
+                uses_space2_heap_loads = true;
+            }
         } else if (inst.encoding == Rdna2Encoding::MUBUF || inst.encoding == Rdna2Encoding::MTBUF) {
             const uint32_t slot = (inst.srsrc == 0u) ? 0u : 1u;
             uav_slots.insert(slot);
@@ -2563,10 +2955,19 @@ bool InferShaderRootBindingsWhenRts0Absent(XboxParsedShaderContainer& container)
                 uav_slots.insert(0u);
             } else if (inst.opcode == Rdna2Opcode::IMAGE_LOAD ||
                        inst.opcode == Rdna2Opcode::IMAGE_SAMPLE ||
-                       inst.opcode == Rdna2Opcode::IMAGE_SAMPLE_LZ) {
-                uses_tex2d_srv = true;
-                if (inst.opcode == Rdna2Opcode::IMAGE_SAMPLE ||
-                    inst.opcode == Rdna2Opcode::IMAGE_SAMPLE_LZ) {
+                       inst.opcode == Rdna2Opcode::IMAGE_SAMPLE_LZ ||
+                       inst.opcode == Rdna2Opcode::IMAGE_SAMPLE_C_LZ ||
+                       inst.opcode == Rdna2Opcode::IMAGE_SAMPLE_CL ||
+                       inst.opcode == Rdna2Opcode::IMAGE_SAMPLE_D_CL ||
+                       inst.opcode == Rdna2Opcode::IMAGE_SAMPLE_B_CL ||
+                       inst.opcode == Rdna2Opcode::IMAGE_SAMPLE_C_CL ||
+                       inst.opcode == Rdna2Opcode::IMAGE_SAMPLE_C_D_CL ||
+                       inst.opcode == Rdna2Opcode::IMAGE_SAMPLE_C_B_CL ||
+                       (inst.raw_opcode >= 0x20u && inst.raw_opcode <= 0x5Fu)) {
+                if (inst.mimg_dim == 2u) uses_tex3d_srv = true;
+                else if (inst.mimg_dim == 3u) uses_texcube_srv = true;
+                else uses_tex2d_srv = true;
+                if (inst.opcode != Rdna2Opcode::IMAGE_LOAD) {
                     uses_sampler = true;
                 }
             } else if (inst.opcode == Rdna2Opcode::IMAGE_LOAD_MIP) {
@@ -2583,6 +2984,154 @@ bool InferShaderRootBindingsWhenRts0Absent(XboxParsedShaderContainer& container)
 
         if (inst.dst.kind == Rdna2OperandKind::Sgpr && inst.dst.reg_index < 106u) {
             written_sgpr[inst.dst.reg_index] = true;
+        }
+    }
+
+    // PSV0-driven root signature synthesis for XDAT / RTS0-less DXBC shaders:
+    // Ensures DeviceX::CreateComputePipelineState & CreatePipelineState always have a complete,
+    // overlap-free host root signature covering all PSV0 CBV/SRV/UAV/Sampler bindings across space0..space3.
+    if (container.psv0.present &&
+        (!container.psv0.resource_bindings.empty() || container.shader_payload_fourcc == "XDAT")) {
+        XboxRootSignatureDesc psv_rs{};
+        psv_rs.present = true;
+        psv_rs.version = 2u;
+        psv_rs.flags = (eff_stage == ShaderStage::Vertex && !container.input_signature.empty()) ? 0x1u : 0u;
+
+        auto merge_range = [](std::vector<XboxDescriptorRange>& ranges,
+                              XboxDescriptorRangeType rtype,
+                              uint32_t space,
+                              uint32_t base_reg,
+                              uint32_t count) {
+            if (count == 0u) return;
+            const uint64_t new_end = static_cast<uint64_t>(base_reg) + static_cast<uint64_t>(count);
+            for (auto& ex : ranges) {
+                if (ex.range_type != rtype || ex.register_space != space) continue;
+                const uint64_t ex_end =
+                    static_cast<uint64_t>(ex.base_shader_register) + static_cast<uint64_t>(ex.num_descriptors);
+                if (base_reg <= ex_end && ex.base_shader_register <= new_end) {
+                    const uint32_t merged_base = std::min(base_reg, ex.base_shader_register);
+                    const uint64_t merged_end = std::max(new_end, ex_end);
+                    ex.base_shader_register = merged_base;
+                    ex.num_descriptors = static_cast<uint32_t>(
+                        std::min<uint64_t>(256ull, merged_end - static_cast<uint64_t>(merged_base)));
+                    return;
+                }
+            }
+            XboxDescriptorRange r{};
+            r.range_type = rtype;
+            r.num_descriptors = std::min(256u, count);
+            r.base_shader_register = base_reg;
+            r.register_space = space;
+            r.offset_in_descriptors_from_table_start = 0xFFFFFFFFu;
+            ranges.push_back(r);
+        };
+
+        std::vector<XboxDescriptorRange> csu_ranges;
+        std::vector<XboxDescriptorRange> samp_ranges;
+        bool emitted_rc_param = false;
+        bool has_b0_space0_cbv = false;
+        bool has_explicit_psv_sampler = false;
+
+        for (const auto& rb : container.psv0.resource_bindings) {
+            const bool is_cbv = (rb.res_kind == 13u) ||
+                                (rb.res_kind == 0u && rb.res_type == 2u && rb.lower_bound >= 500u);
+            const bool is_sampler = (rb.res_kind == 14u) ||
+                                    (rb.res_kind == 0u && (rb.res_type == 1u || rb.res_type == 2u) && !is_cbv);
+            const bool is_uav = (rb.res_type >= 6u && rb.res_type <= 9u);
+            const bool unbounded = (rb.upper_bound == 0xFFFFFFFFu || rb.upper_bound < rb.lower_bound);
+            const uint32_t count = unbounded ? 32u : std::min(256u, rb.upper_bound - rb.lower_bound + 1u);
+
+            if (is_cbv) {
+                if (rb.lower_bound >= 500u && !emitted_rc_param) {
+                    XboxRootParameter rc{};
+                    rc.type = XboxRootParamType::Constants32Bit;
+                    rc.shader_visibility = 0u;
+                    rc.shader_register = rb.lower_bound;
+                    rc.register_space = rb.space;
+                    rc.num_32bit_values = std::max(16u, max_root_const + 1u);
+                    psv_rs.parameters.push_back(std::move(rc));
+                    emitted_rc_param = true;
+                } else {
+                    if (rb.space == 0u && rb.lower_bound == 0u) has_b0_space0_cbv = true;
+                    merge_range(csu_ranges, XboxDescriptorRangeType::Cbv, rb.space, rb.lower_bound, count);
+                }
+            } else if (is_sampler) {
+                has_explicit_psv_sampler = true;
+                merge_range(samp_ranges, XboxDescriptorRangeType::Sampler, rb.space, rb.lower_bound, count);
+            } else if (is_uav) {
+                merge_range(csu_ranges, XboxDescriptorRangeType::Uav, rb.space, rb.lower_bound, count);
+            } else {
+                merge_range(csu_ranges, XboxDescriptorRangeType::Srv, rb.space, rb.lower_bound, count);
+            }
+        }
+
+        if (uses_root_consts && !emitted_rc_param && !has_b0_space0_cbv) {
+            XboxRootParameter rc{};
+            rc.type = XboxRootParamType::Constants32Bit;
+            rc.shader_visibility = 0u;
+            rc.shader_register = 0u;
+            rc.register_space = 0u;
+            rc.num_32bit_values = std::max(4u, max_root_const + 1u);
+            psv_rs.parameters.insert(psv_rs.parameters.begin(), std::move(rc));
+            emitted_rc_param = true;
+        }
+        if (uses_smem_cbv && csu_ranges.empty()) {
+            merge_range(csu_ranges, XboxDescriptorRangeType::Srv, 0u, 0u, 1u);
+        }
+        if (!uav_slots.empty() && container.psv0.resource_bindings.empty()) {
+            merge_range(csu_ranges, XboxDescriptorRangeType::Uav, 0u, 0u, (*uav_slots.rbegin()) + 1u);
+        }
+        if ((uses_tex2d_srv || uses_tex3d_srv || uses_texcube_srv) && container.psv0.resource_bindings.empty()) {
+            merge_range(csu_ranges, XboxDescriptorRangeType::Srv, 0u, 0u, 3u);
+        }
+        if (uses_space2_heap_loads) {
+            merge_range(csu_ranges, XboxDescriptorRangeType::Cbv, 2u, 0u, 32u);
+            merge_range(csu_ranges, XboxDescriptorRangeType::Srv, 2u, 0u, 32u);
+        }
+        if (!csu_ranges.empty()) {
+            XboxRootParameter tbl{};
+            tbl.type = XboxRootParamType::DescriptorTable;
+            tbl.shader_visibility = 0u;
+            tbl.descriptor_ranges = std::move(csu_ranges);
+            psv_rs.parameters.push_back(std::move(tbl));
+        }
+        if (!samp_ranges.empty()) {
+            XboxRootParameter stbl{};
+            stbl.type = XboxRootParamType::DescriptorTable;
+            stbl.shader_visibility = 0u;
+            stbl.descriptor_ranges = std::move(samp_ranges);
+            psv_rs.parameters.push_back(std::move(stbl));
+        } else if (uses_sampler && !has_explicit_psv_sampler) {
+            // Match ApplyXboxContainerToLiftOptions default bindless static sampler at (s0, space99).
+            XboxStaticSamplerInfo ss{};
+            ss.filter = 0x15u;  // D3D12_FILTER_MIN_MAG_MIP_LINEAR
+            ss.address_u = 3u;  // D3D12_TEXTURE_ADDRESS_MODE_CLAMP
+            ss.address_v = 3u;
+            ss.address_w = 3u;
+            ss.max_anisotropy = 1u;
+            ss.comparison_func = 4u;  // D3D12_COMPARISON_FUNC_LESS_EQUAL
+            ss.min_lod = 0.0f;
+            ss.max_lod = 3.402823466e+38f;
+            ss.shader_register = 0u;
+            ss.register_space = 99u;
+            ss.shader_visibility = 0u;
+            psv_rs.static_samplers.push_back(ss);
+        }
+
+        if (!psv_rs.parameters.empty() || !psv_rs.static_samplers.empty() || psv_rs.flags != 0u) {
+            container.inferred_root_signature = std::move(psv_rs);
+            container.root_signature_inferred = true;
+            const uint32_t max_sgprs =
+                container.fssm.present && container.fssm.user_sgpr_count > 16u
+                    ? std::min(32u, container.fssm.user_sgpr_count)
+                    : 16u;
+            (void)BuildUserSgprRootMap(
+                container.inferred_root_signature,
+                container.reg_setup.present ? &container.reg_setup : nullptr,
+                eff_stage,
+                container.sgpr_map,
+                max_sgprs);
+            return true;
         }
     }
 
@@ -2918,6 +3467,349 @@ Status LiftXboxShaderContainer(
                 }
             }
         }
+    }
+
+    return Status::Ok();
+}
+
+bool ExtractXdatDxilChunkToXs2(const std::vector<uint8_t>& dxil_data, Xs2ShaderContainer& out_xs2) {
+    std::vector<uint32_t> isa_words;
+    bool has_xs2 = false;
+    XboxFssmMetadata fssm{};
+    return TryExtractFssmIsaFromXdatDxilChunk(dxil_data, isa_words, out_xs2, has_xs2, fssm) && has_xs2;
+}
+
+bool GetEffectiveXboxShaderRootSignature(
+    const XboxParsedShaderContainer& container,
+    XboxRootSignatureDesc& out_root_sig) {
+    if (container.root_signature.present) {
+        out_root_sig = container.root_signature;
+        return true;
+    }
+    if (container.inferred_root_signature.present) {
+        out_root_sig = container.inferred_root_signature;
+        return true;
+    }
+    out_root_sig = XboxRootSignatureDesc{};
+    return false;
+}
+
+Status LiftXboxShaderContainerToDxil(
+    const void* data,
+    size_t size,
+    std::vector<uint8_t>& out_dxil,
+    XboxParsedShaderContainer* out_parsed,
+    std::string* out_hlsl,
+    std::string* out_diagnostics,
+    const XboxContainerLiftOptions& options) {
+    out_dxil.clear();
+    if (out_hlsl) out_hlsl->clear();
+    if (out_diagnostics) out_diagnostics->clear();
+
+    XboxContainerLiftOptions eff = options;
+    eff.lift_options.emit_hlsl = true;
+    eff.lift_options.compile_dxil_with_dxc = true;
+
+    XboxContainerLiftResult res{};
+    Status st = LiftXboxShaderContainer(data, size, res, eff);
+    if (out_parsed) {
+        *out_parsed = res.parsed;
+    }
+    if (out_hlsl) {
+        *out_hlsl = res.lift.hlsl_source;
+    }
+    if (out_diagnostics) {
+        *out_diagnostics = res.lift.dxc_diagnostics;
+    }
+    if (!st.ok()) {
+        return st;
+    }
+    out_dxil = std::move(res.lift.pc_dxil);
+    return Status::Ok();
+}
+
+namespace {
+
+std::vector<uint8_t> CompressStoredZlibRfc1950(const std::vector<uint8_t>& raw) {
+    std::vector<uint8_t> out;
+    out.reserve(raw.size() + 16u);
+    // RFC 1950 header: CMF=0x78 (deflate, 32K window), FLG=0x01 (0x7801 % 31 == 0)
+    out.push_back(0x78u);
+    out.push_back(0x01u);
+    size_t pos = 0u;
+    while (pos < raw.size() || raw.empty()) {
+        const size_t chunk = std::min<size_t>(raw.size() - pos, 65535u);
+        const bool is_final = (pos + chunk >= raw.size());
+        out.push_back(is_final ? 0x01u : 0x00u);  // BFINAL | (BTYPE=00 << 1)
+        const uint16_t len = static_cast<uint16_t>(chunk);
+        const uint16_t nlen = static_cast<uint16_t>(len ^ 0xFFFFu);
+        out.push_back(static_cast<uint8_t>(len & 0xFFu));
+        out.push_back(static_cast<uint8_t>((len >> 8u) & 0xFFu));
+        out.push_back(static_cast<uint8_t>(nlen & 0xFFu));
+        out.push_back(static_cast<uint8_t>((nlen >> 8u) & 0xFFu));
+        out.insert(out.end(), raw.begin() + static_cast<std::ptrdiff_t>(pos),
+                   raw.begin() + static_cast<std::ptrdiff_t>(pos + chunk));
+        pos += chunk;
+        if (raw.empty()) break;
+    }
+    const uint32_t adler = zlib_rfc1950::ComputeAdler32(raw.data(), raw.size());
+    out.push_back(static_cast<uint8_t>((adler >> 24u) & 0xFFu));
+    out.push_back(static_cast<uint8_t>((adler >> 16u) & 0xFFu));
+    out.push_back(static_cast<uint8_t>((adler >> 8u) & 0xFFu));
+    out.push_back(static_cast<uint8_t>(adler & 0xFFu));
+    return out;
+}
+
+std::vector<uint8_t> BuildSyntheticXdatDxilPayload(
+    uint16_t dxil_stage_kind,
+    uint32_t fssm_sub_version,
+    bool wave32,
+    uint8_t user_sgprs,
+    uint32_t tg_x,
+    uint32_t tg_y,
+    uint32_t tg_z,
+    const std::vector<uint32_t>& raw_isa_with_padding) {
+    const size_t v_shift = (fssm_sub_version >= 6u) ? 8u : 0u;
+    const size_t isa_off = 0x280u;
+    const size_t isa_bytes = 0x28u + raw_isa_with_padding.size() * 4u;
+    std::vector<uint8_t> fssm(isa_off + isa_bytes, 0u);
+    std::memcpy(fssm.data(), "FSSM", 4u);
+    const uint32_t sub_ver = fssm_sub_version;
+    std::memcpy(fssm.data() + 0x10u, &sub_ver, 4u);
+    constexpr uint64_t kDead = 0xDEADBEEFDEADBEEFull;
+    for (size_t off = 0x18u; off < 0x78u; off += 8u) {
+        std::memcpy(fssm.data() + off, &kDead, 8u);
+    }
+    const uint64_t stage_hdr_off = 0x80ull;
+    std::memcpy(fssm.data() + 0x48u, &stage_hdr_off, 8u);
+    const uint64_t isa_off_u64 = static_cast<uint64_t>(isa_off);
+    const uint64_t isa_sz_u64 = static_cast<uint64_t>(isa_bytes);
+    std::memcpy(fssm.data() + 0x80u + 0x10u, &isa_off_u64, 8u);
+    std::memcpy(fssm.data() + 0x80u + 0x18u, &isa_sz_u64, 8u);
+
+    const uint32_t flags_d4 = (wave32 ? (1u << 5u) : 0u) | (static_cast<uint32_t>(user_sgprs) << 16u);
+    std::memcpy(fssm.data() + 0xD4u, &flags_d4, 4u);
+    const uint32_t first_vgpr = 4u;
+    std::memcpy(fssm.data() + 0xD8u, &first_vgpr, 4u);
+    std::memcpy(fssm.data() + 0x134u + v_shift, &tg_x, 4u);
+    std::memcpy(fssm.data() + 0x138u + v_shift, &tg_y, 4u);
+    std::memcpy(fssm.data() + 0x13Cu + v_shift, &tg_z, 4u);
+
+    // Populate realistic non-zero Compute FSSM 0x28-byte prologue (w0=0x00000008, non-zero q1,
+    // and 24-byte 3x v_nop_e64 0xD5800000 shader-hash sled at +0x10..+0x27) when CS stage is built,
+    // matching Leonida's live Frame 455 Compute Shader prologue layout!
+    if (dxil_stage_kind == 5u) {
+        const uint32_t p_w0 = 0x00000008u;
+        const uint32_t p_w2 = 0x00000400u;
+        const uint32_t v_nop_e64_w0 = 0xD5800000u;
+        const uint32_t hash_word = 0x12345678u;
+        std::memcpy(fssm.data() + isa_off + 0x00u, &p_w0, 4u);
+        std::memcpy(fssm.data() + isa_off + 0x08u, &p_w2, 4u);
+        for (size_t hi = 0u; hi < 3u; ++hi) {
+            std::memcpy(fssm.data() + isa_off + 0x10u + hi * 8u, &v_nop_e64_w0, 4u);
+            std::memcpy(fssm.data() + isa_off + 0x14u + hi * 8u, &hash_word, 4u);
+        }
+    }
+    for (size_t i = 0u; i < raw_isa_with_padding.size(); ++i) {
+        const uint32_t w = raw_isa_with_padding[i];
+        std::memcpy(fssm.data() + isa_off + 0x28u + i * 4u, &w, 4u);
+    }
+
+    const std::vector<uint8_t> comp = CompressStoredZlibRfc1950(fssm);
+    std::vector<uint8_t> xbch(24u + comp.size(), 0u);
+    std::memcpy(xbch.data(), "XBCH", 4u);
+    const uint64_t comp_sz = static_cast<uint64_t>(comp.size());
+    const uint64_t uncomp_sz = static_cast<uint64_t>(fssm.size());
+    std::memcpy(xbch.data() + 8u, &comp_sz, 8u);
+    std::memcpy(xbch.data() + 16u, &uncomp_sz, 8u);
+    std::memcpy(xbch.data() + 24u, comp.data(), comp.size());
+
+    // DXIL header (24 bytes) + XDAT header & 1-entry directory (24 + 12 = 36 bytes -> xbch at +60)
+    const uint32_t entries_off = 48u;
+    const uint32_t xbch_off = 60u;
+    std::vector<uint8_t> dxil(xbch_off + xbch.size(), 0u);
+    const uint32_t hdr_w0 = (static_cast<uint32_t>(dxil_stage_kind) << 16u) | 0x0065u;
+    std::memcpy(dxil.data(), &hdr_w0, 4u);
+    std::memcpy(dxil.data() + 24u, "XDAT", 4u);
+    const uint32_t entry_count = 1u;
+    std::memcpy(dxil.data() + 28u, &entry_count, 4u);
+    std::memcpy(dxil.data() + 32u, &entries_off, 4u);
+    const uint32_t kind_xbch = 0x0Du;
+    const uint32_t xbch_sz_u32 = static_cast<uint32_t>(xbch.size());
+    std::memcpy(dxil.data() + entries_off + 0u, &kind_xbch, 4u);
+    std::memcpy(dxil.data() + entries_off + 4u, &xbch_off, 4u);
+    std::memcpy(dxil.data() + entries_off + 8u, &xbch_sz_u32, 4u);
+    std::memcpy(dxil.data() + xbch_off, xbch.data(), xbch.size());
+    return dxil;
+}
+
+}  // namespace
+
+Status VerifyXdatFssmExtractionSelfCheck() {
+    // 1. Build an XDAT -> XBCH -> FSSM v6 Compute Shader ([numthreads(8, 8, 1)], wave32, user_sgprs=4)
+    //    containing BOTH:
+    //      (a) a 0xBF810000 (-1.0078125f) 32-bit FP32 literal inside v_mov_b32, AND
+    //      (b) an early-exit basic block (s_cbranch_execz -> s_endpgm) followed by the main body
+    //          reading SV_GroupID (s4, s5), packed 10-bit SV_GroupThreadID (v0), v_fmac_legacy_f32,
+    //          buffer_atomic_add (MUBUF 0x32), and buffer_store_dword to PSV0 u2 (space1),
+    //          terminated by final s_endpgm + s_code_end (0xBF9F0000) + zero padding!
+    Rdna2Assembler cs_asm;
+    // Unpack X = v0 & 0x3FF, Y = (v0 >> 10) & 0x3FF, combine with SV_GroupID.x (s4) & .y (s5)
+    cs_asm.EmitVop2(Rdna2Opcode::V_AND_B32, 1u, Rdna2Operand::LiteralU32(0x3FFu), 0u);
+    cs_asm.EmitVop3(Rdna2Opcode::V_BFE_U32, 2u, Rdna2Operand::Vgpr(0u),
+                    Rdna2Operand::InlineInt(10), Rdna2Operand::InlineInt(10));
+    // Load FP32 literal 0xBF810000 (-1.0078125f) — previously caused premature s_endpgm truncation!
+    cs_asm.EmitVop1(Rdna2Opcode::V_MOV_B32, 3u, Rdna2Operand::LiteralU32(0xBF810000u));
+    // Early-out branch over an in-stream s_endpgm basic block:
+    // v_cmp_eq_u32 vcc, 0xFFFF, v1 (false for valid threads -> execz not taken? Jump OVER early s_endpgm!)
+    cs_asm.EmitSopc(Rdna2Opcode::S_CMP_EQ_U32, Rdna2Operand::Sgpr(4u), Rdna2Operand::LiteralU32(0x7FFFFFFFu));
+    const uint32_t br_skip_early = cs_asm.EmitSopp(Rdna2Opcode::S_CBRANCH_SCC0, 0);
+    // Early-exit block ending in s_endpgm (0xBF810000)!
+    cs_asm.EmitSopp(Rdna2Opcode::S_ENDPGM);
+    const uint32_t main_cont = cs_asm.CurrentWordOffset();
+    cs_asm.PatchBranch(br_skip_early, main_cont);
+
+        // Also exercise VOP2 raw_op=0x00 (v_cndmask_b32_e32: w0 = 0x00000008 -> v0 = vcc ? v0 : s0)
+        // AND trailing non-zero FSSM footer dwords (0x00000008 after s_endpgm + s_code_end)!
+        cs_asm.EmitVopc(Rdna2Opcode::V_CMP_GT_U32, Rdna2Operand::InlineInt(64), 1u);
+        std::vector<uint32_t> cs_words = cs_asm.Words();
+        cs_words.push_back((0x00u << 25u) | (1u << 17u) | (1u << 9u) | 0u);  // v_cndmask_b32_e32 v1, s0, v1, vcc
+    {
+        const uint32_t w_fmac_leg = (0x06u << 25u) | (3u << 17u) | (3u << 9u) | 0u;  // v3 += s0 * v3
+        cs_words.push_back(w_fmac_leg);
+        // Compute byte offset v5 = ((s4 * 8 + v1) + (s5 * 8 + v2) * 64) * 4 -> simplified (s4 + v1 + v2) << 2
+        Rdna2Assembler tail;
+        tail.EmitVop2(Rdna2Opcode::V_ADD_NC_U32, 5u, Rdna2Operand::Sgpr(4u), 1u);
+        tail.EmitVop2(Rdna2Opcode::V_ADD_NC_U32, 5u, Rdna2Operand::Sgpr(5u), 5u);
+        tail.EmitVop2(Rdna2Opcode::V_ADD_NC_U32, 5u, Rdna2Operand::Vgpr(2u), 5u);
+        tail.EmitVop2(Rdna2Opcode::V_LSHLREV_B32, 5u, Rdna2Operand::InlineInt(2), 5u);
+        for (uint32_t w : tail.Words()) cs_words.push_back(w);
+        // Raw MUBUF buffer_atomic_add (raw_op 0x32, glc=1, offen=1): v6 = atomicAdd(uav[v5], 1)
+        Rdna2Assembler init_one;
+        init_one.EmitVop1(Rdna2Opcode::V_MOV_B32, 6u, Rdna2Operand::InlineInt(1));
+        for (uint32_t w : init_one.Words()) cs_words.push_back(w);
+        const uint32_t w0_atomic = (0x38u << 26u) | (0x32u << 18u) | (1u << 14u) | (1u << 12u);
+        const uint32_t w1_atomic = (128u << 24u) | (0u << 16u) | (6u << 8u) | 5u;
+        cs_words.push_back(w0_atomic);
+        cs_words.push_back(w1_atomic);
+        // Store v3 (containing survived 0xBF810000 literal math!) to UAV
+        Rdna2Assembler fin;
+        fin.EmitMubuf(Rdna2Opcode::BUFFER_STORE_DWORD, 3u, 5u, 0u, 4u, true, false);
+        fin.EmitSopp(Rdna2Opcode::S_ENDPGM);
+        for (uint32_t w : fin.Words()) cs_words.push_back(w);
+        // Append trailing s_code_end (0xBF9F0000) + non-zero FSSM footer (0x00000008) that MUST be stripped!
+        cs_words.push_back(0xBF9F0000u);
+        cs_words.push_back(0x00000008u);
+        cs_words.push_back(0x00000000u);
+    }
+
+    XboxFullDxbcBuildDesc cs_desc{};
+    cs_desc.stage = ShaderStage::Compute;
+    cs_desc.xbox_chunk_fourcc = "";
+    cs_desc.aux_shader_fourcc = "DXIL";
+    cs_desc.shdr_or_shex_payload = BuildSyntheticXdatDxilPayload(5u, 6u, true, 4u, 8u, 8u, 1u, cs_words);
+    cs_desc.psv0.present = true;
+    cs_desc.psv0.shader_stage = 5u;
+    cs_desc.psv0.min_wave_lane_count = 32u;
+    cs_desc.psv0.max_wave_lane_count = 32u;
+    cs_desc.psv0.num_threads_x = 8u;
+    cs_desc.psv0.num_threads_y = 8u;
+    cs_desc.psv0.num_threads_z = 1u;
+    cs_desc.psv0.resource_bindings.push_back({2u /*CBV*/, 0u, 999u, 999u, 13u /*CBuffer*/, 0u});
+    cs_desc.psv0.resource_bindings.push_back({4u /*SRVRaw*/, 0u, 1u, 1u, 11u /*RawBuffer*/, 0u});
+    cs_desc.psv0.resource_bindings.push_back({7u /*UAVRaw*/, 1u, 2u, 2u, 11u /*RawBuffer*/, 0u});
+    const std::vector<uint8_t> cs_dxbc = BuildFullXboxDxbcContainer(cs_desc);
+
+    if (!IsXboxShaderContainerBlob(cs_dxbc.data(), cs_dxbc.size()) ||
+        !IsXboxShaderBytecode(cs_dxbc.data(), cs_dxbc.size())) {
+        return Status::Error(StatusCode::ShaderError, "XDAT self-check: IsXboxShaderContainerBlob/Bytecode returned false");
+    }
+
+    XboxDxbcContainer basic_parsed{};
+    if (auto st = ParseXboxShaderContainer(cs_dxbc, basic_parsed); !st.ok() || !basic_parsed.has_xs2) {
+        return Status::Error(StatusCode::ShaderError, "XDAT self-check: ParseXboxShaderContainer failed to extract XDAT XS2");
+    }
+
+    std::vector<uint8_t> cs_pc_dxil;
+    XboxParsedShaderContainer cs_parsed{};
+    std::string cs_hlsl;
+    std::string cs_diag;
+    XboxContainerLiftOptions lift_opts{};
+    lift_opts.lift_options.emit_spirv = true;
+    if (auto st = LiftXboxShaderContainerToDxil(
+            cs_dxbc.data(), cs_dxbc.size(), cs_pc_dxil, &cs_parsed, &cs_hlsl, &cs_diag, lift_opts);
+        !st.ok()) {
+        return Status::Error(StatusCode::ShaderError,
+                             "XDAT CS self-check failed (" + st.message + "): " + cs_diag + "\nHLSL:\n" + cs_hlsl);
+    }
+    // Verify 0xBF810000 literal survived AND early-out s_endpgm did NOT truncate the final s_endpgm!
+    if (cs_parsed.rdna_isa_words.size() != cs_words.size() - 3u) {
+        return Status::Error(StatusCode::ShaderError,
+                             "XDAT CS self-check: unexpected extracted ISA word count (" +
+                                 std::to_string(cs_parsed.rdna_isa_words.size()) + " vs expected " +
+                                 std::to_string(cs_words.size() - 3u) + ")");
+    }
+    XboxRootSignatureDesc eff_rs{};
+    if (!GetEffectiveXboxShaderRootSignature(cs_parsed, eff_rs) || eff_rs.parameters.empty()) {
+        return Status::Error(StatusCode::ShaderError, "XDAT CS self-check: PSV0 root signature inference empty");
+    }
+    if (cs_hlsl.find("[numthreads(8, 8, 1)]") == std::string::npos ||
+        cs_hlsl.find("SV_GroupID") == std::string::npos ||
+        cs_hlsl.find("SV_GroupThreadID") == std::string::npos ||
+        cs_hlsl.find("register(u2, space1)") == std::string::npos ||
+        cs_hlsl.find("0xbf810000u") == std::string::npos) {
+        return Status::Error(StatusCode::ShaderError, "XDAT CS self-check: missing expected HLSL constructs:\n" + cs_hlsl);
+    }
+
+    // 2. Build an XDAT -> XBCH -> FSSM v6 Pixel Shader with PSV0 TextureCube at (t3, space1),
+    //    exercising float3 coordinate adaptation on image_sample + image_sample_c_lz + image_gather4
+    //    and v_mul_legacy_f32 (VOP2 0x07).
+    std::vector<uint32_t> ps_words;
+    {
+        Rdna2Assembler pa;
+        pa.EmitVop1(Rdna2Opcode::V_MOV_B32, 0u, Rdna2Operand::InlineFloat(0.5f));
+        pa.EmitVop1(Rdna2Opcode::V_MOV_B32, 1u, Rdna2Operand::InlineFloat(0.5f));
+        pa.EmitVop1(Rdna2Opcode::V_MOV_B32, 2u, Rdna2Operand::InlineFloat(1.0f));
+        pa.EmitVop1(Rdna2Opcode::V_MOV_B32, 3u, Rdna2Operand::InlineFloat(0.25f));
+        for (uint32_t w : pa.Words()) ps_words.push_back(w);
+        // image_sample (0x20, dim=3 Cube, dmask=0xF): v[4:7] = sample(t3, v[0:2])
+        ps_words.push_back((0x3Cu << 26u) | (0x20u << 18u) | (0xFu << 8u) | (3u << 3u));
+        ps_words.push_back((4u << 8u) | 0u);
+        // image_sample_c_lz (0x2F, dim=3 Cube, dmask=0x1): v8 = sample_c_lz(t3, dref=v0, uvw=v[1:3])
+        ps_words.push_back((0x3Cu << 26u) | (0x2Fu << 18u) | (0x1u << 8u) | (3u << 3u));
+        ps_words.push_back((8u << 8u) | 0u);
+        // image_gather4 (0x40, dim=3 Cube, dmask=0x1 red): v[9:12] = gather4_r(t3, v[0:2])
+        ps_words.push_back((0x3Cu << 26u) | (0x40u << 18u) | (0x1u << 8u) | (3u << 3u));
+        ps_words.push_back((9u << 8u) | 0u);
+        // v_mul_legacy_f32 v4, v8, v4 (VOP2 0x07)
+        ps_words.push_back((0x07u << 25u) | (4u << 17u) | (4u << 9u) | (256u + 8u));
+        Rdna2Assembler pe;
+        pe.EmitVop2(Rdna2Opcode::V_ADD_F32, 4u, Rdna2Operand::Vgpr(9u), 4u);
+        pe.EmitExp(static_cast<uint8_t>(Rdna2ExportTarget::Mrt0), 4u, 5u, 6u, 7u, 0xFu, true, false, true);
+        pe.EmitSopp(Rdna2Opcode::S_ENDPGM);
+        for (uint32_t w : pe.Words()) ps_words.push_back(w);
+        ps_words.push_back(0xBF9F0000u);
+    }
+    XboxFullDxbcBuildDesc ps_desc{};
+    ps_desc.stage = ShaderStage::Pixel;
+    ps_desc.xbox_chunk_fourcc = "";
+    ps_desc.aux_shader_fourcc = "DXIL";
+    ps_desc.shdr_or_shex_payload = BuildSyntheticXdatDxilPayload(0u, 6u, true, 2u, 1u, 1u, 1u, ps_words);
+    ps_desc.psv0.present = true;
+    ps_desc.psv0.shader_stage = 0u;
+    ps_desc.psv0.min_wave_lane_count = 32u;
+    ps_desc.psv0.max_wave_lane_count = 32u;
+    ps_desc.psv0.resource_bindings.push_back({3u /*SRVTyped*/, 1u, 3u, 3u, 5u /*TextureCube*/, 0u});
+    const std::vector<uint8_t> ps_dxbc = BuildFullXboxDxbcContainer(ps_desc);
+
+    std::vector<uint8_t> ps_pc_dxil;
+    std::string ps_hlsl;
+    std::string ps_diag;
+    if (auto st = LiftXboxShaderContainerToDxil(
+            ps_dxbc.data(), ps_dxbc.size(), ps_pc_dxil, nullptr, &ps_hlsl, &ps_diag, lift_opts);
+        !st.ok()) {
+        return Status::Error(StatusCode::ShaderError,
+                             "XDAT PS TextureCube self-check failed (" + st.message + "): " + ps_diag + "\nHLSL:\n" + ps_hlsl);
     }
 
     return Status::Ok();
