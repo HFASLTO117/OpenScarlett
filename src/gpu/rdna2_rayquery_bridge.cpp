@@ -559,17 +559,28 @@ Status EmitRdna2ComputeBvh4FallbackHlsl(
        << "        } else if (ntype <= 3u) {\n"
        << "            if (!BvhWordRangeValid(root_base, rel_dw, 16u, root_limit)) { continue; }\n"
        << "            // Direct BLAS triangle leaf in root window\n"
+       << "            uint tri_id = BvhData[node_dw + 12u];\n"
+       << "            uint tri_count = min(2u, tri_id & 3u);\n"
        << "            float3 v0 = float3(asfloat(BvhData[node_dw + 0u]), asfloat(BvhData[node_dw + 1u]), asfloat(BvhData[node_dw + 2u]));\n"
        << "            float3 v1 = float3(asfloat(BvhData[node_dw + 3u]), asfloat(BvhData[node_dw + 4u]), asfloat(BvhData[node_dw + 5u]));\n"
        << "            float3 v2 = float3(asfloat(BvhData[node_dw + 6u]), asfloat(BvhData[node_dw + 7u]), asfloat(BvhData[node_dw + 8u]));\n"
        << "            uint prim_idx = BvhData[node_dw + 13u];\n"
        << "            uint geom_packed = BvhData[node_dw + 14u];\n"
        << "            float t = 0.0f; float u = 0.0f; float v = 0.0f; uint ff = 1u;\n"
-       << "            if (IntersectTri(v0, v1, v2, rin.origin, rin.direction, rin.t_min, hout.t, ray_flags, 0u, t, u, v, ff)) {\n"
+       << "            if (tri_count >= 1u && IntersectTri(v0, v1, v2, rin.origin, rin.direction, rin.t_min, hout.t, ray_flags, 0u, t, u, v, ff)) {\n"
        << "                hout.committed_status = 1u; hout.t = t; hout.bary_u = u; hout.bary_v = v;\n"
        << "                hout.primitive_index = prim_idx; hout.instance_index = 0u; hout.instance_id = 0u;\n"
        << "                hout.geometry_index = geom_packed & 0x00FFFFFFu; hout.sbt_offset = 0u; hout.front_face = ff;\n"
        << "                if (accept_first) { done = true; }\n"
+       << "            }\n"
+       << "            if (tri_count >= 2u && !done) {\n"
+       << "                float3 v3 = float3(asfloat(BvhData[node_dw + 9u]), asfloat(BvhData[node_dw + 10u]), asfloat(BvhData[node_dw + 11u]));\n"
+       << "                if (IntersectTri(v1, v2, v3, rin.origin, rin.direction, rin.t_min, hout.t, ray_flags, 0u, t, u, v, ff)) {\n"
+       << "                    hout.committed_status = 1u; hout.t = t; hout.bary_u = u; hout.bary_v = v;\n"
+       << "                    hout.primitive_index = BvhData[node_dw + 15u]; hout.instance_index = 0u; hout.instance_id = 0u;\n"
+       << "                    hout.geometry_index = geom_packed & 0x00FFFFFFu; hout.sbt_offset = 0u; hout.front_face = ff;\n"
+       << "                    if (accept_first) { done = true; }\n"
+       << "                }\n"
        << "            }\n"
        << "        } else if (ntype == 6u) {\n"
        << "            if (!BvhWordRangeValid(root_base, rel_dw, 18u, root_limit)) { continue; }\n"
@@ -668,6 +679,7 @@ Status EmitRdna2ComputeBvh4FallbackHlsl(
        << "                                }\n"
        << "                            }\n"
        << "                        } else if (btype == 7u) {\n"
+       << "                            if (!BvhWordRangeValid(blas_base, brel_dw, 16u, blas_limit)) { continue; }\n"
        << "                            float3 pmin = float3(asfloat(BvhData[bdw + 0u]), asfloat(BvhData[bdw + 1u]), asfloat(BvhData[bdw + 2u]));\n"
        << "                            float3 pmax = float3(asfloat(BvhData[bdw + 3u]), asfloat(BvhData[bdw + 4u]), asfloat(BvhData[bdw + 5u]));\n"
        << "                            float pt = 0.0f;\n"
@@ -684,6 +696,7 @@ Status EmitRdna2ComputeBvh4FallbackHlsl(
        << "                }\n"
        << "            }\n"
        << "        } else if (ntype == 7u) {\n"
+       << "            if (!BvhWordRangeValid(root_base, rel_dw, 16u, root_limit)) { continue; }\n"
        << "            float3 pmin = float3(asfloat(BvhData[node_dw + 0u]), asfloat(BvhData[node_dw + 1u]), asfloat(BvhData[node_dw + 2u]));\n"
        << "            float3 pmax = float3(asfloat(BvhData[node_dw + 3u]), asfloat(BvhData[node_dw + 4u]), asfloat(BvhData[node_dw + 5u]));\n"
        << "            float pt = 0.0f;\n"
@@ -1190,6 +1203,116 @@ Status TranslateRdna2BvhIntersectToRayQuery(
 // ---------------------------------------------------------------------------
 // 4. Title-List XboxBvhBuilder Conversion (Xbox BVH4 <-> PC Host BLAS/TLAS)
 // ---------------------------------------------------------------------------
+namespace {
+
+uint32_t ComputeLocalBvhPayloadCrc32(const uint8_t* data, size_t size) noexcept {
+    static const std::array<uint32_t, 256> kTable = []() {
+        std::array<uint32_t, 256> t{};
+        for (uint32_t i = 0; i < 256u; ++i) {
+            uint32_t c = i;
+            for (int bit = 0; bit < 8; ++bit) {
+                c = (c & 1u) ? (0xEDB88320u ^ (c >> 1u)) : (c >> 1u);
+            }
+            t[i] = c;
+        }
+        return t;
+    }();
+    if (!data || size == 0u) return 0u;
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0u; i < size; ++i) {
+        crc = kTable[(crc ^ data[i]) & 0xFFu] ^ (crc >> 8u);
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
+// Emits a valid, CRC32-verified empty/bounding GFX10.3 RDNA2 BVH4 acceleration structure
+// (Box32/Box16 root + zero-area degenerate leaf for BLAS or masked-out null instance leaf for TLAS)
+// that passes ValidateRdna2Bvh4 and guarantees clean ray misses on DXR=0 GPUs.
+Status BuildEmptyBoundingRdna2Bvh4(
+    Rdna2BvhAsType as_type,
+    const Rdna2BvhEncodeOptions& options,
+    std::vector<uint8_t>& out_buf,
+    Rdna2BvhHeader& out_hdr) {
+    out_buf.clear();
+    const uint32_t root_off = kRdna2BvhHeaderSize;
+    const uint32_t root_sz = options.use_box16 ? kRdna2BvhBox16Size : kRdna2BvhBox32Size;
+    const uint32_t leaf_off = root_off + root_sz;
+    const uint32_t leaf_sz =
+        (as_type == Rdna2BvhAsType::TopLevel) ? kRdna2BvhInstanceNodeSize : kRdna2BvhTriangleNodeSize;
+    const uint32_t total_sz = leaf_off + leaf_sz;
+    out_buf.assign(total_sz, 0u);
+
+    const RtAabb zero_box{{0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}};
+    uint32_t leaf_ptr = kRdna2BvhInvalidNodePtr;
+    if (as_type == Rdna2BvhAsType::TopLevel) {
+        Rdna2BvhInstanceNode inode{};
+        inode.blas_base_va = 0ull;
+        inode.blas_root_ptr = kRdna2BvhInvalidNodePtr;
+        inode.instance_id = 0u;
+        inode.instance_mask = 0x00u;  // Masked out -> guaranteed miss on CPU & GPU compute BVH4
+        inode.sbt_offset = 0u;
+        inode.instance_flags = 0u;
+        inode.instance_index = 0u;
+        MakeIdentity3x4(inode.world_to_object);
+        MakeIdentity3x4(inode.object_to_world);
+        Status lst = EncodeRdna2InstanceNode(inode, out_buf.data() + leaf_off, leaf_sz);
+        if (!lst.ok()) return lst;
+        leaf_ptr = EncodeRdna2NodePtr(leaf_off, Rdna2BvhNodeType::Instance);
+    } else {
+        Rdna2BvhTriangleNode tnode{};
+        tnode.v0 = {0.0f, 0.0f, 0.0f};
+        tnode.v1 = {0.0f, 0.0f, 0.0f};
+        tnode.v2 = {0.0f, 0.0f, 0.0f};  // Zero-area -> det == 0 -> guaranteed miss
+        tnode.triangle_id = 1u;
+        tnode.primitive_index = 0xFFFFFFFFu;
+        tnode.geometry_index = options.geometry_index;
+        tnode.geometry_flags = options.geometry_flags;
+        Status lst = EncodeRdna2TriangleNode(tnode, out_buf.data() + leaf_off, leaf_sz);
+        if (!lst.ok()) return lst;
+        leaf_ptr = EncodeRdna2NodePtr(leaf_off, Rdna2BvhNodeType::Triangle0);
+    }
+
+    uint32_t root_ptr = kRdna2BvhInvalidNodePtr;
+    if (options.use_box16) {
+        Rdna2BvhBox16Node b16{};
+        b16.children[0] = leaf_ptr;
+        EncodeBox16ChildAabb(zero_box, b16.bbox_fp16[0]);
+        Status rst = EncodeRdna2Box16Node(b16, out_buf.data() + root_off, root_sz);
+        if (!rst.ok()) return rst;
+        root_ptr = EncodeRdna2NodePtr(root_off, Rdna2BvhNodeType::Box16);
+    } else {
+        Rdna2BvhBox32Node b32{};
+        b32.children[0] = leaf_ptr;
+        b32.bbox[0] = zero_box;
+        b32.child_count = 1u;
+        Status rst = EncodeRdna2Box32Node(b32, out_buf.data() + root_off, root_sz);
+        if (!rst.ok()) return rst;
+        root_ptr = EncodeRdna2NodePtr(root_off, Rdna2BvhNodeType::Box32);
+    }
+
+    out_hdr = Rdna2BvhHeader{};
+    out_hdr.magic = kRdna2BvhMagic;
+    out_hdr.version = kRdna2BvhVersion;
+    out_hdr.as_type = as_type;
+    out_hdr.build_flags = options.build_flags;
+    out_hdr.total_size_bytes = total_sz;
+    out_hdr.header_size_bytes = kRdna2BvhHeaderSize;
+    out_hdr.nodes_offset_bytes = root_off;
+    out_hdr.nodes_size_bytes = total_sz - root_off;
+    out_hdr.root_node_ptr = root_ptr;
+    out_hdr.internal_node_count = 1u;
+    out_hdr.leaf_node_count = 1u;
+    out_hdr.primitive_count = 0u;
+    out_hdr.geometry_count = 1u;
+    out_hdr.max_depth = 2u;
+    out_hdr.root_aabb = zero_box;
+    out_hdr.payload_crc32 =
+        ComputeLocalBvhPayloadCrc32(out_buf.data() + out_hdr.nodes_offset_bytes, out_hdr.nodes_size_bytes);
+    return EncodeRdna2BvhHeader(out_hdr, out_buf.data(), out_buf.size());
+}
+
+}  // namespace
+
 Status ConvertXboxBlasToHostAndBvh4(
     const XboxBvhBlasBuildInput& input,
     uint64_t xbox_base_va,
@@ -1199,17 +1322,12 @@ Status ConvertXboxBlasToHostAndBvh4(
         return Status::Error(StatusCode::InvalidArgument,
                              "Xbox BLAS base VA must be non-zero and 256-byte aligned");
     }
-    if (input.geometries.empty()) {
-        return Status::Error(StatusCode::InvalidArgument, "Xbox BLAS input requires at least one geometry");
-    }
 
     std::vector<RtTriangle> tris;
     for (const auto& geom : input.geometries) {
         if (!geom.indices.empty()) {
-            if ((geom.indices.size() % 3u) != 0u) {
-                return Status::Error(StatusCode::InvalidArgument, "Geometry index count must be a multiple of 3");
-            }
-            for (size_t i = 0; i < geom.indices.size(); i += 3u) {
+            const size_t usable = geom.indices.size() - (geom.indices.size() % 3u);
+            for (size_t i = 0; i < usable; i += 3u) {
                 const uint32_t i0 = geom.indices[i + 0u];
                 const uint32_t i1 = geom.indices[i + 1u];
                 const uint32_t i2 = geom.indices[i + 2u];
@@ -1227,12 +1345,9 @@ Status ConvertXboxBlasToHostAndBvh4(
                 }
                 tris.push_back(t);
             }
-        } else {
-            if (geom.vertices.size() < 3u || (geom.vertices.size() % 3u) != 0u) {
-                return Status::Error(StatusCode::InvalidArgument,
-                                     "Non-indexed geometry vertex count must be a non-zero multiple of 3");
-            }
-            for (size_t i = 0; i < geom.vertices.size(); i += 3u) {
+        } else if (geom.vertices.size() >= 3u) {
+            const size_t usable = geom.vertices.size() - (geom.vertices.size() % 3u);
+            for (size_t i = 0; i < usable; i += 3u) {
                 RtTriangle t{};
                 t.v0 = geom.vertices[i + 0u];
                 t.v1 = geom.vertices[i + 1u];
@@ -1247,32 +1362,36 @@ Status ConvertXboxBlasToHostAndBvh4(
         }
     }
 
-    if (tris.empty()) {
-        return Status::Error(StatusCode::RaytracingError, "Xbox BLAS conversion produced 0 triangles");
-    }
-
-    BvhAccelerationStructure sah_bvh;
-    Status st = sah_bvh.Build(tris);
-    if (!st.ok()) {
-        return st;
-    }
-
     Rdna2BvhEncodeOptions enc_opts{};
     enc_opts.use_box16 = input.use_box16;
     enc_opts.build_flags = input.build_flags;
-    enc_opts.geometry_index = input.geometries[0].geometry_index;
-    enc_opts.geometry_flags = input.geometries[0].is_opaque ? 1u : 0u;
+    if (!input.geometries.empty()) {
+        enc_opts.geometry_index = input.geometries[0].geometry_index;
+        enc_opts.geometry_flags = input.geometries[0].is_opaque ? 1u : 0u;
+    }
 
     std::vector<uint8_t> bvh4_buf;
     Rdna2BvhHeader hdr{};
-    st = EncodeBvh2ToRdna2Bvh4(sah_bvh, enc_opts, bvh4_buf, &hdr);
-    if (!st.ok()) {
-        return st;
+    if (tris.empty()) {
+        Status est = BuildEmptyBoundingRdna2Bvh4(Rdna2BvhAsType::BottomLevel, enc_opts, bvh4_buf, hdr);
+        if (!est.ok()) {
+            return est;
+        }
+    } else {
+        BvhAccelerationStructure sah_bvh;
+        Status st = sah_bvh.Build(tris);
+        if (!st.ok()) {
+            return st;
+        }
+        st = EncodeBvh2ToRdna2Bvh4(sah_bvh, enc_opts, bvh4_buf, &hdr);
+        if (!st.ok()) {
+            return st;
+        }
     }
 
-    st = ValidateRdna2Bvh4(bvh4_buf.data(), bvh4_buf.size());
-    if (!st.ok()) {
-        return st;
+    Status vst = ValidateRdna2Bvh4(bvh4_buf.data(), bvh4_buf.size());
+    if (!vst.ok()) {
+        return vst;
     }
 
     out_blas.xbox_gpu_va = xbox_base_va;
@@ -1280,7 +1399,7 @@ Status ConvertXboxBlasToHostAndBvh4(
     out_blas.xbox_bvh4_buffer = std::move(bvh4_buf);
     out_blas.bvh4_header = hdr;
     out_blas.host_build_flags = input.build_flags;
-    out_blas.geometry_count = static_cast<uint32_t>(input.geometries.size());
+    out_blas.geometry_count = static_cast<uint32_t>(std::max<size_t>(1u, input.geometries.size()));
     out_blas.host_prebuild.result_data_max_size_bytes =
         AlignUpU64(out_blas.xbox_bvh4_buffer.size(), kDxrAsByteAlignment);
     out_blas.host_prebuild.scratch_data_size_bytes =
@@ -1305,9 +1424,10 @@ Status ConvertXboxTlasToHostAndBvh4(
         return Status::Error(StatusCode::InvalidArgument,
                              "Xbox TLAS base VA must be non-zero and 256-byte aligned");
     }
-    if (instances.empty()) {
-        return Status::Error(StatusCode::InvalidArgument, "Xbox TLAS input requires at least one instance");
-    }
+
+    Rdna2BvhEncodeOptions enc_opts{};
+    enc_opts.use_box16 = use_box16;
+    enc_opts.build_flags = build_flags;
 
     std::vector<DxrInstanceDesc> host_insts;
     std::vector<Rdna2BvhTlasInstanceInput> bvh4_insts;
@@ -1315,6 +1435,29 @@ Status ConvertXboxTlasToHostAndBvh4(
     bvh4_insts.reserve(instances.size());
 
     for (const auto& in : instances) {
+        if (in.blas_xbox_va == 0ull) {
+            // D3D12 DXR allows null AccelerationStructure VA for inactive instance slots.
+            DxrInstanceDesc hi{};
+            std::memcpy(hi.transform, in.object_to_world, sizeof(hi.transform));
+            hi.instance_id = in.instance_id & 0x00FFFFFFu;
+            hi.instance_mask = 0u;
+            hi.instance_contribution_to_hit_group_index = in.hit_group_contribution & 0x00FFFFFFu;
+            hi.flags = in.instance_flags & 0xFFu;
+            host_insts.push_back(hi);
+
+            Rdna2BvhTlasInstanceInput bi{};
+            bi.blas_base_va = 0ull;
+            bi.blas_root_ptr = kRdna2BvhInvalidNodePtr;
+            bi.blas_local_aabb = {{0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}};
+            MakeIdentity3x4(bi.object_to_world);
+            bi.instance_id = hi.instance_id;
+            bi.instance_mask = 0u;
+            bi.sbt_offset = hi.instance_contribution_to_hit_group_index;
+            bi.instance_flags = hi.flags;
+            bvh4_insts.push_back(bi);
+            continue;
+        }
+
         const XboxBvhConvertedBlas* matched = nullptr;
         for (const auto& b : blas_list) {
             if (b.xbox_gpu_va == in.blas_xbox_va) {
@@ -1341,6 +1484,11 @@ Status ConvertXboxTlasToHostAndBvh4(
         bi.blas_root_ptr = matched->bvh4_header.root_node_ptr;
         bi.blas_local_aabb = matched->bvh4_header.root_aabb;
         std::memcpy(bi.object_to_world, in.object_to_world, sizeof(bi.object_to_world));
+        float inv_tmp[3][4]{};
+        if (!InvertTransform3x4(bi.object_to_world, inv_tmp)) {
+            MakeIdentity3x4(bi.object_to_world);
+            bi.instance_mask = 0u;
+        }
         bi.instance_id = hi.instance_id;
         bi.instance_mask = hi.instance_mask;
         bi.sbt_offset = hi.instance_contribution_to_hit_group_index;
@@ -1348,13 +1496,11 @@ Status ConvertXboxTlasToHostAndBvh4(
         bvh4_insts.push_back(bi);
     }
 
-    Rdna2BvhEncodeOptions enc_opts{};
-    enc_opts.use_box16 = use_box16;
-    enc_opts.build_flags = build_flags;
-
     std::vector<uint8_t> tlas_buf;
     Rdna2BvhHeader thdr{};
-    Status st = BuildRdna2Bvh4Tlas(bvh4_insts, {}, enc_opts, tlas_buf, &thdr);
+    Status st = bvh4_insts.empty()
+                    ? BuildEmptyBoundingRdna2Bvh4(Rdna2BvhAsType::TopLevel, enc_opts, tlas_buf, thdr)
+                    : BuildRdna2Bvh4Tlas(bvh4_insts, {}, enc_opts, tlas_buf, &thdr);
     if (!st.ok()) {
         return st;
     }

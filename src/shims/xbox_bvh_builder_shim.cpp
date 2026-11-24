@@ -213,9 +213,9 @@ int32_t OS_SHIM_CALL XboxBvhGetPrebuildInfo(
                   ? openscarlett::DxrAsType::TopLevel
                   : openscarlett::DxrAsType::BottomLevel;
     in.build_flags = inputs->buildFlags;
-    in.primitive_count = inputs->primitiveCount;
+    in.primitive_count = inputs->primitiveCount == 0u ? 1u : inputs->primitiveCount;
     in.geometry_count = inputs->geometryCount == 0u ? 1u : inputs->geometryCount;
-    in.vertex_stride = inputs->vertexStride == 0u ? 12u : inputs->vertexStride;
+    in.vertex_stride = inputs->vertexStride < 12u ? 12u : inputs->vertexStride;
     in.is_opaque = inputs->isOpaque != 0u;
 
     openscarlett::DxrPrebuildInfo info{};
@@ -228,8 +228,8 @@ int32_t OS_SHIM_CALL XboxBvhGetPrebuildInfo(
         return RecordHr("XboxBvhGetPrebuildInfo", StatusToHr(st));
     }
 
-    outInfo->resultDataMaxSizeBytes = info.result_data_max_size_bytes;
-    outInfo->scratchDataSizeBytes = info.scratch_data_size_bytes;
+    outInfo->resultDataMaxSizeBytes = std::max<uint64_t>(512ull, info.result_data_max_size_bytes);
+    outInfo->scratchDataSizeBytes = std::max<uint64_t>(256ull, info.scratch_data_size_bytes);
     outInfo->updateScratchDataSizeBytes = info.update_scratch_data_size_bytes;
     outInfo->fromHardwareDriver = info.from_hardware_driver ? 1u : 0u;
     return RecordHr("XboxBvhGetPrebuildInfo", OS_SHIM_S_OK);
@@ -241,7 +241,7 @@ int32_t OS_SHIM_CALL XboxBvhBuildBlas(
     uint32_t triangleCount,
     uint32_t buildFlags,
     uint64_t* outBlasId) {
-    if (!builder || !triangles || triangleCount == 0u || !outBlasId) {
+    if (!builder || !outBlasId || (triangleCount > 0u && !triangles)) {
         return RecordHr("XboxBvhBuildBlas", OS_SHIM_E_INVALIDARG);
     }
     *outBlasId = 0ull;
@@ -250,13 +250,21 @@ int32_t OS_SHIM_CALL XboxBvhBuildBlas(
         return RecordHr("XboxBvhBuildBlas", OS_SHIM_E_HANDLE);
     }
 
-    auto tris = ConvertTriangles(triangles, triangleCount);
+    auto tris = (triangleCount > 0u && triangles)
+                    ? ConvertTriangles(triangles, triangleCount)
+                    : std::vector<openscarlett::RtTriangle>{};
     uint64_t blas_id = 0ull;
 
     std::lock_guard<std::mutex> lk(obj->mutex);
-    const openscarlett::Status st = obj->engine.BuildBlas(tris, buildFlags, blas_id);
-    if (!st.ok()) {
-        return RecordHr("XboxBvhBuildBlas", StatusToHr(st));
+    if (tris.empty()) {
+        // Zero-triangle BLAS safety: synthesize a non-colliding fallback ID + valid empty GFX10.3 BVH4 window.
+        static std::atomic<uint64_t> s_empty_as_id{0xE0B00001ull};
+        blas_id = s_empty_as_id.fetch_add(1ull, std::memory_order_relaxed);
+    } else {
+        const openscarlett::Status st = obj->engine.BuildBlas(tris, buildFlags, blas_id);
+        if (!st.ok()) {
+            return RecordHr("XboxBvhBuildBlas", StatusToHr(st));
+        }
     }
 
     auto bvh = std::make_shared<openscarlett::BvhAccelerationStructure>();
@@ -413,7 +421,7 @@ int32_t OS_SHIM_CALL XboxBvhBuildTlas(
         }
     }
 
-    if (!bvh4_insts.empty()) {
+    {
         openscarlett::XboxBvhConvertedTlas conv_tlas{};
         const uint64_t tlas_va = obj->AllocXboxVa(
             static_cast<uint64_t>(bvh4_insts.size()) * 256ull + 4096ull);
@@ -426,7 +434,7 @@ int32_t OS_SHIM_CALL XboxBvhBuildTlas(
         }
     }
 
-    if (!world_tris.empty()) {
+    {
         auto bvh = std::make_shared<openscarlett::BvhAccelerationStructure>();
         if (bvh->Build(world_tris).ok()) {
             obj->bvh_cache[tlas_id] = std::move(bvh);
@@ -643,6 +651,148 @@ inline OsBvhHresult RecordCppHr(const char* sym, int32_t hr) {
 }
 
 #if defined(_WIN32)
+bool IsBvhProtectReadable(DWORD prot) noexcept {
+    if ((prot & (PAGE_GUARD | PAGE_NOACCESS)) != 0u) return false;
+    const DWORD base = prot & 0xFFu;
+    return base == PAGE_READONLY || base == PAGE_READWRITE || base == PAGE_WRITECOPY ||
+           base == PAGE_EXECUTE_READ || base == PAGE_EXECUTE_READWRITE ||
+           base == PAGE_EXECUTE_WRITECOPY;
+}
+
+bool IsBvhProtectWritable(DWORD prot) noexcept {
+    if ((prot & (PAGE_GUARD | PAGE_NOACCESS)) != 0u) return false;
+    const DWORD base = prot & 0xFFu;
+    return base == PAGE_READWRITE || base == PAGE_WRITECOPY ||
+           base == PAGE_EXECUTE_READWRITE || base == PAGE_EXECUTE_WRITECOPY;
+}
+
+uint64_t ResolveBvhCpuAliasVa(uint64_t gpu_va) noexcept {
+    if (gpu_va == 0ull) return 0ull;
+    using ResolveFn = uint64_t(__stdcall*)(uint64_t);
+    static std::atomic<ResolveFn> s_resolve{nullptr};
+    static std::atomic<bool> s_probed{false};
+    ResolveFn fn = s_resolve.load(std::memory_order_acquire);
+    if (!fn && !s_probed.load(std::memory_order_relaxed)) {
+        if (HMODULE hm = ::GetModuleHandleA("xmem.dll")) {
+            fn = reinterpret_cast<ResolveFn>(::GetProcAddress(hm, "OpenScarlett_XMemResolveCpuAliasVa"));
+            if (fn) s_resolve.store(fn, std::memory_order_release);
+            s_probed.store(true, std::memory_order_release);
+        }
+    }
+    if (fn) {
+        const uint64_t resolved = fn(gpu_va);
+        if (resolved != 0ull) return resolved;
+    }
+    return gpu_va;
+}
+
+bool CheckCommittedCpuRange(uintptr_t addr, size_t size, bool require_writable) noexcept {
+    if (addr == 0u || size == 0u || addr + size < addr) return false;
+    uintptr_t cur = addr;
+    size_t rem = size;
+    while (rem > 0u) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (::VirtualQuery(reinterpret_cast<LPCVOID>(cur), &mbi, sizeof(mbi)) == 0u) return false;
+        if (mbi.State != MEM_COMMIT) return false;
+        if (require_writable ? !IsBvhProtectWritable(mbi.Protect)
+                             : !IsBvhProtectReadable(mbi.Protect)) {
+            return false;
+        }
+        const uintptr_t end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+        if (end <= cur) return false;
+        const size_t step = std::min<size_t>(rem, static_cast<size_t>(end - cur));
+        cur += step;
+        rem -= step;
+    }
+    return true;
+}
+
+const void* TryResolveReadableGpuVa(uint64_t gpu_va, size_t byte_size) noexcept {
+    if (gpu_va == 0ull || byte_size == 0u) return nullptr;
+    const uintptr_t resolved = static_cast<uintptr_t>(ResolveBvhCpuAliasVa(gpu_va));
+    if (CheckCommittedCpuRange(resolved, byte_size, false)) {
+        return reinterpret_cast<const void*>(resolved);
+    }
+    const uintptr_t raw = static_cast<uintptr_t>(gpu_va);
+    if (raw != resolved && CheckCommittedCpuRange(raw, byte_size, false)) {
+        return reinterpret_cast<const void*>(raw);
+    }
+    return nullptr;
+}
+
+void* TryResolveWritableGpuVa(uint64_t gpu_va, size_t byte_size) noexcept {
+    if (gpu_va == 0ull || byte_size == 0u) return nullptr;
+    const uintptr_t resolved = static_cast<uintptr_t>(ResolveBvhCpuAliasVa(gpu_va));
+    if (CheckCommittedCpuRange(resolved, byte_size, true)) {
+        return reinterpret_cast<void*>(resolved);
+    }
+    const uintptr_t raw = static_cast<uintptr_t>(gpu_va);
+    if (raw != resolved && CheckCommittedCpuRange(raw, byte_size, true)) {
+        return reinterpret_cast<void*>(raw);
+    }
+    return nullptr;
+}
+
+openscarlett::Vec3 DecodeVertexAt(const uint8_t* ptr, DXGI_FORMAT fmt) noexcept {
+    openscarlett::Vec3 v{};
+    switch (fmt) {
+        case DXGI_FORMAT_R32G32B32_FLOAT:
+        case DXGI_FORMAT_R32G32B32A32_FLOAT:
+            std::memcpy(&v.x, ptr + 0u, 4u);
+            std::memcpy(&v.y, ptr + 4u, 4u);
+            std::memcpy(&v.z, ptr + 8u, 4u);
+            break;
+        case DXGI_FORMAT_R32G32_FLOAT:
+            std::memcpy(&v.x, ptr + 0u, 4u);
+            std::memcpy(&v.y, ptr + 4u, 4u);
+            v.z = 0.0f;
+            break;
+        case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        case DXGI_FORMAT_R16G16_FLOAT: {
+            uint16_t h0 = 0u, h1 = 0u, h2 = 0u;
+            std::memcpy(&h0, ptr + 0u, 2u);
+            std::memcpy(&h1, ptr + 2u, 2u);
+            if (fmt == DXGI_FORMAT_R16G16B16A16_FLOAT) std::memcpy(&h2, ptr + 4u, 2u);
+            v.x = openscarlett::Fp16ToFloat32(h0);
+            v.y = openscarlett::Fp16ToFloat32(h1);
+            v.z = (fmt == DXGI_FORMAT_R16G16B16A16_FLOAT) ? openscarlett::Fp16ToFloat32(h2) : 0.0f;
+            break;
+        }
+        case DXGI_FORMAT_R16G16B16A16_SNORM:
+        case DXGI_FORMAT_R16G16_SNORM: {
+            int16_t s0 = 0, s1 = 0, s2 = 0;
+            std::memcpy(&s0, ptr + 0u, 2u);
+            std::memcpy(&s1, ptr + 2u, 2u);
+            if (fmt == DXGI_FORMAT_R16G16B16A16_SNORM) std::memcpy(&s2, ptr + 4u, 2u);
+            v.x = std::max(-1.0f, static_cast<float>(s0) / 32767.0f);
+            v.y = std::max(-1.0f, static_cast<float>(s1) / 32767.0f);
+            v.z = (fmt == DXGI_FORMAT_R16G16B16A16_SNORM)
+                      ? std::max(-1.0f, static_cast<float>(s2) / 32767.0f)
+                      : 0.0f;
+            break;
+        }
+        default:
+            break;
+    }
+    if (!std::isfinite(v.x)) v.x = 0.0f;
+    if (!std::isfinite(v.y)) v.y = 0.0f;
+    if (!std::isfinite(v.z)) v.z = 0.0f;
+    return v;
+}
+
+uint32_t MinVertexElementBytes(DXGI_FORMAT fmt) noexcept {
+    switch (fmt) {
+        case DXGI_FORMAT_R32G32B32_FLOAT: return 12u;
+        case DXGI_FORMAT_R32G32B32A32_FLOAT: return 16u;
+        case DXGI_FORMAT_R32G32_FLOAT: return 8u;
+        case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        case DXGI_FORMAT_R16G16B16A16_SNORM: return 8u;
+        case DXGI_FORMAT_R16G16_FLOAT:
+        case DXGI_FORMAT_R16G16_SNORM: return 4u;
+        default: return 0u;
+    }
+}
+
 ID3D12Device* CastDevice11ToBase(ID3D12Device11* device) noexcept {
 #  if defined(__ID3D12Device11_INTERFACE_DEFINED__)
     return static_cast<ID3D12Device*>(device);
@@ -679,6 +829,8 @@ struct XboxBvhBuilder::Impl {
     bool use_64bit_morton_codes = false;
     openscarlett::DxrHardwareEngine engine;
     openscarlett::XboxBvh4RehydrationManager rehydrator;
+    openscarlett::Rdna2Bvh64MultiWindow sw_built_windows;
+    std::unordered_map<uint64_t, openscarlett::XboxBvhConvertedBlas> sw_built_blas;
     std::unordered_map<uint64_t, uint64_t> built_va_to_pc_va;
     uint64_t build_count = 0ull;
     uint64_t rehydrate_count = 0ull;
@@ -721,6 +873,8 @@ OsBvhHresult XboxBvhBuilder::Initialize(ID3D12Device11* device, uint32_t flags) 
     }
     std::lock_guard<std::mutex> lk(impl_->mutex);
     impl_->rehydrator.Clear();
+    impl_->sw_built_windows.Clear();
+    impl_->sw_built_blas.clear();
     impl_->built_va_to_pc_va.clear();
     impl_->engine.Shutdown();
 
@@ -762,6 +916,8 @@ void XboxBvhBuilder::Shutdown() {
     if (!impl_) return;
     std::lock_guard<std::mutex> lk(impl_->mutex);
     impl_->rehydrator.Clear();
+    impl_->sw_built_windows.Clear();
+    impl_->sw_built_blas.clear();
     impl_->built_va_to_pc_va.clear();
     impl_->engine.Shutdown();
     impl_->initialized = false;
@@ -791,15 +947,33 @@ OsBvhHresult XboxBvhBuilder::GetRaytracingAccelerationStructurePrebuildInfoX(
         for (UINT i = 0u; i < pDesc->NumDescs; ++i) {
             const D3D12_RAYTRACING_GEOMETRY_DESC* g = nullptr;
             if (pDesc->DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY && pDesc->pGeometryDescs) {
-                g = &pDesc->pGeometryDescs[i];
+                if (CheckCommittedCpuRange(
+                        reinterpret_cast<uintptr_t>(&pDesc->pGeometryDescs[i]),
+                        sizeof(D3D12_RAYTRACING_GEOMETRY_DESC),
+                        false)) {
+                    g = &pDesc->pGeometryDescs[i];
+                }
             } else if (pDesc->DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS &&
                        pDesc->ppGeometryDescs) {
-                g = pDesc->ppGeometryDescs[i];
+                if (CheckCommittedCpuRange(
+                        reinterpret_cast<uintptr_t>(&pDesc->ppGeometryDescs[i]),
+                        sizeof(void*),
+                        false)) {
+                    const auto* cand = pDesc->ppGeometryDescs[i];
+                    if (cand && CheckCommittedCpuRange(
+                                    reinterpret_cast<uintptr_t>(cand),
+                                    sizeof(D3D12_RAYTRACING_GEOMETRY_DESC),
+                                    false)) {
+                        g = cand;
+                    }
+                }
             }
             if (!g) continue;
             if (g->Type == D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES) {
-                if (g->Triangles.IndexCount >= 3u) {
-                    total_prims += g->Triangles.IndexCount / 3u;
+                if (g->Triangles.IndexFormat != DXGI_FORMAT_UNKNOWN) {
+                    if (g->Triangles.IndexCount >= 3u) {
+                        total_prims += g->Triangles.IndexCount / 3u;
+                    }
                 } else if (g->Triangles.VertexCount >= 3u) {
                     total_prims += g->Triangles.VertexCount / 3u;
                 }
@@ -851,8 +1025,8 @@ OsBvhHresult XboxBvhBuilder::GetRaytracingAccelerationStructurePrebuildInfoX(
         scratch_bytes += extra;
     }
 
-    pInfo->ResultDataMaxSizeInBytes = prebuild.result_data_max_size_bytes;
-    pInfo->ScratchDataSizeInBytes = scratch_bytes;
+    pInfo->ResultDataMaxSizeInBytes = std::max<uint64_t>(512ull, prebuild.result_data_max_size_bytes);
+    pInfo->ScratchDataSizeInBytes = std::max<uint64_t>(256ull, scratch_bytes);
     pInfo->UpdateScratchDataSizeInBytes = prebuild.update_scratch_data_size_bytes;
     return RecordCppHr("XboxBvhBuilder::GetRaytracingAccelerationStructurePrebuildInfoX", OS_SHIM_S_OK);
 #else
@@ -875,7 +1049,7 @@ OsBvhHresult XboxBvhBuilder::BuildRaytracingAccelerationStructureX(
         return RecordCppHr("XboxBvhBuilder::BuildRaytracingAccelerationStructureX",
                            OS_SHIM_E_INVALIDARG);
     }
-    if (pDesc->ScratchAccelerationStructureData == 0ull ||
+    if ((pDesc->ScratchAccelerationStructureData == 0ull && pDesc->Inputs.NumDescs > 0u) ||
         (pDesc->ScratchAccelerationStructureData & (openscarlett::kDxrAsByteAlignment - 1u)) != 0ull) {
         return RecordCppHr("XboxBvhBuilder::BuildRaytracingAccelerationStructureX",
                            OS_SHIM_E_INVALIDARG);
@@ -886,8 +1060,238 @@ OsBvhHresult XboxBvhBuilder::BuildRaytracingAccelerationStructureX(
         commandList->BuildRaytracingAccelerationStructure(
             pDesc, numPostbuildInfoDescs, pPostbuildInfoDescs);
     } else {
-        (void)numPostbuildInfoDescs;
-        (void)pPostbuildInfoDescs;
+        // DXR=0 software BVH4 path (e.g. Turing GTX 1650 Ti):
+        // Never dereference unmapped GPU VAs; build a valid GFX10.3 RDNA2 BVH4 representation
+        // (either from CPU-mapped/aliased geometry or a valid empty/bounding root node) and
+        // write it into DestAccelerationStructureData if mapped & CPU-writable.
+        const uint64_t dest_va = pDesc->DestAccelerationStructureData;
+        const uint32_t bflags = static_cast<uint32_t>(pDesc->Inputs.Flags);
+        const bool use_box16 =
+            (bflags & static_cast<uint32_t>(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_MINIMIZE_MEMORY)) != 0u;
+        std::vector<uint8_t> sw_bvh4;
+
+        if (pDesc->Inputs.Type == D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL) {
+            constexpr UINT kMaxSwInstances = 4096u;
+            const UINT inst_cnt = std::min<UINT>(pDesc->Inputs.NumDescs, kMaxSwInstances);
+            std::vector<openscarlett::XboxBvhTlasInstanceInput> tlas_in;
+            std::vector<openscarlett::XboxBvhConvertedBlas> blas_refs;
+            if (inst_cnt > 0u && pDesc->Inputs.InstanceDescs != 0ull) {
+                if (pDesc->Inputs.DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY) {
+                    const size_t bytes = static_cast<size_t>(inst_cnt) * sizeof(D3D12_RAYTRACING_INSTANCE_DESC);
+                    if (const auto* raw_insts = static_cast<const D3D12_RAYTRACING_INSTANCE_DESC*>(
+                            TryResolveReadableGpuVa(pDesc->Inputs.InstanceDescs, bytes))) {
+                        tlas_in.reserve(inst_cnt);
+                        for (UINT i = 0u; i < inst_cnt; ++i) {
+                            const auto& di = raw_insts[i];
+                            openscarlett::XboxBvhTlasInstanceInput ti{};
+                            std::memcpy(ti.object_to_world, di.Transform, sizeof(ti.object_to_world));
+                            ti.instance_id = di.InstanceID;
+                            ti.instance_mask = static_cast<uint32_t>(di.InstanceMask);
+                            ti.hit_group_contribution = di.InstanceContributionToHitGroupIndex;
+                            ti.instance_flags = di.Flags;
+                            auto bit = impl_->sw_built_blas.find(di.AccelerationStructure);
+                            if (di.AccelerationStructure != 0ull && bit != impl_->sw_built_blas.end()) {
+                                ti.blas_xbox_va = di.AccelerationStructure;
+                                blas_refs.push_back(bit->second);
+                            } else {
+                                ti.blas_xbox_va = 0ull;
+                                ti.instance_mask = 0u;
+                            }
+                            tlas_in.push_back(ti);
+                        }
+                    }
+                }
+            }
+            openscarlett::XboxBvhConvertedTlas conv_tlas{};
+            if (openscarlett::ConvertXboxTlasToHostAndBvh4(
+                    tlas_in, blas_refs, dest_va, bflags, use_box16, conv_tlas).ok()) {
+                sw_bvh4 = std::move(conv_tlas.xbox_bvh4_buffer);
+            }
+        } else {
+            constexpr UINT kMaxSwGeoms = 256u;
+            constexpr UINT kMaxSwTrisTotal = 32768u;
+            const UINT geom_cnt = std::min<UINT>(pDesc->Inputs.NumDescs, kMaxSwGeoms);
+            openscarlett::XboxBvhBlasBuildInput blas_in{};
+            blas_in.build_flags = bflags;
+            blas_in.use_box16 = use_box16;
+            std::vector<openscarlett::Rdna2BvhProceduralInput> proc_aabbs;
+            uint32_t accum_tris = 0u;
+
+            for (UINT gi = 0u; gi < geom_cnt && accum_tris < kMaxSwTrisTotal; ++gi) {
+                const D3D12_RAYTRACING_GEOMETRY_DESC* g = nullptr;
+                if (pDesc->Inputs.DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY &&
+                    pDesc->Inputs.pGeometryDescs) {
+                    if (CheckCommittedCpuRange(
+                            reinterpret_cast<uintptr_t>(&pDesc->Inputs.pGeometryDescs[gi]),
+                            sizeof(D3D12_RAYTRACING_GEOMETRY_DESC),
+                            false)) {
+                        g = &pDesc->Inputs.pGeometryDescs[gi];
+                    }
+                } else if (pDesc->Inputs.DescsLayout == D3D12_ELEMENTS_LAYOUT_ARRAY_OF_POINTERS &&
+                           pDesc->Inputs.ppGeometryDescs) {
+                    if (CheckCommittedCpuRange(
+                            reinterpret_cast<uintptr_t>(&pDesc->Inputs.ppGeometryDescs[gi]),
+                            sizeof(void*),
+                            false)) {
+                        const auto* cand = pDesc->Inputs.ppGeometryDescs[gi];
+                        if (cand && CheckCommittedCpuRange(
+                                        reinterpret_cast<uintptr_t>(cand),
+                                        sizeof(D3D12_RAYTRACING_GEOMETRY_DESC),
+                                        false)) {
+                            g = cand;
+                        }
+                    }
+                }
+                if (!g) continue;
+
+                const bool geom_opaque = (g->Flags & D3D12_RAYTRACING_GEOMETRY_FLAG_OPAQUE) != 0u;
+                if (g->Type == D3D12_RAYTRACING_GEOMETRY_TYPE_TRIANGLES) {
+                    const uint32_t elem_sz = MinVertexElementBytes(g->Triangles.VertexFormat);
+                    const uint64_t raw_stride = g->Triangles.VertexBuffer.StrideInBytes;
+                    const uint64_t stride = (raw_stride == 0ull) ? elem_sz : raw_stride;
+                    const UINT vcount = g->Triangles.VertexCount;
+                    if (elem_sz == 0u || stride < elem_sz || vcount == 0u ||
+                        g->Triangles.VertexBuffer.StartAddress == 0ull) {
+                        continue;
+                    }
+                    const uint64_t vbytes_u64 =
+                        static_cast<uint64_t>(vcount - 1u) * stride + static_cast<uint64_t>(elem_sz);
+                    if (vbytes_u64 > 64ull * 1024ull * 1024ull) continue;
+                    const auto* vbase = static_cast<const uint8_t*>(
+                        TryResolveReadableGpuVa(g->Triangles.VertexBuffer.StartAddress,
+                                                static_cast<size_t>(vbytes_u64)));
+                    if (!vbase) continue;
+
+                    openscarlett::XboxBvhGeometryDesc gd{};
+                    gd.geometry_index = gi;
+                    gd.is_opaque = geom_opaque;
+                    if (g->Triangles.Transform3x4 != 0ull) {
+                        if (const void* xm = TryResolveReadableGpuVa(g->Triangles.Transform3x4, 48u)) {
+                            std::memcpy(gd.transform, xm, sizeof(gd.transform));
+                            gd.has_transform = true;
+                        }
+                    }
+
+                    if (g->Triangles.IndexFormat != DXGI_FORMAT_UNKNOWN) {
+                        const UINT icount = g->Triangles.IndexCount;
+                        const uint32_t idx_sz =
+                            (g->Triangles.IndexFormat == DXGI_FORMAT_R16_UINT) ? 2u
+                            : (g->Triangles.IndexFormat == DXGI_FORMAT_R32_UINT) ? 4u : 0u;
+                        if (idx_sz == 0u || icount < 3u || g->Triangles.IndexBuffer == 0ull) continue;
+                        const uint32_t max_tris = kMaxSwTrisTotal - accum_tris;
+                        const UINT capped_icount = std::min<UINT>(icount - (icount % 3u), max_tris * 3u);
+                        const auto* ibase = static_cast<const uint8_t*>(
+                            TryResolveReadableGpuVa(g->Triangles.IndexBuffer,
+                                                    static_cast<size_t>(capped_icount) * idx_sz));
+                        if (!ibase) continue;
+                        gd.vertices.reserve(capped_icount);
+                        for (UINT k = 0u; k < capped_icount; ++k) {
+                            uint32_t vidx = 0u;
+                            if (idx_sz == 2u) {
+                                uint16_t idx16 = 0u;
+                                std::memcpy(&idx16, ibase + static_cast<size_t>(k) * 2u, 2u);
+                                vidx = idx16;
+                            } else {
+                                std::memcpy(&vidx, ibase + static_cast<size_t>(k) * 4u, 4u);
+                            }
+                            if (vidx >= vcount) {
+                                gd.vertices.clear();
+                                break;
+                            }
+                            gd.vertices.push_back(DecodeVertexAt(
+                                vbase + static_cast<size_t>(vidx) * static_cast<size_t>(stride),
+                                g->Triangles.VertexFormat));
+                        }
+                    } else if (vcount >= 3u) {
+                        const uint32_t max_tris = kMaxSwTrisTotal - accum_tris;
+                        const UINT capped_vcount = std::min<UINT>(vcount - (vcount % 3u), max_tris * 3u);
+                        gd.vertices.reserve(capped_vcount);
+                        for (UINT k = 0u; k < capped_vcount; ++k) {
+                            gd.vertices.push_back(DecodeVertexAt(
+                                vbase + static_cast<size_t>(k) * static_cast<size_t>(stride),
+                                g->Triangles.VertexFormat));
+                        }
+                    }
+
+                    if (gd.vertices.size() >= 3u) {
+                        accum_tris += static_cast<uint32_t>(gd.vertices.size() / 3u);
+                        blas_in.geometries.push_back(std::move(gd));
+                    }
+                } else if (g->Type == D3D12_RAYTRACING_GEOMETRY_TYPE_PROCEDURAL_PRIMITIVE_AABBS) {
+                    const uint64_t acount_u64 = g->AABBs.AABBCount;
+                    if (acount_u64 == 0ull || g->AABBs.AABBs.StartAddress == 0ull) continue;
+                    const uint64_t astride =
+                        (g->AABBs.AABBs.StrideInBytes == 0ull) ? sizeof(D3D12_RAYTRACING_AABB)
+                                                               : g->AABBs.AABBs.StrideInBytes;
+                    if (astride < sizeof(D3D12_RAYTRACING_AABB)) continue;
+                    const uint32_t capped = static_cast<uint32_t>(std::min<uint64_t>(acount_u64, 4096ull));
+                    const uint64_t abytes =
+                        static_cast<uint64_t>(capped - 1u) * astride + sizeof(D3D12_RAYTRACING_AABB);
+                    const auto* abase = static_cast<const uint8_t*>(
+                        TryResolveReadableGpuVa(g->AABBs.AABBs.StartAddress, static_cast<size_t>(abytes)));
+                    if (!abase) continue;
+                    for (uint32_t k = 0u; k < capped; ++k) {
+                        D3D12_RAYTRACING_AABB da{};
+                        std::memcpy(&da, abase + static_cast<size_t>(k) * static_cast<size_t>(astride), sizeof(da));
+                        if (std::isfinite(da.MinX) && std::isfinite(da.MinY) && std::isfinite(da.MinZ) &&
+                            std::isfinite(da.MaxX) && std::isfinite(da.MaxY) && std::isfinite(da.MaxZ) &&
+                            da.MinX <= da.MaxX && da.MinY <= da.MaxY && da.MinZ <= da.MaxZ) {
+                            openscarlett::Rdna2BvhProceduralInput pi{};
+                            pi.bounds.min = {da.MinX, da.MinY, da.MinZ};
+                            pi.bounds.max = {da.MaxX, da.MaxY, da.MaxZ};
+                            pi.primitive_index = k;
+                            pi.geometry_index = gi;
+                            pi.geometry_flags = geom_opaque ? 1u : 0u;
+                            proc_aabbs.push_back(pi);
+                        }
+                    }
+                }
+            }
+
+            if (blas_in.geometries.empty() && !proc_aabbs.empty()) {
+                openscarlett::Rdna2BvhEncodeOptions popts{};
+                popts.use_box16 = use_box16;
+                popts.build_flags = bflags;
+                openscarlett::Rdna2BvhHeader phdr{};
+                if (openscarlett::BuildRdna2Bvh4ProceduralBlas(proc_aabbs, popts, sw_bvh4, &phdr).ok()) {
+                    openscarlett::XboxBvhConvertedBlas cblas{};
+                    cblas.xbox_gpu_va = dest_va;
+                    cblas.xbox_bvh4_buffer = sw_bvh4;
+                    cblas.bvh4_header = phdr;
+                    cblas.host_build_flags = bflags;
+                    cblas.geometry_count = 1u;
+                    impl_->sw_built_blas[dest_va] = std::move(cblas);
+                }
+            } else {
+                openscarlett::XboxBvhConvertedBlas conv_blas{};
+                if (openscarlett::ConvertXboxBlasToHostAndBvh4(blas_in, dest_va, conv_blas).ok()) {
+                    sw_bvh4 = conv_blas.xbox_bvh4_buffer;
+                    impl_->sw_built_blas[dest_va] = std::move(conv_blas);
+                }
+            }
+        }
+
+        if (!sw_bvh4.empty()) {
+            (void)impl_->sw_built_windows.RegisterWindow(dest_va, sw_bvh4);
+            if (void* dst_cpu = TryResolveWritableGpuVa(dest_va, sw_bvh4.size())) {
+                std::memcpy(dst_cpu, sw_bvh4.data(), sw_bvh4.size());
+            }
+            if (numPostbuildInfoDescs > 0u && pPostbuildInfoDescs != nullptr &&
+                CheckCommittedCpuRange(
+                    reinterpret_cast<uintptr_t>(pPostbuildInfoDescs),
+                    static_cast<size_t>(numPostbuildInfoDescs) *
+                        sizeof(D3D12_RAYTRACING_ACCELERATION_STRUCTURE_POSTBUILD_INFO_DESC),
+                    false)) {
+                const uint64_t as_sz =
+                    (static_cast<uint64_t>(sw_bvh4.size()) + 255ull) & ~255ull;
+                for (uint32_t pi = 0u; pi < numPostbuildInfoDescs; ++pi) {
+                    const auto& pbd = pPostbuildInfoDescs[pi];
+                    if (void* pb_dst = TryResolveWritableGpuVa(pbd.DestBuffer, sizeof(uint64_t))) {
+                        std::memcpy(pb_dst, &as_sz, sizeof(uint64_t));
+                    }
+                }
+            }
+        }
     }
     impl_->built_va_to_pc_va[pDesc->DestAccelerationStructureData] =
         pDesc->DestAccelerationStructureData;
@@ -1241,7 +1645,15 @@ OsBvhHresult XboxBvhBuilder::TraceRehydratedRayX(
     if (!impl_ || rootXboxVa == 0ull || !ray || !outHit) {
         return RecordCppHr("XboxBvhBuilder::TraceRehydratedRayX", OS_SHIM_E_INVALIDARG);
     }
-    const openscarlett::Status st = impl_->rehydrator.TraceRehydratedRay(rootXboxVa, *ray, *outHit);
+    openscarlett::Status st = impl_->rehydrator.TraceRehydratedRay(rootXboxVa, *ray, *outHit);
+    if (!st.ok()) {
+        std::lock_guard<std::mutex> lk(impl_->mutex);
+        const openscarlett::Status sw_st =
+            impl_->sw_built_windows.TraceRay64(rootXboxVa, *ray, *outHit);
+        if (sw_st.ok()) {
+            st = sw_st;
+        }
+    }
     return RecordCppHr("XboxBvhBuilder::TraceRehydratedRayX", StatusToHr(st));
 }
 
@@ -1337,6 +1749,24 @@ void OS_SHIM_CDECL XboxBvhBuilder_CopyRaytracingAccelerationStructure(
             destAccelerationStructureData, sourceAccelerationStructureData, mode);
     } else {
         (void)mode;
+        if (destAccelerationStructureData != sourceAccelerationStructureData) {
+            const auto* src_hdr_ptr = static_cast<const uint8_t*>(TryResolveReadableGpuVa(
+                sourceAccelerationStructureData, openscarlett::kRdna2BvhHeaderSize));
+            if (src_hdr_ptr != nullptr) {
+                openscarlett::Rdna2BvhHeader hdr{};
+                if (openscarlett::DecodeRdna2BvhHeader(
+                        src_hdr_ptr, openscarlett::kRdna2BvhHeaderSize, hdr).ok() &&
+                    hdr.total_size_bytes >= openscarlett::kRdna2BvhHeaderSize) {
+                    const void* src_full = TryResolveReadableGpuVa(
+                        sourceAccelerationStructureData, hdr.total_size_bytes);
+                    void* dst_full = TryResolveWritableGpuVa(
+                        destAccelerationStructureData, hdr.total_size_bytes);
+                    if (src_full != nullptr && dst_full != nullptr) {
+                        std::memmove(dst_full, src_full, hdr.total_size_bytes);
+                    }
+                }
+            }
+        }
     }
 #else
     (void)commandList;
